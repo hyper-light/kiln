@@ -3,7 +3,7 @@ Why: the run host's side of Shards' D286, whose API side is change 0001-shards-a
 Kiln-only: crates/shards, the binary kiln carries (ci/shards/pack.sh), which Hex's API-only copy of Shards doesn't take, so no product holds this change
 
 diff --git a/crates/shards/src/api_run.rs b/crates/shards/src/api_run.rs
-index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc1e6ab142 100644
+index 3a65ea8f15b6b1e2e48e38714ab337642889af55..8b9e7fee5838f20aa6a53d8189ddf3a48830d0d4 100644
 --- a/crates/shards/src/api_run.rs
 +++ b/crates/shards/src/api_run.rs
 @@ -20,6 +20,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -349,7 +349,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
          let (vm, networked) = checking.taken();
          super::step(format_args!(
              "its VM's binary checked{}",
-@@ -4500,7 +4682,11 @@ mod hosted {
+@@ -4503,7 +4685,11 @@ mod hosted {
      /// and its other the VM's, which the run's request hands it. Each directory at 4 + i,
      /// the home's private directory at 4 + n and each share's end of its stream at
      /// 5 + n + i, as its Unix twin is numbered; made in the run's job, detached from the
@@ -362,7 +362,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
      #[cfg(windows)]
      fn start_shares(
          home: &Path,
-@@ -4509,29 +4695,63 @@ mod hosted {
+@@ -4512,8 +4698,37 @@ mod hosted {
          job: &shards_ipc::GroupJob,
          tags: Option<&[String]>,
      ) -> Result<Shares, String> {
@@ -401,8 +401,9 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
              .iter()
              .map(|_| crate::os::share_pipe())
              .collect::<io::Result<Vec<_>>>()
-             .map_err(|e| format!("a share's stream: {e}"))?;
+@@ -4523,21 +4738,26 @@ mod hosted {
          let mut args: Vec<&OsStr> = vec![OsStr::new("share")];
+         args.extend(durable.iter().map(OsString::as_os_str));
          // Its notices of what its host changes (D235), on a pipe past its others.
 -        let told = tags.filter(|t| t.len() == dirs.len()).map(|t| t.join(","));
 -        let notices = match &told {
@@ -437,7 +438,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
          let number = |at: usize| i32::try_from(at).map_err(|_| "too many shares".to_string());
          let err = io::stderr();
          let ghosts = private_dir(home)?;
-@@ -4539,7 +4759,7 @@ mod hosted {
+@@ -4545,7 +4765,7 @@ mod hosted {
              (err.as_fd(), 2),
              (ghosts.as_fd(), number(4usize.saturating_add(n))?),
          ];
@@ -446,7 +447,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
              fds.push((dir.as_fd(), number(4usize.saturating_add(i))?));
              fds.push((
                  server.as_fd(),
-@@ -4553,9 +4773,15 @@ mod hosted {
+@@ -4559,9 +4779,15 @@ mod hosted {
          let child =
              shards_ipc::spawn_detached(Some(job), &exe, &args, &fds, &crate::netproc::env_pairs(&env))
                  .map_err(|e| format!("starting the share process: {e}"))?;
@@ -464,7 +465,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
              notices: notices.map(|(r, _)| OwnedFd::from(r)),
          })
      }
-@@ -6530,6 +6756,8 @@ mod hosted {
+@@ -6536,6 +6762,8 @@ mod hosted {
          pause_asks: Mutex<Option<Vec<Asked<Unheld>>>>,
          /// The host directories its shares give its guest, canonical (D259).
          reached: &'a [PathBuf],
@@ -473,7 +474,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
          /// What its own lanes of its agent-control endpoint are served with, where its
          /// orchestrator asked for the endpoint (D238, D252, D254).
          agent: Option<Agent>,
-@@ -7652,7 +7880,10 @@ mod hosted {
+@@ -7658,7 +7886,10 @@ mod hosted {
                  return Err(e);
              }
          };
@@ -485,7 +486,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
              Ok(plan) => plan,
              // Its shares' directories went with `shaped`, as `plan` failed.
              Err(e) => {
-@@ -7881,6 +8112,7 @@ mod hosted {
+@@ -7887,6 +8118,7 @@ mod hosted {
                  pauses: Mutex::new(super::Pauses::new()),
                  pause_asks: Mutex::new(Some(Vec::new())),
                  reached: &plan.reached,
@@ -493,7 +494,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
                  agent,
                  stdio: std::sync::OnceLock::new(),
                  net: net.as_ref(),
-@@ -9578,6 +9810,15 @@ mod hosted {
+@@ -9584,6 +9816,15 @@ mod hosted {
                  "this host's microVMs take no snapshots".into(),
              ));
          }
@@ -509,7 +510,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
          let mut reached = live.reached.to_vec();
          reached.extend(lock(&live.plugged).values().flatten().map(|p| p.host.clone()));
          let target = super::destination(Path::new(to), live.home, &reached)?;
-@@ -10188,6 +10429,108 @@ mod hosted {
+@@ -10194,6 +10435,108 @@ mod hosted {
          }
      }
  
@@ -618,7 +619,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
      #[cfg(all(test, unix))]
      #[allow(clippy::unwrap_used)]
      mod tests {
-@@ -10365,6 +10708,7 @@ mod hosted {
+@@ -10371,6 +10714,7 @@ mod hosted {
                  pauses: Mutex::new(super::super::Pauses::new()),
                  pause_asks: Mutex::new(Some(Vec::new())),
                  reached: &[],
@@ -626,7 +627,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
                  agent: None,
                  stdio: std::sync::OnceLock::new(),
                  net: None,
-@@ -13089,6 +13433,30 @@ mod hosted {
+@@ -13095,6 +13439,30 @@ mod hosted {
              bridges.close();
          }
  
@@ -657,7 +658,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
          /// D259's run host, its VM played by the test on the VM's end of the link and the link
          /// followed as a run's is. Do: save where the owner may, and while its VM holds its
          /// answer ask a second; save again, the VM refusing; save once more, the VM's link
-@@ -13870,6 +14238,65 @@ mod tests {
+@@ -13876,6 +14244,65 @@ mod tests {
          );
      }
  
@@ -723,7 +724,7 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
      fn request(members: Vec<wire::MemberStage>) -> wire::Request {
          wire::Request {
              image: "i".into(),
-@@ -13889,6 +14316,7 @@ mod tests {
+@@ -13895,6 +14322,7 @@ mod tests {
              upstream_roots: Vec::new(),
              plug_roots: Vec::new(),
              egress_ceiling: Vec::new(),
@@ -732,10 +733,10 @@ index 8852b2fed3429297223f6690d5ff84dfdcde197a..f78ede3422cc774700e9a2badfdd7adc
          }
      }
 diff --git a/crates/shards/src/cli/mod.rs b/crates/shards/src/cli/mod.rs
-index abd9e42d81f1cc30132c13103045d5f11a69f79a..d12a8f2f49c7bc8a17484f68ee4ecf877410b90f 100644
+index aa793b76eccc4393aad4acf5767475a4303f7033..5286b3fe11083958d302d5715450e053b0c4620b 100644
 --- a/crates/shards/src/cli/mod.rs
 +++ b/crates/shards/src/cli/mod.rs
-@@ -2236,7 +2236,10 @@ const WARM: &str = "warm";
+@@ -2271,7 +2271,10 @@ const WARM: &str = "warm";
  /// inheritable, and a spawn by std, which passes every inheritable handle on, would hand it
  /// to that child too. It reaches the VM by DuplicateHandle alone.
  #[cfg(windows)]
@@ -748,10 +749,10 @@ index abd9e42d81f1cc30132c13103045d5f11a69f79a..d12a8f2f49c7bc8a17484f68ee4ecf87
      use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
      use windows_sys::Win32::System::Console::{
 diff --git a/crates/shards/src/daemon.rs b/crates/shards/src/daemon.rs
-index ce1f0c4edff02c5fc89c1b996d7805de292fe236..7ee0b582aca88dbf68bc38b8f5d08001dd3ace9e 100644
+index b04884f3bb143b59e88b322181c74d095e4c2ed6..ec5bea84b3b8cc75312fb0e46971511f480c1f8b 100644
 --- a/crates/shards/src/daemon.rs
 +++ b/crates/shards/src/daemon.rs
-@@ -173,9 +173,10 @@ type JoinDoor = (UnixStream, u32);
+@@ -171,9 +171,10 @@ type JoinDoor = (UnixStream, u32);
  type JoinDoor = (UnixStream, u32, std::os::windows::io::OwnedHandle);
  
  /// Whether `handle` is a pipe's (GetFileType): on Windows, a share's that a client serves
@@ -765,7 +766,7 @@ index ce1f0c4edff02c5fc89c1b996d7805de292fe236..7ee0b582aca88dbf68bc38b8f5d08001
      use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
      // SAFETY: GetFileType reads an open handle's type, which this borrows, and touches no
 diff --git a/crates/shards/tests/api_image.rs b/crates/shards/tests/api_image.rs
-index c93d7b0eba093bc77c140d36bd553fceb319e828..2261563dbe5fd5d9c7c5cb91496a2fbf1e941d25 100644
+index 81e0c40da055f82a15b5dac578d4adbab0c66875..95331d6baffd0ad4ede7c801879ea970ebcb9110 100644
 --- a/crates/shards/tests/api_image.rs
 +++ b/crates/shards/tests/api_image.rs
 @@ -165,6 +165,7 @@ fn spec(home: &TempDir, image: &str) -> ImageSpec {
@@ -776,7 +777,7 @@ index c93d7b0eba093bc77c140d36bd553fceb319e828..2261563dbe5fd5d9c7c5cb91496a2fbf
          gpu_report: None,
      }
  }
-@@ -3881,6 +3882,7 @@ fn pooled_spec(home: &std::path::Path, image: &str, binary: &std::path::Path) ->
+@@ -3884,6 +3885,7 @@ fn pooled_spec(home: &std::path::Path, image: &str, binary: &std::path::Path) ->
          upstream_roots: Vec::new(),
          plug_roots: Vec::new(),
          egress_ceiling: Vec::new(),
@@ -785,7 +786,7 @@ index c93d7b0eba093bc77c140d36bd553fceb319e828..2261563dbe5fd5d9c7c5cb91496a2fbf
      }
  }
 diff --git a/crates/shards/tests/member_exec.rs b/crates/shards/tests/member_exec.rs
-index 83f5b570b0e47a1458033da843d2ebcc8172617c..7c4937acfc61feafa92d5cd291c4c3ed917c629b 100644
+index d762a55c6d3bb2889d0cd588c8d6f993cca864b5..2676d929ddd3c8650f8a068547781dd34d1d01c8 100644
 --- a/crates/shards/tests/member_exec.rs
 +++ b/crates/shards/tests/member_exec.rs
 @@ -117,6 +117,7 @@ fn boot_member(home: &TempDir, image: &str, terminal: bool, stdin: bool) -> Box<
@@ -797,7 +798,7 @@ index 83f5b570b0e47a1458033da843d2ebcc8172617c..7c4937acfc61feafa92d5cd291c4c3ed
      };
      booted(&ImageShards::new(), &spec).unwrap()
 diff --git a/crates/shards/tests/nesting.rs b/crates/shards/tests/nesting.rs
-index 84a5c3c070bd47863193f3a7e3c8041c127fdada..2043c7b86787bcf736dc83d92b3fa2b244286af2 100644
+index a969f421454b4a1f472f816dd4abe2c4c5072951..82041a68f02b85358fd365e5cf50acc804d7ed71 100644
 --- a/crates/shards/tests/nesting.rs
 +++ b/crates/shards/tests/nesting.rs
 @@ -572,6 +572,7 @@ fn a_deadline_given_through_shards_api_is_met_or_said_passed() {
@@ -824,7 +825,7 @@ index 84a5c3c070bd47863193f3a7e3c8041c127fdada..2043c7b86787bcf736dc83d92b3fa2b2
          gpu_report: None,
      };
      let guest = booted(&ImageShards::new(), &spec).unwrap();
-@@ -1068,6 +1071,7 @@ fn an_orchestrators_run_binds_its_own_agent_control_endpoint() {
+@@ -1086,6 +1089,7 @@ fn an_orchestrators_run_binds_its_own_agent_control_endpoint() {
              upstream_roots: Vec::new(),
              plug_roots: Vec::new(),
              egress_ceiling: Vec::new(),

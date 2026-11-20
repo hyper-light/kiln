@@ -104,6 +104,21 @@ impl Bridge for ScopedBridge<'_> {
     self.shown(node, parent, cx)
   }
 
+  fn stored_entry(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+  ) -> Result<(String, NodeAttr), VfsError> {
+    // Admitted and shown as its look-up is, so the scope answers nothing outside it; the name is the inner volume's.
+    let attr = self.lookup(parent, cx, name)?;
+    if name == ".." && parent.inode == self.scope {
+      return Ok((name.to_owned(), attr));
+    }
+    let (stored, _) = self.inner.stored_entry(parent, cx, name)?;
+    Ok((stored, attr))
+  }
+
   fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError> {
     self.admit(object, cx)?;
     self.inner.getattr(object, cx)
@@ -463,6 +478,14 @@ impl Bridge for ScopedBridge<'_> {
 
   fn attribute_namespaces(&mut self) -> crate::AttributeNamespaces {
     self.inner.attribute_namespaces()
+  }
+
+  fn setxattr_ext(&mut self) -> bool {
+    self.inner.setxattr_ext()
+  }
+
+  fn set_setxattr_ext(&mut self, extended: bool) {
+    self.inner.set_setxattr_ext(extended);
   }
 
   fn dax_state(&mut self) -> Option<crate::DaxState<'_>> {

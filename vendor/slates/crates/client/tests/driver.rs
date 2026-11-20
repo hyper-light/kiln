@@ -199,8 +199,8 @@ struct Anchor {
   profile: MachineProfile,
   config: DaemonConfig,
   segment: AnchorSegment,
-  /// The instance's rendezvous, which each daemon adopts (A-114).
-  rendezvous: HeldRendezvous,
+  /// The instance's rendezvous, which each daemon adopts (A-114); `None` once the anchor has let it go.
+  rendezvous: Option<HeldRendezvous>,
 }
 
 impl Anchor {
@@ -220,8 +220,19 @@ impl Anchor {
       profile,
       config,
       segment,
-      rendezvous: HeldRendezvous::hold(instance).unwrap(),
+      rendezvous: Some(HeldRendezvous::hold(instance).unwrap()),
     }
+  }
+
+  /// Lets go of the instance's rendezvous, as an anchor that stops for good does: nothing restarts the daemon then, so
+  /// a client whose daemon is gone fails `DaemonGone` at once rather than waiting for a restart (A-468).
+  fn let_go(&mut self) {
+    self.rendezvous = None;
+  }
+
+  /// Holds the instance's rendezvous again, as a new anchor of it would.
+  fn hold_again(&mut self, instance: &str) {
+    self.rendezvous = Some(HeldRendezvous::hold(instance).unwrap());
   }
 
   fn start(&self) -> Daemon {
@@ -234,7 +245,11 @@ impl Anchor {
         handoff,
         len,
         content,
-        rendezvous: self.rendezvous.adoption(),
+        rendezvous: self
+          .rendezvous
+          .as_ref()
+          .expect("the anchor holds the rendezvous")
+          .adoption(),
       },
     )
     .unwrap();
@@ -337,9 +352,18 @@ fn overflow_then_restart(
   second
 }
 
-/// Phase two: the daemon stopped for good and a ring's worth submitted; every call ends `DaemonGone`.
-fn death(daemon: Daemon, client: &mut Client, driver: &mut Driver, ticker: &mut Ticker) {
+/// Phase two: the daemon stopped for good, its anchor letting go of the rendezvous, and a ring's worth submitted; every
+/// call ends `DaemonGone`. Since A-468 a reconnect waits while the rendezvous has a holder, so a daemon gone under an
+/// anchor that still holds it is waited for; letting it go is what makes the daemon gone for good.
+fn death(
+  anchor: &mut Anchor,
+  daemon: Daemon,
+  client: &mut Client,
+  driver: &mut Driver,
+  ticker: &mut Ticker,
+) {
   daemon.stop();
+  anchor.let_go();
   let (doomed, _) = submit_lists(client, driver, client.outstanding_limit());
   ticker.run(client, driver, &doomed, budgets() * 2);
   for ticket in &doomed {
@@ -378,15 +402,16 @@ fn budgets() -> Duration {
 fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
   let noise = Noise::start();
   let instance = format!("cl-driver-{}", std::process::id());
-  let anchor = Anchor::new(&instance);
+  let mut anchor = Anchor::new(&instance);
   let first = anchor.start();
   let mut ticker = Ticker::default();
   let mut client = connect_from_the_loop(&instance, deadlines(), &mut ticker);
   let mut driver = Driver::new(&client);
 
   let second = overflow_then_restart(&anchor, first, &mut client, &mut driver, &mut ticker);
-  death(second, &mut client, &mut driver, &mut ticker);
+  death(&mut anchor, second, &mut client, &mut driver, &mut ticker);
 
+  anchor.hold_again(&instance);
   let third = anchor.start();
   let cancelled = driver
     .submit(
@@ -403,6 +428,56 @@ fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
   third.stop();
   let noise = noise.stop();
   assert_never_held(&ticker, step_bound(), noise);
+}
+
+/// A-523 (R3's class C). Do: start a daemon that holds its own rendezvous, connect from the loop, stop the daemon, then
+/// submit a call and run the loop. Expect: the call ends `DaemonGone` before half the old reply deadline. The driver asks
+/// the daemon's liveness at the call's first look, twice the longer of its wait when first judged and the client's wake
+/// estimate, and nothing holds the rendezvous to restart the daemon (A-468); before A-523 the driver first asked at the
+/// reply deadline, the liveness budget, so the call ended a second after it was sent.
+#[test]
+fn a_call_whose_daemon_is_gone_ends_before_the_old_reply_deadline() {
+  let instance = format!("cl-driver-look-{}", std::process::id());
+  let profile = profile();
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-driver-look-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut ticker = Ticker::default();
+  let mut client = connect_from_the_loop(&instance, deadlines(), &mut ticker);
+  let mut driver = Driver::new(&client);
+  daemon.stop();
+  let asked = Instant::now();
+  let (doomed, _) = submit_lists(&mut client, &mut driver, 1);
+  ticker.run(
+    &mut client,
+    &mut driver,
+    &doomed,
+    Duration::from_nanos(LIVENESS_BUDGET_NS) * 2,
+  );
+  let took = asked.elapsed();
+  for ticket in &doomed {
+    assert!(
+      matches!(
+        ticker.ended.get(ticket),
+        Some(Err(ClientError::DaemonGone { .. }))
+      ),
+      "call {ticket} to the stopped daemon ended DaemonGone: {:?} after {took:?}",
+      ticker.ended.get(ticket)
+    );
+  }
+  assert!(
+    took < Duration::from_nanos(LIVENESS_BUDGET_NS / 2),
+    "the call ended {took:?} after it was sent, not before half the old reply deadline"
+  );
 }
 
 /// Asserts no step of `ticker`'s loop was held past `bound` by the driver: a step over `bound` plus the sampled `noise`
@@ -627,4 +702,74 @@ fn assert_alive_throughout(daemon: &Daemon, (looks_before, withheld_before): (u6
     withheld, withheld_before,
     "the watchdog judged the held daemon alive throughout ({looks} looks)"
   );
+}
+
+/// Shape: the volumes the chained-listing test lists: about three pages of summaries at these names, so the listing is
+/// a chain of page requests under the call's one word.
+const CHAINED_VOLUMES: usize = 250;
+
+/// §4.4 `list` (A-263), the async path both SDKs drive. Do: create 250 volumes, then list them through the driver as
+/// an SDK does: on each `Ready`, poll the call's word; a page that is not the last answers `None` while the client
+/// sends the next page under the same word; settle the call when the poll answers the listing. Expect: the listing,
+/// every volume once, well within the reply deadline. Before 2026-11-09 the driver reported a call `Ready` once until
+/// it was finished, so the second page's reply was never reported and the call failed `Stalled` at the deadline (both
+/// SDKs' async suites on CI, diag list-3, `Stalled { after_ns: 10000000000 }`).
+#[test]
+fn a_chained_call_is_reported_at_each_step_until_it_ends() {
+  let instance = format!("cl-driver-chain-{}", std::process::id());
+  let anchor = Anchor::new(&instance);
+  let daemon = anchor.start();
+  let mut ticker = Ticker::default();
+  let mut client = connect_from_the_loop(&instance, deadlines(), &mut ticker);
+  let mut made = std::collections::BTreeSet::new();
+  for n in 0..CHAINED_VOLUMES {
+    made.insert(
+      client
+        .create(&slates_client::CreateSpec {
+          name: format!("chained-{n:04}"),
+          size: slates_client::SizeClass::Bounded { limit: 1 << 20 },
+          names: slates_client::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        })
+        .unwrap(),
+    );
+  }
+  let mut driver = Driver::new(&client);
+  let ticket = driver
+    .submit(
+      &mut client,
+      Box::new(|client: &mut Client| client.list_begin()),
+    )
+    .unwrap();
+  let started = Instant::now();
+  let listed = 'call: loop {
+    let mut events = driver.pump(&mut client);
+    events.extend(driver.tick(&mut client));
+    for event in events {
+      match event {
+        Event::Ready { word, .. } => {
+          if let Some(volumes) = client.list_poll(word).unwrap() {
+            driver.finish(ticket);
+            break 'call volumes;
+          }
+          driver.continued(ticket);
+        }
+        Event::Failed { error, .. } => panic!(
+          "the chained listing failed after {:?}: {error}",
+          started.elapsed()
+        ),
+      }
+    }
+    std::hint::spin_loop();
+  };
+  let ids: std::collections::BTreeSet<_> = listed.iter().map(|v| v.id).collect();
+  assert_eq!(
+    (ids.len(), listed.len()),
+    (made.len(), made.len()),
+    "every volume once"
+  );
+  assert_eq!(ids, made);
+  assert!(driver.is_idle());
+  daemon.stop();
 }

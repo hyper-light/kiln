@@ -2878,6 +2878,12 @@ impl Registry {
         v
     }
 
+    /// The workspaces the agents of the machine at `target` work in now (`workspace::live`): what a start there whose
+    /// folder lies in one of them shares (W2).
+    fn live_at(&self, target: &str) -> Vec<(String, crate::workspace::Workspace)> {
+        crate::workspace::live(self.list().into_iter().filter(|i| Location::of_target(&i.target).target() == target).collect())
+    }
+
     /// [`Registry::list`], each info as its owner shares it with its view, none copied (goal 9, plan 01a1a87b2cec
     /// step 5: `agents.list` copied every session's whole info to read a few fields of each).
     pub fn list_shared(&self) -> Vec<Arc<Info>> {
@@ -4385,6 +4391,18 @@ impl Registry {
         self.open_as(hub, target, spec, count, &[]).await
     }
 
+    /// The boundary a start of `spec` on `target` runs in, as [`Registry::open_as`] decides it: as it asks; else its
+    /// parent's, since an isolated agent's agents are isolated too, however they're started (kiln plan
+    /// 01a1cd8e862e7169a074db3d5fa33f3d step 32); else, for a new conversation on a `microvm` runner, a microVM of its own
+    /// (kiln plan 01a1dd2e…, P2.3; one taken up, `resume`, a found session taken over or branched or a conversation
+    /// continued, stays where its harness keeps it). None: on its machine's host. What a start's workspace is judged by
+    /// before it's opened (`api`'s `harness_open`: a volume served to its microVM needs no host mount, docs/agentic.md W8).
+    pub fn isolation_for(&self, hub: &Hub, target: &str, spec: &Spec) -> Option<super::session::Isolation> {
+        spec.isolation.clone().or_else(|| spec.parent.as_deref().and_then(|p| self.info(p)).and_then(|i| i.isolation)).or_else(|| {
+            (spec.resume.is_none() && crate::harness::lineage::engine_at(hub, target) == Ok(crate::harness::engine::Engine::Microvm)).then(|| super::session::Isolation { person: spec.opener.clone(), ..super::session::Isolation::microvm() })
+        })
+    }
+
     /// [`Registry::open`], the sessions under `ids` in order (made by the client that asks, so its
     /// page can open a session's own page before it has started, W21-R15; those it names no id
     /// for get one made here). One that's a session's already, or a start's under way, is refused
@@ -4395,23 +4413,15 @@ impl Registry {
         // The most egress its microVM may be granted live: the org's policy, never what was asked (kiln plan 01a1dd2e…,
         // P6b.4).
         spec.egress_ceiling.clone_from(&hub.cfg.agents.egress_ceiling);
-        // An isolated agent's agents are isolated too, however they're started; and one is held so
-        // only where its machine starts microVMs: one that can't would run it as a process, unasked
-        // (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
-        if spec.isolation.is_none() {
-            spec.isolation = spec.parent.as_deref().and_then(|p| self.info(p)).and_then(|i| i.isolation);
-        }
+        // Its boundary ([`Registry::isolation_for`]): an isolated agent's agents are isolated too, and a new
+        // conversation that asks for no microVM takes its runner's engine. One is held so only where its machine starts
+        // microVMs: one that can't would run it as a process, unasked (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+        spec.isolation = self.isolation_for(hub, target, &spec);
         // The engine setting its boundary is decided under (kiln plan 01a1dd2e…, P2.3), before anything
         // it waits for: its runner refuses it where it's been set again since. One `agents.start`
         // decided keeps the one it was decided under.
         if spec.engine_version.is_none() {
             spec.engine_version = crate::harness::engine::version_at(hub, target);
-        }
-        // A new conversation that asks for no microVM takes its runner's engine (kiln plan 01a1dd2e…,
-        // P2.3): on a `microvm` runner, a microVM of its own. One taken up (`resume`: a found session
-        // taken over or branched, a conversation continued) stays where its harness keeps it.
-        if spec.isolation.is_none() && spec.resume.is_none() && crate::harness::lineage::engine_at(hub, target) == Ok(crate::harness::engine::Engine::Microvm) {
-            spec.isolation = Some(super::session::Isolation { person: spec.opener.clone(), ..super::session::Isolation::microvm() });
         }
         if spec.isolation.is_some() {
             crate::harness::lineage::isolation_on(hub, target).map_err(|why| anyhow::anyhow!("an agent can't run isolated there: {why}"))?;
@@ -4419,18 +4429,21 @@ impl Registry {
         let loc = Location::of_target(target);
         // Where it works, on its machine's host (the person's decision, 2026-11-18, kiln goal
         // 01a1ec34599974448aed2672bafaf9a2; docs/agentic.md W2): one whose folder lies in a workspace an agent there
-        // works in now works in that one; one whose start named none gets a volume of its own where its machine can make
-        // one, else its folder, saying why (`[agents] workspace`, `volume` unless a server says `folder`). In a microVM
-        // its boundary's sharing decides; a conversation taken up stays in the folder its harness keeps it by
-        // (`resume`); and an agent started in a person's shell (`shell`) works beside them in the shell's folder, as the
-        // composer shows it, since it takes the shell's environment, whose `PWD` names that folder.
+        // works in now works in that one; one whose start named none gets a volume of its own, and a machine that can't
+        // make one refuses the start, naming what it lacks (`lineage::NoWorkspace`), rather than run it in its plain
+        // folder: no second path (`[agents] workspace`, `volume` unless a server says `folder`). In a microVM
+        // its boundary's sharing decides. One started in a person's shell (`shell`) works on a volume too: the shell's
+        // folder, read on its machine as it starts, is the one laid over, and its environment is moved onto the mount
+        // with it (`workspace::prepare`, `kinds::launch`), so nothing of it names the person's folder (I11); and so does
+        // a conversation taken up (`resume`), its harness's record of it moved to where the harness looks from the
+        // mount's folder (`harness::homes::rehome`, I12).
         if spec.isolation.is_none() && spec.workspace.as_ref().is_none_or(|w| w.made.is_none()) {
-            let here = loc.target();
-            let live: Vec<(String, crate::workspace::Workspace)> = self.list().into_iter().filter(|i| Location::of_target(&i.target).target() == here).filter_map(|i| i.workspace.filter(|w| w.made.is_some()).map(|w| (i.id, w))).collect();
+            let live = self.live_at(&loc.target());
             if let Some(shared) = spec.cwd.as_deref().and_then(|cwd| crate::workspace::sharing(cwd, &live)) {
                 spec.workspace = Some(shared);
-            } else if spec.workspace.is_none() && spec.resume.is_none() && spec.shell.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
-                spec.workspace = Some(crate::workspace::by_default(crate::harness::lineage::workspaces_on(hub, target).await));
+            } else if spec.workspace.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
+                crate::harness::lineage::workspaces_on(hub, target, crate::harness::lineage::WorkspaceUse::Mounted).await?;
+                spec.workspace = Some(crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() });
             }
         }
         // How much its launcher lets it do unasked, kept as given whatever it or its harness says later (the person's
@@ -4468,15 +4481,11 @@ impl Registry {
             }
             match loc {
                 Location::Local => {
-                    // Started on one of the server's own shells: in that shell's directory.
+                    // Started on one of the server's own shells: in that shell's directory, and in the volume of an
+                    // agent here whose mount that directory lies in (`workspace::from_shell`, W2).
                     if let Some(pid) = spec.shell.as_ref().and_then(|t| self.local_shells.load().get(t).copied()) {
-                        let (cwd, env) = crate::rt::blocking(move || super::host::shell_context(pid)).await.unwrap_or((None, Vec::new()));
-                        if spec.cwd.is_none() {
-                            spec.cwd = cwd;
-                        }
-                        if spec.env.is_empty() {
-                            spec.env = env;
-                        }
+                        let shell = crate::rt::blocking(move || super::host::shell_context(pid)).await.unwrap_or((None, Vec::new()));
+                        crate::workspace::from_shell(&mut spec, shell, &self.live_at(&loc.target()));
                     }
                     // A workspace of its own first: a volume over its folder, mounted, its folder in it.
                     let id = ids.get(i).cloned().unwrap_or_else(crate::util::new_id);
@@ -4486,6 +4495,7 @@ impl Registry {
                         Ok(s) => s,
                         Err(e) => {
                             // What was made for it goes with it: asked again under its id, it's made anew.
+                            // Nothing ran in it, so nothing of it is on its way out: asked to go once.
                             if let Some(m) = made
                                 && let Err(gone) = crate::workspace::slates::remove(&m).await
                             {

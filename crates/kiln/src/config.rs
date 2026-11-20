@@ -63,6 +63,32 @@ pub struct Config {
     /// The machine's capacity keeper this runner holds its runs' room through (docs/lb.md "A
     /// machine's keeper"): none until declared.
     pub capacity: Capacity,
+    /// kiln's Slates fleet (docs/agentic.md W7): which runners' Slates join it, where each is
+    /// reached, and its fault tolerance; the server's word, none until declared.
+    pub slates_fleet: SlatesFleet,
+}
+
+/// `[slates_fleet]` (docs/agentic.md W7; kiln goal 95101ef32ffb8b099942fe076619c310, K3), the
+/// server's: the runners whose Slates join kiln's Slates fleet, each by its machine's name with
+/// where its node is reached (an IPv4 address or a DNS name, and the base of the node's two UDP
+/// ports, both of which each other listed runner must be able to reach), and the fleet's fault
+/// tolerance `f` (a write commits at `f + 1` of `2f + 1` copies, so at least `2f + 1` runners).
+/// A listed runner's Slates starts as the fleet's node from its next start; every other runner's
+/// runs alone. Off while no runner is listed (AGENTS.md: opt-in automation).
+///
+/// ```toml
+/// [slates_fleet]
+/// f = 1
+/// [slates_fleet.nodes]
+/// "adas-mac-studio" = "192.168.1.20:17300"
+/// "adas-macbook-pro" = "192.168.1.21:17300"
+/// "adas-mac-mini" = "192.168.1.22:17300"
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SlatesFleet {
+    pub f: u32,
+    pub nodes: BTreeMap<String, String>,
 }
 
 /// `[capacity]` (docs/lb.md "A machine's keeper"; Hex's capacity-view.md; kiln plan

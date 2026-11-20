@@ -88,12 +88,20 @@ const TAG_INSTALL: u8 = 1;
 const TAG_FETCH: u8 = 2;
 /// Format: a whole-state message's first byte: phase one's report (successor to holder; A-240).
 const TAG_REPORT: u8 = 3;
+/// Format: a whole-state message's first byte: a claim's admission (owner to candidate; §4.2, A-401).
+const TAG_ADMIT: u8 = 4;
+/// Format: an [`Admit`]'s size kind: a bounded claim.
+const SIZE_BOUNDED: u8 = 0;
+/// Format: an [`Admit`]'s size kind: a dynamic volume.
+const SIZE_DYNAMIC: u8 = 1;
 /// Format: a reply's first byte: a head held, a holder with nothing, or a fence refusal.
 const REPLY_HEAD: u8 = 1;
 /// Format: see [`REPLY_HEAD`].
 const REPLY_EMPTY: u8 = 2;
 /// Format: see [`REPLY_HEAD`].
 const REPLY_STALE: u8 = 3;
+/// Format: see [`REPLY_HEAD`]: the holder has no room for the volume's admission ([`LiveError::NoRoom`]).
+const REPLY_NO_ROOM: u8 = 4;
 
 /// A refusal of the live log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +128,14 @@ pub enum LiveError {
   NoCredit {
     /// The durable position.
     durable: Option<u64>,
+  },
+  /// The holder cannot make the volume's admission against its own machine (§4.2 "a remote holder makes the same
+  /// admission against its own machine before acknowledging placement"): the claim a successor's restore takes, or the
+  /// held log's bytes past it. `available` is what the holder could admit now. The holder takes nothing; the owner
+  /// counts it as no acknowledgement.
+  NoRoom {
+    /// The bytes the holder could admit now.
+    available: u64,
   },
 }
 
@@ -487,6 +503,74 @@ impl Report {
   }
 }
 
+/// An owner's ask, before it turns a volume's live shipping on, that a candidate make the admission a successor's restore
+/// would make (§4.2: "a remote holder makes the same admission against its own machine before acknowledging placement";
+/// A-401): the volume, its size class and whether it must live in locked RAM, as its catalog records them. Answered with
+/// the empty head when the candidate holds the claim ([`encode_reply`]'s `Ok(None)`), [`LiveError::NoRoom`] when it
+/// cannot make it, and nothing when it will not serve the owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admit {
+  /// The volume.
+  pub object: ObjectId,
+  /// Its size class.
+  pub size: crate::catalog::SizeClass,
+  /// Whether its content must live in locked RAM.
+  pub require_locked: bool,
+}
+
+impl Admit {
+  /// The canonical bytes: its tag, the object, the size's kind and bytes, and the locked flag.
+  pub fn encode(&self) -> Vec<u8> {
+    let (kind, bytes) = match self.size {
+      crate::catalog::SizeClass::Bounded { limit } => (SIZE_BOUNDED, limit),
+      crate::catalog::SizeClass::Dynamic { max } => (SIZE_DYNAMIC, max),
+    };
+    let mut out = Vec::new();
+    out.push(TAG_ADMIT);
+    out.extend_from_slice(&self.object.0);
+    out.push(kind);
+    out.extend_from_slice(&bytes.to_le_bytes());
+    out.push(u8::from(self.require_locked));
+    out
+  }
+
+  /// Parses bytes that crossed the network: `Malformed` for another tag, an unknown size kind or locked flag, or any
+  /// length but the canonical one.
+  pub fn decode(bytes: &[u8]) -> Result<Admit, LiveError> {
+    let mut reader = Reader { bytes };
+    if reader.byte()? != TAG_ADMIT {
+      return Err(LiveError::Malformed);
+    }
+    let object = reader.object()?;
+    let kind = reader.byte()?;
+    let bytes = reader.word()?;
+    let size = match kind {
+      SIZE_BOUNDED => crate::catalog::SizeClass::Bounded { limit: bytes },
+      SIZE_DYNAMIC => crate::catalog::SizeClass::Dynamic { max: bytes },
+      _ => return Err(LiveError::Malformed),
+    };
+    let require_locked = match reader.byte()? {
+      0 => false,
+      1 => true,
+      _ => return Err(LiveError::Malformed),
+    };
+    if reader.bytes.is_empty() {
+      Ok(Admit {
+        object,
+        size,
+        require_locked,
+      })
+    } else {
+      Err(LiveError::Malformed)
+    }
+  }
+}
+
+/// Whether a whole-state message is an [`Admit`].
+pub fn is_admit(bytes: &[u8]) -> bool {
+  bytes.first() == Some(&TAG_ADMIT)
+}
+
 /// A holder's answer to a [`Report`]: the bytes it keeps of the log, then its reply (the head, or the fence refusing a
 /// stale successor).
 pub fn encode_reported(reply: &Result<Option<Head>, LiveError>, kept: u64) -> Vec<u8> {
@@ -502,33 +586,122 @@ pub fn decode_reported(bytes: &[u8]) -> Result<(Result<Option<Head>, LiveError>,
   Ok((decode_reply(reader.bytes), kept))
 }
 
-/// A holder's answer to a [`Fetch`]: its reply (the head, or the fence refusing a stale successor) and the payloads it
-/// keeps, in order, each `u32`-length-prefixed.
-pub fn encode_fetched(reply: &Result<Option<Head>, LiveError>, payloads: &[Vec<u8>]) -> Vec<u8> {
+/// Format: the bytes of the length that prefixes each payload of a holder's answer to a [`Fetch`] (a `u32` LE).
+pub const FETCHED_PREFIX_BYTES: usize = size_of::<u32>();
+
+/// The start of a holder's answer to a [`Fetch`]: its reply (the head, or the fence refusing a stale successor),
+/// `u32`-length-prefixed, in a buffer with room for `payload_bytes` more. The payloads it keeps follow in order, each
+/// appended by [`push_fetched`], so a candidate lays a long log out a slice at a time (g251) and no payload is copied
+/// twice: laid out whole in one turn, after a clone of every entry, a 300 MB log was two copies of it in the turn.
+pub fn fetched_reply(reply: &Result<Option<Head>, LiveError>, payload_bytes: usize) -> Vec<u8> {
   let head = encode_reply(reply);
-  let mut out = Vec::new();
+  let mut out = Vec::with_capacity(
+    FETCHED_PREFIX_BYTES
+      .saturating_add(head.len())
+      .saturating_add(payload_bytes),
+  );
   out.extend_from_slice(&u32::try_from(head.len()).unwrap_or(u32::MAX).to_le_bytes());
   out.extend_from_slice(&head);
-  for payload in payloads {
-    out.extend_from_slice(
-      &u32::try_from(payload.len())
-        .unwrap_or(u32::MAX)
-        .to_le_bytes(),
-    );
-    out.extend_from_slice(payload);
-  }
   out
 }
 
-/// Parses a holder's answer to a [`Fetch`], refusing any payload over `cap` before it is copied.
-pub fn decode_fetched(bytes: &[u8], cap: usize) -> Result<(Option<Head>, Vec<Vec<u8>>), LiveError> {
-  let mut reader = Reader { bytes };
-  let head = decode_reply(&reader.prefixed(cap)?)?;
-  let mut payloads = Vec::new();
-  while !reader.bytes.is_empty() {
-    payloads.push(reader.prefixed(cap)?);
+/// Appends one payload to an answer [`fetched_reply`] began: its length and its bytes.
+pub fn push_fetched(out: &mut Vec<u8>, payload: &[u8]) {
+  out.extend_from_slice(
+    &u32::try_from(payload.len())
+      .unwrap_or(u32::MAX)
+      .to_le_bytes(),
+  );
+  out.extend_from_slice(payload);
+}
+
+/// A holder's answer to a [`Fetch`] as it crossed the network (g251): its reply decoded, its payloads left in place in
+/// the answer's bytes and read one at a time ([`FetchedLog::next_payload`]), each refused over the cap before it is
+/// used. Copied out whole, a 300 MB log's payloads took one turn of the successor's control shard; read in place, each
+/// costs only its own apply, in whichever turn the rebuild applies it.
+#[derive(Debug)]
+pub struct FetchedLog {
+  /// The answer's bytes.
+  bytes: Vec<u8>,
+  /// Where the next payload's length begins.
+  next: usize,
+  /// The largest payload taken.
+  cap: usize,
+  /// The payloads taken so far.
+  taken: usize,
+}
+
+impl FetchedLog {
+  /// Parses a holder's answer: its reply, refused [`LiveError::Malformed`] when cut short or over `cap`, and the log of
+  /// its payloads, each read and checked against `cap` only when it is taken.
+  pub fn decode(bytes: Vec<u8>, cap: usize) -> Result<(Option<Head>, FetchedLog), LiveError> {
+    let mut reader = Reader { bytes: &bytes };
+    let head = decode_reply(&reader.prefixed(cap)?)?;
+    let next = bytes
+      .len()
+      .checked_sub(reader.bytes.len())
+      .ok_or(LiveError::Malformed)?;
+    Ok((
+      head,
+      FetchedLog {
+        bytes,
+        next,
+        cap,
+        taken: 0,
+      },
+    ))
   }
-  Ok((head, payloads))
+
+  /// The next payload, `None` once every one was taken. Refused [`LiveError::Malformed`] when its length runs past the
+  /// answer or over the cap, after which the log is spent.
+  pub fn next_payload(&mut self) -> Option<Result<&[u8], LiveError>> {
+    match self.peek()? {
+      Ok(length) => {
+        let start = self.next.saturating_add(FETCHED_PREFIX_BYTES);
+        let end = start.saturating_add(length);
+        self.next = end;
+        self.taken = self.taken.saturating_add(1);
+        self.bytes.get(start..end).map(Ok)
+      }
+      Err(refusal) => {
+        self.next = self.bytes.len();
+        Some(Err(refusal))
+      }
+    }
+  }
+
+  /// The next payload without taking it (a log's first, whose sealing a takeover reads before its rebuild begins);
+  /// `None` when every one was taken or the next is malformed.
+  pub fn first(&self) -> Option<&[u8]> {
+    let length = self.peek()?.ok()?;
+    let start = self.next.saturating_add(FETCHED_PREFIX_BYTES);
+    self.bytes.get(start..start.saturating_add(length))
+  }
+
+  /// Whether every payload was taken.
+  pub fn is_spent(&self) -> bool {
+    self.next >= self.bytes.len()
+  }
+
+  /// The payloads taken so far.
+  pub fn taken(&self) -> usize {
+    self.taken
+  }
+
+  /// The next payload's length, checked to lie within the answer and the cap; `None` when none is left.
+  fn peek(&self) -> Option<Result<usize, LiveError>> {
+    let rest = self
+      .bytes
+      .get(self.next..)
+      .filter(|rest| !rest.is_empty())?;
+    let mut reader = Reader { bytes: rest };
+    Some(reader.count().and_then(|length| {
+      if length > self.cap || reader.bytes.len() < length {
+        return Err(LiveError::Malformed);
+      }
+      Ok(length)
+    }))
+  }
 }
 
 /// A holder's answer to an entry or an install: the head it holds after it (`Ok(None)`: nothing), or a refusal.
@@ -543,6 +716,10 @@ pub fn encode_reply(reply: &Result<Option<Head>, LiveError>) -> Vec<u8> {
     Err(LiveError::StaleEpoch { current }) => {
       out.push(REPLY_STALE);
       out.extend_from_slice(&current.0.to_le_bytes());
+    }
+    Err(LiveError::NoRoom { available }) => {
+      out.push(REPLY_NO_ROOM);
+      out.extend_from_slice(&available.to_le_bytes());
     }
     // A refusal that names nothing the owner can act on is an empty answer: it counts as no acknowledgement.
     Err(_) => {}
@@ -560,6 +737,9 @@ pub fn decode_reply(bytes: &[u8]) -> Result<Option<Head>, LiveError> {
     REPLY_EMPTY => Ok(None),
     REPLY_STALE => Err(LiveError::StaleEpoch {
       current: HostEpoch(reader.word()?),
+    }),
+    REPLY_NO_ROOM => Err(LiveError::NoRoom {
+      available: reader.word()?,
     }),
     _ => Err(LiveError::Malformed),
   };
@@ -883,9 +1063,10 @@ pub fn adopt_past_tolerance(reports: &[(HostId, Option<Head>)], wait: &[HostId])
 /// ([`Entry::wire_bytes`]; AC-8.9).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bounds {
-  /// The entries appended and not yet durable, at most, counting the one being appended
-  /// ([`Shipper::append`]); a whole state may go one entry past it ([`Shipper::append_checkpoint`]). One entry is
-  /// admitted whatever its size while nothing is in flight, so zero still lets the log go one entry at a time.
+  /// The deltas appended and not yet durable, at most, counting the one being appended ([`Shipper::append`]); a whole
+  /// state may go one entry past it ([`Shipper::append_checkpoint`]) and is not counted against the deltas behind it
+  /// (A-371). One delta is admitted whatever its size while no delta is in flight, so zero still lets the log go one
+  /// entry at a time.
   pub credit: usize,
   /// The entries retained for laggards, at most; past it the oldest is dropped and a holder that lacks it is installed.
   /// The newest entry is never dropped for size alone, and an entry every holder holds is not kept at all.
@@ -931,12 +1112,16 @@ pub struct Shipper {
   holders: Vec<HostId>,
   /// The bytes it holds in flight and retains for laggards ([`Shipper::set_bounds`]).
   bounds: Bounds,
-  /// The entries appended here and not yet durable, oldest first: each one's position and wire bytes. Kept apart from
-  /// `retained`, which a checkpoint past the credit can trim below them, so the credit counts exactly what is in flight.
-  /// Bounded by the credit: at most its bytes plus one whole state ([`Shipper::append_checkpoint`]).
-  unsettled: VecDeque<(u64, usize)>,
+  /// The entries appended here and not yet durable, oldest first: each one's position and wire bytes, and whether it is
+  /// a whole state ([`Shipper::append_checkpoint`]). Kept apart from `retained`, which a checkpoint past the credit can
+  /// trim below them, so the credit counts exactly what is in flight. Bounded: the deltas within the credit, and the
+  /// whole states admitted one past it.
+  unsettled: VecDeque<(u64, usize, bool)>,
   /// The sum of `unsettled`'s bytes.
   unsettled_bytes: usize,
+  /// The sum of the bytes of `unsettled`'s whole states: a whole state rides one past the credit, so the credit a delta
+  /// is held to counts the rest alone (A-371).
+  unsettled_whole_bytes: usize,
   /// The head the owner started from (a takeover's adopted head), which it holds and every holder may report.
   start: Option<Head>,
   /// The position its first entry takes when it has no `start`: 0 for a new log, and for an owner restarted over its
@@ -988,6 +1173,7 @@ impl Shipper {
       bounds,
       unsettled: VecDeque::new(),
       unsettled_bytes: 0,
+      unsettled_whole_bytes: 0,
       start,
       first: 0,
       head: start,
@@ -1209,7 +1395,8 @@ impl Shipper {
     .max()
   }
 
-  /// The wire bytes of the entries appended here that are not yet durable: what [`Bounds::credit`] holds.
+  /// The wire bytes of the entries appended here that are not yet durable, whole states included: [`Bounds::credit`]
+  /// holds the deltas among them, and a whole state is admitted only while all of them are within it.
   pub fn in_flight_bytes(&self) -> usize {
     self.unsettled_bytes
   }
@@ -1220,17 +1407,24 @@ impl Shipper {
   }
 
   /// Appends the next publication to the chain: the entry to send to every holder. Refused [`LiveError::NoCredit`]
-  /// when entries are in flight and their bytes with this one's would pass [`Bounds::credit`]; the writer waits for
-  /// acknowledgements (AC-8.9). With nothing in flight it is admitted whatever its size, so the log always moves.
+  /// when deltas are in flight and their bytes with this one's would pass [`Bounds::credit`]; the writer waits for
+  /// acknowledgements (AC-8.9). A whole state in flight is not counted: it rides one past the credit
+  /// ([`Shipper::append_checkpoint`], A-371). With no delta in flight it is admitted whatever its size, so the log always
+  /// moves.
   pub fn append(&mut self, payload: Vec<u8>) -> Result<Entry, LiveError> {
     let bytes = ENTRY_PREFIX_BYTES.saturating_add(payload.len());
-    if !self.unsettled.is_empty() && self.unsettled_bytes.saturating_add(bytes) > self.bounds.credit
-    {
+    // The deltas in flight, a whole state's bytes left out: a whole state rides one past the credit (A-371). Counted
+    // with it, the whole entry the daemon has just appended filled the credit it sets from that entry's size, and every
+    // delta after it was refused until the whole state was durable.
+    let deltas = self
+      .unsettled_bytes
+      .saturating_sub(self.unsettled_whole_bytes);
+    if deltas > 0 && deltas.saturating_add(bytes) > self.bounds.credit {
       return Err(LiveError::NoCredit {
         durable: self.durable,
       });
     }
-    self.append_unchecked(payload)
+    self.append_unchecked(payload, false)
   }
 
   /// Whether a whole state would be admitted now ([`Shipper::append_checkpoint`]): what is in flight is within the
@@ -1250,10 +1444,11 @@ impl Shipper {
         durable: self.durable,
       });
     }
-    self.append_unchecked(payload)
+    self.append_unchecked(payload, true)
   }
 
-  fn append_unchecked(&mut self, payload: Vec<u8>) -> Result<Entry, LiveError> {
+  /// Appends `payload` at the next position, kept unsettled as a whole state when `whole`.
+  fn append_unchecked(&mut self, payload: Vec<u8>, whole: bool) -> Result<Entry, LiveError> {
     let (position, previous) = match self.head {
       Some(head) => (
         head.position.checked_add(1).ok_or(LiveError::Malformed)?,
@@ -1271,8 +1466,11 @@ impl Shipper {
     };
     self.head = Some(entry.head());
     let bytes = entry.wire_bytes();
-    self.unsettled.push_back((position, bytes));
+    self.unsettled.push_back((position, bytes, whole));
     self.unsettled_bytes = self.unsettled_bytes.saturating_add(bytes);
+    if whole {
+      self.unsettled_whole_bytes = self.unsettled_whole_bytes.saturating_add(bytes);
+    }
     self.retained.push_back(entry.clone());
     self.trim();
     self.refresh_durable();
@@ -1285,12 +1483,15 @@ impl Shipper {
     let Some(floor) = self.settled_through() else {
       return;
     };
-    while let Some((position, bytes)) = self.unsettled.front().copied() {
+    while let Some((position, bytes, whole)) = self.unsettled.front().copied() {
       if position > floor {
         break;
       }
       self.unsettled.pop_front();
       self.unsettled_bytes = self.unsettled_bytes.saturating_sub(bytes);
+      if whole {
+        self.unsettled_whole_bytes = self.unsettled_whole_bytes.saturating_sub(bytes);
+      }
     }
   }
 
@@ -1418,6 +1619,13 @@ impl Shipper {
       .iter()
       .find(|entry| entry.position == head.position)
       .is_some_and(|entry| entry.head() == *head)
+  }
+
+  /// Whether the retained tail still holds every entry after `position` (A-428): a holder installed from a whole state at
+  /// `position` then catches up by those entries alone, so [`Shipper::pending`] answers it entries, never a second
+  /// install. The owner owes an install image at its head only for a whole state the tail no longer reaches past.
+  pub fn retains_after(&self, position: u64) -> bool {
+    !matches!(self.entries_after(Some(position)), Next::Install)
   }
 
   /// The retained entries after `position` (all of them from position 0 when `None`), or an install when the tail no

@@ -38,8 +38,9 @@ use std::fmt;
 use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
-  AttachTransport, DatabaseRefusal, HostPathReason, OwnMountUse, Principal, RecoveryCause, Refusal,
-  SnapshotId, TargetRefusal, UnsupportedReason, VolumeId, VolumeRefusal,
+  ArchiveFault, AttachTransport, DatabaseRefusal, HostPathReason, MoveRefusal, OwnMountUse,
+  Principal, RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason, VolumeId,
+  VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -301,6 +302,10 @@ pub enum Busy {
   /// The volume core's holder: `Pinned` (a live clone, or a green's origin, holds the snapshot or the volume: end it
   /// first), `DaxMapped` (a guest maps the file: wait for the map's end) (A-299).
   Volume(VolumeRefusal),
+  /// The volume has an attachment or a lease, which a move of it waits for to end (A-291): detach, then ask again.
+  Attached,
+  /// The volume is already moving to another member (A-291): ask for that move, or wait for it to end.
+  Moving,
 }
 
 /// What has moved on.
@@ -334,8 +339,10 @@ pub enum Stale {
   Grant,
   /// The disk changed under these entries after the plan was made (§4.15 step 4): present again.
   Disk {
-    /// The entries, from the target's root.
+    /// The entries, from the target's root: as many as one reply holds (A-267).
     paths: Vec<String>,
+    /// Entries past what one reply holds (A-267): presenting again lists every one.
+    elided: u32,
   },
   /// A bootstrap naming another daemon start.
   Bootstrap,
@@ -348,6 +355,12 @@ pub enum Stale {
   Policy {
     /// The policy's version now.
     current: u64,
+  },
+  /// A merge's or a rebase's conflict windows were read after the work's verdict was replaced — by a later submit or
+  /// rebase of the work, or the daemon's restart (A-267): merge or rebase again for a new verdict.
+  Verdict {
+    /// The work volume.
+    work: VolumeId,
   },
 }
 
@@ -413,6 +426,9 @@ pub enum RetryCause {
   HandoffLost,
   /// A wait ended at its deadline.
   Deadline,
+  /// A move's records were not placed within the fleet's failover SLO, so it was not reported and the volume thawed
+  /// (A-291): ask for the move again.
+  MoveUnplaced,
 }
 
 /// Why no daemon answers.
@@ -473,7 +489,8 @@ pub enum Invalid {
   /// The green requires evidence on every increment, and the merge carried none.
   EvidenceRequired,
   /// A green's base must be a complete immutable snapshot, and this one still serves entries from a host folder: pin the
-  /// whole base and snapshot again.
+  /// whole base and snapshot again. Or a capture's folder moved under it (`Instance::capture_base`, A-291): capture it
+  /// again once nothing writes it.
   LiveBase,
   /// No clean digest exists for the entry: read and hash its bytes instead (§4.15).
   NoCleanDigest,
@@ -506,6 +523,21 @@ pub enum Invalid {
   /// The entry or the volume is the wrong one for the operation: `NotDirectory`, `IsDirectory`, `NotEmpty`, `Invalid`,
   /// `NoAttribute`, `SpecialFileOperation`, `CrossVolumeMove`, `NotOverlay` (A-299).
   Volume(VolumeRefusal),
+  /// A move's target cannot take the volume (A-291): name another member.
+  MoveTarget(MoveTarget),
+  /// The bytes an archive import read make no volume, by their kind (A-453): another format's file, a newer format, a
+  /// copy cut off or altered, or an archive a faulty writer made. Nothing was made.
+  Archive(ArchiveFault),
+}
+
+/// Why a move's target cannot take the volume ([`Invalid::MoveTarget`], A-291).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTarget {
+  /// It is not another member of the volume's region: `status` names the members.
+  NotMember,
+  /// It is outside the owner's neighbourhood (it holds no key to the volume's sealed content), or its neighbourhood does
+  /// not cover the cohort the volume's records sit in.
+  OutsideNeighbourhood,
 }
 
 /// A volume of the wrong kind for the verb.
@@ -542,6 +574,8 @@ pub enum Unusable {
   /// out of range, a malformed sealing key, a refused encoding. Each is a fault on the daemon's side to report, not a
   /// request to change.
   Database(DatabaseRefusal),
+  /// The volume cannot move to another member in its present form (A-291).
+  Unmovable(Unmovable),
   /// The fleet's configuration cannot hold the write to the operator's declared durability (§4.8 "Placement"); reads
   /// continue.
   DurabilityUnmet {
@@ -552,6 +586,17 @@ pub enum Unusable {
     /// The hosts the policy assumes fail at once.
     coincident_failures: u64,
   },
+}
+
+/// Why a volume cannot move to another member in its present form ([`Unusable::Unmovable`], A-291).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unmovable {
+  /// It is not a plain live volume: an overlay (its base stays on its source host), an image, a green or a work.
+  NotPlain,
+  /// It has clones, or is a green's origin, each depending on it on its owner.
+  Lineage,
+  /// It has snapshots other than its head: a move carries the head, and the others would be lost. Destroy them first.
+  Snapshots,
 }
 
 /// Where to send the call instead.
@@ -716,6 +761,23 @@ impl Error {
     }
   }
 
+  /// A move's refusal (A-291), typed by what a consumer does about it: detach or wait ([`Busy`]), change the volume
+  /// ([`Unusable::Unmovable`]), name another target ([`Invalid::MoveTarget`]), or ask again ([`RetryCause::MoveUnplaced`]).
+  fn of_move_refusal(reason: MoveRefusal, pause_ns: u64) -> Error {
+    match reason {
+      MoveRefusal::Attached => Error::Busy(Busy::Attached),
+      MoveRefusal::Pending => Error::Busy(Busy::Moving),
+      MoveRefusal::NotPlain => Error::Unusable(Unusable::Unmovable(Unmovable::NotPlain)),
+      MoveRefusal::Lineage => Error::Unusable(Unusable::Unmovable(Unmovable::Lineage)),
+      MoveRefusal::Snapshots => Error::Unusable(Unusable::Unmovable(Unmovable::Snapshots)),
+      MoveRefusal::Target => Error::Invalid(Invalid::MoveTarget(MoveTarget::NotMember)),
+      MoveRefusal::Neighbourhood => {
+        Error::Invalid(Invalid::MoveTarget(MoveTarget::OutsideNeighbourhood))
+      }
+      MoveRefusal::Unplaced => retry(RetryCause::MoveUnplaced, pause_ns),
+    }
+  }
+
   /// A daemon refusal of a call that named `subject`, typed: one exhaustive table over §4.4's taxonomy as the wire
   /// carries it, so a refusal added to the wire does not compile until it is given its class here.
   pub(crate) fn of_refusal(refusal: Refusal, subject: Option<Missing>, pause_ns: u64) -> Error {
@@ -732,8 +794,15 @@ impl Error {
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
       Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
+      Refusal::VerdictReplaced { work } => Error::Stale(Stale::Verdict { work }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
-      Refusal::LandingConflict { entries } => Error::Stale(Stale::Disk { paths: entries }),
+      Refusal::LandingConflict {
+        entries,
+        entries_elided,
+      } => Error::Stale(Stale::Disk {
+        paths: entries,
+        elided: entries_elided,
+      }),
       Refusal::ConsensusBootstrapStale => Error::Stale(Stale::Bootstrap),
       Refusal::ConsensusRecoveryStale => Error::Stale(Stale::Recovery),
       Refusal::LeaseHeld { epoch } => Error::Busy(Busy::WriteLease { epoch }),
@@ -764,6 +833,7 @@ impl Error {
         verb: Note::new(verb),
       }),
       Refusal::NotShared { principal, .. } => Error::Denied(Denied::NotShared { principal }),
+      Refusal::MoveRefused { reason } => Error::of_move_refusal(reason, pause_ns),
       Refusal::PolicyForbids { act, by } => {
         Error::Denied(Denied::Policy(PolicyRefusal::forbidden(act, by)))
       }
@@ -826,6 +896,7 @@ impl Error {
       Refusal::DigestNotClean => Error::Invalid(Invalid::NoCleanDigest),
       Refusal::ChosenPathUnavailable { reason } => Error::Invalid(Invalid::ChosenPath(reason)),
       Refusal::ImageRefused { reason } => Error::Invalid(Invalid::Image(Note::new(reason))),
+      Refusal::ArchiveRefused { fault } => Error::Invalid(Invalid::Archive(fault)),
       Refusal::OwnMount { path, used_as } => Error::Invalid(Invalid::OwnMount { path, used_as }),
       Refusal::Destroying => Error::Unusable(Unusable::Destroying),
       Refusal::Archived => Error::Unusable(Unusable::Archived),
@@ -994,6 +1065,16 @@ fn target_words(refusal: TargetRefusal) -> String {
       "the anchor's hold on the drive did not answer within its bound; the mount or its release waits on it".to_owned()
     }
     TargetRefusal::DetachPending => "a detach of this drive already waits for the anchor's release".to_owned(),
+    TargetRefusal::MountManagerNotAllowed => "this machine does not let WinFsp's driver make a Mount Manager drive: an \
+      Administrator allows it once with `reg add HKLM\\SOFTWARE\\WOW6432Node\\WinFsp /v MountUseMountmgrFromFSD /t \
+      REG_DWORD /d 1 /f`"
+      .to_owned(),
+    TargetRefusal::DriveLetterTaken => {
+      "the drive letter names another volume, on this machine or in the daemon's session".to_owned()
+    }
+    TargetRefusal::TooLong { longest } => {
+      format!("the path is longer than the {longest} bytes the daemon takes there")
+    }
   }
 }
 
@@ -1133,24 +1214,113 @@ pub enum MountFault {
     /// Why taking the mount down again failed.
     unmount: Box<MountFault>,
   },
-  /// The OS program that removes a mount (`umount`, `fusermount3 -u`) could not run, or refused: the path is still
-  /// in use, or nothing is mounted there.
+  /// The OS refused the unmount and the mount stays: on macOS and the BSDs `unmount(2)`'s error number (A-507); on
+  /// Linux the exit code of `fusermount3 -u`, or the error number of starting it.
   Unmount {
     /// The mount point.
     path: String,
-    /// The program's exit code, when it ran and exited.
+    /// The helper's exit code, when it ran and exited (Linux).
     status: Option<i32>,
-    /// The OS error number of starting it, when it could not run.
+    /// The OS error number: the unmount call's (macOS and the BSDs), or starting the helper's (Linux).
     errno: Option<i32>,
   },
-  /// No volume that reported its mounts is mounted at the path (Windows, where a drive is the daemon's own and is
-  /// removed by detaching its attachment): the volumes that could not report theirs.
+  /// The mount is busy and stays (A-507): a process holds a reference to a file on it, an open file or a working
+  /// directory there. macOS and the BSDs say so by `unmount(2)`'s `EBUSY`; on Linux `fusermount3` reports no error
+  /// number, so a plain unmount it refused while the kernel's table still lists the mount is this (A-537). End the
+  /// holders, or let go of the mount anyway with [`crate::mount::unmount_busy`].
+  Busy {
+    /// The mount point.
+    path: String,
+    /// The processes the kernel's own tables show holding it, read on this refusal alone (A-537).
+    holders: MountHolders,
+  },
+  /// The unmount answered done, but the kernel's mount table still lists the mount (A-507): an unmount is believed
+  /// only when the table agrees.
+  StillMounted {
+    /// The mount point.
+    path: String,
+  },
+  /// The kernel's mount table could not be read (A-507), so the unmount could not be judged: the mount may remain.
+  MountTable {
+    /// The mount point.
+    path: String,
+    /// The OS error number, when the kernel gave one.
+    errno: Option<i32>,
+  },
+  /// Nothing is mounted at the path: on macOS and Linux the kernel's mount table lists no mount there (A-507); on
+  /// Windows, where a drive is the daemon's own and is removed by detaching its attachment, no volume that reported its
+  /// mounts is mounted there, and the volumes that could not report theirs are named.
   NotMounted {
     /// The path asked.
     path: String,
     /// Each volume whose status was refused, and the refusal.
     unreported: Vec<Unreported>,
   },
+}
+
+/// The processes the kernel's own tables show holding a busy mount ([`MountFault::Busy`], A-537), read on the refusal's
+/// cold path without touching the mount, bounded by what the kernel states it lists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MountHolders {
+  /// The processes holding a file, a working directory or a root on the mount, by process id, ascending, each once.
+  pub pids: Vec<u32>,
+  /// The processes listed whose tables this caller may not read (another user's, on Linux): any may hold it too.
+  pub unreadable: u32,
+  /// Why none were read, when none were.
+  pub unread: Option<HoldersUnread>,
+}
+
+/// Why a busy mount's holders were not read ([`MountHolders::unread`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoldersUnread {
+  /// This platform has no reader that leaves the mount alone. On macOS every libproc answer that reports a file stats
+  /// it (xnu's `fill_vnodeinfo` runs `vn_stat`), and the slates mount is a `hard` NFS mount, on which a stat waits
+  /// without bound once its daemon has gone.
+  NoReader {
+    /// The platform.
+    platform: &'static str,
+  },
+  /// The kernel refused its process tables.
+  Refused {
+    /// The OS error number, when the kernel gave one.
+    errno: Option<i32>,
+  },
+  /// A listing went past the bound the kernel states for it (on Linux `pid_max` processes, `nr_open` descriptors a
+  /// process).
+  PastBound {
+    /// The bound.
+    cap: usize,
+  },
+}
+
+impl fmt::Display for MountHolders {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match (&self.unread, self.pids.as_slice()) {
+      (Some(unread), _) => write!(f, "its holders were not read ({unread})"),
+      (None, []) => write!(f, "no process this caller may read holds a file there"),
+      (None, pids) => write!(f, "held by process(es) {pids:?}"),
+    }?;
+    if self.unreadable > 0 {
+      write!(f, ", and {} process(es) could not be read", self.unreadable)?;
+    }
+    Ok(())
+  }
+}
+
+impl fmt::Display for HoldersUnread {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::NoReader { platform } => {
+        write!(f, "{platform} has no reader that leaves the mount alone")
+      }
+      Self::Refused { errno } => write!(
+        f,
+        "the kernel refused its process tables: {}",
+        errno_text(*errno)
+      ),
+      Self::PastBound { cap } => write!(f, "a listing passed the kernel's bound of {cap}"),
+    }
+  }
 }
 
 /// A volume that could not report its mounts: named in [`MountFault::NotMounted`] when no other volume reported the
@@ -1194,8 +1364,13 @@ pub enum MountMissing {
   SharedMount,
   /// A subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive.
   WindowsSubtreeOrShared,
-  /// A lazy unmount is Linux's (`fusermount3 -u -z`); elsewhere unmount the path once its users have closed it.
-  LazyUnmount,
+  /// The machine does not let WinFsp's driver make a mount's drive (Windows, A-369): an Administrator sets
+  /// `MountUseMountmgrFromFSD` to 1 once, which the driver reads at every mount (A-417).
+  MountManager,
+  /// Someone besides root can capture this host's loopback traffic (macOS and the BSDs, A-535): a `/dev/bpf` device a
+  /// group or another user may read, as Wireshark's ChmodBPF leaves them. A loopback mount's capability crosses loopback
+  /// in the clear, since the kernel's NFS client speaks neither RPC-with-TLS nor RPCSEC_GSS, so it would be theirs.
+  PrivateLoopback,
 }
 
 impl fmt::Display for MountMissing {
@@ -1224,8 +1399,14 @@ impl fmt::Display for MountMissing {
       Self::WindowsSubtreeOrShared => {
         "a subtree or shared mount is the Unix mounts'; a WinFsp mount presents the whole volume at a drive letter"
       }
-      Self::LazyUnmount => {
-        "a lazy unmount is Linux's (`fusermount3 -u -z`); here unmount the path once its users have closed it"
+      Self::MountManager => {
+        "this machine does not let WinFsp's driver make a mount's drive: an Administrator allows it once with \
+         `reg add HKLM\\SOFTWARE\\WOW6432Node\\WinFsp /v MountUseMountmgrFromFSD /t REG_DWORD /d 1 /f`"
+      }
+      Self::PrivateLoopback => {
+        "loopback traffic here can be captured by more than root (a /dev/bpf device a group or another user may read, \
+         as Wireshark's ChmodBPF leaves them), and a mount's capability crosses loopback in the clear: give /dev/bpf* \
+         back to root alone (remove ChmodBPF, or `sudo chmod 600 /dev/bpf*` until the next boot) to mount here"
       }
     })
   }
@@ -1267,12 +1448,22 @@ impl fmt::Display for MountFault {
           f,
           "unmounting {path} failed (exit {status}); is the path still in use?"
         ),
-        (None, errno) => write!(
-          f,
-          "unmounting {path}: the unmount program could not run: {}",
-          errno_text(*errno)
-        ),
+        (None, errno) => write!(f, "unmounting {path} was refused: {}", errno_text(*errno)),
       },
+      Self::Busy { path, holders } => write!(
+        f,
+        "{path} is busy: {holders}; end the holders, or let go of the mount anyway \
+         (`slates_api::mount::unmount_busy`)"
+      ),
+      Self::StillMounted { path } => write!(
+        f,
+        "the unmount of {path} answered done, but the kernel's mount table still lists it"
+      ),
+      Self::MountTable { path, errno } => write!(
+        f,
+        "the kernel's mount table could not be read to judge the unmount of {path}: {}",
+        errno_text(*errno)
+      ),
       Self::NotMounted { path, unreported } if unreported.is_empty() => {
         write!(f, "no slates volume is mounted at {path}")
       }

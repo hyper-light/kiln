@@ -1325,24 +1325,88 @@ impl Kept {
     }
 }
 
-/// Whether agents on `target` (`local`, `agent:<machine>`) can have workspaces of their own: its
-/// kiln asks its machine about folders, and its machine has Slates and can mount a volume.
-pub async fn workspaces_on(hub: &Hub, target: &str) -> Result<(), String> {
+/// Why agents can't have workspaces of their own on a machine: what it lacks, typed, and the machine's own words for it.
+/// A start there is refused for it, whether it asked for a volume or named no workspace (docs/agentic.md W2): every agent
+/// on a machine's host works in a volume of its own, and none runs in its plain folder instead (no second path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoWorkspace {
+    /// What the machine lacks.
+    pub missing: crate::workspace::slates::WorkspaceMissing,
+    /// What it said of it.
+    pub said: String,
+}
+
+impl std::fmt::Display for NoWorkspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.said)
+    }
+}
+
+impl std::error::Error for NoWorkspace {}
+
+/// How a start's workspace of its own is used on its machine, which decides what the machine must have for it
+/// (docs/agentic.md W2, W8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceUse {
+    /// Mounted on the machine's host, where its agent works in the mount (W2, W3): it needs the host mount Slates makes
+    /// there (FUSE on Linux, NFS on loopback on macOS, a WinFsp drive on Windows).
+    Mounted,
+    /// Served to its agent's microVM by Slates itself, over Slates' own virtio-fs device on the stream kiln hands Shards,
+    /// and never mounted on the machine (W8: `crate::workspace::slates::make_unmounted`, `crate::sandbox::served`): it
+    /// needs Slates and kiln's workspaces there, and no host mount, so a Windows host without WinFsp (a WHP host such
+    /// as jupiter) or a Linux host without FUSE (a KVM host) gives an isolated agent one.
+    Served,
+}
+
+impl WorkspaceUse {
+    /// A start's: served where it runs isolated, in a microVM of its own; else mounted.
+    pub fn of(isolated: bool) -> Self {
+        if isolated { Self::Served } else { Self::Mounted }
+    }
+}
+
+/// Whether agents on `target` can have workspaces of their own used as `used` ([`WorkspaceUse`]): refused, typed,
+/// saying what that machine lacks ([`NoWorkspace`]).
+pub async fn workspaces_on(hub: &Hub, target: &str, used: WorkspaceUse) -> Result<(), NoWorkspace> {
+    use crate::workspace::slates::WorkspaceMissing;
     let facts = match target.strip_prefix("agent:") {
         None => crate::workspace::slates::facts().await,
         Some(machine) => {
             let caps = hub.instances.load().newest_with(machine, crate::proto::CAP_WORKSPACE).is_some();
             if !caps {
-                return Err(format!("{}'s kiln is older than workspaces: upgrade it (System → Updates)", hub.shown(machine)));
+                return Err(NoWorkspace { missing: WorkspaceMissing::KilnUpgrade, said: format!("{}'s kiln is older than workspaces: upgrade it (System → Updates)", hub.shown(machine)) });
             }
             let said = hub.agents.load().get(machine).and_then(|a| a.facts.as_ref().and_then(|f| f.workspaces.clone()));
             match said {
                 Some(f) => f,
-                None => return Err(format!("{} hasn't said yet whether it has Slates: try again in a minute", hub.shown(machine))),
+                None => return Err(NoWorkspace { missing: WorkspaceMissing::Facts, said: format!("{} hasn't said yet whether it has Slates: try again in a minute", hub.shown(machine)) }),
             }
         }
     };
-    if facts.available { Ok(()) } else { Err(facts.why_not.unwrap_or_else(|| "Slates isn't installed there".to_owned())) }
+    judged(facts, used)
+}
+
+/// What a machine whose workspace facts are `facts` answers a workspace of its own used as `used`: given where it can
+/// make one, which for a served one is wherever all it lacks is a host mount ([`only_a_host_mount`]); else refused,
+/// typed, in its own words.
+fn judged(facts: crate::workspace::slates::Facts, used: WorkspaceUse) -> Result<(), NoWorkspace> {
+    let missing = facts.missing.unwrap_or(crate::workspace::slates::WorkspaceMissing::Unnamed);
+    if facts.available || (used == WorkspaceUse::Served && only_a_host_mount(missing)) {
+        return Ok(());
+    }
+    Err(NoWorkspace { missing, said: facts.why_not.unwrap_or_else(|| "Slates isn't installed there".to_owned()) })
+}
+
+/// Whether a machine lacking `missing` lacks only a host mount, which a volume served to a microVM never needs
+/// ([`WorkspaceUse::Served`]). Its facts name such a lack only once Slates' library has answered and its kiln keeps
+/// workspaces (`crate::workspace::slates::facts` says first that a kiln keeps none), so the rest a served volume needs is
+/// there. Matched whole: a lack the facts add fails to build here until kiln says whether a served volume needs it.
+fn only_a_host_mount(missing: crate::workspace::slates::WorkspaceMissing) -> bool {
+    use crate::workspace::slates::WorkspaceMissing as Lacks;
+    match missing {
+        Lacks::Fusermount3 | Lacks::FuseDevice | Lacks::WinFsp | Lacks::MountNfs | Lacks::Mount => true,
+        Lacks::Workspaces | Lacks::KilnUpgrade | Lacks::Facts | Lacks::Unnamed => false,
+    }
 }
 
 /// Whether `target` names the machine `info` runs on.
@@ -1832,8 +1896,9 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
             if !isolated && lacks(hub, target, kind).await {
                 return Err(not_installed(hub, target, kind));
             }
+            // An isolated agent's volume is served to its microVM, never mounted on the machine (W8): no host mount needed.
             if volume {
-                workspaces_on(hub, target).await.map_err(|why| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+                workspaces_on(hub, target, WorkspaceUse::of(isolated)).await.map_err(|no| (StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
             }
             // Before anything starts, so its claims are let go: a fallback's pick is checked too.
             if isolated {
@@ -2109,6 +2174,85 @@ mod tests {
                 let why = isolation_on(&hub, target).err().unwrap_or_default();
                 anyhow::ensure!(!why.is_empty(), "{target} refuses an isolated agent, saying why");
             }
+            Ok(())
+        })
+    }
+
+    /// UI goal 88, kiln goal part 01a1f1249c5e75b5bc82c9eb011550f4 (docs/agentic.md W8 on Linux KVM and Windows WHP): an
+    /// isolated agent's volume is served to its microVM by Slates and never mounted on its machine, so a runner that lacks
+    /// only a host mount gives an isolated agent a volume of its own: a Windows WHP host without WinFsp (as jupiter is), a
+    /// Linux KVM host without `fusermount3` or `/dev/fuse`, and each other host mount's lack alike; an agent on that
+    /// runner's host is refused one there, naming what it lacks. Do ask on a scratch hub, of runners lacking each host
+    /// mount, keeping no workspaces, naming no lack, older than workspaces, silent, and lacking nothing, for a workspace
+    /// served to a microVM and one mounted on the host; then decide a start's use as `harness_open` does, by the boundary
+    /// the registry will give it (`Registry::isolation_for`), on a `microvm` runner without WinFsp. Expect a served one
+    /// given wherever all a runner lacks is a host mount, and every other answer as before: a mounted one refused there,
+    /// typed, in the runner's own words; both refused, typed, where a runner keeps no workspaces, names no lack, is older
+    /// than workspaces or hasn't said; both given where it lacks nothing. A start there that names a microVM, or asks
+    /// nothing of its boundary, is served its volume; a conversation taken up there runs on its host, and is refused one
+    /// for want of WinFsp.
+    #[test]
+    fn w8_an_isolated_agents_volume_needs_no_host_mount_so_a_runner_without_winfsp_or_fuse_serves_one() -> anyhow::Result<()> {
+        use crate::workspace::slates::WorkspaceMissing as Lacks;
+        use kiln_ci::facts::{RunnerFacts, Workspaces};
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            // Runner `name` on `os`, as process `peer`: new enough for workspaces where `capable`, its facts `facts`.
+            let join = |peer: crate::instances::PeerId, name: &str, os: &str, capable: bool, facts: Option<RunnerFacts>| {
+                let hello = crate::proto::Hello { protocol: crate::proto::VERSION, name: name.into(), labels: vec![], slots: 1, hostname: name.into(), os: os.into(), arch: "x86_64".into(), version: "test".into(), ephemeral: false, dedicated_job: None, running: vec![], terminal: true };
+                hub.instances.update(|i| {
+                    i.join(peer, name, hello.clone(), 1);
+                    i.set_build(peer, "test".into(), if capable { crate::proto::CAP_WORKSPACE } else { 0 });
+                });
+                hub.put_agent(crate::hub::AgentLive { facts: facts.map(Box::new), ..crate::hub::tests::live_runner(name, os, "x86_64") });
+            };
+            let lacking = |missing: Option<Lacks>, why: &str| RunnerFacts { workspaces: Some(Workspaces { available: false, slates: Some("slates ce9b6905e".into()), why_not: Some(why.into()), missing, ..Workspaces::default() }), ..RunnerFacts::default() };
+            // Each host mount's lack, as kiln types what Slates' library says it lacks (`workspace::slates::missing_of`).
+            let host_mounts = [
+                (1, "whp", "windows", Lacks::WinFsp, "WinFsp isn't installed (winfsp.dev)"),
+                (2, "kvm", "linux", Lacks::Fusermount3, "fusermount3 isn't on the PATH (the OS's fuse3 package ships it)"),
+                (3, "kvm-dev", "linux", Lacks::FuseDevice, "/dev/fuse isn't this user's to read and write"),
+                (4, "bsd", "freebsd", Lacks::MountNfs, "mount_nfs isn't on the PATH"),
+                (5, "drives", "windows", Lacks::Mount, "WinFsp's driver may not make a drive on this machine"),
+            ];
+            for (peer, name, os, lacks, why) in host_mounts {
+                join(peer, name, os, true, Some(lacking(Some(lacks), why)));
+                let target = format!("agent:{name}");
+                assert_eq!(workspaces_on(&hub, &target, WorkspaceUse::Served).await, Ok(()), "{name}: a volume served to a microVM needs no host mount");
+                assert_eq!(workspaces_on(&hub, &target, WorkspaceUse::Mounted).await, Err(NoWorkspace { missing: lacks, said: why.into() }), "{name}: one mounted on its host does");
+            }
+            // What a served volume needs besides is refused as before, both ways.
+            join(10, "keeps-none", "linux", true, Some(lacking(Some(Lacks::Workspaces), "this kiln keeps no workspaces")));
+            join(11, "unnamed", "linux", true, Some(lacking(None, "Slates isn't installed on this machine")));
+            join(12, "older", "windows", false, Some(lacking(Some(Lacks::WinFsp), "WinFsp isn't installed (winfsp.dev)")));
+            join(13, "silent", "linux", true, None);
+            for (name, lacks) in [("keeps-none", Lacks::Workspaces), ("unnamed", Lacks::Unnamed), ("older", Lacks::KilnUpgrade), ("silent", Lacks::Facts)] {
+                for used in [WorkspaceUse::Served, WorkspaceUse::Mounted] {
+                    let refused = workspaces_on(&hub, &format!("agent:{name}"), used).await;
+                    anyhow::ensure!(refused.as_ref().is_err_and(|no| no.missing == lacks), "{name}, {used:?}: {refused:?}");
+                }
+            }
+            let whole = RunnerFacts { workspaces: Some(Workspaces { available: true, slates: Some("slates ce9b6905e".into()), mount: Some("nfs".into()), ..Workspaces::default() }), ..RunnerFacts::default() };
+            join(14, "mac", "macos", true, Some(whole));
+            for used in [WorkspaceUse::Served, WorkspaceUse::Mounted] {
+                assert_eq!(workspaces_on(&hub, "agent:mac", used).await, Ok(()), "{used:?}: a runner lacking nothing gives both");
+            }
+            // A `microvm` runner without WinFsp (a WHP host, as jupiter is): a start's use decided as `harness_open` decides
+            // it, by the boundary the registry will give it.
+            let isolation = kiln_ci::facts::Isolation { available: true, hypervisor: Some("WHP".into()), engine: Some(Engine::Microvm), ..kiln_ci::facts::Isolation::default() };
+            let whp = RunnerFacts { isolation: Some(isolation), virt: kiln_ci::facts::Virt { microvm: true, ..kiln_ci::facts::Virt::default() }, ..lacking(Some(Lacks::WinFsp), "WinFsp isn't installed (winfsp.dev)") };
+            join(20, "jupiter", "windows", true, Some(whp));
+            let used = |spec: &Spec| WorkspaceUse::of(hub.harness.isolation_for(&hub, "agent:jupiter", spec).is_some());
+            let asked_nothing = Spec { kind: "claude".into(), ..Spec::default() };
+            let named = Spec { isolation: Some(Isolation::microvm()), ..asked_nothing.clone() };
+            let taken_up = Spec { resume: Some("0e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b".into()), ..asked_nothing.clone() };
+            for (what, spec) in [("asking nothing of its boundary", &asked_nothing), ("naming a microVM", &named)] {
+                assert_eq!(used(spec), WorkspaceUse::Served, "a start {what} runs in a microVM of its own there");
+                assert_eq!(workspaces_on(&hub, "agent:jupiter", used(spec)).await, Ok(()), "a start {what} is served its volume");
+            }
+            assert_eq!(used(&taken_up), WorkspaceUse::Mounted, "a conversation taken up stays on its host");
+            let refused = workspaces_on(&hub, "agent:jupiter", used(&taken_up)).await;
+            anyhow::ensure!(refused.as_ref().is_err_and(|no| no.missing == Lacks::WinFsp), "a conversation taken up there: {refused:?}");
             Ok(())
         })
     }

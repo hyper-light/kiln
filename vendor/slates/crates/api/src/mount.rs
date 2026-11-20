@@ -3,7 +3,8 @@
 //!
 //! - **macOS**: the loopback NFS bridge, `mount(2)` with the export's root handle fetched over this process's own
 //!   loopback socket, so the mount capability never appears in `ps`, `mount` or `nfsstat -m` (§4.6 A-34). No kernel
-//!   extension, no FUSE library and no Apple entitlement: slates serves its own NFS.
+//!   extension, no FUSE library and no Apple entitlement: slates serves its own NFS. `unmount(2)` removes it, no
+//!   program run (A-507).
 //! - **Linux**: FUSE; the daemon mounts through the OS's `fusermount3` and serves the mount on the volume's owner shard
 //!   (AUD-29-64), and `fusermount3 -u` removes it.
 //! - **Windows**: a WinFsp drive the daemon mounts and serves itself; detaching its attachment removes it.
@@ -18,12 +19,19 @@
 //! detection (`classify`, the other BSDs' and tested on any host with no live mount), a probe that refuses with a message
 //! naming what is missing, and the mount/unmount lifecycle.
 
-#[cfg(not(windows))]
+#[cfg(all(unix, not(target_os = "macos")))]
 use std::process::Command;
+
+#[cfg(not(windows))]
+use slates_bridge_oci::mount_holders::{Holders, HoldersError};
+#[cfg(not(windows))]
+use slates_bridge_oci::mount_table::{MountEntry, MountIdentity, MountTableError};
 
 use slates_ipc::protocol::{Intent, VolumeId};
 
 use crate::error::{Error, Missing, MountFault, MountMissing};
+#[cfg(not(windows))]
+use crate::error::{HoldersUnread, MountHolders};
 use crate::instance::Instance;
 
 /// How a volume is mounted.
@@ -378,15 +386,73 @@ const FUSE_DEVICE: &str = "/dev/fuse";
 /// machine's state — this process's `PATH`, `/dev/fuse`, WinFsp's library — and mounts nothing, so it needs no daemon;
 /// a daemon started from this process finds the same `PATH`. macOS always offers its loopback mount, `mount(2)` being
 /// built in.
+///
+/// On macOS and the BSDs the loopback mount is offered only where no one but root can capture loopback traffic (A-535):
+/// its capability rides every file handle in the clear, since the kernel's NFS client speaks neither RPC-with-TLS nor
+/// RPCSEC_GSS ([`MountMissing::PrivateLoopback`] otherwise).
 #[cfg(target_os = "macos")]
 pub fn available() -> Result<MountKind, MountFault> {
-  Ok(MountKind::NfsLoopback)
+  loopback_available(capture_open(bpf_devices()))
 }
 
-/// See the macOS arm: the other BSDs need `mount_nfs` on the `PATH`.
+/// See the macOS arm: the other BSDs need `mount_nfs` on the `PATH`, and a loopback no one but root can capture.
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 pub fn available() -> Result<MountKind, MountFault> {
-  nfs_available(backend())
+  nfs_available(backend()).and_then(|_| loopback_available(capture_open(bpf_devices())))
+}
+
+/// Format: the BPF capture devices of macOS and the BSDs: `/dev/bpf` (FreeBSD's cloning device) and `/dev/bpf<n>`,
+/// which xnu makes in order from 0 (`bsd/net/bpf.c`).
+#[cfg(all(unix, not(target_os = "linux")))]
+const BPF_DEVICE: &str = "/dev/bpf";
+
+/// Format: the owner-read permission bit (`S_IRUSR`, `<sys/stat.h>`).
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+const READ_BY_OWNER: u32 = 0o400;
+/// Format: the group-read and other-read permission bits (`S_IRGRP | S_IROTH`, `<sys/stat.h>`).
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+const READ_BY_OTHERS: u32 = 0o044;
+/// Format: root's user id.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+const ROOT_UID: u32 = 0;
+
+/// The BPF capture devices this host has, as `(st_mode, st_uid)`: `/dev/bpf` if it exists, then `/dev/bpf0`,
+/// `/dev/bpf1` and on until one is missing or cannot be read, so the count is the system's own (a read of the device
+/// nodes' metadata, never an open).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bpf_devices() -> Vec<(u32, u32)> {
+  let of = |stat: rustix::fs::Stat| (u32::from(stat.st_mode), stat.st_uid);
+  let mut devices: Vec<(u32, u32)> = rustix::fs::stat(BPF_DEVICE).map(of).into_iter().collect();
+  for index in 0u32.. {
+    match rustix::fs::stat(format!("{BPF_DEVICE}{index}")) {
+      Ok(stat) => devices.push(of(stat)),
+      Err(_) => break,
+    }
+  }
+  devices
+}
+
+/// Whether anyone but root can capture this host's loopback traffic (A-535), judged from its BPF devices' modes and
+/// owners (`devices`, as `(st_mode, st_uid)`): one a group or anyone may read, or one owned by a user other than root
+/// who may read it. macOS leaves each `crw-------` root's alone; Wireshark's ChmodBPF gives every one to its
+/// `access_bpf` group to read. Pure, so every case is tested on any host.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+pub(crate) fn capture_open(devices: impl IntoIterator<Item = (u32, u32)>) -> bool {
+  devices
+    .into_iter()
+    .any(|(mode, uid)| mode & READ_BY_OTHERS != 0 || (uid != ROOT_UID && mode & READ_BY_OWNER != 0))
+}
+
+/// Whether the loopback mount may be offered on a host where loopback capture is `open` or not (A-535): refused
+/// [`MountMissing::PrivateLoopback`] where it is open. Pure, so every case is tested on any host.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+pub(crate) fn loopback_available(open: bool) -> Result<MountKind, MountFault> {
+  if open {
+    return Err(MountFault::Unsupported {
+      missing: MountMissing::PrivateLoopback,
+    });
+  }
+  Ok(MountKind::NfsLoopback)
 }
 
 /// See the macOS arm: Linux needs `fusermount3` on the `PATH` and `/dev/fuse` this user may read and write.
@@ -399,15 +465,29 @@ pub fn available() -> Result<MountKind, MountFault> {
   fuse_available(command_on_path("fusermount3"), device.is_ok())
 }
 
-/// See the macOS arm: Windows needs WinFsp's library to load (its own `FspLoad` search).
+/// See the macOS arm: Windows needs WinFsp's library to load (its own `FspLoad` search), and the machine to let WinFsp's
+/// driver make the mount's drive (A-369), which the driver decides at every mount from `MountUseMountmgrFromFSD` (A-417):
+/// without it a host was told it could mount, and each mount was then refused `MountManagerNotAllowed`.
 #[cfg(windows)]
 pub fn available() -> Result<MountKind, MountFault> {
-  if slates_bridge_winfsp::host::installed() {
-    Ok(MountKind::WinFsp)
-  } else {
-    Err(MountFault::Unsupported {
+  winfsp_available(
+    slates_bridge_winfsp::host::installed(),
+    slates_bridge_winfsp::host::mount_manager_allowed(),
+  )
+}
+
+/// WinFsp's availability from the two facts it needs: its library loads, and the machine lets its driver make the
+/// mount's drive. Pure, so every case tests on any host.
+#[cfg(any(windows, test))]
+fn winfsp_available(library_loads: bool, drive_allowed: bool) -> Result<MountKind, MountFault> {
+  match (library_loads, drive_allowed) {
+    (true, true) => Ok(MountKind::WinFsp),
+    (false, _) => Err(MountFault::Unsupported {
       missing: MountMissing::WinFsp,
-    })
+    }),
+    (true, false) => Err(MountFault::Unsupported {
+      missing: MountMissing::MountManager,
+    }),
   }
 }
 
@@ -468,17 +548,12 @@ pub(crate) fn mount_args(
   ]
 }
 
-/// Derived: how long the mount waits for the daemon's MOUNT service on each of connect, send and receive: one liveness
-/// budget (`slates_server::daemon::LIVENESS_BUDGET_NS`). A daemon that cannot answer one loopback call within the
-/// budget the anchor gives it to beat is not serving. macOS only, as the `mount(2)` path that makes the call is.
-#[cfg(target_os = "macos")]
-const MOUNT_CALL_DEADLINE: std::time::Duration =
-  std::time::Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-
 /// Mounts the volume on macOS without the capability leaving this process (§4.6 A-34): the root handle comes from the
 /// daemon's MOUNT service over this process's own loopback socket, and goes to the kernel in `mount(2)`'s XDR
 /// arguments (`NFS_MATTR_FH`), with a source name that holds no secret (`slates:/<name>`). Nothing another user can
-/// read (`ps`, the mount table) carries the token.
+/// read (`ps`, the mount table) carries the token. The MOUNT call waits while its connection lives, as the hard mount
+/// it makes does: a daemon gone ends it at once and a stuck one is ended by its watchdog or its anchor (A-517,
+/// `slates_bridge_nfs::client::exchange`); until A-517 it was bounded by one liveness budget.
 #[cfg(target_os = "macos")]
 fn mount_volume(
   port: u16,
@@ -495,28 +570,23 @@ fn mount_volume(
       .map(|groups| groups.into_iter().map(|gid| gid.as_raw()).collect())
       .unwrap_or_default(),
   };
-  let handle = fetch_root_handle(
-    port,
-    &caller,
-    &export_path(name, capability),
-    MOUNT_CALL_DEADLINE,
-  )
-  .map_err(|error| {
-    Error::Mount(match error {
-      FetchError::Io(io) => MountFault::RootHandle {
-        errno: io.raw_os_error(),
-        status: None,
-      },
-      FetchError::Malformed => MountFault::RootHandle {
-        errno: None,
-        status: None,
-      },
-      FetchError::Refused(status) => MountFault::RootHandle {
-        errno: None,
-        status: Some(status),
-      },
-    })
-  })?;
+  let handle =
+    fetch_root_handle(port, &caller, &export_path(name, capability)).map_err(|error| {
+      Error::Mount(match error {
+        FetchError::Io(io) => MountFault::RootHandle {
+          errno: io.raw_os_error(),
+          status: None,
+        },
+        FetchError::Malformed => MountFault::RootHandle {
+          errno: None,
+          status: None,
+        },
+        FetchError::Refused(status) => MountFault::RootHandle {
+          errno: None,
+          status: Some(status),
+        },
+      })
+    })?;
   // `nosuid` and `nodev` whoever mounts (A-94): a volume is shared, so a setuid binary or a device node one writer
   // plants must not run or open with its privilege for another. xnu adds both for an unprivileged caller only.
   let mut mnt_flags = libc::MNT_NOSUID | libc::MNT_NODEV;
@@ -590,39 +660,307 @@ fn mount_volume(
   Ok(())
 }
 
-/// Unmounts the slates mount at `path` with the OS's own program, the lifecycle counterpart of a mount (sylk's cgofuse
-/// `Close`): `fusermount3 -u` on Linux (the daemon's serve task then sees the kernel's disconnect and ends the
-/// attachment, AUD-29-64), the user's own `umount` elsewhere. No privilege: a user unmounts a mount they made. It needs
-/// no daemon, so a stale mount is removable after its daemon has gone. A WinFsp drive is the daemon's own and is
-/// unmounted by detaching it ([`Instance::unmount`]), so this is the Unix hosts' alone.
+/// Unmounts the slates mount at `path`, the lifecycle counterpart of a mount (sylk's cgofuse `Close`), with no daemon
+/// and no privilege: a user unmounts a mount they made, so a stale mount is removable after its daemon has gone. macOS
+/// and the BSDs call `unmount(2)` itself (A-507: until 2026-11-18 this ran `umount` found on the `PATH`, so a host
+/// whose `PATH` lacked `/sbin` could not unmount at all, g264's kiln runner). Linux runs `fusermount3 -u`, the setuid
+/// helper its FUSE mount was made through, since `umount2(2)` needs `CAP_SYS_ADMIN` (the daemon's serve task then sees
+/// the kernel's disconnect and ends the attachment, AUD-29-64). Either answer is judged by the kernel's mount table:
+/// nothing mounted at `path` is `NotMounted` before any call, and an unmount is done only once the table no longer
+/// lists the mount. A WinFsp drive is the daemon's own and is unmounted by detaching it ([`Instance::unmount`]), so
+/// this is the Unix hosts' alone.
 #[cfg(not(windows))]
 pub fn unmount(path: &str) -> Result<(), MountFault> {
-  run_unmount(UNMOUNT_ARGS, path)
+  unmount_as(path, Unmounting::Plain)
 }
 
-/// Lets go of the mount at `path` even while processes still use it (Linux: `fusermount3 -u -z`): the kernel takes it
-/// out of the namespace now and finishes the unmount once its last user closes — what a host does for an ended agent
-/// whose leftover process still holds a file there, where [`unmount`] is refused busy. Like [`unmount`] it needs no
-/// daemon and no privilege. Elsewhere refused [`MountFault::Unsupported`]: macOS and the BSDs have no lazy unmount.
-#[cfg(target_os = "linux")]
-pub fn unmount_lazy(path: &str) -> Result<(), MountFault> {
-  run_unmount(LAZY_UNMOUNT_ARGS, path)
+/// How [`unmount_busy`] let go of a mount processes still used: the OS's way, by which a host knows what its leftover
+/// processes meet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LetGo {
+  /// Taken out of the namespace now; its users read and write on until they close, and the unmount finishes then
+  /// (Linux: `fusermount3 -u -z`, the kernel's `MNT_DETACH`).
+  Detached,
+  /// Unmounted now; its users' next calls on it fail (macOS and the BSDs: `unmount(2)` with `MNT_FORCE`). The loopback
+  /// NFS mount is `hard`, so this is the only way off it for a holder whose daemon has gone.
+  Forced,
 }
 
-/// See the Linux arm: no lazy unmount here.
-#[cfg(all(unix, not(target_os = "linux")))]
-pub fn unmount_lazy(_path: &str) -> Result<(), MountFault> {
-  Err(MountFault::Unsupported {
-    missing: MountMissing::LazyUnmount,
+/// Lets go of the mount at `path` even while processes still use it: what a host does for an ended agent whose
+/// leftover process still holds a file there, where [`unmount`] is refused `Busy`. Linux detaches it (`fusermount3 -u
+/// -z`); macOS and the BSDs have no detaching unmount and force it (`unmount(2)` with `MNT_FORCE`); the answer says
+/// which ([`LetGo`]). Like [`unmount`] it needs no daemon and no privilege, and is judged by the kernel's mount table.
+/// Until 2026-11-18 this was Linux's `unmount_lazy`, refused `Unsupported` elsewhere, so a macOS host had no library
+/// route off a busy mount (found by g076a, whose conformance harness forces it).
+#[cfg(not(windows))]
+pub fn unmount_busy(path: &str) -> Result<LetGo, MountFault> {
+  unmount_as(path, Unmounting::LetGo).map(|()| BUSY_UNMOUNT)
+}
+
+/// Which unmount is asked.
+#[cfg(not(windows))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unmounting {
+  /// Refused while a process holds a file on the mount.
+  Plain,
+  /// Lets go of the mount even then ([`LetGo`]).
+  LetGo,
+}
+
+/// An unmount as the OS is asked it: the mount point as the call takes it, and whether it lets go of a busy mount.
+#[cfg(not(windows))]
+#[derive(Debug, PartialEq, Eq)]
+struct UnmountRequest {
+  /// The mount point, NUL-terminated.
+  point: std::ffi::CString,
+  /// Whether it lets go of a busy mount: `MNT_FORCE` on macOS and the BSDs; `-z`, the kernel's `MNT_DETACH`, through
+  /// `fusermount3` on Linux.
+  let_go: bool,
+}
+
+/// The request for `path`, or `MountPoint` when no OS call can name it (a path holding a NUL byte).
+#[cfg(not(windows))]
+fn unmount_request(path: &str, unmounting: Unmounting) -> Result<UnmountRequest, MountFault> {
+  let point = std::ffi::CString::new(path).map_err(|_| MountFault::MountPoint {
+    path: path.to_owned(),
+    errno: None,
+  })?;
+  Ok(UnmountRequest {
+    point,
+    let_go: unmounting == Unmounting::LetGo,
   })
 }
 
-/// Runs [`UNMOUNT_PROGRAM`] with `args` on `path`: its exit status, or the error number of starting it, typed.
+/// `unmount(2)`'s flags for a request: `MNT_FORCE` ("forcibly unmounted even if files are still active") to let go of
+/// a busy mount, none otherwise.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn unmount_flags(request: &UnmountRequest) -> libc::c_int {
+  if request.let_go { libc::MNT_FORCE } else { 0 }
+}
+
+/// Unmounts `path` as `unmounting` asks, judged by the kernel's mount table (A-507): the mount the table lists at
+/// `path` before the call must be gone from it after. With nothing mounted there the answer is `NotMounted` and no call
+/// is made; where the platform has no table to ask (the BSDs other than macOS), the call's own answer stands.
 #[cfg(not(windows))]
-fn run_unmount(args: &[&str], path: &str) -> Result<(), MountFault> {
+fn unmount_as(path: &str, unmounting: Unmounting) -> Result<(), MountFault> {
+  let request = unmount_request(path, unmounting)?;
+  let point = recorded_point(path)?;
+  let before = mount_table_for(path)?;
+  let mounted = match &before {
+    Some(table) => match mount_at(table, &point) {
+      Some(entry) => Some(entry.identity),
+      None => {
+        return Err(MountFault::NotMounted {
+          path: path.to_owned(),
+          unreported: Vec::new(),
+        });
+      }
+    },
+    None => None,
+  };
+  let answer = ask_unmount(path, &request);
+  let after = mount_table_for(path)?;
+  judged(path, mounted, after.as_deref(), answer, unmounting).map_err(|fault| named(fault, mounted))
+}
+
+/// The mount point as the kernel's table records it, worked out without touching the mount (a lookup on a `hard` NFS
+/// mount whose daemon has gone waits forever): the real path of its parent directory with its own name, so macOS's
+/// `/var` reads as the table's `/private/var`. `MountPoint` when `path` names no entry or its parent cannot be
+/// resolved.
+#[cfg(not(windows))]
+fn recorded_point(path: &str) -> Result<String, MountFault> {
+  let refused = |errno: Option<i32>| MountFault::MountPoint {
+    path: path.to_owned(),
+    errno,
+  };
+  let given = std::path::Path::new(path);
+  let name = given.file_name().ok_or_else(|| refused(None))?;
+  let parent = given
+    .parent()
+    .filter(|parent| !parent.as_os_str().is_empty())
+    .unwrap_or_else(|| std::path::Path::new("."));
+  let parent = std::fs::canonicalize(parent).map_err(|error| refused(error.raw_os_error()))?;
+  Ok(parent.join(name).to_string_lossy().into_owned())
+}
+
+/// The kernel's mount table (`slates_bridge_oci::mount_table`: `getfsstat(MNT_NOWAIT)` on macOS, `/proc/self/mountinfo`
+/// on Linux, neither touching a mount), `None` where the platform has no query, or `MountTable` when the kernel refused
+/// it.
+#[cfg(not(windows))]
+fn mount_table_for(path: &str) -> Result<Option<Vec<MountEntry>>, MountFault> {
+  match slates_bridge_oci::mount_table::mount_table() {
+    Ok(table) => Ok(Some(table)),
+    Err(MountTableError::Unsupported { .. }) => Ok(None),
+    Err(MountTableError::Query { errno }) => Err(MountFault::MountTable {
+      path: path.to_owned(),
+      errno: Some(errno),
+    }),
+    Err(_) => Err(MountFault::MountTable {
+      path: path.to_owned(),
+      errno: None,
+    }),
+  }
+}
+
+/// The mount the table lists at `point` that an unmount takes: the last listed there, since a later mount at one path
+/// shadows an earlier one.
+#[cfg(not(windows))]
+fn mount_at<'table>(table: &'table [MountEntry], point: &str) -> Option<&'table MountEntry> {
+  table.iter().rev().find(|entry| entry.mount_point == point)
+}
+
+/// An unmount's answer judged by the table read after it (A-507; kiln judges its own so): the mount gone from the
+/// table is done, whatever the call said; still listed, it is the call's refusal ([`still_listed`]), or `StillMounted`
+/// when the call said done. With no table on the platform (`mounted` or `after` is `None`) the call's own answer
+/// stands.
+#[cfg(not(windows))]
+fn judged(
+  path: &str,
+  mounted: Option<MountIdentity>,
+  after: Option<&[MountEntry]>,
+  answer: Result<(), MountFault>,
+  unmounting: Unmounting,
+) -> Result<(), MountFault> {
+  match (mounted, after) {
+    (Some(identity), Some(table)) => {
+      if table.iter().any(|entry| entry.identity == identity) {
+        Err(match answer {
+          Ok(()) => MountFault::StillMounted {
+            path: path.to_owned(),
+          },
+          Err(refusal) => still_listed(path, refusal, unmounting),
+        })
+      } else {
+        Ok(())
+      }
+    }
+    _ => answer,
+  }
+}
+
+/// A refusal of an unmount whose mount the kernel's table still lists, typed by what it says (A-537). Linux's
+/// `fusermount3 -u` reports no error number: a refused `umount2(2)` prints "failed to unmount %s: %s" and the helper
+/// exits 1, as it does for a mount not the caller's (libfuse `util/fusermount.c`: `unmount_fuse_locked`, `may_unmount`,
+/// `err_out`). For the caller's own FUSE mount, still listed after a plain unmount its helper refused, that is a
+/// process holding a reference to a file there (`umount2(2)`'s `EBUSY`), so it is `Busy`, as `EBUSY` is on macOS and
+/// the BSDs. A detaching unmount (`-z`) refused stands as the helper's exit, and so does every refusal that names an
+/// error number.
+#[cfg(not(windows))]
+fn still_listed(path: &str, refusal: MountFault, unmounting: Unmounting) -> MountFault {
+  match refusal {
+    MountFault::Unmount {
+      status: Some(_),
+      errno: None,
+      ..
+    } if unmounting == Unmounting::Plain => MountFault::Busy {
+      path: path.to_owned(),
+      holders: MountHolders::default(),
+    },
+    other => other,
+  }
+}
+
+/// A busy refusal with its holders named (A-537): the processes the kernel's own tables show holding the mount, read
+/// now, on this refusal alone, without touching the mount (`slates_bridge_oci::mount_holders`); every other refusal as
+/// it is.
+#[cfg(not(windows))]
+fn named(fault: MountFault, mounted: Option<MountIdentity>) -> MountFault {
+  match fault {
+    MountFault::Busy { path, .. } => MountFault::Busy {
+      path,
+      holders: match mounted {
+        Some(identity) => holders_from(slates_bridge_oci::mount_holders::holders(identity.device)),
+        None => unread(HoldersUnread::NoReader {
+          platform: std::env::consts::OS,
+        }),
+      },
+    },
+    other => other,
+  }
+}
+
+/// What the kernel's tables showed of a busy mount, in the API's terms ([`MountHolders`]).
+#[cfg(not(windows))]
+fn holders_from(read: Result<Holders, HoldersError>) -> MountHolders {
+  match read {
+    Ok(holders) => MountHolders {
+      pids: holders.pids,
+      unreadable: holders.unreadable,
+      unread: None,
+    },
+    Err(HoldersError::Unsupported { platform, .. }) => unread(HoldersUnread::NoReader { platform }),
+    Err(HoldersError::Query { errno }) => unread(HoldersUnread::Refused { errno: Some(errno) }),
+    Err(HoldersError::Malformed { .. }) => unread(HoldersUnread::Refused { errno: None }),
+    Err(HoldersError::TooLarge { cap }) => unread(HoldersUnread::PastBound { cap }),
+  }
+}
+
+/// No holder read, for `why`.
+#[cfg(not(windows))]
+fn unread(why: HoldersUnread) -> MountHolders {
+  MountHolders {
+    pids: Vec::new(),
+    unreadable: 0,
+    unread: Some(why),
+  }
+}
+
+/// The kernel's refusal of an unmount typed by its error number (`unmount(2)`): `EBUSY` ("a process is holding a
+/// reference to a file located on the filesystem") is `Busy`, `EINVAL` ("the requested directory is not in the mount
+/// table") is `NotMounted`, `ENOENT` and `ENOTDIR` (no such directory) are `MountPoint`, and every other is `Unmount`
+/// with its number.
+#[cfg(all(unix, any(not(target_os = "linux"), test)))]
+fn refusal_of_errno(path: &str, errno: Option<i32>) -> MountFault {
+  let path = path.to_owned();
+  match errno {
+    Some(libc::EBUSY) => MountFault::Busy {
+      path,
+      holders: MountHolders::default(),
+    },
+    Some(libc::EINVAL) => MountFault::NotMounted {
+      path,
+      unreported: Vec::new(),
+    },
+    Some(libc::ENOENT | libc::ENOTDIR) => MountFault::MountPoint { path, errno },
+    errno => MountFault::Unmount {
+      path,
+      status: None,
+      errno,
+    },
+  }
+}
+
+/// Asks the kernel to unmount (macOS and the BSDs, `unmount(2)`): no program and no `PATH` (A-507), and no privilege,
+/// since only "the caller is not the super-user, and the mount() was not done by the user" is refused `EPERM`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ask_unmount(path: &str, request: &UnmountRequest) -> Result<(), MountFault> {
+  // SAFETY: `request.point` is a NUL-terminated string that outlives the call, the only pointer `unmount(2)` reads,
+  // and the flags are `unmount(2)`'s own.
+  let result = unsafe { libc::unmount(request.point.as_ptr(), unmount_flags(request)) };
+  if result == 0 {
+    Ok(())
+  } else {
+    Err(refusal_of_errno(
+      path,
+      std::io::Error::last_os_error().raw_os_error(),
+    ))
+  }
+}
+
+/// Asks `fusermount3 -u` (with `-z`, the kernel's `MNT_DETACH`, to let go of a busy mount), the setuid helper the FUSE
+/// mount was made through: `umount2(2)` "requires appropriate privilege (Linux: the `CAP_SYS_ADMIN` capability)", so an
+/// unprivileged caller's own call is refused `EPERM`. Its answer is its exit, or the error number of starting it.
+#[cfg(target_os = "linux")]
+fn ask_unmount(path: &str, request: &UnmountRequest) -> Result<(), MountFault> {
+  use std::os::unix::ffi::OsStrExt;
+  let args = if request.let_go {
+    BUSY_UNMOUNT_ARGS
+  } else {
+    UNMOUNT_ARGS
+  };
   let status = Command::new(UNMOUNT_PROGRAM)
     .args(args)
-    .arg(path)
+    .arg(std::ffi::OsStr::from_bytes(request.point.as_bytes()))
     .status()
     .map_err(|error| MountFault::Unmount {
       path: path.to_owned(),
@@ -640,29 +978,30 @@ fn run_unmount(args: &[&str], path: &str) -> Result<(), MountFault> {
   }
 }
 
-/// Format: the program that removes a slates mount without a privilege (R10): on Linux every slates mount is FUSE,
-/// removed by the OS's `fusermount3 -u`; elsewhere the user's own `umount` of the loopback NFS mount.
+/// Format: the helper that removes a slates mount on Linux without a privilege (R10): every slates mount there is FUSE,
+/// made and removed by the OS's `fusermount3`.
 #[cfg(target_os = "linux")]
 const UNMOUNT_PROGRAM: &str = "fusermount3";
-/// Format: see [`UNMOUNT_PROGRAM`].
+/// Format: `fusermount3`'s unmount (`-u`).
 #[cfg(target_os = "linux")]
 const UNMOUNT_ARGS: &[&str] = &["-u"];
-/// Format: `fusermount3`'s lazy unmount (`-z`: the kernel's `MNT_DETACH`), for [`unmount_lazy`].
+/// Format: `fusermount3`'s lazy unmount (`-z`: the kernel's `MNT_DETACH`), for [`unmount_busy`].
 #[cfg(target_os = "linux")]
-const LAZY_UNMOUNT_ARGS: &[&str] = &["-u", "-z"];
-/// Format: see the Linux form.
+const BUSY_UNMOUNT_ARGS: &[&str] = &["-u", "-z"];
+/// Format: how [`unmount_busy`] lets go on Linux.
+#[cfg(target_os = "linux")]
+const BUSY_UNMOUNT: LetGo = LetGo::Detached;
+/// Format: how [`unmount_busy`] lets go on macOS and the BSDs (`unmount(2)` with `MNT_FORCE`).
 #[cfg(all(unix, not(target_os = "linux")))]
-const UNMOUNT_PROGRAM: &str = "umount";
-/// Format: see the Linux form.
-#[cfg(all(unix, not(target_os = "linux")))]
-const UNMOUNT_ARGS: &[&str] = &[];
+const BUSY_UNMOUNT: LetGo = LetGo::Forced;
 
 #[cfg(test)]
 mod tests {
   use super::{
-    MountBackend, MountKind, classify, export_path, fuse_available, mount_args, nfs_available,
+    MountBackend, MountKind, ROOT_UID, capture_open, classify, export_path, fuse_available,
+    loopback_available, mount_args, nfs_available, winfsp_available,
   };
-  use crate::error::{MountFault, MountMissing};
+  use crate::error::{HoldersUnread, MountFault, MountHolders, MountMissing};
 
   /// §4.6 A-34 — a read-only mount asks the kernel for `rdonly` (with the daemon refusing writes under the read-only
   /// capability too); a writable mount does not.
@@ -799,38 +1138,367 @@ mod tests {
     );
   }
 
-  /// §4.6 A-34, A-278 — on macOS the loopback mount is always available: `mount(2)` is built in, so a host's fact is
-  /// `NfsLoopback` with nothing to install.
+  /// §4.6, A-369, A-417 — a Windows host is told it can mount only when the mount would be made: WinFsp's library loads
+  /// and the machine lets WinFsp's driver make the drive (`MountUseMountmgrFromFSD`). Do: each pair of the two facts.
+  /// Expect `WinFsp` with both, the library named first without it (no drive is asked for then), and the Mount Manager
+  /// setting named when only it is missing. Before A-417 the second fact was not asked, so a machine without the
+  /// setting was told it could mount and each mount was refused `MountManagerNotAllowed` after its volume was made.
+  /// Pure, so every case runs on any host.
+  #[test]
+  fn a_windows_mount_is_available_only_where_winfsps_driver_may_make_its_drive() {
+    assert_eq!(winfsp_available(true, true), Ok(MountKind::WinFsp));
+    assert_eq!(
+      winfsp_available(true, false),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::MountManager
+      })
+    );
+    assert_eq!(
+      winfsp_available(false, true),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::WinFsp
+      })
+    );
+    assert_eq!(
+      winfsp_available(false, false),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::WinFsp
+      }),
+      "the library is named first: without it no drive is ever asked for"
+    );
+    let words = MountMissing::MountManager.to_string();
+    assert!(
+      words.contains("MountUseMountmgrFromFSD") && words.contains("REG_DWORD /d 1"),
+      "the refusal names the one command that allows it: {words}"
+    );
+  }
+
+  /// §4.13, A-535 — a macOS or BSD host is told it can mount only where no one but root can capture its loopback: a
+  /// mount's capability rides every file handle in the clear, which the kernel's NFS client cannot encrypt. Do: judge BPF
+  /// devices as macOS leaves them (root's, read by root alone), as Wireshark's ChmodBPF leaves one (read by its group),
+  /// read by anyone, owned and read by a user, and none at all; then ask the loopback's availability under each answer.
+  /// Expect capture open exactly where a group, anyone or a user other than root may read a device; the mount offered
+  /// where capture is closed and refused `PrivateLoopback` where it is open, its words naming the devices and the fix.
+  /// Before A-535 every macOS host was told it could mount, and a group granted capture read each mount's capability
+  /// off loopback. Pure, so every case runs on any host.
+  #[test]
+  fn a_loopback_mount_is_offered_only_where_no_one_but_root_can_capture_loopback() {
+    /// Format: a character device's file-type bits (`S_IFCHR`, `<sys/stat.h>`).
+    const CHAR_DEVICE: u32 = 0o020_000;
+    /// Shape: a user other than root (macOS's first account's id).
+    const USER: u32 = 501;
+    let root_only = (CHAR_DEVICE | 0o600, ROOT_UID);
+    assert!(
+      !capture_open([root_only, root_only]),
+      "macOS's default: each device root's alone"
+    );
+    assert!(
+      capture_open([root_only, (CHAR_DEVICE | 0o660, ROOT_UID)]),
+      "one device its group may read, as ChmodBPF leaves them"
+    );
+    assert!(
+      capture_open([(CHAR_DEVICE | 0o604, ROOT_UID)]),
+      "a device anyone may read"
+    );
+    assert!(
+      capture_open([(CHAR_DEVICE | 0o600, USER)]),
+      "a device a user owns and may read"
+    );
+    assert!(!capture_open([]), "no device: nothing captures");
+    assert_eq!(loopback_available(false), Ok(MountKind::NfsLoopback));
+    assert_eq!(
+      loopback_available(true),
+      Err(MountFault::Unsupported {
+        missing: MountMissing::PrivateLoopback
+      })
+    );
+    let words = MountMissing::PrivateLoopback.to_string();
+    assert!(
+      words.contains("/dev/bpf") && words.contains("chmod 600"),
+      "the refusal names the devices and the fix: {words}"
+    );
+  }
+
+  /// §4.6 A-34, A-278, A-535 — on a Mac whose loopback no one but root can capture (macOS's default) the loopback mount
+  /// is available: `mount(2)` is built in, so a host's fact is `NfsLoopback` with nothing to install.
   #[cfg(target_os = "macos")]
   #[test]
   fn macos_always_offers_its_loopback_mount() {
     assert_eq!(super::available(), Ok(MountKind::NfsLoopback));
   }
 
-  /// A-278 — a lazy unmount is Linux's: elsewhere it is refused `Unsupported` before any program runs.
-  #[cfg(all(unix, not(target_os = "linux")))]
+  /// A-507 (g264's kiln runner, whose `PATH` lacked `/sbin`): an unmount is judged by the kernel's mount table, and a
+  /// path the table lists no mount at is refused before any call, on every Unix host, with no program run and no `PATH`
+  /// read. Do: unmount, and let go of, this crate's own directory, never a mount. Expect both refused `NotMounted`
+  /// naming the path. Until A-507 macOS ran `umount` found on the `PATH` and answered its exit status, or the error of
+  /// starting it where the `PATH` lacked `/sbin`.
+  #[cfg(unix)]
   #[test]
-  fn a_lazy_unmount_is_refused_where_the_os_has_none() {
-    assert!(matches!(
-      super::unmount_lazy(env!("CARGO_MANIFEST_DIR")),
-      Err(MountFault::Unsupported { .. })
-    ));
+  fn an_unmount_of_a_path_where_nothing_is_mounted_is_refused_not_mounted() {
+    let path = env!("CARGO_MANIFEST_DIR");
+    let not_mounted = MountFault::NotMounted {
+      path: path.to_owned(),
+      unreported: Vec::new(),
+    };
+    assert_eq!(super::unmount(path), Err(not_mounted.clone()));
+    assert_eq!(super::unmount_busy(path), Err(not_mounted));
   }
 
-  /// A-278 — a lazy unmount runs `fusermount3 -u -z`, which refuses a path where nothing is mounted: the refusal comes
-  /// back typed with the program's exit status, and nothing changes (this crate's own directory is never a mount).
-  /// Skips loudly where `fusermount3` is not installed.
-  #[cfg(target_os = "linux")]
+  /// A-507: do build the request a plain unmount and a busy one make; expect the mount point passed whole as the call
+  /// takes it, the plain unmount asking no force and the busy one `unmount(2)`'s `MNT_FORCE` (`-z` through
+  /// `fusermount3` on Linux), and a path no call can name (a NUL byte in it) refused `MountPoint`, never a panic.
+  #[cfg(unix)]
   #[test]
-  fn a_lazy_unmount_of_a_path_where_nothing_is_mounted_is_refused_with_the_programs_status() {
-    if !super::command_on_path("fusermount3") {
-      eprintln!("SKIP: fusermount3 is not on the PATH");
-      return;
+  fn an_unmount_is_asked_as_the_os_takes_it() {
+    let plain = super::unmount_request("/Volumes/work", super::Unmounting::Plain).unwrap();
+    assert_eq!(plain.point.as_bytes(), b"/Volumes/work");
+    assert!(!plain.let_go);
+    assert_eq!(super::unmount_flags(&plain) & libc::MNT_FORCE, 0);
+    let busy = super::unmount_request("/Volumes/work", super::Unmounting::LetGo).unwrap();
+    assert!(busy.let_go);
+    assert_eq!(super::unmount_flags(&busy), libc::MNT_FORCE);
+    assert_eq!(
+      super::unmount_request("/Volumes/a\0b", super::Unmounting::Plain),
+      Err(MountFault::MountPoint {
+        path: "/Volumes/a\0b".to_owned(),
+        errno: None
+      })
+    );
+  }
+
+  /// A-507: do map each error number `unmount(2)` documents; expect `EBUSY` refused `Busy` (a process holds a file on
+  /// the mount, `unmount_busy` lets go anyway), `EINVAL` `NotMounted` (not in the mount table), `ENOENT` and `ENOTDIR`
+  /// `MountPoint` with the number, and every other number, or none, `Unmount` with it.
+  #[cfg(unix)]
+  #[test]
+  fn the_kernels_unmount_refusals_are_typed() {
+    let path = "/Volumes/work";
+    assert_eq!(
+      super::refusal_of_errno(path, Some(libc::EBUSY)),
+      MountFault::Busy {
+        path: path.to_owned(),
+        holders: MountHolders::default()
+      }
+    );
+    assert!(
+      super::refusal_of_errno(path, Some(libc::EBUSY))
+        .to_string()
+        .contains("unmount_busy"),
+      "a busy refusal names the way to let go"
+    );
+    assert_eq!(
+      super::refusal_of_errno(path, Some(libc::EINVAL)),
+      MountFault::NotMounted {
+        path: path.to_owned(),
+        unreported: Vec::new()
+      }
+    );
+    for errno in [libc::ENOENT, libc::ENOTDIR] {
+      assert_eq!(
+        super::refusal_of_errno(path, Some(errno)),
+        MountFault::MountPoint {
+          path: path.to_owned(),
+          errno: Some(errno)
+        }
+      );
     }
-    let path = env!("CARGO_MANIFEST_DIR");
-    assert!(matches!(
-      super::unmount_lazy(path),
-      Err(MountFault::Unmount { path: refused, status: Some(_), errno: None }) if refused == path
-    ));
+    for errno in [Some(libc::EPERM), Some(libc::EIO), None] {
+      assert_eq!(
+        super::refusal_of_errno(path, errno),
+        MountFault::Unmount {
+          path: path.to_owned(),
+          status: None,
+          errno
+        }
+      );
+    }
+  }
+
+  /// A-507 (kiln's own rule since g264's 68eda5b14): do judge unmount answers against the table read after them;
+  /// expect the mount gone from the table done whatever the call said, the mount still listed the call's refusal or
+  /// `StillMounted` when the call said done, and with no table on the platform the call's own answer. The mount an
+  /// unmount takes is the last the table lists at its point, a later mount shadowing an earlier one.
+  #[cfg(unix)]
+  #[test]
+  fn an_unmount_is_believed_only_when_the_table_agrees() {
+    use slates_bridge_oci::mount_table::{MountEntry, MountIdentity};
+    let entry = |mount: u64, point: &str| MountEntry {
+      identity: MountIdentity { mount, device: 7 },
+      mount_point: point.to_owned(),
+      fstype: "nfs".to_owned(),
+      source: "slates:/work".to_owned(),
+    };
+    let path = "/Volumes/work";
+    let before = [entry(1, "/"), entry(2, path), entry(3, path)];
+    let taken = super::mount_at(&before, path).map(|mounted| mounted.identity);
+    assert_eq!(
+      taken,
+      Some(MountIdentity {
+        mount: 3,
+        device: 7
+      }),
+      "the shadowing mount is taken"
+    );
+    assert_eq!(super::mount_at(&before, "/Volumes/other"), None);
+    let busy = || {
+      Err(MountFault::Busy {
+        path: path.to_owned(),
+        holders: MountHolders::default(),
+      })
+    };
+    let plain = super::Unmounting::Plain;
+    let gone = [entry(1, "/"), entry(2, path)];
+    assert_eq!(
+      super::judged(path, taken, Some(&gone), Ok(()), plain),
+      Ok(())
+    );
+    assert_eq!(
+      super::judged(path, taken, Some(&gone), busy(), plain),
+      Ok(()),
+      "the table, not the call"
+    );
+    assert_eq!(
+      super::judged(path, taken, Some(&before), Ok(()), plain),
+      Err(MountFault::StillMounted {
+        path: path.to_owned()
+      })
+    );
+    assert_eq!(
+      super::judged(path, taken, Some(&before), busy(), plain),
+      busy()
+    );
+    assert_eq!(
+      super::judged(path, None, None, busy(), plain),
+      busy(),
+      "no table: the call's answer"
+    );
+    assert_eq!(super::judged(path, None, None, Ok(()), plain), Ok(()));
+  }
+
+  /// A-537, Linux's busy unmount typed by the table (pure, every host): `fusermount3` reports no error number, so a plain
+  /// unmount its helper refused (an exit and no number) while the kernel's table still lists the mount is `Busy`, as
+  /// `EBUSY` is on macOS. Do: judge, against a table still listing the mount, the helper's refusal of a plain unmount,
+  /// of a detaching one, and a refusal that names an error number; then the plain refusal against a table that no longer
+  /// lists the mount. Expect `Busy` for the first alone, the other two standing, and done once the table drops it.
+  #[cfg(unix)]
+  #[test]
+  fn a_plain_unmount_its_helper_refused_while_the_table_lists_the_mount_is_busy() {
+    use slates_bridge_oci::mount_table::{MountEntry, MountIdentity};
+    let identity = MountIdentity {
+      mount: 3,
+      device: 7,
+    };
+    let path = "/home/me/work";
+    let listed = [MountEntry {
+      identity,
+      mount_point: path.to_owned(),
+      fstype: "fuse.slates".to_owned(),
+      source: "slates".to_owned(),
+    }];
+    let gone: [MountEntry; 0] = [];
+    let helper = || {
+      Err(MountFault::Unmount {
+        path: path.to_owned(),
+        status: Some(1),
+        errno: None,
+      })
+    };
+    let numbered = || {
+      Err(MountFault::Unmount {
+        path: path.to_owned(),
+        status: None,
+        errno: Some(libc::EPERM),
+      })
+    };
+    let (plain, let_go) = (super::Unmounting::Plain, super::Unmounting::LetGo);
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&listed), helper(), plain),
+      Err(MountFault::Busy {
+        path: path.to_owned(),
+        holders: MountHolders::default()
+      }),
+      "a plain unmount the helper refused, the mount still listed, is busy"
+    );
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&listed), helper(), let_go),
+      helper(),
+      "a detach refused stands as the helper's exit"
+    );
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&listed), numbered(), plain),
+      numbered(),
+      "a refusal that names its error number stands"
+    );
+    assert_eq!(
+      super::judged(path, Some(identity), Some(&gone), helper(), plain),
+      Ok(()),
+      "gone from the table: done"
+    );
+  }
+
+  /// A-537: what the holder read answered, in the API's terms, and the busy refusal's words (pure, every host). Do: map a
+  /// read naming two holders and one unreadable process, then each refusal the reader gives: no reader (macOS), the
+  /// kernel's refusal, a bound's malformed sysctl, a listing past its bound; and print a busy refusal with one holder
+  /// and two unreadable. Expect the holders as read, each refusal as its `HoldersUnread`, and the words naming the
+  /// holder, the unreadable count and the way to let go.
+  #[cfg(unix)]
+  #[test]
+  fn a_busy_mounts_holders_are_named_as_the_kernel_listed_them() {
+    use slates_bridge_oci::mount_holders::{Holders, HoldersError};
+    assert_eq!(
+      super::holders_from(Ok(Holders {
+        pids: vec![41, 97],
+        unreadable: 1,
+      })),
+      MountHolders {
+        pids: vec![41, 97],
+        unreadable: 1,
+        unread: None,
+      }
+    );
+    for (read, unread) in [
+      (
+        HoldersError::Unsupported {
+          platform: "macos",
+          reason: "libproc stats every file",
+        },
+        HoldersUnread::NoReader { platform: "macos" },
+      ),
+      (
+        HoldersError::Query {
+          errno: libc::EACCES,
+        },
+        HoldersUnread::Refused {
+          errno: Some(libc::EACCES),
+        },
+      ),
+      (
+        HoldersError::Malformed {
+          path: "/proc/sys/kernel/pid_max",
+        },
+        HoldersUnread::Refused { errno: None },
+      ),
+      (
+        HoldersError::TooLarge { cap: 5 },
+        HoldersUnread::PastBound { cap: 5 },
+      ),
+    ] {
+      assert_eq!(super::holders_from(Err(read)).unread, Some(unread));
+    }
+    let words = MountFault::Busy {
+      path: "/home/me/work".to_owned(),
+      holders: MountHolders {
+        pids: vec![41],
+        unreadable: 2,
+        unread: None,
+      },
+    }
+    .to_string();
+    assert!(
+      words.contains("[41]")
+        && words.contains("2 process(es) could not be read")
+        && words.contains("unmount_busy"),
+      "{words}"
+    );
   }
 }

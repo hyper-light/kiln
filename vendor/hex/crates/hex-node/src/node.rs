@@ -2374,6 +2374,67 @@ impl Runtime for Node {
         })
     }
 
+    /// Kiln plan P5.5b: a VM box's backend pauses it, an image VM's its class's; any other box of the node pauses none,
+    /// refused naming its class as inspect says it, as the trait refuses it.
+    fn pause(&self, id: &BoxId) -> Result<(), Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.pause(id);
+        }
+        Err(Refusal::Pause {
+            cause: hex_api::PauseCause::Class(self.inspect(id)?.class),
+            id: id.clone(),
+            op: "pause",
+        })
+    }
+
+    /// Kiln plan P5.5b: a VM box's backend resumes it, as its pause is.
+    fn resume(&self, id: &BoxId) -> Result<(), Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.resume(id);
+        }
+        Err(Refusal::Pause {
+            cause: hex_api::PauseCause::Class(self.inspect(id)?.class),
+            id: id.clone(),
+            op: "resume",
+        })
+    }
+
+    /// Shards' D270 slice 4: a VM box's backend swaps its member's component, an image VM's its class's; any other box of
+    /// the node has none, refused naming its class as inspect says it, as the trait refuses it.
+    fn swap(
+        &self,
+        id: &BoxId,
+        at: &str,
+        digest: &str,
+        when: hex_api::SwapWhen,
+    ) -> Result<hex_api::Swapped, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.swap(id, at, digest, when);
+        }
+        Err(self.no_components(id, "swap")?)
+    }
+
+    /// Shards' D270 slice 4: a VM box's backend restores its member's component, as its swap is routed.
+    fn restore(
+        &self,
+        id: &BoxId,
+        at: &str,
+        when: hex_api::SwapWhen,
+    ) -> Result<hex_api::Swapped, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.restore(id, at, when);
+        }
+        Err(self.no_components(id, "restore")?)
+    }
+
+    /// Shards' D270 slice 4: a VM box's backend tells its components, as its swap is routed.
+    fn components(&self, id: &BoxId) -> Result<Vec<hex_api::ComponentAt>, Refusal> {
+        if let Some(backend) = self.backend_record(id)? {
+            return backend.components(id);
+        }
+        Err(self.no_components(id, "components")?)
+    }
+
     fn usage(&self, id: &BoxId) -> Result<Usage, Refusal> {
         if let Some(backend) = self.backend_record(id)? {
             return backend.usage(id);
@@ -2509,6 +2570,17 @@ impl Runtime for Node {
 }
 
 impl Node {
+    /// Box `id`'s `op` refused for its components (Shards' D270 slice 4), a box of the node's own classes having none:
+    /// its class as inspect says it, as the trait refuses it.
+    fn no_components(&self, id: &BoxId, op: &'static str) -> Result<Refusal, Refusal> {
+        Ok(Refusal::Swap {
+            cause: hex_api::SwapCause::Class(self.inspect(id)?.class),
+            id: id.clone(),
+            op,
+            why: None,
+        })
+    }
+
     /// Ends what runs in box `id` and removes it: [`Runtime::delete`] once its turn is held and any run of the box
     /// is taken.
     fn delete_box(&self, id: &BoxId) -> Result<(), Refusal> {

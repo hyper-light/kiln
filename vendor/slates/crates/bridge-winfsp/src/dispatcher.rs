@@ -203,10 +203,13 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+  /// Starts the receive thread. `bound` is the open bound, and `spin_ceiling` the most the thread may spin for a reply
+  /// (the step quantum of the shard that started the mount, A-560): the thread learns its window from its own wakes
+  /// under it ([`crate::reply::start`]).
   pub(crate) fn start(
     file_system: usize,
     section: OwnedHandle,
-    bound: usize,
+    (bound, spin_ceiling): (usize, std::time::Duration),
     outcomes: std::sync::mpsc::SyncSender<crate::host::Outcome>,
     wake: std::task::Waker,
     confirmations: SyncSender<crate::host::Request>,
@@ -216,20 +219,19 @@ impl Worker {
     let thread = std::thread::Builder::new()
       .name("slates-winfsp-receive".to_owned())
       .spawn(move || {
-        if let Err(error) = crate::reply::measure().and_then(|()| {
-          receive_loop(
-            file_system,
-            section,
-            bound,
-            Receive {
-              stopped,
-              confirmations: &confirmations,
-              wake: &wake,
-              outcomes: &outcomes,
-              private,
-            },
-          )
-        }) {
+        crate::reply::start(spin_ceiling);
+        if let Err(error) = receive_loop(
+          file_system,
+          section,
+          bound,
+          Receive {
+            stopped,
+            confirmations: &confirmations,
+            wake: &wake,
+            outcomes: &outcomes,
+            private,
+          },
+        ) {
           slates_machine::log_line!("slates-winfsp: receive worker ended: {error}");
           if outcomes.send(crate::host::Outcome::Failed(error)).is_err() {
             slates_machine::log_line!(
@@ -520,15 +522,20 @@ fn operation(
   PRIVATE_PURGE.set(purge);
   CURRENT_HINT.set(request.hint());
   CREATOR_MAY_LINK.set(creator_may_link(request)?);
-  // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
-  // eight-byte alignment (checked above for the response) and protocol maximum capacity, and file_system stays live
-  // throughout the synchronous call.
-  let callback_status = unsafe {
-    callback(
-      file_system,
-      working.0.as_mut_ptr().cast(),
-      response.as_mut_ptr().cast(),
-    )
+  let callback_status = match request.link().map_err(WinFspError::Capture)? {
+    // A hard link a patched driver forwards (A-360): the DLL has no case for it, so the worker serves it itself.
+    // SAFETY: file_system is the live file system the owner keeps until this worker joins.
+    Some(link) => unsafe { crate::host::link(file_system, &link) },
+    // SAFETY: callback is the DLL's initialized operation for this checked kind; both packet addresses have native
+    // eight-byte alignment (checked above for the response) and protocol maximum capacity, and file_system stays live
+    // throughout the synchronous call.
+    None => unsafe {
+      callback(
+        file_system,
+        working.0.as_mut_ptr().cast(),
+        response.as_mut_ptr().cast(),
+      )
+    },
   };
   let terminal_status = TERMINAL_REFUSAL.replace(0);
   let status = if callback_status == 0 {

@@ -208,7 +208,7 @@ fn on_the_wire(adapted: &Refusal) -> Refusal {
 #[test]
 fn b15_each_of_shards_guest_failures_is_its_own_typed_refusal() {
     let judge = shards_api::Record::new();
-    judge.teach(Duration::from_nanos(1), Duration::ZERO);
+    judge.teach(Duration::from_nanos(1), shards_api::Work::ZERO);
     let since = Instant::now();
     let stall = judge
         .stalled(since, since.checked_add(Duration::from_millis(1)).unwrap())

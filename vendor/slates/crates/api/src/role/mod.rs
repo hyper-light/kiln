@@ -12,6 +12,9 @@
 //!   the published profile, derives its configuration and serves; it leaves when its anchor does.
 //! - **The WinFsp purge client** (Windows) is a child the daemon starts from the same executable and prefix, since no
 //!   daemon thread opens a volume it serves (§4.6).
+//! - **The chosen-path launcher** (`exec`, §4.6 "The launcher", A-370) runs one command with a volume at a path it
+//!   names, in a namespace of its own; it is served here so slates' AppArmor profile can attach to the host's own
+//!   executable ([`crate::exec`]).
 //!
 //! A host serves the roles from its `main`: when its arguments begin with the prefix it chose, it hands the rest to
 //! [`main`], which never returns to the host's own code paths. [`crate::StartSpec`] builds the anchor's command with the
@@ -29,14 +32,18 @@ pub(crate) mod anchor;
 pub(crate) mod daemon;
 mod dumps;
 pub(crate) mod fleet;
+pub use fleet::{FleetCheck, check_fleet};
 // A-232 step 5: the liveness bound against this crate's own anchor (the test binary re-invoked as the anchor and
 // daemon). Unix only: the Windows anchor hands its daemon an explicit handle list, so the roles' shared standard input
 // is owed there.
 #[cfg(test)]
 mod liveness_tests;
+// A-510: a stop asked by a sender that then exits completes within its bound (the liveness tests' roles, re-invoked).
 mod parent;
 pub(crate) mod recovery_key;
 mod signal;
+#[cfg(test)]
+mod stop_tests;
 
 /// Format: the exit code of a role that failed (a refused or failed start, a daemon its own watchdog ended, A-232):
 /// the server's one constant, as the `slates` command's.
@@ -337,9 +344,10 @@ pub fn serve(prefix: &[String], role: &Role) -> Result<(), Failure> {
 }
 
 /// The role entry of a host's own executable: `args` are what followed the host's `prefix` in its arguments (the
-/// WinFsp purge client's word, on Windows, or a role [`Role::parse`] reads); the role runs, and its exit code comes
-/// back for the host's `main` to return. A usage error prints [`ROLE_USAGE`]; a failure prints one line naming the
-/// role.
+/// WinFsp purge client's word, on Windows; the chosen-path launcher's, beginning `exec`, which
+/// [`crate::exec::command`] builds; or a role [`Role::parse`] reads); the role runs, and its exit code comes back for
+/// the host's `main` to return. The launcher never returns on success: it becomes its command. A usage error prints
+/// [`ROLE_USAGE`]; a failure prints one line naming the role.
 ///
 /// ```no_run
 /// fn main() -> std::process::ExitCode {
@@ -356,6 +364,10 @@ pub fn main(prefix: &[String], args: &[String]) -> ExitCode {
   if args.first().map(String::as_str) == Some(slates_bridge_winfsp::purge_client::ROLE_ARG) {
     let code = slates_bridge_winfsp::purge_client::serve_from_env();
     return ExitCode::from(u8::try_from(code).unwrap_or(u8::MAX));
+  }
+  // The chosen-path launcher (A-370), served by the host's own executable so slates' AppArmor profile can attach to it.
+  if args.first().map(String::as_str) == Some(slates_client::exec::EXEC_WORD) {
+    return crate::exec::serve(args);
   }
   let role = match Role::parse(args) {
     Ok(role) => role,

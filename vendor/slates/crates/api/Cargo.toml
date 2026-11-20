@@ -40,6 +40,9 @@ slates-rt = { workspace = true }
 slates-vfs = { workspace = true }
 # The fleet manifest the roles read (`role::fleet`).
 serde_json = { workspace = true }
+# An S3 base as the library names it (A-524): the naming, its addressing and its credential's type. The server links it
+# already.
+slates-base = { workspace = true }
 # The merge engine's conflict classes, which a merge window names by discriminant on the wire (§4.16, D-27): the
 # contract reads them against the engine's own enum (A-299). The server links it already.
 slates-merge = { workspace = true }
@@ -47,6 +50,11 @@ slates-merge = { workspace = true }
 # random (`slates-transport`, A-66), as the daemon mints its own. The server links both already.
 slates-wire = { workspace = true }
 slates-transport = { workspace = true }
+# The kernel's mount table an unmount is judged by (A-507): `getfsstat(MNT_NOWAIT)` on macOS, `/proc/self/mountinfo` on
+# Linux, neither touching a mount; and the container handoff's judge and check (A-520: `container`, `container_engine`),
+# whose verdicts and refusals are the contract's types on every platform. Every platform links it: where it builds no
+# table query (Windows) its table, identity and watch answer `Unsupported`, which the contract carries.
+slates-bridge-oci = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -55,8 +63,10 @@ rustix = { workspace = true }
 slates-bridge-nfs = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# The roles' stop flag: the console control handler (`role::signal`).
-windows-sys = { workspace = true }
+# The roles' stop flag: the console control handler (`role::signal`). And a fleet node's nameservers, the DNS servers
+# its network adapters list (`role::fleet::windows_dns`, A-490): IP Helper's `GetAdaptersAddresses`, whose adapter
+# entry needs NDIS's interface types.
+windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
 # The WinFsp mounts' purge client, a role of the executable the daemon runs from (§4.6: no daemon thread opens a volume
 # it serves).
 slates-bridge-winfsp = { workspace = true }
@@ -69,9 +79,19 @@ slates-db = { workspace = true }
 slates-bridge-fuse = { workspace = true }
 # The landing test checks each listed file's bytes against the BLAKE3 its plan's entry names (A-287).
 blake3 = { workspace = true }
+# The archive export test decodes and restores the archive it reads back, as a consumer that keeps it would (A-441).
+slates-archive = { workspace = true }
 # The signed-merge test signs with a software Ed25519 key as `ssh-keygen -Y sign` signs (A-321), through the one
 # cryptographic library slates builds on (A-66), which the server links already.
 aws-lc-rs = { workspace = true }
+# The fleet manifest's planning test mints its nodes' certificates as the server's deployment tests do (contract 39).
+rcgen = { workspace = true }
+
+# The vhost-user test plays the VMM over the device's end the library hands (§4.6, G-vhost): the daemon's own test
+# front end and guest driver (`crates/server/tests/common/`), which speak through the device's protocol types. Linux
+# alone serves the form; the server links the crate already.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+slates-bridge-virtiofs = { workspace = true }
 
 # Instance start by use: the test binary is an embedding host whose own `main` serves the roles when its arguments
 # begin with its prefix, as kiln's does, so it runs without libtest's harness (A-278).

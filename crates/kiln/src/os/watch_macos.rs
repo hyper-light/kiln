@@ -181,36 +181,47 @@ pub(super) fn forget(id: u64) {
 
 /// Until one of `pids` exits (goal 9): a kqueue of their `EVFILT_PROC`/`NOTE_EXIT`, readable once
 /// one has, as hyper-rt's readiness says; one already gone at once; with none to watch, never.
-pub(super) async fn exited(pids: &[u32]) {
+/// Refused, each with the OS's error number, where it can watch none: no kqueue, or every
+/// registration refused other than for a process gone.
+pub(super) async fn exited(pids: &[u32]) -> Result<(), Vec<super::Unwatched>> {
     use nix::libc;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    let refused = |pid: u32, errno: Option<i32>| super::Unwatched { pid, why: super::Unwatchable::Refused(errno.unwrap_or(0)) };
     // SAFETY: kqueue() takes nothing and returns a descriptor or -1, owned from here.
     let raw = unsafe { libc::kqueue() };
     if raw < 0 {
-        return std::future::pending().await;
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        return if pids.is_empty() { std::future::pending().await } else { Err(pids.iter().map(|pid| refused(*pid, errno)).collect()) };
     }
     // SAFETY: a descriptor kqueue() just returned, owned by nothing else.
     let kq = unsafe { OwnedFd::from_raw_fd(raw) };
     let mut watched = 0usize;
+    let mut unwatched = Vec::new();
     for pid in pids {
+        let Ok(ident) = usize::try_from(*pid) else {
+            unwatched.push(super::Unwatched { pid: *pid, why: super::Unwatchable::NotAPid });
+            continue;
+        };
         // SAFETY: an all-zero kevent is a valid value of the C struct.
         let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
-        ev.ident = usize::try_from(*pid).unwrap_or(0);
+        ev.ident = ident;
         ev.filter = libc::EVFILT_PROC;
         ev.flags = libc::EV_ADD | libc::EV_ONESHOT;
         ev.fflags = libc::NOTE_EXIT;
         // SAFETY: one change, no events asked back, no timeout.
         let r = unsafe { libc::kevent(kq.as_raw_fd(), &raw const ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         if r < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                return;
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            if errno == Some(libc::ESRCH) {
+                return Ok(());
             }
+            unwatched.push(refused(*pid, errno));
             continue;
         }
         watched += 1;
     }
     if watched == 0 {
-        return std::future::pending().await;
+        return if unwatched.is_empty() { std::future::pending().await } else { Err(unwatched) };
     }
     loop {
         crate::os::proc::wait_readable(&kq).await;
@@ -220,7 +231,7 @@ pub(super) async fn exited(pids: &[u32]) {
         let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         // SAFETY: no changes; room for one event; no wait.
         if unsafe { libc::kevent(kq.as_raw_fd(), std::ptr::null(), 0, &raw mut out, 1, &raw const zero) } > 0 {
-            return;
+            return Ok(());
         }
     }
 }

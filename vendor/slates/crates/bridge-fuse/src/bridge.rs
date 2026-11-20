@@ -243,10 +243,12 @@ pub fn success_reply_bytes(opcode: Opcode) -> Option<usize> {
 /// daemon restart once the reply arrives (§4.8 barrier, D-18): a namespace or attribute change, an extended
 /// attribute set or removed (as NFSv4.2's `SETXATTR` and `REMOVEXATTR` are; until 2026-11-18 these two were missing,
 /// so an acknowledged `setcap` died with its daemon), an allocation (A-108), and the commit points of data — `fsync`
-/// and the `flush` every close sends — succeeded. A plain `write` is not one: like an NFS `UNSTABLE` write, its bytes
-/// are in the daemon when it returns and are made stable by the `flush` or `fsync` that follows. Every transport that
-/// serves this dispatch (the kernel's `/dev/fuse`, a virtio-fs guest, a Shards stream) holds such a reply until its
-/// owner's barrier has captured the volume (AUD-29-82).
+/// and the `flush` every close sends — succeeded. A plain `write` is not one: every transport that serves this dispatch
+/// keeps it in the shard's write log before its reply, for a successor to replay (a mount A-63, a Shards stream A-316,
+/// a virtio-fs guest A-410), and one the log has no room for is published before its reply instead (a virtio-fs
+/// guest's through [`Bridge::awaits_publication`]). Every transport that serves this dispatch (the kernel's
+/// `/dev/fuse`, a virtio-fs guest, a Shards stream) holds such a reply until its owner's barrier has captured the
+/// volume (AUD-29-82).
 pub fn needs_barrier(opcode: Option<Opcode>, error: i32) -> bool {
   error == 0
     && matches!(
@@ -801,9 +803,12 @@ fn permission_bits(mode: u32) -> u32 {
 }
 
 /// Format: the set-user-id, set-group-id and group-execute mode bits (`<sys/stat.h>` `S_ISUID`,
-/// `S_ISGID`, `S_IXGRP`), for `FATTR_KILL_SUIDGID`.
+/// `S_ISGID`, `S_IXGRP`), for `FATTR_KILL_SUIDGID` (and the set-group-id bit for
+/// `FUSE_SETXATTR_ACL_KILL_SGID`, [`kill_sgid`]).
 const S_ISUID: u32 = 0o4000;
+/// Format: `<sys/stat.h>`'s set-group-id bit.
 const S_ISGID: u32 = 0o2000;
+/// Format: `<sys/stat.h>`'s group-execute bit.
 const S_IXGRP: u32 = 0o010;
 
 /// The mode `FATTR_KILL_SUIDGID` asks for: the set-user-id bit cleared, and the set-group-id bit
@@ -1873,25 +1878,33 @@ fn serve_getxattr(
   write_or_drop(ReplyHeader::write_ok(unique, &value, out), out)
 }
 
-/// `SETXATTR`: `fuse_setxattr_in` is the value's size and the `setxattr(2)` flags (slates does not negotiate
-/// `FUSE_SETXATTR_EXT`, so the short form), then the name, then the value. Only a name in a namespace the transport
-/// reaches is stored; any other is `EOPNOTSUPP`, what a filesystem without that namespace answers. A POSIX ACL is
-/// checked as Linux checks one and kept with its named owners turned through the bridge's view (A-302), and the seam
-/// keeps the file's mode with an access ACL (A-314).
+/// `SETXATTR`: `fuse_setxattr_in` is the value's size and the `setxattr(2)` flags, and on a connection whose kernel
+/// sends the extended form (`FUSE_SETXATTR_EXT`, a guest's route, A-378) the setter's flags and a pad; then the name,
+/// then the value. Only a name in a namespace the transport reaches is stored; any other is `EOPNOTSUPP`, what a
+/// filesystem without that namespace answers. A POSIX ACL is checked as Linux checks one and kept with its named owners
+/// turned through the bridge's view (A-302), and the seam keeps the file's mode with an access ACL (A-314); an access
+/// ACL whose setter the kernel says is outside the file's group (`FUSE_SETXATTR_ACL_KILL_SGID`) clears the file's
+/// set-group-ID bit as it is set ([`kill_sgid`]).
 fn serve_setxattr(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
   cx: &OpContext,
   out: &mut [u8],
 ) -> usize {
-  /// Format: `fuse_setxattr_in` — size, flags — before the name.
-  const HEAD: usize = 2 * size_of::<u32>();
   let unique = req.header.unique;
   let (Some(size), Some(flags)) = (body_u32(req.body, 0), body_u32(req.body, size_of::<u32>()))
   else {
     return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
   };
-  let rest = req.body.get(HEAD..).unwrap_or_default();
+  let (head, setter_flags) = if bridge.setxattr_ext() {
+    match body_u32(req.body, crate::abi::COMPAT_SETXATTR_IN_BYTES) {
+      Some(setter_flags) => (crate::abi::SETXATTR_IN_BYTES, setter_flags),
+      None => return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
+    }
+  } else {
+    (crate::abi::COMPAT_SETXATTR_IN_BYTES, 0)
+  };
+  let rest = req.body.get(head..).unwrap_or_default();
   let Some(name) = reached_attribute(rest, bridge.attribute_namespaces()) else {
     return write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out);
   };
@@ -1923,12 +1936,40 @@ fn serve_setxattr(
       );
     }
   };
-  reply(
-    unique,
-    bridge.xattr_set(object, cx, name, &value, how),
-    |()| Vec::new(),
-    out,
-  )
+  let set = bridge
+    .xattr_set(object, cx, name, &value, how)
+    .and_then(|()| {
+      if setter_flags & crate::abi::SETXATTR_ACL_KILL_SGID != 0
+        && name == slates_bridge_core::POSIX_ACL_ACCESS
+      {
+        kill_sgid(bridge, cx, object)
+      } else {
+        Ok(())
+      }
+    });
+  reply(unique, set, |()| Vec::new(), out)
+}
+
+/// Clears `object`'s set-group-ID bit, if it has one, as Linux's own filesystems do when a setter outside the file's
+/// group without `CAP_FSETID` sets its access ACL (`posix_acl_update_mode`); a FUSE kernel says so by
+/// `FUSE_SETXATTR_ACL_KILL_SGID` and leaves the clearing to its server (A-378). The permission bits stay as the ACL's set
+/// just left them. It follows a set that succeeded, so a refused set changes nothing, as Linux keeps neither the mode it
+/// computed nor the ACL on a refusal; and that set made the inode current, so this chmod needs no room.
+fn kill_sgid(bridge: &mut dyn Bridge, cx: &OpContext, object: ObjectId) -> Result<(), VfsError> {
+  let mode = bridge.getattr(object, cx)?.mode;
+  if mode & S_ISGID == 0 {
+    return Ok(());
+  }
+  bridge
+    .setattr(
+      object,
+      cx,
+      slates_bridge_core::SetAttr {
+        mode: Some(mode & !S_ISGID),
+        ..slates_bridge_core::SetAttr::default()
+      },
+    )
+    .map(drop)
 }
 
 /// The errno a default ACL set on anything but a directory is refused with (A-302): `EACCES`, as Linux's

@@ -192,11 +192,11 @@ async fn routed(hub: &Arc<Hub>, r: &Record, v: &Value, by: &str, fixes: u32, tex
             let thread = s(v, "thread").map(|t| format!(" in thread {t}")).unwrap_or_default();
             let count = format!("Agents have started {fixes} of {} fixes{thread} since a person last spoke there; at {} it waits for a person.", decide::FIXES_PER_THREAD, decide::FIXES_PER_THREAD);
             if tell(hub, r, format!("{text}\n\nWhy kiln sent you this: {why}. {count}")).await {
-                keep(hub, r, "threads", &name, &why).await;
+                kept(hub, r, "threads", &name, &why).await;
             }
         }
         Route::Hold(Why::Ended) if speaker != Speaker::Person => {
-            keep(hub, r, crate::ship::HELD, &name, &format!("The fix waits for a person to start or resume {name}")).await;
+            kept(hub, r, crate::ship::HELD, &name, &format!("The fix waits for a person to start or resume {name}")).await;
         }
         Route::Hold(_) => {}
     }
@@ -283,13 +283,53 @@ async fn reviewed(hub: &Arc<Hub>, agent: &str, first: &str, v: &Value, by: &str,
 }
 
 /// Keeps what kiln did with agents' feedback on agent `r`'s change at its newest version (`what`:
-/// `threads` handed to it, or held), as Ship reads it (`crate::ship::kiln_kept`).
-async fn keep(hub: &Hub, r: &Record, what: &str, name: &str, why: &str) {
-    let Some(diff) = r.change.as_deref() else { return };
-    let Ok(Some(d)) = crate::ci::diffs::find(hub, diff).await else { return };
-    let Some(v) = crate::ci::diffs::versions(hub, &d).await.ok().and_then(|vs| vs.last().cloned()) else { return };
-    if let Err(e) = crate::ship::kiln_kept(hub, &d.repo, &v.commit, v.n, what, name, &r.agent, why).await {
-        tracing::warn!(agent = %r.agent, diff, error = %format!("{e:#}"), "what kiln did with agents' feedback wasn't kept");
+/// `threads` handed to it, or held), as Ship reads it (`crate::ship::kiln_kept`); which step refused, where one did.
+async fn keep(hub: &Hub, r: &Record, what: &str, name: &str, why: &str) -> Result<(), NotKept> {
+    let diff = r.change.as_deref().ok_or(NotKept::NoChange)?;
+    let d = crate::ci::diffs::find(hub, diff).await.map_err(|e| NotKept::DiffUnread(diff.to_owned(), format!("{e:#}")))?.ok_or_else(|| NotKept::NoDiff(diff.to_owned()))?;
+    let versions = crate::ci::diffs::versions(hub, &d).await.map_err(|e| NotKept::VersionsUnread(diff.to_owned(), format!("{e:#}")))?;
+    let v = versions.last().ok_or_else(|| NotKept::NoVersion(diff.to_owned()))?;
+    crate::ship::kiln_kept(hub, &d.repo, &v.commit, v.n, what, name, &r.agent, why).await.map_err(|e| NotKept::NotWritten(diff.to_owned(), format!("{e:#}")))
+}
+
+/// Why kiln kept no hand-off of what it did with agents' feedback ([`keep`]; W26-R18): the step that refused, with what
+/// it said.
+#[derive(Debug, PartialEq, Eq)]
+enum NotKept {
+    /// The agent's record names no change of its.
+    NoChange,
+    /// Its change, by that name, is no change kiln holds.
+    NoDiff(String),
+    /// Its change couldn't be read.
+    DiffUnread(String, String),
+    /// Its change's versions couldn't be read.
+    VersionsUnread(String, String),
+    /// Its change has no version to hand off at.
+    NoVersion(String),
+    /// The hand-off couldn't be written.
+    NotWritten(String, String),
+}
+
+impl std::fmt::Display for NotKept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoChange => write!(f, "its agent's record names no change"),
+            Self::NoDiff(diff) => write!(f, "{diff} is no change kiln holds"),
+            Self::DiffUnread(diff, said) => write!(f, "{diff} couldn't be read: {said}"),
+            Self::VersionsUnread(diff, said) => write!(f, "{diff}'s versions couldn't be read: {said}"),
+            Self::NoVersion(diff) => write!(f, "{diff} has no version"),
+            Self::NotWritten(diff, said) => write!(f, "{diff}'s hand-off couldn't be written: {said}"),
+        }
+    }
+}
+
+/// [`keep`], its refusal never dropped: recorded in the audit trail where a person reads what kiln did (`ship.hand_off`,
+/// refused, saying which step refused), and logged.
+async fn kept(hub: &Hub, r: &Record, what: &str, name: &str, why: &str) {
+    if let Err(not) = keep(hub, r, what, name, why).await {
+        tracing::warn!(agent = %r.agent, %not, "what kiln did with agents' feedback wasn't kept");
+        let detail = format!("{what} to {name}: {not}");
+        crate::audit::write(&hub.store, crate::audit::Entry { principal: "kiln".into(), action: "ship.hand_off".into(), target: r.change.clone(), result: "refused".into(), detail, ..Default::default() }).await;
     }
 }
 
@@ -337,7 +377,7 @@ async fn tell(hub: &Arc<Hub>, r: &Record, text: String) -> bool {
     deliver(hub, &r.agent, text).await
 }
 
-/// Sends agent `agent` `text`, queued after its turn, when it still runs; whether it went.
+/// Sends agent `agent` `text`, queued after its turn, when it still runs; whether kiln took it for the agent.
 pub async fn deliver(hub: &Hub, agent: &str, text: String) -> bool {
     let Some(info) = hub.harness.info(agent) else { return false };
     if info.status == Status::Exited {
@@ -346,10 +386,16 @@ pub async fn deliver(hub: &Hub, agent: &str, text: String) -> bool {
     let message = crate::util::new_id();
     crate::harness::wait::sent(&info.id, info.last_turn.as_ref().map(|t| t.at));
     let sent = hub.harness.command(hub, &info.id, Command::Send { id: message, text, mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None }).await;
-    if !sent.went() {
+    // Taken: it went, or kiln took it into its custody as mail, which hands it to the agent in turn (W20: published,
+    // waiting for the agent's admission), unless that was cancelled or superseded -- as a person's message is judged
+    // (`Sent::kept_for_person`). Since W20 nearly every message is published first, so judged by `went` alone every
+    // one read as lost: no hand-off was kept for what reached the agent, and the conflict ladder said it couldn't
+    // reach an agent it had.
+    let taken = sent.kept_for_person();
+    if !taken {
         tracing::info!(agent = %info.id, "a change request's news didn't reach its agent");
     }
-    sent.went()
+    taken
 }
 
 /// Where a comment is, as its thread has it (W26-R18): the thread, the file and lines it's on, the
@@ -509,6 +555,23 @@ mod tests {
         Ok(())
     }
 
+    /// W26-R18: a hand-off kiln can't keep says which step refused, in the audit trail where a person reads what kiln
+    /// did, never dropped: a record that names no change, and a change kiln doesn't hold.
+    #[test]
+    fn w26_r18_a_hand_off_kiln_cant_keep_says_which_step_refused() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+            let none = Record { change: None, ..record() };
+            assert_eq!(keep(&hub, &none, "threads", "it", "why").await, Err(NotKept::NoChange));
+            let gone = Record { change: Some("CR404".into()), ..record() };
+            assert_eq!(keep(&hub, &gone, "threads", "it", "why").await, Err(NotKept::NoDiff("CR404".into())));
+            kept(&hub, &gone, "threads", "it", "why").await;
+            let said = hub.store.call(|c| Ok(c.query_row("SELECT detail FROM audit2 WHERE action = 'ship.hand_off' AND result = 'refused'", [], |r| r.get::<_, String>(0))?)).await?;
+            anyhow::ensure!(said == "threads to it: CR404 is no change kiln holds", "{said}");
+            Ok(())
+        })
+    }
+
     fn record() -> Record {
         Record { agent: "0192abcd00000000000000000000beef".into(), change: Some("CR12".into()), url: "https://k/diffs/CR12".into(), version: 3, fix_checks: true, ..Record::default() }
     }
@@ -603,6 +666,26 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(120)).unwrap_or_else(|_| Err(anyhow::anyhow!("not done within two minutes")))
     }
 
+    /// What a server runs for a comment to reach its agent, as `server::run` starts them: its own machine's sessions,
+    /// the agents' mail pump, and the follower. The pump is the one a test forgets: since W20 a message to an agent is
+    /// published to the mail ledger and waits there (`Disposition::Waiting`) until the pump hands it over, so without
+    /// it the follower's `deliver` says the message went and its agent, idle with nothing queued, never hears it.
+    #[cfg(unix)]
+    fn serve(hub: &Arc<Hub>) {
+        let h = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            let _ = crate::harness::registry::Registry::run_local(h).await;
+        });
+        let h = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            let _ = crate::harness::mail_delivery::run(h).await;
+        });
+        let h = Arc::clone(hub);
+        crate::rt::spawn(async move {
+            let _ = follow_loop(h).await;
+        });
+    }
+
     /// What kiln's fake harness in `dir` was sent, each message's text.
     #[cfg(unix)]
     fn heard(dir: &std::path::Path) -> Vec<String> {
@@ -630,14 +713,7 @@ mod tests {
     fn w26_r18_a_persons_reply_reaches_the_agent_with_its_place() -> anyhow::Result<()> {
         within(async {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
-            let h = Arc::clone(&hub);
-            crate::rt::spawn(async move {
-                let _ = crate::harness::registry::Registry::run_local(h).await;
-            });
-            let h = Arc::clone(&hub);
-            crate::rt::spawn(async move {
-                let _ = follow_loop(h).await;
-            });
+            serve(&hub);
             let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-claude/claude");
             hub.store.call(|c| Ok(c.execute_batch("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('acme', 'acme/app', 'https://example.invalid/app.git', 1);")?)).await?;
             let mut agents = Vec::new();
@@ -718,14 +794,7 @@ mod tests {
     fn w26_ac10_agents_feedback_starts_a_fix_only_where_the_switch_is_on() -> anyhow::Result<()> {
         within(async {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
-            let h = Arc::clone(&hub);
-            crate::rt::spawn(async move {
-                let _ = crate::harness::registry::Registry::run_local(h).await;
-            });
-            let h = Arc::clone(&hub);
-            crate::rt::spawn(async move {
-                let _ = follow_loop(h).await;
-            });
+            serve(&hub);
             let fake = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-claude/claude");
             hub.store.call(|c| Ok(c.execute_batch("INSERT INTO repos (id, name, clone_url, created_at) VALUES ('acme', 'acme/app', 'https://example.invalid/app.git', 1);")?)).await?;
             let mut agents = Vec::new();
@@ -820,7 +889,22 @@ mod tests {
                 }
                 crate::rt::sleep(std::time::Duration::from_millis(20)).await;
             }
-            let hand: (String, String, u32, String) = hub.store.call(|c| Ok(c.query_row("SELECT to_name, sha, version, why FROM ship_handoffs WHERE what = 'threads' AND by = 'kiln'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?)).await?;
+            let hand: Option<(String, String, u32, String)> = hub
+                .store
+                .call(|c| {
+                    use rusqlite::OptionalExtension as _;
+                    Ok(c.query_row("SELECT to_name, sha, version, why FROM ship_handoffs WHERE what = 'threads' AND by = 'kiln'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).optional()?)
+                })
+                .await?;
+            let refused = hub
+                .store
+                .call(|c| {
+                    let mut said = c.prepare("SELECT detail FROM audit2 WHERE action = 'ship.hand_off' AND result = 'refused'")?;
+                    let refusals = said.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                    Ok(refusals)
+                })
+                .await?;
+            let hand = hand.ok_or_else(|| anyhow::anyhow!("kiln kept no hand-off for what reached the agent; it recorded these refusals: {refused:?}"))?;
             anyhow::ensure!(hand.1 == "1".repeat(40) && hand.2 == 1 && hand.3.starts_with("acme/app lets agents fix code from agents' feedback"), "kiln's hand-off at CR1's newest version: {hand:?}");
 
             // Three agents' fixes answering th1 since kim spoke: the next agent's words go nowhere.

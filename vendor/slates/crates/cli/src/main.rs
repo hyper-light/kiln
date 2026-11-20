@@ -28,12 +28,11 @@
 
 use std::process::ExitCode;
 
+mod apparmor;
 mod args;
-#[cfg(target_os = "linux")]
-mod exec;
 mod format;
-// The handshake asks a container engine's CLI over a poll loop (`rustix`) and judges the answer with
-// `slates-bridge-oci`; both are `cfg(unix)` dependencies, so the module is too.
+// The handshake is the library's (`slates_api::container_engine`, A-520), which asks an engine only on Unix, where
+// its poll loop runs; this module prints its answer there, and Windows keeps its refusal (`run_oci_runtime`).
 #[cfg(unix)]
 mod oci_runtime;
 // The self-pipe `slates pmem` reads its signals from, Linux's alone.
@@ -80,6 +79,7 @@ fn main() -> ExitCode {
     Command::Shards(request) => request.json,
     Command::VhostUser(request) => request.json,
     Command::Pmem(request) => request.json,
+    Command::AppArmor(args::AppArmorRequest::Check { json }) => *json,
     _ => false,
   };
   let outcome = match command {
@@ -96,7 +96,11 @@ fn main() -> ExitCode {
     }
     Command::Mcp(options) => verbs::mcp(&options),
     Command::Client(request) => verbs::run(&request),
-    Command::Exec(request) => run_exec(&request),
+    Command::Exec(spec) => run_exec(&spec),
+    Command::AppArmor(args::AppArmorRequest::Profile { executable }) => {
+      apparmor::profile(executable.as_deref())
+    }
+    Command::AppArmor(args::AppArmorRequest::Check { json }) => apparmor::check(json),
     Command::Run(request) => verbs::run_consumer(&request),
     Command::Shards(request) => verbs::run_shards(&request),
     Command::VhostUser(request) => verbs::run_vhost_user(&request),
@@ -178,19 +182,14 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
   ExitCode::from(code)
 }
 
-/// Runs the launcher on Linux; elsewhere the namespaces it needs do not exist.
-#[cfg(target_os = "linux")]
-fn run_exec(request: &args::ExecRequest) -> Result<(), Failure> {
-  exec::run(request)
-}
-
-/// The launcher is Linux-only (user and mount namespaces); other platforms refuse it.
-#[cfg(not(target_os = "linux"))]
-fn run_exec(_request: &args::ExecRequest) -> Result<(), Failure> {
-  Err(Failure::Failed(
-    "slates exec needs Linux user and mount namespaces; it is not available on this platform"
-      .to_owned(),
-  ))
+/// Runs the launcher, the library's (`slates_api::exec`, A-370), which an embedding host's executable serves too. On
+/// Linux it never returns on success: it becomes the command. Every refusal is a failure (exit 4) printing its sentence;
+/// off Linux it is refused there, since the namespaces it needs do not exist.
+fn run_exec(spec: &slates_client::exec::ExecSpec) -> Result<(), Failure> {
+  match slates_api::exec::run(spec) {
+    Ok(never) => match never {},
+    Err(fault) => Err(Failure::Failed(fault.to_string())),
+  }
 }
 
 /// Runs the consuming runtime's handshake on Unix, where the engine's CLI can be polled and judged.
@@ -199,9 +198,9 @@ fn run_oci_runtime(runtime: &str) -> Result<(), Failure> {
   oci_runtime::oci_runtime(runtime)
 }
 
-/// The handshake is Unix-only: it polls the engine's CLI through `rustix` and judges the answer with
-/// `slates-bridge-oci`, both `cfg(unix)` dependencies. Windows refuses it rather than pretending to check,
-/// because a bind source this verb has not judged is exactly what it exists to catch.
+/// The handshake is Unix-only: the library polls the engine's CLI there alone (`slates_api::container_engine`, A-520,
+/// which answers `EngineFault::Unsupported` elsewhere). Windows refuses it rather than pretending to check, because a
+/// bind source this verb has not judged is exactly what it exists to catch.
 #[cfg(not(unix))]
 fn run_oci_runtime(_runtime: &str) -> Result<(), Failure> {
   Err(Failure::Failed(

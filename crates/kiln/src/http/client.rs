@@ -44,7 +44,9 @@ pub enum Roots {
     WebPki,
     /// A PEM bundle (e.g. a Kubernetes cluster CA or kiln's own CA).
     Pem(Vec<u8>),
-    /// The public roots plus one extra CA certificate in DER (agents: kiln's CA).
+    /// A kiln server's: the public roots plus its CA's certificate in DER (agents: kiln's CA; a peer: its own), under
+    /// which a certificate answers only in the server's role, the server's own or a front door's, never a capacity
+    /// holder's or a Slates fleet node's for the same name (`crate::pki::answers_as_server`, docs/agentic.md W10).
     WebPkiPlusDer(Vec<u8>),
 }
 

@@ -707,6 +707,30 @@ fn kind(r: &Refusal) -> &'static str {
         Refusal::Unconfigured { .. } => "Unconfigured",
         Refusal::Guest { .. } => "Guest",
         Refusal::Volume { .. } => "Volume",
+        // Where a box's pause stands is the contract's, as what a refusal awaits is (kiln plan P5.5b).
+        Refusal::Pause { cause, .. } => match cause {
+            crate::PauseCause::Paused => "Pause(Paused)",
+            crate::PauseCause::Running => "Pause(Running)",
+            crate::PauseCause::NotRunning => "Pause(NotRunning)",
+            crate::PauseCause::Ended => "Pause(Ended)",
+            crate::PauseCause::Class(_) => "Pause(Class)",
+        },
+        // Why a component's swap was refused is the contract's too (Shards' D270 slice 4), Shards' words beside it not.
+        Refusal::Swap { cause, .. } => match cause {
+            crate::SwapCause::Unknown => "Swap(Unknown)",
+            crate::SwapCause::Artifact => "Swap(Artifact)",
+            crate::SwapCause::Kind => "Swap(Kind)",
+            crate::SwapCause::Platform => "Swap(Platform)",
+            crate::SwapCause::Asks => "Swap(Asks)",
+            crate::SwapCause::Device => "Swap(Device)",
+            crate::SwapCause::Running => "Swap(Running)",
+            crate::SwapCause::Failed => "Swap(Failed)",
+            crate::SwapCause::NotRunning => "Swap(NotRunning)",
+            crate::SwapCause::Ended => "Swap(Ended)",
+            crate::SwapCause::Class(_) => "Swap(Class)",
+            crate::SwapCause::Workdir => "Swap(Workdir)",
+            crate::SwapCause::Capacity => "Swap(Capacity)",
+        },
     }
 }
 

@@ -335,7 +335,7 @@ fn publish(dir: &Path, name: &str, bytes: &[u8]) -> Result<PathBuf, String> {
     pause_gpu(GpuStage::Created);
     let written = file
         .write_all(bytes)
-        .and_then(|()| file.sync_all())
+        .and_then(|()| shards_durable::all(&file))
         .map_err(|e| at(&temp, e));
     // A published executable has no writable handle left (exec can otherwise fail
     // ETXTBSY). Another caller may start it as soon as rename makes it visible.
@@ -562,7 +562,7 @@ fn place(root: &Path, id: &str) -> Result<bool, String> {
         let path = temp.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         let mut file = executable(&path).map_err(|e| at(&path, e))?;
         file.write_all(bytes).map_err(|e| at(&path, e))?;
-        file.sync_all().map_err(|e| at(&path, e))?;
+        shards_durable::all(&file).map_err(|e| at(&path, e))?;
     }
     match fs::rename(&temp, &dir) {
         Ok(()) => Ok(true),
@@ -678,12 +678,29 @@ fn private_dir(path: &Path) -> Result<(), String> {
 }
 
 /// Where the AppContainer profiles of this user's microVMs are recorded as they live, so
-/// that one whose `shards` ended without deleting it is deleted by the next (D141).
+/// that one whose `shards` ended without deleting it is deleted by the next, from any home:
+/// beside the profiles, in the user's own LocalAppData (D141, `shards_ipc`'s
+/// `app_container_records`), not in this home's cache.
 #[cfg(windows)]
 pub fn containers() -> Result<PathBuf, String> {
-    let dir = cache()?.join("containers");
-    private_dir(&dir)?;
-    Ok(dir)
+    shards_ipc::app_container_records().map_err(|e| format!("the AppContainer records: {e}"))
+}
+
+/// What tells a VM process or a share process this one starts where to declare its durable
+/// writes (`--durable HOME`, D286): this process's home ([`shards_durable::home`]), made
+/// whole here, as the daemon records its own as `.` (runs-02). Its slot file, and the home
+/// where it is not made, are made first ([`shards_durable::make`]), so that they are there
+/// for a confined VM to be granted (D30): a VM on macOS and Windows opens only what it is
+/// granted. None where this process recorded no home. A home or slot file that cannot be
+/// made fails the start.
+pub(crate) fn durable_words() -> Result<Vec<std::ffi::OsString>, String> {
+    let Some(home) = shards_durable::home() else {
+        return Ok(Vec::new());
+    };
+    let said = |e: std::io::Error| format!("{}: its declarations of durable writes: {e}", home.display());
+    shards_durable::make().map_err(said)?;
+    let whole = std::path::absolute(home).map_err(said)?;
+    Ok(vec![crate::share::DURABLE.into(), whole.into_os_string()])
 }
 
 /// What tells a VM process of `command` where its host model's vCPU records are kept
@@ -694,13 +711,20 @@ pub(crate) fn vcpu_records_words(command: Option<&std::ffi::OsStr>) -> Vec<std::
     if command.is_none_or(|command| command != "run") {
         return Vec::new();
     }
-    match cache() {
-        Ok(cache) if cache.is_absolute() => vec![
-            "--vcpu-records".into(),
-            cache.join("vcpu-limits").into_os_string(),
-        ],
-        _ => Vec::new(),
+    match vcpu_records() {
+        Some(dir) => vec!["--vcpu-records".into(), dir.into_os_string()],
+        None => Vec::new(),
     }
+}
+
+/// Where this user's host models' vCPU records are kept (D261): the cache's `vcpu-limits`,
+/// where a cache is named whole. What the VMs it boots keep their outcomes in
+/// ([`vcpu_records_words`]), and their host's bursts of refusals, whose width the daemon reads.
+pub(crate) fn vcpu_records() -> Option<PathBuf> {
+    cache()
+        .ok()
+        .filter(|cache| cache.is_absolute())
+        .map(|cache| cache.join("vcpu-limits"))
 }
 
 /// This user's cache: `SHARDS_CACHE` where it names a directory, else `~/Library/Caches/shards`

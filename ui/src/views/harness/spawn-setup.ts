@@ -226,7 +226,8 @@ export function specOf(c: Choices): Spec {
     prompt: c.prompt.trim() || undefined,
     shell: c.shell || undefined,
     reach: c.reach || undefined,
-    workspace: c.shell ? undefined : c.volume ? { kind: "volume" } : c.folder ? { kind: "folder" } : undefined,
+    // A shell's agent works on a volume too (its folder and environment moved onto the mount): its choice goes as any other's.
+    workspace: c.volume ? { kind: "volume" } : c.folder ? { kind: "folder" } : undefined,
     // A microVM of its own, made from its Agentfile (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
     ...(c.agentfile ? { isolation: { kind: "microvm", image: c.agentfile } } : {}),
     // Its environment (docs/agents.md, "Environments").

@@ -227,7 +227,7 @@ to your own sessions and an agent's to the agents it started (and theirs), as `a
 
 | Method | Path | |
 |---|---|---|
-| POST | `/api/harness/sessions/{agent}/pause` | → `{ agent, asked: "pause", engine /* "host" \| "microvm" */ }` (`sessions.pause`): its machine holds it, and the subagents kiln started under it: `agents.get` says it's paused once it is (stand `paused`, `state.frozen`), and its timeline says why where it couldn't be (a microVM's, until Hex pauses one: P5.5b). 409 when it's paused already |
+| POST | `/api/harness/sessions/{agent}/pause` | → `{ agent, asked: "pause", engine /* "host" \| "microvm" */ }` (`sessions.pause`): its machine holds it, and the subagents kiln started under it: `agents.get` says it's paused once it is (stand `paused`, `state.frozen`), and its timeline says why where it couldn't be. 409 when it's paused already |
 | DELETE | `/api/harness/sessions/{agent}/pause` | → `{ agent, asked: "resume", engine }` (`sessions.resume`): your pause ends, and a usage limit's. 409 when nothing pauses it |
 | POST | `/api/harness/sessions/{agent}/restart` | → `{ agent, how /* "force_stop" \| "start" \| "resume" */, engine, resumed? }` (`sessions.restart`): its harness starts again from its own launch, in a fresh microVM where it ran in one, under the same id, its conversation going on; `resumed` as `agents.resume` answers, for a crashed one. 409 while it's starting, 502 while its machine is away |
 

@@ -8,6 +8,9 @@
 //! - [`change`]: an agent's change request, from its work to review (C1, C6).
 //! - [`follow`]: what happens to it, back to the agent (C2, C3).
 //! - [`slates`]: a workspace of its own, a Slates volume over its folder (W1–W4).
+//! - [`container`]: an agent's container on its workspace's volume, bound from its mount through Slates' library (W9).
+//! - [`slates_fleet`]: a runner's identity as a node of kiln's Slates fleet, its key and kiln's certificate for it.
+//! - [`slates_move`]: an agent moved to another runner with its workspace volume, by Slates' own move (K4).
 //! - [`place`]: where a workspace's volume is mounted on its machine (a folder, or a drive letter on Windows).
 //! - [`ignored`]: what git ignores in one with no mount, from its volume's own `.gitignore` files.
 //! - [`review`]: an agent's work in one with no mount, from its volume's landing entries (A-287).
@@ -15,6 +18,7 @@
 //!   (docs/ci.md W20-R11).
 
 pub mod change;
+pub mod container;
 pub mod follow;
 pub mod git;
 pub mod ignored;
@@ -22,9 +26,14 @@ pub mod measure;
 pub mod place;
 pub mod review;
 pub mod slates;
+pub mod slates_faults;
+pub mod slates_fleet;
+pub mod slates_move;
 
 #[cfg(test)]
 mod bare_metal_tests;
+#[cfg(test)]
+mod captured_tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -37,7 +46,7 @@ use serde_json::{Value, json};
 #[cfg_attr(test, derive(ts_rs::TS))]
 pub struct Workspace {
     /// `volume`: a Slates volume laid over its folder (its own, or another agent's it works in: `owner`); `folder`:
-    /// the folder itself, as a person asked, or because its machine can't make a volume (`why_not`).
+    /// the folder itself, as a person asked.
     pub kind: String,
     /// The folder it's laid over: its repository's top (else the folder itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,25 +65,10 @@ pub struct Workspace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub owner: Option<String>,
-    /// Why it works in its folder though its start named no workspace: its machine can't make a volume, as it said
-    /// ([`by_default`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional))]
-    pub why_not: Option<String>,
 }
 
 /// The kinds of workspace an agent may ask for: its folder itself, or a volume of its own.
 pub const KINDS: &[&str] = &["folder", "volume"];
-
-/// What an agent works in when its start named no workspace (the person's decision, 2026-11-18, kiln goal
-/// 01a1ec34599974448aed2672bafaf9a2: kiln's bare-metal engine runs every harness and agent on a Slates volume;
-/// docs/agentic.md W2): a volume of its own where its machine can make one (`can`), else its folder, saying why.
-pub fn by_default(can: Result<(), String>) -> Workspace {
-    match can {
-        Ok(()) => Workspace { kind: "volume".to_owned(), ..Workspace::default() },
-        Err(why) => Workspace { kind: "folder".to_owned(), why_not: Some(why), ..Workspace::default() },
-    }
-}
 
 /// The workspace an agent works in when its folder `cwd` lies in one that an agent of its machine works in now
 /// (`live`: each such agent's id and workspace): that one, the agent's folder its own place in it. A volume is never
@@ -90,9 +84,35 @@ pub fn sharing(cwd: &str, live: &[(String, Workspace)]) -> Option<Workspace> {
             sub: beneath(cwd, &made.mount),
             made: Some(made.clone()),
             owner: Some(w.owner.clone().unwrap_or_else(|| id.clone())),
-            why_not: None,
         })
     })
+}
+
+/// The workspaces agents on one machine work in now (`infos`, its sessions): each made one with its agent's id, what
+/// [`sharing`] judges a folder against.
+pub fn live(infos: Vec<crate::harness::session::Info>) -> Vec<(String, Workspace)> {
+    infos.into_iter().filter_map(|i| i.workspace.filter(|w| w.made.is_some()).map(|w| (i.id, w))).collect()
+}
+
+/// What a start on a person's shell takes from it once its machine has read the shell (`harness::host::shell_context`:
+/// its folder `cwd` and its environment `env`): the folder and the environment where the start named none; and, where
+/// the folder lies in a workspace an agent of this machine works in now (`live`), that agent's volume ([`sharing`]),
+/// at the shell's own place in it. The server chose the start's workspace before this machine read the shell's folder
+/// (`Registry::open_as`), so a start that asked for a volume of its own, still to be made, takes the one it is in: a
+/// volume is never laid over a volume (Slates refuses a base on one of its own mounts, its A-227), as one started in
+/// another agent's folder works in that agent's volume (W2). A person's choice of the folder itself, and a workspace
+/// decided already, are kept.
+pub fn from_shell(spec: &mut crate::harness::session::Spec, (cwd, env): (Option<String>, Vec<(String, String)>), live: &[(String, Workspace)]) {
+    if spec.cwd.is_none() {
+        spec.cwd = cwd;
+    }
+    if spec.env.is_empty() {
+        spec.env = env;
+    }
+    let own_to_make = spec.workspace.as_ref().is_some_and(|w| w.kind == "volume" && w.made.is_none() && w.owner.is_none());
+    if own_to_make && let Some(shared) = spec.cwd.as_deref().and_then(|cwd| sharing(cwd, live)) {
+        spec.workspace = Some(shared);
+    }
 }
 
 /// Whether `a` and `b` are workspaces in one volume.
@@ -189,6 +209,51 @@ fn beneath(path: &str, mount: &str) -> String {
     mount_prefix(path, mount).and_then(|n| path.get(n..)).unwrap_or_default().trim_start_matches(['/', '\\']).trim_end_matches(['/', '\\']).to_owned()
 }
 
+/// The variables of an agent's environment naming its harness's own homes, where kiln reads what the harness keeps for
+/// a session (its transcript, its memories: `harness::homes`) after any volume has gone: never moved onto a mount, even
+/// where a person's home lies in the folder a volume is laid over (`XDG_*` stay too).
+const HOMES: &[&str] = &["HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "GEMINI_CLI_HOME"];
+
+/// The separator of a list of paths in one variable (`PATH`, `PYTHONPATH`) on this system, as `std::env::split_paths`
+/// reads them: `;` on Windows, `:` elsewhere.
+const PATH_LIST: char = if cfg!(windows) { ';' } else { ':' };
+
+/// `env` with every path in it that lies in folder `over` named at the same place under `top`, where a workspace's
+/// volume shows `over`: a variable's whole value, or each path of a list of them ([`PATH_LIST`]); the rest as it was,
+/// byte for byte. An agent started in a person's shell is handed the shell's environment, which names the person's
+/// folder (`OLDPWD`, an activated virtual environment's `VIRTUAL_ENV` and its `PATH` entry, a `CARGO_TARGET_DIR`);
+/// moved onto the mount, a command that trusts its environment works in the volume, never past it (I11; `PWD` is the
+/// folder the harness starts in, `harness::kinds`). A path spelled through a link is judged by its real path, as git
+/// names `over`. The harness's own homes stay ([`HOMES`], `XDG_*`), and so does a path on the mount already.
+pub fn rehomed(env: &[(String, String)], over: &str, top: &str) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(key, value)| {
+            let home = HOMES.contains(&key.as_str()) || key.starts_with("XDG_");
+            (key.clone(), if home { value.clone() } else { value.split(PATH_LIST).map(|path| rehomed_path(path, over, top).unwrap_or_else(|| path.to_owned())).collect::<Vec<_>>().join(&PATH_LIST.to_string()) })
+        })
+        .collect()
+}
+
+/// `path` at its place under `top` where it lies in `over`, by its spelling or by its real path (`place::real`: through
+/// its nearest folder there is, where it isn't made yet); None for anything else (a relative path or no path at all, one
+/// outside `over`, one under `top` already).
+fn rehomed_path(path: &str, over: &str, top: &str) -> Option<String> {
+    if !Path::new(path).is_absolute() || within(path, top) {
+        return None;
+    }
+    let place = if within(path, over) {
+        beneath(path, over)
+    } else {
+        let real = place::real(Path::new(path)).to_string_lossy().into_owned();
+        if !within(&real, over) || within(&real, top) {
+            return None;
+        }
+        beneath(&real, over)
+    };
+    let top = Path::new(top);
+    Some(if place.is_empty() { top.to_string_lossy().into_owned() } else { top.join(place).to_string_lossy().into_owned() })
+}
+
 /// Makes the workspace `spec` asks for (on the machine its agent `id` works on), before its
 /// harness starts: a volume laid over its folder's repository, mounted, and the agent's folder in
 /// it; for an isolated session, the volume with no mount, which Slates serves its microVM itself
@@ -197,19 +262,18 @@ fn beneath(path: &str, mount: &str) -> String {
 pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyhow::Result<()> {
     let Some(w) = spec.workspace.clone().filter(|w| w.kind == "volume") else { return Ok(()) };
     if let Some(m) = &w.made {
-        return slates::mounted(m).await;
+        slates::mounted(m).await?;
+        // Its environment on that mount too, as its folder is (one started in a person's shell inside another agent's
+        // volume, or one started again): nothing of it left naming the folder the volume is laid over.
+        if let Some(over) = w.over.as_deref().filter(|_| !m.mount.is_empty()) {
+            spec.env = rehomed(&spec.env, over, &place::top(&m.mount).to_string_lossy());
+        }
+        return Ok(());
     }
     let cwd = PathBuf::from(crate::harness::session::resolve_cwd(spec.cwd.as_deref()));
     anyhow::ensure!(cwd.is_dir(), "{} isn't a folder on this machine", cwd.display());
     // The whole repository, so git works in it as it does in the folder; the agent where it was asked to be.
-    let (over, sub) = match git::facts(&cwd).await {
-        Ok(f) => {
-            let top = PathBuf::from(&f.top);
-            let sub = cwd.strip_prefix(&top).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-            (top, sub)
-        }
-        Err(_) => (cwd.clone(), String::new()),
-    };
+    let (over, sub) = repo_place(&cwd).await;
     // The whole id: kiln's ids start with the time they were made, so two agents started together
     // share their beginnings (Slates' names are unique on the machine).
     let whole: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
@@ -227,11 +291,92 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     }
     if !made.mount.is_empty() {
         let top = place::top(&made.mount);
+        // Its environment moved onto the mount with its folder (an agent started in a person's shell is handed the
+        // shell's, which names the person's folder: I11).
+        spec.env = rehomed(&spec.env, &over.to_string_lossy(), &top.to_string_lossy());
         let here = if sub.is_empty() { top } else { top.join(&sub) };
         spec.cwd = Some(here.to_string_lossy().into_owned());
+        // A conversation taken up goes on from the mount's folder: its harness's record of it moved where the harness
+        // looks from there, or copied for a branch of it, whose original goes on where it was (I12).
+        if let Some(session) = spec.resume.clone() {
+            let (kind, dirs, cwd, branch) = (spec.kind.clone(), crate::harness::homes::Dirs::here(&spec.env), here.to_string_lossy().into_owned(), spec.fork);
+            let moved = crate::rt::blocking(move || if branch { crate::harness::homes::rehome_branch(&kind, &dirs, &session, &cwd) } else { crate::harness::homes::rehome(&kind, &dirs, &session, &cwd) }).await?;
+            if let Err(why) = moved {
+                if let Err(gone) = slates::remove(&made).await {
+                    tracing::warn!(volume = %made.volume, error = %format!("{gone:#}"), "the workspace of a conversation that couldn't be taken up stayed");
+                }
+                anyhow::bail!("its conversation's record couldn't be moved onto its volume: {why}");
+            }
+        }
     }
     spec.workspace = Some(Workspace { kind: w.kind, over: Some(over.to_string_lossy().into_owned()), sub, made: Some(made), ..Workspace::default() });
     Ok(())
+}
+
+/// A session that arrived with a workspace volume (it moved here with its agent, K4, `harness::host`'s take-over): its
+/// mount re-placed under this machine's own place for workspaces where it named another machine's, and its folder and
+/// environment there ([`follow_to`]: the mount's top, with the agent's place beneath it). Its work is written back here as
+/// on the runner it came from (Slates judges a moved captured clone against its capture, its A-503). Whether it has a
+/// workspace volume to mount here as it starts ([`mounted_for`]), so its folder is never taken for one this machine lacks.
+pub fn arrived_here(spec: &mut crate::harness::session::Spec) -> bool {
+    let Some(m) = spec.workspace.as_ref().filter(|w| w.kind == "volume").and_then(|w| w.made.clone()).filter(|m| !m.mount.is_empty()) else { return false };
+    match slates::placed_here(&m) {
+        Ok(arrived) => follow_to(spec, arrived),
+        Err(e) => {
+            tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "a workspace that arrived couldn't be placed here");
+            false
+        }
+    }
+}
+
+/// Agent `spec`'s workspace volume as it was placed here, `arrived`: where its mount moved, its folder and its
+/// environment follow it (the mount's top, with the agent's place beneath it; every path of its environment on the
+/// mount it left, which I11 moved there as it started and a move carries, [`rehomed`] to its place on this one). Whether
+/// it has a workspace volume to mount here.
+fn follow_to(spec: &mut crate::harness::session::Spec, arrived: slates::Made) -> bool {
+    let Some(w) = spec.workspace.as_mut().filter(|w| w.kind == "volume") else { return false };
+    let Some(was) = w.made.as_ref().filter(|m| !m.mount.is_empty()).map(|m| m.mount.clone()) else { return false };
+    let sub = w.sub.clone();
+    let now = arrived.mount.clone();
+    w.made = Some(arrived);
+    if now != was {
+        let (left, top) = (place::top(&was), place::top(&now));
+        spec.env = rehomed(&spec.env, &left.to_string_lossy(), &top.to_string_lossy());
+        let here = if sub.is_empty() { top } else { top.join(&sub) };
+        spec.cwd = Some(here.to_string_lossy().into_owned());
+    }
+    true
+}
+
+/// A session's workspace volume mounted where it says before its harness starts in it (`harness::session`): one that
+/// arrived with a move (its new owner may answer a moment after the move, so Slates' pauses are waited out), or one a
+/// refused move let go of and took back. Nothing for any other workspace.
+pub async fn mounted_for(spec: &crate::harness::session::Spec) -> anyhow::Result<()> {
+    match spec.workspace.as_ref().filter(|w| w.kind == "volume").and_then(|w| w.made.as_ref()) {
+        Some(m) => slates::mounted_patiently(m).await,
+        None => Ok(()),
+    }
+}
+
+/// The folder a workspace for `cwd` is laid over, and `cwd`'s place beneath it (a workspace's `sub`): its repository's
+/// top and git's own place for it ([`git::prefix`], in this system's separators), or `cwd` itself where no repository
+/// holds it. The place is git's, never `cwd` with the top taken off its front: git names the top by its real path, which
+/// a path spelled with a symbolic link, or on Windows with a short 8.3 name (a runner's `%TEMP%`) or a name in another
+/// case, does not share, and the agent then started at its volume's top instead of in its folder.
+async fn repo_place(cwd: &Path) -> (PathBuf, String) {
+    match git::facts(cwd).await {
+        Ok(f) => {
+            let sub = git::prefix(cwd).await.map(|prefix| beneath_top(&prefix)).unwrap_or_default();
+            (PathBuf::from(&f.top), sub)
+        }
+        Err(_) => (cwd.to_path_buf(), String::new()),
+    }
+}
+
+/// git's place for a folder (`crates/kiln/`, [`git::prefix`]) as a path in this system's separators (`crates\kiln` on
+/// Windows), empty at the top.
+fn beneath_top(prefix: &str) -> String {
+    prefix.split('/').filter(|name| !name.is_empty()).collect::<PathBuf>().to_string_lossy().into_owned()
 }
 
 /// The volume a start made for its agent alone, which goes with it when it can't start after all: none when its
@@ -245,15 +390,43 @@ pub fn needs_preparing(spec: &crate::harness::session::Spec) -> bool {
     spec.workspace.as_ref().is_some_and(|w| w.kind == "volume")
 }
 
+/// An ended agent's conversation sent back from the project its harness kept for the agent's folder on its mount to the
+/// one it keeps for its person's folder, where they resume it from where they work (the reverse of a conversation
+/// taken up onto a volume, I12): Claude Code's transcript and its session's own files, Gemini CLI's chat and its
+/// subagents' folder (`harness::homes::return_home`). Its harness's conversation is `conversation` (its own id for it).
+/// Asked as its agent ends, before its volume's mount goes. One that can't go back stays where it is, both records
+/// kept, and kiln says why, typed (`homes::NotMoved`) and logged; a branch's copy of another conversation stays.
+pub async fn send_conversation_home(spec: &crate::harness::session::Spec, conversation: Option<String>) {
+    let (Some(session), Some((mount, person))) = (conversation, record_places(spec)) else { return };
+    let (kind, dirs, asked) = (spec.kind.clone(), crate::harness::homes::Dirs::here(&spec.env), session.clone());
+    match crate::rt::blocking(move || crate::harness::homes::return_home(&kind, &dirs, &asked, &mount, &person)).await {
+        Ok(Ok(true)) => tracing::info!(%session, "an ended agent's conversation went back to its person's folder"),
+        Ok(Ok(false)) => {}
+        Ok(Err(not)) => tracing::warn!(%session, %not, "an ended agent's conversation stays where its harness kept it on its volume"),
+        Err(e) => tracing::warn!(%session, error = %format!("{e:#}"), "an ended agent's conversation stays where its harness kept it on its volume"),
+    }
+}
+
+/// Where agent `spec`'s harness kept its conversation, its folder on its volume's mount, and its person's folder that the
+/// volume shows there (the folder it's laid over, `over`, and its place beneath, `sub`); none for an agent with no
+/// mount.
+fn record_places(spec: &crate::harness::session::Spec) -> Option<(String, String)> {
+    let w = spec.workspace.as_ref()?;
+    w.made.as_ref().filter(|m| !m.mount.is_empty())?;
+    let (over, on_mount) = (w.over.as_deref()?, spec.cwd.clone()?);
+    let person = if w.sub.is_empty() { PathBuf::from(over) } else { Path::new(over).join(&w.sub) };
+    Some((on_mount, person.to_string_lossy().into_owned()))
+}
+
 /// Ends agent session `spec`'s workspace for good, when it has a volume: the volume and what it held go
-/// with the session. Its caller asks this of the last agent working in it alone ([`same_volume`]).
-pub fn release(spec: &crate::harness::session::Spec) {
+/// with the session. Its caller asks this of the last agent working in it alone ([`same_volume`]), once every process
+/// kiln started for it has ended (`harness::host::processes_ended`), so its mount is asked to go once
+/// (`slates::remove`).
+pub async fn release(spec: &crate::harness::session::Spec) {
     let Some(m) = spec.workspace.as_ref().and_then(|w| w.made.clone()) else { return };
-    crate::rt::spawn(async move {
-        if let Err(e) = slates::remove(&m).await {
-            tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "an ended agent's workspace stayed");
-        }
-    });
+    if let Err(e) = slates::remove(&m).await {
+        tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "an ended agent's workspace stayed");
+    }
 }
 
 /// What the server asks the machine about an agent's folder.
@@ -450,7 +623,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
             let (m, over) = own(ws)?;
             let (plan, excludes) = slates::plan_landing(m, over).await?;
             // Why it can't be written from kiln: the landing would write what git ignores.
-            let why_not = slates::writable(m, over, &plan).await.err();
+            let why_not = slates::writable(m, over, &plan, &excludes).await.err();
             Ok(json!({"plan": plan, "excludes": excludes, "can_write": why_not.is_none(), "why_not": why_not}))
         }
         Ask::Land { manifest } => {
@@ -458,7 +631,7 @@ async fn answer(cwd: &Path, ws: Option<&Workspace>, ask: Ask, sign: Option<&str>
             Ok(match slates::land(m, over, &manifest).await? {
                 slates::Landed::Written(outcome) => json!({"landed": outcome}),
                 slates::Landed::Changed(plan, excludes) => {
-                    let why_not = slates::writable(m, over, &plan).await.err();
+                    let why_not = slates::writable(m, over, &plan, &excludes).await.err();
                     json!({"changed": true, "plan": plan, "excludes": excludes, "can_write": why_not.is_none(), "why_not": why_not})
                 }
             })
@@ -536,22 +709,125 @@ mod tests {
     use super::*;
 
     fn made(volume: &str, mount: &str) -> slates::Made {
-        slates::Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: mount.into() }
+        slates::Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: mount.into(), ..Default::default() }
     }
 
     fn volume_at(volume: &str, mount: &str, over: &str) -> Workspace {
         Workspace { kind: "volume".into(), over: Some(over.into()), made: Some(made(volume, mount)), ..Workspace::default() }
     }
 
-    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (W2): a start that names no workspace gets a volume where its machine
-    /// can make one, and its folder where it can't, with the machine's word for why.
+    /// W7 (kiln goal 01a1ec34599974448aed2672bafaf9a2, I14): an agent whose volume moved here with it works at the mount
+    /// its volume is placed at here, its folder and its environment with it: every path of its environment on the mount
+    /// it left (moved there as it started: an activated virtual environment, a `CARGO_TARGET_DIR`) names its place on the
+    /// new one, and the rest stays as it was.
     #[test]
-    fn w2_a_start_that_names_nothing_gets_a_volume_where_its_machine_can_make_one() {
-        assert_eq!(by_default(Ok(())), Workspace { kind: "volume".into(), ..Workspace::default() });
-        let folder = by_default(Err("fusermount3 isn't installed (the fuse3 package)".into()));
-        assert_eq!(folder.kind, "folder");
-        assert_eq!(folder.why_not.as_deref(), Some("fusermount3 isn't installed (the fuse3 package)"));
-        assert!(folder.made.is_none() && folder.owner.is_none());
+    fn w7_a_moved_agents_folder_and_environment_follow_its_volume_to_its_new_mount() {
+        let (was, now) = ("/Users/a/.kiln/state/workspaces/kiln-x", "/home/b/.kiln/state/workspaces/kiln-x");
+        let mut spec = crate::harness::session::Spec {
+            cwd: Some(format!("{was}/src")),
+            env: vec![("VIRTUAL_ENV".to_owned(), format!("{was}/.venv")), ("CARGO_TARGET_DIR".to_owned(), format!("{was}/target")), ("EDITOR".to_owned(), "vi".to_owned())],
+            workspace: Some(Workspace { sub: "src".into(), ..volume_at("v1", was, "/Users/a/project") }),
+            ..Default::default()
+        };
+        assert!(follow_to(&mut spec, made("v1", now)));
+        assert_eq!(spec.cwd.as_deref(), Some("/home/b/.kiln/state/workspaces/kiln-x/src"));
+        let env: std::collections::HashMap<&str, &str> = spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(env.get("VIRTUAL_ENV"), Some(&"/home/b/.kiln/state/workspaces/kiln-x/.venv"), "{env:?}");
+        assert_eq!(env.get("CARGO_TARGET_DIR"), Some(&"/home/b/.kiln/state/workspaces/kiln-x/target"), "{env:?}");
+        assert_eq!(env.get("EDITOR"), Some(&"vi"));
+        assert_eq!(spec.workspace.and_then(|w| w.made).map(|m| m.mount), Some(now.to_owned()));
+    }
+
+    /// W2: an ended agent's conversation goes back from its folder on its volume's mount to its person's folder the
+    /// volume shows there, its place beneath the folder laid over kept; an agent with no mount has none to send back.
+    #[test]
+    fn w2_an_ended_agents_conversation_goes_back_to_the_folder_its_volume_showed() {
+        let spec = |sub: &str, mount: &str| crate::harness::session::Spec {
+            cwd: Some(format!("/state/workspaces/kiln-a/{sub}").trim_end_matches('/').to_owned()),
+            workspace: Some(Workspace { sub: sub.into(), ..volume_at("v1", mount, "/Users/person/project") }),
+            ..Default::default()
+        };
+        assert_eq!(record_places(&spec("src", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a/src".to_owned(), "/Users/person/project/src".to_owned())));
+        assert_eq!(record_places(&spec("", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a".to_owned(), "/Users/person/project".to_owned())));
+        assert_eq!(record_places(&spec("src", "")), None, "no mount: an isolated agent's, kept in its microVM's volume");
+        assert_eq!(record_places(&crate::harness::session::Spec::default()), None);
+    }
+
+    /// I11 (kiln goal 01a1ec34599974448aed2672bafaf9a2, docs/agentic.md W2): an agent started in a person's shell works
+    /// on its volume with no second path: every path of the shell's environment in the folder its volume is laid over,
+    /// whole or in a list, spelled through a link or not, is moved to its place on the mount; its harness's homes, paths
+    /// elsewhere, a path on the mount already, a look-alike folder and what isn't a path stay byte for byte.
+    #[test]
+    #[cfg(unix)]
+    fn i11_a_shells_environment_is_moved_onto_its_agents_mount() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let over = std::fs::canonicalize(dir.path())?.join("project");
+        std::fs::create_dir_all(over.join(".venv").join("bin"))?;
+        std::fs::create_dir_all(over.join("src"))?;
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&over, &linked)?;
+        let (o, l, top) = (over.to_string_lossy().into_owned(), linked.to_string_lossy().into_owned(), "/state/workspaces/kiln-a");
+        let shells: Vec<(String, String)> = [
+            ("PWD", format!("{o}/src")),
+            ("OLDPWD", "/Users/person".to_owned()),
+            ("VIRTUAL_ENV", format!("{o}/.venv")),
+            ("PATH", format!("{o}/.venv/bin:/usr/bin:{l}/src")),
+            ("CARGO_TARGET_DIR", format!("{l}/target")),
+            ("HOME", o.clone()),
+            ("XDG_CONFIG_HOME", format!("{o}/.config")),
+            ("DISPLAY", ":0".to_owned()),
+            ("ON_IT", format!("{top}/src")),
+            ("LOOKALIKE", format!("{o}-other/x")),
+            ("WORDS", "src".to_owned()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        let moved: std::collections::HashMap<String, String> = rehomed(&shells, &o, top).into_iter().collect();
+        let at = |key: &str| moved.get(key).map(String::as_str);
+        assert_eq!(at("PWD"), Some("/state/workspaces/kiln-a/src"));
+        assert_eq!(at("VIRTUAL_ENV"), Some("/state/workspaces/kiln-a/.venv"));
+        assert_eq!(at("PATH"), Some("/state/workspaces/kiln-a/.venv/bin:/usr/bin:/state/workspaces/kiln-a/src"), "each path of a list, one spelled through a link");
+        assert_eq!(at("CARGO_TARGET_DIR"), Some("/state/workspaces/kiln-a/target"), "through a link, though it isn't made yet");
+        for (key, value) in &shells {
+            if ["OLDPWD", "HOME", "XDG_CONFIG_HOME", "DISPLAY", "ON_IT", "LOOKALIKE", "WORDS"].contains(&key.as_str()) {
+                assert_eq!(at(key), Some(value.as_str()), "{key} stays");
+            }
+        }
+        assert_eq!(moved.len(), shells.len());
+        Ok(())
+    }
+
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2; Windows): an agent's folder keeps its place in its repository on its
+    /// volume however its path is spelled. git names the repository's top by its real path, so a folder spelled through
+    /// a symbolic link (Unix) or with a name in another case (Windows; a runner's `%TEMP%` in its short 8.3 form is the
+    /// same case) had no place beneath it, and the agent started at its volume's top instead of in its folder. Do: a
+    /// repository with `src/deep`, reached by another spelling of its top. Expect `src/deep` beneath git's top.
+    #[test]
+    fn w3_an_agents_folder_keeps_its_place_in_its_repository_however_its_path_is_spelled() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let real = dir.path().join("repo");
+        std::fs::create_dir_all(real.join("src").join("deep"))?;
+        let no_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        let made = std::process::Command::new("git").args(["init", "-q"]).current_dir(&real).env("GIT_CONFIG_GLOBAL", no_config).env("GIT_CONFIG_NOSYSTEM", "1").status()?;
+        anyhow::ensure!(made.success(), "git init: {made}");
+        // The same folder spelled otherwise: through a link on Unix, its name in capitals on Windows.
+        #[cfg(unix)]
+        let spelled = {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link)?;
+            link
+        };
+        #[cfg(not(unix))]
+        let spelled = dir.path().join("REPO");
+        let deep = spelled.join("src").join("deep");
+        let (over, sub) = crate::rt::block_on(async move { Ok(repo_place(&deep).await) })?;
+        anyhow::ensure!(sub == Path::new("src").join("deep").to_string_lossy(), "its place beneath {}: {sub:?}", over.display());
+        let same = std::fs::canonicalize(over.join(&sub))? == std::fs::canonicalize(real.join("src").join("deep"))?;
+        anyhow::ensure!(same, "{} beneath {} is the folder asked for", sub, over.display());
+        assert_eq!(beneath_top(""), "", "at the top");
+        assert_eq!(beneath_top("crates/kiln/"), Path::new("crates").join("kiln").to_string_lossy());
+        Ok(())
     }
 
     /// W2: an agent whose folder lies in another agent's volume works in that volume, at its place there, the volume's
@@ -579,6 +855,41 @@ mod tests {
         assert_eq!(sharing("/state/workspaces/kiln-c", &unmade), None);
     }
 
+    /// W2 (ledger row W's owed line, 2026-11-18): an agent started in a person's shell whose folder lies in another
+    /// agent's mount works in that agent's volume, at the same path, as one started in that folder does. The server
+    /// chooses a start's workspace before its machine reads the shell's folder, so it had chosen a volume of its own,
+    /// and laying that over the other agent's mount was refused by Slates (its A-227). Do: a start the server left
+    /// asking for a volume of its own takes a shell whose folder lies in agent `a`'s mount. Expect `a`'s volume, `a` its
+    /// owner, the shell's place beneath the mount, and the shell's own folder and environment. A shell's folder outside
+    /// every mount keeps the volume of its own, a person's choice of the folder itself is kept, and a start that named
+    /// its folder keeps it.
+    #[test]
+    fn w2_an_agent_started_in_a_shell_inside_another_agents_mount_works_in_its_volume() {
+        let parent = volume_at("v1", "/state/workspaces/kiln-a", "/home/ada/src/kiln");
+        let live = vec![("a".to_owned(), parent.clone())];
+        let own = || Some(Workspace { kind: "volume".into(), ..Workspace::default() });
+        let env = vec![("OLDPWD".to_owned(), "/home/ada".to_owned())];
+        let shell = |cwd: &str| (Some(cwd.to_owned()), env.clone());
+        let started = |workspace: Option<Workspace>, cwd: Option<&str>, at: &str| {
+            let mut spec = crate::harness::session::Spec { workspace, cwd: cwd.map(str::to_owned), ..Default::default() };
+            from_shell(&mut spec, shell(at), &live);
+            spec
+        };
+        let inside = started(own(), None, "/state/workspaces/kiln-a/crates/kiln");
+        let w = inside.workspace.clone().unwrap_or_default();
+        assert_eq!(w.made, parent.made, "the other agent's volume, not one of its own laid over its mount");
+        assert_eq!(w.owner.as_deref(), Some("a"));
+        assert_eq!(w.over, parent.over, "laid over the folder that agent's is");
+        assert_eq!(w.sub, "crates/kiln");
+        assert_eq!(inside.cwd.as_deref(), Some("/state/workspaces/kiln-a/crates/kiln"), "at the shell's own folder");
+        assert_eq!(inside.env, env, "with the shell's environment");
+        assert_eq!(started(own(), None, "/home/ada/src/kiln").workspace, own(), "outside every mount: its own volume");
+        let folder = Some(Workspace { kind: "folder".into(), ..Workspace::default() });
+        assert_eq!(started(folder.clone(), None, "/state/workspaces/kiln-a/src").workspace, folder, "a person's folder choice");
+        let named = started(own(), Some("/home/ada/elsewhere"), "/state/workspaces/kiln-a");
+        assert_eq!((named.cwd.as_deref(), named.workspace), (Some("/home/ada/elsewhere"), own()), "a folder the start named");
+    }
+
     /// W2 on Windows (judged on any server): a volume is mounted at a drive letter, and a folder on that drive, written
     /// either way and with the letter in either case, lies in it.
     #[test]
@@ -604,7 +915,8 @@ mod tests {
         assert!(same_volume(Some(&parent), child.as_ref()));
         assert!(!same_volume(Some(&parent), Some(&volume_at("v2", "/w/kiln-b", "/src"))));
         assert!(!same_volume(Some(&parent), None));
-        assert!(!same_volume(Some(&by_default(Ok(()))), Some(&by_default(Ok(())))), "volumes not made yet are no volume");
+        let unmade = || Workspace { kind: "volume".into(), ..Workspace::default() };
+        assert!(!same_volume(Some(&unmade()), Some(&unmade())), "volumes not made yet are no volume");
         let spec = |w: Option<Workspace>| crate::harness::session::Spec { workspace: w, ..Default::default() };
         assert_eq!(made_alone(&spec(Some(parent.clone()))), parent.made);
         assert_eq!(made_alone(&spec(child)), None, "its parent's volume goes on");
@@ -668,7 +980,7 @@ mod tests {
     /// W2: an agent in its folder, whatever the reason, has no workspace of its own to ask about.
     #[test]
     fn w2_an_agent_in_its_folder_has_no_volume_to_ask_about() {
-        let folder = by_default(Err("no Slates here".into()));
+        let folder = Workspace { kind: "folder".into(), ..Workspace::default() };
         let refused = own_of(Some(&folder));
         assert!(refused.contains("its folder itself"), "{refused}");
         assert!(own_of(None).contains("its folder itself"));

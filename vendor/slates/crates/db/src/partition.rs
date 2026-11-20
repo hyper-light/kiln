@@ -20,10 +20,10 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord, NfsCallRecord,
-  NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsPurgeRecord,
-  NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner,
-  SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  GrantState, LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord,
+  NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
+  NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX,
+  SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -48,6 +48,9 @@ pub struct PartitionCaps {
   /// The bytes all green merge chains together may hold in the partition (§4.16); a new increment
   /// past it is a typed capacity refusal (bounded growth until checkpointing folds old entries).
   pub green_chain_bytes: usize,
+  /// The audit records the partition retains (§4.15, §4.14; A-265): past it the oldest is dropped and counted. The
+  /// daemon derives it from memory (`DaemonConfig`), so the audit is bounded with nothing invented.
+  pub audit_records: usize,
 }
 
 /// One client's completion state, as the snapshot carries it.
@@ -102,7 +105,7 @@ pub struct PartitionSnapshot {
   pub landing_leases: Vec<LandingLeaseRecord>,
   /// The landings, by id order.
   pub landings: Vec<LandingRecord>,
-  /// The audit records retained (the ring holds the rest).
+  /// The audit records retained, oldest first: the partition's bounded window (A-265).
   pub audit: Vec<AuditRecord>,
   /// Each green volume's merge chain, by green order (§4.16; appended for append-only evolution).
   pub green_chains: Vec<GreenChain>,
@@ -150,6 +153,28 @@ pub struct PartitionSnapshot {
   pub pending_creations: Vec<crate::catalog::PendingCreationRecord>,
   /// Each green this node took over and adopted from its own holder ledger of it (A-333; 2026-11-18; appended).
   pub green_adoptions: Vec<GreenAdoption>,
+  /// The sequence the next audit record takes (A-265; appended): numbered in `apply`, so a recovery numbers each
+  /// record as the live partition did.
+  pub audit_next_seq: u64,
+  /// The audit records dropped past the bound (A-265; appended).
+  pub audit_dropped: u64,
+  /// The highest grant id ever issued here (A-266; appended): the table holds live grants only.
+  pub grants_issued_through: u64,
+  /// The audit records owed the control partition and not yet acknowledged, oldest first (A-265's crossing; appended).
+  pub audit_outbox: Vec<AuditRecord>,
+  /// The crossing sequence the next owed record takes (A-265; appended).
+  pub audit_outbox_next: u64,
+  /// On the control partition, what each owing partition has delivered (A-265; appended), by partition order.
+  pub audit_received: Vec<crate::catalog::AuditReceivedMark>,
+  /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291; 2026-11-18; appended), by
+  /// (volume, snapshot) order.
+  pub captured_bases: Vec<CapturedBase>,
+  /// Each volume's carried capture (A-503; 2026-11-18; appended), by volume order.
+  pub carried_captures: Vec<crate::catalog::CarriedCaptureRecord>,
+  /// The repositories this partition holds (§4.17.1, A-515; appended), by id order.
+  pub repositories: Vec<crate::catalog::RepositoryRecord>,
+  /// Their namespaces' bindings (§4.17.1, A-515; appended), by (repository, name) order.
+  pub repository_branches: Vec<crate::catalog::BranchRecord>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -166,6 +191,17 @@ pub struct GreenAdoption {
   pub identity: [u8; 32],
   /// Version 0's inputs manifest identity as the ledger names it; `None` for a green with no origin.
   pub origin: Option<[u8; 32]>,
+}
+
+/// A snapshot captured as a complete immutable base (§4.15 `capture_base`, A-291): every name, byte and attribute of its
+/// tree is held by the volume, none read from the host directory any more, so a clone of it needs no base directory and
+/// moves between fleet members as a plain volume does.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CapturedBase {
+  /// The volume captured.
+  pub volume: VolumeId,
+  /// Its snapshot that holds the whole tree.
+  pub snapshot: SnapshotId,
 }
 
 /// One green's checkpoint, as a snapshot carries it (W3; §4.16): the version it is the green's state at, and its
@@ -222,8 +258,19 @@ pub struct Partition {
   leases_by_holder: Art<VolumeId>,
   lease_expiry: Wheel,
   lease_timers: BTreeMap<VolumeId, slates_rt::timer::TimerId>,
+  /// The earliest lease expiry entered in the wheel since the shard's deadline keeper last asked
+  /// ([`Partition::take_noted_lease`]): what tells the keeper a lease was set to lapse before the deadline it sleeps for
+  /// (A-536), whichever path recorded it (a take, a renewal, a replay).
+  lease_noted: Option<u64>,
   attachments: Slab<AttachmentRecord>,
   attachment_index: Art<Handle<AttachmentRecord>>,
+  /// The termed attachments (a CLI's, A-230) by when their term lapses, each `(expires_ns, id)`: derived from the
+  /// records, made again at a restore, one entry a termed attachment, so the lapsed are found without a walk of the
+  /// table (A-536).
+  termed_by_expiry: BTreeSet<(u64, u64)>,
+  /// The earliest term entered in [`Partition::termed_by_expiry`] since the shard's deadline keeper last asked
+  /// ([`Partition::take_noted_term`]), as `lease_noted` is for leases (A-536).
+  term_noted: Option<u64>,
   completions: BTreeMap<(u64, u32), ClientWindow<Vec<u8>>>,
   /// The completions a green's successor adopted from the green's merge records (A-255), each with the work whose submit
   /// it completes (A-288), by key `(origin, client, sequence)`: held while the client's window retains the completion,
@@ -241,7 +288,27 @@ pub struct Partition {
   consumers: BTreeMap<u64, ConsumerRecord>,
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
-  audit: Vec<AuditRecord>,
+  /// The audit records retained, oldest first: at most `caps.audit_records` (A-265).
+  audit: std::collections::VecDeque<AuditRecord>,
+  /// The audit records dropped oldest first past the bound (A-265), snapshotted with the window.
+  audit_dropped: u64,
+  /// The sequence the next audit record takes (A-265): a counter of the partition's own, snapshotted, so the numbers
+  /// never depend on which records are retained.
+  audit_next_seq: u64,
+  /// The audit records this partition owes the control partition and has not had acknowledged, oldest first, each
+  /// carrying its crossing sequence in `seq` (A-265's crossing, made durable 2026-11-18): kept from the atom that made
+  /// it until the control partition has appended it, so a crash between the two loses none. At most
+  /// `caps.audit_records`; past it the oldest leaves, counted in `audit_dropped`, as the control partition's window
+  /// would drop it.
+  audit_outbox: std::collections::VecDeque<AuditRecord>,
+  /// The crossing sequence the next owed record takes (A-265), snapshotted: the records before it were owed already.
+  audit_outbox_next: u64,
+  /// On the control partition: for each partition that owes it records, the crossing sequence of the first it has not
+  /// appended (A-265), snapshotted, so a batch sent again appends only what is new. One entry a partition.
+  audit_received: BTreeMap<u16, u64>,
+  /// The highest grant id ever issued here (A-266): the table holds live grants only, so this mark, snapshotted, is
+  /// what keeps an ended grant's id from being issued again after a restart.
+  grants_issued_through: u64,
   /// Each green volume's merge chain (§4.16): its accepted increments after its checkpoint (all of them while it holds
   /// none), encoded, in commit order, so recovery replays them to rebuild the green. Bounded by `green_chain_bytes`
   /// against the cap.
@@ -249,6 +316,17 @@ pub struct Partition {
   /// Each checkpointed green's checkpoint (W3; §4.16): its version and its encoding, held in place of every increment
   /// up to that version. Counted in `green_chain_bytes` against the same cap. Removed with the green.
   green_checkpoints: BTreeMap<VolumeId, (u64, Vec<u8>)>,
+  /// The snapshots captured as complete immutable bases (§4.15 `capture_base`, A-291): a clone of one is made with no
+  /// base directory. Bounded by the snapshots (one entry a snapshot at most); an entry leaves with its snapshot or its
+  /// volume.
+  captured_bases: std::collections::BTreeSet<CapturedBase>,
+  /// Each captured clone's carried capture (A-503): what its move carried of its capture, shipped in its catalog, and
+  /// the snapshot here it is relative to (its mark). One entry a volume at most; an entry leaves with its volume, and its
+  /// mark with its snapshot.
+  carried: BTreeMap<VolumeId, (crate::catalog::CarriedRecord, Option<SnapshotId>)>,
+  /// The repositories and their namespaces (§4.17.1, A-515): repositories bounded by `caps.volumes`, bindings by the
+  /// greens each binds.
+  repositories: crate::repository::Repositories,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -335,6 +413,9 @@ impl Partition {
       leases_by_holder: Art::new(),
       lease_expiry: Wheel::new(caps.tick_ns, caps.timers, now_ns),
       lease_timers: BTreeMap::new(),
+      lease_noted: None,
+      termed_by_expiry: BTreeSet::new(),
+      term_noted: None,
       attachments: Slab::new(caps.segment_slots, caps.attachments),
       attachment_index: Art::new(),
       completions: BTreeMap::new(),
@@ -360,7 +441,8 @@ impl Partition {
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
-      audit: Vec::new(),
+      audit: std::collections::VecDeque::new(),
+      audit_dropped: 0,
       green_chains: BTreeMap::new(),
       green_origins: BTreeMap::new(),
       green_chain_bytes: 0,
@@ -368,7 +450,31 @@ impl Partition {
       green_origin_refs: BTreeMap::new(),
       green_adoptions: BTreeMap::new(),
       green_checkpoints: BTreeMap::new(),
+      audit_next_seq: 0,
+      audit_outbox: std::collections::VecDeque::new(),
+      audit_outbox_next: 0,
+      audit_received: BTreeMap::new(),
+      grants_issued_through: 0,
+      captured_bases: std::collections::BTreeSet::new(),
+      carried: BTreeMap::new(),
+      repositories: crate::repository::Repositories::new(),
       tombstones: BTreeMap::new(),
+    }
+  }
+
+  /// The repositories this partition holds and their namespaces (§4.17.1, A-515).
+  pub fn repositories(&self) -> &crate::repository::Repositories {
+    &self.repositories
+  }
+
+  /// What the catalog holds under `id`, as a repository's namespace asks it (§4.17.1: a namespace binds greens).
+  fn held(&self, id: VolumeId) -> crate::repository::Held {
+    match self.volume(id) {
+      None => crate::repository::Held::Absent,
+      Some(record) if matches!(record.policy.role, crate::catalog::Role::Green { .. }) => {
+        crate::repository::Held::Green
+      }
+      Some(_) => crate::repository::Held::NotGreen,
     }
   }
 
@@ -633,6 +739,32 @@ impl Partition {
   }
 
   /// Applies a work's floor or pending-submit record (A-247).
+  /// Erases volume `id`'s keys with its record (A-92; seal.md §3.1, cryptographic erase): its lineage and naming keys,
+  /// whose one wrapped copy was here, so every chunk sealed under them, on any holder, opens for no one after this; and
+  /// its tenant's key when `tenant` has no other volume on this partition (a tenant key wraps only its volumes' lineage
+  /// keys). The scan is bounded by the partition's volume cap, once per destroy or release.
+  fn erase_volume_keys(&mut self, id: VolumeId, tenant: Option<u64>) {
+    self.seal_keys.remove(&SealKeyOwner::Lineage { volume: id });
+    self.seal_keys.remove(&SealKeyOwner::Naming { volume: id });
+    if let Some(account) = tenant
+      && !self
+        .volumes()
+        .iter()
+        .any(|volume| volume.owner.tenant() == account)
+    {
+      self.seal_keys.remove(&SealKeyOwner::Tenant { account });
+    }
+  }
+
+  /// A moved volume's release (A-291): as a destroy's apply, but no tombstone, since the volume's registers are the
+  /// member's it moved to; this node's copies of its keys go with its record, its new owner holding its own.
+  fn release_volume(&mut self, id: VolumeId) -> Result<(), DbError> {
+    let tenant = self.volume(id).map(|volume| volume.owner.tenant());
+    self.remove_volume(id)?;
+    self.erase_volume_keys(id, tenant);
+    Ok(())
+  }
+
   fn apply_work_floor(&mut self, op: &Op) {
     match op {
       Op::WorkFloorSet { green, work, base } => self.set_work_floor(*green, *work, *base),
@@ -685,6 +817,18 @@ impl Partition {
     self.volumes.get(h).ok()
   }
 
+  /// The first `limit` volumes past `after` (from the first when `None`) in volume-id order (§4.4 `list`, A-267): a
+  /// bounded ordered read of the id index ([`crate::art::Art::after`]), so a page of the listing costs the volumes it
+  /// passes, never the table.
+  pub fn volumes_after(&self, after: Option<VolumeId>, limit: usize) -> Vec<&VolumeRecord> {
+    self
+      .by_id
+      .after(after.as_ref().map(|id| id.bytes.as_slice()), limit)
+      .into_iter()
+      .filter_map(|(_, h)| self.volumes.get(*h).ok())
+      .collect()
+  }
+
   /// Every volume, by id order.
   pub fn volumes(&self) -> Vec<&VolumeRecord> {
     self
@@ -715,9 +859,39 @@ impl Partition {
       .collect()
   }
 
+  /// Whether `volume`'s `snapshot` was captured as a complete immutable base (§4.15 `capture_base`, A-291), so a clone
+  /// of it is made with no base directory.
+  pub fn is_captured(&self, volume: VolumeId, snapshot: SnapshotId) -> bool {
+    self
+      .captured_bases
+      .contains(&CapturedBase { volume, snapshot })
+  }
+
+  /// What a captured clone's move carried of its capture (A-503), with the snapshot here it is relative to (its mark),
+  /// when this node holds one.
+  pub fn carried(
+    &self,
+    volume: VolumeId,
+  ) -> Option<(&crate::catalog::CarriedRecord, Option<SnapshotId>)> {
+    self
+      .carried
+      .get(&volume)
+      .map(|(carried, mark)| (carried, *mark))
+  }
+
   /// A clone's lineage edge.
   pub fn lineage(&self, child: VolumeId) -> Option<&LineageEdge> {
     self.lineage.get(&child.bytes)
+  }
+
+  /// Whether a volume of this partition is a clone of `origin` (its lineage edge names it): a clone shares its origin's
+  /// records here, so the origin cannot leave this node while one stands (A-291). A scan bounded by the partition's
+  /// volume cap.
+  pub fn has_clones(&self, origin: VolumeId) -> bool {
+    self
+      .lineage
+      .iter()
+      .any(|(_, edge)| edge.origin_volume == origin)
   }
 
   /// The volume a principal holds a lease on.
@@ -804,8 +978,53 @@ impl Partition {
       .attachment_index
       .remove(&id.to_be_bytes())
       .ok_or(DbError::NotFound)?;
-    self.attachments.remove(handle)?;
+    let record = self.attachments.remove(handle)?;
+    self.unindex_term(&record);
     Ok(())
+  }
+
+  /// Enters a termed attachment's lapse in [`Partition::termed_by_expiry`] and notes it for the keeper (A-536); any
+  /// other kind holds no term.
+  fn index_term(&mut self, record: &AttachmentRecord) {
+    if let Consumer::Termed { expires_ns } = record.consumer {
+      self.termed_by_expiry.insert((expires_ns, record.id));
+      self.term_noted = Some(
+        self
+          .term_noted
+          .map_or(expires_ns, |noted| noted.min(expires_ns)),
+      );
+    }
+  }
+
+  /// Takes a termed attachment's lapse out of [`Partition::termed_by_expiry`].
+  fn unindex_term(&mut self, record: &AttachmentRecord) {
+    if let Consumer::Termed { expires_ns } = record.consumer {
+      self.termed_by_expiry.remove(&(expires_ns, record.id));
+    }
+  }
+
+  /// The termed attachments whose term lapsed by `now_ns`, read from their index alone (A-536): the caller ends each.
+  pub fn lapsed_terms(&self, now_ns: u64) -> Vec<u64> {
+    self
+      .termed_by_expiry
+      .iter()
+      .take_while(|(expires_ns, _)| *expires_ns <= now_ns)
+      .map(|(_, id)| *id)
+      .collect()
+  }
+
+  /// When the next termed attachment lapses, the deadline the shard's keeper sleeps until for them (A-536).
+  pub fn next_term_lapse(&self) -> Option<u64> {
+    self
+      .termed_by_expiry
+      .first()
+      .map(|(expires_ns, _)| *expires_ns)
+  }
+
+  /// The earliest term entered since the last call, taken: the keeper wakes for it when it sleeps for a later deadline
+  /// (A-536).
+  pub fn take_noted_term(&mut self) -> Option<u64> {
+    self.term_noted.take()
   }
 
   /// The highest attachment id the partition holds, or `None` when it holds none (a walk of the table,
@@ -878,14 +1097,23 @@ impl Partition {
       })
   }
 
-  /// The grants made for a principal (a walk of the table; a `slates grants` read, never a
-  /// hot path).
-  pub fn grants_of(&self, principal: &Principal) -> Vec<&GrantRecord> {
+  /// `principal`'s grants past grant id `after` (`None`: from the first), in grant-id order (§4.13, A-266, A-267): a
+  /// range from the cursor over the id-ordered table, so a page of a principal's grants costs the grants it passes, never
+  /// the whole table; collecting every grant of the principal and then skipping to the cursor cost the table each page.
+  pub fn grants_of_after<'a>(
+    &'a self,
+    principal: &'a Principal,
+    after: Option<u64>,
+  ) -> impl Iterator<Item = &'a GrantRecord> + 'a {
+    let from = match after {
+      Some(after) => std::ops::Bound::Excluded(after),
+      None => std::ops::Bound::Unbounded,
+    };
     self
       .grants
-      .values()
-      .filter(|g| &g.principal == principal)
-      .collect()
+      .range((from, std::ops::Bound::Unbounded))
+      .map(|(_, grant)| grant)
+      .filter(move |grant| &grant.principal == principal)
   }
 
   /// A grant.
@@ -896,6 +1124,25 @@ impl Partition {
   /// Every grant, by id order: what a restarted shard rebuilds its runtime grants from (AUD-29-06).
   pub fn grants(&self) -> impl Iterator<Item = &GrantRecord> {
     self.grants.values()
+  }
+
+  /// A grant's state change: at a terminal step (consumed, expired, revoked) it leaves the table (A-266), which holds
+  /// live grants; its history is the audit log.
+  fn change_grant_state(&mut self, id: u64, state: GrantState) -> Result<(), DbError> {
+    if matches!(
+      state,
+      GrantState::Consumed | GrantState::Expired | GrantState::Revoked
+    ) {
+      self.grants.remove(&id).ok_or(DbError::NotFound)?;
+    } else {
+      self.grants.get_mut(&id).ok_or(DbError::NotFound)?.state = state;
+    }
+    Ok(())
+  }
+
+  /// The highest grant id ever issued here (A-266), whatever grants have since ended and left the table.
+  pub fn grants_issued_through(&self) -> u64 {
+    self.grants_issued_through
   }
 
   /// An enrolled consumer's record (§4.13), or `None` if no such consumer was ever enrolled.
@@ -1058,9 +1305,99 @@ impl Partition {
     self.landings.keys().next_back().copied()
   }
 
-  /// The audit records retained in memory (the ring is the durable stream).
-  pub fn audit(&self) -> &[AuditRecord] {
-    &self.audit
+  /// The audit records retained, oldest first (A-265): the newest `caps.audit_records` of them. Their history is the
+  /// log and the snapshots that carry this window; what fell past the bound is counted ([`Partition::audit_dropped`]).
+  pub fn audit(&self) -> impl Iterator<Item = &AuditRecord> {
+    self.audit.iter()
+  }
+
+  /// The audit records from sequence `since` on, oldest first (A-265, A-267): a seek, never a scan of the window. The
+  /// window is in sequence order (each record is numbered as it is appended, and the oldest leave first), so a page of
+  /// the audit costs the records it carries and a binary search, not the window's length; filtering the window from its
+  /// start made a walk of it quadratic in the window.
+  pub fn audit_from(&self, since: u64) -> impl Iterator<Item = &AuditRecord> {
+    let start = self.audit.partition_point(|record| record.seq < since);
+    self.audit.range(start..)
+  }
+
+  /// The audit records dropped oldest first past the bound since the partition began (A-265).
+  pub fn audit_dropped(&self) -> u64 {
+    self.audit_dropped
+  }
+
+  /// Appends an audit record, numbered here in log order whatever it carried (A-265): the guard-then-apply rule, so a
+  /// replay numbers each record as the live partition did. Bounded: the oldest leaves, counted, once the window is
+  /// full, from the caps alone, so a replay keeps the same window.
+  fn append_audit(&mut self, record: &AuditRecord) {
+    let mut record = record.clone();
+    record.seq = self.audit_next_seq;
+    self.audit_next_seq = self.audit_next_seq.saturating_add(1);
+    self.audit.push_back(record);
+    while self.audit.len() > self.caps.audit_records {
+      self.audit.pop_front();
+      self.audit_dropped = self.audit_dropped.saturating_add(1);
+    }
+  }
+
+  /// The audit records this partition owes the control partition, oldest first, each carrying its crossing sequence in
+  /// `seq` (A-265): what a batch sends, from the oldest, so a batch that was lost is in the next one.
+  pub fn audit_outbox(&self) -> impl Iterator<Item = &AuditRecord> {
+    self.audit_outbox.iter()
+  }
+
+  /// On the control partition: the crossing sequence of the first record partition `origin` owes that is not appended
+  /// here (A-265); 0 for a partition that delivered none.
+  pub fn audit_received(&self, origin: u16) -> u64 {
+    self.audit_received.get(&origin).copied().unwrap_or(0)
+  }
+
+  /// The audit crossing's three records (A-265), unconditional so a replay repeats them:
+  /// - `AuditOwed`: the record enters the outbox under the next crossing sequence; past the bound the oldest leaves,
+  ///   counted, from the caps alone, as `append_audit`'s window does.
+  /// - `AuditDelivered`: the records before `through` leave the outbox; an older acknowledgement than one already
+  ///   applied removes nothing.
+  /// - `AuditBatchAppended`: the records at or past `origin`'s mark are appended, in order, and the mark moves to the
+  ///   batch's end; a record before the mark was appended by an earlier batch and is passed over. A batch whose first
+  ///   record is past the mark appends from its first: the records between were dropped from the outbox's bound, and
+  ///   counted there.
+  fn apply_audit_crossing(&mut self, op: &Op) {
+    match op {
+      Op::AuditOwed { record } => {
+        let mut record = record.clone();
+        record.seq = self.audit_outbox_next;
+        self.audit_outbox_next = self.audit_outbox_next.saturating_add(1);
+        self.audit_outbox.push_back(record);
+        while self.audit_outbox.len() > self.caps.audit_records {
+          self.audit_outbox.pop_front();
+          self.audit_dropped = self.audit_dropped.saturating_add(1);
+        }
+      }
+      Op::AuditDelivered { through } => {
+        while self
+          .audit_outbox
+          .front()
+          .is_some_and(|record| record.seq < *through)
+        {
+          self.audit_outbox.pop_front();
+        }
+      }
+      Op::AuditBatchAppended {
+        origin,
+        first,
+        records,
+      } => {
+        let from = self.audit_received(*origin);
+        for (crossing, record) in (*first..).zip(records) {
+          if crossing >= from {
+            self.append_audit(record);
+          }
+        }
+        let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        let end = first.saturating_add(count);
+        self.audit_received.insert(*origin, from.max(end));
+      }
+      _ => {}
+    }
   }
 
   // ------------------------------------------------------------------ the guard
@@ -1078,6 +1415,13 @@ impl Partition {
         if let Some(alias) = self.name_alias(&record.name) {
           return Err(DbError::AlreadyExists {
             existing: alias.volume.bytes,
+          });
+        }
+        // A work being admitted here holds its name meanwhile (A-247), against a work made on another shard as much as
+        // against one made here (A-400).
+        if let Some(pending) = self.pending_creations.get(&record.name) {
+          return Err(DbError::AlreadyExists {
+            existing: pending.work.bytes,
           });
         }
         if self.name_aliases.len() >= self.caps.volumes {
@@ -1113,6 +1457,38 @@ impl Partition {
             table: "tombstone sequence",
           })
       }
+      // A moved volume leaves only as a whole record (A-291): no attachment of it may be left behind to name it.
+      Op::VolumeReleased { id } => {
+        self.volume(*id).ok_or(DbError::NotFound)?;
+        let attachments = self.attachments_of(*id).len();
+        if attachments > 0 {
+          return Err(DbError::Attached {
+            attachments: u32::try_from(attachments).unwrap_or(u32::MAX),
+          });
+        }
+        Ok(())
+      }
+      // A captured base names a snapshot this partition holds (A-291).
+      Op::BaseCaptured { volume, snapshot } => {
+        self.snapshot(*volume, *snapshot).ok_or(DbError::NotFound)?;
+        Ok(())
+      }
+      // A carried capture names a volume here, and its mark one of that volume's snapshots (A-503).
+      Op::CaptureCarried { volume, mark, .. } | Op::CaptureAdopted { volume, mark, .. } => {
+        self.volume(*volume).ok_or(DbError::NotFound)?;
+        if let Some(mark) = mark {
+          self.snapshot(*volume, *mark).ok_or(DbError::NotFound)?;
+        }
+        Ok(())
+      }
+      // A repository's record and namespace keep §4.17.1's rules (A-515): `crate::repository`.
+      Op::RepositoryCreated { .. }
+      | Op::RepositoryBranchAdded { .. }
+      | Op::RepositoryBranchRetired { .. }
+      | Op::RepositoryDefaultSet { .. }
+      | Op::RepositoryDestroyed { .. } => self
+        .repositories
+        .check(op, self.caps.volumes, |id| self.held(id)),
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1179,6 +1555,9 @@ impl Partition {
       }
       Op::AttachmentRemoved { id } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::AttachmentBound { id, .. } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
+      Op::AttachmentMountSeen { id, .. } => {
+        self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound)
+      }
       // Only an attachment presenting a snapshot is re-pinned; the head is not a version to move from.
       Op::AttachmentRepinned { id, .. } => self
         .attachment(*id)
@@ -1312,7 +1691,11 @@ impl Partition {
         Ok(())
       }
       Op::LandingStateChanged { id, .. } => self.landing(*id).map(|_| ()).ok_or(DbError::NotFound),
-      Op::AuditAppended { .. } => Ok(()),
+      // The audit is never refused (A-265): its records are the history of what happened, kept or counted as dropped.
+      Op::AuditAppended { .. }
+      | Op::AuditOwed { .. }
+      | Op::AuditDelivered { .. }
+      | Op::AuditBatchAppended { .. } => Ok(()),
       Op::GreenAdvanced { green, increment } => {
         self.volume(*green).ok_or(DbError::NotFound)?;
         // Bounded growth (§4.16; CLAUDE.md): the chain grows per accepted version, so a new increment
@@ -1462,6 +1845,40 @@ impl Partition {
 
   // ------------------------------------------------------------------ the transition
 
+  /// [`Op::VolumeDestroyed`]'s effect: the tombstone takes the volume's slot, its sequence read before the record goes;
+  /// and the volume's lineage key goes with it, in the same record (A-92; seal.md §3.1, cryptographic erase): its one
+  /// wrapped copy was here, so every chunk sealed under it, on any holder, opens for no one after this.
+  fn destroy_volume(&mut self, id: VolumeId) -> Result<(), DbError> {
+    let sequence = self.tombstone_sequence(id);
+    let tenant = self.volume(id).map(|volume| volume.owner.tenant());
+    self.remove_volume(id)?;
+    if let Some(sequence) = sequence {
+      self.tombstones.insert(id, sequence);
+    }
+    self.erase_volume_keys(id, tenant);
+    Ok(())
+  }
+
+  /// [`Op::SnapshotDestroyed`]'s effect: the record and its index entry go, with any capture base it was; and a carried
+  /// capture's mark goes with its snapshot (A-503), so its landings are refused from then on.
+  fn destroy_snapshot(&mut self, volume: VolumeId, id: SnapshotId) -> Result<(), DbError> {
+    let h = self
+      .snapshot_index
+      .remove(&snapshot_key(volume, id))
+      .ok_or(DbError::NotFound)?;
+    self.snapshots.remove(h)?;
+    self.captured_bases.remove(&CapturedBase {
+      volume,
+      snapshot: id,
+    });
+    if let Some((_, mark)) = self.carried.get_mut(&volume)
+      && *mark == Some(id)
+    {
+      *mark = None;
+    }
+    Ok(())
+  }
+
   /// Applies a recorded operation; unconditional, so replay is deterministic. A record the
   /// operation names that does not exist (a corrupted history) is a typed refusal.
   pub fn apply(&mut self, op: &Op) -> Result<(), DbError> {
@@ -1515,32 +1932,42 @@ impl Partition {
         v.policy.write_version = v.policy.write_version.saturating_add(1);
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
-      Op::VolumeDestroyed { id } => {
-        // The tombstone takes the volume's slot: its sequence is read before the record goes.
-        let sequence = self.tombstone_sequence(*id);
-        let tenant = self.volume(*id).map(|volume| volume.owner.tenant());
-        self.remove_volume(*id)?;
-        if let Some(sequence) = sequence {
-          self.tombstones.insert(*id, sequence);
-        }
-        // The volume's lineage key goes with it, in the same record (A-92; seal.md §3.1, cryptographic erase): its
-        // one wrapped copy was here, so every chunk sealed under it, on any holder, opens for no one after this.
-        self
-          .seal_keys
-          .remove(&SealKeyOwner::Lineage { volume: *id });
-        self.seal_keys.remove(&SealKeyOwner::Naming { volume: *id });
-        // A tenant key wraps only its volumes' lineage keys, so with the tenant's last volume on this partition it is
-        // erased too, in the same record. The scan is bounded by the partition's volume cap, once per destroy.
-        if let Some(account) = tenant
-          && !self
-            .volumes()
-            .iter()
-            .any(|volume| volume.owner.tenant() == account)
-        {
-          self.seal_keys.remove(&SealKeyOwner::Tenant { account });
-        }
+      Op::VolumeDestroyed { id } => self.destroy_volume(*id),
+      Op::VolumeReleased { id } => self.release_volume(*id),
+      Op::BaseCaptured { volume, snapshot } => {
+        self.captured_bases.insert(CapturedBase {
+          volume: *volume,
+          snapshot: *snapshot,
+        });
         Ok(())
       }
+      // The catalog register carries it (A-503), so its version moves as the write policy's does.
+      Op::CaptureCarried {
+        volume,
+        carried,
+        mark,
+      } => {
+        self.update_volume(*volume, |v| {
+          v.catalog_version = v.catalog_version.saturating_add(1);
+        })?;
+        self.carried.insert(*volume, (carried.clone(), *mark));
+        Ok(())
+      }
+      // Adopted with the volume's catalog, which already carries it: its version stays (A-503).
+      Op::CaptureAdopted {
+        volume,
+        carried,
+        mark,
+      } => {
+        self.volume(*volume).ok_or(DbError::NotFound)?;
+        self.carried.insert(*volume, (carried.clone(), *mark));
+        Ok(())
+      }
+      Op::RepositoryCreated { .. }
+      | Op::RepositoryBranchAdded { .. }
+      | Op::RepositoryBranchRetired { .. }
+      | Op::RepositoryDefaultSet { .. }
+      | Op::RepositoryDestroyed { .. } => self.repositories.apply(op),
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
       Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
@@ -1572,14 +1999,7 @@ impl Partition {
         self.snapshots.get_mut(h)?.identity = Some(*identity);
         Ok(())
       }
-      Op::SnapshotDestroyed { volume, id } => {
-        let h = self
-          .snapshot_index
-          .remove(&snapshot_key(*volume, *id))
-          .ok_or(DbError::NotFound)?;
-        self.snapshots.remove(h)?;
-        Ok(())
-      }
+      Op::SnapshotDestroyed { volume, id } => self.destroy_snapshot(*volume, *id),
       Op::LineageAdded { edge } => {
         self.lineage.insert(&edge.child.bytes, edge.clone());
         Ok(())
@@ -1589,6 +2009,7 @@ impl Partition {
       Op::AttachmentAdded { record } => {
         let h = self.attachments.insert(record.clone())?;
         self.attachment_index.insert(&record.id.to_be_bytes(), h);
+        self.index_term(record);
         Ok(())
       }
       Op::ClientIdReserved { client } => {
@@ -1620,9 +2041,17 @@ impl Partition {
           .get(&id.to_be_bytes())
           .ok_or(DbError::NotFound)?;
         let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
-        record.consumer = Consumer::Termed {
-          expires_ns: *expires_ns,
-        };
+        let lapsed_at = std::mem::replace(
+          &mut record.consumer,
+          Consumer::Termed {
+            expires_ns: *expires_ns,
+          },
+        );
+        let renewed = record.clone();
+        if let Consumer::Termed { expires_ns: before } = lapsed_at {
+          self.termed_by_expiry.remove(&(before, *id));
+        }
+        self.index_term(&renewed);
         Ok(())
       }
       Op::AttachmentExpired { id } => {
@@ -1689,6 +2118,15 @@ impl Partition {
             (None, None) => crate::catalog::AttachForm::ChosenPath { path: path.clone() },
           };
         }
+        Ok(())
+      }
+      Op::AttachmentMountSeen { id, mount } => {
+        let h = *self
+          .attachment_index
+          .get(&id.to_be_bytes())
+          .ok_or(DbError::NotFound)?;
+        let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
+        record.mount = Some(*mount);
         Ok(())
       }
       Op::AttachmentRepinned { id, snapshot } => {
@@ -1775,13 +2213,11 @@ impl Partition {
         Ok(())
       }
       Op::GrantIssued { record } => {
+        self.grants_issued_through = self.grants_issued_through.max(record.id);
         self.grants.insert(record.id, record.clone());
         Ok(())
       }
-      Op::GrantStateChanged { id, state } => {
-        self.grants.get_mut(id).ok_or(DbError::NotFound)?.state = *state;
-        Ok(())
-      }
+      Op::GrantStateChanged { id, state } => self.change_grant_state(*id, *state),
       Op::ConsumerEnrolled { record } => {
         self.consumers.insert(record.consumer, record.clone());
         Ok(())
@@ -1830,7 +2266,11 @@ impl Partition {
         Ok(())
       }
       Op::AuditAppended { record } => {
-        self.audit.push(record.clone());
+        self.append_audit(record);
+        Ok(())
+      }
+      Op::AuditOwed { .. } | Op::AuditDelivered { .. } | Op::AuditBatchAppended { .. } => {
+        self.apply_audit_crossing(op);
         Ok(())
       }
       Op::GreenAdvanced { green, increment } => {
@@ -1978,6 +2418,10 @@ impl Partition {
       }
     }
     self.lineage.remove(&id.bytes);
+    self.captured_bases.retain(|captured| captured.volume != id);
+    self.carried.remove(&id);
+    // A destroyed green leaves the namespace that bound it (§4.17.1, A-515).
+    self.repositories.green_removed(id);
     // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
     // a volume that no longer exists), returning its bytes to the chain budget.
     if let Some(chain) = self.green_chains.remove(&id) {
@@ -2033,7 +2477,24 @@ impl Partition {
         table: "lease timers",
       })?;
     self.lease_timers.insert(volume, timer);
+    // Noted as the wheel will report it, its tick at or after the expiry (`next_lease_expiry`), so the keeper's own arming
+    // for it reads as no earlier deadline.
+    let tick = self.lease_expiry.tick_ns().max(1);
+    let due = lease.expires_ns.div_ceil(tick).saturating_mul(tick);
+    self.lease_noted = Some(self.lease_noted.map_or(due, |noted| noted.min(due)));
     Ok(())
+  }
+
+  /// The earliest lease expiry entered since the last call, taken: the shard's keeper wakes for it when it sleeps for a
+  /// later deadline (A-536).
+  pub fn take_noted_lease(&mut self) -> Option<u64> {
+    self.lease_noted.take()
+  }
+
+  /// When the next lease lapses on the wheel, the deadline the shard's keeper sleeps until for leases (A-536): the
+  /// wheel's tick at or after the earliest expiry, so a pass at that moment finds the lease due.
+  pub fn next_lease_expiry(&mut self) -> Option<u64> {
+    self.lease_expiry.next_deadline_ns()
   }
 
   /// The volumes whose leases expired by `now_ns` (the caller records `LeaseReleased` for
@@ -2112,7 +2573,7 @@ impl Partition {
       grants: self.grants.values().cloned().collect(),
       landing_leases: self.landing_leases.iter().map(|(_, l)| l.clone()).collect(),
       landings: self.landings.values().cloned().collect(),
-      audit: self.audit.clone(),
+      audit: self.audit.iter().cloned().collect(),
       consumers: self.consumers.values().cloned().collect(),
       nfs_opens: self.nfs_opens.values().cloned().collect(),
       nfs_delegations: self.nfs_delegations.values().cloned().collect(),
@@ -2140,6 +2601,20 @@ impl Partition {
         })
         .collect(),
       green_adoptions: self.green_adoptions.values().copied().collect(),
+      captured_bases: self.captured_bases.iter().copied().collect(),
+      carried_captures: self
+        .carried
+        .iter()
+        .map(
+          |(volume, (carried, mark))| crate::catalog::CarriedCaptureRecord {
+            volume: *volume,
+            carried: carried.clone(),
+            mark: *mark,
+          },
+        )
+        .collect(),
+      repositories: self.repositories.repositories().cloned().collect(),
+      repository_branches: self.repositories.bindings().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2153,6 +2628,19 @@ impl Partition {
       pending_submits: self.pending_submits.values().cloned().collect(),
       pending_creations: self.pending_creations.values().cloned().collect(),
       expired_attachments: self.expired_attachments.iter().copied().collect(),
+      audit_next_seq: self.audit_next_seq,
+      audit_dropped: self.audit_dropped,
+      grants_issued_through: self.grants_issued_through,
+      audit_outbox: self.audit_outbox.iter().cloned().collect(),
+      audit_outbox_next: self.audit_outbox_next,
+      audit_received: self
+        .audit_received
+        .iter()
+        .map(|(origin, through)| crate::catalog::AuditReceivedMark {
+          origin: *origin,
+          through: *through,
+        })
+        .collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -2336,6 +2824,7 @@ impl Partition {
     for a in &snapshot.attachments {
       let h = p.attachments.insert(a.clone())?;
       p.attachment_index.insert(&a.id.to_be_bytes(), h);
+      p.index_term(a);
     }
     p.restore_completions(&snapshot.completions);
     for g in &snapshot.grants {
@@ -2347,13 +2836,33 @@ impl Partition {
     for l in &snapshot.landings {
       p.landings.insert(l.id, l.clone());
     }
-    p.audit = snapshot.audit.clone();
+    p.audit = snapshot.audit.iter().cloned().collect();
+    p.audit_dropped = snapshot.audit_dropped;
+    p.audit_next_seq = snapshot.audit_next_seq;
+    p.grants_issued_through = snapshot.grants_issued_through;
+    p.audit_outbox = snapshot.audit_outbox.iter().cloned().collect();
+    p.audit_outbox_next = snapshot.audit_outbox_next;
+    p.audit_received = snapshot
+      .audit_received
+      .iter()
+      .map(|mark| (mark.origin, mark.through))
+      .collect();
     p.restore_merge(snapshot);
     p.restore_nfs(snapshot);
     p.restore_name_aliases(snapshot);
     p.restore_work_records(snapshot);
     p.restore_expired_attachments(snapshot);
     p.restore_consumers_and_tombstones(snapshot);
+    p.captured_bases = snapshot.captured_bases.iter().copied().collect();
+    p.carried = snapshot
+      .carried_captures
+      .iter()
+      .map(|record| (record.volume, (record.carried.clone(), record.mark)))
+      .collect();
+    p.repositories = crate::repository::Repositories::restore(
+      &snapshot.repositories,
+      &snapshot.repository_branches,
+    )?;
     Ok(p)
   }
 

@@ -835,12 +835,17 @@ pub mod feature {
     /// runner that didn't name it isn't asked: a person's view of their volumes says it couldn't be, and a start's
     /// placement counts none of its volumes' bytes as held there.
     pub const VOLUMES: &str = "agents.volumes";
+    /// This runner moves an agent's workspace volume with it by Slates' own move (`Command::MoveTo::slates`, kiln goal
+    /// 95101ef3, K4), and mounts one that arrived with a session before its harness starts; the server moves a volume
+    /// only between two runners that name it, and refuses the move otherwise (an older runner would hand the session
+    /// over without its volume).
+    pub const SLATES_MOVE: &str = "workspace.slates.move";
     /// This runner runs sessions with the environments the server resolves for them (docs/agents.md,
     /// "Environments": `Spec::agentenv`, `Command::Agentenv`), and says which variables its user has, by
     /// name, as the server asks ([`super::ServerMsg::UserEnv`]). A runner that didn't name it isn't sent
     /// one: a start with an environment there is refused, saying so.
     pub const AGENTENV: &str = "agentenv";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, AGENTENV];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

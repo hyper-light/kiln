@@ -53,21 +53,21 @@ pub use grants::{
 pub use id::BoxId;
 pub use runtime::{
     Allocation, Asked, BackingGrant, BackingKey, BackingOffer, BackingPhase, BoxInfo, BoxState,
-    Capacity, CapacityResources, Charged, ConnectFailure, ConnectPhase, ConnectReply, ControlLink,
-    ControlWake, Execution, Exit, GpuEligibility, GuestEnd, GuestFailure, GuestTime, HomeVolume,
-    HostUse, ImageArch, ImageOs, ImagePlatform, IoKind, Killer, Learned, LearnedAwait,
+    Capacity, CapacityResources, Charged, ComponentAt, ConnectFailure, ConnectPhase, ConnectReply,
+    ControlLink, ControlWake, Execution, Exit, GpuEligibility, GuestEnd, GuestFailure, GuestTime,
+    HomeVolume, HostUse, ImageArch, ImageOs, ImagePlatform, IoKind, Killer, Learned, LearnedAwait,
     LearnedCeiling, LearnedEnd, LearnedHolder, LearnedHolding, LearnedOverhead, LearnedPrior,
     LearnedRank, LearnedRate, LearnedReservations, LearnedUnacted, LearnedUnread,
     LearnedUnrecorded, LearnedUse, LearnedWindow, LifecycleCause, MAX_LEARNED_HOLDINGS,
     MAX_LEARNED_PRIORS, MAX_RUNTIME_ROUTES, MachineTime, Membership, Negotiated, NodeRun,
-    NodeVmPhase, NodeVmReceipt, Proc, RateHeld, Refusal, Reserved, RouteKey, RouteOffer,
-    RouteReceipt, Runtime, RuntimeCost, Signal, StartedFrom, Upstream, Usage, VmSize, VolumeCause,
-    WARM_ROOM, WarmHeld, WarmPool,
+    NodeVmPhase, NodeVmReceipt, PauseCause, Proc, RateHeld, Refusal, Reserved, RouteKey,
+    RouteOffer, RouteReceipt, Runtime, RuntimeCost, Signal, StartedFrom, SwapCause, SwapWhen,
+    Swapped, Upstream, Usage, VmSize, VolumeCause, WARM_ROOM, WarmHeld, WarmPool,
 };
 pub use spec::{
     Ask, BlockCount, BoxOwner, BoxSpec, Class, ClassSpec, End, ExecLimit, Given, ImageMember,
-    ImageVolume, Mount, Network, OciSpec, Program, Rootfs, ServedMount, ShardsImage, Stdio,
-    StringUnit, User, check_pinned, drive_absolute,
+    ImageShare, ImageVolume, Mount, Network, OciSpec, Program, Rootfs, ServedMount, ShardsImage,
+    Stdio, StringUnit, User, check_pinned, drive_absolute,
 };
 
 /// A caller's owned stream: Unix's descriptor becomes a file; Windows keeps the handle's resource kind.

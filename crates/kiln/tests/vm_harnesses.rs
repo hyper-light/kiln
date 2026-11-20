@@ -405,6 +405,39 @@ mod checks {
         assert!(said_marker(&lines, STUB_DONE));
     }
 
+    /// r41 (jupiter, kiln 7d760b850): what devin said by the drive's look, its first turn and the turn kiln started
+    /// to tell it the agent it started had ended, whose `HEARD` quotes that agent's `CWD` and `WHERE`. Its folder
+    /// and kernel are its first turn's. Red: `first_turn` keeping every line, failing with r41's own words.
+    #[test]
+    fn s34_the_first_turn_ends_at_its_marker() {
+        let project = r"C:\Users\corph\.cache\xplat\windows\w\t\.tmpidbtmV\project";
+        let read: Vec<String> = [
+            "CWD /mnt/c/Users/corph/.cache/xplat/windows/w/t/.tmpidbtmV/project",
+            "WHERE Linux aa598e29-87e9-4e06-b668-874bbe7986fa",
+            "HEARD WRITE=vm-e2e-2e500e28699c.txt MCP_PING SPAWN=devin do the task",
+            "WROTE vm-e2e-2e500e28699c.txt",
+            "MCP_OK 109 code_run",
+            "MCP_AS 01a1ed46e72273e29f44b28bd7f23623",
+            "SPAWN_OK 01a1ed53df777712af1c3c050921205f",
+            "line 00000",
+            "line 00001",
+            "STUB_DONE",
+            "CWD /mnt/c/Users/corph/.cache/xplat/windows/w/t/.tmpidbtmV/project",
+            "WHERE Linux aa598e29-87e9-4e06-b668-874bbe7986fa",
+            "HEARD Agent \u{201c}Devin\u{201d} (01a1ed53), which you started, ended its turn: CWD /mnt/c/Users/corph/.cache/xplat/windows/w/t/.tmpidbtmV/project WHERE Linux 5607892d-31f9-4e54-b0d2-d34b1d4422d0 HEARD CHILD do the task",
+            "line 00000",
+            "line 00001",
+            "STUB_DONE",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let first = first_turn(read, STUB_DONE);
+        assert_eq!(check_project_path(Some(project), cwd_said(&first).as_deref(), project, "windows"), Ok(()));
+        assert_eq!(where_said(&first), Some(Where { kernel: "Linux".into(), boot: Some("aa598e29-87e9-4e06-b668-874bbe7986fa".into()) }));
+        assert_eq!(first.last().map(String::as_str), Some(STUB_DONE), "the first turn keeps its marker");
+    }
+
     #[test]
     fn s34_kilns_mcp_server_is_reached_from_where_the_harness_runs() {
         let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
@@ -591,29 +624,49 @@ mod waits {
         assert_eq!(w.look(&word("running"), &[], None, true, s(86_401)), Verdict::Done);
     }
 
-    /// Once its harness answered, the slowest answer it gave in the drive bounds how long a wait may
-    /// go without progress, and progress moves the window on. Learning the last answer rather than the
-    /// slowest, or counting the window from the wait's start rather than its last progress, fails it.
+    /// Once its harness answered twice or more, the tail of its answers of a wait's kind bounds how long that
+    /// wait may go without progress ([`tail`]: past the slowest of them, wide for a few and closer for many),
+    /// and progress moves the window on; one answer measures no spread, so it bounds nothing, and a kind
+    /// never answered (a landing's first turn) has no window whatever the drive's other answers. The
+    /// slowest single answer as the window refused a landing's turn at 373 ms of ordinary load
+    /// (the coordinator's proofs, 2026-11-18); counting the window from the wait's start rather than its last
+    /// progress, or one kind's answers bounding another's, fails it.
     #[test]
-    fn s35_its_slowest_answer_bounds_a_wait_without_progress() {
+    fn s35_its_answers_tail_bounds_a_wait_without_progress() {
         let mut pace = Pace::default();
-        for took in [3, 11, 2] {
-            pace.answered(s(took));
+        pace.answered(Asked::Message("m"), s(3));
+        assert_eq!(pace.window(Asked::Message("m")), None, "one answer: no spread measured");
+        for took in [11, 2, 4, 5, 3, 6, 4, 5, 3] {
+            pace.answered(Asked::Message("m"), s(took));
         }
         assert_eq!(pace.slowest(), Some(s(11)));
-        let window = pace.window(Asked::Message("m"));
-        assert_eq!(window, Some(s(11)));
-        let mut w = Watch::new(Asked::Message("m"), window);
+        assert_eq!(pace.window(Asked::Landing("l")), None, "a landing's turn: no landing answered yet");
+        assert_eq!(pace.window(Asked::Opening), None, "nor a first turn");
+        let window = pace.window(Asked::Message("m")).unwrap_or_default();
+        assert!(window > s(11), "past the slowest answer: {window:?}");
+        let mut w = Watch::new(Asked::Message("m"), Some(window));
         let asked = vec![user(1, "m", "go")];
         assert_eq!(w.look(&word("running"), &asked, None, false, s(0)), Verdict::Wait);
         let line = vec![user(1, "m", "go"), says(2, "line 00000")];
-        assert_eq!(w.look(&word("running"), &line, None, false, s(10)), Verdict::Wait);
-        assert_eq!(w.look(&word("running"), &line, None, false, s(21)), Verdict::Wait);
-        // kiln's word moving is progress too (its queue, here).
-        let queued = with(&word("running"), "queued", json!(1));
-        assert_eq!(w.look(&queued, &line, None, false, s(30)), Verdict::Wait);
-        assert_eq!(w.look(&queued, &line, None, false, s(41)), Verdict::Wait);
-        assert_eq!(w.look(&queued, &line, None, false, s(42)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
+        let moved = s(10);
+        assert_eq!(w.look(&word("running"), &line, None, false, moved), Verdict::Wait);
+        assert_eq!(w.look(&word("running"), &line, None, false, moved + window), Verdict::Wait, "a whole window since it moved, no more");
+        let past = moved + window + s(1);
+        assert_eq!(w.look(&word("running"), &line, None, false, past), Verdict::Refuse(Stall::Quiet { quiet: window + s(1), bound: window }));
+    }
+
+    /// The tail's Student's t, by its closed form for whole degrees: the textbook's two-sided 95 % points
+    /// (12.706 for one degree, 4.303 for two, 2.228 for ten) and the normal's 1.960 approached with many.
+    #[test]
+    fn s35_the_tails_t_is_the_textbooks() {
+        for (nu, want) in [(1, 12.706), (2, 4.303), (10, 2.228), (1000, 1.962)] {
+            let got = t_upper(0.025, nu);
+            assert!((got - want).abs() < 1e-3, "t at 0.025 above, {nu} degrees: {got}, not {want}");
+        }
+        assert_eq!(tail(&[s(3)]), None, "one answer");
+        let few = tail(&[s(3), s(4)]).unwrap_or_default();
+        let many = tail(&[s(3), s(4), s(3), s(4), s(3), s(4), s(3), s(4), s(3), s(4)]).unwrap_or_default();
+        assert!(few > many && many > s(4), "a few answers give a wider window than many alike: {few:?}, {many:?}");
     }
 
     /// A turn the drive asked to be long waits as a first does, whatever its drive learned: no shorter
@@ -622,7 +675,10 @@ mod waits {
     #[test]
     fn s35_a_turn_asked_to_be_long_follows_its_harness_alone() {
         let mut pace = Pace::default();
-        pace.answered(s(1));
+        for took in [1, 2, 1] {
+            pace.answered(Asked::Message("m"), s(took));
+        }
+        assert!(pace.window(Asked::Message("m")).is_some());
         assert_eq!(pace.window(Asked::Steered("steer")), None);
         let mut w = Watch::new(Asked::Steered("steer"), pace.window(Asked::Steered("steer")));
         for secs in [0, 2, 3_600] {
@@ -644,10 +700,12 @@ mod waits {
         assert_eq!(later.window(Asked::Opening), None, "a cold start, whatever another drive's took");
         assert_eq!(later.window(Asked::Steered("steer")), None);
         let mut drove = Pace::default();
-        drove.answered(s(11));
-        assert_eq!(drove.window(Asked::Opening), Some(s(11)), "its own resumed start");
+        drove.answered(Asked::Opening, s(11));
+        drove.answered(Asked::Opening, s(10));
+        let resumed = drove.window(Asked::Opening);
+        assert!(resumed.is_some_and(|w| w >= s(11)), "its own starts bound its resumed start: {resumed:?}");
         assert_eq!(drove.window(Asked::Steered("steer")), None);
-        let mut w = Watch::new(Asked::Opening, drove.window(Asked::Opening));
+        let mut w = Watch::new(Asked::Opening, Some(s(11)));
         for (secs, cpu_us) in [(0, 1_000), (10, 900_000), (20, 1_800_000), (30, 2_500_000)] {
             w.parties(json!({"pids": [4242], "cpu_us": cpu_us}));
             assert_eq!(w.look(&word("starting"), &[], None, false, s(secs)), Verdict::Wait, "at {secs} s, its build working");
@@ -656,7 +714,7 @@ mod waits {
         w.parties(json!({"pids": [4250, 4251], "cpu_us": 40_000}));
         assert_eq!(w.look(&word("starting"), &[], None, false, s(41)), Verdict::Wait);
         assert_eq!(w.look(&word("starting"), &[], None, false, s(52)), Verdict::Wait, "still within its window");
-        assert_eq!(w.look(&word("starting"), &[], None, false, s(53)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
+        assert_eq!(w.look(&word("starting"), &[], None, false, s(53)), Verdict::Refuse(Stall::Quiet { quiet: s(12), bound: s(11) }));
     }
 
     /// A drive's own processes are those its runner's trees gained since it began: a build an earlier
@@ -803,6 +861,36 @@ mod waits {
         Ok(())
     }
 
+    /// A wait reads the frames that follow kiln's next change within a look's time of it, never past, so a socket
+    /// kiln keeps busy (its server samples itself every `[telemetry] sample_seconds`) can't keep it from looking
+    /// again. Here kiln speaks every twentieth of a look's time for twenty looks' time: a wait that reads on while
+    /// each frame follows the last within a look's time reads until kiln stops, as pre2's start's wait read kiln's
+    /// frames for hours, never asking again (adacachy, 2026-11-18).
+    #[test]
+    fn s35_a_busy_socket_never_holds_a_wait_past_a_looks_time() -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        let look = s(1);
+        let (every, speaks_for) = (look / 20, look.saturating_mul(20));
+        let busy = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            while began.elapsed() < speaks_for {
+                if server.write_all(&[0x81, 2, b'{', b'}']).is_err() {
+                    return;
+                }
+                std::thread::sleep(every);
+            }
+        });
+        let (said, ended) = frames(&mut client, None, look);
+        drop(client);
+        let _ = busy.join();
+        assert!(!said.is_empty(), "kiln's next change heard");
+        assert!(!ended, "it read kiln's {} frames until kiln stopped speaking, past a look's time", said.len());
+        Ok(())
+    }
+
     /// A wait's socket read is bounded by what's left of its window, never more: none before a first
     /// answer; from its last progress once there's one. Bounding the read by a period of its own would
     /// refuse late or look for nothing.
@@ -902,11 +990,11 @@ mod waits {
         assert!(matches!(w.look(&info, &events, Some(&state), false, s(24)), Verdict::Held(_)), "held still");
         // Taken by admission: nothing kiln states holds it, and a whole window passes without progress.
         w.heard(&admission_said("m", "accepted", None));
-        assert_eq!(w.look(&info, &events, Some(&state), false, s(36)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
+        assert_eq!(w.look(&info, &events, Some(&state), false, s(36)), Verdict::Refuse(Stall::Quiet { quiet: s(12), bound: s(11) }));
         let mut other = Watch::new(Asked::Message("m"), Some(s(11)));
         other.heard(&admission_said("n", "waiting", Some("peer_turn")));
         assert_eq!(other.look(&info, &events, Some(&state), false, s(0)), Verdict::Wait);
-        assert_eq!(other.look(&info, &events, Some(&state), false, s(12)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }), "another's wait");
+        assert_eq!(other.look(&info, &events, Some(&state), false, s(12)), Verdict::Refuse(Stall::Quiet { quiet: s(12), bound: s(11) }), "another's wait");
     }
 
     /// ROOT's five runs at eeebb5cbd: three resumed sessions idle, each with its opening prompt in
@@ -926,7 +1014,7 @@ mod waits {
         let mut w = Watch::new(Asked::Opening, Some(s(11)));
         assert_eq!(w.look(&info, &events, Some(&state), false, s(0)), Verdict::Wait);
         assert_eq!(w.look(&info, &events, Some(&state), false, s(11)), Verdict::Wait, "within its window");
-        let stuck = Stall::DeliveryStuck { message: opening.clone(), quiet: s(12), slowest: s(11) };
+        let stuck = Stall::DeliveryStuck { message: opening.clone(), quiet: s(12), bound: s(11) };
         assert_eq!(w.look(&info, &events, Some(&state), false, s(12)), Verdict::Refuse(stuck.clone()));
         let refused = Refused { what: "cursor taking its conversation up again".into(), stall: stuck, evidence: told(&info, &Ok(state.clone()), &events) };
         let text = refused.to_string();
@@ -937,7 +1025,7 @@ mod waits {
         let running = with(&info, "status", json!("running"));
         let mut w = Watch::new(Asked::Opening, Some(s(11)));
         assert_eq!(w.look(&running, &events, Some(&state), false, s(0)), Verdict::Wait);
-        assert_eq!(w.look(&running, &events, Some(&state), false, s(12)), Verdict::Refuse(Stall::Quiet { quiet: s(12), slowest: s(11) }));
+        assert_eq!(w.look(&running, &events, Some(&state), false, s(12)), Verdict::Refuse(Stall::Quiet { quiet: s(12), bound: s(11) }));
     }
 
     /// A paused session's message waits in kiln's queue (nothing goes to its harness until the pause

@@ -11,9 +11,10 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { basename } from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { Worker } from 'node:worker_threads';
 import { AsyncClient } from '../async.mjs';
+import { endAnchor, startAnchor } from './anchor.mjs';
 
 const require = createRequire(import.meta.url);
 const addonPath = process.env.SLATES_NODE_ADDON;
@@ -87,12 +88,7 @@ test('async lifecycle over a live daemon', async (t) => {
   // its own request (R5, R6). The anchor is killed in `finally`, so a failed assertion leaves nothing.
   const slates = require(addonPath);
   const instance = `slates-node-async-${process.pid}`;
-  // `detached` makes the anchor its own process-group leader, so teardown kills the whole group — the
-  // anchor and the daemon it supervises — at once.
-  const anchor = spawn(daemon, ['--instance', instance, 'anchor', '--quick', '--shards', '1'], {
-    stdio: 'ignore',
-    detached: true,
-  });
+  const anchor = startAnchor(daemon, instance);
   try {
     const client = await connectWhenReady(slates, instance);
     const bootstrap = spawnSync(daemon, ['--instance', instance, 'bootstrap', 'root'], {
@@ -144,6 +140,21 @@ test('async lifecycle over a live daemon', async (t) => {
     assert.equal(ids.length, CONCURRENCY);
     assert.equal(new Set(ids).size, CONCURRENCY, 'each concurrent create got a distinct volume id');
 
+    // A listing longer than one reply (§4.4 `list`): about three pages at these names (a page holds about 80
+    // summaries in a 4,096-byte reply chunk), and one await walks every page, each volume listed once. Before
+    // 2026-11-08 the whole listing was one reply, refused past about 80 volumes.
+    const PAGED_VOLUMES = 250;
+    const PAGED_BYTES = 1024 * 1024;
+    const pagedIds = [];
+    for (let start = 0; start < PAGED_VOLUMES; start += CONCURRENCY) {
+      const batch = Array.from({ length: Math.min(CONCURRENCY, PAGED_VOLUMES - start) }, (_, i) => `node-async-paged-${String(start + i).padStart(4, '0')}`);
+      pagedIds.push(...(await Promise.all(batch.map((name) => client.create(name, PAGED_BYTES)))));
+    }
+    const listedIds = (await client.list()).map((v) => v.id);
+    for (const id of pagedIds) {
+      assert.equal(listedIds.filter((listed) => listed === id).length, 1, `${id} listed once`);
+    }
+
     // Merge workflow (§4.16): a green, a work over it, a content edit, a clean submit — the async
     // merge loop, awaited on the same loop.
     const green = await client.createGreen('g-node-async');
@@ -187,12 +198,7 @@ test('async lifecycle over a live daemon', async (t) => {
     const nsOutcome = await client.submit(nsId);
     assert.equal(nsOutcome.ok, true, 'the async namespace ops submitted cleanly');
   } finally {
-    // Kill the whole process group so the supervised daemon goes with the anchor at once.
-    try {
-      process.kill(-anchor.pid, 'SIGKILL');
-    } catch {
-      // already gone
-    }
+    await endAnchor(anchor);
   }
 });
 
@@ -388,6 +394,14 @@ async function stopGroupAndWait(daemon, instance, anchorPid) {
 }
 
 test('every async call ends across restart, silence, reader loss and death', async (t) => {
+  // Windows has no SIGSTOP or SIGCONT, and no `pgrep` or `ps` to find the instance's daemons and read whether each has
+  // stopped. Its equivalent freeze is `NtSuspendProcess` over each process (slates' Rust suites use it:
+  // `crates/cli/tests/start_judgment.rs`), which a Node test can make only through native code; owed (GAPS, the Node
+  // SDK suites on Windows).
+  if (process.platform === 'win32') {
+    t.skip('Windows has no SIGSTOP, pgrep or ps for the freeze this test drives (owed: GAPS, the Node SDK suites on Windows) — skipped loudly');
+    return;
+  }
   const daemon = process.env.SLATES_DAEMON;
   if (!addonPath || !existsSync(addonPath) || !daemon || !existsSync(daemon)) {
     t.skip('SLATES_NODE_ADDON or SLATES_DAEMON is not set — skipped loudly');
@@ -395,10 +409,7 @@ test('every async call ends across restart, silence, reader loss and death', asy
   }
   const slates = require(addonPath);
   const instance = `slates-node-ends-${process.pid}`;
-  const anchor = spawn(daemon, ['--instance', instance, 'anchor', '--quick', '--shards', '1'], {
-    stdio: 'ignore',
-    detached: true,
-  });
+  const anchor = startAnchor(daemon, instance);
   const noise = startNoise();
   const ticker = startTicker();
   try {
@@ -463,7 +474,7 @@ test('every async call ends across restart, silence, reader loss and death', asy
 
     // (4) Death: a fresh client, then the anchor and its daemon killed for good.
     const fresh = await connectWhenReady(slates, instance);
-    process.kill(-anchor.pid, 'SIGKILL');
+    await endAnchor(anchor);
     await waitFor(async () => (await daemonPids(daemon, instance)).length === 0, 'the daemon is gone');
     const doomed = await Promise.allSettled(Array.from({ length: limit }, () => fresh.list()));
     for (const result of doomed) {
@@ -482,11 +493,7 @@ test('every async call ends across restart, silence, reader loss and death', asy
   } finally {
     await noise.stop();
     clearInterval(ticker.timer);
-    try {
-      process.kill(-anchor.pid, 'SIGKILL');
-    } catch (_) {
-      // already gone
-    }
+    await endAnchor(anchor);
     await spawner?.stop();
     spawner = null;
   }

@@ -6,11 +6,11 @@
 use slates_wire::Wire;
 
 use crate::catalog::{
-  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, CompletionRecord, ConsumerRecord,
-  GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
-  LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
-  PlacementState, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
-  VolumeState,
+  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, BranchRecord, CompletionRecord,
+  ConsumerRecord, GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState,
+  LeaseRecord, LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
+  NfsOpenRecord, PlacementState, RepositoryId, RepositoryRecord, SizeClass, SnapshotId,
+  SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
 };
 
 /// One mutation.
@@ -546,6 +546,109 @@ pub enum Op {
     /// archived); `None` for a green with no origin.
     origin: Option<[u8; 32]>,
   },
+  /// An audit record this partition owes the control partition (A-265's crossing, made durable 2026-11-18): kept in the
+  /// partition's outbox, numbered by its own crossing sequence in `apply`, until the control partition acknowledges it,
+  /// so it commits with the atom that made it and a crash before its batch arrives loses nothing. Appended.
+  AuditOwed {
+    /// The record; its `seq` is set in `apply`.
+    record: AuditRecord,
+  },
+  /// The control partition appended this partition's owed records before crossing sequence `through` (A-265): they
+  /// leave the outbox. Appended.
+  AuditDelivered {
+    /// The first crossing sequence the control partition has not appended.
+    through: u64,
+  },
+  /// On the control partition: a batch of the records partition `origin` owes, the first at crossing sequence `first`
+  /// (A-265). `apply` appends only those past what `origin` already delivered, and marks `origin` delivered through the
+  /// batch's end, so a batch sent again, after a crash or a lost acknowledgement, appends nothing twice. Appended.
+  AuditBatchAppended {
+    /// The partition that owed the records.
+    origin: u16,
+    /// The crossing sequence of the batch's first record.
+    first: u64,
+    /// The records, in crossing order.
+    records: Vec<AuditRecord>,
+  },
+  /// A volume moved to another fleet member left this node (§4.10 "Ownership follows the writer", A-291): its record,
+  /// snapshots, lineage and this node's copies of its keys go, as a destroy's do, but no tombstone stays. Its registers
+  /// belong to the member the configuration's moved-object exception names, which adopted them, so nothing here may
+  /// close them. Appended (2026-11-18).
+  VolumeReleased {
+    /// The volume.
+    id: VolumeId,
+  },
+  /// A snapshot was captured as a complete immutable base (§4.15 `capture_base`, A-291): its tree holds every name,
+  /// byte and attribute, none read from the host directory, so a clone of it is made with no base directory. Kept while
+  /// the snapshot and its volume are. Appended (2026-11-18).
+  BaseCaptured {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot.
+    snapshot: crate::catalog::SnapshotId,
+  },
+  /// A captured clone's move carried its capture (A-503): what the volume's catalog ships from now on, and the snapshot
+  /// here holding the head the move hands over (its mark, should the move thaw). Raises the catalog register's sequence,
+  /// so the catalog ships it before the move is reported. Replaces any carried capture the volume held. Appended
+  /// (2026-11-18).
+  CaptureCarried {
+    /// The volume.
+    volume: VolumeId,
+    /// What the move carries.
+    carried: crate::catalog::CarriedRecord,
+    /// The snapshot holding the head it is relative to.
+    mark: Option<crate::catalog::SnapshotId>,
+  },
+  /// A volume a move brought here was materialized with the carried capture its adopted catalog holds (A-503), its mark
+  /// the snapshot it was materialized as when that is the head the capture was carried against, else none. The catalog
+  /// is the adopted one, unchanged, so its sequence stays. Appended (2026-11-18).
+  CaptureAdopted {
+    /// The volume.
+    volume: VolumeId,
+    /// What its adopted catalog carries.
+    carried: crate::catalog::CarriedRecord,
+    /// Its snapshot holding that head, when it holds one.
+    mark: Option<crate::catalog::SnapshotId>,
+  },
+  /// A repository was created, its namespace empty (§4.17.1, A-515). Appended.
+  RepositoryCreated {
+    /// The record.
+    record: RepositoryRecord,
+  },
+  /// A branch name of a repository was bound to a green of its partition (§4.17.1, A-515). Appended.
+  RepositoryBranchAdded {
+    /// The binding.
+    record: BranchRecord,
+  },
+  /// A branch name left its repository's namespace; its green is untouched, so binding the name to it again restores
+  /// the branch (§4.17.1 "Deleting a branch", A-515). Appended.
+  RepositoryBranchRetired {
+    /// The repository.
+    repository: RepositoryId,
+    /// The name.
+    name: String,
+  },
+  /// A repository's default branch was set, or cleared with `None` (§4.17.1, A-515). Appended.
+  RepositoryDefaultSet {
+    /// The repository.
+    repository: RepositoryId,
+    /// The branch name, bound or not yet (an unborn default).
+    branch: Option<String>,
+  },
+  /// A repository left, with every name of its namespace; its greens are untouched, each destroyed by its own verb
+  /// (§4.17.1, A-515). Appended.
+  RepositoryDestroyed {
+    /// The repository.
+    repository: RepositoryId,
+  },
+  /// A host mount's attachment was seen mounted (A-540): the kernel's id of its mount, kept in the attachment's record
+  /// so a successor's start can judge whether the kernel let that mount go while no daemon ran. Appended.
+  AttachmentMountSeen {
+    /// The attachment.
+    id: u64,
+    /// The kernel's id of its mount, as its mount table names it.
+    mount: u64,
+  },
 }
 
 impl Op {
@@ -577,6 +680,7 @@ impl Op {
       Op::AttachmentAdded { .. } => "attachment_added",
       Op::AttachmentRemoved { .. } => "attachment_removed",
       Op::AttachmentBound { .. } => "attachment_bound",
+      Op::AttachmentMountSeen { .. } => "attachment_mount_seen",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",
@@ -628,6 +732,18 @@ impl Op {
       Op::ConsumerWritePolicySet { .. } => "consumer_write_policy_set",
       Op::VolumeSignersSet { .. } => "volume_signers_set",
       Op::VolumeRelinquished { .. } => "volume_relinquished",
+      Op::AuditOwed { .. } => "audit_owed",
+      Op::AuditDelivered { .. } => "audit_delivered",
+      Op::AuditBatchAppended { .. } => "audit_batch_appended",
+      Op::VolumeReleased { .. } => "volume_released",
+      Op::BaseCaptured { .. } => "base_captured",
+      Op::CaptureCarried { .. } => "capture_carried",
+      Op::CaptureAdopted { .. } => "capture_adopted",
+      Op::RepositoryCreated { .. } => "repository_created",
+      Op::RepositoryBranchAdded { .. } => "repository_branch_added",
+      Op::RepositoryBranchRetired { .. } => "repository_branch_retired",
+      Op::RepositoryDefaultSet { .. } => "repository_default_set",
+      Op::RepositoryDestroyed { .. } => "repository_destroyed",
     }
   }
 }

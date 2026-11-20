@@ -16,8 +16,9 @@
 //!    of the drive's own instance runs at any of its looks ([`cli_of_instance`]); and the runner's facts name the Slates
 //!    it links as the revision this checkout's `vendor/MANIFEST.toml` pins ([`links_the_pin`]).
 //! 2. **The volume.** kiln's word on the session names its volume over the project ([`workspace_of`]). On the host
-//!    (`bare_metal`), its mount is in the host's table as Slates' (NFS on loopback on macOS, FUSE on Linux; WinFsp keeps
-//!    no table to read) and the harness works in it. In a microVM (`microvm`), no host mount: kiln names none, the host's
+//!    (`bare_metal`), its mount is Slates' and the harness works in it: in the host's table as Slates' (NFS on loopback
+//!    on macOS, FUSE on Linux), or on Windows a drive letter whose file system Windows names Slates' (WinFsp keeps no
+//!    table to read: [`slates_mounted_at`]). In a microVM (`microvm`), no host mount: kiln names none, the host's
 //!    table gains no Slates mount of the session's at any look ([`session_mounts`]), and the harness runs in a guest's
 //!    kernel at its project's guest path.
 //! 3. **Isolation.** Nothing the harness did is in the project's folder before its landing writes it, byte for byte
@@ -28,7 +29,8 @@
 //!    folder untouched; its change request (`agents.change`) holds exactly its changes; a person is shown the same
 //!    request ([`approval_manifest`]) and approves it, and only then does its folder hold exactly its changes. git's HEAD
 //!    and index stay as they were throughout.
-//! 5. **The end.** Ended for good, the session's mount goes (bare metal).
+//! 5. **The end.** Ended for good, the session's mount goes (bare metal): out of the host's table, or on Windows its
+//!    drive gone.
 //!
 //! What it needs, and who owes it (`~/.cache/slates-scratch/fanout/g266-e2e-contract.md`, draft 3): Slates' library API
 //! and its typed landing outcomes (g262) and the daemon's landing policy (A-285), vendored in kiln and driven by kiln's
@@ -39,17 +41,18 @@
 //! - `checks`: the pure checks, against samples (any OS).
 //! - `stand_in`: the stand-in's words for a project's files, for the mode it runs in and for its own landing, driven as a
 //!   process against a kiln MCP server of the test's own (Unix: python3).
-//! - `bare_metal`: the drive on the runner's host (Unix: the stand-in is a Python script run by its name), and drift.
+//! - `bare_metal`: the drive on the runner's host, and drift, on Linux, macOS and Windows; its module doc says what
+//!   differs on each.
 //! - `microvm`: the drive in a Shards microVM of its own, booting the stand-in's Agentfile from kiln's repository at this
 //!   checkout's commit (which must be on GitHub, as `vm_harnesses`' stand-in images' is).
 //!
 //! `SLATES_E2E=1` makes a runner without workspaces a failure rather than a skip; `VM_E2E=1` does so for a runner without
 //! microVMs (tests/vm_e2e/README.md). Each drive owns a Slates instance of its own ([`Instance`]) and ends exactly its
-//! processes, its mounts unmounted first.
+//! processes, its mounts unmounted first (on Windows its drives are its daemon's own, and go with it).
 //!
 //!   SLATES_E2E=1 cargo test -p kiln --test slates_e2e -- --nocapture --test-threads 1
 
-#![allow(dead_code, reason = "the drives are Unix's until the stand-in runs by its name on Windows' hosts here; the checks are every OS's")]
+#![allow(dead_code, reason = "the microVM drive and the stand-in's own checks run on Unix hosts alone here; the checks and the bare-metal drive are every OS's")]
 
 mod common;
 mod vm_e2e;
@@ -180,6 +183,23 @@ pub fn session_mounts(mounts: &[Mount], dir: &Path, made: &Made) -> Vec<Mount> {
         .collect()
 }
 
+/// Where a session's volume is mounted, as the host is asked of it: on Unix its real path ([`canonical`]), the
+/// spelling the mount table gives a mount (macOS reaches `/var` through `/private/var`); on Windows the drive letter as
+/// kiln names it (`Z:`), whose root Windows is asked of (`kiln::workspace::place::is_mount`).
+pub fn mount_point(mount: &str) -> PathBuf {
+    if cfg!(windows) { PathBuf::from(mount) } else { canonical(Path::new(mount)) }
+}
+
+/// Whether a Slates mount is at `at` ([`mount_point`]) now: on Unix the host's mount table lists one there; on Windows,
+/// which keeps no table of WinFsp's mounts, the drive holds a file system Windows names Slates' (`slates`), as kiln's own
+/// runner judges a workspace's drive (`kiln::workspace::place::is_mount`).
+pub fn slates_mounted_at(at: &Path) -> anyhow::Result<bool> {
+    if cfg!(windows) {
+        return Ok(kiln::workspace::place::is_mount(at));
+    }
+    Ok(host_mounts()?.iter().any(|m| is_slates(m) && Path::new(&m.at) == at))
+}
+
 /// Unmounts the mount at `at`, as its user may: `umount` (and forced, where that's refused) on macOS, `fusermount3 -u`
 /// (and lazily, where that's refused) on Linux. Whether it went is read from the table after, not from these.
 fn unmount(at: &str) {
@@ -239,7 +259,8 @@ pub fn holding_cli(path: &str) -> Vec<PathBuf> {
 /// that folder is unmounted, then, with none left, every process naming the instance is ended: asked to stop, then
 /// killed after [`STOP_GRACE`]. Unmounted first: a hard NFS mount over a stopped server never gives up, and on macOS
 /// a daemon killed under a live kernel NFS mount panicked the Mac twice (Slates' record of 2026-10-06), so with a mount
-/// left nothing is ended, and it says so.
+/// left nothing is ended, and it says so. On Windows no table lists a drive and none lies under the folder: a
+/// workspace's drive is its daemon's own (WinFsp), so it goes as the instance's processes end.
 pub struct Instance {
     pub name: String,
     dir: PathBuf,
@@ -269,7 +290,7 @@ impl Drop for Instance {
 }
 
 /// Every process of instance `name` ended: asked to stop (SIGTERM), then killed after [`STOP_GRACE`]; on Windows
-/// ended at once with its tree.
+/// ended at once with its tree, its drives going with its daemon.
 fn end_instance(name: &str) {
     let pids = |procs: &[HostProc]| -> Vec<u32> { of_instance(procs, name).iter().map(|p| p.pid).collect() };
     let Ok(first) = vm_e2e::host_processes().map(|p| pids(&p)) else {
@@ -783,7 +804,7 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
     }
     eprintln!("DRIVE: {engine:?}, an agent in mode {}, on {}, instance {}", mode.claude(), f.machine, instance.name);
     let id = vm_e2e::open(f, &spec)?;
-    let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?;
+    let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?.reporting(landing_reports(&instance.name));
     let (info, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
     let lines = vm_e2e::said(&events);
     let what = format!("{engine:?} session {id} ({mode:?})");
@@ -799,11 +820,8 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
         Engine::BareMetal => {
             let mount = made.mount.clone().ok_or_else(|| fail(format!("kiln names no mount of its volume on its host: {made:?}")))?;
             anyhow::ensure!(Path::new(&said_cwd).starts_with(canonical(Path::new(&mount))), "{what}: its harness works in {said_cwd}, outside its volume's mount {mount}");
-            if cfg!(unix) {
-                let at = canonical(Path::new(&mount));
-                let table = host_mounts()?;
-                anyhow::ensure!(table.iter().any(|m| is_slates(m) && Path::new(&m.at) == at), "{what}: nothing of Slates' is mounted at {}: {table:?}", at.display());
-            }
+            let at = mount_point(&mount);
+            anyhow::ensure!(slates_mounted_at(&at)?, "{what}: nothing of Slates' is mounted at {} (the host's mount table, which Windows keeps none of: {:?})", at.display(), host_mounts()?);
             None
         }
         Engine::MicroVm => {
@@ -848,12 +866,21 @@ pub fn drive_agent(d: &Drive<'_>, project: &Project, mode: Mode, looks: &mut Loo
     looks.look(instance, mounts_of)?;
     pace.stop(f, &id)?;
     if engine == Engine::BareMetal
-        && cfg!(unix)
         && let Some(mount) = &made.mount
     {
-        mount_gone(&canonical(Path::new(mount))).map_err(|e| anyhow::anyhow!("{what}: {e}"))?;
+        // A mount that stays says what kiln's runner and Slates said of it, the runner's every word on taking its
+        // workspaces down among them.
+        mount_gone(&mount_point(mount)).map_err(|e| fail(format!("{e:#}\n--- kiln's runner on taking workspaces down ---\n{}", removals_said(f))))?;
     }
     Ok(())
+}
+
+/// Every line kiln's runner logged of taking agents' workspaces down (an ended agent's workspace, the mount table, a
+/// workspace that stayed), whole, where its log's tail is crowded with its periodic lines: which branch a removal took.
+fn removals_said(f: &vm_e2e::Fixture) -> String {
+    let text = f.log.as_ref().and_then(|log| std::fs::read_to_string(log).ok()).unwrap_or_default();
+    let said: Vec<&str> = text.lines().filter(|line| ["an ended agent's", "mount table", "workspace stayed"].iter().any(|word| line.contains(word))).collect();
+    if said.is_empty() { "kiln's runner said nothing of taking its workspace down".to_owned() } else { said.join("\n") }
 }
 
 /// How many of the end lines of each Slates log a failed drive says.
@@ -896,13 +923,38 @@ pub fn slates_state(instance: &str, volume: &str) -> String {
     format!("--- Slates' own state ---\n{status}\n{shards}")
 }
 
-/// Waits, a bounded while ([`OP_WITHIN`]), for the Slates mount at `at` to leave the host's table, as an ended session's
-/// does once kiln has let its volume go.
+/// What a landing in the drive's own instance `instance` reports of itself, for a wait's progress (`vm_e2e::Pace::reporting`):
+/// the sequence of the last record of Slates' audit, which a landing moves at each step (presented, granted, validated,
+/// each entry written, finished), asked through its library as an operator would. What kept it from saying, where it
+/// couldn't, which doesn't move.
+fn landing_reports(instance: &str) -> impl FnMut() -> Value + 'static {
+    let name = instance.to_owned();
+    let mut attached: Option<slates_api::Instance> = None;
+    let mut seen = 0u64;
+    move || {
+        if attached.is_none() {
+            attached = slates_api::Instance::attach(&name).ok();
+        }
+        let Some(i) = attached.as_mut() else { return json!({"audit": "not attached"}) };
+        match i.audit(seen) {
+            Ok(records) => {
+                seen = records.iter().map(|r| r.seq).max().unwrap_or(seen).max(seen);
+                json!({"audit": seen})
+            }
+            Err(e) => {
+                attached = None;
+                json!({"audit": format!("{e}")})
+            }
+        }
+    }
+}
+
+/// Waits, a bounded while ([`OP_WITHIN`]), for the Slates mount at `at` ([`mount_point`]) to go ([`slates_mounted_at`]):
+/// out of the host's table, or on Windows its drive gone, as an ended session's does once kiln has let its volume go.
 fn mount_gone(at: &Path) -> anyhow::Result<()> {
     let until = Instant::now() + OP_WITHIN;
     loop {
-        let table = host_mounts()?;
-        if !table.iter().any(|m| is_slates(m) && Path::new(&m.at) == at) {
+        if !slates_mounted_at(at)? {
             return Ok(());
         }
         anyhow::ensure!(Instant::now() < until, "its volume is still mounted at {} after its session ended", at.display());
@@ -1411,11 +1463,30 @@ for line in sys.stdin:
 }
 
 // =================================================================================================
-// The bare-metal engine: an agent on the runner's host in its own volume, mounted there (Unix: the stand-in is a Python
-// script run by its name). Skipped in the runner's own words until it gives agents volumes with no Slates binary.
+// The bare-metal engine: an agent on the runner's host in its own volume, mounted there, on Linux, macOS and Windows.
+// Skipped in the runner's own words until it gives agents volumes with no Slates binary.
 // =================================================================================================
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod bare_metal {
+    //! The drive on the runner's host (the module's 1 to 5) and W6's drift: the same steps and checks on every OS,
+    //! but where the OS differs.
+    //!
+    //! - **The volume's mount.** A folder of its own under the runner's state, in the host's mount table as Slates'
+    //!   (FUSE on Linux, NFS on loopback on macOS); on Windows a drive letter of its own (WinFsp), which no table lists,
+    //!   so it is Slates' where Windows names the drive's file system Slates' ([`slates_mounted_at`], kiln's runner's own
+    //!   judgement of a workspace's drive). At the agent's end the mount leaves the table; on Windows the drive goes.
+    //! - **kiln.** This build of kiln, `kiln.exe` on Windows, is the server, the runner and the drive's own Slates
+    //!   instance (its anchor and daemon are kiln's executable in Slates' roles). The instance ends at the drive's end:
+    //!   on Unix asked to stop, then killed past [`STOP_GRACE`], once its mounts are unmounted; on Windows at once with
+    //!   its tree (`taskkill /T /F`), its drives, its daemon's own, going with it ([`Instance`]).
+    //! - **The stand-in harness**, a Python script. On Unix each harness's name links to it and its `#!` line runs it by
+    //!   `python3`; on Windows each harness is a `<program>.cmd` that kiln finds by `PATHEXT`, as it finds npm's, and
+    //!   starts through `cmd.exe`, running it by the Python 3 found there (`py -3`, `python` or `python3`:
+    //!   `vm_e2e::stub_host_env`). It writes its words' bytes alone on every OS (Python's text mode would end a line with
+    //!   `\r\n` on Windows), so the drive compares the same bytes everywhere. With no Python 3 the drives skip, saying so.
+    //! - **Drift.** Slates' Windows host keeps no watcher yet (fingerprints alone), so a person's change on disk is drift
+    //!   once Slates re-checks the file, which kiln's word on the workspace (`agents.workspace`) has it do; the drive
+    //!   asks for that word only after the change, on every OS.
     use super::*;
 
     /// A server and runner of the drive's own under `dir`, the runner's engine its host (a kiln that carries Shards runs
@@ -1428,17 +1499,30 @@ mod bare_metal {
         Ok(f)
     }
 
+    /// Whether the stand-in, a Python script, can run here: by `python3` on Unix, its `#!` line's; on Windows by the
+    /// Python 3 its `.cmd` shims run it by (`vm_e2e::stub_python`: `py -3`, `python` or `python3`).
     fn have_python() -> bool {
-        std::process::Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
+        #[cfg(windows)]
+        {
+            vm_e2e::stub_python().is_ok()
+        }
+        #[cfg(not(windows))]
+        {
+            std::process::Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success())
+        }
     }
 
+    /// The skip a drive says where [`have_python`] finds no Python 3, in this OS's words.
+    const NO_PYTHON: &str = if cfg!(windows) { "SKIP: the stand-in harness needs Python 3 (py -3, python or python3)" } else { "SKIP: the stand-in harness needs python3" };
+
     /// The module's 1 to 5 on the host: two agents, each in its own volume mounted on its host (macOS: NFS on loopback;
-    /// Linux: FUSE), started through kiln with no Slates binary in reach; the one whose mode asks nothing writes its work
-    /// to its folder at once, the one whose mode asks goes up for review and writes only once a person approves it.
+    /// Linux: FUSE; Windows: WinFsp at a drive letter), started through kiln with no Slates binary in reach; the one
+    /// whose mode asks nothing writes its work to its folder at once, the one whose mode asks goes up for review and
+    /// writes only once a person approves it.
     #[test]
     fn g266_on_its_host_a_bypass_agents_landing_writes_at_once_and_an_ask_agents_only_once_a_person_approves() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -1457,7 +1541,7 @@ mod bare_metal {
     #[test]
     fn g266_a_file_changed_on_disk_after_the_agent_changed_it_is_drift_and_no_landing_writes_over_the_persons_bytes() -> anyhow::Result<()> {
         if !have_python() {
-            eprintln!("SKIP: the stand-in harness needs python3");
+            eprintln!("{NO_PYTHON}");
             return Ok(());
         }
         let dir = tempfile::tempdir()?;
@@ -1468,7 +1552,7 @@ mod bare_metal {
         }
         for mode in Mode::ALL {
             let project = Project::new(&dir.path().join(mode.word()))?;
-            drift_kept(&f, &project, mode).map_err(|e| anyhow::anyhow!("{mode:?}: {e:#}"))?;
+            drift_kept(&f, &instance, &project, mode).map_err(|e| anyhow::anyhow!("{mode:?}: {e:#}"))?;
         }
         Ok(())
     }
@@ -1476,10 +1560,10 @@ mod bare_metal {
     /// One agent in `mode` over `project`: its append, the person's change of the same file on disk, its drift, then
     /// its landing (asked by the agent in its next turn where its mode asks nothing; approved by the person where it
     /// asks), which keeps the person's bytes.
-    fn drift_kept(f: &vm_e2e::Fixture, project: &Project, mode: Mode) -> anyhow::Result<()> {
+    fn drift_kept(f: &vm_e2e::Fixture, instance: &Instance, project: &Project, mode: Mode) -> anyhow::Result<()> {
         let spec = json!({"kind": "claude", "mode": mode.claude(), "cwd": project.dir, "prompt": format!("APPEND={} do the task", APPENDED.0), "workspace": {"kind": "volume"}});
         let id = vm_e2e::open(f, &spec)?;
-        let mut pace = vm_e2e::Pace::default();
+        let mut pace = vm_e2e::Pace::default().reporting(landing_reports(&instance.name));
         let (_, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
         anyhow::ensure!(vm_e2e::said(&events).iter().any(|l| *l == format!("APPENDED {}", APPENDED.0)), "{:?}", vm_e2e::said(&events));
         let persons = b"the person's\n".to_vec();
@@ -1491,7 +1575,7 @@ mod bare_metal {
             Mode::Bypass => {
                 let client = format!("land-{}", nonce());
                 vm_e2e::command(f, &id, &json!({"type": "send", "id": client, "text": "LAND do the task", "mode": "queue"}))?;
-                let (_, events) = pace.until(f, &id, vm_e2e::Asked::Message(&client), "its landing's turn", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, &client), vm_e2e::STUB_DONE))?;
+                let (_, events) = pace.until(f, &id, vm_e2e::Asked::Landing(&client), "its landing's turn", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, &client), vm_e2e::STUB_DONE))?;
                 let lines = vm_e2e::said_after(&events, &client);
                 anyhow::ensure!(!lines.iter().any(|l| l.starts_with("LAND_FAIL ")), "its landing reached no answer: {lines:?}");
                 format!("{lines:?}")

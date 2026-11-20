@@ -419,8 +419,8 @@ sessions, and an agent's to do to the agents it started (and theirs), as `agents
 
 - **Pause.** On its machine's host, its processes stop where they are, held by the machine's pacer
   ("What a person does with an agent's subagents", below). In a microVM, its microVM is paused,
-  through Hex: until Hex pauses a box (kiln plan 01a1dd2e…, P5.5b), kiln refuses it, its timeline says
-  why, and the session goes on as it was. The subagents kiln started under it pause with it. Your
+  through Hex (kiln plan 01a1dd2e…, P5.5b): its guest runs no CPU, and its stdio and connections are
+  kept until it's resumed. The subagents kiln started under it pause with it. Your
   pause is asked of its machine: `agents.get` says it's paused once it is (stand `paused`,
   `state.frozen` since when).
 - **Resume.** What pauses it ends: your pause, and a usage limit's ("Usage limits: pause and resume",
@@ -1157,7 +1157,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.commits` | `GET /api/harness/agents/:id/commits?picks=&branch=&trunk=` | → `{log: {top, head, branch, trunk, base, dirty: {files, added, removed} \| null, commits: [{sha, parents, subject, author, at, files, added, removed, session}], more, told, branches, listed}, picked: {from, files: [FileChange], needs: {pick, commit, subject}} \| null}` ("Commits", below) |
 | `agents.refs` | `GET /api/harness/agents/:id/refs` | → `{refs: {branches, tags, commits: [{sha, subject, at, ...}], trunk}}` ("Compare", below) |
 | `agents.compare` | `GET /api/harness/agents/:id/compare?from=&to=&split=&path=` | → `{compared: {files: [FileChange], counts_only, split, changed_by: {path: [who]}}}`; a point is `now`, `began`, `agent:<who>` or a branch, tag or commit ("Compare", below) |
-| `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}` (an agent whose granted mode edits unasked: written at once); `{manifest}` (that plan's: a person's, or an agent's as its granted mode lets it) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more; each answer names its `outcome` (`written` or `approval_required`) |
+| `agents.land` | `POST /api/harness/agents/:id/land` | `{}` → `{plan, excludes, can_write, why_not?}` (an agent whose granted mode edits unasked: written at once); `{manifest}` (that plan's: a person's, or an agent's as its granted mode lets it) → `{landed}`, or `{changed, plan, …}` with nothing written when the plan isn't that one any more; each answer names its `outcome` (`written`, `approval_required`, `conflicted` with each conflict typed, nothing written whoever asks, or `refused`) |
 | `agents.credential` | `POST /api/harness/agents/:id/credential` | → `{token, expires_at}`: the agent's own token for git, for a day, so its pushes to kiln's repositories go as the agent, for its person (ci.md W27-R03). Only that very agent is given it, as its runner asks when its git needs it: never a person or another agent, and it's no tool of an agent's |
 
 Each takes an input type of its own (`crate::ops::Input`), as every operation of the registry
@@ -1179,12 +1179,14 @@ Every route needs `agents.run`. An agent is named by its id or the start of it (
 lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,
 as are the goal stack's operations (`goals.*`); what ends, stops or steers an agent always names it.
 kiln's MCP server tells each agent its id. `workspace` is `volume` (a Slates volume of its own:
-what it gets when it names none, where its machine can make one) or `folder` (the folder itself);
-in a result it is `{kind, over, sub, volume, mount, owner, why_not}`: `owner` when it works in
-another agent's volume, `why_not` when it works in its folder because its machine can't make one,
-and `null` for one isolated in a microVM, a conversation taken up (`resume`), one started in a person's shell
-(`shell`), or one started before
-volumes were the default; `branch` and
+what it gets when it names none; a machine that can't make one refuses the start, 409, naming what
+it lacks) or `folder` (the folder itself, a person's explicit choice); in a result it is
+`{kind, over, sub, volume, mount, owner}`: `owner` when it works in another agent's volume,
+and `null` for one isolated in a microVM or one started before volumes were the default (one started in a person's
+shell works on a volume too, its folder and environment moved onto the mount, its `PWD` the folder it starts in, and so
+does a conversation taken up, `resume`, its harness's record of it moved to where the harness looks from the mount's
+folder; when an agent on a volume ends, its conversation goes back to its person's folder's project once its processes
+have ended, where they resume it); `branch` and
 `change_request` are `null` until it has a change request.
 
 An `Agent` is `{id, name, kind, machine, cwd, status, stand, mode, model, queued, summary,
@@ -1411,8 +1413,10 @@ agent's folder on that agent's machine works in that agent's volume:
   at once in a mode that edits
   unasked (accept edits, auto, bypass); after its person's click in one that asks (asked in their
   chat turn: 428 until they confirm, then the same call again; refused outside one); never in one that
-  only plans (403). The answer names its `outcome`: `written` (Slates' outcome) or
-  `approval_required` (`approval`: the manifest to approve, its summary and conflicts). An agent
+  only plans (403). The answer names its `outcome`: `written` (Slates' outcome),
+  `approval_required` (`approval`: the manifest to approve, its summary and conflicts), `conflicted`
+  (`conflicts`, each its path and class: a file it changed that a person changed on disk since;
+  nothing is written, whoever asks and whatever their mode) or `refused` (the policy's). An agent
   working in another's volume lands nothing of its own while that one works: the volume lands whole,
   from its owner. kiln approves it with a secret of its own that it hands Slates at every start,
   on every system. kiln leaves out what git ignores in the workspace (the agent's build output
@@ -1428,7 +1432,8 @@ agent's folder on that agent's machine works in that agent's volume:
   free: Slates mounts a WinFsp volume at a drive letter alone). Nothing needs installing but WinFsp:
   Slates is built into kiln (vendored, and driven through its library, never a `slates` command),
   and kiln's own executable runs its anchor and daemon (`kiln slates-role`). `GET
-  /api/harness/workspaces` says which machines can, and why each other can't. kiln keeps one Slates
+  /api/harness/workspaces` says which machines can, and why each other can't (`why_not`, and
+  `missing`: what it lacks, typed); an agent's start there is refused, naming it. kiln keeps one Slates
   instance, `kiln`, per machine (two shards).
 
 ## From an Agentfile, in a microVM of its own
@@ -2590,9 +2595,8 @@ its machine's pacer holds its group at share 0 (cgroup.freeze on Linux, SIGSTOP 
 thread suspended on Windows) under the pacer's guard, which starts them again should the runner
 end (docs/headroom.md, "A person's pause"). `state.frozen` says since when; a runner that can't
 pause says why, and one that restarts holds a paused session again. In a microVM none of its
-processes is its machine's to hold: its microVM is paused instead (`Run::pause`, through Hex), only
-while it runs, and refused, said in its timeline, until Hex pauses a box (kiln plan 01a1dd2e…,
-P5.5b). The server sends the pause,
+processes is its machine's to hold: its microVM is paused instead (`Run::pause`, through Hex's
+P5.5b), only while it runs. The server sends the pause,
 and its end, to every subagent kiln started under it. With `task`, that subagent of its harness's
 own is held at its next tool call: kiln has a hook on every one of Claude Code's tool calls (a
 `PreToolUse` matcher for every tool, its answer awaited up to 7 days), and on each of Codex's local

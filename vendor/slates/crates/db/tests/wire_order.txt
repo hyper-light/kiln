@@ -16,6 +16,7 @@ AuditKind 3 LandingValidated
 AuditKind 4 EntryWritten
 AuditKind 5 EntryRefused
 AuditKind 6 LandingFinished
+AuditKind 7 GrantExpired
 BaseRecord 0 Scratch
 BaseRecord 1 Path
 BaseRecord 2 Image
@@ -47,6 +48,9 @@ LandingState 8 Refused
 LandingState 9 Aborted
 NamePolicy 0 Exact
 NamePolicy 1 Fold
+ObjectFormat 0 Sha1
+ObjectFormat 1 Sha256
+ObjectFormat 2 Revisions
 Op 0 VolumeCreated
 Op 1 VolumeStateChanged
 Op 2 VolumeResized
@@ -123,6 +127,19 @@ Op 72 WorkFloorDropped
 Op 73 VolumeSignersSet
 Op 74 VolumeRelinquished
 Op 75 GreenAdopted
+Op 76 AuditOwed
+Op 77 AuditDelivered
+Op 78 AuditBatchAppended
+Op 79 VolumeReleased
+Op 80 BaseCaptured
+Op 81 CaptureCarried
+Op 82 CaptureAdopted
+Op 83 RepositoryCreated
+Op 84 RepositoryBranchAdded
+Op 85 RepositoryBranchRetired
+Op 86 RepositoryDefaultSet
+Op 87 RepositoryDestroyed
+Op 88 AttachmentMountSeen
 PlacementState 0 Local
 PlacementState 1 Placed
 Principal 0 Uid
@@ -141,6 +158,9 @@ SealKeyOwner 5 PairReceived
 SealKeyOwner 6 PairRetired
 SizeClass 0 Bounded
 SizeClass 1 Dynamic
+VcsTool 0 Git
+VcsTool 1 Mercurial
+VcsTool 2 Subversion
 VolumeState 0 Creating
 VolumeState 1 Live
 VolumeState 2 Sealing

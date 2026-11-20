@@ -5,7 +5,10 @@
 //! alone the owner had parked by then: on ubuntu-24.04-arm's three shards the quiet single-client p99 was 116.4 µs
 //! against main's 27.1, its shards parking 144 to 331 times per 1,000 creates (step 6 of the A-223 plan, diag-liveness-42
 //! and -43). A forward made for a request that continues the loop now holds its owner's window for the loop's return at
-//! R9's percentile (`config::closed_loop_hold`), never longer than the loop had already run (`verbs::loop_hold`).
+//! R9's percentile (`config::closed_loop_hold`), never longer than the loop had already run (`verbs::loop_hold`). The
+//! owner keeps the hold only while the idle turn a request would land in, as it has learned its own turns, is shorter
+//! than its wake estimate (A-387, `slates_rt::held_turn`): a macOS shard's zero-timeout `kevent` naps 12–15 µs a turn
+//! (A-218), longer than a kicked park's wake, so there the owners decline and park between the loop's returns.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
@@ -17,7 +20,9 @@
 use std::time::{Duration, Instant};
 
 use slates_client::{Client, CreateSpec, NamePolicy, SizeClass};
-use slates_server::config::{CLOSED_LOOP_CYCLE_NS, PROVISION_TAIL, loop_revisit_cycles};
+use slates_server::config::{
+  CLOSED_LOOP_CYCLE_NS, PROVISION_TAIL, closed_loop_hold, loop_revisit_cycles,
+};
 use slates_server::daemon::OBSERVE_BUDGET_NS;
 use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -81,8 +86,26 @@ fn names_on(partition: usize, count: usize) -> Vec<String> {
     .collect()
 }
 
-/// Each shard's parks so far and the holds its forwards asked of it, by position.
-fn parks_and_holds(daemon: &Daemon) -> Vec<(u64, u64)> {
+/// One shard's counters at a moment: its parks, the holds it kept and those it declined, the idle turn a request meets
+/// as it has learned its own, and its wake estimate (A-326, A-387).
+#[derive(Clone, Copy, Debug, Default)]
+struct Reading {
+  parks: u64,
+  holds: u64,
+  declined: u64,
+  turn_ns: u64,
+  wake_ns: u64,
+}
+
+impl Reading {
+  /// Whether the shard's learned idle turn was no shorter than its wake estimate: a hold asked now is declined.
+  fn naps(&self) -> bool {
+    self.turn_ns >= self.wake_ns
+  }
+}
+
+/// Each shard's reading now, by position.
+fn readings(daemon: &Daemon) -> Vec<Reading> {
   daemon
     .shards()
     .iter()
@@ -91,7 +114,13 @@ fn parks_and_holds(daemon: &Daemon) -> Vec<(u64, u64)> {
         .observation(Some(*shard), OBSERVE_BUDGET_NS, |_: &mut ShardState| {
           slates_rt::registry::with_current(|ctx| {
             let counters = ctx.counters();
-            (counters.waits, counters.idle_holds)
+            Reading {
+              parks: counters.waits,
+              holds: counters.idle_holds,
+              declined: counters.idle_holds_declined,
+              turn_ns: counters.held_turn_ns,
+              wake_ns: counters.wake_cost_ns,
+            }
           })
           .unwrap_or_default()
         })
@@ -102,13 +131,19 @@ fn parks_and_holds(daemon: &Daemon) -> Vec<(u64, u64)> {
     .collect()
 }
 
-/// The parks and holds the shards in `owners` gained between `before` and `after`, summed.
-fn gained(before: &[(u64, u64)], after: &[(u64, u64)], owners: &[usize]) -> (u64, u64) {
-  owners.iter().fold((0, 0), |(parks, holds), owner| {
-    (
-      parks + (after[*owner].0 - before[*owner].0),
-      holds + (after[*owner].1 - before[*owner].1),
-    )
+/// What the shards in `owners` gained between two readings, summed: parks, holds kept and holds declined.
+#[derive(Clone, Copy, Debug, Default)]
+struct Gained {
+  parks: u64,
+  holds: u64,
+  declined: u64,
+}
+
+fn gained(before: &[Reading], after: &[Reading], owners: &[usize]) -> Gained {
+  owners.iter().fold(Gained::default(), |sum, owner| Gained {
+    parks: sum.parks + (after[*owner].parks - before[*owner].parks),
+    holds: sum.holds + (after[*owner].holds - before[*owner].holds),
+    declined: sum.declined + (after[*owner].declined - before[*owner].declined),
   })
 }
 
@@ -131,41 +166,57 @@ fn run_cycle(client: &mut Client, spec: &CreateSpec) {
   client.destroy(volume).unwrap();
 }
 
-/// What one run of the loop measured from the client: its returns to an owner later than the hold, its longest return,
-/// and its mean cycle.
-#[derive(Debug)]
+/// What one run of the loop measured from the client: each owner's returns (the time from its last cycle's end to its
+/// next one's start, the least the owner sat without the loop), and the mean cycle.
 struct LoopRun {
-  late_returns: u64,
-  longest_return: Duration,
+  returns: Vec<Duration>,
   cycle: Duration,
 }
 
+impl LoopRun {
+  /// The returns later than `bound`.
+  fn later_than(&self, bound: Duration) -> u64 {
+    u64::try_from(self.returns.iter().filter(|gap| **gap > bound).count()).unwrap()
+  }
+
+  /// The longest return.
+  fn longest(&self) -> Duration {
+    self.returns.iter().copied().max().unwrap_or_default()
+  }
+}
+
+impl std::fmt::Debug for LoopRun {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let cycle_bound = Duration::from_nanos(CLOSED_LOOP_CYCLE_NS);
+    f.debug_struct("LoopRun")
+      .field("returns", &self.returns.len())
+      .field("later_than_2f", &self.later_than(cycle_bound))
+      .field("longest", &self.longest())
+      .field("cycle", &self.cycle)
+      .finish()
+  }
+}
+
 /// Runs the loop's `cycles`, cycle `n` on owner `n % owners` with its `n / owners`th spec, and measures each owner's
-/// returns: the time from its last cycle's end to its next one's start.
+/// returns.
 fn run_loop(
   client: &mut Client,
   specs: &[Vec<CreateSpec>],
   cycles: std::ops::Range<usize>,
-  hold: Duration,
 ) -> LoopRun {
   let mut last_visit: Vec<Option<Instant>> = vec![None; specs.len()];
-  let mut run = LoopRun {
-    late_returns: 0,
-    longest_return: Duration::ZERO,
-    cycle: Duration::ZERO,
-  };
+  let mut returns = Vec::with_capacity(cycles.len());
   let (count, started) = (cycles.len(), Instant::now());
   for n in cycles {
     let owner = n % specs.len();
     if let Some(gap) = last_visit[owner].map(|last| last.elapsed()) {
-      run.longest_return = run.longest_return.max(gap);
-      run.late_returns += u64::from(gap > hold);
+      returns.push(gap);
     }
     run_cycle(client, &specs[owner][n / specs.len()]);
     last_visit[owner] = Some(Instant::now());
   }
-  run.cycle = started.elapsed() / u32::try_from(count.max(1)).unwrap();
-  run
+  let cycle = started.elapsed() / u32::try_from(count.max(1)).unwrap();
+  LoopRun { returns, cycle }
 }
 
 /// Runs [`PACED_CYCLES`] cycles [`PACE`] apart, round every shard: on the client's own shard (`own`) every `shards`th
@@ -196,23 +247,30 @@ fn wait(span: Duration) {
   }
 }
 
-/// A-326, R9 (AC-2.1), §4.7. Do: on a three-shard daemon, run one client's closed loop of creates and destroys, a cycle
-/// on each of the two shards that do not serve the client in turn, first long enough for the loop's run to reach its
-/// full hold, then [`LOOP_CYCLES`] cycles measured; then pause, and run [`PACED_CYCLES`] cycles a millisecond apart over
-/// all three shards, the client's own among them. Expect, in the loop: holds asked of the two owners (the non-vacuity
-/// count), and at most R9's tail of parks on them past those the run's own returns explain, judged against the loop's
-/// measured period; in the paced cycles: no hold asked of any shard, though a destroy on the client's own shard leaves
-/// work running through the pause (judged by the shard's last work, 1 to 3 of 24 paced cycles looked like a loop's,
-/// 2026-11-18), and the owners parking between cycles (R9's floor alone, as A-223's window rule leaves a paced client).
-/// At R9's floor alone, before A-326, the owners parked 460 times over 200 returns (2026-11-18, the Mac Studio, a debug
-/// cycle 272 µs).
-#[test]
-fn a_closed_loops_creates_find_the_shards_it_goes_round_polling_and_a_paced_client_holds_none() {
+/// What the scenario measured: the loop's own run, the shards that own its volumes, and each shard's reading before
+/// the loop, after it, after the rest and after the paced cycles; and the daemon's hold for a closed loop.
+struct Scenario {
+  looped: LoopRun,
+  owners: Vec<usize>,
+  before: Vec<Reading>,
+  after_loop: Vec<Reading>,
+  rested: Vec<Reading>,
+  paced: Vec<Reading>,
+  hold: Duration,
+}
+
+/// Runs the scenario every platform's test judges: on a three-shard daemon, one client's closed loop of creates and
+/// destroys, a cycle on each of the two shards that do not serve the client in turn, first long enough for the loop's
+/// run to reach its full hold, then [`LOOP_CYCLES`] cycles measured; then a rest, and [`PACED_CYCLES`] cycles a
+/// millisecond apart over all three shards, the client's own among them. The client spins for its reply as long as a
+/// loop's return at R9's percentile (`config::closed_loop_hold`), whatever its owners keep, so its own wake never
+/// stretches a cycle and the loop is R9's closed loop on every platform.
+fn run_scenario() -> Scenario {
   let profile = common::machine_profile();
   let instance = format!("srv-closed-loop-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let hold_ns = config.closed_loop_hold_ns;
-  let hold = Duration::from_nanos(hold_ns);
+  let hold = Duration::from_nanos(config.closed_loop_hold_ns);
+  let spin_ns = closed_loop_hold(TEST_SHARDS).get();
   let daemon = Daemon::start(
     &profile,
     config,
@@ -225,8 +283,7 @@ fn a_closed_loops_creates_find_the_shards_it_goes_round_polling_and_a_paced_clie
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   let mut client = common::client::connect(&instance);
-  // The loop's client spins for its reply as long as a forward holds a shard, so its own wake never stretches a cycle.
-  client.spin_for(Some(hold_ns));
+  client.spin_for(Some(spin_ns));
   let origin = serving(&daemon, client.client_id());
   let shards = usize::from(TEST_SHARDS);
   let owners: Vec<usize> = (0..shards).filter(|shard| *shard != origin).collect();
@@ -243,36 +300,126 @@ fn a_closed_loops_creates_find_the_shards_it_goes_round_polling_and_a_paced_clie
     .into_iter()
     .map(spec)
     .collect();
-  run_loop(&mut client, &looped_specs, 0..warm, hold);
-  let before = parks_and_holds(&daemon);
-  let looped = run_loop(&mut client, &looped_specs, warm..warm + LOOP_CYCLES, hold);
-  let after_loop = parks_and_holds(&daemon);
-  wait(hold.saturating_mul(2));
-  let rested = parks_and_holds(&daemon);
+  run_loop(&mut client, &looped_specs, 0..warm);
+  let before = readings(&daemon);
+  let looped = run_loop(&mut client, &looped_specs, warm..warm + LOOP_CYCLES);
+  let after_loop = readings(&daemon);
+  // The rest outlasts any hold the loop asked for, so the paced cycles start with every shard back to its own window.
+  wait(Duration::from_nanos(spin_ns).saturating_mul(2));
+  let rested = readings(&daemon);
   run_paced(
     &mut client,
     (&own_specs, &looped_specs),
     warm + LOOP_CYCLES,
     shards,
   );
-  let paced = parks_and_holds(&daemon);
+  let paced = readings(&daemon);
   drop(client);
   daemon.stop();
   println!(
-    "closed loop: {TEST_SHARDS} shards, {looped:?}, hold {hold:?}; parks and holds before {before:?}, after the loop \
-     {after_loop:?}, rested {rested:?}, paced {paced:?}"
+    "closed loop: {TEST_SHARDS} shards, {looped:?}, hold {hold:?}; owners {owners:?}; readings before {before:?}, after \
+     the loop {after_loop:?}, rested {rested:?}, paced {paced:?}"
   );
-  judge_loop(gained(&before, &after_loop, &owners), &looped, hold);
-  let (paced_parks, paced_holds) = gained(&rested, &paced, &owners);
+  Scenario {
+    looped,
+    owners,
+    before,
+    after_loop,
+    rested,
+    paced,
+    hold,
+  }
+}
+
+/// A-326, A-387, R9 (AC-2.1), §4.7. Do: run the scenario ([`run_scenario`]). Expect, in the loop: holds asked of the
+/// two owners, kept or declined (the non-vacuity count), each owner deciding by what it measured. An owner whose
+/// learned idle turn stayed at least its wake estimate through the loop declined holds, and one whose turn stayed
+/// shorter kept them: a macOS shard's zero-timeout `kevent` naps 12–15 µs a turn (A-218), longer than a kicked park's
+/// wake, where a Linux or Windows shard's poll returns at once. One whose turn crossed its wake during the loop is
+/// reported and not judged. Where the owners kept no hold, they parked at least once for every return of the loop later
+/// than a cycle of R9's closed loop (2F), R9's tail aside; where they kept holds, at most R9's tail of parks past those
+/// the run's own returns explain (A-326's verdict). In the paced cycles: no hold asked of any shard, though a destroy
+/// on the client's own shard leaves work running through the pause (judged by the shard's last work, 1 to 3 of 24
+/// paced cycles looked like a loop's, 2026-11-18), and the owners parking between cycles. At R9's floor alone, before
+/// A-326, the owners parked 460 times over 200 returns (the Mac Studio, a debug cycle 272 µs). On the Mac Studio with
+/// every hold kept (main before A-387) the owners kept 261 and 164 holds and parked 173 and 315 times over 198 returns
+/// later than 2F; with no hold asked (A-387's first form) they parked 416 to 419 times over the same 198 (2026-11-18,
+/// debug, load 25 to 31). With the decision (debug, load 14): the owners' learned turns 14.7 and 16.2 µs against wakes
+/// of 5.7 and 5.8 µs, 188 and 192 holds declined and none kept in the loop, 416 parks over 198 late returns; with the
+/// decision forced to hold, they kept 192 and 196 holds while their turns stayed over their wakes, and the test failed.
+#[test]
+fn a_closed_loops_owners_hold_only_while_their_idle_turns_poll_faster_than_they_wake() {
+  let scenario = run_scenario();
+  let in_loop = gained(&scenario.before, &scenario.after_loop, &scenario.owners);
+  assert!(
+    in_loop.holds + in_loop.declined > 0,
+    "the loop's forwards asked no hold of its owners: {in_loop:?}"
+  );
+  for owner in &scenario.owners {
+    let (before, after) = (scenario.before[*owner], scenario.after_loop[*owner]);
+    let (kept, declined) = (after.holds - before.holds, after.declined - before.declined);
+    if before.naps() != after.naps() {
+      eprintln!(
+        "owner {owner}'s learned idle turn crossed its wake during the loop ({before:?} to {after:?}): its {kept} kept \
+         and {declined} declined holds are not judged"
+      );
+    } else if after.naps() {
+      assert!(
+        declined > 0,
+        "owner {owner}'s idle turn a request meets, {} ns, stayed no shorter than its wake, {} ns, yet it declined no \
+         hold ({kept} kept): {after:?}",
+        after.turn_ns,
+        after.wake_ns
+      );
+    } else {
+      assert!(
+        kept > 0,
+        "owner {owner}'s idle turn a request meets, {} ns, stayed shorter than its wake, {} ns, yet it kept no hold \
+         ({declined} declined): {after:?}",
+        after.turn_ns,
+        after.wake_ns
+      );
+    }
+  }
+  if in_loop.holds == 0 {
+    judge_unheld_loop(in_loop, &scenario.looped);
+  } else {
+    judge_loop(in_loop, &scenario.looped, scenario.hold);
+  }
+  judge_paced(&scenario);
+}
+
+/// The verdict of a loop whose owners kept no hold (A-387): they parked at least once for every return of the loop
+/// later than a cycle of R9's closed loop (2F), R9's tail aside, since a return that late left its owner idle past its
+/// own window.
+fn judge_unheld_loop(in_loop: Gained, looped: &LoopRun) {
+  let late = looped.later_than(Duration::from_nanos(CLOSED_LOOP_CYCLE_NS));
+  let tail = u64::try_from(LOOP_CYCLES).unwrap().div_ceil(PROVISION_TAIL);
+  assert!(
+    in_loop.parks + tail >= late,
+    "the owners kept no hold and parked {} times over the loop's {late} returns later than 2F (R9's tail {tail}): \
+     {in_loop:?}",
+    in_loop.parks
+  );
+}
+
+/// The paced cycles' verdict, on every platform: no hold asked of any shard, and the owners parking between cycles.
+fn judge_paced(scenario: &Scenario) {
+  let paced = gained(&scenario.rested, &scenario.paced, &scenario.owners);
   let all: Vec<usize> = (0..usize::from(TEST_SHARDS)).collect();
+  let everywhere = gained(&scenario.rested, &scenario.paced, &all);
   assert_eq!(
-    gained(&rested, &paced, &all).1,
+    everywhere.holds + everywhere.declined,
     0,
-    "a paced client's requests held no shard: {paced:?} against {rested:?}"
+    "a paced client's requests asked no shard for a hold: {:?} against {:?}",
+    scenario.paced,
+    scenario.rested
   );
   assert!(
-    paced_parks > 0,
-    "the owners parked between a paced client's cycles ({paced_holds} holds): {paced:?} against {rested:?}"
+    paced.parks > 0,
+    "the owners parked between a paced client's cycles: {:?} against {:?}",
+    scenario.paced,
+    scenario.rested
   );
 }
 
@@ -283,8 +430,9 @@ fn a_closed_loops_creates_find_the_shards_it_goes_round_polling_and_a_paced_clie
 /// in the longest return the loop measured; and one park an owner for the counters' own question, which reaches a
 /// parked shard. Fewer than half the forwards held means the build ran slower than R9's closed loop at least as often
 /// as within it, so the run says so and judges nothing.
-fn judge_loop((parks, holds): (u64, u64), looped: &LoopRun, hold: Duration) {
-  let (late_returns, longest_return) = (looped.late_returns, looped.longest_return);
+fn judge_loop(in_loop: Gained, looped: &LoopRun, hold: Duration) {
+  let (parks, holds) = (in_loop.parks, in_loop.holds);
+  let (late_returns, longest_return) = (looped.later_than(hold), looped.longest());
   let returns = u64::try_from(LOOP_CYCLES).unwrap();
   let forwards = returns * 2;
   if holds * 2 < forwards {

@@ -121,6 +121,7 @@ pub trait Runtime: Send + Sync {
     /// `Signal(9)` where its own kill ended it; it is no process of this host. Its start is waited for as decision 9 has a
     /// wait follow its party. Refused, typed: `Invalid` for a program that can't be started, names a user, or is past
     /// what the lane carries, and for a member its run declares not; as `mcp` is for a box that isn't running;
+    /// `Pause(Paused)` at once while its VM is paused ([`Runtime::pause`]), its member's guest answering nothing then;
     /// `NotRunning` where the member runs no program, refused it (it has ended, or its confinement refused what it
     /// asked) or the run's connection ended first. A class whose boxes have no members refuses it, naming the class.
     fn exec_member(
@@ -186,8 +187,9 @@ pub trait Runtime: Send + Sync {
     /// controller is dialed where none is yet, as a member's signal dials it, and its endpoint's report is waited for
     /// until it comes or the run's agent-control connection ends: decision 9's W* is where the census is told a run-out,
     /// never where the wait ends. Asked again, it answers the same while its run is the same. Refused, typed: by a class
-    /// whose boxes have no agent-control link, naming the class; Pending while it boots, held, and `NotRunning(id,
-    /// "link")` before its start and once its stop has begun; `NotRunning(id, "link: its run ended")` where its
+    /// whose boxes have no agent-control link, naming the class; Pending while it boots, held, `Pause(Paused)` at once
+    /// while its VM is paused ([`Runtime::pause`]), its endpoint being its guest's, and `NotRunning(id, "link")` before
+    /// its start and once its stop has begun; `NotRunning(id, "link: its run ended")` where its
     /// connection ends before its endpoint reports; and any other of Shards' faults `Os`, in its words.
     fn link(&self, id: &BoxId) -> Result<ControlLink, Refusal> {
         Err(Refusal::Invalid {
@@ -328,6 +330,120 @@ pub trait Runtime: Send + Sync {
                 .to_owned(),
         })
     }
+
+    /// Holds running Shards image box `id`'s vCPUs out of its guest where they are (kiln plan P5.5b; Shards' D267), its
+    /// VM kept whole: its memory, devices and connections, and the room its admission booked, which its node keeps
+    /// booked (no window that holds a pause is a sample of its learned charge). Its guest runs no CPU until
+    /// [`Runtime::resume`]; meanwhile inspect says [`BoxState::Paused`] and usage tells its paused time
+    /// ([`Usage::paused_ns`]). A call that needs its guest's answer while it is paused (a signal but KILL, a member's
+    /// signal or program, its agent-control link, its room) is refused at once, [`PauseCause::Paused`], never waited on; KILL, delete, inspect, usage, its host
+    /// use and its members' streams answer as ever. Refused, typed ([`Refusal::Pause`]): [`PauseCause::Paused`] where it is
+    /// paused already, which a caller that lost its pause's answer takes as done; [`PauseCause::NotRunning`] before its
+    /// start and once its stop has begun; [`PauseCause::Ended`] once its run has ended; and [`PauseCause::Class`] for a box
+    /// of any other class or form, which is this default's answer, its class as inspect says it. Its boot under way is
+    /// [`Refusal::Lifecycle`] `Pending`, and a pause or resume of it under way `Busy`.
+    fn pause(&self, id: &BoxId) -> Result<(), Refusal> {
+        Err(Refusal::Pause {
+            cause: PauseCause::Class(self.inspect(id)?.class),
+            id: id.try_clone()?,
+            op: "pause",
+        })
+    }
+
+    /// Lets paused Shards image box `id`'s vCPUs run its guest again where they stopped ([`Runtime::pause`]; Shards'
+    /// D267), [`BoxState::Running`] once answered. Refused as a pause is, naming `resume`, but [`PauseCause::Running`]
+    /// where it isn't paused, which a caller that lost its resume's answer takes as done.
+    fn resume(&self, id: &BoxId) -> Result<(), Refusal> {
+        Err(Refusal::Pause {
+            cause: PauseCause::Class(self.inspect(id)?.class),
+            id: id.try_clone()?,
+            op: "resume",
+        })
+    }
+
+    /// Gives the member of running Shards image box `id` at path `at` (`/agents/NAME` or `/harness/NAME`, its Agentfile's
+    /// directory for it) the component of manifest digest `digest` (`sha256:…`), an OSI artifact its node's Shards store
+    /// holds, in its running VM in place (Shards' D270 slice 4): checked against its image, made ready beside its
+    /// writable layer, and laid at its path as its member starts again: at its next start ([`SwapWhen::NextStart`]), or
+    /// now ([`SwapWhen::Now`]), its member's current generation asked to end (SIGTERM) and its next started with it.
+    /// Answers every member's component after it, the generation a `Now` started, whose streams and end
+    /// [`Runtime::member`] takes, and the bytes of the ended generation's output no caller had taken, which its node read
+    /// to their end and let go so that output no one reads held no restart ([`Swapped`]). It waits on its VM's answer or
+    /// its run's end alone, never a timer: a member that doesn't end at its SIGTERM holds a `Now` until a KILL ends it
+    /// (its own, [`Runtime::signal_member`], or its box's). Refused, typed ([`Refusal::Swap`]): each of Shards' own
+    /// causes, in its words ([`SwapCause`]); [`SwapCause::NotRunning`] before its start and once its stop has begun;
+    /// [`SwapCause::Ended`] once its run has ended; and [`SwapCause::Class`] for a box of any other class or form, which
+    /// is this default's answer, its class as inspect says it. While it is paused it is refused [`Refusal::Pause`]
+    /// `Paused`, its guest answering nothing; while it boots, `Lifecycle { Pending }`.
+    fn swap(&self, id: &BoxId, at: &str, digest: &str, when: SwapWhen) -> Result<Swapped, Refusal> {
+        let _ = (at, digest, when);
+        Err(Refusal::Swap {
+            cause: SwapCause::Class(self.inspect(id)?.class),
+            id: id.try_clone()?,
+            op: "swap",
+            why: None,
+        })
+    }
+
+    /// Gives the member of running Shards image box `id` at path `at` its image's own component back (Shards' D270 slice
+    /// 4), at its next start or now, as [`Runtime::swap`] gives it another: answered and refused as a swap is, naming
+    /// `restore`.
+    fn restore(&self, id: &BoxId, at: &str, when: SwapWhen) -> Result<Swapped, Refusal> {
+        let _ = (at, when);
+        Err(Refusal::Swap {
+            cause: SwapCause::Class(self.inspect(id)?.class),
+            id: id.try_clone()?,
+            op: "restore",
+            why: None,
+        })
+    }
+
+    /// Every member's component in running Shards image box `id`, as its run host said them with its last swap's answer
+    /// (Shards' D270 slice 4, [`ComponentAt`]): none where none was swapped. Answered from what its node holds, paused or
+    /// not; refused as a swap is, naming `components`.
+    fn components(&self, id: &BoxId) -> Result<Vec<ComponentAt>, Refusal> {
+        Err(Refusal::Swap {
+            cause: SwapCause::Class(self.inspect(id)?.class),
+            id: id.try_clone()?,
+            op: "components",
+            why: None,
+        })
+    }
+}
+
+/// When a component's swap or restore takes its member (Shards' D270 slice 4; [`Runtime::swap`]). The node's wire tags
+/// each by its place here, so append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SwapWhen {
+    /// At its member's next start: a later swap or restore `Now` of that member starts it, as Hex starts a member again
+    /// through no other call.
+    NextStart,
+    /// Now: its member's current generation asked to end (SIGTERM), and its next started with it.
+    Now,
+}
+
+/// One member's component in a running Shards image box (Shards' D270 slice 4; [`Runtime::components`]): its path
+/// (`/agents/NAME`, `/harness/NAME`), the component its next start lays there (`desired`) and the one its current
+/// generation runs with (`held`), each by its OSI artifact's manifest digest, none for its image's own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentAt {
+    pub at: String,
+    pub desired: Option<String>,
+    pub held: Option<String>,
+}
+
+/// What a swap or a restore did ([`Runtime::swap`], [`Runtime::restore`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Swapped {
+    /// Every member's component after it, as its run host holds them.
+    pub components: Vec<ComponentAt>,
+    /// The generation of its member a `Now` started (Shards' D270 slice 3b: 0 its first, each start again one more),
+    /// whose streams and end [`Runtime::member`] takes; none for a `NextStart`.
+    pub started: Option<u32>,
+    /// The bytes of the ended generation's output that no caller had taken, which its node read to their end and let go
+    /// so that output no one reads held no restart: none for a `NextStart`, or where its callers took them.
+    pub unread: u64,
 }
 
 /// A volume of a node's Shards home ([`Runtime::volumes`]), as Shards' store reads it (D281).
@@ -394,6 +510,11 @@ pub struct HostUse {
     pub window: Duration,
     /// Whether `cpu_ns` holds the vCPUs' guest time (D265). Appended after the other fields.
     pub charged: Charged,
+    /// The time its owner held its run paused since it started ([`Runtime::pause`]; Shards' D267, `Stats::paused`), every
+    /// pause so far and the one under way among it, on its run host's clock: part of `window`, which spans the whole run
+    /// as before, so a reader of two reads takes this one's growth off the window's for what ran between them, and one
+    /// that grew holds a pause. Appended after `charged`.
+    pub paused: Duration,
 }
 
 /// A Shards image box's agent-control link as both its ends say it ([`Runtime::link`]; Shards' D238, D239): what each
@@ -2737,6 +2858,10 @@ pub enum BoxState {
     Running,
     /// An `oci` box whose init waits for [`Runtime::start`].
     Created,
+    /// A Shards image VM whose vCPUs its owner holds out of its guest ([`Runtime::pause`]; kiln plan P5.5b), or is moving
+    /// so: its machine and its room held, its guest running no CPU and answering nothing from its pause's ask to its
+    /// resume's answer. Appended: the node's wire tags each state by its place here.
+    Paused,
 }
 
 /// How a macOS `process` box holds its members, which its node reports so a caller knows which (the
@@ -2866,6 +2991,12 @@ pub struct Usage {
     /// the wire means `None` (append-only, CLAUDE.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_from: Option<StartedFrom>,
+    /// A Shards image VM's time held paused by its owner since its run started ([`Runtime::pause`]; Shards' D267,
+    /// `Stats::paused`, on its run host's clock), in nanoseconds, every pause so far and the one under way among it:
+    /// `None` for a box with no VM to pause. After `started_from`, so absent on the wire means `None` (append-only,
+    /// CLAUDE.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_ns: Option<u64>,
 }
 
 /// How a Shards image VM's microVM started (D253), as its run host says it as the run starts: Shards' own five
@@ -3021,6 +3152,78 @@ pub enum Refusal {
     /// ([`Runtime::clear_volume`]). After `Guest` (append-only).
     #[error("a Shards home's volume, {cause}: {why}")]
     Volume { cause: VolumeCause, why: String },
+    /// Box `id`'s `op` refused for where its pause stands (kiln plan P5.5b): its pause or resume ([`Runtime::pause`],
+    /// [`Runtime::resume`]), or a call that needs its guest's answer while it is paused. Typed by [`PauseCause`], so a
+    /// caller tells a box paused already from one that runs, one with no run, one whose run has ended and one of a class
+    /// that pauses none, without reading words. After `Volume` (append-only).
+    #[error("box {id}: {op}: {cause}")]
+    Pause {
+        id: BoxId,
+        op: &'static str,
+        cause: PauseCause,
+    },
+    /// Box `id`'s `op` refused for its components (Shards' D270 slice 4): a swap, a restore or a read of its components
+    /// ([`Runtime::swap`], [`Runtime::restore`], [`Runtime::components`]). Typed by [`SwapCause`], so a caller tells each
+    /// of Shards' causes, a box with no run, one whose run has ended and one of a class with no components apart without
+    /// reading words; `why` in Shards' words where it gave them. After `Pause` (append-only).
+    #[error("box {id}: {op}: {cause}{}", Said(.why))]
+    Swap {
+        id: BoxId,
+        op: &'static str,
+        cause: SwapCause,
+        why: Option<String>,
+    },
+}
+
+/// Why a box's component swap, its restore or a read of its components was refused ([`Refusal::Swap`]; Shards' D270 slice
+/// 4): Shards' own causes one for one (`shards_api::image::SwapRefusal`), then where the box stands, then the causes
+/// Shards added after them (a member's next start, D277 and D252). The node's wire tags each by its place here, so append
+/// only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SwapCause {
+    /// No member of its run's image runs at that path.
+    #[error("no member of its image runs at that path")]
+    Unknown,
+    /// Its node's Shards store holds no OSI artifact of that digest, or one it cannot read, or it is no sha256 digest.
+    #[error("its node holds no such component")]
+    Artifact,
+    /// The artifact is of another kind than its path's: an agent's at a harness's path.
+    #[error("the component is of another kind than its path's")]
+    Kind,
+    /// The artifact is of another platform than its VM's.
+    #[error("the component is of another platform than its VM's")]
+    Platform,
+    /// The artifact asks past what its member is granted.
+    #[error("the component asks past what its member is granted")]
+    Asks,
+    /// Its VM could not take it: no bus, no slot, or no room in its components' window.
+    #[error("its VM has no room for the component")]
+    Device,
+    /// A swap or a start again of its member is under way.
+    #[error("a swap of its member is under way")]
+    Running,
+    /// It failed, in its guest's or its run host's words: its member's start again among it, after which Shards lets that
+    /// member go (D270 slice 3b).
+    #[error("it failed")]
+    Failed,
+    /// It has no run: it hasn't started, or its stop has begun.
+    #[error("it has no run: it hasn't started, or its stop has begun")]
+    NotRunning,
+    /// Its run has ended.
+    #[error("its run has ended")]
+    Ended,
+    /// It is of a class or form whose boxes have no components to swap: every one but a Shards image box, a box of
+    /// `Class::Shards` in Hex's own guest among them.
+    #[error("only a Shards image box has components to swap, and it is of class {}", .0.name())]
+    Class(Class),
+    /// Its member, started again now, couldn't enter its working directory (Shards' D277, `SwapRefusal::Workdir`), its
+    /// run host's words naming the member, the directory and the errno: its member then ended whole.
+    #[error("its member's next start couldn't enter its working directory")]
+    Workdir,
+    /// Its member, started again now, wasn't: its run host's budget had no room for its next generation's stdio lanes
+    /// (Shards' D252, `SwapRefusal::Capacity`), and its member then ended whole.
+    #[error("its run host had no room for its member's next start")]
+    Capacity,
 }
 
 /// What held a volume of a node's Shards home from a start or a clearing ([`Refusal::Volume`]; Shards' D281), each by
@@ -3040,6 +3243,31 @@ pub enum VolumeCause {
     /// The home has none of that name.
     #[error("not in its home")]
     Unknown,
+}
+
+/// Where a box stands that refuses its pause, its resume, or a call that needs its guest's answer while it is paused
+/// ([`Refusal::Pause`]; kiln plan P5.5b). The node's wire tags each by its place here, so append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PauseCause {
+    /// Its vCPUs are held out of its guest, or a pause or resume of them is under way, from whose ask to its resume's
+    /// answer its guest answers nothing (Shards' D267): a pause of it has nothing to do, so a caller that lost its
+    /// pause's answer takes this as done, and a call that needs its guest's answer waits for its resume.
+    #[error("it is paused")]
+    Paused,
+    /// Its vCPUs run its guest: a resume of it has nothing to do, so a caller that lost its resume's answer takes this as
+    /// done.
+    #[error("it runs, unpaused")]
+    Running,
+    /// It has no run to pause or resume: it hasn't started, or its stop has begun.
+    #[error("it has no run: it hasn't started, or its stop has begun")]
+    NotRunning,
+    /// Its run has ended.
+    #[error("its run has ended")]
+    Ended,
+    /// It is of a class or form whose boxes Hex pauses none of: every one but a Shards image box, the one whose VM is its
+    /// own and whose VMM holds its vCPUs (Shards' D267). A box of `Class::Shards` in Hex's own guest is among them.
+    #[error("only a Shards image box pauses, and it is of class {}", .0.name())]
+    Class(Class),
 }
 
 /// How a Shards guest failed a call ([`Refusal::Guest`]): each of Shards' kinds by itself (Shards R04), so a caller
@@ -3069,6 +3297,10 @@ pub enum GuestFailure {
     /// Its VM process answered its use with none of the protocol's (Shards' D260), as Shards says.
     #[error("answered its use with none of the protocol's: {0}")]
     HostUse(String),
+    /// Its VM didn't make a pause or a resume asked of it (kiln plan P5.5b; Shards' D267, `ImageRefusal::Pause`), in its
+    /// words: its machine stopped before every vCPU was held. After `HostUse` (append-only).
+    #[error("made no pause or resume asked of it: {0}")]
+    Pause(String),
 }
 
 /// How a Shards guest ended ([`GuestFailure::Ended`]): Shards' own ends.

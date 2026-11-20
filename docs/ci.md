@@ -9561,7 +9561,10 @@ resolution makes, a comment, a resolution, an approval and each mark of the Revi
   - **Agents' feedback** (`kiln_ci::review::agents::route`, pure). An agent's comment on an agent's
     change reaches the change's agent only with the switch on, saying why, and kiln hands it off so
     Ship reads the agent fixing. Agents start at most three fixes in a thread until a person speaks
-    there; an ended agent is sent nothing, and the item says the fix waits for a person.
+    there; an ended agent is sent nothing, and the item says the fix waits for a person. The words
+    count as reaching the agent once kiln's mail holds them (W20: published, handed over in turn),
+    as a person's do; a hand-off kiln can't keep is recorded in the audit trail (`ship.hand_off`,
+    refused) naming the step that refused (no change, no such change, its versions, the write).
     `agents.change`'s `threads` makes the version an agent's fix of those threads, and each thread
     says which version fixed it.
   - **Review agents** (`ci/attach.rs`'s `review` wake). A push asking `reviewer=agent:<name>` wakes

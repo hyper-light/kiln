@@ -183,6 +183,88 @@ fn a_restore_maps_ahead_the_working_set_the_restore_before_it_recorded() {
     assert!(pages > 0, "{second}");
 }
 
+/// A restore whose guest runs no command records its working set until its spawner says so
+/// (`--record-until`), as a run's recording ends when its command answers, and hands it then
+/// while its guest goes on (D25, amended 2026-11-18): told at once, it hands fewer pages
+/// than a restore that records until its VM ends, whose guest wrote more after. Each set
+/// goes to the test, which keeps none, so each restore of the generation records anew.
+#[cfg(unix)]
+#[test]
+fn a_bare_restore_told_to_end_its_recording_hands_what_it_had_recorded_by_then() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    if cannot_run_vms() || cannot_snapshot() {
+        return;
+    }
+    if !shards_vmm::vm::RESTORES_RECORD {
+        // Straight to stderr, as common's SKIP lines: a passing test's captured output is
+        // never shown.
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIP: this host's restores record no working set (vm::RESTORES_RECORD: KVM and WHP alone)"
+        );
+        return;
+    }
+    let s = Scratch::new("wset-until");
+    let original = boot_and_snapshot(&s, "stop");
+    assert_eq!(original.status, Some(0), "{original}");
+    let dir = s.snapshot();
+    // The set a restore hands, and its guest's console; told at once where `told`.
+    let recorded = |told: bool| -> (Vec<u8>, String) {
+        let (mut from_vm, to_test) = std::io::pipe().unwrap();
+        let (until, tell) = std::io::pipe().unwrap();
+        let (set_fd, until_fd) = (to_test.as_raw_fd(), until.as_raw_fd());
+        let mut command = std::process::Command::new(common::shards_vm());
+        command.arg("restore").args(["--working-set", "3"]);
+        if told {
+            command.args(["--record-until", "4"]);
+        }
+        command
+            .arg(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        // SAFETY: runs in the child between fork and exec, calling only fcntl(2) and dup2(2),
+        // which are async-signal-safe; each end copied above 4 first, closed on exec.
+        unsafe {
+            command.pre_exec(move || {
+                let high = |fd| libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 5);
+                let (set, until) = (high(set_fd), high(until_fd));
+                if set < 0 || until < 0 || libc::dup2(set, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The word's pipe given to the restore told alone.
+                if told && (libc::dup2(until, 4) < 0 || libc::fcntl(4, libc::F_SETFD, 0) < 0) {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop((to_test, until));
+        // Told at once: the end of its pipe is its word.
+        drop(tell);
+        let mut set = Vec::new();
+        from_vm.read_to_end(&mut set).unwrap();
+        let mut console = String::new();
+        child.stdout.take().unwrap().read_to_string(&mut console).unwrap();
+        assert!(child.wait().unwrap().success(), "{console}");
+        (set, console)
+    };
+    let (at_once, said) = recorded(true);
+    assert!(said.contains("SHARDS-TEST PASS"), "its guest went on: {said}");
+    let (to_its_end, said) = recorded(false);
+    assert!(said.contains("SHARDS-TEST PASS"), "{said}");
+    assert!(!to_its_end.is_empty(), "nothing recorded until its VM ended");
+    assert!(
+        at_once.len() < to_its_end.len(),
+        "told at once it handed {} bytes, recorded until its VM ended {}",
+        at_once.len(),
+        to_its_end.len()
+    );
+}
+
 #[test]
 fn the_original_guest_can_continue_after_its_snapshot() {
     if cannot_run_vms() || cannot_snapshot() {
@@ -277,10 +359,26 @@ impl Unwritable {
             // SAFETY: geteuid(2) takes nothing and cannot fail.
             mounted: unsafe { libc::geteuid() } == 0 && read_only_over_itself(dir),
         };
-        // What it is for, checked: a test given a directory it could write in proves nothing.
+        // What it is for, checked as the run writes there first: a file, its snapshot's lock
+        // (vmm `snapshot::staging`), which a directory's FILE_ADD_FILE grants (icacls' WD; a
+        // subdirectory takes FILE_ADD_SUBDIRECTORY, AD: Microsoft's File Access Rights
+        // Constants). Not a directory: a host whose token holds SeBackupPrivilege and
+        // SeRestorePrivilege enabled makes directories past the deny. On jupiter, under kiln's
+        // service token, CreateDirectoryW made a subdirectory past a deny of W, WD, AD and WD,AD
+        // alike, where CreateFileW was refused by each naming WD (2026-11-18), and the hosted
+        // windows-2025 runner made one past it too (CI 44189693085). SE_RESTORE_NAME grants
+        // FILE_ADD_FILE and FILE_ADD_SUBDIRECTORY whatever the ACL (Microsoft's Privilege
+        // Constants) to an open made for backup or restore (CreateFileW's
+        // FILE_FLAG_BACKUP_SEMANTICS); CreateDirectoryW's page names no such open, so that it
+        // makes one is the probe's word alone. A test given a directory it could write in proves
+        // nothing.
         let probe = dir.join("probe");
         assert!(
-            std::fs::create_dir(&probe).is_err(),
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+                .is_err(),
             "{} is writable, by this test itself",
             dir.display()
         );
@@ -433,6 +531,7 @@ fn restores_elsewhere_read_the_disks_the_snapshot_was_taken_with() {
 
 /// Storms: machines busy in every way at once when they are snapshotted (audit A02). They
 /// stream through vsock, which the host reaches through Unix sockets (AF_UNIX on Windows).
+/// Beside them, a machine of the most vCPUs it may have, each read back by a restore.
 mod storm {
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
@@ -448,6 +547,10 @@ mod storm {
     const ECHO_PORT: u32 = 1234;
     /// Where the host tells a storm it has stopped streaming.
     const DONE_PORT: u32 = 1235;
+    /// What the host writes to `DONE_PORT` once it has stopped streaming: the guest's verdict
+    /// waits for these bytes alone, and any other stream there fails it, naming itself
+    /// (testguest linux.rs `DONE_WORD`, `host_word`).
+    const DONE_WORD: &[u8] = b"SHARDS-DONE\n";
 
     /// The memory of a storm of `cpus` vCPUs, in MiB: 256 for 64 vCPUs or fewer, and as much
     /// a vCPU past that. What binds is the kernel's thread limit, an eighth of the memory free
@@ -529,10 +632,9 @@ mod storm {
     /// slowest rate measured, 196,608 bytes in 120 s (1,638.4 B/s: 64 vCPUs on an arm64
     /// Windows host nested under QEMU's TCG on 4 CPUs, the parity plan's step 10), a busy
     /// machine's restores carry 13 MiB, 1 MiB before its snapshot (the guest's own wait) and
-    /// a whole round in each of three restores (`all_whole`), in 8,320 s (2 h 19 min), and at
-    /// the most, restored once ([`restores`]), 5 MiB in 3,200 s (53 min); the one that goes on
-    /// 12 MiB, 1 MiB before its snapshot, 8 after (the guest's) and the rest of the round they
-    /// end in, in 7,680 s (2 h 8 min).
+    /// a whole round in each of three restores (`all_whole`), in 8,320 s (2 h 19 min); the one
+    /// that goes on 12 MiB, 1 MiB before its snapshot, 8 after (the guest's) and the rest of
+    /// the round they end in, in 7,680 s (2 h 8 min).
     fn stream(
         sock: PathBuf,
         size: String,
@@ -707,7 +809,7 @@ mod storm {
         let checked = start.elapsed();
         stop.store(true, Ordering::Relaxed);
         let rounds = streamer.join().unwrap();
-        assert!(line.contains("storm checked"), "{}", vm.seen.join("\n"));
+        assert!(line.contains("storm checked"), "{}", said_with_vsock(vm));
         // Connected, then a byte: the guest waits for it, so it lives until the host has
         // read its OK. Past it the storm's workers have stopped and its vCPUs wait, whatever
         // their count: its end is waited on with its VM process's CPU its progress
@@ -715,10 +817,10 @@ mod storm {
         // are work, not a spin (HVF at e6fb55548: a restored 2-vCPU storm's end refused
         // 93 to 131 ms in, past a W* of 16.5 ms, its CPU read as its liveness alone).
         let told = common::vsock_connect(sock, DONE_PORT)
-            .and_then(|mut s| s.write_all(b"\n").map_err(|e| e.to_string()));
+            .and_then(|mut s| s.write_all(DONE_WORD).map_err(|e| e.to_string()));
         if let Err(e) = told {
             vm.wait_exit_streamed(None);
-            panic!("telling the guest it may finish: {e}\n{}", vm.seen.join("\n"));
+            panic!("telling the guest it may finish: {e}\n{}", said_with_vsock(vm));
         }
         (rounds, checked)
     }
@@ -736,6 +838,33 @@ mod storm {
         assert!(reads >= 100, "{what}: {reads} clock reads {when}:\n{said}");
     }
 
+    /// A storm's VM process logs at info, so that its vsock muxer says each host connection's
+    /// ports as it takes it ([`said_with_vsock`]); its wait counts any new line as progress,
+    /// and a connect line comes only as the host begins a round, so none masks a stalled one.
+    const VSOCK_LOGGED: &[(&str, &str)] = &[("SHARDS_LOG", "info")];
+
+    /// What `vm`'s guest said, and below it its VM process's own `vsock:` lines, every one it
+    /// printed whether read or not: a failure then names the stream its muxer took and the
+    /// port it gave it (ROOT, 2026-11-18), which the harness, keeping no failing test's
+    /// directory, would otherwise lose.
+    fn said_with_vsock(vm: &Vm) -> String {
+        let vsock: Vec<String> = vm
+            .log()
+            .lock()
+            .map(|log| {
+                log.iter()
+                    .filter(|line| line.contains("vsock:"))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        format!(
+            "{}\n--- its VM process's vsock lines\n{}",
+            vm.seen.join("\n"),
+            vsock.join("\n")
+        )
+    }
+
     /// Every round came back whole, but for connections refused before the guest listened,
     /// and at least `least` did. A failure says what its guest `said`.
     fn all_whole(rounds: &[Result<(), String>], least: usize, what: &str, said: &str) {
@@ -749,13 +878,16 @@ mod storm {
         );
     }
 
-    /// What a storm's largest size shows past a machine whose every vCPU has a CPU (D14).
+    /// What a storm's largest size shows (D14).
     #[derive(Debug, Clone, Copy)]
     enum Largest {
-        /// Every vCPU a machine may have: the bounds its snapshot and its hypervisor keep of
-        /// each vCPU, which only a restore reads back (D13: every 255-vCPU snapshot was
-        /// refused as it restored, "sequence of 255 (limit 254)", found by this storm).
-        Most,
+        /// This host's CPUs: the most it runs at once, every vCPU on a CPU of its own. The
+        /// bounds a snapshot and its hypervisor keep of each vCPU, which only a restore reads
+        /// back and only the most a machine may have crosses (D13: every 255-vCPU snapshot was
+        /// refused as it restored, "sequence of 255 (limit 254)", found by this storm), are
+        /// [`a_restore_reads_back_every_vcpu_a_machine_may_have`]'s, with no storm's work on
+        /// each vCPU: a restored storm of 255 vCPUs on a host of 4 CPUs took 1,782 s.
+        Host,
         /// One vCPU more than this host has CPUs: the least it cannot run at once, so the
         /// barrier kicks a vCPU its host is not running.
         Overcommitted,
@@ -767,7 +899,7 @@ mod storm {
     /// vCPU on a CPU of its own; and `largest`.
     fn sizes(host: u32, most: u32, largest: Largest) -> Vec<u32> {
         let largest = match largest {
-            Largest::Most => most,
+            Largest::Host => host,
             Largest::Overcommitted => host.saturating_add(1),
         };
         let mut cpus: Vec<u32> = [2, host.min(most), largest]
@@ -807,58 +939,39 @@ mod storm {
         common::vcpus_admitted(shards_vmm::vm::max_vcpus().unwrap().min(common::kernel_nr_cpus()))
     }
 
-    /// How many restores the restores' storm of `cpus` vCPUs takes, `most` the most a machine
-    /// may have here (D14): three below the most, each a trial of a loss that comes in one
-    /// restore of several (180 restores in 20 runs, 00519521d1), and one at it. What the most
-    /// alone shows, each vCPU's state read back at the machine's bounds, every restore shows or
-    /// none does (D13's "sequence of 255 (limit 254)" refused every one), and one restore of 255
-    /// vCPUs on CI's 4-CPU x86_64 runner took 1,782 s (run 44007524337), past the step's 58
-    /// minutes for three.
-    fn restores(cpus: u32, most: u32) -> u32 {
-        if cpus >= most { 1 } else { 3 }
-    }
+    /// How many restores the restores' storm takes of each size (D14): each a trial of a loss
+    /// that comes in one restore of several (180 restores in 20 runs, 00519521d1).
+    const RESTORES: u32 = 3;
 
     /// A storm's sizes are the regimes its claim needs, from its host's CPUs and the most vCPUs
     /// a machine may have: CI's x86_64 runners (4 CPUs, 255), a Mac (18, 64), a host of one
     /// CPU, and one of more CPUs than a machine may have vCPUs (an arm64 KVM host: 192, 123).
+    /// Past its host's CPUs, the restores' storm takes no size: the most is
+    /// [`a_restore_reads_back_every_vcpu_a_machine_may_have`]'s.
     #[test]
     fn a_storms_sizes_are_the_regimes_its_claim_needs() {
-        assert_eq!(sizes(4, 255, Largest::Most), [2, 4, 255]);
+        assert_eq!(sizes(4, 255, Largest::Host), [2, 4]);
         assert_eq!(sizes(4, 255, Largest::Overcommitted), [2, 4, 5]);
-        assert_eq!(sizes(18, 64, Largest::Most), [2, 18, 64]);
+        assert_eq!(sizes(18, 64, Largest::Host), [2, 18]);
         assert_eq!(sizes(18, 64, Largest::Overcommitted), [2, 18, 19]);
-        assert_eq!(sizes(1, 255, Largest::Most), [2, 255]);
+        assert_eq!(sizes(1, 255, Largest::Host), [2]);
         assert_eq!(sizes(1, 255, Largest::Overcommitted), [2]);
         assert_eq!(sizes(2, 255, Largest::Overcommitted), [2, 3]);
-        assert_eq!(sizes(192, 123, Largest::Most), [2, 123]);
+        assert_eq!(sizes(192, 123, Largest::Host), [2, 123]);
         assert_eq!(sizes(192, 123, Largest::Overcommitted), [2, 123]);
-        // Restored three times below the most, once at it: CI's x86_64 runners, a Mac, a
-        // `SHARDS_STORM_CPUS` past the most.
-        let restored = |host: u32, most: u32| -> Vec<u32> {
-            sizes(host, most, Largest::Most)
-                .into_iter()
-                .map(|cpus| restores(cpus, most))
-                .collect()
-        };
-        assert_eq!(restored(4, 255), [3, 3, 1]);
-        assert_eq!(restored(18, 64), [3, 3, 1]);
-        assert_eq!(restored(192, 123), [3, 1]);
-        assert_eq!(restores(300, 255), 1);
     }
 
     /// A snapshot of a machine busy in every way at once, its CPUs waking one another, its
     /// timers ticking, both disks mid-request and a vsock stream in both directions, restores
     /// whole (audit A02): each restore finds every activity going on, no interrupt lost, every
-    /// record on the writable disk written exactly once, and the host's stream whole. Of every
-    /// size a machine may have, up to the most ([`Largest::Most`]): a restore alone reads back
-    /// what its snapshot keeps of each vCPU. Each size restores [`restores`] times.
+    /// record on the writable disk written exactly once, and the host's stream whole. Up to
+    /// its host's CPUs ([`Largest::Host`]), each size restored [`RESTORES`] times.
     #[test]
     fn restores_of_a_busy_machine_lose_no_interrupt_and_repeat_no_write() {
         if cannot_run_vms() || cannot_snapshot() {
             return;
         }
-        let most = most();
-        for cpus in storm_cpus(Largest::Most) {
+        for cpus in storm_cpus(Largest::Host) {
             let s = Scratch::new(&format!("storm{cpus}"));
             let rw = s.0.join("rw.img");
             std::fs::write(&rw, vec![0u8; RW_BYTES]).unwrap();
@@ -866,7 +979,8 @@ mod storm {
             let stop = Arc::new(AtomicBool::new(false));
             let carried = Arc::new(AtomicU64::new(0));
             let start = Instant::now();
-            let mut original = Vm::spawn(&storm_args(&s, cpus, &sock, "stop")).sized(size(cpus));
+            let mut original =
+                Vm::spawn_env(&storm_args(&s, cpus, &sock, "stop"), VSOCK_LOGGED).sized(size(cpus));
             let streamer = stream(
                 sock.clone(),
                 size(cpus),
@@ -880,24 +994,27 @@ mod storm {
             // Its stream breaks where it stopped, at the snapshot.
             stop.store(true, Ordering::Relaxed);
             drop(streamer.join().unwrap());
-            let said = original.seen.join("\n");
+            let said = said_with_vsock(&original);
             assert_eq!(code, Some(0), "{cpus} vCPUs: {said}");
             assert!(!said.contains("SHARDS-TEST FAIL"), "{cpus} vCPUs: {said}");
 
             // The writable disk as the snapshot left it, in the same file, for each restore.
             let taken = std::fs::read(&rw).unwrap();
-            for i in 0..restores(cpus, most) {
+            for i in 0..RESTORES {
                 std::fs::write(&rw, &taken).unwrap();
                 let sock = s.0.join(format!("r{i}.sock"));
                 let stop = Arc::new(AtomicBool::new(false));
                 let carried = Arc::new(AtomicU64::new(0));
                 let start = Instant::now();
-                let mut copy = Vm::spawn(&[
-                    "restore".as_ref(),
-                    s.snapshot().as_os_str(),
-                    "--vsock".as_ref(),
-                    sock.as_os_str(),
-                ])
+                let mut copy = Vm::spawn_env(
+                    &[
+                        "restore".as_ref(),
+                        s.snapshot().as_os_str(),
+                        "--vsock".as_ref(),
+                        sock.as_os_str(),
+                    ],
+                    VSOCK_LOGGED,
+                )
                 .sized(size(cpus));
                 let streamer = stream(
                     sock.clone(),
@@ -911,7 +1028,7 @@ mod storm {
                 let (rounds, checked) = storm_done(&mut copy, &sock, &stop, streamer, &carried, start);
                 let code = copy.wait_exit_following();
                 let what = format!("{cpus} vCPUs, restore {i} (storm checked {checked:?} in)");
-                let said = copy.seen.join("\n");
+                let said = said_with_vsock(&copy);
                 assert_eq!(code, Some(0), "{what}: {said}");
                 assert!(said.contains("SHARDS-TEST PASS"), "{what}: {said}");
                 assert!(said.contains("generation=1"), "{what}: {said}");
@@ -925,8 +1042,8 @@ mod storm {
     /// (audit A02): every activity continues, and the host's vsock stream, running through
     /// the snapshot, loses and repeats nothing. Up to one vCPU more than its host has CPUs
     /// ([`Largest::Overcommitted`]): what a resume adds to a snapshot, the barrier letting its
-    /// vCPUs go on, holds no bound of the machine's, whose largest snapshot the restores'
-    /// storm takes and reads back.
+    /// vCPUs go on, holds no bound of the machine's, whose largest snapshot
+    /// [`a_restore_reads_back_every_vcpu_a_machine_may_have`] takes and reads back.
     #[test]
     fn a_busy_machine_goes_on_whole_past_its_snapshot() {
         if cannot_run_vms() || cannot_snapshot() {
@@ -939,7 +1056,8 @@ mod storm {
             let stop = Arc::new(AtomicBool::new(false));
             let carried = Arc::new(AtomicU64::new(0));
             let start = Instant::now();
-            let mut vm = Vm::spawn(&storm_args(&s, cpus, &sock, "resume")).sized(size(cpus));
+            let mut vm =
+                Vm::spawn_env(&storm_args(&s, cpus, &sock, "resume"), VSOCK_LOGGED).sized(size(cpus));
             let streamer = stream(
                 sock.clone(),
                 size(cpus),
@@ -951,7 +1069,7 @@ mod storm {
             );
             let (rounds, checked) = storm_done(&mut vm, &sock, &stop, streamer, &carried, start);
             let code = vm.wait_exit_following();
-            let said = vm.seen.join("\n");
+            let said = said_with_vsock(&vm);
             assert_eq!(code, Some(0), "{cpus} vCPUs: {said}");
             assert!(said.contains("SHARDS-TEST PASS"), "{cpus} vCPUs: {said}");
             assert!(said.contains("generation=0"), "{cpus} vCPUs: {said}");
@@ -966,5 +1084,69 @@ mod storm {
                 &said,
             );
         }
+    }
+
+    /// A machine of `cpus` vCPUs in the test guest's `vcpus` mode, whose snapshot goes to
+    /// `s.snapshot()`, then stops. Its memory is a storm's of its size ([`storm_mib`]): the
+    /// kernel's threads and one of the guest's a vCPU, fewer than a storm's two. Its CPUs come
+    /// up as a storm's do ([`storm_args`]).
+    fn every_vcpu_args(s: &Scratch, cpus: u32) -> Vec<std::ffi::OsString> {
+        [
+            "run".into(),
+            "--kernel".into(),
+            kernel().as_os_str().to_owned(),
+            "--init".into(),
+            test_guest().as_os_str().to_owned(),
+            "--cpus".into(),
+            cpus.to_string().into(),
+            "--memory".into(),
+            storm_mib(cpus).to_string().into(),
+            "--cmdline".into(),
+            format!(
+                "console=hvc0 quiet panic=-1{} shards_test=vcpus",
+                shards_vmm::vm::late_cpus_cmdline(cpus)
+            )
+            .into(),
+            "--snapshot-dir".into(),
+            s.snapshot().into_os_string(),
+            "--snapshot-then".into(),
+            "stop".into(),
+        ]
+        .into()
+    }
+
+    /// Every vCPU a machine may have here ([`most`]) read back by a restore (D13, D14): the
+    /// bounds a snapshot and its hypervisor keep of each vCPU are crossed only at the most
+    /// ("sequence of 255 (limit 254)" refused every 255-vCPU restore), which every restore
+    /// shows or none does, so one restore shows it. In the restore each vCPU runs a thread of
+    /// its own, its clock read in turn with every other's (the test guest's `vcpus`), and none
+    /// carries a storm's work: past its host's CPUs, that work is what a restore of the most
+    /// waited on, 1,782 s on a host of 4 CPUs, and the storms keep it to the sizes their
+    /// claims need ([`Largest`]).
+    #[test]
+    fn a_restore_reads_back_every_vcpu_a_machine_may_have() {
+        if cannot_run_vms() || cannot_snapshot() {
+            return;
+        }
+        let cpus = most();
+        let s = Scratch::new(&format!("vcpus{cpus}"));
+        let mut original = Vm::spawn(&every_vcpu_args(&s, cpus)).sized(size(cpus));
+        let code = original.wait_exit_streamed(None);
+        let said = original.seen.join("\n");
+        assert_eq!(code, Some(0), "{cpus} vCPUs: {said}");
+        assert!(!said.contains("SHARDS-TEST FAIL"), "{cpus} vCPUs: {said}");
+
+        let mut copy = Vm::spawn(&["restore".as_ref(), s.snapshot().as_os_str()]).sized(size(cpus));
+        let code = copy.wait_exit_streamed(None);
+        let what = format!("{cpus} vCPUs, restored");
+        let said = copy.seen.join("\n");
+        assert_eq!(code, Some(0), "{what}: {said}");
+        assert!(said.contains("SHARDS-TEST PASS"), "{what}: {said}");
+        assert!(said.contains("generation=1"), "{what}: {said}");
+        assert!(
+            said.contains(&format!("in turn on {cpus} CPUs")),
+            "{what}: {said}"
+        );
+        clock_checked(&said, "after the snapshot", &what);
     }
 }

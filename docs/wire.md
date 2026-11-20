@@ -720,6 +720,11 @@ run out, and two lines can't take the same one by accident as they could a bit.
   01a1dd2e…, P6.2), answering each refusal by its cause; a runner that didn't name it isn't asked: a
   person's view of their volumes says so, and a start's placement counts none of their bytes as held
   there.
+  `workspace.slates.move`: the runner moves an agent's workspace volume with it by Slates' own move
+  (`Command::MoveTo`'s `slates`, kiln goal 95101ef3 K4) once the agent's harness is down, and mounts a
+  volume that arrived with a session before its harness starts; the server moves a volume only between
+  two runners that name it, and refuses the move by kind otherwise (an older runner would hand the
+  session over without its volume).
   `agentenv`: the runner runs sessions with the environments the server resolves for them
   (`Spec::agentenv`, `Command::Agentenv`; docs/agents.md, "Environments"), and says which variables
   its user has, by name and where each is set, as the server asks (`ServerMsg::UserEnv`); a runner

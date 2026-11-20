@@ -487,17 +487,35 @@ fn write_out_file(_fd: BorrowedFd<'_>) -> Result<(), HostError> {
 /// runs, and the platform's syncs over them when it runs — each file synced ([`sync_file`]) on ⌈√n⌉ streams for n
 /// files, then the syncs ordered ahead of every later write ([`order_synced`]).
 struct OsBarrier {
-  files: Vec<OwnedFd>,
+  files: Vec<(OwnedFd, Durability)>,
+}
+
+/// What a batch's barrier makes durable of one file (A-472). A temporary's data (`Data`): its name and inode reach the
+/// disk with the directory sync its placement is followed by. A file whose metadata alone a landing set in place
+/// (`Whole`): its inode, which `fsync` flushes ("as well as flushing the file data, fsync() also flushes the metadata
+/// information associated with the file", fsync(2)) and `fdatasync` need not ("does not flush modified metadata unless
+/// that metadata is needed in order to allow a subsequent data retrieval", the same page), nor any directory's sync.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Durability {
+  /// A temporary's data.
+  Data,
+  /// A file's metadata with its data.
+  Whole,
 }
 
 impl Barrier for OsBarrier {
   fn run(self: Box<Self>) -> Result<(), HostError> {
-    let fds: Vec<BorrowedFd<'_>> = self.files.iter().map(AsFd::as_fd).collect();
-    let streams = fds
+    let files: Vec<(BorrowedFd<'_>, Durability)> = self
+      .files
+      .iter()
+      .map(|(fd, durability)| (fd.as_fd(), *durability))
+      .collect();
+    let fds: Vec<BorrowedFd<'_>> = files.iter().map(|(fd, _)| *fd).collect();
+    let streams = files
       .len()
       .isqrt()
-      .saturating_add(usize::from(!is_square(fds.len())));
-    sync_on_streams(&fds, streams).and_then(|()| order_synced(&fds))
+      .saturating_add(usize::from(!is_square(files.len())));
+    sync_on_streams(&files, streams).and_then(|()| order_synced(&fds))
   }
 }
 
@@ -518,7 +536,7 @@ fn is_square(n: usize) -> bool {
 /// CPU quota. An online ramp over the count was tried the same day and rejected: a barrier's time varies about 6× at
 /// one count on a shared disk, so two samples mismeasured the noise and the ramp settled on one stream in 9,620 of
 /// 9,690 barriers.
-fn sync_on_streams(fds: &[BorrowedFd<'_>], streams: usize) -> Result<(), HostError> {
+fn sync_on_streams(fds: &[(BorrowedFd<'_>, Durability)], streams: usize) -> Result<(), HostError> {
   let streams = streams.clamp(1, fds.len().max(1));
   std::thread::scope(|scope| {
     let mut started = Vec::with_capacity(streams.saturating_sub(1));
@@ -547,27 +565,37 @@ fn sync_on_streams(fds: &[BorrowedFd<'_>], streams: usize) -> Result<(), HostErr
 
 /// One stream's share of a batch: files `stream`, `stream + streams`, and so on, each synced in turn; the first refusal
 /// (the rest are still synced).
-fn sync_stream(fds: &[BorrowedFd<'_>], stream: usize, streams: usize) -> Result<(), HostError> {
+fn sync_stream(
+  fds: &[(BorrowedFd<'_>, Durability)],
+  stream: usize,
+  streams: usize,
+) -> Result<(), HostError> {
   let mut synced = Ok(());
-  for fd in fds.iter().skip(stream).step_by(streams.max(1)) {
-    synced = synced.and(sync_file(*fd));
+  for (fd, durability) in fds.iter().skip(stream).step_by(streams.max(1)) {
+    synced = synced.and(sync_file(*fd, *durability));
   }
   synced
 }
 
-/// One file of a batch made durable on Linux and the other unixes: `fdatasync` (on Linux its writeback was started at
-/// the write-out, and the journal's group commit merges the syncs in flight together: ext4's jbd2 joins every sync
-/// waiting on the running transaction to its commit).
+/// One file of a batch made durable on Linux and the other unixes: a temporary's data by `fdatasync` (on Linux its
+/// writeback was started at the write-out, and the journal's group commit merges the syncs in flight together: ext4's
+/// jbd2 joins every sync waiting on the running transaction to its commit); a file whose metadata alone a landing set,
+/// whole by `fsync`, since `fdatasync` need not write a mode (fsync(2), A-472).
 #[cfg(not(target_os = "macos"))]
-fn sync_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
-  rustix::fs::fdatasync(fd).map_err(refusal)
+#[allow(clippy::disallowed_methods)] // the write seam's own barrier (R1, D-26; AUD-29-31).
+fn sync_file(fd: BorrowedFd<'_>, durability: Durability) -> Result<(), HostError> {
+  match durability {
+    Durability::Data => rustix::fs::fdatasync(fd).map_err(refusal),
+    Durability::Whole => rustix::fs::fsync(fd).map_err(refusal),
+  }
 }
 
-/// One file of a batch handed to the device on macOS: `fsync`, its data and attributes (not a media flush); the
-/// batch's barrier after every one orders them ahead of every later write ([`order_synced`]).
+/// One file of a batch handed to the device on macOS: `fsync`, which "causes all modified data and attributes of fildes
+/// to be moved to a permanent storage device" (Apple's fsync(2)), a temporary's and a set mode's alike (not a media
+/// flush); the batch's barrier after every one orders them ahead of every later write ([`order_synced`]).
 #[cfg(target_os = "macos")]
 #[allow(clippy::disallowed_methods)] // the write seam's own barrier (R1, D-26; AUD-29-31).
-fn sync_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+fn sync_file(fd: BorrowedFd<'_>, _durability: Durability) -> Result<(), HostError> {
   rustix::fs::fsync(fd).map_err(refusal)
 }
 
@@ -702,6 +730,19 @@ impl LandFs for OsLand {
     })
   }
 
+  /// No reflink here yet (`capabilities` says so, so the engine never asks): Linux's `FICLONE` and macOS's
+  /// `clonefile` are owed (A-445); refused `ENOTSUP`, nothing made.
+  fn clone_temp(
+    &mut self,
+    dir: HostDir,
+    _name: &str,
+    _from: HostFile,
+    _len: u64,
+  ) -> Result<HostFile, HostError> {
+    self.dir(dir)?;
+    Err(refusal(rustix::io::Errno::NOTSUP))
+  }
+
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
     if let Some(file) = self.create_unnamed(dir)? {
       return Ok(file);
@@ -728,13 +769,21 @@ impl LandFs for OsLand {
     write_out_file(self.file(file)?)
   }
 
+  /// The batch's barrier over its own descriptor of each file: a temporary synced for its data, any other file (one whose
+  /// metadata alone a landing set in place) synced whole (A-472).
   fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError> {
     let files = files
       .iter()
       .map(|file| {
+        let durability = if self.temps.contains_key(&file.0) {
+          Durability::Data
+        } else {
+          Durability::Whole
+        };
         self
           .file(*file)?
           .try_clone_to_owned()
+          .map(|fd| (fd, durability))
           .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
       })
       .collect::<Result<Vec<_>, _>>()?;
@@ -749,8 +798,33 @@ impl LandFs for OsLand {
     ran
   }
 
+  /// The file opened to read, never through a link (`O_NOFOLLOW`; a regular file alone): `fchmod` asks ownership, not
+  /// write access (A-458). A file its owner may not read is refused `EACCES`, typed, and the entry fails.
+  fn open_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    self.host.open_file(dir, name)
+  }
+
+  /// The directory opened as the host opens one (`O_DIRECTORY|O_NOFOLLOW`, its name checked and never on one of this
+  /// daemon's own mounts, A-227) and held as a file handle (A-501): `fchmod`, `fstat` and the barrier's `fsync` take any
+  /// descriptor, and `fsync` of a directory's descriptor writes its inode, its mode among it.
+  fn open_dir_to_chmod(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let opened = self.host.open_dir(dir, name)?;
+    let held = self.host.dir_fd(opened).and_then(|fd| {
+      fd.try_clone_to_owned()
+        .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+    });
+    self.host.close_dir(opened);
+    self.host.adopt_file(held?)
+  }
+
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     rustix::fs::fchmod(self.file(file)?, mode_bits(mode)).map_err(refusal)
+  }
+
+  /// Linux and macOS hold no Windows attribute bits (A-262: their landings carry them in the volume and apply none), so
+  /// the file is kept as it is (A-451).
+  fn set_windows(&mut self, file: HostFile, _windows: u16) -> Result<(), HostError> {
+    self.file(file).map(drop)
   }
 
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError> {
@@ -821,7 +895,8 @@ impl LandFs for OsLand {
   /// never a symlink swapped in under the name) and given the recorded mode exactly with `fchmod`,
   /// as a file's temporary is by `set_mode`. Before 2026-10-01 the umask cleared bits the volume
   /// held (0775 landed 0755; docs/bugs/2026-10-01-landed-directory-mode-umask.md).
-  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError> {
+  /// A directory with its mode; a Unix directory holds no Windows bits (A-451).
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32, _windows: u16) -> Result<(), HostError> {
     let parent = self.dir(dir)?;
     rustix::fs::mkdirat(parent, name, mode_bits(mode)).map_err(refusal)?;
     let made = rustix::fs::openat(parent, name, dir_flags(), Mode::empty()).map_err(refusal)?;
@@ -832,7 +907,16 @@ impl LandFs for OsLand {
     rustix::fs::unlinkat(self.dir(dir)?, name, AtFlags::REMOVEDIR).map_err(refusal)
   }
 
-  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError> {
+  /// `symlinkat` makes the link whole at `name` in one step, so `staged` is not used (the seam's contract); a Unix link
+  /// has no kind and holds no Windows bits (A-451).
+  fn symlink(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    target: &str,
+    _staged: &str,
+    _windows: u16,
+  ) -> Result<(), HostError> {
     rustix::fs::symlinkat(target, self.dir(dir)?, name).map_err(refusal)
   }
 

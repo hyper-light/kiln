@@ -220,6 +220,7 @@ mod tests {
     timers: 4,
     tick_ns: 1,
     green_chain_bytes: 1,
+    audit_records: 4,
   };
   /// Shape: the mounting user and another.
   const OWNER: Principal = Principal::Uid {
@@ -296,6 +297,7 @@ mod tests {
             admin: false,
           },
           token: [1; 16],
+          mount: None,
         },
       })
       .unwrap();
@@ -388,6 +390,7 @@ mod tests {
             admin: false,
           },
           token: [1; 16],
+          mount: None,
         },
       })
       .unwrap();
@@ -430,6 +433,7 @@ mod tests {
             admin: false,
           },
           token: [2; 16],
+          mount: None,
         },
       })
       .unwrap();
@@ -507,6 +511,7 @@ mod tests {
             principal,
             rights: Rights { read: true, write: write_rights, admin: false },
             token: [1; 16],
+            mount: None,
           },
         })
         .unwrap();

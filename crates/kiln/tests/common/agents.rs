@@ -94,7 +94,7 @@ pub fn runner_env(dir: &Path, port: u16, name: &str, chaos: Option<&str>, talk: 
     Ok((Runner(child), log_path))
 }
 
-/// A folder of this machine's programs (symlinks to /usr/bin's and /bin's) without any harness kiln
+/// A folder of this machine's programs (symlinks to /usr/bin's, /bin's and /usr/sbin's) without any harness kiln
 /// knows ([`kiln::harness::kinds::Kind::all`]'s programs), as a PATH: a harness is on it only where a
 /// test puts one, also on a machine with one installed system-wide (adacachy: pacman's claude-code
 /// and codex in /usr/bin), which a runner or server would otherwise find first.
@@ -103,8 +103,13 @@ pub fn path_without_harnesses(dir: &Path) -> anyhow::Result<String> {
     let system = dir.join("system-bin");
     std::fs::create_dir_all(&system)?;
     let harnesses: Vec<&str> = kiln::harness::kinds::Kind::all().iter().map(|k| k.program).collect();
-    for folder in ["/usr/bin", "/bin"] {
-        for entry in std::fs::read_dir(folder)?.flatten() {
+    // The system's own folders a machine's PATH holds, `/usr/sbin` among them for `lsof` (macOS keeps it there), which
+    // names what holds a workspace's mount that stays. No unmount needs a program on it: Slates' runs none on macOS
+    // (`unmount(2)`, contract 42, Slates' A-507; it ran `umount` from `/sbin` before), and kiln reads the mount table by
+    // its path (`/sbin/mount`).
+    for folder in ["/usr/bin", "/bin", "/usr/sbin"] {
+        let Ok(entries) = std::fs::read_dir(folder) else { continue };
+        for entry in entries.flatten() {
             let name = entry.file_name();
             if harnesses.iter().any(|h| name == *h) || std::fs::symlink_metadata(system.join(&name)).is_ok() {
                 continue;

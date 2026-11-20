@@ -15,24 +15,19 @@
   clippy::disallowed_methods
 )]
 
-#[cfg(unix)]
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use slates_api::{
-  AttachTransport, Denied, Error, Exhausted, Existing, Instance, Intent, Invalid, IssuerFault,
-  KindMismatch, MergeApproval, MergeOutcome, MergeRecord, Missing, MountOptions, PathFault,
-  PolicyReason, PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId,
-  Source, TrustedSigner, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
+  ArchiveFault, AttachTransport, AuditKind, BaseState, ConflictClass, Denied, Drift, DriftKind,
+  Error, Exhausted, Existing, Filter, Instance, Intent, Invalid, IssuerFault, KindMismatch,
+  LandOutcome, LandingApproval, LandingConflict, LandingStage, LandingState, MergeApproval,
+  MergeOutcome, MergeRecord, Missing, MountOptions, MoveTarget, PathFault, PolicyReason,
+  PolicyRefusal, PolicySubject, Provisioned, RebaseOutcome, SimVolumes, SnapshotId, Source,
+  TrustedSigner, Unsupported, Unusable, Verification, VolumeId, VolumeSpec, Volumes, Work,
   WorkSignature, WriteAct, WriteMode, WritePolicy,
-};
-// What only the Unix-gated tests (the overlay and landing tests) name.
-#[cfg(unix)]
-use slates_api::{
-  AuditKind, BaseState, ConflictClass, Drift, DriftKind, Filter, GrantState, LandOutcome,
-  LandingApproval, LandingConflict, LandingStage, LandingState,
 };
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -41,6 +36,18 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 #[path = "../../server/tests/common/signer.rs"]
 #[allow(dead_code)]
 mod signer;
+
+/// The daemon's own test VMM (§4.6, G-vhost): a guest driver over real virtqueues and the vhost-user front end that
+/// speaks for it, shared with the server's virtio-fs suite and the CLI's live-shipping flow; not every helper is used
+/// here. Linux only, as the vhost-user form is.
+#[cfg(target_os = "linux")]
+#[path = "../../server/tests/common/guest.rs"]
+#[allow(dead_code)]
+mod guest;
+#[cfg(target_os = "linux")]
+#[path = "../../server/tests/common/vhost_front_end.rs"]
+#[allow(dead_code)]
+mod vhost_front_end;
 
 /// Shape: each probe's wall budget for the tests' machine profile (milliseconds); measured once per process.
 const PROBE_MS: u64 = 5;
@@ -132,7 +139,6 @@ fn grouped(tag: &str) -> (Daemon, Instance) {
 }
 
 /// [`grouped`] on the shards of the daemon kiln starts ([`KILN_SHARDS`]).
-#[cfg(unix)]
 fn kiln_grouped(tag: &str) -> (Daemon, Instance) {
   let (daemon, mut instance) = daemon_on(tag, KILN_SHARDS);
   instance.ensure_group().unwrap();
@@ -140,13 +146,12 @@ fn kiln_grouped(tag: &str) -> (Daemon, Instance) {
 }
 
 /// A real directory for an overlay's base and a landing's target (A-50: never `/tmp`, never a RAM directory): in the
-/// build output, named with the process id and a counter, canonical, removed on drop.
-#[cfg(unix)]
+/// build output, named with the process id and a counter, canonical, removed on drop. The daemon reads and lands into
+/// it on every platform (Windows since A-185).
 struct Folder {
   path: String,
 }
 
-#[cfg(unix)]
 impl Folder {
   fn new() -> Folder {
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -157,10 +162,7 @@ impl Folder {
     ));
     std::fs::create_dir_all(&made).unwrap();
     Folder {
-      path: std::fs::canonicalize(&made)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned(),
+      path: as_a_host_names_it(&std::fs::canonicalize(&made).unwrap()),
     }
   }
 
@@ -177,11 +179,25 @@ impl Folder {
   }
 }
 
-#[cfg(unix)]
 impl Drop for Folder {
   fn drop(&mut self) {
     let _removed = std::fs::remove_dir_all(&self.path);
   }
+}
+
+/// A canonical folder as a host names it, the plain path it passes an overlay or a landing (kiln passes its workspace's
+/// own). Windows' `canonicalize` answers the verbatim form (`\\?\C:\...`), under which `/` is a name's character rather
+/// than a separator, so a name such as `.git/HEAD` joined to it is no path at all; the drive's plain form is the same
+/// folder.
+fn as_a_host_names_it(canonical: &Path) -> String {
+  let text = canonical.to_string_lossy().into_owned();
+  #[cfg(windows)]
+  if let Some(plain) = text.strip_prefix(r"\\?\")
+    && plain.get(1..3) == Some(r":\")
+  {
+    return plain.to_owned();
+  }
+  text
 }
 
 /// Writes `bytes` as the whole of `path` in `volume` through the typed file channel, under a write attachment held for
@@ -208,7 +224,6 @@ fn provision(instance: &mut Instance, spec: &VolumeSpec) -> VolumeId {
 }
 
 /// The landing of `volume`'s head into `folder`, `.git` left out as kiln's landings leave it.
-#[cfg(unix)]
 fn landing_into(volume: VolumeId, folder: &Folder) -> slates_api::LandingRequest {
   slates_api::LandingRequest {
     volume,
@@ -348,15 +363,14 @@ fn the_launchers_authority_needs_the_anchors_handoff() {
   ));
 }
 
-/// AC-5.10 / T-5.12 and AC-5.12 / T-5.14 (A-278, A-299; §4.15, D-25, D-26) on the landing a host drives (Unix: the
-/// daemon lands on Unix). Do: lay an overlay over a folder holding a file and a `.git`, change the file, add one and
+/// AC-5.10 / T-5.12 and AC-5.12 / T-5.14 (A-278, A-299; §4.15, D-25, D-26) on the landing a host drives, on every
+/// platform (Windows since A-185). Do: lay an overlay over a folder holding a file and a `.git`, change the file, add one and
 /// change `.git/HEAD` in the volume; land it with `/.git` left out under the ask mode every landing has today; approve
 /// an approval of another manifest; approve the one shown. Expect: the folder untouched until the approval; the
 /// landing answered `ApprovalRequired` with a typed summary (one create, one replace, `.git` filtered out), unsigned,
 /// listing exactly the two files as they read; the stale approval writing nothing and answering the fresh
 /// presentation; the shown one `Written`, `Done`, two entries, and the folder then holding exactly the volume's two
 /// files with `.git/HEAD` as it was.
-#[cfg(unix)]
 #[test]
 fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
   let (daemon, mut instance) = grouped("landing");
@@ -406,7 +420,6 @@ fn an_overlay_lands_exactly_what_was_approved_and_nothing_else() {
 /// The ask of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: land `request`, unsigned. Expect it
 /// answered `ApprovalRequired`, unsigned and carrying no signature, for `request`, with the landing's statement and a
 /// typed summary of one create and one replace, `.git` filtered out. Returns the approval.
-#[cfg(unix)]
 fn expect_an_approval_asked(
   instance: &mut Instance,
   request: &slates_api::LandingRequest,
@@ -441,7 +454,6 @@ fn expect_an_approval_asked(
 
 /// The entry list of `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (A-287). Expect `approval`'s list to
 /// be what it writes, path by path, `/.git` left out, each file as it reads in `volume`.
-#[cfg(unix)]
 fn expect_the_entries_listed_as_they_read(
   instance: &mut Instance,
   volume: VolumeId,
@@ -479,7 +491,6 @@ fn expect_the_entries_listed_as_they_read(
 /// The approved landing of `an_overlay_lands_exactly_what_was_approved_and_nothing_else`. Do: approve `approval` with
 /// `issuer`. Expect it `Written` and `Done`, unsigned, two entries written, and `folder` holding exactly the volume's
 /// two files with `.git/HEAD` as it was.
-#[cfg(unix)]
 fn expect_the_approved_manifest_written(
   instance: &mut Instance,
   approval: &LandingApproval,
@@ -503,9 +514,9 @@ fn expect_the_approved_manifest_written(
 }
 
 /// The record of `an_overlay_lands_exactly_what_was_approved_and_nothing_else` (A-299). Expect the approval and the
-/// landing audited and listed, typed: the presentation, the grant the launcher issued, the landing finished `Done`, and
-/// the single-use grant of `approval` consumed by it.
-#[cfg(unix)]
+/// landing audited, typed: the presentation, the grant the launcher issued and the landing finished `Done`; and the
+/// single-use grant of `approval`, consumed by it, gone from the grant table (A-266: a principal's grants are its live
+/// ones, and a used grant's history is the audit's).
 fn expect_the_landing_audited_and_its_grant_consumed(
   instance: &mut Instance,
   approval: &LandingApproval,
@@ -525,18 +536,17 @@ fn expect_the_landing_audited_and_its_grant_consumed(
   );
   let grants = instance.grants().unwrap();
   assert!(
-    grants
+    !grants
       .iter()
-      .any(|grant| grant.manifest == approval.manifest && grant.state == GrantState::Consumed),
-    "{grants:?}"
+      .any(|grant| grant.manifest == approval.manifest),
+    "a consumed grant leaves the table: {grants:?}"
   );
 }
 
 /// AC-5.12 / T-5.14 (A-278, A-299; §4.15 "Drift", step 4): do change a file in an overlay, then change the same file on
 /// the disk; expect no drift before and, after, the drift typed — the file `Modified` at its whole path, the base read
-/// with a watcher — and the landing answered `Conflicted` with the file's class `ModifyModify` and the bytes the volume
-/// would land there, nothing written.
-#[cfg(unix)]
+/// (helped by a watcher where the host has one; Windows' base host reads by fingerprints alone) — and the landing
+/// answered `Conflicted` with the file's class `ModifyModify` and the bytes the volume would land there, nothing written.
 #[test]
 fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed_conflict() {
   let (daemon, mut instance) = grouped("drift");
@@ -585,7 +595,6 @@ fn a_file_changed_on_disk_after_the_volume_changed_it_is_typed_drift_and_a_typed
 /// call, `Written` and `Done`, its file on the disk; its plan presented and nothing written (the daemon's present-only
 /// verb); the forbid volume's landing answered `Refused` by its own policy and nothing written; and the signed-merge
 /// requirement set and read back on the volume, a consumer's refused (A-321).
-#[cfg(unix)]
 #[test]
 fn a_landing_follows_its_volumes_write_mode() {
   let (daemon, mut instance) = grouped("modes");
@@ -641,7 +650,6 @@ fn a_landing_follows_its_volumes_write_mode() {
 /// signed merges on it, and one on a consumer. Expect the landing answered `Refused` by the volume's own policy, nothing
 /// written; the volume's requirement set and read back (A-321); and the consumer's refused
 /// `Invalid::SignedMergesNotAVolume` before anything is sent, since the requirement is a volume's rule.
-#[cfg(unix)]
 fn expect_a_forbidding_volume_never_lands(
   instance: &mut Instance,
   shut: VolumeId,
@@ -872,13 +880,12 @@ fn a_signed_merge_is_judged_and_read_back_through_the_contract() {
   daemon.stop();
 }
 
-/// AC-5.10 / AC-5.12 (A-321; §4.15, §4.12 "The consumer contract") on the landing a host drives (Unix: the daemon lands
-/// on Unix): do trust a key on an overlay with the launcher's authority; plan its landing; sign the statement the plan
+/// AC-5.10 / AC-5.12 (A-321; §4.15, §4.12 "The consumer contract") on the landing a host drives, on every platform
+/// (Windows since A-185): do trust a key on an overlay with the launcher's authority; plan its landing; sign the statement the plan
 /// states with the trusted key and land with the signature under the ask an unset volume has; approve the approval it
 /// answers; read the audit. Expect the plan unsigned, stating the landing for a signer; the signed landing asked again
 /// over the same manifest, verified naming the key and carrying the signature, nothing written; the approval `Written`
 /// and verified, the file on the disk; and the landing's planned and finished audit records verified.
-#[cfg(unix)]
 #[test]
 fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
   let (daemon, mut instance) = grouped("signed-landing");
@@ -888,13 +895,65 @@ fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
     &mut instance,
     &VolumeSpec::overlay("signed-landing", &folder.path, ROOM),
   );
-  write_file(&mut instance, volume, "/s.txt", b"signed\n");
+  let (landing, verified) = land_signed(&mut instance, &launcher, volume, &folder);
+  expect_the_signed_landing_audited(&mut instance, landing, verified);
+  daemon.stop();
+}
+
+/// Shape: the instances that read the audit in the cross-shard test beside the one that landed. A client's shard is its
+/// id's residue over the shards and fresh ids are handed out in turn, so the four sit on both of kiln's shards
+/// whichever the first took.
+const AUDIT_READERS: usize = 3;
+
+/// AC-5.10 / AC-5.12 (A-321, A-265; §4.15 "Ownership facts": the audit log is written through the control shard;
+/// §4.12) on the shards kiln starts: do land an overlay signed and approve it as
+/// `a_signed_landing_is_judged_and_read_back_through_the_contract` does, the overlay named so that the shard other than
+/// the control shard owns it; then read the audit from the instance that landed and from three more attached after it.
+/// Expect every reader to read the landing's planned and finished records, verified. Before A-265 `Audit` read only the
+/// partition of the reader's own shard while a landing's records were written on its volume's, so a reader on the
+/// control shard read none of them and the landing's verdict with them (GAPS, found by g90).
+#[test]
+fn a_signed_landings_audit_reads_back_on_every_shard_kiln_starts() {
+  let (daemon, mut instance) = kiln_grouped("audit-shards");
+  let launcher = issuer_of(&daemon);
+  let folder = Folder::new();
+  let name = (0..)
+    .map(|n| format!("audited-elsewhere-{n}"))
+    .find(|name| slates_server::verbs::owner_of_name(name, usize::from(KILN_SHARDS)) != 0)
+    .unwrap();
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay(&name, &folder.path, ROOM),
+  );
+  let (landing, verified) = land_signed(&mut instance, &launcher, volume, &folder);
+  let mut readers: Vec<Instance> = (0..AUDIT_READERS)
+    .map(|_| Instance::attach(instance.name()).unwrap())
+    .collect();
+  expect_the_signed_landing_audited(&mut instance, landing, verified);
+  for reader in &mut readers {
+    expect_the_signed_landing_audited(reader, landing, verified);
+  }
+  drop(readers);
+  daemon.stop();
+}
+
+/// The signed landing of `a_signed_landing_is_judged_and_read_back_through_the_contract`: do trust a fresh key on
+/// `volume` with the `launcher`'s authority, write a file into it, plan its landing into `folder`, sign the statement
+/// the plan states and land with the signature, and approve what that asks. Expect what that test names; the landing
+/// and the verdict it was answered with.
+fn land_signed(
+  instance: &mut Instance,
+  launcher: &slates_api::Issuer,
+  volume: VolumeId,
+  folder: &Folder,
+) -> (u64, Verification) {
+  write_file(instance, volume, "/s.txt", b"signed\n");
   let key = signer::TestSigner::fresh();
   let trusted = TrustedSigner::from_wire(key.public()).unwrap();
   instance
-    .set_signers(volume, std::slice::from_ref(&trusted), &launcher)
+    .set_signers(volume, std::slice::from_ref(&trusted), launcher)
     .unwrap();
-  let request = landing_into(volume, &folder);
+  let request = landing_into(volume, folder);
   let LandOutcome::ApprovalRequired(plan) = instance.plan_landing(&request).unwrap() else {
     panic!("a plan presents");
   };
@@ -916,18 +975,16 @@ fn a_signed_landing_is_judged_and_read_back_through_the_contract() {
     None,
     "nothing written before the approval"
   );
-  let LandOutcome::Written(report) = instance.approve_landing(&asked, &launcher).unwrap() else {
+  let LandOutcome::Written(report) = instance.approve_landing(&asked, launcher).unwrap() else {
     panic!("the approved manifest lands");
   };
   assert_eq!(report.verification, verified);
   assert_eq!(folder.read("s.txt").unwrap(), b"signed\n");
-  expect_the_signed_landing_audited(&mut instance, report.landing, verified);
-  daemon.stop();
+  (report.landing, verified)
 }
 
 /// The audit of `a_signed_landing_is_judged_and_read_back_through_the_contract`. Expect every record of `landing` that
 /// judges its signature `verified`, a planned and a finished one among them, and no other kind of record judging one.
-#[cfg(unix)]
 fn expect_the_signed_landing_audited(
   instance: &mut Instance,
   landing: u64,
@@ -1053,7 +1110,6 @@ fn a_merge_follows_its_greens_write_mode() {
 
 /// kiln's volume bound (`crates/kiln/src/workspace/slates.rs`, `volume_max`): a quarter of the machine's memory in
 /// whole GiB, at least one and at most 64.
-#[cfg(unix)]
 fn kiln_volume_max() -> u64 {
   /// Format: kiln's `MAX_VOLUME_GIB`.
   const MAX_VOLUME_GIB: u64 = 64;
@@ -1062,7 +1118,6 @@ fn kiln_volume_max() -> u64 {
 
 /// The daemon's own count of each shard's inode-version slab (§4.2 inode dimension), printed beside a test's verdict
 /// as its evidence: the slots, those committed to volumes' allowances, and those snapshots retain.
-#[cfg(unix)]
 fn print_version_slabs(instance: &mut Instance, when: &str) {
   for shard in instance.daemon_status().unwrap().shards {
     eprintln!(
@@ -1084,7 +1139,6 @@ fn print_version_slabs(instance: &mut Instance, when: &str) {
 /// that snapshot's landing without writing and list its entries, read `.gitignore` at the head as kiln's ignore rules
 /// do, and a base file nothing looked up before the snapshot. Expect: each file's bytes as the disk holds them — a read
 /// of a file nobody changed is never refused for space.
-#[cfg(unix)]
 #[test]
 fn an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot() {
   let (daemon, mut instance) = kiln_grouped("review-read");
@@ -1136,7 +1190,6 @@ fn an_unchanged_base_file_reads_at_the_head_while_a_review_holds_its_snapshot() 
 /// spec, a quarter of the machine's memory each) than the daemon kiln starts has shards, through one instance, as kiln
 /// does for its agents' sessions. Expect every one made: a workspace that may grow to a quarter of the machine holds
 /// none of its shard's room before it grows (§4.2: dynamic growth consumes only unpromised capacity).
-#[cfg(unix)]
 #[test]
 fn kilns_workspaces_are_provisioned_side_by_side() {
   let (daemon, mut instance) = kiln_grouped("side-by-side");
@@ -1163,11 +1216,639 @@ fn kilns_workspaces_are_provisioned_side_by_side() {
   daemon.stop();
 }
 
+/// A-291 (§4.10 "Ownership follows the writer"), the contract's half: a lone instance names itself and refuses a move
+/// typed. Do: on a lone instance, read its member id, then ask to move a volume to that id, to another id, and a
+/// volume that does not exist. Expect a member id that is not zero; both moves refused
+/// `Invalid::MoveTarget(NotMember)` (a node alone has no other member: R8's degenerate fleet), the volume still
+/// served where it was; and the missing volume refused by what it named. The move itself across members is the
+/// server's fleet test (`a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards`).
+#[test]
+fn a_lone_instance_names_itself_and_refuses_a_move_typed() {
+  let (daemon, mut instance) = grouped("move");
+  let member = instance.member().unwrap();
+  assert_ne!(member, 0, "an instance names its member");
+  let volume = provision(&mut instance, &VolumeSpec::empty("staying", ROOM));
+  write_file(&mut instance, volume, "/f", b"stays here");
+  let not_member = Err(Error::Invalid(Invalid::MoveTarget(MoveTarget::NotMember)));
+  assert_eq!(instance.move_volume(volume, member), not_member);
+  assert_eq!(
+    instance.move_volume(volume, member.wrapping_add(1)),
+    not_member
+  );
+  assert_eq!(read_file(&mut instance, volume, "/f"), b"stays here");
+  let missing = VolumeId { bytes: [7; 16] };
+  assert_eq!(
+    instance.move_volume(missing, member.wrapping_add(1)),
+    Err(Error::NotFound(Missing::Volume(missing)))
+  );
+  drop(instance);
+  daemon.stop();
+}
+
+/// A-291 (§4.15 `capture_base`): an overlay's base captured whole, and a clone of the capture reading it with no base
+/// directory, the form a kiln workspace takes so it can move between runners. Do: write two files into a folder,
+/// overlay it, capture its base; then change one file and add another in the folder; clone the captured snapshot and
+/// read it; capture a scratch volume. Expect the clone to read the captured bytes, never the folder's later ones, and to
+/// report no base (it reads no folder); and the scratch volume's capture refused `Unsupported`, there being no base to
+/// capture.
+#[test]
+fn a_captured_bases_clone_reads_the_capture_with_no_base_directory() {
+  let (daemon, mut instance) = grouped("capture");
+  let folder = Folder::new();
+  folder.write("a.txt", b"first");
+  folder.write("sub/b.txt", b"second");
+  let overlay = provision(
+    &mut instance,
+    &VolumeSpec::overlay("captured", &folder.path, ROOM),
+  );
+  let snapshot = instance.capture_base(overlay).unwrap();
+  folder.write("a.txt", b"changed on the disk after the capture");
+  folder.write("late.txt", b"added after the capture");
+  let clone = provision(
+    &mut instance,
+    &VolumeSpec::clone_of("workspace", overlay, snapshot),
+  );
+  assert_eq!(read_file(&mut instance, clone, "/a.txt"), b"first");
+  assert_eq!(read_file(&mut instance, clone, "/sub/b.txt"), b"second");
+  assert!(
+    matches!(
+      instance.read(clone, "/late.txt", slates_api::ReadAt::Head),
+      Err(Error::NotFound(_))
+    ),
+    "the clone holds the capture, never the folder's later entries"
+  );
+  assert_eq!(
+    instance.status(clone).unwrap().base,
+    None,
+    "the clone reads no base directory"
+  );
+  let scratch = provision(&mut instance, &VolumeSpec::empty("plain", ROOM));
+  assert!(
+    matches!(
+      instance.capture_base(scratch),
+      Err(Error::Unsupported(Unsupported::Feature(_)))
+    ),
+    "a scratch volume has no base to capture"
+  );
+  drop(instance);
+  daemon.stop();
+}
+
+/// Shape: the length of the archive export test's file that spans several chunks (a chunk is sixteen pages).
+const SPANNING_BYTES: usize = 300 * 1024;
+/// Shape: the permission bits of a directory the archive export test makes.
+const DIRECTORY_MODE: u32 = 0o755;
+/// Format: POSIX `S_IFMT` and `S_IFREG`, a regular file's type bits as an archive's metadata carries them.
+const FILE_TYPE: (u32, u32) = (0o170_000, 0o100_000);
+
+/// The bytes a restored file holds: its pieces laid at their offsets over its length's zeros.
+fn assembled(file: &slates_archive::RestoredFile) -> Vec<u8> {
+  let mut bytes = vec![0u8; usize::try_from(file.len).unwrap()];
+  for (offset, piece) in &file.pieces {
+    let at = usize::try_from(*offset).unwrap();
+    bytes[at..at + piece.len()].copy_from_slice(piece);
+  }
+  bytes
+}
+
+/// Writes the archive export test's `files` into `volume`, under its two directories.
+fn write_export_tree(instance: &mut Instance, volume: VolumeId, files: &[(&str, &[u8])]) {
+  let attached = instance.attach_volume(volume, Intent::Write).unwrap();
+  for directory in ["/dir", "/dir/deeper"] {
+    instance
+      .client()
+      .fs_mkdir((volume, attached.attachment), directory, DIRECTORY_MODE)
+      .unwrap();
+  }
+  for &(path, bytes) in files {
+    instance
+      .client()
+      .fs_write(
+        (volume, attached.attachment),
+        &format!("/{path}"),
+        bytes,
+        MODE,
+      )
+      .unwrap();
+  }
+  instance.detach(attached.attachment).unwrap();
+}
+
+/// Judges the archive export test's archive, restored in memory: exactly the snapshot's `files`, each with its bytes,
+/// a regular file's type, its mode and its length, and both its directories.
+fn judge_exported_tree(archive: &slates_archive::Archive, files: &[(&str, &[u8])]) {
+  let restored = slates_archive::restore(archive, u64::MAX).unwrap();
+  let trimmed = |path: &str| path.trim_start_matches('/').to_owned();
+  let restored_files: std::collections::BTreeMap<String, Vec<u8>> = restored
+    .files
+    .iter()
+    .map(|(path, file)| (trimmed(path), assembled(file)))
+    .collect();
+  let expected: std::collections::BTreeMap<String, Vec<u8>> = files
+    .iter()
+    .map(|(path, bytes)| ((*path).to_owned(), bytes.to_vec()))
+    .collect();
+  assert_eq!(
+    restored_files, expected,
+    "every file of the snapshot, with its bytes, and none written after it"
+  );
+  for &(path, bytes) in files {
+    let meta = restored
+      .metadata
+      .iter()
+      .find(|(named, _)| trimmed(named) == path)
+      .map(|(_, meta)| meta)
+      .unwrap_or_else(|| panic!("{path} has its metadata"));
+    assert_eq!(
+      meta.mode & FILE_TYPE.0,
+      FILE_TYPE.1,
+      "{path} is a regular file"
+    );
+    assert_eq!(meta.mode & 0o7777, MODE, "{path} keeps its mode");
+    assert_eq!(
+      meta.size,
+      u64::try_from(bytes.len()).unwrap(),
+      "{path}'s length"
+    );
+  }
+  let directories: std::collections::BTreeSet<String> = restored
+    .directories
+    .iter()
+    .map(|path| trimmed(path))
+    .collect();
+  assert!(
+    directories.contains("dir") && directories.contains("dir/deeper"),
+    "both directories: {directories:?}"
+  );
+}
+
+/// Judges the archive export's refusals by kind: a snapshot the volume never took is `NotFound` naming it, and an
+/// archive volume's name already held is `AlreadyExists`.
+fn judge_export_refusals(instance: &mut Instance, volume: VolumeId, snapshot: SnapshotId) {
+  let never = SnapshotId {
+    value: snapshot.value.saturating_add(1_000),
+  };
+  assert!(
+    matches!(
+      instance.export_archive(volume, never, "never-archive"),
+      Err(Error::NotFound(Missing::Snapshot { .. }))
+    ),
+    "a snapshot the volume never took"
+  );
+  assert!(
+    matches!(
+      instance.export_archive(volume, snapshot, "exported-archive"),
+      Err(Error::AlreadyExists(_))
+    ),
+    "an archive volume's name already held"
+  );
+}
+
+/// A-441 (§4.11 "Archive"; Mantle's CP-T10.4): a snapshot exported as its archive carries every file's bytes and every
+/// entry's metadata, read back as a consumer streams it out. Do: a volume holding a small file, a file spanning several
+/// chunks and an empty one, in nested directories; snapshot it, then write over the small file; export the snapshot
+/// into a new volume; read the archive file back through `read`, a page at a time as a consumer would; decode it and
+/// restore it in memory (`slates_archive`: every chunk and the whole archive verified by identity). Expect: the archive
+/// is as long as the export said and names the manifest it said; the restored tree holds exactly the snapshot's files,
+/// each with its bytes, its length and a regular file's mode as written, and its two directories, never the write made
+/// after the snapshot; a second export of the snapshot names the same manifest. And by kind: a snapshot the volume
+/// never took is `NotFound` naming it, and an archive volume's name already held is `AlreadyExists`.
+#[test]
+fn a_snapshot_exported_as_its_archive_carries_every_file_and_entry() {
+  let (daemon, mut instance) = grouped("archive-export");
+  let volume = provision(&mut instance, &VolumeSpec::empty("exported", ROOM));
+  let spanning: Vec<u8> = (0..SPANNING_BYTES)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let files: [(&str, &[u8]); 3] = [
+    ("top.txt", b"before the snapshot"),
+    ("dir/spanning.bin", &spanning),
+    ("dir/deeper/empty", b""),
+  ];
+  write_export_tree(&mut instance, volume, &files);
+  let snapshot = instance.snapshot(volume).unwrap();
+  write_file(
+    &mut instance,
+    volume,
+    "/top.txt",
+    b"written after the snapshot",
+  );
+
+  let exported = instance
+    .export_archive(volume, snapshot, "exported-archive")
+    .unwrap();
+  let bytes = read_file(
+    &mut instance,
+    exported.id,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+  );
+  assert_eq!(
+    u64::try_from(bytes.len()).unwrap(),
+    exported.archive_bytes,
+    "the archive file is as long as the export said"
+  );
+  let archive = slates_archive::Archive::decode(&bytes)
+    .expect("the archive decodes, every chunk and its whole verified by identity");
+  assert_eq!(
+    archive.manifest_identity(),
+    exported.manifest,
+    "the archive names the manifest the export said"
+  );
+  judge_exported_tree(&archive, &files);
+  let again = instance
+    .export_archive(volume, snapshot, "exported-again")
+    .unwrap();
+  assert_eq!(
+    again.manifest, exported.manifest,
+    "the same snapshot names the same manifest"
+  );
+  judge_export_refusals(&mut instance, volume, snapshot);
+  drop(instance);
+  daemon.stop();
+}
+
+/// Shape: the permission bits of the archive import test's private file and its private directory, unlike [`MODE`]
+/// and [`DIRECTORY_MODE`], so each entry's own mode is seen to come back.
+const PRIVATE_MODES: (u32, u32) = (0o600, 0o700);
+
+/// A volume's tree as an archive of it restores it, every inode number cleared: the files' bytes, the directories, and
+/// each entry's metadata and the root's. Two volumes holding the same tree compare equal by it, whatever numbers their
+/// inodes were given.
+type Tree = (
+  std::collections::BTreeMap<String, Vec<u8>>,
+  std::collections::BTreeSet<String>,
+  std::collections::BTreeMap<String, slates_archive::NodeMeta>,
+  slates_archive::NodeMeta,
+);
+
+/// The tree of `archive`'s bytes, restored in memory, its inode numbers cleared ([`Tree`]).
+fn tree_of(bytes: &[u8]) -> Tree {
+  let archive = slates_archive::Archive::decode(bytes).expect("the archive decodes whole");
+  let restored = slates_archive::restore(&archive, u64::MAX).unwrap();
+  let numberless = |meta: &slates_archive::NodeMeta| slates_archive::NodeMeta {
+    ino: 0,
+    ..meta.clone()
+  };
+  (
+    restored
+      .files
+      .iter()
+      .map(|(path, file)| (path.clone(), assembled(file)))
+      .collect(),
+    restored.directories.clone(),
+    restored
+      .metadata
+      .iter()
+      .map(|(path, meta)| (path.clone(), numberless(meta)))
+      .collect(),
+    numberless(&restored.root),
+  )
+}
+
+/// The tree `volume` holds at a new snapshot, through its export ([`tree_of`]); the export is destroyed after.
+fn tree_held(instance: &mut Instance, volume: VolumeId, export_name: &str) -> Tree {
+  let snapshot = instance.snapshot(volume).unwrap();
+  let exported = instance
+    .export_archive(volume, snapshot, export_name)
+    .unwrap();
+  let bytes = read_file(
+    instance,
+    exported.id,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+  );
+  instance.destroy(exported.id).unwrap();
+  tree_of(&bytes)
+}
+
+/// Format: POSIX `S_IFLNK`, a symbolic link's type bits as an archive's metadata carries them, with every permission.
+const SYMLINK_MODE: u32 = 0o120_777;
+
+/// The archive `bytes` with a symbolic link `link` to `target` added in its root, as a consumer writing its own archive
+/// adds one: the target a raw chunk of its own, the link's inode number one no entry has (an exported archive's numbers
+/// carry the volume's prefix in their high bits), its owner and times the root's.
+fn with_symlink(bytes: &[u8], link: &str, target: &[u8]) -> Vec<u8> {
+  let mut archive = slates_archive::Archive::decode(bytes).unwrap();
+  let chunk = slates_archive::Archive::raw_chunk(target.to_vec());
+  let len = u64::try_from(target.len()).unwrap();
+  let root = archive.root_meta.clone();
+  let slates_archive::Node::Directory(entries) = &mut archive.manifest else {
+    panic!("an archive's root is a directory");
+  };
+  entries.push(slates_archive::Entry {
+    name: link.to_owned(),
+    meta: slates_archive::NodeMeta {
+      ino: u64::MAX,
+      mode: SYMLINK_MODE,
+      size: len,
+      nlink: 1,
+      uid: root.uid,
+      gid: root.gid,
+      atime_ns: root.atime_ns,
+      mtime_ns: root.mtime_ns,
+      ctime_ns: root.ctime_ns,
+      btime_ns: root.btime_ns,
+      ..Default::default()
+    },
+    node: slates_archive::Node::File(vec![slates_archive::Extent {
+      offset: 0,
+      len,
+      chunk: chunk.identity,
+      chunk_offset: 0,
+    }]),
+  });
+  archive.chunks.push(chunk);
+  archive.encode()
+}
+
+/// The daemon's volumes and the bytes committed to its bounded volumes, over its shards: what a refused import leaves
+/// as it found them.
+fn held(instance: &mut Instance) -> (u64, u64) {
+  let report = instance.daemon_status().unwrap();
+  report
+    .shards
+    .iter()
+    .fold((0, 0), |(volumes, bytes), shard| {
+      (volumes + shard.volumes, bytes + shard.committed_bytes)
+    })
+}
+
+/// Whether a volume named `name` is listed.
+fn listed(instance: &mut Instance, name: &str) -> bool {
+  instance
+    .list()
+    .unwrap()
+    .iter()
+    .any(|summary| summary.name == name)
+}
+
+/// The archive export test's tree written into a new volume `name` and snapshotted: a small file, a file spanning
+/// several chunks and an empty one, a private file and a private directory, in nested directories. The volume, the
+/// snapshot, and each file's path and bytes.
+fn archived_tree(
+  instance: &mut Instance,
+  name: &str,
+) -> (VolumeId, SnapshotId, Vec<(&'static str, Vec<u8>)>) {
+  let volume = provision(instance, &VolumeSpec::empty(name, ROOM));
+  let spanning: Vec<u8> = (0..SPANNING_BYTES)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let files: Vec<(&'static str, Vec<u8>, u32)> = vec![
+    ("top.txt", b"the top file".to_vec(), MODE),
+    ("dir/spanning.bin", spanning, MODE),
+    ("dir/deeper/empty", Vec::new(), MODE),
+    ("private/key", b"a private file".to_vec(), PRIVATE_MODES.0),
+  ];
+  let attached = instance.attach_volume(volume, Intent::Write).unwrap();
+  for (directory, mode) in [
+    ("/dir", DIRECTORY_MODE),
+    ("/dir/deeper", DIRECTORY_MODE),
+    ("/private", PRIVATE_MODES.1),
+  ] {
+    instance
+      .client()
+      .fs_mkdir((volume, attached.attachment), directory, mode)
+      .unwrap();
+  }
+  for (path, bytes, mode) in &files {
+    instance
+      .client()
+      .fs_write(
+        (volume, attached.attachment),
+        &format!("/{path}"),
+        bytes,
+        *mode,
+      )
+      .unwrap();
+  }
+  instance.detach(attached.attachment).unwrap();
+  let snapshot = instance.snapshot(volume).unwrap();
+  (
+    volume,
+    snapshot,
+    files
+      .into_iter()
+      .map(|(path, bytes, _)| (path, bytes))
+      .collect(),
+  )
+}
+
+/// Judges two imports of the `exported` archive, whose tree is `exported_tree`: each names the export's manifest; each
+/// of `files` reads back its bytes and length from the first; the first holds the exported tree, its private entries'
+/// own modes with it; and the second a byte-identical tree.
+fn judge_two_imports(
+  instance: &mut Instance,
+  exported: slates_api::ArchiveExported,
+  files: &[(&str, Vec<u8>)],
+  exported_tree: &Tree,
+) {
+  let imported = instance
+    .import_archive(exported.id, "imported", ROOM)
+    .unwrap();
+  assert_eq!(
+    imported.manifest, exported.manifest,
+    "the import names the archive's manifest"
+  );
+  for (path, bytes) in files {
+    assert_eq!(
+      &read_file(instance, imported.id, &format!("/{path}")),
+      bytes,
+      "{path} reads back its bytes and length"
+    );
+  }
+  let imported_tree = tree_held(instance, imported.id, "imported-export");
+  assert_eq!(
+    &imported_tree, exported_tree,
+    "the new volume holds the exported tree, every entry's metadata with it"
+  );
+  let modes: Vec<u32> = ["private", "private/key"]
+    .iter()
+    .map(|path| imported_tree.2[*path].mode & 0o7777)
+    .collect();
+  assert_eq!(
+    modes,
+    [PRIVATE_MODES.1, PRIVATE_MODES.0],
+    "the private directory and file keep their own modes"
+  );
+  let again = instance
+    .import_archive(exported.id, "imported-again", ROOM)
+    .unwrap();
+  assert_eq!(again.manifest, exported.manifest);
+  assert_eq!(
+    tree_held(instance, again.id, "imported-again-export"),
+    imported_tree,
+    "a second import of the archive holds a byte-identical tree"
+  );
+}
+
+/// Judges an import of a consumer's own archive: `exported_bytes` with a symbolic link added, written into a scratch
+/// volume and imported, comes back whole, the link a link as long as its target.
+fn judge_an_own_archive_with_a_link(instance: &mut Instance, exported_bytes: &[u8]) {
+  let target = b"dir/spanning.bin";
+  let linked = with_symlink(exported_bytes, "link", target);
+  let scratch = provision(instance, &VolumeSpec::empty("import-own", ROOM));
+  write_file(
+    instance,
+    scratch,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+    &linked,
+  );
+  let own = instance
+    .import_archive(scratch, "imported-own", ROOM)
+    .unwrap();
+  assert_eq!(
+    own.manifest,
+    slates_archive::Archive::decode(&linked)
+      .unwrap()
+      .manifest_identity()
+  );
+  let (own_files, own_directories, own_metadata, _) =
+    tree_held(instance, own.id, "imported-own-export");
+  let (linked_files, linked_directories, _, _) = tree_of(&linked);
+  assert_eq!(
+    (own_files, own_directories),
+    (linked_files, linked_directories),
+    "the consumer's own archive comes back whole, the link's target with it"
+  );
+  assert_eq!(
+    (own_metadata["link"].mode, own_metadata["link"].size),
+    (SYMLINK_MODE, u64::try_from(target.len()).unwrap()),
+    "the link is a symbolic link as long as its target"
+  );
+}
+
+/// Judges the import's refusals by kind: an import into a name a volume holds is `AlreadyExists`, and one whose tree
+/// outgrows the size it asks is `Exhausted::Memory` naming that size, with nothing made and the room given back.
+fn judge_import_refusals(instance: &mut Instance, exported: slates_api::ArchiveExported) {
+  assert!(
+    matches!(
+      instance.import_archive(exported.id, "imported", ROOM),
+      Err(Error::AlreadyExists(_))
+    ),
+    "a name a volume holds"
+  );
+  let before = held(instance);
+  let small = u64::try_from(SPANNING_BYTES / 2).unwrap();
+  assert_eq!(
+    instance
+      .import_archive(exported.id, "imported-small", small)
+      .unwrap_err(),
+    Error::Exhausted(Exhausted::Memory { available: small }),
+    "a tree past the size the import asks"
+  );
+  assert_eq!(
+    held(instance),
+    before,
+    "the refused import made no volume and gave its room back"
+  );
+  assert!(!listed(instance, "imported-small"));
+}
+
+/// A-453 (§4.11 "Archive"; Mantle's CP-T10.4): a volume made from an exported archive holds the exported tree. Do:
+/// export a snapshot of a tree of files and directories of several modes; import the archive volume the export made
+/// into a new volume, and again into another. Expect: each import names the export's manifest; each file of the new
+/// volume reads back its bytes and length through `read`; the tree each new volume holds (exported again and restored
+/// in memory) is the exported tree in every file's bytes, every directory, and every entry's mode, length, owner and
+/// times, the root's too, save the inode numbers, which are each volume's own; and the two imports hold byte-identical
+/// trees. Then write into a scratch volume the archive with a symbolic link added, as a consumer writing its own
+/// archive would, and import that. Expect the link back as a link to its target, beside every file of the tree. And by
+/// kind: an import into a name a volume holds is `AlreadyExists`, and one whose tree outgrows the size it asks is
+/// `Exhausted::Memory` naming that size, with nothing made and the room given back.
+#[test]
+fn a_volume_imported_from_an_exported_archive_holds_the_exported_tree() {
+  let (daemon, mut instance) = grouped("archive-import");
+  let (volume, snapshot, files) = archived_tree(&mut instance, "import-source");
+  let exported = instance
+    .export_archive(volume, snapshot, "import-archive")
+    .unwrap();
+  let exported_bytes = read_file(
+    &mut instance,
+    exported.id,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+  );
+  let exported_tree = tree_of(&exported_bytes);
+  judge_two_imports(&mut instance, exported, &files, &exported_tree);
+  judge_an_own_archive_with_a_link(&mut instance, &exported_bytes);
+  judge_import_refusals(&mut instance, exported);
+  drop(instance);
+  daemon.stop();
+}
+
+/// Shape: the bytes of an archive's header the truncated-header archive keeps: its magic and its first fields, short
+/// of the header's whole length.
+const HEADER_CUT: usize = 20;
+/// Format: the magic of a zip file's local header, `PK\x03\x04`: another format's file where an archive should be.
+const FOREIGN_MAGIC: [u8; 4] = *b"PK\x03\x04";
+
+/// A-453 (§4.9 hostile input; §4.11 "Archive"): bytes that are no whole archive make no volume. Do: export an archive,
+/// then write into a scratch volume of the caller's, one at a time, the archive re-encoded declaring a chunk length of
+/// `u32::MAX` (its checksum made whole again, so only the length is wrong), its first bytes cut short of the header,
+/// the archive with one bit flipped, and the archive under another format's magic; import each. Expect each refused
+/// `Invalid::Archive` by its kind (malformed, truncated, corrupt, foreign magic), no volume made and no room kept, the
+/// name free; then the whole archive imported under a name a refused import used.
+#[test]
+fn a_hostile_archive_is_refused_by_kind_with_nothing_made() {
+  let (daemon, mut instance) = grouped("archive-hostile");
+  let (volume, snapshot, _) = archived_tree(&mut instance, "hostile-source");
+  let exported = instance
+    .export_archive(volume, snapshot, "hostile-archive")
+    .unwrap();
+  let whole = read_file(
+    &mut instance,
+    exported.id,
+    &format!("/{}", slates_api::ARCHIVE_FILE),
+  );
+  let mut declared = slates_archive::Archive::decode(&whole).unwrap();
+  declared.chunk_max = u32::MAX;
+  let mut flipped = whole.clone();
+  flipped[whole.len() / 2] ^= 1;
+  let mut foreign = whole.clone();
+  foreign[..FOREIGN_MAGIC.len()].copy_from_slice(&FOREIGN_MAGIC);
+  let hostile: [(&str, Vec<u8>, ArchiveFault); 4] = [
+    ("length", declared.encode(), ArchiveFault::Malformed),
+    (
+      "header",
+      whole[..HEADER_CUT].to_vec(),
+      ArchiveFault::Truncated,
+    ),
+    ("flipped", flipped, ArchiveFault::Corrupt),
+    ("foreign", foreign, ArchiveFault::ForeignMagic),
+  ];
+  for (kind, bytes, fault) in hostile {
+    let scratch = provision(
+      &mut instance,
+      &VolumeSpec::empty(&format!("hostile-{kind}"), ROOM),
+    );
+    write_file(
+      &mut instance,
+      scratch,
+      &format!("/{}", slates_api::ARCHIVE_FILE),
+      &bytes,
+    );
+    let before = held(&mut instance);
+    let name = format!("from-{kind}");
+    assert_eq!(
+      instance.import_archive(scratch, &name, ROOM).unwrap_err(),
+      Error::Invalid(Invalid::Archive(fault)),
+      "the {kind} archive is refused by its kind"
+    );
+    assert_eq!(
+      held(&mut instance),
+      before,
+      "the {kind} archive made no volume and kept no room"
+    );
+    assert!(!listed(&mut instance, &name), "{name} is free");
+  }
+  let made = instance
+    .import_archive(exported.id, "from-flipped", ROOM)
+    .unwrap();
+  assert_eq!(made.manifest, exported.manifest);
+  drop(instance);
+  daemon.stop();
+}
+
 /// Shape: a capped daemon's version slab: room for a handful of files, so a test can spend every unpromised slot.
-#[cfg(unix)]
 const CAPPED_SLAB: usize = 64;
 /// Shape: the capped daemon's arena, sized with its slab so a slot is about 1 MiB of quota (A-109).
-#[cfg(unix)]
 const CAPPED_RESERVE: u64 = 64 << 20;
 
 /// The retention sibling of P1 (2026-11-18; A-342's record): a snapshot's retention refused reached kiln as
@@ -1176,7 +1857,6 @@ const CAPPED_RESERVE: u64 = 64 << 20;
 /// the growth, snapshot it, and change a file the snapshot holds. Expect: the growth refused `NoSpace`, the volume's
 /// own bound, and the change refused `Volume { RetentionExceeded }` on the wire, typed apart from it (the contract
 /// classes it `Exhausted::Volume`, `error.rs`'s unit test), the file as it was.
-#[cfg(unix)]
 #[test]
 fn a_snapshots_retention_refused_is_not_the_quota() {
   let (daemon, mut instance) = daemon_with("retention", TEST_SHARDS, |config| {
@@ -1225,6 +1905,263 @@ fn a_snapshots_retention_refused_is_not_the_quota() {
   daemon.stop();
 }
 
+/// Shape: the volumes the listing test makes: three pages' worth and more of summaries at these names (a page holds
+/// what one reply chunk holds, about seventy).
+const LISTED: usize = 200;
+/// Shape: the files the drift test changes on disk under its overlay: more drifted entries at these path lengths than a
+/// status reply carries beside its other fields, and more than one paged read holds.
+const DRIFTED: usize = 100;
+/// Shape: the paths the changed-since test's work changes in its green: more than one reply's worth at these lengths.
+const CHANGED: usize = 150;
+/// Shape: the landings the audit test presents, each one audit record: more than one reply's worth of records.
+const PRESENTED: usize = 120;
+
+/// Walks `read` a page at a time from the start: every page's items, and the cursors the pages were asked from (the
+/// first `None`). Each cursor must move past the last, so the walk ends.
+fn walk<T, C: Copy + Ord + std::fmt::Debug>(
+  mut read: impl FnMut(Option<C>) -> slates_api::Page<T, C>,
+) -> (Vec<Vec<T>>, Vec<Option<C>>) {
+  let mut pages = Vec::new();
+  let mut asked = vec![None];
+  loop {
+    let page = read(*asked.last().unwrap());
+    pages.push(page.items);
+    match page.next {
+      None => return (pages, asked),
+      Some(next) => {
+        assert!(
+          asked.last().unwrap().is_none_or(|last| next > last),
+          "a page moves its cursor forward: {next:?} after {asked:?}"
+        );
+        asked.push(Some(next));
+      }
+    }
+  }
+}
+
+/// A-263 (§4.4 `list`, §4.3; the library's paged listing, A-299's owed list): do make 200 volumes, then walk the
+/// listing a page at a time through the library and read it whole. Expect: more than one page; each page in volume-id
+/// order past the volume it was asked after; every volume exactly once across the walk; and the whole listing the same
+/// volumes, in name order. Before A-263 the listing was one reply, refused past about 80 volumes.
+#[test]
+fn a_listing_is_read_a_page_at_a_time_and_whole() {
+  let (daemon, mut instance) = grouped("list-pages");
+  let made: std::collections::BTreeSet<VolumeId> = (0..LISTED)
+    .map(|n| {
+      provision(
+        &mut instance,
+        &VolumeSpec::empty(&format!("listed-volume-{n:04}"), ROOM),
+      )
+    })
+    .collect();
+  let (pages, asked) = walk(|after| instance.list_page(after).unwrap());
+  assert!(
+    pages.len() > 1,
+    "{} volumes take more than one page",
+    LISTED
+  );
+  for (page, after) in pages.iter().zip(&asked) {
+    assert!(
+      page.windows(2).all(|pair| pair[0].id < pair[1].id)
+        && after.is_none_or(|after| page.iter().all(|summary| summary.id > after)),
+      "a page is in id order past its cursor"
+    );
+  }
+  let walked: Vec<VolumeId> = pages.iter().flatten().map(|summary| summary.id).collect();
+  assert_eq!(walked.len(), made.len(), "every volume once");
+  assert_eq!(
+    walked
+      .iter()
+      .copied()
+      .collect::<std::collections::BTreeSet<_>>(),
+    made
+  );
+  let whole = instance.list().unwrap();
+  let names: Vec<&str> = whole.iter().map(|summary| summary.name.as_str()).collect();
+  assert!(
+    names.windows(2).all(|pair| pair[0] <= pair[1]),
+    "the whole listing is in name order"
+  );
+  assert_eq!(
+    whole
+      .iter()
+      .map(|summary| summary.id)
+      .collect::<std::collections::BTreeSet<_>>(),
+    made
+  );
+  daemon.stop();
+}
+
+/// A-264 (§4.16 "Attachments and versions"): do merge into a green one work that writes 150 files with long names,
+/// then read what the green changed since its first version a page at a time and whole. Expect: more than one page;
+/// every path exactly once across the walk; the whole answer the same paths, in path order; and a version past the
+/// head refused `Stale`. Before A-264 the answer was one reply, refused at 800 changed files.
+#[test]
+fn a_greens_changes_are_read_a_page_at_a_time_and_whole() {
+  let (daemon, mut instance) = grouped("changed-pages");
+  let green = provision(
+    &mut instance,
+    &VolumeSpec {
+      name: "green".to_owned(),
+      source: slates_api::Source::Green {
+        base: None,
+        require_evidence: false,
+      },
+    },
+  );
+  let Provisioned::Work { work, base } = instance
+    .provision(&VolumeSpec::work("work", green))
+    .unwrap()
+  else {
+    panic!("a work volume provisions as one");
+  };
+  let written: std::collections::BTreeSet<String> = (0..CHANGED)
+    .map(|n| format!("a-path-long-enough-to-fill-a-page-sooner-{n:04}.txt"))
+    .collect();
+  for path in &written {
+    instance
+      .client()
+      .edit(work.volume, path, 0, 0, b"x")
+      .unwrap();
+  }
+  let MergeOutcome::Merged { version, .. } = instance.merge(&work, &[], None).unwrap() else {
+    panic!("a lone work merges");
+  };
+  let (pages, _) = walk(|from| instance.changed_since_page(green, base, from).unwrap());
+  assert!(pages.len() > 1, "{} paths take more than one page", CHANGED);
+  let walked: Vec<String> = pages.into_iter().flatten().collect();
+  assert_eq!(walked.len(), written.len(), "every path once: {walked:?}");
+  assert_eq!(
+    walked
+      .iter()
+      .cloned()
+      .collect::<std::collections::BTreeSet<_>>(),
+    written
+  );
+  let whole = instance.changed_since(green, base).unwrap();
+  assert_eq!(whole, written.into_iter().collect::<Vec<_>>());
+  assert!(
+    matches!(
+      instance.changed_since(green, version + 1),
+      Err(Error::Stale(_))
+    ),
+    "a version past the head is stale"
+  );
+  daemon.stop();
+}
+
+/// A-267 (§4.15 "Drift"): do write 100 files with long names through an overlay, change each on the disk, then read the
+/// volume's status and its drift. Expect: the status carries what fits and counts the rest (`elided` above zero);
+/// `drift` names all 100 `Modified`, in path order, and elides none; and the paged read, walked from the start, names
+/// each once.
+/// Before A-267 a status with 600 drifted entries was refused, and the library read only what a status carried.
+#[test]
+fn an_overlays_drift_past_one_reply_is_read_whole() {
+  let (daemon, mut instance) = grouped("drift-pages");
+  let folder = Folder::new();
+  let paths: Vec<String> = (0..DRIFTED)
+    .map(|n| format!("a-file-whose-name-takes-room-in-every-drift-entry-{n:04}.txt"))
+    .collect();
+  for path in &paths {
+    folder.write(path, b"base\n");
+  }
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("drifting", &folder.path, ROOM),
+  );
+  for path in &paths {
+    write_file(
+      &mut instance,
+      volume,
+      &format!("/{path}"),
+      b"the volume's\n",
+    );
+    folder.write(path, b"the person's\n");
+  }
+  let Some(BaseState::Read(carried)) = instance.status(volume).unwrap().base else {
+    panic!("the base reads");
+  };
+  assert!(
+    carried.elided > 0 && carried.drifted.len() < DRIFTED,
+    "a status carries what fits and counts the rest: {} carried, {} elided",
+    carried.drifted.len(),
+    carried.elided
+  );
+  let whole = instance.drift(volume).unwrap().unwrap();
+  let expected: Vec<Drift> = paths
+    .iter()
+    .map(|path| Drift {
+      path: format!("/{path}"),
+      kind: DriftKind::Modified,
+    })
+    .collect();
+  assert_eq!((whole.drifted, whole.elided), (expected.clone(), 0));
+  let mut after = None;
+  let mut walked = Vec::new();
+  loop {
+    let page = instance.drift_page(volume, after).unwrap();
+    walked.extend(page.drifted);
+    match page.next {
+      None => break,
+      next => after = next,
+    }
+  }
+  walked.sort_by(|a, b| a.path.cmp(&b.path));
+  assert_eq!(walked, expected, "the pages name each entry once");
+  daemon.stop();
+}
+
+/// A-265 (§4.15, §4.14): do present 120 landings of an overlay, each one audit record, then read the audit a page at a
+/// time and whole. Expect: more than one page; the records numbered in order, each once, every page's first record the
+/// sequence it was asked from or later; and the whole audit the same records. Before A-265 every record was numbered 0
+/// and the audit was one reply, refused between 50 and 100 records.
+#[test]
+fn the_audit_is_read_a_page_at_a_time_and_whole() {
+  let (daemon, mut instance) = grouped("audit-pages");
+  let folder = Folder::new();
+  let volume = provision(
+    &mut instance,
+    &VolumeSpec::overlay("audited", &folder.path, ROOM),
+  );
+  write_file(&mut instance, volume, "/n.txt", b"n\n");
+  for _ in 0..PRESENTED {
+    assert!(matches!(
+      instance
+        .plan_landing(&landing_into(volume, &folder))
+        .unwrap(),
+      LandOutcome::ApprovalRequired(_)
+    ));
+  }
+  let mut pages = Vec::new();
+  let mut since = 0;
+  loop {
+    let page = instance.audit_page(since).unwrap();
+    assert!(page.items.first().is_none_or(|record| record.seq >= since));
+    pages.push(page.items);
+    match page.next {
+      None => break,
+      Some(next) => since = next,
+    }
+  }
+  assert!(
+    pages.len() > 1,
+    "{} records take more than one page",
+    PRESENTED
+  );
+  let walked: Vec<u64> = pages.iter().flatten().map(|record| record.seq).collect();
+  assert!(walked.len() >= PRESENTED, "every presentation recorded");
+  assert_eq!(
+    walked,
+    (0..u64::try_from(walked.len()).unwrap()).collect::<Vec<_>>(),
+    "numbered in order, each once"
+  );
+  assert_eq!(
+    instance.audit(0).unwrap(),
+    pages.into_iter().flatten().collect::<Vec<_>>()
+  );
+  daemon.stop();
+}
+
 /// AC-5.12 / T-5.14 (A-278; §4.14): do read the daemon's status and a shard's telemetry through the library; expect the
 /// daemon's shards reported and the drain answered for the shard it has.
 #[test]
@@ -1237,11 +2174,12 @@ fn the_daemon_is_observed_through_the_library() {
   daemon.stop();
 }
 
-/// The Shards route by use (§4.6, A-161): the stream end the library hands a VMM serves the volume.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// The Shards route by use (§4.6, A-161): the stream end the library hands a VMM serves the volume, and offers its guest
+/// DAX. On every platform whose daemon serves the Shards form: a Unix socket on Linux and macOS, the client end of the
+/// attachment's named pipe on Windows (the handle route, A-179). slates ships no other platform.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod shards {
   use std::io::{Read, Write};
-  use std::os::unix::net::UnixStream;
 
   use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 
@@ -1255,11 +2193,73 @@ mod shards {
   const MAJOR: u32 = 7;
   const MINOR: u32 = 31;
   const MAX_READAHEAD: u32 = 128 << 10;
+  /// Format: `FUSE_MAP_ALIGNMENT` and `FUSE_INIT_EXT` in `fuse_init_in.flags`, and `FUSE_HAS_INODE_DAX` in its `flags2`,
+  /// which `FUSE_INIT_EXT` announces: what a `dax=inode` guest offers (Linux `include/uapi/linux/fuse.h`).
+  const INIT_MAP_ALIGNMENT: u32 = 1 << 26;
+  const INIT_EXT: u32 = 1 << 30;
+  const INIT2_HAS_INODE_DAX: u32 = 1 << 1;
+  /// Format: the unused words that end an extended `fuse_init_in` after `flags2` (eleven `u32`s).
+  const INIT_UNUSED_BYTES: usize = 44;
+  /// Format: where `fuse_init_out` keeps its `flags`, its `max_pages` and `map_alignment` pair, and its `flags2`, past
+  /// the reply's header.
+  const INIT_OUT_FLAGS_AT: usize = 12;
+  const INIT_OUT_ALIGNMENT_AT: usize = 28;
+  const INIT_OUT_FLAGS2_AT: usize = 32;
+  /// Format: `fuse_attr.flags`' `FUSE_ATTR_DAX`, the guest maps this file with DAX, and where it lies in a LOOKUP reply
+  /// (`fuse_entry_out`: 40 bytes before its `fuse_attr`, whose last word is `flags`, at 84).
+  const ATTR_DAX: u32 = 1 << 1;
+  const ENTRY_ATTR_FLAGS_AT: usize = OUT_HEADER_LEN + 40 + 84;
+  /// Shape: a file of a DAX range and a half (`FUSE_DAX_SZ`, the range a guest maps a file in): one the stream marks.
+  const LARGE_BYTES: u64 = slates_mem::DAX_RANGE_BYTES + slates_mem::DAX_RANGE_BYTES / 2;
+
+  /// The end the library handed, as Shards' device reads and writes it: a Unix socket with the suite's read bound.
+  #[cfg(unix)]
+  type Wire = std::os::unix::net::UnixStream;
+
+  /// The end the library handed on Windows: the client end of the attachment's pipe, opened for overlapped I/O, so each
+  /// read and write waits on an `OVERLAPPED` of its own (`slates_ipc::stream::read_waiting`, `write_waiting`), as the
+  /// client's own Shards suite speaks it (`crates/client/tests/shards.rs`).
+  #[cfg(windows)]
+  struct Wire(slates_api::StreamEnd);
+
+  #[cfg(windows)]
+  impl Read for Wire {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      use std::os::windows::io::AsHandle;
+      slates_ipc::stream::read_waiting(self.0.as_handle(), buf).map_err(std::io::Error::other)
+    }
+  }
+
+  #[cfg(windows)]
+  impl Write for Wire {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+      use std::os::windows::io::AsHandle;
+      slates_ipc::stream::write_waiting(self.0.as_handle(), buf).map_err(std::io::Error::other)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  /// The handed end as a [`Wire`].
+  #[cfg(unix)]
+  fn wire(end: slates_api::StreamEnd) -> Wire {
+    let stream = std::os::unix::net::UnixStream::from(end);
+    stream.set_read_timeout(Some(START_WAIT)).unwrap();
+    stream
+  }
+
+  /// The handed end as a [`Wire`].
+  #[cfg(windows)]
+  fn wire(end: slates_api::StreamEnd) -> Wire {
+    Wire(end)
+  }
 
   /// Shards' fs device as the end's holder speaks it: a little-endian length, then the FUSE request; one reply frame
   /// back.
   struct Device {
-    stream: UnixStream,
+    stream: Wire,
     unique: u64,
   }
 
@@ -1290,31 +2290,652 @@ mod shards {
     -i32::from_le_bytes(reply[4..8].try_into().unwrap())
   }
 
-  /// AC-5.12 / T-5.14 (A-278; §4.6, the Shards route, A-161): do serve a volume holding a file over the library's Shards stream, then
-  /// speak FUSE through the end as Shards' device does; expect INIT answered and the file found by LOOKUP, a name the
-  /// volume lacks answered `ENOENT` — the end serves that volume and no host mount is involved.
+  /// Whether a successful LOOKUP reply marks its file `FUSE_ATTR_DAX`.
+  fn marked_dax(reply: &[u8]) -> bool {
+    assert_eq!(errno(reply), 0, "the LOOKUP is answered");
+    let flags = &reply[ENTRY_ATTR_FLAGS_AT..ENTRY_ATTR_FLAGS_AT + 4];
+    u32::from_le_bytes(flags.try_into().unwrap()) & ATTR_DAX != 0
+  }
+
+  /// AC-5.12 / T-5.14 (A-278; §4.6, the Shards route, A-161; Shards part 3, the DAX offer): do serve a volume holding a
+  /// small file and one of a DAX range and a half over the library's Shards stream, then speak FUSE through the end as
+  /// Shards' device does, its `INIT` offering the DAX flags a `dax=inode` guest offers. Expect INIT answered keeping
+  /// `FUSE_MAP_ALIGNMENT` and `FUSE_HAS_INODE_DAX` with the host's page as the alignment, both files found by LOOKUP,
+  /// the large one marked `FUSE_ATTR_DAX` and the small one not, and a name the volume lacks answered `ENOENT`: the end
+  /// serves that volume, offers its guest DAX per file, and no host mount is involved.
   #[test]
   fn a_shards_stream_end_serves_the_volume_it_was_made_for() {
     let (daemon, mut instance) = grouped("shards");
-    let volume = provision(&mut instance, &VolumeSpec::empty("guest", ROOM));
+    let large = vec![0x5a_u8; usize::try_from(LARGE_BYTES).unwrap()];
+    let volume = provision(
+      &mut instance,
+      &VolumeSpec::empty("guest", ROOM + LARGE_BYTES),
+    );
     write_file(&mut instance, volume, "/present", b"through the stream\n");
+    write_file(&mut instance, volume, "/large", &large);
     let served = instance.serve_shards(volume, Intent::Write, None).unwrap();
-    let stream = UnixStream::from(served.stream);
-    stream.set_read_timeout(Some(START_WAIT)).unwrap();
-    let mut device = Device { stream, unique: 0 };
+    let mut device = Device {
+      stream: wire(served.stream),
+      unique: 0,
+    };
     let mut init = Vec::new();
-    for word in [MAJOR, MINOR, MAX_READAHEAD, 0] {
+    for word in [
+      MAJOR,
+      MINOR,
+      MAX_READAHEAD,
+      INIT_MAP_ALIGNMENT | INIT_EXT,
+      INIT2_HAS_INODE_DAX,
+    ] {
       init.extend_from_slice(&word.to_le_bytes());
     }
-    assert_eq!(errno(&device.ask(Opcode::Init, 0, &init)), 0, "INIT");
+    init.extend_from_slice(&[0u8; INIT_UNUSED_BYTES]);
+    let answered = device.ask(Opcode::Init, 0, &init);
+    assert_eq!(errno(&answered), 0, "INIT");
+    let word = |at: usize| {
+      u32::from_le_bytes(
+        answered[OUT_HEADER_LEN + at..OUT_HEADER_LEN + at + 4]
+          .try_into()
+          .unwrap(),
+      )
+    };
+    assert_ne!(
+      word(INIT_OUT_FLAGS_AT) & INIT_MAP_ALIGNMENT,
+      0,
+      "FUSE_MAP_ALIGNMENT kept"
+    );
+    assert_ne!(
+      word(INIT_OUT_FLAGS2_AT) & INIT2_HAS_INODE_DAX,
+      0,
+      "FUSE_HAS_INODE_DAX kept"
+    );
+    // The host's page, which the daemon names as the alignment on every platform (Windows' is 4 KiB, as its INIT's).
+    let page = u32::try_from(slates_machine::facts::Facts::page_bytes()).unwrap();
+    assert_eq!(
+      word(INIT_OUT_ALIGNMENT_AT) >> 16,
+      page.trailing_zeros(),
+      "the host's page as the alignment"
+    );
     let found = device.ask(Opcode::Lookup, ROOT, b"present\0");
-    assert_eq!(errno(&found), 0, "LOOKUP of the volume's file");
-    assert!(found.len() > OUT_HEADER_LEN);
+    assert!(
+      !marked_dax(&found),
+      "the volume's small file is found and not marked"
+    );
+    assert!(
+      marked_dax(&device.ask(Opcode::Lookup, ROOT, b"large\0")),
+      "a file of a range or more is found and marked"
+    );
     let missing = device.ask(Opcode::Lookup, ROOT, b"absent\0");
     assert_eq!(errno(&missing), ENOENT, "a name the volume lacks is ENOENT");
     drop(device);
     daemon.stop();
   }
+}
+
+/// Format: what a guest writes through the vhost-user device the library served, and the file it names.
+#[cfg(target_os = "linux")]
+const FROM_THE_GUEST: &[u8] =
+  b"written by a guest through the device the library served, read by the library\n";
+#[cfg(target_os = "linux")]
+const GUEST_FILE: &str = "from-the-guest.txt";
+
+/// One FUSE request through the vhost-user guest: submitted on the request queue, kicked, its interrupt awaited, its
+/// reply read back (the server's virtio-fs suite's `through_vhost`).
+#[cfg(target_os = "linux")]
+fn through_vhost(
+  front: &vhost_front_end::FrontEnd,
+  driver: &mut guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  request: &[u8],
+) -> Vec<u8> {
+  let head = driver.submit(request, guest::REPLY_CAP);
+  front.kick_and_wait(1);
+  let (id, len) = driver.reap().expect("a used element after the interrupt");
+  assert_eq!(id, head);
+  driver.reply_of(head, len)
+}
+
+/// Waits within the suite's wait until `volume` holds `count` attachments: a device's ends after its end closes.
+#[cfg(target_os = "linux")]
+fn wait_for_attachments(instance: &mut Instance, volume: VolumeId, count: u32) {
+  let started = Instant::now();
+  while instance.status(volume).unwrap().attachments != count {
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the attachments never came to {count}"
+    );
+    std::thread::yield_now();
+  }
+}
+
+/// AC-5.12 / T-5.14 (A-278; §4.6, G-vhost: slates' own virtio-fs device for a VMM over vhost-user; the library audit's
+/// gap c): the library's own route, `Instance::serve_vhost_user`, by use. Do: serve a volume over vhost-user; check the
+/// record before any front end speaks; as the VMM, take the device's end, negotiate the guest's memory and configure the
+/// queues (the daemon's own test front end); as the guest, create, write and release a file; read it through the
+/// library; close the end. Then serve the volume again offering a DAX window of one range, and serve a volume no one
+/// made. Expect: the device recorded at once with the write lease; the guest's bytes read back by the library; the
+/// attachment gone once the end closes; the window offered (the capability's residency names DAX-mapped guest pages);
+/// and the stranger refused `NotFound` naming the volume.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_user_device_the_library_serves_drives_a_guest_whose_file_it_reads() {
+  let (daemon, mut instance) = grouped("vhost-user");
+  let volume = provision(&mut instance, &VolumeSpec::empty("vhosted", ROOM));
+  let device = instance
+    .serve_vhost_user(volume, Intent::Write, ("slates", None), None)
+    .unwrap();
+  assert!(device.attachment.capability.supported);
+  assert!(
+    device.attachment.lease_epoch.is_some(),
+    "the write lease is taken"
+  );
+  assert_eq!(
+    instance.status(volume).unwrap().attachments,
+    1,
+    "the device is recorded before its front end speaks"
+  );
+  let front = vhost_front_end::FrontEnd::over(device.end);
+  let ram = vhost_front_end::guest_ram(true);
+  let mut driver = vhost_front_end::guest_over(&ram);
+  assert_eq!(
+    front.negotiate_memory(&ram),
+    0,
+    "the memory table is accepted"
+  );
+  front.configure_queues(&driver);
+  guest_creates_writes_and_releases_its_file(&front, &mut driver);
+  assert_eq!(
+    read_file(&mut instance, volume, &format!("/{GUEST_FILE}")),
+    FROM_THE_GUEST,
+    "the library reads what the guest wrote"
+  );
+  drop(driver);
+  drop(front);
+  wait_for_attachments(&mut instance, volume, 0);
+  assert_a_windowed_device_is_offered(&mut instance, volume);
+  assert_eq!(
+    instance
+      .serve_vhost_user(NOWHERE, Intent::Write, ("slates", None), None)
+      .err(),
+    Some(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  daemon.stop();
+}
+
+/// As the guest over `front`: create [`GUEST_FILE`], write [`FROM_THE_GUEST`] into it and release it, each answered
+/// without an error.
+#[cfg(target_os = "linux")]
+fn guest_creates_writes_and_releases_its_file(
+  front: &vhost_front_end::FrontEnd,
+  driver: &mut guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+) {
+  use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
+  use slates_bridge_fuse::reply::EntryOut;
+
+  let created = through_vhost(
+    front,
+    driver,
+    &guest::message(
+      Opcode::Create.to_wire(),
+      1,
+      1,
+      &guest::create_body(GUEST_FILE),
+    ),
+  );
+  assert_eq!(guest::reply_error(&created), 0, "CREATE");
+  let node = guest::u64_at(&created, OUT_HEADER_LEN);
+  let handle = guest::u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+  let written = through_vhost(
+    front,
+    driver,
+    &guest::message(
+      Opcode::Write.to_wire(),
+      2,
+      node,
+      &guest::write_body(handle, FROM_THE_GUEST),
+    ),
+  );
+  assert_eq!(guest::reply_error(&written), 0, "WRITE");
+  let released = through_vhost(
+    front,
+    driver,
+    &guest::message(
+      Opcode::Release.to_wire(),
+      3,
+      node,
+      &guest::release_body(handle),
+    ),
+  );
+  assert_eq!(guest::reply_error(&released), 0, "RELEASE");
+}
+
+/// The volume served again over vhost-user with a DAX window of one range offers the window (the capability's
+/// residency names DAX-mapped guest pages); the device is then let go, and the volume left without attachments.
+#[cfg(target_os = "linux")]
+fn assert_a_windowed_device_is_offered(instance: &mut Instance, volume: VolumeId) {
+  let windowed = instance
+    .serve_vhost_user(
+      volume,
+      Intent::Write,
+      ("slates", None),
+      Some(slates_mem::DAX_RANGE_BYTES),
+    )
+    .unwrap();
+  assert!(
+    matches!(
+      windowed.attachment.capability.residency,
+      slates_ipc::protocol::Residency::DaemonRamAndGuestPageCache { dax_mapped: true }
+    ),
+    "the window is offered: {:?}",
+    windowed.attachment.capability.residency
+  );
+  drop(windowed);
+  wait_for_attachments(instance, volume, 0);
+}
+
+/// AC-5.12 (A-278; §4.6, G-vhost): vhost-user is Linux's (its eventfds and the KVM VMMs that speak it), and elsewhere the
+/// library's route answers so, typed. Do: on another platform, ask the library to serve a volume over vhost-user.
+/// Expect it refused `Unsupported::Attachment` naming the inherited-descriptor transport and `BindingNotBuilt`, before
+/// any effect: the volume holds no attachment after.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_vhost_user_device_is_refused_typed_where_the_form_is_not_built() {
+  let (daemon, mut instance) = grouped("vhost-elsewhere");
+  let volume = provision(&mut instance, &VolumeSpec::empty("vhost-elsewhere", ROOM));
+  assert_eq!(
+    instance
+      .serve_vhost_user(volume, Intent::Write, ("slates", None), None)
+      .err(),
+    Some(Error::Unsupported(Unsupported::Attachment {
+      transport: AttachTransport::VirtioFsInheritedDescriptor,
+      reason: slates_api::UnsupportedReason::BindingNotBuilt,
+    }))
+  );
+  assert_eq!(
+    instance.status(volume).unwrap().attachments,
+    0,
+    "nothing attached"
+  );
+  daemon.stop();
+}
+
+/// The async form by use (§4.12 "Embedding", R6; A-299): an instance a host awaits on its own loop, on every platform:
+/// the completion signal is a descriptor on Unix and a socket on Windows (`slates_api::Completion`), and only the
+/// reactor's one wait on it is the platform's own ([`readable_within`]).
+mod asynchronous_form {
+  use std::cell::Cell;
+  use std::pin::pin;
+  use std::task::{Context, Poll, Waker};
+
+  use slates_api::{AsyncInstance, Completion, Reactor, Waiting, Woke};
+
+  use super::*;
+
+  /// Shape: the most polls [`block_on`] gives a future whose waits all answer at once: one is enough, a few more
+  /// guard against a call that loops without waiting.
+  const POLLS: usize = 4;
+
+  /// Shape: how many times the rounds the cancellation case wants dropped it may run: a round whose call is answered on
+  /// its first poll (the daemon replied before the call reached its wait) drops nothing and runs again.
+  const ROUNDS_PER_DROP: usize = 4;
+
+  /// Whether `completion` became readable within `bound`, this thread blocked in `poll(2)` until it did or the bound
+  /// passed. The instance's client keeps the descriptor open while the call that waits here borrows the instance.
+  #[cfg(unix)]
+  fn readable_within(completion: Completion, bound: Duration) -> std::io::Result<bool> {
+    // SAFETY: `completion` is the waiting instance's completion descriptor, which its client keeps open for as long
+    // as the instance lives, and the call that waits here borrows the instance.
+    let descriptor = unsafe { std::os::fd::BorrowedFd::borrow_raw(completion) };
+    let timeout = rustix::event::Timespec::try_from(bound).ok();
+    let mut interest = [rustix::event::PollFd::new(
+      &descriptor,
+      rustix::event::PollFlags::IN,
+    )];
+    rustix::event::poll(&mut interest, timeout.as_ref())
+      .map(|ready| ready > 0)
+      .map_err(std::io::Error::from)
+  }
+
+  /// Whether `completion` became readable within `bound`, this thread blocked in `WSAPoll` (Winsock's `poll`) until it
+  /// did or the bound passed, in whole milliseconds rounded up so a short bound never spins. The instance's client
+  /// keeps the socket open while the call that waits here borrows the instance.
+  #[cfg(windows)]
+  fn readable_within(completion: Completion, bound: Duration) -> std::io::Result<bool> {
+    use windows_sys::Win32::Networking::WinSock::{
+      POLLRDNORM, SOCKET, SOCKET_ERROR, WSAPOLLFD, WSAPoll,
+    };
+    /// Format: the nanoseconds of the millisecond `WSAPoll` counts its timeout in.
+    const NANOS_PER_MILLI: u128 = 1_000_000;
+    let millis = i32::try_from(bound.as_nanos().div_ceil(NANOS_PER_MILLI)).unwrap_or(i32::MAX);
+    let mut interest = [WSAPOLLFD {
+      fd: SOCKET::try_from(completion).unwrap(),
+      events: POLLRDNORM,
+      revents: 0,
+    }];
+    // SAFETY: `interest` is one live, initialized entry for the call's length, naming the waiting instance's completion
+    // socket, which its client keeps open while the call that waits here borrows the instance.
+    let ready = unsafe { WSAPoll(interest.as_mut_ptr(), 1, millis) };
+    if ready == SOCKET_ERROR {
+      return Err(std::io::Error::last_os_error());
+    }
+    Ok(ready > 0)
+  }
+
+  /// A host's reactor in miniature: its wait blocks this thread ([`readable_within`]) until the completion signal is
+  /// readable or the timeout passes, then answers at once, so an awaited call ends in the one poll [`block_on`] gives it. A call
+  /// that would wait for good fails the test instead of hanging it: a wait with no timeout is bounded by the suite's
+  /// wait, and so are the waits a call times out one after another with no signal between them (a live daemon's call
+  /// goes on waiting through its deadlines, A-232, so only the host bounds it). It counts how its waits ended, the
+  /// evidence a test prints: a wait that timed out is the driver's deadline, not a reply's signal.
+  #[derive(Default)]
+  struct Blocking {
+    /// Waits the completion signal ended.
+    readable: Cell<u64>,
+    /// Waits the timeout ended.
+    timed_out: Cell<u64>,
+    /// How long the waits since the last signal timed out, in all.
+    unsignalled: Cell<Duration>,
+  }
+
+  impl Reactor for Blocking {
+    fn wait(&self, completion: Completion, timeout_ns: Option<u64>) -> Waiting<'_> {
+      let bound = timeout_ns.map_or(START_WAIT, Duration::from_nanos);
+      let woke = match readable_within(completion, bound) {
+        Ok(false) if timeout_ns.is_none() => Err(std::io::Error::new(
+          std::io::ErrorKind::TimedOut,
+          "nothing landed within the suite's wait",
+        )),
+        Ok(false) => Ok(Woke::TimedOut),
+        Ok(true) => Ok(Woke::Readable),
+        Err(error) => Err(error),
+      };
+      let counted = match woke {
+        Ok(Woke::Readable) => {
+          self.unsignalled.set(Duration::ZERO);
+          &self.readable
+        }
+        Ok(Woke::TimedOut) => {
+          let unsignalled = self.unsignalled.get().saturating_add(bound);
+          self.unsignalled.set(unsignalled);
+          if unsignalled > START_WAIT {
+            return Box::pin(std::future::ready(Err(std::io::Error::new(
+              std::io::ErrorKind::TimedOut,
+              "no reply was signalled within the suite's wait",
+            ))));
+          }
+          &self.timed_out
+        }
+        Err(_) => return Box::pin(std::future::ready(woke)),
+      };
+      counted.set(counted.get().saturating_add(1));
+      Box::pin(std::future::ready(woke))
+    }
+  }
+
+  /// A reactor whose wait never answers: a host's loop while its call waits, for the cancellation case.
+  struct Never;
+
+  impl Reactor for Never {
+    fn wait(&self, _completion: Completion, _timeout_ns: Option<u64>) -> Waiting<'_> {
+      Box::pin(std::future::pending())
+    }
+  }
+
+  /// Polls `future` to its end with a waker that wakes nothing: its waits answer at once, so it ends within
+  /// [`POLLS`].
+  fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = pin!(future);
+    let mut context = Context::from_waker(Waker::noop());
+    for _ in 0..POLLS {
+      if let Poll::Ready(out) = future.as_mut().poll(&mut context) {
+        return out;
+      }
+    }
+    panic!("an awaited call did not end within {POLLS} polls");
+  }
+
+  /// A-299, R6: do drive the async form over a daemon: provision an empty volume, snapshot it, read its status,
+  /// provision a clone of the snapshot, ask the status of a volume no one made; then drop a status call while its wait
+  /// has not answered, and ask again, until more calls have been dropped than twice the calls the client admits
+  /// outstanding (a call the daemon answered before it reached its wait is answered on its first poll, drops nothing,
+  /// and the round runs again); destroy the clone, and give the instance back to the synchronous form. Expect each
+  /// answer as the synchronous verb answers it, the stranger refused `NotFound` naming the volume, every call after a
+  /// dropped one answered (a dropped call is cancelled and its reply dropped when it comes; calls left in the driver
+  /// would fill it and have one refused `TooManyOutstanding`), every drop made within the rounds' bound, and the
+  /// synchronous form serving afterwards with its parked calls woken
+  /// ([`expect_parked_synchronous_calls_woken`]). The reactor's wakes and the slowest answered round are printed: a
+  /// round's wait that timed out was ended by the driver's deadline, not by its reply's signal.
+  #[test]
+  fn an_async_instance_provisions_snapshots_reports_and_destroys() {
+    let (daemon, mut instance) = grouped("async");
+    let abandoned = instance
+      .client()
+      .outstanding_limit()
+      .saturating_mul(2)
+      .saturating_add(1);
+    let reactor = Blocking::default();
+    let mut instance = AsyncInstance::new(instance).unwrap();
+    let volume = block_on(instance.provision(&reactor, &VolumeSpec::empty("async", ROOM)))
+      .unwrap()
+      .volume();
+    let snapshot = block_on(instance.snapshot(&reactor, volume)).unwrap();
+    let status = block_on(instance.status(&reactor, volume)).unwrap();
+    assert_eq!((status.name.as_str(), status.snapshots), ("async", 1));
+    let copy = block_on(instance.provision(
+      &reactor,
+      &VolumeSpec::clone_of("async-copy", volume, snapshot),
+    ))
+    .unwrap()
+    .volume();
+    assert_eq!(
+      block_on(instance.status(&reactor, NOWHERE)),
+      Err(Error::NotFound(Missing::Volume(NOWHERE)))
+    );
+    let (dropped, slowest) = drop_and_ask_again(&mut instance, &reactor, volume, abandoned);
+    eprintln!(
+      "dropped {dropped} of {abandoned} calls; the slowest answered round took {slowest:?}; the reactor's waits ended \
+       {} by the signal, {} by the driver's deadline",
+      reactor.readable.get(),
+      reactor.timed_out.get()
+    );
+    assert_eq!(
+      dropped, abandoned,
+      "every drop made within the rounds' bound"
+    );
+    assert_eq!(
+      block_on(instance.status(&reactor, copy)).map(|status| status.name),
+      Ok("async-copy".to_owned()),
+      "a dropped call leaves the instance serving"
+    );
+    block_on(instance.destroy(&reactor, copy)).unwrap();
+    let mut instance = instance.into_instance().unwrap();
+    expect_parked_synchronous_calls_woken(&mut instance, volume);
+    daemon.stop();
+  }
+
+  /// Shape: the synchronous calls made after the instance is given back, each parking at once.
+  const PARKED_CALLS: u64 = 20;
+
+  /// The synchronous half of `an_async_instance_provisions_snapshots_reports_and_destroys`. Do: on the instance the
+  /// async form gave back, ask `volume`'s status [`PARKED_CALLS`] times, the client spinning for none of them, so each
+  /// parks for its reply. Expect each answered, every one of them parked, and each well within the client's reply
+  /// deadline. With the async form's completion bridge still running, the daemon's one wake per reply went to the bridge
+  /// or to the parked call, whichever the kernel picked, and 16 to 19 of 20 such calls slept to their 2.0 s deadline
+  /// (macOS, Mac Studio, 2026-11-18).
+  fn expect_parked_synchronous_calls_woken(instance: &mut Instance, volume: VolumeId) {
+    let deadline = Duration::from_nanos(instance.client().deadlines().reply_ns);
+    instance.client().spin_for(Some(0));
+    let (parks_before, _) = instance.client().park_ratio();
+    for call in 0..PARKED_CALLS {
+      let asked = Instant::now();
+      assert_eq!(
+        instance.status(volume).map(|status| status.snapshots),
+        Ok(1)
+      );
+      let took = asked.elapsed();
+      assert!(
+        took < deadline,
+        "call {call}: a parked synchronous call took {took:?} of its {deadline:?} deadline: its wake went elsewhere"
+      );
+    }
+    let (parks_after, _) = instance.client().park_ratio();
+    assert!(
+      parks_after.saturating_sub(parks_before) >= PARKED_CALLS,
+      "every call parked: {parks_before} parks before, {parks_after} after"
+    );
+    instance.client().spin_for(None);
+  }
+
+  /// The cancellation case of `an_async_instance_provisions_snapshots_reports_and_destroys`: rounds of a status call of
+  /// `volume` polled once on a loop that never answers and dropped, then one asked on `reactor`, until `wanted` calls
+  /// were dropped or [`ROUNDS_PER_DROP`] times that many rounds ran. A call the daemon answered on its first poll drops
+  /// nothing and must have been answered. Each asked call must be answered. The calls dropped, and the slowest round's
+  /// asked call.
+  fn drop_and_ask_again(
+    instance: &mut AsyncInstance,
+    reactor: &Blocking,
+    volume: VolumeId,
+    wanted: usize,
+  ) -> (usize, Duration) {
+    let mut dropped = 0;
+    let mut slowest = Duration::ZERO;
+    for round in 0..wanted.saturating_mul(ROUNDS_PER_DROP) {
+      if dropped == wanted {
+        break;
+      }
+      {
+        let waiting = instance.status(&Never, volume);
+        let mut waiting = pin!(waiting);
+        let mut context = Context::from_waker(Waker::noop());
+        match waiting.as_mut().poll(&mut context) {
+          Poll::Pending => dropped += 1,
+          Poll::Ready(answered) => assert!(
+            answered.is_ok(),
+            "round {round}: a call answered on its first poll: {answered:?}"
+          ),
+        }
+      }
+      let asked = Instant::now();
+      let answered = block_on(instance.status(reactor, volume));
+      slowest = slowest.max(asked.elapsed());
+      assert!(
+        answered.is_ok(),
+        "round {round}: a dropped call is cancelled, so the next is answered: {answered:?}"
+      );
+    }
+    (dropped, slowest)
+  }
+}
+
+/// Shape: the environment variable that opts into a test making a kernel mount, which main runs; a unit run skips it
+/// loudly. Unix's alone, as the busy unmount is: `mount::unmount_busy` is Linux's lazy detach and the forced unmount of
+/// macOS and the BSDs, and a Windows drive is the WinFsp host's to end, whose own tests are the CLI's
+/// (`crates/cli/tests/winfsp.rs`).
+#[cfg(unix)]
+const MOUNT_TESTS: &str = "SLATES_TEST_MOUNT";
+
+/// Whether `path` is a mount point: its device differs from its parent's.
+#[cfg(unix)]
+fn is_mount_point(path: &str) -> bool {
+  use std::os::unix::fs::MetadataExt;
+  let parent = Path::new(path).parent().unwrap();
+  std::fs::metadata(path).unwrap().dev() != std::fs::metadata(parent).unwrap().dev()
+}
+
+/// §4.6, A-278 (g076a's report): a busy mount is let go of on every Unix host, the OS's way. Do: mount a volume through
+/// the library, open a file on the mount and hold it, unmount the path plainly, then let go of it busy. Expect the plain
+/// unmount refused while the file is held, the busy one answered `Detached` on Linux and `Forced` on macOS and the BSDs,
+/// and the path no longer a mount point. Before 2026-11-18 macOS refused the busy unmount `Unsupported`, and a host had
+/// no library route off a held, `hard` loopback mount. Skips loudly unless SLATES_TEST_MOUNT is set: it makes a kernel
+/// mount.
+#[cfg(unix)]
+#[test]
+fn a_busy_mount_is_let_go_of_the_oss_way() {
+  if std::env::var_os(MOUNT_TESTS).is_none() {
+    eprintln!("SKIP: {MOUNT_TESTS} is not set: this test makes a kernel mount");
+    return;
+  }
+  let (daemon, mut instance) = grouped("busy-mount");
+  let volume = provision(&mut instance, &VolumeSpec::empty("busy-mount", ROOM));
+  write_file(&mut instance, volume, "/held.txt", b"held\n");
+  let point = Folder::new();
+  let mounted = instance
+    .mount(volume, &point.path, &MountOptions::default())
+    .unwrap();
+  let held = std::fs::File::open(Path::new(&mounted.path).join("held.txt")).unwrap();
+  // `Busy` from `unmount(2)`'s `EBUSY` on macOS and the BSDs (A-507); `fusermount3 -u`'s exit on Linux.
+  assert!(
+    matches!(
+      slates_api::mount::unmount(&mounted.path),
+      Err(slates_api::MountFault::Busy { .. } | slates_api::MountFault::Unmount { .. })
+    ),
+    "a mount a process holds is busy"
+  );
+  let expected = if cfg!(target_os = "linux") {
+    slates_api::LetGo::Detached
+  } else {
+    slates_api::LetGo::Forced
+  };
+  assert_eq!(slates_api::mount::unmount_busy(&mounted.path), Ok(expected));
+  assert!(!is_mount_point(&mounted.path), "the mount is gone");
+  drop(held);
+  daemon.stop();
+}
+
+/// §4.6 A-9, A-520 (kiln's container engine): a mounted volume binds into a container through the library. Do: mount a
+/// volume through the library, bind its mount point into a container for writing and for reading, and bind a path no
+/// mount is at beside it; detach both bindings, then unmount. Expect each binding the runtime's entry at the mount point
+/// as the kernel's table records it (the mount's own path) and the destination given (`bind`, `rw` or `ro`, `private`,
+/// `nosuid`, `nodev`), each an attachment of its own, and the path beside it refused `ChosenPath(NotAMountPoint)`, as
+/// the daemon judges the table. Skips loudly unless SLATES_TEST_MOUNT is set: it makes a kernel mount.
+#[cfg(unix)]
+#[test]
+fn a_mounted_volume_binds_into_a_container_through_the_library() {
+  if std::env::var_os(MOUNT_TESTS).is_none() {
+    eprintln!("SKIP: {MOUNT_TESTS} is not set: this test makes a kernel mount");
+    return;
+  }
+  let (daemon, mut instance) = grouped("container-bind");
+  let volume = provision(&mut instance, &VolumeSpec::empty("container-bind", ROOM));
+  let point = Folder::new();
+  let mounted = instance
+    .mount(volume, &point.path, &MountOptions::default())
+    .unwrap();
+  let writable = instance
+    .bind_into_container(volume, &mounted.path, "/work", Intent::Write)
+    .unwrap();
+  let readable = instance
+    .bind_into_container(volume, &mounted.path, "/work", Intent::Read)
+    .unwrap();
+  for (bound, read_only, access) in [(&writable, false, "rw"), (&readable, true, "ro")] {
+    assert_eq!(
+      (
+        bound.binding.source.as_str(),
+        bound.binding.destination.as_str(),
+        bound.binding.read_only,
+        bound.binding.mount_type.as_str()
+      ),
+      (mounted.path.as_str(), "/work", read_only, "bind")
+    );
+    assert_eq!(
+      bound.binding.options,
+      ["bind", access, "private", "nosuid", "nodev"]
+    );
+  }
+  assert_ne!(writable.attachment, readable.attachment);
+  assert_eq!(
+    instance.bind_into_container(
+      volume,
+      &format!("{}-beside", mounted.path),
+      "/work",
+      Intent::Read
+    ),
+    Err(Error::Invalid(Invalid::ChosenPath(
+      slates_api::HostPathReason::NotAMountPoint
+    )))
+  );
+  instance.detach(writable.attachment).unwrap();
+  instance.detach(readable.attachment).unwrap();
+  slates_api::mount::unmount(&mounted.path).unwrap();
+  daemon.stop();
 }
 
 /// A volume id no instance issued (A-310's conformance cases).
@@ -1351,16 +2972,32 @@ fn reads_its_end(socket: &std::os::unix::net::UnixStream) -> bool {
   matches!(std::io::Read::read(&mut &*socket, &mut byte), Ok(0))
 }
 
-/// A stream end as it is where it is a pipe handle (Windows): [`reads_its_end`] does not judge it.
-#[cfg(not(unix))]
+/// A stream end made ready for [`reads_its_end`] on Windows: the client end of the attachment's pipe, as it came.
+#[cfg(windows)]
 fn awaiting(end: slates_api::StreamEnd) -> slates_api::StreamEnd {
   end
 }
 
-/// Whether the peer of a stream end reads its end: not judged where the end is a pipe handle (Windows).
-#[cfg(not(unix))]
-fn reads_its_end(_end: &slates_api::StreamEnd) -> bool {
-  true
+/// Whether the peer of a stream end reads its end within the suite's wait: the attachment it reached has ended. A
+/// Windows end is an overlapped pipe handle whose waited read (`slates_ipc::stream::read_waiting`, zero once the peer
+/// has gone) takes no bound of its own, so a duplicate of the handle is read on a thread of the test's and its answer
+/// waited for within the suite's wait: an end that never comes fails the check instead of hanging the suite. Until
+/// 2026-11-18 this answered `true` without reading.
+#[cfg(windows)]
+fn reads_its_end(end: &slates_api::StreamEnd) -> bool {
+  use std::os::windows::io::AsHandle;
+  let reader = end.try_clone().unwrap();
+  let (answer, answered) = std::sync::mpsc::channel();
+  let reading = std::thread::spawn(move || {
+    let mut byte = [0u8; 1];
+    let read = slates_ipc::stream::read_waiting(reader.as_handle(), &mut byte).ok();
+    let _ = answer.send(read);
+  });
+  let ended = matches!(answered.recv_timeout(START_WAIT), Ok(Some(0)));
+  if ended {
+    reading.join().unwrap();
+  }
+  ended
 }
 
 /// A-310's conformance suite: one flow of the seam's verbs, each outcome and each refusal asserted as its typed value,
@@ -1409,8 +3046,9 @@ fn the_seam_conforms<V: Volumes>(seam: &mut V) {
   );
 }
 
-/// The strangers of `the_seam_conforms`. Do: snapshot, clone from (at `snapshot`), destroy and serve a volume no one
-/// made; detach an attachment no one made; provision an overlay of a relative folder. Expect each refused typed:
+/// The strangers of `the_seam_conforms`. Do: snapshot, clone from (at `snapshot`), destroy, serve and bind into a
+/// container a volume no one made; detach an attachment no one made; provision an overlay of a relative folder. Expect
+/// each refused typed:
 /// `NotFound` naming the volume, the snapshot or the attachment, and the folder `NotAbsolute`.
 fn expect_strangers_refused_typed<V: Volumes>(seam: &mut V, snapshot: SnapshotId) {
   assert_eq!(
@@ -1432,6 +3070,12 @@ fn expect_strangers_refused_typed<V: Volumes>(seam: &mut V, snapshot: SnapshotId
     seam
       .serve_shards(NOWHERE, Intent::Read, None)
       .map(|served| served.attachment.attachment),
+    Err(Error::NotFound(Missing::Volume(NOWHERE)))
+  );
+  // A container bind of a volume no one made (A-520): the daemon finds the volume before it judges the form, on every
+  // platform, so the stranger is `NotFound` whatever the host offers to bind.
+  assert_eq!(
+    seam.bind_into_container(NOWHERE, "/seam/nowhere", "/work", Intent::Read),
     Err(Error::NotFound(Missing::Volume(NOWHERE)))
   );
   assert_eq!(

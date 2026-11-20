@@ -74,26 +74,34 @@ mod green_adopt;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
+// The judgment a held NFS connection's adoption takes on Linux (A-550): pure, so every host's tests hold it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod held_send;
 pub mod histogram;
 mod image;
 pub mod landing;
 mod landing_entries;
 pub mod lease;
 mod lease_wait;
+mod live_hold;
 mod live_ship;
 mod member_task;
 // Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
 mod merge_origin;
 pub mod merge_service;
 mod mirror;
+/// The planned move of a volume to another fleet member (§4.10, A-291).
+mod moves;
 // A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").
 mod readmission;
 mod remote_attach;
 mod work_home;
 // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
-// stream's (Linux, macOS; A-316, A-339).
-#[cfg(unix)]
+// stream's (every platform; A-316, A-339, A-402).
 mod write_log;
+// Each range a Shards stream's held DAX backing has answered, kept in anchor RAM for a successor (A-365; Windows'
+// sections, A-448).
+mod dax_ranges;
 // The Windows WinFsp transport (§4.6 "Windows"): a volume at a drive letter, served on its owner shard.
 #[cfg(windows)]
 mod winfsp;
@@ -102,6 +110,10 @@ mod winfsp;
 // rides the runtime's TCP, which every platform has since A-182.
 mod callback;
 mod delegation;
+// A wait whose bound is learned from the waits it measured (RFC 6298, Karn's rule, back-off; A-431, A-442).
+mod learned_wait;
+// The helper processes a shard waits on (the FUSE helpers), each wait learned as `learned_wait` learns one (A-525).
+mod helper_runs;
 mod listing;
 mod lock_ledger;
 pub mod nfs;
@@ -122,7 +134,12 @@ pub mod work_route;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;
-pub mod peer;
+// The deadlines of what a shard's clients leave behind (staging buffers, status captures), kept on the shard's timing
+// wheel by one keeper task (A-522).
+mod deadlines;
+// A client's hang-up, the event its death is seen at (A-475): its control socket's end of stream (Linux) or its
+// process's exit (macOS, Windows), awaited through the shard's driver.
+mod hangup;
 mod reap;
 // Whether Windows Error Reporting writes this daemon full crash dumps (A-239): read, logged once and reported.
 pub mod local_dumps;

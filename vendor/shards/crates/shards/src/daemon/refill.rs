@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
-use super::{Daemon, For, MAX_FAILURES, PoolKey, State, Threads, lock, log, resolved};
+use super::{Daemon, For, PoolKey, State, Threads, lock, log, resolved};
 use crate::containers::Disk;
 
 /// Warm VMs of one pool to start, counted as starting already
@@ -115,8 +115,13 @@ impl<D: Disk> Daemon<D> {
     /// Plans the warm VMs of pool `key` to start: one for each run waiting that none is
     /// starting for, and with `ahead`, more until its pool will hold its target, as far as
     /// `warm_max` allows all pools together, after evicting the ready VMs of the pools
-    /// least recently claimed from. Those planned count as starting at once.
+    /// least recently claimed from. Those planned count as starting at once. None ahead of its
+    /// runs while its host refuses to enter VMs, until a burst width has passed with none
+    /// refused (D26, D261: `Host::Refusing`), nor since a refill of it ended before it was
+    /// ready for no fault of its template's, until one comes ready (`Ahead::Held`); its runs'
+    /// own, each past the span it came in, as ever (`Daemon::claim`).
     pub(super) fn plan_refill(&self, state: &mut State, key: &PoolKey, ahead: bool) -> Option<Planned> {
+        let ahead = ahead && state.host.span_end(Instant::now()).is_none();
         let dir = key.dir.as_path();
         // A template collected is restored no more, and its files are held no more.
         if !shards_vmm::snapshot::exists(dir) {
@@ -126,7 +131,7 @@ impl<D: Disk> Daemon<D> {
         }
         let (for_runs, more) = {
             let pool = state.pools.entry(key.clone()).or_default();
-            if pool.failures >= MAX_FAILURES {
+            if pool.broken {
                 return None;
             }
             // A pool forgotten (age_pools) before its refill comes is made again here,
@@ -155,13 +160,13 @@ impl<D: Disk> Daemon<D> {
                     "{}: its root filesystem was replaced; no warm VM restores it",
                     dir.display()
                 ));
-                pool.failures = MAX_FAILURES;
+                pool.broken = true;
                 return None;
             }
             let now = Instant::now();
             pool.demand.begin(now);
             let for_runs = pool.waiting.saturating_sub(pool.starting);
-            let more = if ahead {
+            let more = if ahead && pool.ahead == super::Ahead::Open {
                 let target = pool.demand.target(now, self.target, self.keep);
                 target.saturating_sub(pool.ready.len() + pool.starting + for_runs)
             } else {

@@ -400,6 +400,9 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "agents", "enroll"]) => return boxed(|| enroll(&hub, req)).await,
         (&Method::POST, ["api", "agents", "instance"]) => return boxed(|| enroll_instance(&hub, req)).await,
         (&Method::POST, ["api", "agents", "capacity"]) => return boxed(|| enroll_capacity(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "slates-fleet"]) => return boxed(|| enroll_slates_node(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "slates-fleet", "members"]) => return boxed(|| slates_fleet_members(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "slates-fleet", "place"]) => return boxed(|| slates_fleet_place(&hub, req)).await,
         (&Method::POST, ["api", "agents", "rekey"]) => return boxed(|| rekey_agent(&hub, req)).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return boxed(|| create_join(&hub, req)).await,
@@ -4588,6 +4591,63 @@ async fn enroll_capacity(hub: &Hub, req: Request) -> R {
     Ok(srv::json(StatusCode::OK, &enrolled))
 }
 
+/// `POST /api/agents/slates-fleet`: the certificate a runner's Slates node joins kiln's Slates fleet with
+/// (`crate::workspace::slates_fleet`; kiln goal 95101ef32ffb8b099942fe076619c310, K1): for the node's key, made on the
+/// runner, named the fleet and the node's failure domain (its machine's), whatever it asked. Needs no token: the
+/// request proves the machine as `POST /api/agents/instance`'s does, and only a machine this server still knows gets
+/// one.
+async fn enroll_slates_node(hub: &Hub, req: Request) -> R {
+    let ask: crate::workspace::slates_fleet::EnrollNode = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let known = hub.store.agents().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.iter().any(|a| a.name == name);
+    if !known {
+        return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
+    }
+    let issued = crate::workspace::slates_fleet::issue(&hub.pki, &ask, &hub.cfg.slates_fleet).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    // Every certificate kiln issues is recorded first (W27-R01).
+    let der = { use base64::Engine as _; base64::engine::general_purpose::STANDARD.decode(&issued.certificate) }.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    crate::identities::record(&hub.store, "slates-node", &name, &crate::pki::cert_pem(&der)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    hub.store.audit(name.clone(), "agent.slates_fleet".into(), String::new()).await;
+    tracing::info!(agent = %name, domain = issued.domain, "issued a Slates fleet node's certificate");
+    Ok(srv::json(StatusCode::OK, &issued))
+}
+
+/// `POST /api/agents/slates-fleet/members`: a runner's word that its Slates node is in kiln's Slates fleet, where it's
+/// reached and with which certificate, and the fleet's nodes whose runners are connected, its own among them
+/// (`crate::workspace::slates_fleet`; kiln goal 95101ef32ffb8b099942fe076619c310, K2). Needs no token: the request
+/// proves the machine as `POST /api/agents/instance`'s does, only a machine this server still knows is heard, and only
+/// for its own node.
+async fn slates_fleet_members(hub: &Hub, req: Request) -> R {
+    let ask: crate::workspace::slates_fleet::Announce = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let agents = hub.store.agents().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if !agents.iter().any(|a| a.name == name) {
+        return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
+    }
+    let member = crate::workspace::slates_fleet::admit_chosen(&hub.pki, &ask, &hub.cfg.slates_fleet).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    tracing::debug!(agent = %name, address = %member.address, "a Slates fleet node's word");
+    hub.slates_fleet.admit(member);
+    let connected: std::collections::BTreeSet<&str> = agents.iter().filter(|a| a.connected).map(|a| a.name.as_str()).collect();
+    let members = hub.slates_fleet.members(|machine| machine == name || connected.contains(machine));
+    Ok(srv::json(StatusCode::OK, &members))
+}
+
+/// `POST /api/agents/slates-fleet/place`: the place the server's `[slates_fleet]` gives the runner that asks (its
+/// fleet, `f`, and where its node is reached), `null` when it lists it not (`crate::workspace::slates_fleet::place_of`;
+/// kiln goal 95101ef32ffb8b099942fe076619c310, K3). Needs no token: the request proves the machine as
+/// `POST /api/agents/instance`'s does, and only a machine this server still knows is answered. A setting that can't
+/// make a fleet is refused, naming what's wrong, so no runner starts on it.
+async fn slates_fleet_place(hub: &Hub, req: Request) -> R {
+    let ask: crate::workspace::slates_fleet::AskPlace = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let known = hub.store.agents().await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?.iter().any(|a| a.name == name);
+    if !known {
+        return Err(err(StatusCode::FORBIDDEN, format!("{name} is not enrolled here any more; enroll it again")));
+    }
+    let place = crate::workspace::slates_fleet::place_of(&hub.cfg.slates_fleet, &name).map_err(|e| err(StatusCode::CONFLICT, e))?;
+    Ok(srv::json(StatusCode::OK, &place))
+}
+
 /// `POST /api/capacity/keeper`: a capacity keeper's certificate from kiln's CA, for its request
 /// (`crate::capacity::issue_keeper`; Hex's capacity-view.md; HEX-CV-2K; kiln plan
 /// 01a1cd8e862e7169a074db3d5fa33f3d, step 13): named as its request asks, its `chain.pem` and
@@ -6232,15 +6292,18 @@ async fn terminal_attach(hub: Arc<Hub>, existing: Option<String>, target: String
 
 /// The harnesses each machine offers; `?target=` narrows it to one ("local", "agent:<name>").
 /// Where agents can have workspaces of their own (docs/agentic.md, W), by target (`local`,
-/// `agent:<name>`): `{available, why_not?, mount?}` for the server and each connected runner.
+/// `agent:<name>`): `{available, why_not?, missing?}` for the server and each connected runner, `missing` what the
+/// machine lacks, typed (`kiln_ci::facts::WorkspaceMissing`).
 async fn harness_workspaces(hub: &Hub) -> Response {
     let mut out = serde_json::Map::new();
     let mut targets = vec!["local".to_owned()];
     targets.extend(hub.agents.load().values().filter(|a| a.connected && !a.ephemeral).map(|a| format!("agent:{}", a.name)));
+    // Mounted on each machine's host, as an agent there works in one (W2); a volume served to a microVM, which needs no
+    // host mount, is judged as its isolated start is made (`lineage::WorkspaceUse::Served`, W8).
     for t in targets {
-        let v = match crate::harness::lineage::workspaces_on(hub, &t).await {
+        let v = match crate::harness::lineage::workspaces_on(hub, &t, crate::harness::lineage::WorkspaceUse::Mounted).await {
             Ok(()) => json!({"available": true}),
-            Err(why) => json!({"available": false, "why_not": why}),
+            Err(no) => json!({"available": false, "why_not": no.said, "missing": no.missing}),
         };
         out.insert(t, v);
     }
@@ -6921,12 +6984,14 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     as_asked(&mut body.spec, caller.as_ref());
     // A workspace is asked for by its kind alone (its machine makes a volume), a volume only of a machine that can make
     // one: one that can't would let it work in the folder itself, unasked. Asked nothing, it gets a volume where its
-    // machine can make one (`Registry::open_as`); the folder itself is a choice kept as made.
+    // machine can make one (`Registry::open_as`); the folder itself is a choice kept as made. One that will run isolated,
+    // as the registry decides its boundary, has its volume served to its microVM, which needs no host mount (W8).
     match body.spec.workspace.as_ref().map(|w| w.kind.as_str()) {
         None => {}
         Some("folder") => body.spec.workspace = Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }),
         Some("volume") => {
-            crate::harness::lineage::workspaces_on(hub, &body.target).await.map_err(|why| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {why}")))?;
+            let used = crate::harness::lineage::WorkspaceUse::of(hub.harness.isolation_for(hub, &body.target, &body.spec).is_some());
+            crate::harness::lineage::workspaces_on(hub, &body.target, used).await.map_err(|no| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
             body.spec.workspace = Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() });
         }
         Some(other) => return Err(err(StatusCode::BAD_REQUEST, format!("a workspace is \"folder\" or \"volume\", not {other:?}"))),
@@ -6978,7 +7043,10 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let attention_kind = if body.spec.prompt.is_some() { "message" } else { "command" };
     let infos = hub.harness.open_as(hub, &body.target, body.spec, count, &body.ids).await.map_err(|e| {
-        let status = if e.downcast_ref::<crate::harness::registry::IdTaken>().is_some() { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
+        // Taken already, or its machine can't give it a workspace of its own (what it lacks named): a conflict with how
+        // things stand, not a bad request.
+        let conflict = e.downcast_ref::<crate::harness::registry::IdTaken>().is_some() || e.downcast_ref::<crate::harness::lineage::NoWorkspace>().is_some();
+        let status = if conflict { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
         err(status, format!("{e:#}"))
     })?;
     // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`), and

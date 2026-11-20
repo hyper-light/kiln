@@ -1025,6 +1025,7 @@ fn read_usage(input: &mut Reader<'_>) -> Result<Usage, Fault> {
         io_write_bytes: input.u64()?,
         guest: None,
         started_from: None,
+        paused_ns: None,
     })
 }
 pub fn read_answer(bytes: &[u8], fds: usize) -> Result<(u16, u64, Answer), Fault> {

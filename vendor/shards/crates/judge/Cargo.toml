@@ -1,0 +1,21 @@
+[package]
+name = "shards-judge"
+version = "0.1.0"
+description = "D215's judge of a wait on another's work: what a kind of answer has taught, and a wait's schedule and verdict"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+# Windows' listing of every process's threads, their states and wait reasons
+# (NtQuerySystemInformation's SystemProcessInformation; KWAIT_REASON).
+windows-sys = { workspace = true, features = [
+  "Wdk_System_SystemInformation",
+  "Wdk_System_SystemServices",
+  "Win32_System_WindowsProgramming",
+] }
+
+[lints]
+workspace = true

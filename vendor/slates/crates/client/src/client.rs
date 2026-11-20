@@ -2,16 +2,21 @@
 //!
 //! **A call waits while its daemon lives, and fails `DaemonGone` once it is gone (§4.7, A-232).** One rule for every
 //! wait a call makes, the async driver's (`crate::driver`) and the two here: `round_trip`'s wait for its
-//! reply and `send`'s wait for a slot on a full command ring. Each reply deadline that passes asks the daemon's
-//! liveness, a cold-path question (`ClientEnd::daemon_gone`: the peer's close on Linux, the exit watch and the
-//! bootstrap stamp on macOS and Windows). Gone, the client reconnects under its id within the reconnect budget and
-//! the caller resends, or the call fails `DaemonGone` past it. Alive, the deadline re-arms and the wait goes on: a
-//! daemon answers every call it is given, however long the work (a granted landing, a forward across the fleet) or
-//! however starved its threads, and a daemon judged stuck is ended by its supervisor, or by its own watchdog when it
-//! runs alone, which the next deadline then finds gone. Until 2026-11-13 a live daemon's overdue call failed
-//! `Stalled` unless its request was one the daemon defers (`defers_reply`, now gone with it); a daemon starved at
-//! `cpu.weight` 1, alive by its own watchdog, had its calls failed so in 10 of 10 runs on both of CI's Linux runners
-//! (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
+//! reply and `send`'s wait for a slot on a full command ring. `round_trip`'s wait has no deadline: it ends at the
+//! reply or at the daemon's departure, which the end waits on beside the reply (`ClientEnd::wait_while_daemon_lives`,
+//! A-456: on Linux the control socket's close, on Windows the daemon's process handle, on macOS its exit watch looked
+//! at on a doubling schedule). The other two cannot see the departure yet (a slot that frees wakes nothing, and the
+//! async driver's loop polls only the completion descriptor), so each asks the daemon's liveness on the same doubling
+//! (`slates_ipc::looks`, A-523: first at twice the longer of the wait when first judged and the wake estimate, then at
+//! twice the time waited; until A-523 at each reply deadline that passed), a cold-path question
+//! (`ClientEnd::daemon_gone`: the peer's close on Linux, the exit watch and the bootstrap stamp on macOS and Windows). Gone, the client reconnects under its id while the instance's rendezvous has
+//! a holder, its anchor restarting the daemon (A-468), and the caller resends; with none, the call fails `DaemonGone`
+//! at once. Alive, the wait goes on: a daemon answers every call it is given, however long the work (a granted
+//! landing, a forward across the fleet) or however starved its threads, and a daemon judged stuck is ended by its
+//! supervisor, or by its own watchdog when it runs alone, which the wait then sees gone. Until 2026-11-13 a live
+//! daemon's overdue call failed `Stalled` unless its request was one the daemon defers (`defers_reply`, now gone with
+//! it); a daemon starved at `cpu.weight` 1, alive by its own watchdog, had its calls failed so in 10 of 10 runs on both
+//! of CI's Linux runners (`docs/bugs/2026-11-13-a-live-starved-daemons-call-was-failed-stalled.md`).
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
@@ -27,11 +32,14 @@ use slates_ipc::protocol::{
   Scope, SizeClass, SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId,
   VolumeSummary, WorkOp, unpack,
 };
-use slates_ipc::protocol::{EntriesCursor, PlannedEntry, PolicySubject, Verification, WritePolicy};
+use slates_ipc::protocol::{
+  ChangedCursor, EntriesCursor, PlannedEntry, PolicySubject, Verification, WritePolicy,
+};
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
 use slates_ipc::{
-  CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, begin_connect_as, connect_as,
+  CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, Waited, begin_connect_as, connect_as,
+  holder_lives,
 };
 use slates_machine::{Derived, derived};
 use slates_wire::request::RequestId;
@@ -111,20 +119,49 @@ pub struct ImageBuilt {
   pub inodes_used: u64,
 }
 
+/// A snapshot exported as its archive (§4.11, A-441): the volume whose root holds the archive file
+/// ([`slates_ipc::protocol::ARCHIVE_FILE`]), read a page at a time with [`Client::read`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveExported {
+  /// The archive volume, the caller's own.
+  pub id: VolumeId,
+  /// The archive file's length in bytes.
+  pub archive_bytes: u64,
+  /// The archive's manifest identity: the BLAKE3 Merkle root of the snapshot's tree (D-17).
+  pub manifest: [u8; 32],
+}
+
+/// A volume made from an archive (§4.11, A-453): the new volume, and the manifest identity of the archive it was made
+/// from, verified against its tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchiveImported {
+  /// The new volume, the caller's own.
+  pub id: VolumeId,
+  /// The archive's manifest identity: the BLAKE3 Merkle root of the exported snapshot's tree (D-17).
+  pub manifest: [u8; 32],
+}
+
 /// The client's deadlines, every one a derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadlines {
-  /// How long a reply is waited for before the daemon's liveness is questioned.
+  /// How long a wait that cannot see the daemon's departure waits before it asks the daemon's liveness, and again
+  /// after each answer that it lives: the async driver's tick, the wait for a slot on a full ring, a delivery's read
+  /// and the macOS route's claim steps. The synchronous wait for a reply uses none: it ends at the reply or the
+  /// departure itself (A-456).
   pub reply_ns: u64,
-  /// How long a reconnect is tried after the daemon is found gone.
+  /// How long a request the daemon refused for now (an owner unreachable during a takeover, a lease not yet
+  /// confirmed, a stream's holder pending) is asked again, and held open for its resend under its own id; the pause
+  /// between such resends is at most a tenth of it. A reconnect itself waits while the instance's anchor lives and
+  /// fails at once with none, by no clock (A-468).
   pub reconnect_ns: u64,
 }
 
 impl Deadlines {
   /// Derived: the reply deadline is the anchor's liveness budget (a daemon silent longer than
   /// that is presumed dead by its own supervisor, so the client asks the same question then);
-  /// the reconnect budget is the recovery budget the restart is bounded by, plus one reply
-  /// deadline for the restarted daemon's first answer.
+  /// the reconnect budget is the recovery budget a restart is bounded by, plus one reply
+  /// deadline. Since A-468 it bounds only the waits on a fleet owner's takeover (`reconnect_ns`), whose
+  /// own bound, the failover delay the daemon reports, is owed (GAPS).
   pub fn derive(liveness_budget_ns: u64, recovery_budget_ns: u64) -> Derived<Deadlines> {
     derived!(
       Deadlines {
@@ -182,8 +219,8 @@ pub struct ShardsStream {
   pub stream: StreamEnd,
   /// The device's end of the stream's resync channel (A-316, A-339; `slates_bridge_fuse::shards_resync`),
   /// close-on-exec, to hand the VMM beside the stream's (`slates_ipc::stream::exec_with_ends`): over it a successor
-  /// daemon hands the device a fresh stream after this one's daemon dies. None where the daemon hands none (Windows
-  /// yet), or made no channel.
+  /// daemon hands the device a fresh stream after this one's daemon dies. On Windows (A-427) a handle the daemon
+  /// duplicated into this process, a message-mode pipe's end. None where the daemon made no channel.
   pub resync: Option<StreamEnd>,
 }
 
@@ -238,6 +275,47 @@ pub struct EntriesPage {
   pub manifest: [u8; 32],
 }
 
+/// One page of a list the daemon answers a reply at a time (§4.3: a reply is one bulk chunk; A-263 to A-266): the
+/// items in the list's order, and the cursor the next page is asked from, `None` when this page ends the list. A list's
+/// order is a key that never changes for its items (a volume's id, a grant's id, a record's sequence, a green version
+/// and its changed paths), and a page continues past the last key the previous one held, so an item that stands for
+/// the whole walk is answered exactly once however the list changes meanwhile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Page<T, C> {
+  /// This page's items.
+  pub items: Vec<T>,
+  /// The cursor the next page is asked from, or `None` when this page ends the list.
+  pub next: Option<C>,
+}
+
+/// One page of an overlay volume's drifted entries ([`Client::drifted_page`]; §4.4 `status`, A-267), typed as a status's
+/// `base` types them (A-299).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriftedPage {
+  /// This page's entries the disk changed after the volume witnessed them, in inode order.
+  pub drifted: Vec<slates_ipc::protocol::DriftEntry>,
+  /// This page's entries whose re-check the host refused now, by path, in inode order.
+  pub unverified: Vec<String>,
+  /// The inode the next page starts after, or `None` when this page ends the walk.
+  pub next: Option<u64>,
+  /// Entries in this page's range too long for any reply alone (a host path near the platform's maximum), passed over
+  /// and counted, never sent.
+  pub oversized: u32,
+}
+
+/// Refuses a page whose cursor does not move past the one it was asked from, so a walk always ends: a daemon that
+/// answered the same cursor again would hold its walker in a loop.
+fn forward<C: Ord>(
+  next: Option<C>,
+  after: Option<C>,
+  verb: &'static str,
+) -> Result<(), ClientError> {
+  match (next, after) {
+    (Some(next), Some(after)) if next <= after => Err(ClientError::UnexpectedReply { verb }),
+    _ => Ok(()),
+  }
+}
+
 /// What a `land` call returns: the landing ran, or it needs a grant a human must make.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Landing {
@@ -251,8 +329,11 @@ pub enum Landing {
     manifest: [u8; 32],
     /// The summary of what would be written.
     summary: LandingSummary,
-    /// Conflicts found before any write.
+    /// Conflicts found before any write, each `PATH (CLASS)`: as many as one reply holds (A-267).
     conflicts: Vec<String>,
+    /// Conflicts past what one reply holds (A-267): every entry of the presentation, its conflict among it, is read
+    /// a page at a time ([`Client::landing_entries`]).
+    conflicts_elided: u32,
   },
 }
 
@@ -292,8 +373,21 @@ pub struct Attachment {
 pub struct Advanced {
   /// The version now pinned.
   pub version: u64,
-  /// The invalidated paths, sorted.
+  /// The invalidated paths, sorted: as many as one reply holds (A-267).
   pub invalidated: Vec<String>,
+  /// Invalidated paths past what one reply holds (A-267): more changed than the reply carried, so a holder of the
+  /// view's reads treats every path as invalidated, or reads a green's with [`Client::changed_since`].
+  pub invalidated_elided: u32,
+}
+
+/// What `rewitness` did (§4.15 `rewitness`): the paths re-witnessed, as many as one reply holds, and the count of the
+/// rest (A-267), which the rewitness took too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rewitnessed {
+  /// The paths re-witnessed, as many as one reply holds.
+  pub paths: Vec<String>,
+  /// Paths re-witnessed past what one reply holds.
+  pub paths_elided: u32,
 }
 
 /// The client.
@@ -359,6 +453,16 @@ pub struct Client {
   /// The word of each chain step in flight, mapped to its chain's public word: a step's reply is filed under the
   /// public word, so the caller's event loop sees one operation.
   chain_steps: std::collections::BTreeMap<u64, u64>,
+  /// Async listings, by the public word their caller awaits: each walks the listing's pages as a chain, one page in
+  /// flight at a time (bounded by `awaited_cap`, as each page is awaited), its steps filed under the public word as an
+  /// edit's are.
+  list_chains: std::collections::BTreeMap<u64, ListChain>,
+  /// Async `changed_since` answers, by the public word their caller awaits: each walks the answer's pages as a chain,
+  /// as a listing does.
+  changed_chains: std::collections::BTreeMap<u64, ChangedChain>,
+  /// Async submits and rebases, by the public word their caller awaits (A-267): a conflicting verdict whose reply
+  /// counted windows it could not carry walks the rest as a chain, as a listing does.
+  verdict_chains: std::collections::BTreeMap<u64, VerdictChain>,
   /// Derived: the outstanding operations admitted — the command ring's slots, the client's in-flight
   /// bound (the same bound the retryable set keeps).
   awaited_cap: usize,
@@ -384,6 +488,8 @@ pub struct Client {
   /// The reconnect claim in flight (AUD-29-19): made by one [`Client::try_reconnect`], its answer read by
   /// the next, so no attempt waits on the daemon.
   reconnecting: Option<Claim>,
+  /// When the reconnect in flight began ([`Client::try_reconnect`]): what a `DaemonGone` it ends in reports.
+  reconnect_began: Option<Instant>,
 }
 
 /// The stream end a Windows daemon duplicated into this process for a Shards attach (A-179): the reply's handle,
@@ -427,6 +533,56 @@ impl std::fmt::Debug for Client {
   }
 }
 
+/// The synchronous send's wait for a slot on a full command ring (A-232, A-523): what it does next, `elapsed_ns` into
+/// the wait. It spins for the client's wake estimate, since the daemon drains its ring in microseconds; then it parks,
+/// each pause twice the last from the wake estimate and never past the next look at the daemon's life, which comes on
+/// A-443's doubling (`slates_ipc::looks`): first at twice the longer of the wait when first judged and the wake
+/// estimate, then at twice the time waited. Its pauses and looks are made of the wait's own length and this machine's
+/// measured wake, never a fixed time, and a wait of `t` wakes about `log2(t / wake)` times.
+#[derive(Debug, Default)]
+struct RoomWait {
+  /// When the wait next asks the daemon's liveness.
+  looks: slates_ipc::looks::Looks,
+  /// The last pause, nanoseconds; `None` before the first.
+  pause_ns: Option<u64>,
+}
+
+/// What a wait for a ring slot does next ([`RoomWait::next`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoomStep {
+  /// Try the ring again at once.
+  Spin,
+  /// Ask the daemon's liveness, then try again.
+  Look,
+  /// Park this long, nanoseconds, then try again.
+  Park(u64),
+}
+
+impl RoomWait {
+  /// The next step, `elapsed_ns` into the wait, the client's wake estimate being `wake_ns`.
+  fn next(&mut self, elapsed_ns: u64, wake_ns: u64) -> RoomStep {
+    if elapsed_ns < wake_ns {
+      return RoomStep::Spin;
+    }
+    if self.looks.due(elapsed_ns, wake_ns) {
+      return RoomStep::Look;
+    }
+    let to_look_ns = self.looks.until(elapsed_ns).unwrap_or(wake_ns).max(1);
+    let pause_ns = self
+      .pause_ns
+      .map_or(wake_ns, |pause| pause.saturating_mul(2))
+      .max(1)
+      .min(to_look_ns);
+    self.pause_ns = Some(pause_ns);
+    RoomStep::Park(pause_ns)
+  }
+
+  /// A look made `elapsed_ns` into the wait found the daemon alive: the next comes at twice the time waited.
+  fn looked(&mut self, elapsed_ns: u64) {
+    self.looks.looked(elapsed_ns);
+  }
+}
+
 /// Derived: the first pause between reconnect attempts is the wake latency the daemon
 /// published as its spin window (the shortest wait that is not a spin); each pause doubles
 /// up to a tenth of the budget, so a restart is seen within a tenth of the budget at worst
@@ -434,8 +590,8 @@ impl std::fmt::Debug for Client {
 pub(crate) fn next_pause_ns(pause_ns: u64, budget_ns: u64) -> u64 {
   derived!(
     pause_ns.saturating_mul(2).min(budget_ns / 10).max(1),
-    "min(2 × pause, reconnect_ns / 10)",
-    ["pause_ns", "reconnect_ns"]
+    "min(2 × pause, budget / 10)",
+    ["pause_ns", "budget_ns"]
   )
   .get()
 }
@@ -467,6 +623,281 @@ struct EditChain {
   token: u64,
   /// How many of `bytes` are put (or in flight).
   offset: usize,
+}
+
+/// A listing walked page by page (§4.4 `list`): the volumes of the pages taken so far and the cursor the next page is
+/// asked after. One reply holds one page, so a listing of any length is a walk, synchronous ([`Client::list`]) or a
+/// chain of requests under one word ([`Client::list_begin`]).
+#[derive(Debug, Default)]
+struct ListChain {
+  volumes: Vec<VolumeSummary>,
+  after: Option<VolumeId>,
+}
+
+impl ListChain {
+  /// Takes one page's reply: the cursor for the next page, or `None` when the listing is complete. A page that does
+  /// not move the cursor forward is refused, so a walk always ends.
+  fn take(&mut self, body: ReplyBody) -> Result<Option<VolumeId>, ClientError> {
+    let ReplyBody::Listed { volumes, next } = resolved(body)? else {
+      return Err(ClientError::UnexpectedReply { verb: "list" });
+    };
+    forward(next, self.after, "list")?;
+    self.volumes.extend(volumes);
+    self.after = next;
+    Ok(next)
+  }
+
+  /// The whole listing, in name order (and id order within a name).
+  fn into_listing(self) -> Vec<VolumeSummary> {
+    let mut volumes = self.volumes;
+    volumes.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    volumes
+  }
+}
+
+/// A green's `changed_since` answer walked page by page (§4.16, A-264): the paths taken so far, each once, and where the
+/// next page continues. One reply holds one page, so an answer of any length is a walk.
+#[derive(Debug)]
+struct ChangedChain {
+  green: VolumeId,
+  version: u64,
+  from: Option<slates_ipc::protocol::ChangedCursor>,
+  paths: std::collections::BTreeSet<String>,
+}
+
+impl ChangedChain {
+  fn new(green: VolumeId, version: u64) -> ChangedChain {
+    ChangedChain {
+      green,
+      version,
+      from: None,
+      paths: std::collections::BTreeSet::new(),
+    }
+  }
+
+  /// The request for the next page: from where the last stopped.
+  fn request(&self) -> RequestBody {
+    RequestBody::ChangedSince {
+      green: self.green,
+      version: self.version,
+      from: self.from,
+    }
+  }
+
+  /// Takes one page's reply: whether more follow. A cursor that does not move past the last is refused, so a walk
+  /// always ends (a page may hold no path: it stopped where the shard's slice was spent).
+  fn take(&mut self, body: ReplyBody) -> Result<bool, ClientError> {
+    let ReplyBody::ChangedSince { paths, next } = resolved(body)? else {
+      return Err(ClientError::UnexpectedReply {
+        verb: "changed_since",
+      });
+    };
+    forward(next, self.from, "changed_since")?;
+    self.paths.extend(paths);
+    match next {
+      None => Ok(false),
+      next => {
+        self.from = next;
+        Ok(true)
+      }
+    }
+  }
+
+  /// The answer: every path taken, in path order, each once.
+  fn into_paths(self) -> Vec<String> {
+    self.paths.into_iter().collect()
+  }
+}
+
+/// A submit's or a rebase's conflicting verdict walked page by page (§4.16, A-267): its reply carries the first windows
+/// and counts the rest, which the work keeps under the verdict's id; the walk reads them, synchronously
+/// ([`Client::submit_with_evidence`], [`Client::rebase`]) or as a chain of requests under the call's one word
+/// ([`Client::submit_begin`], [`Client::rebase_begin`]), so a caller is handed every window either way.
+#[derive(Debug)]
+struct VerdictChain {
+  work: VolumeId,
+  /// Which verb's outcome the walk ends in.
+  kind: VerdictKind,
+  /// Whether the verdict's own reply came, naming the verdict.
+  started: bool,
+  /// The verdict, once its reply named it.
+  verdict: u64,
+  windows: Vec<MergeWindow>,
+  /// The windows the verdict holds: those its reply carried and those it counted.
+  total: usize,
+  /// How a submit's signature was judged (A-321): `Unsigned` until a signed verdict or an approval request says.
+  verification: Verification,
+}
+
+/// Which verb a [`VerdictChain`] answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerdictKind {
+  Submit,
+  Rebase,
+}
+
+/// What a submit or a rebase ends in, before it is the verb's own type.
+enum VerdictOutcome {
+  Submitted(Submitted),
+  Rebased(Rebased),
+}
+
+impl VerdictChain {
+  /// A walk of `work`'s `kind` verdict, before its reply.
+  fn new(work: VolumeId, kind: VerdictKind) -> VerdictChain {
+    VerdictChain {
+      work,
+      kind,
+      started: false,
+      verdict: 0,
+      windows: Vec::new(),
+      total: 0,
+      verification: Verification::Unsigned,
+    }
+  }
+
+  /// Takes the verdict's reply, then each page of its windows: the outcome once every window is taken, else `None`,
+  /// the next page to ask for being [`VerdictChain::request`]. A page that brings no window while more are owed, that
+  /// names a position other than the windows taken, or that ends short of or past the verdict's count, is refused, so
+  /// a walk always ends.
+  fn take(&mut self, body: ReplyBody) -> Result<Option<VerdictOutcome>, ClientError> {
+    if !self.started {
+      return self.take_verdict(body);
+    }
+    let ReplyBody::Conflicts { windows, next } = resolved(body)? else {
+      return Err(ClientError::UnexpectedReply { verb: "conflicts" });
+    };
+    let before = self.windows.len();
+    self.windows.extend(windows);
+    let taken = self.windows.len();
+    match next {
+      Some(next) if taken > before && taken < self.total && usize::try_from(next) == Ok(taken) => {
+        Ok(None)
+      }
+      None if taken == self.total => Ok(Some(
+        self.kind.conflicted(std::mem::take(&mut self.windows)),
+      )),
+      _ => Err(ClientError::UnexpectedReply { verb: "conflicts" }),
+    }
+  }
+
+  /// The verdict's own reply: its outcome, or `None` when it counted windows it could not carry.
+  fn take_verdict(&mut self, body: ReplyBody) -> Result<Option<VerdictOutcome>, ClientError> {
+    let verb = self.kind.verb();
+    let (version, conflicts, elided, verdict) = match (self.kind, resolved(body)?) {
+      (
+        VerdictKind::Submit,
+        ReplyBody::Submitted {
+          version,
+          conflicts,
+          conflicts_elided,
+          verdict,
+        },
+      )
+      | (
+        VerdictKind::Rebase,
+        ReplyBody::Rebased {
+          version,
+          conflicts,
+          conflicts_elided,
+          verdict,
+        },
+      ) => (version, conflicts, conflicts_elided, verdict),
+      // A signed submit's verdict, or an accept a signed submit made first (A-321): the same, judged.
+      (
+        VerdictKind::Submit,
+        ReplyBody::SubmittedSigned {
+          version,
+          conflicts,
+          conflicts_elided,
+          verdict,
+          verification,
+        },
+      ) => {
+        self.verification = verification;
+        (version, conflicts, conflicts_elided, verdict)
+      }
+      (
+        VerdictKind::Submit,
+        ReplyBody::MergeApprovalRequired {
+          identity,
+          paths,
+          verification,
+          ..
+        },
+      ) => {
+        self.verification = verification;
+        return Ok(Some(VerdictOutcome::Submitted(
+          Submitted::ApprovalRequired { identity, paths },
+        )));
+      }
+      _ => return Err(ClientError::UnexpectedReply { verb }),
+    };
+    if let Some(version) = version {
+      return Ok(Some(self.kind.accepted(version)));
+    }
+    if elided == 0 {
+      return Ok(Some(self.kind.conflicted(conflicts)));
+    }
+    self.total = usize::try_from(elided)
+      .ok()
+      .and_then(|elided| conflicts.len().checked_add(elided))
+      .ok_or(ClientError::UnexpectedReply { verb })?;
+    self.started = true;
+    self.verdict = verdict;
+    self.windows = conflicts;
+    Ok(None)
+  }
+
+  /// The request for the next page: from the windows taken so far.
+  fn request(&self) -> RequestBody {
+    RequestBody::Conflicts {
+      work: self.work,
+      verdict: self.verdict,
+      from: u32::try_from(self.windows.len()).unwrap_or(u32::MAX),
+    }
+  }
+}
+
+impl VerdictKind {
+  fn verb(self) -> &'static str {
+    match self {
+      VerdictKind::Submit => "submit",
+      VerdictKind::Rebase => "rebase",
+    }
+  }
+
+  fn accepted(self, version: u64) -> VerdictOutcome {
+    match self {
+      VerdictKind::Submit => VerdictOutcome::Submitted(Submitted::Accepted(version)),
+      VerdictKind::Rebase => VerdictOutcome::Rebased(Rebased::Rebased(version)),
+    }
+  }
+
+  fn conflicted(self, windows: Vec<MergeWindow>) -> VerdictOutcome {
+    match self {
+      VerdictKind::Submit => VerdictOutcome::Submitted(Submitted::Conflict(windows)),
+      VerdictKind::Rebase => VerdictOutcome::Rebased(Rebased::Conflict(windows)),
+    }
+  }
+}
+
+impl VerdictOutcome {
+  /// The submit's outcome, or a typed mismatch for a rebase's.
+  fn submitted(self) -> Result<Submitted, ClientError> {
+    match self {
+      VerdictOutcome::Submitted(outcome) => Ok(outcome),
+      VerdictOutcome::Rebased(_) => Err(ClientError::UnexpectedReply { verb: "submit" }),
+    }
+  }
+
+  /// The rebase's outcome, or a typed mismatch for a submit's.
+  fn rebased(self) -> Result<Rebased, ClientError> {
+    match self {
+      VerdictOutcome::Rebased(outcome) => Ok(outcome),
+      VerdictOutcome::Submitted(_) => Err(ClientError::UnexpectedReply { verb: "rebase" }),
+    }
+  }
 }
 
 /// A file's bytes delivered to a same-kernel client (§4.6, A-171): mapped from the daemon's copy of the file with no
@@ -786,6 +1217,21 @@ fn mapped_access_refused(call: &'static str, error: &slates_mem::MemError) -> Cl
   })
 }
 
+/// Where a volume's move stands after one ask ([`Client::move_volume`], A-291).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveState {
+  /// Under way: frozen, waiting for its records' placement or for the configuration to name its new owner.
+  Moving {
+    /// The member it moves to.
+    to: u64,
+  },
+  /// Done: the configuration names its new owner, where its verbs go now.
+  Moved {
+    /// The member it moved to.
+    to: u64,
+  },
+}
+
 /// Maps a decoded reply body to a result: a refusal becomes the typed error, any other body passes
 /// through — the same rule [`Client::exchange`] applies to a synchronous reply.
 fn resolved(body: ReplyBody) -> Result<ReplyBody, ClientError> {
@@ -821,13 +1267,6 @@ fn extract_status(body: ReplyBody) -> Result<StatusReport, ClientError> {
 }
 
 /// Extracts the volume list from its reply, or a typed mismatch.
-fn extract_listed(body: ReplyBody) -> Result<Vec<VolumeSummary>, ClientError> {
-  match body {
-    ReplyBody::Listed { volumes } => Ok(volumes),
-    _ => Err(ClientError::UnexpectedReply { verb: "list" }),
-  }
-}
-
 /// Confirms a resize's reply, or a typed mismatch. A unit verb yields `true` (not the `None` a poll
 /// returns when the reply has not come), so an async pump can tell "done" from "not yet".
 fn extract_resized(body: ReplyBody) -> Result<bool, ClientError> {
@@ -879,58 +1318,13 @@ fn extract_advanced(body: ReplyBody) -> Result<Advanced, ClientError> {
     ReplyBody::Advanced {
       version,
       invalidated,
+      invalidated_elided,
     } => Ok(Advanced {
       version,
       invalidated,
+      invalidated_elided,
     }),
     _ => Err(ClientError::UnexpectedReply { verb: "advance" }),
-  }
-}
-
-/// Extracts a read's bytes, or a typed mismatch.
-fn extract_read(body: ReplyBody) -> Result<Vec<u8>, ClientError> {
-  match body {
-    ReplyBody::ReadBytes { bytes } => Ok(bytes),
-    _ => Err(ClientError::UnexpectedReply { verb: "read" }),
-  }
-}
-
-/// Extracts a submit's outcome from its reply — accepted at a version, or a conflict with windows —
-/// or a typed mismatch. The same rule the sync [`Client::submit`] applies.
-fn extract_submitted(body: ReplyBody) -> Result<Submitted, ClientError> {
-  extract_judged(body).map(|(submitted, _)| submitted)
-}
-
-/// Extracts a submit's outcome and how its signature was judged (A-321): a signed submit's verdict and an approval
-/// request carry it; an unsigned verdict is `Unsigned`.
-fn extract_judged(body: ReplyBody) -> Result<(Submitted, Verification), ClientError> {
-  match body {
-    ReplyBody::Submitted { version, conflicts } => {
-      Ok((verdict_of(version, conflicts), Verification::Unsigned))
-    }
-    ReplyBody::SubmittedSigned {
-      version,
-      conflicts,
-      verification,
-    } => Ok((verdict_of(version, conflicts), verification)),
-    ReplyBody::MergeApprovalRequired {
-      identity,
-      paths,
-      verification,
-      ..
-    } => Ok((
-      Submitted::ApprovalRequired { identity, paths },
-      verification,
-    )),
-    _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
-  }
-}
-
-/// A verdict's version and windows as a [`Submitted`].
-fn verdict_of(version: Option<u64>, conflicts: Vec<MergeWindow>) -> Submitted {
-  match version {
-    Some(version) => Submitted::Accepted(version),
-    None => Submitted::Conflict(conflicts),
   }
 }
 
@@ -943,29 +1337,6 @@ fn extract_versions(body: ReplyBody) -> Result<u64, ClientError> {
 }
 
 /// Extracts the changed-paths list from its reply, or a typed mismatch.
-fn extract_changed(body: ReplyBody) -> Result<Vec<String>, ClientError> {
-  match body {
-    ReplyBody::ChangedSince { paths } => Ok(paths),
-    _ => Err(ClientError::UnexpectedReply {
-      verb: "changed_since",
-    }),
-  }
-}
-
-/// Extracts a rebase's outcome — rebased onto a version, or a conflict — or a typed mismatch.
-fn extract_rebased(body: ReplyBody) -> Result<Rebased, ClientError> {
-  match body {
-    ReplyBody::Rebased {
-      version: Some(v), ..
-    } => Ok(Rebased::Rebased(v)),
-    ReplyBody::Rebased {
-      version: None,
-      conflicts,
-    } => Ok(Rebased::Conflict(conflicts)),
-    _ => Err(ClientError::UnexpectedReply { verb: "rebase" }),
-  }
-}
-
 /// Confirms a namespace declaration's reply, or a typed mismatch (yields `true`, the unit sentinel).
 fn extract_declared(body: ReplyBody) -> Result<bool, ClientError> {
   match body {
@@ -996,12 +1367,14 @@ fn extract_signed_landing(body: ReplyBody) -> Result<SignedLanding, ClientError>
       conflicts,
       statement,
       verification,
+      conflicts_elided,
     } => Ok(SignedLanding {
       landing: Landing::GrantRequired {
         landing,
         manifest,
         summary,
         conflicts,
+        conflicts_elided,
       },
       verification,
       statement: Some(statement),
@@ -1096,7 +1469,7 @@ impl Client {
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
     install_seal();
-    let connected = connect_as(instance, 0, deadlines.reconnect_ns)?;
+    let connected = connect_as(instance, 0)?;
     let mut client = Client::over(instance, connected, 0, deadlines, None)?;
     client.bind_delivered(delivered)?;
     Ok(client)
@@ -1108,7 +1481,7 @@ impl Client {
   pub fn begin_connect(instance: &str, deadlines: Deadlines) -> Result<Connecting, ClientError> {
     let delivered = delivered_capability()?;
     install_seal();
-    let claim = begin_connect_as(instance, 0, deadlines.reconnect_ns)?;
+    let claim = begin_connect_as(instance, 0)?;
     Ok(Connecting {
       instance: instance.to_owned(),
       deadlines,
@@ -1129,7 +1502,7 @@ impl Client {
   ) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
     install_seal();
-    let connected = connect_as(instance, session.client_id, deadlines.reconnect_ns)?;
+    let connected = connect_as(instance, session.client_id)?;
     let assigned = connected.region.client_id();
     if assigned != session.client_id {
       return Err(ClientError::SessionTaken { assigned });
@@ -1186,6 +1559,9 @@ impl Client {
       awaited: std::collections::BTreeMap::new(),
       edit_chains: std::collections::BTreeMap::new(),
       chain_steps: std::collections::BTreeMap::new(),
+      list_chains: std::collections::BTreeMap::new(),
+      changed_chains: std::collections::BTreeMap::new(),
+      verdict_chains: std::collections::BTreeMap::new(),
       awaited_cap: unpublished_cap,
       unawaited_dropped: 0,
       attest_in_flight: None,
@@ -1194,6 +1570,7 @@ impl Client {
       bound: false,
       rebinds: 0,
       reconnecting: None,
+      reconnect_began: None,
     })
   }
 
@@ -1296,6 +1673,12 @@ impl Client {
   /// Parks a wake ended with no reply waiting, so the client parked again.
   pub fn unanswered_wakes(&self) -> u64 {
     self.end.unanswered_wakes()
+  }
+
+  /// Parks a look at the daemon's life ended, the daemon found alive and the client parked again (macOS, Windows;
+  /// A-506; `ClientEnd::parks_ended_by_looks`).
+  pub fn parks_ended_by_looks(&self) -> u64 {
+    self.end.parks_ended_by_looks()
   }
 
   /// Sends `body` as the next request and returns the reply body, refusals typed.
@@ -1636,9 +2019,13 @@ impl Client {
         lease_epoch,
         capability,
         handle,
+        resync,
       } => Ok(ShardsStream {
         stream: adopt_handed_stream(handle)?,
-        resync: None,
+        // The device's end of the resync channel, beside the stream's (A-427): zero where the daemon made or handed none.
+        resync: (resync != 0)
+          .then(|| adopt_handed_stream(resync))
+          .transpose()?,
         attachment: Attachment {
           attachment,
           lease_epoch,
@@ -1786,8 +2173,8 @@ impl Client {
   }
 
   /// Claims the stream end offered for `attachment` on the daemon's socket route with the offer's `secret` (macOS,
-  /// A-161), and its resync end beside it when the daemon made one (A-339), each socket step bounded by the client's
-  /// reply deadline.
+  /// A-161), and its resync end beside it when the daemon made one (A-339), each socket step waiting while the route's
+  /// connection lives (`slates_ipc::route::claim`, A-523).
   #[cfg(target_os = "macos")]
   fn claim_offer(
     &self,
@@ -1798,8 +2185,6 @@ impl Client {
       &self.instance,
       (slates_ipc::route::OfferKind::Stream, attachment),
       secret,
-      std::time::Duration::from_nanos(self.deadlines.reply_ns),
-      &mut || !self.end.daemon_gone(),
     )
     .map(|claimed| (claimed.descriptor, claimed.resync))
     .map_err(ClientError::Ipc)
@@ -1819,7 +2204,8 @@ impl Client {
   }
 
   /// Claims a direct map's copy offered on the daemon's socket route (§4.6, A-173, macOS): its descriptor, each step of
-  /// the claim waited for in reply deadlines while the daemon lives, as the map's own reply is (A-186).
+  /// the claim waiting while the route's connection lives, as the map's own reply waits while the daemon does (A-186,
+  /// A-523).
   #[cfg(target_os = "macos")]
   fn claim_map(
     &self,
@@ -1830,8 +2216,6 @@ impl Client {
       &self.instance,
       (slates_ipc::route::OfferKind::Map, mapping_id),
       secret,
-      std::time::Duration::from_nanos(self.deadlines.reply_ns),
-      &mut || !self.end.daemon_gone(),
     )
     .map(|claimed| claimed.descriptor)
     .map_err(ClientError::Ipc)
@@ -1850,16 +2234,17 @@ impl Client {
 
   /// Receives the descriptor the daemon sent over the control socket for the reply just read (§4.6: a content map,
   /// A-135; a stream end, A-161), the one `ours` recognises by what the reply named. The daemon sends it before the
-  /// ring reply, so it is already waiting; the loop only covers a kernel that makes the socket readable a scheduling
-  /// tick after the ring slot, bounded by the client's existing reply deadline (no new timeout). A delivery for an
-  /// earlier request whose caller stopped waiting is dropped here, its descriptor closed, so it never answers a later
-  /// call.
+  /// ring reply, and answers a typed refusal where the send failed, so it is waiting, or the socket turns readable a
+  /// scheduling tick after the ring slot: the loop waits on the socket itself, readable or hung up, with no clock
+  /// (`ClientEnd::wait_delivery`, A-523), and ends `ChannelLost` once the daemon is gone with nothing delivered. Until
+  /// A-523 it yielded until the client's reply deadline (a fixed second) and gave up `DeadlineExceeded` there. A
+  /// delivery for an earlier request whose caller stopped waiting is dropped here, its descriptor closed, so it never
+  /// answers a later call.
   #[cfg(unix)]
   fn recv_delivery(
     &self,
     ours: impl Fn(&ControlDelivery) -> bool,
   ) -> Result<ControlDelivery, ClientError> {
-    let start = Instant::now();
     loop {
       if let Some(delivery) = self.end.recv_delivery().map_err(ClientError::Ipc)? {
         if ours(&delivery) {
@@ -1867,10 +2252,10 @@ impl Client {
         }
         continue;
       }
-      if elapsed_ns(start) > self.deadlines.reply_ns {
-        return Err(ClientError::Ipc(IpcError::DeadlineExceeded));
+      if self.end.daemon_gone() {
+        return Err(ClientError::ChannelLost);
       }
-      std::thread::yield_now();
+      self.end.wait_delivery().map_err(ClientError::Ipc)?;
     }
   }
 
@@ -2057,8 +2442,9 @@ impl Client {
     })
   }
 
-  /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon was found
-  /// gone and the client reconnected instead (the caller binds and resends).
+  /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon departed and
+  /// the client reconnected instead (the caller binds and resends). The wait has no deadline: it ends at the reply or
+  /// at the daemon's departure, which the end waits on beside the reply (A-456; the module doc's rule).
   fn round_trip(
     &mut self,
     id: RequestId,
@@ -2068,8 +2454,12 @@ impl Client {
       return Ok(None);
     }
     loop {
-      match self.end.wait(Some(self.deadlines.reply_ns)) {
-        Ok(reply) => {
+      match self
+        .end
+        .wait_while_daemon_lives()
+        .map_err(ClientError::Ipc)?
+      {
+        Waited::Reply(reply) => {
           if reply.request != id.word() {
             // Another request's reply (an async call's, or an abandoned one's still in flight): kept for its
             // caller when one awaits it, else dropped and counted, as the async drain does (AUD-29-22); this wait
@@ -2080,15 +2470,12 @@ impl Client {
           }
           return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
         }
-        Err(IpcError::DeadlineExceeded) if self.end.daemon_gone() => {
+        // The daemon's process ended with the reply unwritten. A daemon that stops answering is ended by its supervisor,
+        // or by its own watchdog when it runs alone (A-232), so this is where every unanswered call's wait ends.
+        Waited::Departed => {
           self.reconnect()?;
           return Ok(None);
         }
-        // The daemon lives: the next wait re-arms the deadline (the module doc's rule, A-232). A daemon that stops
-        // answering is ended by its supervisor, or by its own watchdog when it runs alone, and a later deadline then
-        // finds it gone.
-        Err(IpcError::DeadlineExceeded) => {}
-        Err(e) => return Err(ClientError::Ipc(e)),
       }
     }
   }
@@ -2216,12 +2603,14 @@ impl Client {
 
   /// One step of a reconnect under the client's id, never waiting (AUD-29-19): the first step makes the
   /// claim, each later one reads its answer. `Ok(true)` connected (the fresh channel is bound to the
-  /// consumer on the next send); `Ok(false)` while the answer is due, or when no daemon answered (the
-  /// next step claims again). A live client holding the id is refused `SessionTaken`.
+  /// consumer on the next send); `Ok(false)` while the answer is due, or when the claim was refused for now while the
+  /// instance's rendezvous has a holder (the next step claims again); `DaemonGone` at once when it has none: no anchor
+  /// restarts the daemon (A-468). A live client holding the id is refused `SessionTaken`.
   pub fn try_reconnect(&mut self) -> Result<bool, ClientError> {
+    let began = *self.reconnect_began.get_or_insert_with(Instant::now);
     let polled = match self.reconnecting.as_mut() {
       Some(claim) => claim.poll(),
-      None => match begin_connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
+      None => match begin_connect_as(&self.instance, self.client_id) {
         Ok(claim) => self.reconnecting.insert(claim).poll(),
         Err(error) => Err(error),
       },
@@ -2229,23 +2618,42 @@ impl Client {
     if !matches!(polled, Ok(None)) {
       self.reconnecting = None;
     }
-    match polled {
-      Ok(None) => Ok(false),
-      Ok(Some(mut connected)) => {
-        let assigned = connected.region.client_id();
-        if assigned != self.client_id {
-          return Err(ClientError::SessionTaken { assigned });
-        }
-        connected.region.set_session_key(&self.session_key)?;
-        self.end = ClientEnd::connected(connected);
-        self.reconnects = self.reconnects.saturating_add(1);
-        self.bound = false;
-        self.attest_in_flight = None;
-        Ok(true)
-      }
-      Err(IpcError::DaemonUnavailable { .. } | IpcError::RingFull) => Ok(false),
+    let reconnected = match polled {
+      Ok(None) => return Ok(false),
+      Ok(Some(connected)) => self.adopt_reconnected(connected).map(|()| true),
+      Err(IpcError::DaemonUnavailable { .. } | IpcError::RingFull) => self.refused_reconnect(began),
       Err(e) => Err(ClientError::Ipc(e)),
+    };
+    if !matches!(reconnected, Ok(false)) {
+      self.reconnect_began = None;
     }
+    reconnected
+  }
+
+  /// A reconnect's claim refused: `Ok(false)` to claim again while the instance's rendezvous has a holder (the anchor
+  /// restarting its daemon, or a daemon holding its own; A-468), else `DaemonGone`, the time since the reconnect `began`.
+  fn refused_reconnect(&self, began: Instant) -> Result<bool, ClientError> {
+    if holder_lives(&self.instance)? {
+      return Ok(false);
+    }
+    Err(ClientError::DaemonGone {
+      after_ns: elapsed_ns(began),
+    })
+  }
+
+  /// Takes a reconnected channel as this client's: refused `SessionTaken` when the daemon gave another id; the session
+  /// key written into the fresh region, the reconnect counted, and the channel left to be bound to the consumer.
+  fn adopt_reconnected(&mut self, mut connected: Connected) -> Result<(), ClientError> {
+    let assigned = connected.region.client_id();
+    if assigned != self.client_id {
+      return Err(ClientError::SessionTaken { assigned });
+    }
+    connected.region.set_session_key(&self.session_key)?;
+    self.end = ClientEnd::connected(connected);
+    self.reconnects = self.reconnects.saturating_add(1);
+    self.bound = false;
+    self.attest_in_flight = None;
+    Ok(())
   }
 
   /// The client's derived budgets.
@@ -2273,7 +2681,11 @@ impl Client {
   /// dropped on arrival. Returns whether it was outstanding.
   pub fn abandon(&mut self, word: u64) -> bool {
     self.pending.retain(|(held, _)| *held != word);
-    if self.edit_chains.remove(&word).is_some() {
+    if self.edit_chains.remove(&word).is_some()
+      || self.list_chains.remove(&word).is_some()
+      || self.changed_chains.remove(&word).is_some()
+      || self.verdict_chains.remove(&word).is_some()
+    {
       let steps: Vec<u64> = self
         .chain_steps
         .iter()
@@ -2300,6 +2712,9 @@ impl Client {
       .filter(|word| !self.chain_steps.contains_key(word))
       .copied()
       .chain(self.edit_chains.keys().copied())
+      .chain(self.list_chains.keys().copied())
+      .chain(self.changed_chains.keys().copied())
+      .chain(self.verdict_chains.keys().copied())
       .collect::<std::collections::BTreeSet<u64>>()
       .into_iter()
       .collect()
@@ -2338,6 +2753,10 @@ impl Client {
     if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
       let (_, body) = self.pending.remove(pos);
       self.awaited.remove(&word);
+      // A page taken as a raw reply ends its walk: the caller has the page, and nothing waits on the chain.
+      self.list_chains.remove(&word);
+      self.changed_chains.remove(&word);
+      self.verdict_chains.remove(&word);
       self.note_reply(word, &body, true);
       return resolved(body).map(Some);
     }
@@ -2345,6 +2764,9 @@ impl Client {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
       if reply.request == word {
         self.awaited.remove(&word);
+        self.list_chains.remove(&word);
+        self.changed_chains.remove(&word);
+        self.verdict_chains.remove(&word);
         self.note_reply(word, &body, true);
         return resolved(body).map(Some);
       }
@@ -2470,6 +2892,16 @@ impl Client {
     self.end.disarm_async().map_err(ClientError::Ipc)
   }
 
+  /// Ends the async completion channel ([`Self::enable_async_completion`]) for a caller going back to the synchronous
+  /// form, so its parked calls are woken by the daemon's wake rather than a bridge taking it (see
+  /// `ClientEnd::disable_async_completion`). The descriptor the async form polled is closed.
+  pub fn disable_async_completion(&mut self) -> Result<(), ClientError> {
+    self
+      .end
+      .disable_async_completion()
+      .map_err(ClientError::Ipc)
+  }
+
   /// Clears the completion fd's readiness after the loop reports it readable.
   #[cfg(unix)]
   pub fn drain_completion(&self) {
@@ -2589,23 +3021,84 @@ impl Client {
     self.poll_as(word, extract_status)
   }
 
-  /// Begins a list, returning its request id.
+  /// Begins a listing, returning its request id: the word of a chain that walks the listing's pages, the first in
+  /// flight now ([`ListChain`]).
   pub fn list_begin(&mut self) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::List)
+    let id = self.begin(&RequestBody::List { after: None })?;
+    self.list_chains.insert(id.word(), ListChain::default());
+    Ok(id)
   }
 
-  /// Takes a list reply within `spin_ns`.
+  /// Takes a listing within `spin_ns`: the whole listing when its first page is its last and comes in the spin; else
+  /// `None`, and the next page is in flight under the same word, for [`Client::list_poll`].
   pub fn list_spin(
     &mut self,
     id: RequestId,
     spin_ns: u64,
   ) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
-    self.spin_as(id, spin_ns, extract_listed)
+    let started = Instant::now();
+    loop {
+      if let Some(body) = self.take_held(id.word())? {
+        return self.advance_list(id.word(), body);
+      }
+      if elapsed_ns(started) >= spin_ns {
+        return Ok(None);
+      }
+      std::hint::spin_loop();
+    }
   }
 
-  /// Takes a list reply by id word once the completion fd signals.
+  /// Takes a listing by id word once the completion fd signals: each page's reply sends the next page's request, and
+  /// the whole listing, in name order, comes with the last page's.
   pub fn list_poll(&mut self, word: u64) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
-    self.poll_as(word, extract_listed)
+    match self.take_held(word)? {
+      Some(body) => self.advance_list(word, body),
+      None => Ok(None),
+    }
+  }
+
+  /// The reply held for the chain `word` once the ring is drained (a step's reply is filed under its chain's word),
+  /// still typed: a chain advances on a refusal by ending.
+  fn take_held(&mut self, word: u64) -> Result<Option<ReplyBody>, ClientError> {
+    self.take_ready()?;
+    let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) else {
+      return Ok(None);
+    };
+    let (_, body) = self.pending.remove(pos);
+    self.awaited.remove(&word);
+    Ok(Some(body))
+  }
+
+  /// Advances the listing `word` by one page's reply: the whole listing after its last page, else `None` with the next
+  /// page's request sent under the chain's word.
+  fn advance_list(
+    &mut self,
+    word: u64,
+    body: ReplyBody,
+  ) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
+    let Some(chain) = self.list_chains.get_mut(&word) else {
+      return Err(ClientError::UnexpectedReply { verb: "list" });
+    };
+    let next = match chain.take(body) {
+      Ok(next) => next,
+      Err(e) => {
+        self.list_chains.remove(&word);
+        return Err(e);
+      }
+    };
+    let Some(after) = next else {
+      return Ok(self.list_chains.remove(&word).map(ListChain::into_listing));
+    };
+    match self.begin(&RequestBody::List { after: Some(after) }) {
+      Ok(id) => {
+        self.chain_steps.insert(id.word(), word);
+        Ok(None)
+      }
+      Err(e) => {
+        self.list_chains.remove(&word);
+        Err(e)
+      }
+    }
   }
 
   /// Begins a resize, returning its request id.
@@ -2864,10 +3357,15 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::Submit {
+    let id = self.begin(&RequestBody::Submit {
       work,
       evidence: evidence.to_vec(),
-    })
+    })?;
+    // Its verdict may count windows its reply could not carry, read as a chain under this word (A-267).
+    self
+      .verdict_chains
+      .insert(id.word(), VerdictChain::new(work, VerdictKind::Submit));
+    Ok(id)
   }
 
   /// Begins an advance of a green attachment (§4.16), returning its request id.
@@ -2896,42 +3394,86 @@ impl Client {
     self.poll_as(word, extract_advanced)
   }
 
-  /// Begins a read of a file at a view (§4.12 `read`), returning its request id.
-  pub fn read_begin(
-    &mut self,
-    volume: VolumeId,
-    path: &str,
-    at: ReadAt,
-  ) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::Read {
-      volume,
-      path: path.to_owned(),
-      at,
-    })
-  }
-
-  /// Takes a read's bytes within `spin_ns`.
-  pub fn read_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<Vec<u8>>, ClientError> {
-    self.spin_as(id, spin_ns, extract_read)
-  }
-
-  /// Takes a read's bytes by id word once the completion fd signals.
-  pub fn read_poll(&mut self, word: u64) -> Result<Option<Vec<u8>>, ClientError> {
-    self.poll_as(word, extract_read)
-  }
-
   /// Takes a submit's outcome within `spin_ns`.
   pub fn submit_spin(
     &mut self,
     id: RequestId,
     spin_ns: u64,
   ) -> Result<Option<Submitted>, ClientError> {
-    self.spin_as(id, spin_ns, extract_submitted)
+    self
+      .verdict_spin(id.word(), spin_ns)?
+      .map(VerdictOutcome::submitted)
+      .transpose()
   }
 
-  /// Takes a submit's outcome by id word once the completion fd signals.
+  /// Takes a submit's outcome by id word once the completion fd signals: every conflict window, a verdict's reply that
+  /// counted windows it could not carry sending the next page's request under the same word (A-267).
   pub fn submit_poll(&mut self, word: u64) -> Result<Option<Submitted>, ClientError> {
-    self.poll_as(word, extract_submitted)
+    self
+      .verdict_poll(word)?
+      .map(VerdictOutcome::submitted)
+      .transpose()
+  }
+
+  /// A verdict walk's outcome within `spin_ns` ([`VerdictChain`]).
+  fn verdict_spin(
+    &mut self,
+    word: u64,
+    spin_ns: u64,
+  ) -> Result<Option<VerdictOutcome>, ClientError> {
+    let started = Instant::now();
+    loop {
+      if let Some(body) = self.take_held(word)? {
+        return self.advance_verdict(word, body);
+      }
+      if elapsed_ns(started) >= spin_ns {
+        return Ok(None);
+      }
+      std::hint::spin_loop();
+    }
+  }
+
+  /// A verdict walk's outcome once the completion fd signals ([`VerdictChain`]).
+  fn verdict_poll(&mut self, word: u64) -> Result<Option<VerdictOutcome>, ClientError> {
+    match self.take_held(word)? {
+      Some(body) => self.advance_verdict(word, body),
+      None => Ok(None),
+    }
+  }
+
+  /// Advances the verdict walk `word` by one reply: its outcome once every window is taken, else `None` with the next
+  /// page's request sent under the walk's word.
+  fn advance_verdict(
+    &mut self,
+    word: u64,
+    body: ReplyBody,
+  ) -> Result<Option<VerdictOutcome>, ClientError> {
+    let Some(chain) = self.verdict_chains.get_mut(&word) else {
+      return Err(ClientError::UnexpectedReply { verb: "submit" });
+    };
+    match chain.take(body) {
+      Ok(Some(outcome)) => {
+        self.verdict_chains.remove(&word);
+        Ok(Some(outcome))
+      }
+      Ok(None) => {
+        let request = chain.request();
+        match self.begin(&request) {
+          Ok(id) => {
+            self.chain_steps.insert(id.word(), word);
+            Ok(None)
+          }
+          Err(e) => {
+            self.verdict_chains.remove(&word);
+            Err(e)
+          }
+        }
+      }
+      Err(e) => {
+        self.verdict_chains.remove(&word);
+        Err(e)
+      }
+    }
   }
 
   /// Begins a versions query on a green, returning its request id.
@@ -2955,26 +3497,88 @@ impl Client {
     green: VolumeId,
     version: u64,
   ) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::ChangedSince { green, version })
+    let chain = ChangedChain::new(green, version);
+    let id = self.begin(&chain.request())?;
+    self.changed_chains.insert(id.word(), chain);
+    Ok(id)
   }
 
-  /// Takes a changed-since reply within `spin_ns`.
+  /// Takes a changed-since answer within `spin_ns`: the whole answer when its first page is its last and comes in the
+  /// spin; else `None`, the next page in flight under the same word, for [`Client::changed_since_poll`].
   pub fn changed_since_spin(
     &mut self,
     id: RequestId,
     spin_ns: u64,
   ) -> Result<Option<Vec<String>>, ClientError> {
-    self.spin_as(id, spin_ns, extract_changed)
+    let started = Instant::now();
+    loop {
+      if let Some(body) = self.take_held(id.word())? {
+        return self.advance_changed(id.word(), body);
+      }
+      if elapsed_ns(started) >= spin_ns {
+        return Ok(None);
+      }
+      std::hint::spin_loop();
+    }
   }
 
-  /// Takes a changed-since reply by id word once the completion fd signals.
+  /// Takes a changed-since answer by id word once the completion fd signals: each page's reply sends the next page's
+  /// request, and the whole answer comes with the last page's.
   pub fn changed_since_poll(&mut self, word: u64) -> Result<Option<Vec<String>>, ClientError> {
-    self.poll_as(word, extract_changed)
+    match self.take_held(word)? {
+      Some(body) => self.advance_changed(word, body),
+      None => Ok(None),
+    }
+  }
+
+  /// Advances the changed-since walk `word` by one page's reply: the whole answer after its last page, else `None`
+  /// with the next page's request sent under the chain's word.
+  fn advance_changed(
+    &mut self,
+    word: u64,
+    body: ReplyBody,
+  ) -> Result<Option<Vec<String>>, ClientError> {
+    let Some(chain) = self.changed_chains.get_mut(&word) else {
+      return Err(ClientError::UnexpectedReply {
+        verb: "changed_since",
+      });
+    };
+    let more = match chain.take(body) {
+      Ok(more) => more,
+      Err(e) => {
+        self.changed_chains.remove(&word);
+        return Err(e);
+      }
+    };
+    if !more {
+      return Ok(
+        self
+          .changed_chains
+          .remove(&word)
+          .map(ChangedChain::into_paths),
+      );
+    }
+    let request = chain.request();
+    match self.begin(&request) {
+      Ok(id) => {
+        self.chain_steps.insert(id.word(), word);
+        Ok(None)
+      }
+      Err(e) => {
+        self.changed_chains.remove(&word);
+        Err(e)
+      }
+    }
   }
 
   /// Begins a rebase of a work volume, returning its request id.
   pub fn rebase_begin(&mut self, work: VolumeId) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::Rebase { work })
+    let id = self.begin(&RequestBody::Rebase { work })?;
+    // Its verdict may count windows its reply could not carry, read as a chain under this word (A-267).
+    self
+      .verdict_chains
+      .insert(id.word(), VerdictChain::new(work, VerdictKind::Rebase));
+    Ok(id)
   }
 
   /// Takes a rebase's outcome within `spin_ns`.
@@ -2983,12 +3587,19 @@ impl Client {
     id: RequestId,
     spin_ns: u64,
   ) -> Result<Option<Rebased>, ClientError> {
-    self.spin_as(id, spin_ns, extract_rebased)
+    self
+      .verdict_spin(id.word(), spin_ns)?
+      .map(VerdictOutcome::rebased)
+      .transpose()
   }
 
-  /// Takes a rebase's outcome by id word once the completion fd signals.
+  /// Takes a rebase's outcome by id word once the completion fd signals: every conflict window, as
+  /// [`Client::submit_poll`] reads them (A-267).
   pub fn rebase_poll(&mut self, word: u64) -> Result<Option<Rebased>, ClientError> {
-    self.poll_as(word, extract_rebased)
+    self
+      .verdict_poll(word)?
+      .map(VerdictOutcome::rebased)
+      .transpose()
   }
 
   /// Begins a namespace declaration on a work volume, returning its request id. The `WorkOp` is the
@@ -3073,32 +3684,31 @@ impl Client {
 
   /// Writes the request into the command ring, waiting for a slot under the module doc's rule (A-232): `true` once
   /// written; `false` when the daemon was found gone instead and the client reconnected (the caller binds and sends
-  /// again). Within the first reply deadline the wait spins, since the daemon drains its ring in microseconds; each
-  /// deadline that passes asks the daemon's liveness, and while it lives the wait goes on, paced as the reconnect
-  /// paces ([`next_pause_ns`] over the reply deadline: doubling from the wake estimate, at most a tenth of the
-  /// deadline), so a ring that a starved daemon does not drain costs this thread no core beside it.
+  /// again). The wait keeps [`RoomWait`]'s schedule (A-523): it spins for the client's wake estimate, since the daemon
+  /// drains its ring in microseconds, then parks, each pause twice the last and never past the next look at the
+  /// daemon's life, which comes on A-443's doubling; while the daemon lives the wait goes on, so a ring a starved daemon
+  /// does not drain costs this thread no core beside it. A slot that frees wakes nothing, so it is found at the next
+  /// try, within the time already waited. Until A-523 the wait spun for a whole reply deadline (a fixed second), asked
+  /// the daemon's liveness at each one, and paced its tries at a tenth of it.
   fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
-    let reply_ns = self.deadlines.reply_ns;
-    let mut armed = Instant::now();
-    // `None` while the first reply deadline runs; the pause between slot checks once one has passed.
-    let mut pause_ns: Option<u64> = None;
+    let started = Instant::now();
+    let mut wait = RoomWait::default();
     loop {
       match self.end.send_message(id.word(), body) {
         Ok(()) => return Ok(true),
         Err(IpcError::RingFull) => {
-          if elapsed_ns(armed) >= reply_ns {
-            if self.end.daemon_gone() {
-              self.reconnect()?;
-              return Ok(false);
+          let elapsed = elapsed_ns(started);
+          match wait.next(elapsed, self.end.wake_estimate_ns()) {
+            RoomStep::Spin => std::hint::spin_loop(),
+            RoomStep::Look => {
+              if self.end.daemon_gone() {
+                self.reconnect()?;
+                return Ok(false);
+              }
+              wait.looked(elapsed);
             }
-            armed = Instant::now();
-            pause_ns.get_or_insert(self.end.wake_estimate_ns().max(1));
-          }
-          match pause_ns {
-            None => std::hint::spin_loop(),
-            Some(pause) => {
-              std::thread::park_timeout(std::time::Duration::from_nanos(pause));
-              pause_ns = Some(next_pause_ns(pause, reply_ns));
+            RoomStep::Park(pause_ns) => {
+              std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));
             }
           }
         }
@@ -3136,33 +3746,24 @@ impl Client {
     }
   }
 
-  /// Reconnects under the client's id inside the reconnect budget; refused when the budget
-  /// passes or a live client holds the id. The fresh channel is the account's until the client
-  /// binds it again (`rebind_if_needed`), which every send path does before sending.
+  /// Reconnects under the client's id while the instance's rendezvous has a holder (A-468): the anchor that restarts the
+  /// daemon, or a daemon that holds its own. Each claim waits while that holder lives, by no clock; a claim refused for
+  /// now (no slot free, the restarted daemon not yet published) is made again, paced as an async connect polls, and
+  /// with no holder left the reconnect fails `DaemonGone` at once. Refused too when a live client holds the id. The
+  /// fresh channel is the account's until the client binds it again (`rebind_if_needed`), which every send path does
+  /// before sending. Until A-468 the reconnect was tried for a budget (the recovery budget and a liveness window, two
+  /// seconds), which failed a client whose anchor took longer to restart its daemon and kept one whose daemon no
+  /// anchor would restart waiting out the whole budget.
   fn reconnect(&mut self) -> Result<(), ClientError> {
-    let started = Instant::now();
-    let budget = self.deadlines.reconnect_ns;
+    let began = Instant::now();
     let mut pause_ns = self.end.wake_estimate_ns().max(1);
     loop {
-      match connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
-        Ok(mut connected) => {
-          let assigned = connected.region.client_id();
-          if assigned != self.client_id {
-            return Err(ClientError::SessionTaken { assigned });
-          }
-          connected.region.set_session_key(&self.session_key)?;
-          self.end = ClientEnd::connected(connected);
-          self.reconnects = self.reconnects.saturating_add(1);
-          self.bound = false;
-          self.attest_in_flight = None;
-          return Ok(());
-        }
+      match connect_as(&self.instance, self.client_id) {
+        Ok(connected) => return self.adopt_reconnected(connected),
         Err(IpcError::DaemonUnavailable { .. } | IpcError::RingFull) => {
-          if elapsed_ns(started) >= budget {
-            return Err(ClientError::DaemonGone { after_ns: budget });
-          }
+          self.refused_reconnect(began)?;
           std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));
-          pause_ns = next_pause_ns(pause_ns, budget);
+          pause_ns = next_pause_ns(pause_ns, CLAIM_WAIT_NS);
         }
         Err(e) => return Err(ClientError::Ipc(e)),
       }
@@ -3369,18 +3970,49 @@ impl Client {
     }
   }
 
-  /// The files a green changed strictly after `version` (§4.16).
+  /// The paths a green changed strictly after `version` in any dimension (§4.16), in path order, each once: the answer
+  /// walked a page at a time ([`Client::changed_since_page`]), as one reply holds one page, so an answer of any length
+  /// is answered.
   pub fn changed_since(
     &mut self,
     green: VolumeId,
     version: u64,
   ) -> Result<Vec<String>, ClientError> {
-    match self.call(&RequestBody::ChangedSince { green, version })? {
-      ReplyBody::ChangedSince { paths } => Ok(paths),
-      _ => Err(ClientError::UnexpectedReply {
-        verb: "changed_since",
-      }),
+    let mut paths = std::collections::BTreeSet::new();
+    let mut from = None;
+    loop {
+      let page = self.changed_since_page(green, version, from)?;
+      paths.extend(page.items);
+      match page.next {
+        None => return Ok(paths.into_iter().collect()),
+        next => from = next,
+      }
     }
+  }
+
+  /// One page of the paths a green changed strictly after `version` (§4.16, A-264), from `from` (`None` begins): read
+  /// from the green's change index in version order, each page ending at a full reply or at the shard's slice of its
+  /// turn, so a page may hold no path and still carry a cursor. A path changed when the walk began is answered once,
+  /// and once more if it changes again during the walk. A page whose cursor does not move past `from` is refused
+  /// [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn changed_since_page(
+    &mut self,
+    green: VolumeId,
+    version: u64,
+    from: Option<ChangedCursor>,
+  ) -> Result<Page<String, ChangedCursor>, ClientError> {
+    let ReplyBody::ChangedSince { paths, next } = self.call(&RequestBody::ChangedSince {
+      green,
+      version,
+      from,
+    })?
+    else {
+      return Err(ClientError::UnexpectedReply {
+        verb: "changed_since",
+      });
+    };
+    forward(next, from, "changed_since")?;
+    Ok(Page { items: paths, next })
   }
 
   /// Creates a work volume over a green (§4.16); its id and the green version it is based on.
@@ -3576,19 +4208,63 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<Submitted, ClientError> {
-    extract_submitted(self.call(&RequestBody::Submit {
+    let reply = self.call(&RequestBody::Submit {
       work,
       evidence: evidence.to_vec(),
-    })?)
+    })?;
+    self
+      .verdict_of(work, VerdictKind::Submit, reply)?
+      .submitted()
+  }
+
+  /// A submit's or a rebase's reply as its outcome, every conflict window read (A-267): past what the reply carried, a
+  /// page at a time from the work, which keeps the verdict.
+  fn verdict_of(
+    &mut self,
+    work: VolumeId,
+    kind: VerdictKind,
+    reply: ReplyBody,
+  ) -> Result<VerdictOutcome, ClientError> {
+    self
+      .verdict_walk(work, kind, reply)
+      .map(|(outcome, _)| outcome)
+  }
+
+  /// A submit's reply as its outcome and how its signature was judged (A-321), every conflict window read (A-267).
+  fn judged_of(
+    &mut self,
+    work: VolumeId,
+    reply: ReplyBody,
+  ) -> Result<(Submitted, Verification), ClientError> {
+    let (outcome, verification) = self.verdict_walk(work, VerdictKind::Submit, reply)?;
+    Ok((outcome.submitted()?, verification))
+  }
+
+  /// Walks a verdict from its reply to its last window: the outcome, and how a submit's signature was judged
+  /// (`Unsigned` for a rebase and an unsigned submit).
+  fn verdict_walk(
+    &mut self,
+    work: VolumeId,
+    kind: VerdictKind,
+    reply: ReplyBody,
+  ) -> Result<(VerdictOutcome, Verification), ClientError> {
+    let mut chain = VerdictChain::new(work, kind);
+    let mut reply = reply;
+    loop {
+      if let Some(outcome) = chain.take(reply)? {
+        return Ok((outcome, chain.verification));
+      }
+      reply = self.call(&chain.request())?;
+    }
   }
 
   /// Submits a work volume's declared operations, as signed work when `signature` is given (A-321): an SSH signature
   /// blob (the armour's base64, decoded) over the merge's statement ([`Client::merge_statement`]), made under the
   /// namespace `slates-work`. The daemon judges it under the work's and the green's trusted signers and records the
-  /// verdict with the version; the outcome is the submit's, as [`Client::submit_with_evidence`] answers it, with how the
-  /// signature was judged (an accepted version's as it was recorded; `Unsigned` with none). A signature permits nothing:
-  /// a volume whose policy requires signed merges refuses one that did not verify when it would merge
-  /// (`SignatureRequired`), and every other answer is what the write modes give.
+  /// verdict with the version; the outcome is the submit's, as [`Client::submit_with_evidence`] answers it, every
+  /// conflict window read (A-267), with how the signature was judged (an accepted version's as it was recorded;
+  /// `Unsigned` with none). A signature permits nothing: a volume whose policy requires signed merges refuses one that
+  /// did not verify when it would merge (`SignatureRequired`), and every other answer is what the write modes give.
   pub fn submit_with_signature(
     &mut self,
     work: VolumeId,
@@ -3596,14 +4272,15 @@ impl Client {
     signature: Option<&[u8]>,
   ) -> Result<(Submitted, Verification), ClientError> {
     let evidence = evidence.to_vec();
-    extract_judged(self.call(&match signature {
+    let reply = self.call(&match signature {
       Some(signature) => RequestBody::SubmitSigned {
         work,
         evidence,
         signature: signature.to_vec(),
       },
       None => RequestBody::Submit { work, evidence },
-    })?)
+    })?;
+    self.judged_of(work, reply)
   }
 
   /// The statement a signature over `work`'s merge signs now (A-321), and the increment's identity it names: the work
@@ -3651,7 +4328,7 @@ impl Client {
   }
 
   /// [`Client::submit_approved`] of a signed merge (A-321): the approval carries the signature the held submit carried,
-  /// since the hold kept nothing, and the outcome comes with how it was judged.
+  /// since the hold kept nothing, and the outcome comes with how it was judged, every conflict window read (A-267).
   pub fn submit_approved_signed(
     &mut self,
     work: VolumeId,
@@ -3659,13 +4336,14 @@ impl Client {
     (identity, proof): ([u8; 32], [u8; 32]),
     signature: Option<&[u8]>,
   ) -> Result<(Submitted, Verification), ClientError> {
-    extract_judged(self.call(&RequestBody::SubmitApproved {
+    let reply = self.call(&RequestBody::SubmitApproved {
       work,
       evidence: evidence.to_vec(),
       identity,
       proof,
       signature: signature.map(<[u8]>::to_vec),
-    })?)
+    })?;
+    self.judged_of(work, reply)
   }
 
   /// Sets a volume's trusted signers (A-321) from the policy `version` the setter read: the whole set of public keys, in
@@ -3755,26 +4433,25 @@ impl Client {
       let token = self.stage(work, bytes)?;
       request(slates_ipc::protocol::EditBytes::Staged { token })
     };
+    let reply = self.call(&request)?;
     // An accept answers as its version recorded it (A-321): a version a signed submit made first answers signed.
-    extract_submitted(self.call(&request)?).map_err(|_| ClientError::UnexpectedReply {
-      verb: "edit_and_submit",
-    })
+    self
+      .verdict_of(work, VerdictKind::Submit, reply)
+      .and_then(VerdictOutcome::submitted)
+      .map_err(|error| match error {
+        ClientError::UnexpectedReply { verb: "submit" } => ClientError::UnexpectedReply {
+          verb: "edit_and_submit",
+        },
+        other => other,
+      })
   }
 
   /// Rebases a work volume onto its green's head (§4.16): its pending operations are mapped forward,
   /// moving the work's base without committing to the green — the head version it now sits on, or the
   /// conflict windows to resolve first.
   pub fn rebase(&mut self, work: VolumeId) -> Result<Rebased, ClientError> {
-    match self.call(&RequestBody::Rebase { work })? {
-      ReplyBody::Rebased {
-        version: Some(v), ..
-      } => Ok(Rebased::Rebased(v)),
-      ReplyBody::Rebased {
-        version: None,
-        conflicts,
-      } => Ok(Rebased::Conflict(conflicts)),
-      _ => Err(ClientError::UnexpectedReply { verb: "rebase" }),
-    }
+    let reply = self.call(&RequestBody::Rebase { work })?;
+    self.verdict_of(work, VerdictKind::Rebase, reply)?.rebased()
   }
 
   /// Clones a snapshot into a new volume; the clone's id.
@@ -3875,8 +4552,8 @@ impl Client {
   }
 
   /// Attaches for a host kernel mount of `volume` (§4.6, §4.13; the `slates mount` flow): the attachment
-  /// is the **mount's** — it outlives this client and the daemon, ending with the kernel's `UMNT` of the
-  /// mount, a `detach`, or the volume's destroy — and the reply's `token` is the capability the mount
+  /// is the **mount's** — it outlives this client and the daemon, ending when the kernel unmounts the mount
+  /// (A-511), with a `detach`, or with the volume's destroy — and the reply's `token` is the capability the mount
   /// presents (`/<name>@<attachment_hex>.<token_hex>`). A write intent takes the volume's write lease as
   /// any write attachment does (D-16; refused `LeaseHeld` while another principal holds it unexpired);
   /// a read intent records a read-only attachment, whose capability presents a read-only view.
@@ -4059,6 +4736,19 @@ impl Client {
     }
   }
 
+  /// Renews a CLI attachment's term from its holder (A-230, A-384), and nothing else: the term now in force and how soon
+  /// to renew again, nanoseconds, as `(term, renew_every)`. Refused as any use of the attachment is (`AttachmentExpired`
+  /// once its term lapsed).
+  pub fn renew(&mut self, attachment: u64) -> Result<(u64, u64), ClientError> {
+    match self.call(&RequestBody::Renew { attachment })? {
+      ReplyBody::Renewed {
+        term_ns,
+        renew_every_ns,
+      } => Ok((term_ns, renew_every_ns)),
+      _ => Err(ClientError::UnexpectedReply { verb: "renew" }),
+    }
+  }
+
   /// Detaches an attachment of `volume`, routed by the volume (§4.10, A-222): the form for an attachment another
   /// host's owner holds, which an attachment id alone cannot route to (it names its owner partition, not its host).
   pub fn detach_of(&mut self, volume: VolumeId, attachment: u64) -> Result<(), ClientError> {
@@ -4150,12 +4840,34 @@ impl Client {
     }
   }
 
-  /// The caller's volumes.
+  /// The caller's volumes, in name order: the listing walked a page at a time ([`Client::list_page`]), as one reply
+  /// holds one page (§4.4 `list`), so a listing of any length is answered.
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, ClientError> {
-    match self.call(&RequestBody::List)? {
-      ReplyBody::Listed { volumes } => Ok(volumes),
-      _ => Err(ClientError::UnexpectedReply { verb: "list" }),
+    let mut chain = ListChain::default();
+    loop {
+      let reply = self.call(&RequestBody::List { after: chain.after })?;
+      if chain.take(reply)?.is_none() {
+        return Ok(chain.into_listing());
+      }
     }
+  }
+
+  /// One page of the caller's volumes (§4.4 `list`, A-263): in volume-id order past `after` (`None` begins), as many as
+  /// one reply holds, and the cursor the next page is asked after, `None` when this page ends the listing. A volume
+  /// that exists for the whole walk is answered exactly once. A page whose cursor does not move past `after` is refused
+  /// [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn list_page(
+    &mut self,
+    after: Option<VolumeId>,
+  ) -> Result<Page<VolumeSummary, VolumeId>, ClientError> {
+    let ReplyBody::Listed { volumes, next } = self.call(&RequestBody::List { after })? else {
+      return Err(ClientError::UnexpectedReply { verb: "list" });
+    };
+    forward(next, after, "list")?;
+    Ok(Page {
+      items: volumes,
+      next,
+    })
   }
 
   /// Lands a snapshot's diverged entries onto a host directory (§4.15). Without a grant the
@@ -4423,18 +5135,209 @@ impl Client {
     }
   }
 
-  /// The caller's grants.
-  pub fn grants(&mut self) -> Result<Vec<GrantSummary>, ClientError> {
-    match self.call(&RequestBody::Grants)? {
-      ReplyBody::Grants { grants } => Ok(grants),
-      _ => Err(ClientError::UnexpectedReply { verb: "grants" }),
+  /// Captures an overlay's whole base into a complete immutable snapshot (§4.15 `capture_base`, A-291): every file's
+  /// bytes and every link's target become the volume's own, and the snapshot is recorded captured, so a clone of it
+  /// ([`Client::clone_snapshot`]) needs no base directory and moves between fleet members as a
+  /// plain volume does. The caller asserts nothing writes the source while it runs; a source that changed under it is
+  /// refused `ConsistentBaseUnavailable`. Waits for the walk, which reads the whole base. `write` on the volume is
+  /// required.
+  pub fn capture_base(&mut self, volume: VolumeId) -> Result<SnapshotId, ClientError> {
+    match self.call(&RequestBody::CaptureBase { volume })? {
+      ReplyBody::BaseCaptured { snapshot } => Ok(snapshot),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "capture_base",
+      }),
     }
   }
 
-  /// The audit log from `since`.
+  /// Exports `snapshot` of `volume` as its archive (§4.11, A-441): a new volume `name`, the caller's, whose root holds
+  /// one file, [`slates_ipc::protocol::ARCHIVE_FILE`], the snapshot's content-addressed archive, read a page at a time
+  /// with [`Client::read`]. Waits for the export, which walks the snapshot in slices on its owner. `read` on the volume
+  /// is required; a snapshot whose entries still read an overlay's base is refused `Unsupported` (capture the base
+  /// first, [`Client::capture_base`]).
+  pub fn archive_export(
+    &mut self,
+    volume: VolumeId,
+    snapshot: SnapshotId,
+    name: &str,
+  ) -> Result<ArchiveExported, ClientError> {
+    match self.call(&RequestBody::ArchiveExport {
+      volume,
+      snapshot,
+      name: name.to_owned(),
+    })? {
+      ReplyBody::ArchiveExported {
+        id,
+        archive_bytes,
+        manifest,
+      } => Ok(ArchiveExported {
+        id,
+        archive_bytes,
+        manifest,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "archive_export",
+      }),
+    }
+  }
+
+  /// Makes a volume `name` of `size` from the archive the caller's volume `archive` holds in its root as
+  /// [`slates_ipc::protocol::ARCHIVE_FILE`] (§4.11, A-453), as an export leaves it or as a caller writes the bytes it
+  /// kept; `require_locked` as a create's. Waits for the import, which reads, verifies and restores the archive in
+  /// slices on `archive`'s owner. `read` on `archive` is required; bytes that make no volume are refused
+  /// `ArchiveRefused` by their kind, with nothing made.
+  pub fn archive_import(
+    &mut self,
+    archive: VolumeId,
+    name: &str,
+    size: SizeClass,
+    require_locked: bool,
+  ) -> Result<ArchiveImported, ClientError> {
+    match self.call(&RequestBody::ArchiveImport {
+      archive,
+      name: name.to_owned(),
+      size,
+      require_locked,
+    })? {
+      ReplyBody::ArchiveImported { id, manifest } => Ok(ArchiveImported { id, manifest }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "archive_import",
+      }),
+    }
+  }
+
+  /// Asks the owner to move `volume` to the fleet member `to` (§4.10 "Ownership follows the writer", A-291; `admin` on
+  /// the volume is required, and it must be a plain volume, a clone of a captured base among them, with no attachment,
+  /// clone of its own or snapshot but its head). One ask: the move goes on between asks, and the caller asks again
+  /// until it is done ([`MoveState::Moved`]). A volume that cannot move is refused `Refusal::MoveRefused`, its
+  /// `MoveRefusal` saying why.
+  pub fn move_volume(&mut self, volume: VolumeId, to: u64) -> Result<MoveState, ClientError> {
+    match self.call(&RequestBody::Move { volume, to })? {
+      ReplyBody::Moving { to } => Ok(MoveState::Moving { to }),
+      ReplyBody::Moved { to } => Ok(MoveState::Moved { to }),
+      _ => Err(ClientError::UnexpectedReply { verb: "move" }),
+    }
+  }
+
+  /// An overlay volume's drift (§4.4 `status`, A-267): every entry the disk changed after the volume witnessed it and
+  /// every one whose re-check the host refused, each list in inode order, walked a page at a time from the volume's owner
+  /// ([`Client::drifted_page`]), since a status carries only the first that fit. Also the number of entries too long for
+  /// any reply, which no page carries.
+  pub fn drifted(&mut self, volume: VolumeId) -> Result<DriftedPage, ClientError> {
+    let mut whole = DriftedPage {
+      drifted: Vec::new(),
+      unverified: Vec::new(),
+      next: None,
+      oversized: 0,
+    };
+    let mut after = None;
+    loop {
+      let page = self.drifted_page(volume, after)?;
+      whole.drifted.extend(page.drifted);
+      whole.unverified.extend(page.unverified);
+      whole.oversized = whole.oversized.saturating_add(page.oversized);
+      match page.next {
+        None => return Ok(whole),
+        next => after = next,
+      }
+    }
+  }
+
+  /// One page of an overlay volume's drift (§4.4 `status`, A-267) past inode `after` (`None` begins), typed as a
+  /// status's `base` types it, in inode order, re-checked now; the inode the next page starts after; and the entries in
+  /// this page's range too long for any reply alone, passed over and counted. A page may hold no entry and still carry
+  /// a cursor (it spent its slice of the shard's step on entries that had not drifted). A page whose cursor does not
+  /// move past `after` is refused [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn drifted_page(
+    &mut self,
+    volume: VolumeId,
+    after: Option<u64>,
+  ) -> Result<DriftedPage, ClientError> {
+    let ReplyBody::Drifted {
+      drifted,
+      unverified,
+      next,
+      oversized,
+    } = self.call(&RequestBody::Drifted { volume, after })?
+    else {
+      return Err(ClientError::UnexpectedReply { verb: "drifted" });
+    };
+    forward(next, after, "drifted")?;
+    Ok(DriftedPage {
+      drifted,
+      unverified,
+      next,
+      oversized,
+    })
+  }
+
+  /// The caller's grants, in grant-id order: walked a page at a time ([`Client::grants_page`]), as one reply holds one
+  /// page (§4.3).
+  pub fn grants(&mut self) -> Result<Vec<GrantSummary>, ClientError> {
+    let mut grants: Vec<GrantSummary> = Vec::new();
+    let mut after = None;
+    loop {
+      let page = self.grants_page(after)?;
+      grants.extend(page.items);
+      match page.next {
+        None => return Ok(grants),
+        next => after = next,
+      }
+    }
+  }
+
+  /// One page of the caller's grants (§4.13, A-266): in grant-id order past `after` (`None` begins), as many as one
+  /// reply holds, and the cursor the next page is asked after, `None` when this page ends them. A grant that stands for
+  /// the whole walk is answered exactly once. A page whose cursor does not move past `after` is refused
+  /// [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn grants_page(
+    &mut self,
+    after: Option<u64>,
+  ) -> Result<Page<GrantSummary, u64>, ClientError> {
+    let ReplyBody::Grants { grants, next } = self.call(&RequestBody::Grants { after })? else {
+      return Err(ClientError::UnexpectedReply { verb: "grants" });
+    };
+    forward(next, after, "grants")?;
+    Ok(Page {
+      items: grants,
+      next,
+    })
+  }
+
+  /// The audit log from `since`, in sequence order: walked a page at a time ([`Client::audit_page`]), as one reply holds
+  /// one page (§4.3), so an audit of any length is answered.
   pub fn audit(&mut self, since: u64) -> Result<Vec<AuditEntry>, ClientError> {
-    match self.call(&RequestBody::Audit { since })? {
-      ReplyBody::Audit { records } => Ok(records),
+    let mut records: Vec<AuditEntry> = Vec::new();
+    let mut from = since;
+    loop {
+      let page = self.audit_page(from)?;
+      records.extend(page.items);
+      match page.next {
+        None => return Ok(records),
+        Some(next) => from = next,
+      }
+    }
+  }
+
+  /// One page of the audit (§4.15, A-265) from record `since`, in sequence order, as many as one reply holds, and the
+  /// sequence the next page is asked from (one past the page's last record), `None` when this page ends the audit. One
+  /// partition numbers the daemon's audit, so a walk continues where the page stopped. A page that says more follows
+  /// but brings no record past `since` is refused [`ClientError::UnexpectedReply`], so a walk always ends.
+  pub fn audit_page(&mut self, since: u64) -> Result<Page<AuditEntry, u64>, ClientError> {
+    let ReplyBody::Audit { records, more } = self.call(&RequestBody::Audit { since })? else {
+      return Err(ClientError::UnexpectedReply { verb: "audit" });
+    };
+    if !more {
+      return Ok(Page {
+        items: records,
+        next: None,
+      });
+    }
+    match records.last().map(|record| record.seq.saturating_add(1)) {
+      Some(next) if next > since => Ok(Page {
+        items: records,
+        next: Some(next),
+      }),
       _ => Err(ClientError::UnexpectedReply { verb: "audit" }),
     }
   }
@@ -4471,14 +5374,42 @@ impl Client {
     self.acknowledge(up_to)
   }
 
-  /// The base entry's bytes as the disk holds them now.
+  /// The base entry's bytes as the disk holds them now, read a page at a time (A-267); refused
+  /// [`ClientError::ChangedWhileRead`] when the file changed on the disk between two pages.
   pub fn read_base(&mut self, volume: VolumeId, path: &str) -> Result<Vec<u8>, ClientError> {
-    match self.call(&RequestBody::ReadBase {
-      volume,
-      path: path.to_owned(),
-    })? {
-      ReplyBody::BaseBytes { bytes } => Ok(bytes),
-      _ => Err(ClientError::UnexpectedReply { verb: "read_base" }),
+    // A reply rides one bulk chunk, so the base file comes in pages (A-267), as `read` takes a volume's; every page
+    // must carry the first one's stamp, or the file changed on the disk between them and the bytes would mix two
+    // states of it.
+    let mut bytes = Vec::new();
+    let mut first_stamp = None;
+    loop {
+      let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      let ReplyBody::BaseBytes {
+        bytes: page,
+        total,
+        stamp,
+      } = self.call(&RequestBody::ReadBase {
+        volume,
+        path: path.to_owned(),
+        offset,
+      })?
+      else {
+        return Err(ClientError::UnexpectedReply { verb: "read_base" });
+      };
+      if *first_stamp.get_or_insert(stamp) != stamp {
+        return Err(ClientError::ChangedWhileRead {
+          path: path.to_owned(),
+        });
+      }
+      let done = offset.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX)) >= total;
+      if page.is_empty() && !done {
+        // A page that makes no progress short of the end would loop forever.
+        return Err(ClientError::UnexpectedReply { verb: "read_base" });
+      }
+      bytes.extend_from_slice(&page);
+      if done {
+        return Ok(bytes);
+      }
     }
   }
 
@@ -4496,14 +5427,21 @@ impl Client {
     }
   }
 
-  /// Re-witnesses drifted entries (all of them when `paths` is none); the paths done.
+  /// Re-witnesses drifted entries (all of them when `paths` is none); the paths done, as many as one reply holds, and
+  /// the count of the rest (A-267).
   pub fn rewitness(
     &mut self,
     volume: VolumeId,
     paths: Option<Vec<String>>,
-  ) -> Result<Vec<String>, ClientError> {
+  ) -> Result<Rewitnessed, ClientError> {
     match self.call(&RequestBody::Rewitness { volume, paths })? {
-      ReplyBody::Rewitnessed { paths } => Ok(paths),
+      ReplyBody::Rewitnessed {
+        paths,
+        paths_elided,
+      } => Ok(Rewitnessed {
+        paths,
+        paths_elided,
+      }),
       _ => Err(ClientError::UnexpectedReply { verb: "rewitness" }),
     }
   }
@@ -4522,5 +5460,76 @@ fn fs_done(reply: ReplyBody, verb: &'static str) -> Result<u64, ClientError> {
   match reply {
     ReplyBody::FsDone { size } => Ok(size),
     _ => Err(ClientError::UnexpectedReply { verb }),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{RoomStep, RoomWait};
+
+  /// Shape: the client's wake estimate the wait is walked with: 3 µs, a wake measured on Apple silicon.
+  const WAKE_NS: u64 = 3_000;
+  /// Shape: how far one spin moves the clock in the walk: a tenth of the wake.
+  const SPIN_NS: u64 = WAKE_NS / 10;
+  /// Shape: the wait walked across: half again the reply deadline the wait spun through before A-523 (a second).
+  const WAIT_NS: u64 = 1_500_000_000;
+
+  /// A-523 (R3's class C). Do: walk a wait for a ring slot across 1.5 s from the first refusal, spinning, looking (the
+  /// daemon found alive each time) and parking as the schedule says. Expect: a spin only inside the wake estimate; each
+  /// pause no more than twice the last and never past the next look; the looks at twice the time waited from twice the
+  /// wake; and no more looks, nor parks between them, than the logarithm of the wait over the wake plus two. Before
+  /// A-523 the wait spun for a whole reply deadline, a second, and then paced its tries at a tenth of it.
+  #[test]
+  fn a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling() {
+    let mut wait = RoomWait::default();
+    let mut elapsed = 0;
+    let mut looks: Vec<u64> = Vec::new();
+    let mut parks: Vec<u64> = Vec::new();
+    while elapsed < WAIT_NS {
+      match wait.next(elapsed, WAKE_NS) {
+        RoomStep::Spin => {
+          assert!(
+            elapsed < WAKE_NS,
+            "spun at {elapsed} ns, past the wake estimate"
+          );
+          elapsed += SPIN_NS;
+        }
+        RoomStep::Look => {
+          looks.push(elapsed);
+          wait.looked(elapsed);
+        }
+        RoomStep::Park(pause) => {
+          let to_look = wait.looks.until(elapsed).unwrap();
+          assert!(
+            pause <= to_look,
+            "a {pause} ns pause past the next look, {to_look} ns on"
+          );
+          if let Some(last) = parks.last() {
+            assert!(pause <= 2 * last, "a {pause} ns pause after {last} ns");
+          }
+          parks.push(pause);
+          elapsed += pause;
+        }
+      }
+    }
+    assert_eq!(
+      looks.first(),
+      Some(&(2 * WAKE_NS)),
+      "the first look at twice the wake"
+    );
+    for pair in looks.windows(2) {
+      assert_eq!(pair[1], 2 * pair[0], "the looks at {looks:?}");
+    }
+    let bound = u64::from((WAIT_NS / WAKE_NS).ilog2()) + 2;
+    assert!(
+      u64::try_from(looks.len()).unwrap() <= bound,
+      "{} looks, past {bound}",
+      looks.len()
+    );
+    assert!(
+      u64::try_from(parks.len()).unwrap() <= bound,
+      "{} parks, past {bound}",
+      parks.len()
+    );
   }
 }

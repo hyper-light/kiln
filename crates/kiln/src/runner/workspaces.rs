@@ -93,7 +93,7 @@ pub fn kept_until(ws: &Path) -> Option<i64> {
 /// Removes a workspace. Files a Docker action wrote as root are removed by a container, as root
 /// (not on Windows, where what a container writes is the user's: there a container can't help).
 pub(super) fn remove(p: &Path) {
-    if std::fs::remove_dir_all(p).is_ok() || !p.exists() {
+    if crate::os::tree::remove_dir_all(p).is_ok() || !p.exists() {
         return;
     }
     let docker = if cfg!(windows) { None } else { super::docker::find() };

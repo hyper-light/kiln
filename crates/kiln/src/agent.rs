@@ -2049,6 +2049,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let root = ca.clone();
     // The machine's certificate, its capacity holder's proof (docs/lb.md "A machine's keeper").
     let machine_leaf = leaf.clone();
+    // What this runner's Slates needs to join kiln's Slates fleet where the server's `[slates_fleet]` chooses it (docs/agentic.md
+    // W7; `workspace::slates_fleet`): asked as its machine's instance starts. Never in a job pod or an outpost.
+    if !o.ephemeral && !o.outpost {
+        crate::workspace::slates_fleet::set_source(crate::workspace::slates_fleet::Source {
+            dir: o.state_dir.join("slates-fleet"),
+            server_url: o.server_url.clone(),
+            ca_pem: crate::pki::cert_pem(&root),
+            machine_name: name.clone(),
+            machine: machine_leaf.clone(),
+        });
+    }
     // This machine's front door (DNS, HTTPS, a .local name), when the server gives it one. It runs
     // from the settings it stored at once, and keeps running while the server is away.
     let front_door = (!o.ephemeral && !o.outpost).then(|| {
@@ -2272,25 +2283,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     if !o.ephemeral && !o.outpost {
         crate::sense::run::install(uplink.clone());
     }
-    // Its facts, probed on each connection, when the server asks, and again as what they're found
-    // from changes (docs/ci.md W13-R01; goal 9: they were probed again every 10 minutes): a folder
-    // they find tools in, a container engine starting or stopping, a run failing for a tool not
-    // found (`crate::runner::probe::Asks`). What comes while a probe runs gives one after it.
-    let probing = Arc::new(crate::runner::probe::Probing::default());
-    if !o.ephemeral && !o.outpost {
-        let (up, dir, declared, busy, stop) = (uplink.clone(), o.work_dir.clone(), o.declared.clone(), Arc::clone(&probing), shutdown.clone());
-        crate::rt::spawn(async move {
-            use futures::FutureExt as _;
-            let asks = crate::runner::probe::Asks::new();
-            loop {
-                futures::select_biased! {
-                    () = stop.cancelled().fuse() => return,
-                    looked = asks.next().fuse() => probe_facts_as(&up, &dir, &declared, &busy, looked),
-                    () = crate::runner::probe::gpu_change().fuse() => start_facts_probe(&up, &dir, &declared, &busy, false, true),
-                }
-            }
-        });
-    }
     let (done_tx, done_rx) = crate::memory::queue::unbounded::<JobResult>(&crate::memory::owners::CHANNELS);
     let mut buffer: VecDeque<(u32, Kind, Vec<u8>)> = VecDeque::new();
     let mut buffered = 0usize;
@@ -2503,6 +2495,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let harness = (!o.ephemeral && o.terminal).then(|| {
         // Agents' workspaces of their own: one place per machine, whichever runner process holds them.
         crate::workspace::slates::init(&o.state_dir);
+        // A runner the server's `[slates_fleet]` lists starts its Slates as the fleet's node now (K4): a node holds the
+        // fleet's copies and takes moved volumes only while its daemon runs.
+        drop(crate::rt::spawn(async {
+            if let Err(e) = crate::workspace::slates::start_if_chosen().await {
+                tracing::warn!(error = %format!("{e:#}"), "this runner's Slates didn't start as kiln's Slates fleet's node now: it joins with its first workspace");
+            }
+        }));
         // What an agent changes in the runner's own folders is an agent's own (docs/agents.md).
         crate::harness::whose::note_kiln(&o.state_dir);
         let waits = cfg!(unix) && take_over_pending.is_some() && !crate::convo::off();
@@ -2551,6 +2550,31 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's microVMs couldn't be held: it holds no isolated agent"),
         }
+    }
+    // Its facts, probed on each connection, when the server asks, and again as what they're found
+    // from changes (docs/ci.md W13-R01; goal 9: they were probed again every 10 minutes): a folder
+    // they find tools in, a container engine starting or stopping, a run failing for a tool not
+    // found (`crate::runner::probe::Asks`). What comes while a probe runs gives one after it.
+    // Asked from here on, once its microVMs are held or it's known it holds none (kiln plan
+    // 01a1cd8e862e7169a074db3d5fa33f3d step 17; kiln goal 3cd82843): a probe while they're being held
+    // would say this kiln carries no microVM runtime, and the hold makes one, its check of the host
+    // (Shards' `api-check`) opening `/dev/kvm` to write, which these asks hear; those facts, sent
+    // before the connection, reached the server ahead of every later probe's (ROOT's pre-runs of
+    // round K on adacachy, 2026-11-18: rest, mcp, narrowed and engine runners said none).
+    let probing = Arc::new(crate::runner::probe::Probing::default());
+    if !o.ephemeral && !o.outpost {
+        let (up, dir, declared, busy, stop) = (uplink.clone(), o.work_dir.clone(), o.declared.clone(), Arc::clone(&probing), shutdown.clone());
+        crate::rt::spawn(async move {
+            use futures::FutureExt as _;
+            let asks = crate::runner::probe::Asks::new();
+            loop {
+                futures::select_biased! {
+                    () = stop.cancelled().fuse() => return,
+                    looked = asks.next().fuse() => probe_facts_as(&up, &dir, &declared, &busy, looked),
+                    () = crate::runner::probe::gpu_change().fuse() => start_facts_probe(&up, &dir, &declared, &busy, false, true),
+                }
+            }
+        });
     }
     // Bind the local Reach endpoint to the actual Host before restoring adapters that
     // can immediately ask it to run work (attention plan 01a199e1b177752e84dad5dc990e6a15).
@@ -4187,15 +4211,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             // made or started again, its workspace included.
                             (Some(h), _) if h.get(&session).is_some() => Ok(()),
                             (Some(h), mut spec) => {
-                                // Started on a shell: in that shell's directory and environment.
+                                // Started on a shell: in that shell's directory and environment, and in the volume of an
+                                // agent here whose mount that directory lies in (`workspace::from_shell`, W2).
                                 if let Some(pid) = spec.shell.as_ref().and_then(|t| terms.get(t)).and_then(|(pty, _)| pty.pid()) {
-                                    let (cwd, env) = crate::harness::host::shell_context(pid);
-                                    if spec.cwd.is_none() {
-                                        spec.cwd = cwd;
-                                    }
-                                    if spec.env.is_empty() {
-                                        spec.env = env;
-                                    }
+                                    crate::workspace::from_shell(&mut spec, crate::harness::host::shell_context(pid), &crate::workspace::live(h.list()));
                                 }
                                 if crate::workspace::needs_preparing(&spec) {
                                     // Its workspace first (a volume made and mounted), off this loop: then it starts there.
@@ -4206,6 +4225,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                                 let made = crate::workspace::made_alone(&spec);
                                                 let opened = h.open(Some(session.clone()), spec).map(|_| ());
                                                 // What was made for it goes with it: asked again under its id, it's made anew.
+                                                // Nothing ran in it, so nothing of it is on its way out: asked to go once.
                                                 if opened.is_err()
                                                     && let Some(m) = made
                                                     && let Err(gone) = crate::workspace::slates::remove(&m).await
@@ -7636,7 +7656,7 @@ mod tests {
         let send = Command::Send { id: "m1".into(), text: "go on".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None };
         let moved: std::collections::HashSet<Owned> = [Owned::Agent("s1".into())].into_iter().collect();
         let me = Me { machine: "box".into(), instance: "01a17502".into(), root: Vec::new() };
-        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false })?)];
+        let mut words = vec![("a local MoveTo".to_owned(), cmd(&Command::MoveTo { to: "box".into(), cwd: String::new(), note: None, now: false, kind: None, model: None, local: true, native: false, slates: None })?)];
         for w in [Word::Taken, Word::Refused("no room".into()), Word::NotPassed("x".into()), Word::Unsure("x".into()), Word::NoneNewer("x".into())] {
             words.push((format!("HandedOver ({w:?})"), cmd(&w.command())?));
         }
@@ -7644,7 +7664,7 @@ mod tests {
             ("a person's message", cmd(&send)?),
             ("a message for its epoch", ServerMsg::HarnessSend { session: "s1".into(), epoch: 2, json: serde_json::to_string(&send)? }),
             ("an interrupt", cmd(&Command::Interrupt)?),
-            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false, native: false })?),
+            ("a move to another machine", cmd(&Command::MoveTo { to: "other".into(), cwd: "~/w".into(), note: None, now: false, kind: None, model: None, local: false, native: false, slates: None })?),
             ("a close", ServerMsg::HarnessClose { session: "s1".into() }),
         ];
         let b64 = |m: &ServerMsg| -> anyhow::Result<String> { Ok(base64::engine::general_purpose::STANDARD.encode(proto::encode(m)?)) };

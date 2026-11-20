@@ -160,9 +160,25 @@ pub fn run_env(args: &[String], hold: bool, env: &[(&str, &std::ffi::OsStr)]) ->
     measure(common::shards(), args, hold, env)
 }
 
+/// [`run_env`], whatever it ended with: a run whose failure its caller says in its own words
+/// (arrival.rs's `stalled`, whose stop of its daemon must not take the place of why it
+/// stopped it).
+#[cfg(any(unix, windows))]
+pub fn run_env_unchecked(args: &[String], hold: bool, env: &[(&str, &std::ffi::OsStr)]) -> Sample {
+    measured(common::shards(), args, hold, env)
+}
+
+/// [`measured`], which must have succeeded.
+#[cfg(any(unix, windows))]
+fn measure(bin: &std::path::Path, args: &[String], hold: bool, env: &[(&str, &std::ffi::OsStr)]) -> Sample {
+    let sample = measured(bin, args, hold, env);
+    assert_eq!(sample.run.status, Some(0), "shards failed: {}", sample.run);
+    sample
+}
+
 #[cfg(unix)]
 #[allow(clippy::zombie_processes)] // reaped by wait4, not Child::wait
-fn measure(bin: &std::path::Path, args: &[String], hold: bool, env: &[(&str, &std::ffi::OsStr)]) -> Sample {
+fn measured(bin: &std::path::Path, args: &[String], hold: bool, env: &[(&str, &std::ffi::OsStr)]) -> Sample {
     tick();
     let start = Instant::now();
     let mut child = Command::new(bin)
@@ -214,7 +230,6 @@ fn measure(bin: &std::path::Path, args: &[String], hold: bool, env: &[(&str, &st
         stderr: reader.join().unwrap(),
         elapsed,
     };
-    assert_eq!(run.status, Some(0), "shards failed: {run}");
     Sample {
         run,
         began: start,
@@ -222,10 +237,10 @@ fn measure(bin: &std::path::Path, args: &[String], hold: bool, env: &[(&str, &st
     }
 }
 
-/// [`measure`] on Windows: the child waited for, and ended where it outlives [`TIMEOUT`],
+/// [`measured`] on Windows: the child waited for, and ended where it outlives [`TIMEOUT`],
 /// by a watchdog holding a handle of its own to the child's process.
 #[cfg(windows)]
-fn measure(bin: &std::path::Path, args: &[String], hold: bool, env: &[(&str, &std::ffi::OsStr)]) -> Sample {
+fn measured(bin: &std::path::Path, args: &[String], hold: bool, env: &[(&str, &std::ffi::OsStr)]) -> Sample {
     use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
     tick();
     let start = Instant::now();
@@ -275,7 +290,6 @@ fn measure(bin: &std::path::Path, args: &[String], hold: bool, env: &[(&str, &st
         stderr: reader.join().unwrap(),
         elapsed,
     };
-    assert_eq!(run.status, Some(0), "shards failed: {run}");
     Sample {
         run,
         began: start,
@@ -291,16 +305,39 @@ fn percentile(v: &[f64], p: f64) -> f64 {
 
 /// Every row's samples, in the order they were taken, for [`report`] to write when
 /// `SHARDS_BENCH_SAMPLES` names a directory: runs interleaved with another VMM's pair up by
-/// their index.
-static SAMPLES: std::sync::Mutex<Vec<(String, String, Vec<f64>)>> = std::sync::Mutex::new(Vec::new());
+/// their index, and a row's samples taken of several snapshots ([`stats_by_snapshot`]) name
+/// each one's.
+static SAMPLES: std::sync::Mutex<Vec<Kept>> = std::sync::Mutex::new(Vec::new());
+
+/// A row's name, unit and samples, and the snapshot each sample was taken of where it says.
+type Kept = (String, String, Vec<f64>, Option<Vec<usize>>);
 
 /// One result row: `(table line, JSON member)`.
 pub fn stats(name: &str, unit: &str, v: Vec<f64>) -> (String, String) {
+    keep((name.to_string(), unit.to_string(), v.clone(), None));
+    row(name, unit, v)
+}
+
+/// [`stats`] of a row whose samples were taken of several snapshots, sample `i` of
+/// `snapshots[i]`. One snapshot's samples are not independent of each other (each of its
+/// restores holds the same pages), so the envelope judges such a row by its snapshots
+/// (scripts/bench-envelope).
+pub fn stats_by_snapshot(name: &str, unit: &str, v: Vec<f64>, snapshots: &[usize]) -> (String, String) {
+    assert_eq!(v.len(), snapshots.len(), "{name}: a snapshot for each sample");
+    keep((
+        name.to_string(),
+        unit.to_string(),
+        v.clone(),
+        Some(snapshots.to_vec()),
+    ));
+    row(name, unit, v)
+}
+
+fn keep(kept: Kept) {
     SAMPLES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((name.to_string(), unit.to_string(), v.clone()));
-    row(name, unit, v)
+        .push(kept);
 }
 
 /// The table line and JSON member of `v`: its p50, p90, p99 and max.
@@ -448,13 +485,17 @@ pub fn report(bench: &str, params: &[(&str, String)], rows: &[(String, String)])
     if let Some(dir) = std::env::var_os("SHARDS_BENCH_SAMPLES") {
         let rows: Vec<String> = samples
             .iter()
-            .map(|(name, unit, values)| {
+            .map(|(name, unit, values, snapshots)| {
                 // As measured, every digit: the envelope's verdicts are these samples'
                 // (scripts/bench-envelope), and a rounding of them, 0.1 MiB being 25.6 pages,
                 // would be a margin no measurement chose (R03).
                 let values: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
+                let snapshots = snapshots.as_ref().map_or_else(String::new, |of| {
+                    let of: Vec<String> = of.iter().map(usize::to_string).collect();
+                    format!(",\"snapshots\":[{}]", of.join(","))
+                });
                 format!(
-                    "\"{name}\":{{\"unit\":\"{unit}\",\"values\":[{}]}}",
+                    "\"{name}\":{{\"unit\":\"{unit}\",\"values\":[{}]{snapshots}}}",
                     values.join(",")
                 )
             })

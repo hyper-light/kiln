@@ -19,14 +19,20 @@
 //! records it again on its own partition, in one transaction with the work's reset, so a retry there meets that. A
 //! re-seal under a new request id is answered by the engine's identity cache (`Green::accepted`).
 //!
-//! **Bounds.** A shard's parked verbs are bounded by its client credit, as `lease_wait`'s are; each ask has a deadline
-//! (the lease bound), past which the verb answers `Overloaded`, unrecorded, and its retry runs it again.
+//! **Bounds.** A shard's parked verbs are bounded by its client credit, as `lease_wait`'s are. A batch of asks waits
+//! for room on its owner's channel and for the owner's answer in the owner's own time (A-426); a verb whose verdict the
+//! owner answers at its quorum commit, or that waits for its work's route, is held at most the node's failover delay,
+//! a held reply's total (A-354, A-375, A-434; [`park_bound_ns`]); past either, the verb answers `Overloaded`,
+//! unrecorded, and its retry runs it again.
 //!
-//! **Asks are batched.** A shard keeps one batch of asks out to each owner at a time ([`Outbox`]), carrying what gathered
-//! while the last was answered, at most a client region's credit, and a batch waits for room on the owner's channel
-//! rather than failing. One message per ask flooded the owner's and the clients' channels at 3,000 clients on one node:
-//! about half the asks were refused at once, their retries refused in turn, and replies to resumed verbs were dropped
-//! (23 to 62 a run), so every run stalled. Batched, ten of ten runs finished with nothing refused or dropped.
+//! **Asks are batched.** A shard keeps at most two batches of asks out to each owner at a time ([`Outbox`],
+//! [`BATCHES_OUT`]), each carrying what gathered while the others were out, at most a client region's credit, and a batch
+//! waits for room on the owner's channel rather than failing. One message per ask flooded the owner's and the clients'
+//! channels at 3,000 clients on one node: about half the asks were refused at once, their retries refused in turn, and
+//! replies to resumed verbs were dropped (23 to 62 a run), so every run stalled. Batched, ten of ten runs finished with
+//! nothing refused or dropped. One batch out at a time made an ask wait for the batch before it to come back before it
+//! left, about half of its way to the owner at 1,000 clients; with two, one waits at the owner while the other is served
+//! (A-388).
 //!
 //! **A submit's route first (A-298).** A version's merge record carries its submit's completion, and A-255 ships it only
 //! once the submitting work's catalog register, which names the green, is committed: after a takeover that register is
@@ -138,6 +144,7 @@ struct ParkedVerb {
   verdict: Option<ReplyBody>,
   rebased: Option<RebaseAnswer>,
   admitted: Option<Result<Admitted, Refusal>>,
+  named: Option<Result<(), Refusal>>,
 }
 
 /// A work's parked verbs, oldest first, and whether the oldest's ask is out.
@@ -146,13 +153,16 @@ struct Queue {
   waiting: VecDeque<ParkedVerb>,
   asking: bool,
   /// When the owner took the oldest verb's verdict to answer at its quorum commit, or the verb waits for its work's
-  /// route (A-298): the instant (the lease's clock) past which the verb stops waiting, is answered `Overloaded`, and the
-  /// work is released (its retry joins the owner, or meets the route again).
+  /// route (A-298): the instant (the host's monotonic clock) past which the verb stops waiting, is answered
+  /// `Overloaded`, and the work is released (its retry joins the owner, or meets the route again).
   deferred_until: Option<u64>,
 }
 
 /// One work whose log could not be replayed at its shard's start because its green lives on another shard (A-247):
-/// replayed through the green's owner once every partition has recovered (`rebuild_remote_works`).
+/// replayed through the green's owner once every partition has recovered (`rebuild_remote_works`). The record stays on
+/// the work's shard until the replay's outcome is installed there (`verbs::install_replayed_work`), so an ask whose
+/// answer was lost finds it again (A-513).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Unbuilt {
   /// The work.
   pub(crate) work: DbVolumeId,
@@ -181,7 +191,10 @@ pub(crate) struct WorkHome {
   pub(crate) rebased: Option<RebaseAnswer>,
   /// … a work's admission.
   pub(crate) admitted: Option<Result<Admitted, Refusal>>,
-  /// The works whose log waits for their green's owner (A-247).
+  /// … the reservation of a new work's name at the partition it hashes to, when the work is made on another (A-400).
+  pub(crate) named: Option<Result<(), Refusal>>,
+  /// The works whose log waits for their green's owner (A-247), each until its replay's outcome is installed here
+  /// (A-513). Bounded by the shard's recovered works.
   pub(crate) unbuilt: Vec<Unbuilt>,
   /// Whether this shard's deadline timer for deferred verdicts is running.
   timer_armed: bool,
@@ -224,6 +237,12 @@ enum Need {
     green: DbVolumeId,
     id: DbVolumeId,
     name: String,
+  },
+  /// The name of a work made on this shard, held at the partition it hashes to by an alias of the work's id (A-400,
+  /// A-236's reservation), asked of that partition's shard before the work is admitted.
+  ReserveName {
+    name: String,
+    id: DbVolumeId,
   },
   /// The work's route (A-255, A-298): its catalog register, which names its green, committed at its quorum. Met on the
   /// work's own shard, which holds the register, before the owner is asked for a verdict, so the merge record that
@@ -296,11 +315,6 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
   };
   match body {
     RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. } => file_if_unheld(path),
-    RequestBody::Read {
-      path,
-      at: ReadAt::Head,
-      ..
-    } => file_if_unheld(path),
     RequestBody::ReadRange {
       path,
       at: ReadAt::Head,
@@ -580,6 +594,9 @@ pub(crate) fn gate(
   principal: &Principal,
   body: RequestBody,
 ) -> Gate {
+  if let Some(refusal) = unbuilt_refusal(state, &body) {
+    return Gate::Answer(crate::verbs::refused(refusal));
+  }
   if let RequestBody::CreateWork { green, name } = &body {
     return match create_need(state, crate::verbs::to_db_volume(*green), name) {
       Ok(None) => Gate::Run(body),
@@ -608,6 +625,31 @@ pub(crate) fn gate(
   park(state, client_id, principal, body, Some(work), need)
 }
 
+/// Format: the refusal-ledger name of a verb of a work recorded unbuilt, answered `Unpublished` (A-533): the
+/// non-vacuity count of [`unbuilt_refusal`].
+const UNBUILT_UNPUBLISHED: &str = "merge.work_unbuilt_unpublished";
+
+/// A verb of a work this shard recovered and has not yet rebuilt through its green's owner (its record in `unbuilt`,
+/// A-247, A-513), answered `Unpublished`: the protocol's "not completed, retry under the same id", never recorded as
+/// the request's completion (`verbs::not_started`), so the resend runs the verb once the work is rebuilt (§4.16
+/// "Recovery": the work "is unserved (`Unpublished`) until it has"). Until A-533 it ran, and answered `NotFound`, as if
+/// the work were gone. Every verb naming the work is answered so, whatever shard holds its green.
+fn unbuilt_refusal(state: &mut ShardState, body: &RequestBody) -> Option<Refusal> {
+  let volume = crate::verbs::to_db_volume(body.volume()?);
+  if !state
+    .work_home
+    .unbuilt
+    .iter()
+    .any(|unbuilt| unbuilt.work == volume)
+  {
+    return None;
+  }
+  state.count(UNBUILT_UNPUBLISHED, 1);
+  Some(Refusal::Unpublished {
+    reason: "the work is rebuilt from its log once its green's owner answers".to_owned(),
+  })
+}
+
 /// A submit's reset must fit the work's log before anything is asked of the owner, as before the verdict when the two
 /// were one step (A-207): a submit that cannot be recorded is refused without the green moving.
 fn reset_refusal(state: &mut ShardState, work: DbVolumeId, body: &RequestBody) -> Option<Refusal> {
@@ -627,34 +669,51 @@ fn reset_refusal(state: &mut ShardState, work: DbVolumeId, body: &RequestBody) -
   crate::verbs::reset_would_fit(state, work, now).err()
 }
 
-/// A work's creation on its own partition needs the green's owner when the green lives elsewhere; with the green here,
-/// or the name already held, it runs, and its own checks answer.
+/// What a work's creation on this shard needs before it runs (A-247, A-400): its name held at the partition the name
+/// hashes to, by an alias of the work's id when that is another partition (asked of that partition's shard first); then
+/// its green's admission when the green lives elsewhere. With both at hand, or the name already held here, it runs, and
+/// its own checks answer. A refused reservation is the creation's answer: its pending record goes with it.
 fn create_need(
   state: &mut ShardState,
   green: DbVolumeId,
   name: &str,
 ) -> Result<Option<Need>, Refusal> {
   let owner = crate::verbs::owner_of(crate::verbs::to_wire_volume(green));
-  if state.greens.contains_key(&green)
-    || state.work_home.admitted.is_some()
-    || crate::verbs::shard_of_partition(state, owner).is_none()
-  {
+  let named_here = crate::verbs::owner_of_name(name, state.shards.len()) == state.partition;
+  let green_here =
+    state.greens.contains_key(&green) || crate::verbs::shard_of_partition(state, owner).is_none();
+  if let Some(Err(refusal)) = &state.work_home.named {
+    let refusal = refusal.clone();
+    crate::verbs::settle_creation(state, name).map_err(|e| crate::error::refusal_of_db(&e))?;
+    return Err(refusal);
+  }
+  let reserved = named_here || matches!(state.work_home.named, Some(Ok(())));
+  if reserved && (green_here || state.work_home.admitted.is_some()) {
     return Ok(None);
   }
   let Some((origin, id)) = state.current_request else {
     return Ok(None);
   };
   let key = (origin, id.client, id.sequence);
-  // This request's own creation, its admission lost or its daemon restarted: asked again under the same id.
+  // This request's own creation: its name reserved now, or an answer lost or its daemon restarted, asked again under
+  // the same id (the reservation is answered again for the id it holds).
   if let Some(pending) = state.db.partition().pending_creation(name) {
-    if (pending.origin, pending.client, pending.sequence) == key {
-      return Ok(Some(Need::Admit {
-        green,
-        id: pending.work,
-        name: name.to_owned(),
-      }));
+    if (pending.origin, pending.client, pending.sequence) != key {
+      return Ok(None);
     }
-    return Ok(None);
+    let work = pending.work;
+    return Ok(Some(if reserved {
+      Need::Admit {
+        green,
+        id: work,
+        name: name.to_owned(),
+      }
+    } else {
+      Need::ReserveName {
+        name: name.to_owned(),
+        id: work,
+      }
+    }));
   }
   if crate::verbs::name_held(state, name).is_some() {
     return Ok(None);
@@ -675,10 +734,17 @@ fn create_need(
     .db
     .mutate(&mut state.segment, &Op::WorkCreationPending { record }, now)
     .map_err(|e| crate::error::refusal_of_db(&e))?;
-  Ok(Some(Need::Admit {
-    green,
-    id: work,
-    name: name.to_owned(),
+  Ok(Some(if named_here {
+    Need::Admit {
+      green,
+      id: work,
+      name: name.to_owned(),
+    }
+  } else {
+    Need::ReserveName {
+      name: name.to_owned(),
+      id: work,
+    }
   }))
 }
 
@@ -695,17 +761,19 @@ fn park(
   let Some((origin, id)) = state.current_request else {
     return Gate::Answer(refused_overloaded(state));
   };
-  let resuming = work.is_some() && state.work_home.resuming == work;
+  // A work's creation has no queue of its own yet: the id it was minted carries it.
+  let queue_key = match (&need, work) {
+    (Some(Need::Admit { id, .. } | Need::ReserveName { id, .. }), _) => *id,
+    (_, Some(work)) => work,
+    _ => return refuse_unrecorded(state),
+  };
+  // A verb resumed by its own queue parks again at the front of it: a work's verb, or a creation whose name was reserved
+  // and whose admission is next (A-400).
+  let resuming = state.work_home.resuming == Some(queue_key);
   if !resuming && state.work_home.parked >= bound(state) {
     state.count(PARK_FULL, 1);
     return refuse_unrecorded(state);
   }
-  // A work's creation has no queue of its own yet: the id it was minted carries it.
-  let queue_key = match (&need, work) {
-    (Some(Need::Admit { id, .. }), _) => *id,
-    (_, Some(work)) => work,
-    _ => return refuse_unrecorded(state),
-  };
   let asks = need.is_some() && (resuming || !state.work_home.queues.contains_key(&queue_key));
   // A route is the work's own, met here once its queue holds the verb (A-298): nothing goes to the owner for it.
   let routing = asks && matches!(need, Some(Need::Route));
@@ -731,6 +799,7 @@ fn park(
     verdict: state.work_home.verdict.take(),
     rebased: state.work_home.rebased.take(),
     admitted: state.work_home.admitted.take(),
+    named: state.work_home.named.take(),
   };
   let home = &mut state.work_home;
   let queue = home.queues.entry(queue_key).or_default();
@@ -841,6 +910,7 @@ fn settle_pending_first(
     verdict: None,
     rebased: None,
     admitted: None,
+    named: None,
   };
   let home = &mut state.work_home;
   home.by_request.insert(pending_key, work);
@@ -888,6 +958,8 @@ enum Answered {
   Verdict(ReplyBody),
   Rebased(RebaseAnswer),
   Admitted(Result<Admitted, Refusal>),
+  /// The name's reservation at the partition it hashes to (A-400).
+  Named(Result<(), Refusal>),
   /// The work's route is committed (A-298): nothing to hand the verb, which runs its gate again.
   Route,
 }
@@ -904,14 +976,27 @@ struct AskItem {
   back: ReplyRoute,
 }
 
-/// A shard's asks to one owner shard: those waiting, and whether a batch is out. One batch is out at a time, so a burst
-/// of asks rides a few messages, each carrying what gathered while the last was answered, and an owner's channel holds
-/// one message from each asking shard at most.
+/// A shard's asks to one owner shard: those waiting, and the batches out. At most [`BATCHES_OUT`] are out at a time, so a
+/// burst of asks rides a few messages, each carrying what gathered while the others were out, and an owner's channel
+/// holds at most that many messages from each asking shard (A-388).
 #[derive(Default)]
 pub(crate) struct Outbox {
   waiting: VecDeque<AskItem>,
-  sending: bool,
+  /// The batches out to the owner now, one a sender task ([`send_batches`]).
+  out: usize,
 }
+
+/// Shape: the batches a shard keeps out to one owner at once (A-388): two, so one waits at the owner while the one
+/// before it is served, and the owner never waits for an asking shard's round trip to have its next batch (double
+/// buffering). With one out, an ask made while a batch was out waited for that batch's whole round trip before it left:
+/// at 1,000 clients on a Mac Studio that wait was about half of an ask's way to the owner, at the median and in the
+/// slowest 1% (the g083 trace, BENCHMARKS 2026-11-18). The owner's channel holds at most two messages from each asking
+/// shard, the bound one batch at a time gave it doubled, never unbounded.
+const BATCHES_OUT: usize = 2;
+
+/// Format: the status counter of the most batch senders this shard has had out to one owner at once (A-388), the
+/// non-vacuity count of [`BATCHES_OUT`]: a shard that never had two out never tested the second.
+pub(crate) const BATCHES_OUT_PEAK: &str = "merge.work.batches_out_peak";
 
 /// The most asks one batch carries: one client region's request credit (`slots`), what one client may hold in flight,
 /// so the owner's step for a batch is about as long as the step it gives one client's requests.
@@ -921,8 +1006,8 @@ fn batch_bound(state: &ShardState) -> usize {
     .max(1)
 }
 
-/// Queues `need`'s ask to the green's owner, sending a batch if none is out. Returns whether it was queued; its answer
-/// resumes the queue.
+/// Queues `need`'s ask to the green's owner, sending a batch at once if fewer than [`BATCHES_OUT`] are out (A-388).
+/// Returns whether it was queued; its answer resumes the queue.
 fn start_ask(
   state: &mut ShardState,
   queue: DbVolumeId,
@@ -944,18 +1029,24 @@ fn start_ask(
       1,
     );
   }
-  let green = match &need {
-    Need::Verdict { sealed, .. } | Need::Rebase { sealed } => sealed.green,
-    Need::Admit { green, .. } => *green,
+  // Every ask goes to its green's owner but a new work's name's, which goes to the partition the name hashes to (A-400).
+  let (green, target) = match &need {
+    Need::Verdict { sealed, .. } | Need::Rebase { sealed } => (sealed.green, None),
+    Need::Admit { green, .. } => (*green, None),
+    Need::ReserveName { name, .. } => (
+      queue,
+      Some(crate::verbs::owner_of_name(name, state.shards.len())),
+    ),
     Need::Files(_) | Need::Page { .. } | Need::Sizes => match state.works.get(&queue) {
-      Some(w) => w.green,
+      Some(w) => (w.green, None),
       None => return false,
     },
     // The owner holds nothing of a work's route (A-298): `park` meets it on this shard.
     Need::Route => return false,
   };
   let version = state.works.get(&queue).map_or(0, |w| w.base_version);
-  let owner_partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(green));
+  let owner_partition =
+    target.unwrap_or_else(|| crate::verbs::owner_of(crate::verbs::to_wire_volume(green)));
   let Some(owner) = crate::verbs::shard_of_partition(state, owner_partition) else {
     return false;
   };
@@ -979,17 +1070,36 @@ fn start_ask(
     principal: principal.clone(),
     back,
   });
-  let already = std::mem::replace(&mut outbox.sending, true);
+  // A batch out takes what waits when its answer is back; past the bound this ask waits for one.
+  let full = outbox.out >= BATCHES_OUT;
+  if !full {
+    outbox.out = outbox.out.saturating_add(1);
+  }
+  let out = outbox.out;
   state.count(ASKED_THE_OWNER, 1);
-  if already {
+  if full {
     return true;
   }
+  let peak = state.refusals.entry(BATCHES_OUT_PEAK).or_insert(0);
+  *peak = (*peak).max(u64::try_from(out).unwrap_or(u64::MAX));
   match slates_rt::futures::spawn(send_batches(here, owner)) {
     Ok(task) => {
       let _ = slates_rt::futures::detach(task);
       true
     }
     Err(_) => {
+      // This sender was not started: another out takes what waits when its answer is back.
+      let others = state
+        .work_home
+        .outboxes
+        .get_mut(&owner)
+        .map_or(0, |outbox| {
+          outbox.out = outbox.out.saturating_sub(1);
+          outbox.out
+        });
+      if others > 0 {
+        return true;
+      }
       // Nothing will send what waits: every ask in this outbox is answered unanswered now.
       let left = state
         .work_home
@@ -1008,13 +1118,18 @@ fn start_ask(
 }
 
 /// What the owner answered for one ask of a batch.
+#[allow(
+  clippy::large_enum_variant,
+  reason = "an answer is the common outcome: boxing it would allocate per ask, to shrink the rare Deferred"
+)]
 enum Outcome {
   Answered(Answered),
   /// The owner took the verdict and answers when it commits.
   Deferred,
 }
 
-/// Sends `here`'s outbox to `owner` a batch at a time until it is empty.
+/// Sends `here`'s outbox to `owner` a batch at a time until it is empty: one of the at most [`BATCHES_OUT`] senders out
+/// to `owner`, each awaiting its own batch's answers (A-388).
 async fn send_batches(here: u16, owner: u16) {
   loop {
     let batch = state::with_state(|s| take_batch(s, owner)).unwrap_or_default();
@@ -1022,8 +1137,8 @@ async fn send_batches(here: u16, owner: u16) {
       return;
     }
     let keys: Vec<DbVolumeId> = batch.iter().map(|item| item.queue).collect();
-    let deadline = crate::lease::lease_bound_ns();
-    let answers = crate::xshard::call_within_room(
+    let budget = crate::lease::lease_bound_ns();
+    let answers = crate::xshard::call_in_shard_time_given_room(
       here,
       owner,
       move |s| {
@@ -1032,7 +1147,7 @@ async fn send_batches(here: u16, owner: u16) {
           .map(|item| answer_on_owner(s, item))
           .collect::<Vec<_>>()
       },
-      deadline,
+      budget,
     )
     .await;
     let _ = state::with_state_counted(|s| match answers {
@@ -1061,7 +1176,8 @@ fn take_batch(state: &mut ShardState, owner: u16) -> Vec<AskItem> {
   let take = outbox.waiting.len().min(bound);
   let items: Vec<AskItem> = outbox.waiting.drain(..take).collect();
   if items.is_empty() {
-    outbox.sending = false;
+    // This sender ends: its batch is no longer out.
+    outbox.out = outbox.out.saturating_sub(1);
     return items;
   }
   let (ready, unstaged): (Vec<AskItem>, Vec<AskItem>) =
@@ -1127,9 +1243,36 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     } => Outcome::Answered(Answered::Admitted(crate::verbs::owner_admit(
       state, &principal, green, work,
     ))),
+    Need::ReserveName { name, id: work } => {
+      Outcome::Answered(Answered::Named(reserve_name(state, name, work)))
+    }
     // Never asked (`start_ask` refuses it); answered, it only runs the work's gate again, which checks the route there.
     Need::Route => Outcome::Answered(Answered::Route),
   }
+}
+
+/// Holds `name` here, the partition it hashes to, for `work`, a work made on another shard (A-400, A-236's reservation):
+/// answered again for the work it already holds (an answer lost, or its shard restarted), refused `AlreadyExists` for
+/// any other holder.
+fn reserve_name(state: &mut ShardState, name: String, work: DbVolumeId) -> Result<(), Refusal> {
+  if state
+    .db
+    .partition()
+    .name_alias(&name)
+    .is_some_and(|alias| alias.volume == work)
+  {
+    return Ok(());
+  }
+  crate::verbs::alias_step(
+    state,
+    &Op::NameAliasReserved {
+      record: slates_db::catalog::NameAliasRecord {
+        name,
+        volume: work,
+        confirmed: false,
+      },
+    },
+  )
 }
 
 /// Settles one ask's outcome on the work's shard.
@@ -1166,8 +1309,8 @@ fn route_committed(state: &ShardState, work: DbVolumeId) -> bool {
 
 /// Holds `work`'s oldest verb, a submit, until the work's route is committed (A-298). The work's catalog register ships
 /// now rather than at the coordinator's period, and the record plane's next pass on this shard after it commits runs
-/// the verb's gate again ([`routes_placed`]). Past the lease bound the verb is answered `Overloaded`, unrecorded, so its
-/// retry runs it again: nothing went to the owner, so nothing waits to be settled.
+/// the verb's gate again ([`routes_placed`]). Past the failover delay ([`park_bound_ns`]) the verb is answered
+/// `Overloaded`, unrecorded, so its retry runs it again: nothing went to the owner, so nothing waits to be settled.
 fn await_route(state: &mut ShardState, work: DbVolumeId) {
   state.count(AWAITED_ROUTE, 1);
   state.work_home.routing.insert(work);
@@ -1194,10 +1337,19 @@ pub(crate) fn routes_placed(state: &mut ShardState) {
   }
 }
 
-/// The oldest verb of `work` waits for its quorum commit, or for its route (A-298), up to the lease bound.
+/// Derived: how long a verb of a work is held for a quorum commit — its verdict's, which the owner answers once its
+/// version commits at the quorum (AUD-11), or its work's route's (A-298) — before it is answered `Overloaded` and
+/// retried (A-434): the node's failover delay (`ShardState::failover_ns`, A-363), a held reply's total (A-354, A-375,
+/// `live_ship`'s durable spans read the same). A commit at the quorum waits, when a holder is lost, for the fleet to fail
+/// over, so a verb given up sooner only comes back to wait again. Before A-434 it was the owner lease's bound (about
+/// 0.9 s), the bound a verb waits for its own lease to confirm (`lease_wait`), which a commit is not.
+fn park_bound_ns(state: &ShardState) -> u64 {
+  state.failover_ns.max(1)
+}
+
+/// The oldest verb of `work` waits for its quorum commit, or for its route (A-298), up to [`park_bound_ns`].
 fn defer_oldest(state: &mut ShardState, work: DbVolumeId) {
-  let deadline =
-    slates_machine::clock::monotonic_ns().saturating_add(crate::lease::lease_bound_ns());
+  let deadline = slates_machine::clock::monotonic_ns().saturating_add(park_bound_ns(state));
   if let Some(queue) = state.work_home.queues.get_mut(&work) {
     queue.deferred_until = Some(deadline);
   }
@@ -1245,7 +1397,11 @@ async fn deferred_timer() {
 
 /// Answers `Overloaded` to every deferred verb past its deadline, releasing its work.
 fn release_expired(state: &mut ShardState) {
-  let now = slates_machine::clock::monotonic_ns();
+  release_expired_at(state, slates_machine::clock::monotonic_ns());
+}
+
+/// [`release_expired`] at `now`, on the host's monotonic clock.
+fn release_expired_at(state: &mut ShardState, now: u64) {
   let expired: Vec<DbVolumeId> = state
     .work_home
     .queues
@@ -1274,6 +1430,7 @@ fn resolve(state: &mut ShardState, work: DbVolumeId, answer: Option<Answered>) {
           Answered::Verdict(reply) => head.verdict = Some(reply),
           Answered::Rebased(rebased) => head.rebased = Some(rebased),
           Answered::Admitted(admitted) => head.admitted = Some(admitted),
+          Answered::Named(named) => head.named = Some(named),
           Answered::Route => {}
         }
       }
@@ -1328,6 +1485,7 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
       verdict,
       rebased,
       admitted,
+      named,
     } = head;
     let home = &mut state.work_home;
     home.by_request.remove(&key(verb.origin, verb.id));
@@ -1347,6 +1505,7 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.verdict = verdict;
     home.rebased = rebased;
     home.admitted = admitted;
+    home.named = named;
     home.resuming = Some(work);
     crate::lease_wait::run_resumed(state, verb, refused, None);
     let home = &mut state.work_home;
@@ -1355,6 +1514,7 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.verdict = None;
     home.rebased = None;
     home.admitted = None;
+    home.named = None;
   }
 }
 
@@ -1421,7 +1581,7 @@ pub(crate) fn tell_floor(
     state.count(FLOOR_NOT_SENT, 1);
     return;
   };
-  let deadline = crate::lease::lease_bound_ns();
+  let budget = crate::lease::lease_bound_ns();
   let spawned = slates_rt::futures::spawn(async move {
     let took = state::with_state(|s| match base {
       Some(base) => s.works.get(&work).is_some_and(|w| w.base_version == base),
@@ -1431,11 +1591,11 @@ pub(crate) fn tell_floor(
     if !took {
       return;
     }
-    let sent = crate::xshard::call_within_room(
+    let sent = crate::xshard::call_in_shard_time_given_room(
       here,
       owner,
       move |s| crate::verbs::owner_floor(s, green, work, base),
-      deadline,
+      budget,
     )
     .await;
     if sent.is_none() {
@@ -1447,5 +1607,69 @@ pub(crate) fn tell_floor(
       let _ = slates_rt::futures::detach(task);
     }
     Err(_) => state.count(FLOOR_NOT_SENT, 1),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{DbVolumeId, ParkedVerb, Queue, defer_oldest, release_expired_at};
+
+  /// The verb a test parks: a status asked by a local client, with nowhere to reply (answered `Overloaded` at its release,
+  /// nothing is sent).
+  fn parked_verb() -> ParkedVerb {
+    ParkedVerb {
+      verb: crate::lease_wait::ResumedVerb {
+        route: None,
+        origin: 0,
+        id: slates_wire::request::RequestId::from_word(1),
+        client_id: 1,
+        principal: slates_db::catalog::Principal::Uid {
+          host: slates_db::HostId(0),
+          uid: 1234,
+        },
+        body: slates_ipc::protocol::RequestBody::DaemonStatus,
+      },
+      fetched: None,
+      verdict: None,
+      rebased: None,
+      admitted: None,
+      named: None,
+    }
+  }
+
+  /// A-434 (R3's class B: a verb held for its quorum commit). Do: on one shard whose failover delay is held at three of
+  /// the owner lease's bounds, park a verb at the front of a work's queue and defer it as a verdict its owner answers at
+  /// its quorum commit; release what has expired once the owner lease's bound has passed since the deferral, then once
+  /// the failover delay has. Expect: the verb still held past the lease's bound, and released at the failover delay.
+  /// Before, it was answered `Overloaded` at the lease's bound, though a commit at the quorum waits out a failover when
+  /// a holder is lost, as a held reply does.
+  #[test]
+  fn a_verb_held_for_its_quorum_commit_waits_the_failover_delay() {
+    crate::daemon::audit_on_shard(|state| {
+      let lease = crate::lease::lease_bound_ns();
+      state.failover_ns = 3 * lease;
+      let work = DbVolumeId { bytes: [7; 16] };
+      let mut queue = Queue::default();
+      queue.waiting.push_back(parked_verb());
+      queue.asking = true;
+      state.work_home.queues.insert(work, queue);
+      state.work_home.parked = 1;
+      defer_oldest(state, work);
+      let deferred = slates_machine::clock::monotonic_ns();
+      let held = |state: &crate::state::ShardState| {
+        state
+          .work_home
+          .queues
+          .get(&work)
+          .is_some_and(|queue| !queue.waiting.is_empty())
+      };
+      release_expired_at(state, deferred + lease);
+      assert!(
+        held(&*state),
+        "the verb is still held once the owner lease's bound has passed"
+      );
+      release_expired_at(state, deferred + 3 * lease);
+      assert!(!held(&*state), "the verb is released at the failover delay");
+    });
   }
 }

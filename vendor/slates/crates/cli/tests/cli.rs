@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 /// Shape: how long the anchor and its daemon get to come up (a quick profile plus two
 /// starts), and how long the daemon gets to leave after its anchor dies.
 const START_WAIT: Duration = Duration::from_secs(20);
-/// Shape: how long a live-mount check waits for the daemon's reaper and the kernel's `UMNT` to show in
+/// Shape: how long a live-mount check waits for the daemon's reaper and the kernel's unmount (A-511) to show in
 /// `status` — ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s; a client is asked about once silent for
 /// one budget, so a death shows within two).
 const WAIT_FOR: Duration = Duration::from_secs(10);
@@ -546,8 +546,8 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
 /// restarted. Do: start an anchor, freeze its daemon (`SIGSTOP`: alive and silent), and wait for another daemon to
 /// answer. Expect the frozen one gone, killed once, and the anchor's kill line to be its process judgment, never a
 /// withheld beat's: the line names a beat at least a window old and a process that made no progress for at least the
-/// window and at most one more, the window being the liveness budget; and the new daemon answering within the suite's
-/// start wait.
+/// window and at most one more, the window being the anchor's (the liveness budget, raised to how late the anchor's own
+/// waits ran where that is longer, A-461); and the new daemon answering within the suite's start wait.
 ///
 /// A frozen process stops its watchdog with every other thread, so the watchdog's silence cannot say whether the daemon
 /// is stuck or only starved; since A-232 the anchor then judges the process by the start's rule, sparing a starved one
@@ -610,10 +610,9 @@ fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
   );
   assert_ne!(successor, frozen);
   assert!(!frozen_alive, "the frozen daemon was killed");
-  assert_eq!(
-    window,
-    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
-    "the anchor's window is the liveness budget"
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the anchor's window is the liveness budget, or longer where its own waits ran later (A-461): {window:?} ({line})"
   );
   assert!(
     age >= window && still >= window,
@@ -634,7 +633,7 @@ const LAPSE_KILL_LINE: &str = "the daemon's heartbeat lapsed (";
 
 /// Format: the words of the anchor's kill line for a daemon whose watchdog has gone silent and whose process the start's
 /// rule finds stuck (`on_lapse`, A-232): "the daemon's watchdog has not looked for L ms, its heartbeat A ms old; its
-/// process made no progress for F ms (the W ms liveness window); killing it".
+/// process made no progress for F ms (its W ms window); killing it" (A-461: the window the anchor judged it by).
 const PROCESS_KILL_LINE: &str = "; its process made no progress for ";
 
 /// The beat's age, how long the process made no progress, and the window the anchor's process kill line names: its
@@ -769,12 +768,30 @@ fn a_stuck_start_is_killed_and_restarted() {
   drop(anchor);
   assert_ne!(answered, stuck);
   assert!(!stuck_alive, "the stuck start was killed");
-  let window = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
-  let still_for = kill_line
+  // The stillness and the window the line names (A-461: the anchor's window, the liveness budget or, where its own waits
+  // ran later, longer): "made no progress for F ms (its W ms window)".
+  let named: Vec<u64> = kill_line
     .split_once(STUCK_WORDS)
-    .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-    .and_then(|ms| ms.parse().ok())
-    .map(Duration::from_millis);
+    .map(|(_, rest)| {
+      rest
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .take(2)
+        .filter_map(|word| word.parse().ok())
+        .collect()
+    })
+    .unwrap_or_default();
+  let (still_for, window) = match named[..] {
+    [still, window] => (
+      Some(Duration::from_millis(still)),
+      Duration::from_millis(window),
+    ),
+    _ => (None, Duration::ZERO),
+  };
+  assert!(
+    window >= Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "the start was judged by the anchor's window, never under the liveness budget: {kill_line:?}"
+  );
   assert!(
     still_for.is_some_and(|still| still >= window && still < window * 2),
     "killed as a start within a window of its last progress: {kill_line:?}"
@@ -1324,6 +1341,55 @@ fn a_cli_attachment_outlives_the_process_that_made_it() {
   drop(anchor);
 }
 
+/// Shape: the volumes the paged-listing test creates through the CLI: about five listing pages' worth, at about 50 bytes
+/// a summary (`paged-NNNNN`, its id and counters) in a 4,096-byte reply chunk; past the 100 that one reply held.
+const PAGED_VOLUMES: usize = 400;
+
+/// §4.4 `list`, by use. Do: on a real anchor (two shards) create [`PAGED_VOLUMES`] volumes with `slates volume
+/// create`, then run `slates volume list` and `slates volume list --json`. Expect: both exit 0 and hold every volume
+/// exactly once. Before 2026-11-08 both were refused "reply too large for the bulk area" at 100 volumes (2,000 tried by
+/// hand: refused at every count from 100).
+#[test]
+fn volume_list_answers_a_listing_longer_than_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the paged volume listing: set SLATES_TEST_CLI=1 to run it (needs the machine to itself)"
+    );
+    return;
+  }
+  let instance = format!("cli-paged-list-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let mut ids = Vec::new();
+  for n in 0..PAGED_VOLUMES {
+    let name = format!("paged-{n:05}");
+    let (code, out, err) = run(&instance, &["volume", "create", &name, "--bounded", "1MiB"]);
+    assert_eq!(code, 0, "create {name}: {err}");
+    ids.push(value_of(&out, "id"));
+  }
+  let (code, out, err) = run(&instance, &["volume", "list"]);
+  assert_eq!(code, 0, "volume list: {err}");
+  for id in &ids {
+    assert_eq!(
+      out
+        .lines()
+        .filter(|line| line.starts_with(id.as_str()))
+        .count(),
+      1,
+      "volume {id} listed once"
+    );
+  }
+  let (code, out, err) = run(&instance, &["volume", "list", "--json"]);
+  assert_eq!(code, 0, "volume list --json: {err}");
+  for id in &ids {
+    assert_eq!(
+      out.matches(&format!("\"id\":\"{id}\"")).count(),
+      1,
+      "volume {id} in the JSON once"
+    );
+  }
+  drop(anchor);
+}
+
 #[test]
 fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor() {
   // This spawns a real anchor and daemon (subprocesses with spinning shards) and a `slates`
@@ -1465,9 +1531,9 @@ fn the_macos_mount_is_nosuid_and_nodev(path: &str) {
   }
 }
 
-/// Shape: how long a forged `UMNT` is watched for effect: three times the daemon's one-liveness-budget
-/// confirmation deadline (`crates/server/src/nfs.rs`, `UNMOUNT_CONFIRM_NS`), so a loaded box's delay
-/// cannot hide an ended attachment.
+/// Shape: how long a forged `UMNT` is watched for effect: three times the longest a `UMNT` ever led the daemon to wait
+/// (one liveness window, the first bound of the timed confirmation A-511 removed), so a regression that brings a
+/// `UMNT`'s effect back cannot hide behind a loaded box's delay.
 #[cfg(target_os = "macos")]
 const FORGED_UNMOUNT_WATCH: Duration = Duration::from_secs(3);
 
@@ -1520,9 +1586,9 @@ fn an_export_names_the_port_the_kernel_mount_uses(instance: &str, id: &str, path
   assert_eq!(code, 0, "detach: {err}");
 }
 
-/// §4.6 A-34: a `UMNT` proves nothing by itself, since any local process can send one. Do send the
-/// daemon a forged `UMNT /<name>` while the volume is mounted, as another user could; expect the mount's
-/// attachment to survive past the daemon's confirmation deadline, and the mount to keep serving.
+/// §4.6 A-34, A-511: a `UMNT` proves nothing by itself, since any local process can send one, so it ends nothing; only
+/// the kernel's own unmount event does. Do send the daemon a forged `UMNT /<name>` while the volume is mounted, as
+/// another user could; expect the mount's attachment to survive the whole watch, and the mount to keep serving.
 #[cfg(target_os = "macos")]
 fn a_forged_unmount_ends_nothing(instance: &str, id: &str, name: &str, path: &str) {
   use slates_bridge_nfs::client::{Credentials, exchange, umnt_call};
@@ -1532,13 +1598,9 @@ fn a_forged_unmount_ends_nothing(instance: &str, id: &str, name: &str, path: &st
     gid: 0,
     gids: Vec::new(),
   };
-  exchange(
-    port,
-    &umnt_call(1, &caller, &format!("/{name}")),
-    Duration::from_secs(5),
-  )
-  .expect("the daemon answers the forged UMNT");
-  // Watched past the daemon's confirmation deadline (one liveness budget), with room for a loaded box:
+  exchange(port, &umnt_call(1, &caller, &format!("/{name}")))
+    .expect("the daemon answers the forged UMNT");
+  // Watched past the longest a `UMNT` ever led the daemon to wait (one liveness budget), with room for a loaded box:
   // the attachment must hold the whole time.
   let watch_until = Instant::now() + FORGED_UNMOUNT_WATCH;
   while Instant::now() < watch_until {
@@ -1720,11 +1782,11 @@ fn unmount_and_check(instance: &str, id: &str, path: &str) {
     !is_mounted(path),
     "the kernel mount table no longer lists it"
   );
-  // The kernel's own `UMNT` ended the mount's attachment (AUD-01): the volume reports none, and no
-  // bound mount point remains.
+  // The kernel's unmount ended the mount's attachment (AUD-01), seen through the kernel's own event on macOS (A-511)
+  // and the FUSE device's close on Linux: the volume reports none, and no bound mount point remains.
   assert!(
     wait_for(|| attachments_of(instance, id) == "0"),
-    "the kernel's UMNT ended the mount's attachment: {}",
+    "the kernel's unmount ended the mount's attachment: {}",
     attachments_of(instance, id)
   );
   let (code, out, err) = run(instance, &["status", id]);
@@ -7360,7 +7422,7 @@ fn shell(script: &str) -> String {
 }
 
 /// Format: the variable naming the daemon's root mount, where a volume appears as `<root>/<volume>`
-/// (`crates/cli/src/exec.rs`); the launcher has no default and refuses without it.
+/// (`crates/api/src/exec.rs`); the launcher has no default and refuses without it.
 #[cfg(target_os = "linux")]
 const ROOT_ENV: &str = "SLATES_ROOT";
 
@@ -7501,6 +7563,247 @@ fn the_launcher_binds_a_volume_or_names_the_host_setting_that_forbids_it() {
     );
   }
   assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// Format: the variable a CI step sets to the AppArmor regime it arranged for this binary before the launcher's
+/// AppArmor test: `absent`, no slates profile loaded for it, or `loaded`, its profile loaded by the step as root. Unset,
+/// the test takes the regime the host has; set, a host in another regime fails it, so a profile the step failed to load
+/// or to unload is never passed off as the other case.
+#[cfg(target_os = "linux")]
+const APPARMOR_REGIME_ENV: &str = "SLATES_TEST_APPARMOR_PROFILE";
+
+/// Format: the launcher's refusal on a host whose AppArmor confines unprivileged user namespaces, word for word as it
+/// read before A-370, which it still reads with the option off and no profile loaded.
+#[cfg(target_os = "linux")]
+const CONFINED_REFUSAL: &str = "this host's AppArmor confines unprivileged user namespaces \
+  (kernel.apparmor_restrict_unprivileged_userns=1), so the launcher's namespace has no capability to bind the volume; an \
+  administrator can allow it with an AppArmor profile for the slates binary that grants `userns,`, or set the sysctl \
+  to 0";
+
+/// What one run of the launcher answered: its exit code, standard output and standard error.
+#[cfg(target_os = "linux")]
+struct Launched {
+  code: i32,
+  out: String,
+  err: String,
+}
+
+/// Runs `slates exec` over `root/vol` at `at`, with the AppArmor option on or off, running a command that reports what
+/// it sees, one line each: the volume's marker through the bind, its own AppArmor label, and whether a user namespace it
+/// makes itself gets the capability to mount (`grant-held`) or not (`grant-withheld`).
+#[cfg(target_os = "linux")]
+fn launch_reporting(root: &str, at: &str, apparmor: bool) -> Launched {
+  let script = format!(
+    "cat {at}/marker; echo; cat /proc/self/attr/apparmor/current 2>/dev/null || echo none; \
+     if unshare -Urm true 2>/dev/null; then echo grant-held; else echo grant-withheld; fi"
+  );
+  let mut command = slates();
+  command.args(["exec", "--volume", "vol", "--at", at]);
+  if apparmor {
+    command.arg("--apparmor-profile");
+  }
+  let output = command
+    .args(["--", "sh", "-c", &script])
+    .env(ROOT_ENV, root)
+    .output()
+    .unwrap();
+  Launched {
+    code: output.status.code().unwrap_or(-1),
+    out: String::from_utf8_lossy(&output.stdout).into_owned(),
+    err: String::from_utf8_lossy(&output.stderr).into_owned(),
+  }
+}
+
+/// A-370 (§4.6 "The launcher"; GAPS `8a-launcher-ci`), with no daemon: a plain directory stands in for the root mount.
+/// Do: ask `slates apparmor check --json` what the launcher will meet, then run `slates exec` with and without
+/// `--apparmor-profile`, its command reporting the volume's marker, its own AppArmor label, and whether a user namespace
+/// it makes itself gets the mount capability. Expect, by the host:
+/// - where AppArmor restricts unprivileged user namespaces and slates' profile is loaded for this binary: with the
+///   option, the command reads the volume, runs `unconfined`, and its own namespace is refused the capability, so it
+///   holds nothing the host withholds; without it, a refusal (exit 4) naming the option, the launcher having left the
+///   loaded profile;
+/// - where it restricts them and no profile is loaded: without the option, the refusal word for word as before A-370;
+///   with it, a refusal naming this binary's profile file and the command that loads it;
+/// - elsewhere (no restriction): the command reads the volume either way.
+///
+/// The host sees nothing at the chosen path after any of them. CI runs it on GitHub's Ubuntu runners in both regimes
+/// (`APPARMOR_REGIME_ENV`), loading the profile as root between them.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_launcher_uses_slates_apparmor_profile_only_when_asked() {
+  let check = slates()
+    .args(["apparmor", "check", "--json"])
+    .output()
+    .unwrap();
+  let report: serde_json::Value = serde_json::from_slice(&check.stdout)
+    .unwrap_or_else(|e| panic!("apparmor check --json: {e}: {check:?}"));
+  let readiness = report["readiness"].as_str().unwrap_or_default().to_owned();
+  assert_the_ci_regime(&readiness, &report);
+  let root = build_output_dir("slates-apparmor-root");
+  let at = build_output_dir("slates-apparmor-at");
+  shell(&format!(
+    "mkdir -p {root}/vol && printf through-the-bind > {root}/vol/marker"
+  ));
+  let off = launch_reporting(&root, &at, false);
+  let on = launch_reporting(&root, &at, true);
+  let left = shell(&format!("ls -A {at}"));
+  shell(&format!("rm -rf {root} {at}"));
+  judge_apparmor_launches(&readiness, &report, &off, &on);
+  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+}
+
+/// When CI names this run's AppArmor regime (`APPARMOR_REGIME_ENV`), the check's readiness must be that regime's.
+#[cfg(target_os = "linux")]
+fn assert_the_ci_regime(readiness: &str, report: &serde_json::Value) {
+  match std::env::var(APPARMOR_REGIME_ENV).as_deref() {
+    Ok("loaded") => assert_eq!(readiness, "profile-loaded", "{report}"),
+    Ok("absent") => assert_eq!(readiness, "profile-missing", "{report}"),
+    Ok(other) => panic!("{APPARMOR_REGIME_ENV}={other}: expected `loaded` or `absent`"),
+    Err(_) => {}
+  }
+}
+
+/// The launches with the option off and on, judged by the host's readiness: under a loaded profile only the option's
+/// launch runs, unconfined and holding no grant; with the profile missing both are refused, the option's naming how to
+/// load it; on a host that refuses user namespaces outright, a loud skip; elsewhere both read the volume.
+#[cfg(target_os = "linux")]
+fn judge_apparmor_launches(
+  readiness: &str,
+  report: &serde_json::Value,
+  off: &Launched,
+  on: &Launched,
+) {
+  let executable = report["executable"].as_str().unwrap_or_default();
+  match readiness {
+    "profile-loaded" => judge_launches_under_a_loaded_profile(off, on, executable),
+    "profile-missing" => judge_launches_with_the_profile_missing(off, on, report, executable),
+    _ if off.err.contains("cannot create a user+mount namespace") => {
+      eprintln!(
+        "SKIP: this host refuses unprivileged user namespaces outright: {}",
+        off.err
+      );
+    }
+    _ => {
+      for launched in [&off, &on] {
+        assert_eq!(launched.code, 0, "{}", launched.err);
+        assert_eq!(launched.out.lines().next(), Some("through-the-bind"));
+      }
+    }
+  }
+}
+
+/// Under a loaded profile only the option's launch runs, outside the profile and holding no user-namespace grant; the
+/// launch without the option is refused, naming the option and the loaded profile's `executable`.
+#[cfg(target_os = "linux")]
+fn judge_launches_under_a_loaded_profile(off: &Launched, on: &Launched, executable: &str) {
+  assert_eq!(
+    on.code, 0,
+    "the profile's launcher runs the command: {}",
+    on.err
+  );
+  assert_eq!(
+    on.out.lines().collect::<Vec<_>>(),
+    ["through-the-bind", "unconfined", "grant-withheld"],
+    "the command reads the volume, runs outside the profile, and holds no user-namespace grant"
+  );
+  assert_eq!(
+    off.code, 4,
+    "without the option the launcher leaves the profile: {}",
+    off.err
+  );
+  assert!(
+    off.err.contains("--apparmor-profile") && off.err.contains(executable),
+    "the refusal names the option and the loaded profile: {}",
+    off.err
+  );
+}
+
+/// With the profile missing both launches are refused: the one without the option as it read before A-370, the option's
+/// naming this binary's profile file from `report` and how to load it.
+#[cfg(target_os = "linux")]
+fn judge_launches_with_the_profile_missing(
+  off: &Launched,
+  on: &Launched,
+  report: &serde_json::Value,
+  executable: &str,
+) {
+  assert_eq!(off.code, 4, "{}", off.err);
+  assert_eq!(
+    off.err.trim(),
+    format!("slates: {CONFINED_REFUSAL}"),
+    "without the option, the refusal as it read before A-370"
+  );
+  assert_eq!(on.code, 4, "{}", on.err);
+  let file = report["profile_file"].as_str().unwrap_or_default();
+  assert!(
+    !file.is_empty()
+      && on.err.contains(&format!("sudo apparmor_parser -r {file}"))
+      && on.err.contains(executable),
+    "with the option, the refusal names this binary's profile and how to load it: {}",
+    on.err
+  );
+}
+
+/// A-370. Do: print slates' AppArmor profile for an installed path, and for a path it cannot name. Expect: the profile
+/// names the path and grants `userns,` in unconfined mode; a path the profile cannot name exactly is refused (exit 1)
+/// naming why.
+#[test]
+fn apparmor_prints_the_profile_and_checks_the_host() {
+  let printed = slates()
+    .args([
+      "apparmor",
+      "profile",
+      "--executable",
+      "/usr/local/bin/slates",
+    ])
+    .output()
+    .unwrap();
+  assert!(printed.status.success(), "{printed:?}");
+  let text = String::from_utf8_lossy(&printed.stdout);
+  assert!(
+    text.contains("\nprofile /usr/local/bin/slates flags=(unconfined) {\n  userns,\n}"),
+    "{text}"
+  );
+  let refused = slates()
+    .args([
+      "apparmor",
+      "profile",
+      "--executable",
+      "/opt/my tools/slates",
+    ])
+    .output()
+    .unwrap();
+  assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+  assert!(String::from_utf8_lossy(&refused.stderr).contains("cannot name exactly"));
+}
+
+/// A-370. Do: check this host, and print this binary's own profile. Expect: the check reports the binary's path as the
+/// kernel records it, succeeding exactly where `exec` can make its namespace, and the profile names that path; off
+/// Linux the check answers `unsupported`.
+#[test]
+fn apparmor_check_reports_this_binary_and_this_host() {
+  let check = slates()
+    .args(["apparmor", "check", "--json"])
+    .output()
+    .unwrap();
+  let report: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+  let readiness = report["readiness"].as_str().unwrap_or_default();
+  assert_eq!(
+    check.status.success(),
+    matches!(readiness, "unrestricted" | "profile-loaded"),
+    "{report}"
+  );
+  if cfg!(target_os = "linux") {
+    let own = std::fs::canonicalize(env!("CARGO_BIN_EXE_slates")).unwrap();
+    assert_eq!(report["executable"].as_str(), own.to_str(), "{report}");
+    let mine = slates().args(["apparmor", "profile"]).output().unwrap();
+    assert!(
+      String::from_utf8_lossy(&mine.stdout).contains(&format!("profile {} flags", own.display())),
+      "{mine:?}"
+    );
+  } else {
+    assert_eq!(readiness, "unsupported", "{report}");
+  }
 }
 
 /// AUD-29-76 (`slates mount --subtree`). Do: through the real binary against a real anchor-supervised daemon,
@@ -12047,6 +12350,9 @@ const GARBLED_HOLD_MESSAGES: usize = 20;
 const UNKNOWN_HOLD_KIND: u8 = 0xff;
 /// Format: the daemon status line carrying the anchor's hold refusals (A-213).
 const HOLD_REFUSALS_LINE: &str = "anchor_hold_refusals: ";
+/// Shape: the bounds the garbling daemon reads its handoff table against, each: past what the anchor holds for this test's
+/// one instance, which holds nothing at the garbler's start, so only the table's frame is read.
+const HANDED_BOUND: usize = 1 << 16;
 /// Shape: the quick profile's probe budget (milliseconds), as `slates anchor --quick` measures it
 /// (`crates/api/src/role/daemon.rs`, `QUICK_PROBE_MS`).
 const QUICK_PROBE_MS: u64 = 5;
@@ -12063,11 +12369,23 @@ fn garbling_daemon() {
   let Ok(instance) = std::env::var(GARBLING_DAEMON_INSTANCE) else {
     return;
   };
-  let handed =
-    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
-  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
-  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment. It is
-  // borrowed, never owned, so it stays open across the exec below for the real daemon to adopt.
+  let pointer =
+    std::env::var(slates_anchor::held::ENV_HELD).expect("the anchor handed its table over");
+  let bounds = slates_anchor::held::TableBounds {
+    devices: HANDED_BOUND,
+    connections: HANDED_BOUND,
+    copies: HANDED_BOUND,
+  };
+  let (table, len) = slates_anchor::held::parse_pointer(&pointer, bounds).unwrap();
+  // SAFETY: the anchor made the table's object inheritable and named its number in the environment (A-462). It is
+  // borrowed, never owned: a copy is read here, and the object stays open across the exec below for the real daemon.
+  let object = unsafe { BorrowedFd::borrow_raw(table) };
+  let text = slates_anchor::held::read_table(object.try_clone_to_owned().unwrap(), len).unwrap();
+  let inherited =
+    slates_anchor::held::parse_devices(&slates_anchor::held::decode_table(&text).unwrap().devices)
+      .unwrap();
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in its table. It is borrowed,
+  // never owned, so it stays open across the exec below for the real daemon to adopt.
   let channel = unsafe { BorrowedFd::borrow_raw(inherited.channel) };
   let short = vec![0u8; slates_anchor::held::MESSAGE_BYTES / 2];
   let mut unknown = vec![0u8; slates_anchor::held::MESSAGE_BYTES];
@@ -12138,7 +12456,7 @@ fn a_real_anchors_hold_refusals_show_in_slates_status() {
     .publish(RegionKind::Profile, profile.to_json().unwrap().as_bytes())
     .unwrap();
   let args = ["--ignored", "--exact", "garbling_daemon", "--nocapture"].map(str::to_owned);
-  let policy = RestartPolicy::derive(config.failover_slo_ns);
+  let policy = RestartPolicy::derive(config.nfs_v4.lease_ns);
   let mut anchor = SupervisingTest(Supervisor::new(segment, &args, policy.get()).unwrap());
   anchor
     .0
@@ -12854,6 +13172,167 @@ fn a_volume_recovery_could_not_rebuild_is_listed_and_its_status_names_why() {
   refused_not_recovered(&instance, &["share", &id, "uid:4242", "--read"]);
 }
 
+/// A path under `root` exactly `bytes` long: components of at most 200 bytes, under the 255-byte name limit, so only
+/// the whole path's length is at stake.
+#[cfg(unix)]
+fn path_of_length(root: &str, bytes: usize) -> String {
+  let mut path = root.to_owned();
+  while path.len() < bytes {
+    let room = bytes - path.len() - 1;
+    path.push('/');
+    path.push_str(&"d".repeat(room.clamp(1, 200)));
+  }
+  assert_eq!(
+    path.len(),
+    bytes,
+    "a path of exactly {bytes} bytes under {root}"
+  );
+  path
+}
+
+/// §4.8, §4.4 `create` and `status` (A-263 on B9: the supervisor's bound on a recorded cause). A recovery cause names an
+/// overlay's base as recorded, so the base a volume records is bounded: the platform's path maximum, and no longer than
+/// the refusal every verb on an unrecovered volume answers holds whole (`slates_server::verbs::longest_recordable_base`).
+/// Do: create an overlay over a base of exactly that length, and try one a byte longer; snapshot the first, make its base
+/// unreadable to the daemon, and restart it in order. Expect: the longer base is refused `BaseUnavailable` before
+/// anything is made; the volume's `status` is refused `NotRecovered` naming `BaseUnavailable`, the whole base path and
+/// the host's refusal.
+#[cfg(unix)]
+#[test]
+fn the_longest_recorded_base_is_named_whole_by_status() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the longest recorded base: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-longbase-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-longbase"),
+  };
+  let longest = slates_server::verbs::longest_recordable_base();
+  let base = path_of_length(&scratch.path, longest);
+  shell(&format!("mkdir -p '{base}'"));
+  // Never made: it is refused before the daemon looks at the disk (on macOS no such directory can be made at all).
+  let longer = path_of_length(&scratch.path, longest + 1);
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "too-long",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &longer,
+    ],
+  );
+  assert_ne!(code, 0, "a base past the bound is refused: {out}");
+  assert!(err.contains("BaseUnavailable"), "refused by kind: {err}");
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "longest",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "a base of {longest} bytes is recorded: {err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "a snapshot recorded before the restart: {err}");
+  shell(&format!("chmod 000 '{base}'"));
+  restart_in_order(&instance);
+  let (code, out, err) = run(&instance, &["status", &id]);
+  shell(&format!("chmod 755 '{base}'"));
+  assert_ne!(code, 0, "the volume was not rebuilt: {out}");
+  assert!(
+    err.contains("NotRecovered") && err.contains("BaseUnavailable") && err.contains(&base),
+    "status names the {longest}-byte base whole, by kind: {err}"
+  );
+}
+
+/// Shape: the base files the drift test changes on disk after pinning: several replies' worth of drift.
+#[cfg(unix)]
+const CLI_DRIFTED: usize = 600;
+
+/// §4.4 `status`, A-267, by use. Do: overlay a host directory of 600 files, pin them, change every file on disk, and
+/// run `slates status ID --drift` until the drift is seen. Expect: it names all 600, once each, though the status reply
+/// carries only the first that fit; and `slates status ID` counts 600. Before, `--drift` printed the status's own list,
+/// and the text form counted only those.
+#[cfg(unix)]
+#[test]
+fn status_drift_names_every_drifted_entry_past_one_reply() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping status --drift past one reply: set SLATES_TEST_CLI=1 to run it (starts daemons)"
+    );
+    return;
+  }
+  let instance = format!("cli-drift-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let scratch = ScratchDir {
+    path: build_output_dir("slates-drift"),
+  };
+  let base = format!("{}/base", scratch.path);
+  shell(&format!(
+    "mkdir -p '{base}' && cd '{base}' && for n in $(seq -w 0 {}); do echo before > drifting-$n.txt; done",
+    CLI_DRIFTED - 1
+  ));
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "drifting",
+      "--bounded",
+      "64MiB",
+      "--base",
+      &base,
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["base", "pin", &id]);
+  assert_eq!(code, 0, "{err}");
+  shell(&format!(
+    "cd '{base}' && for f in drifting-*.txt; do echo 'after, and longer' > \"$f\"; done"
+  ));
+  let started = std::time::Instant::now();
+  let named = loop {
+    let (code, out, err) = run(&instance, &["status", &id, "--drift"]);
+    assert_eq!(code, 0, "{err}");
+    let lines: Vec<String> = out.lines().map(str::to_owned).collect();
+    if lines.len() >= CLI_DRIFTED || started.elapsed() > std::time::Duration::from_secs(30) {
+      break lines;
+    }
+    // A test waiting on the base's watcher between asks; the daemon is another process.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_millis(200));
+  };
+  assert_eq!(
+    named.len(),
+    CLI_DRIFTED,
+    "every drifted entry, once: {} named",
+    named.len()
+  );
+  let distinct: std::collections::BTreeSet<&String> = named.iter().collect();
+  assert_eq!(distinct.len(), CLI_DRIFTED, "each once");
+  let (code, out, err) = run(&instance, &["status", &id]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out
+      .lines()
+      .any(|line| line == format!("drifted: {CLI_DRIFTED}")),
+    "the status counts every drifted entry: {out}"
+  );
+}
+
 /// Bug (GAPS, 2026-11-08; §2 item 8, unbounded growth): a volume recovery could not rebuild was refused `NotRecovered`
 /// by `destroy` too, so its catalog record, its snapshots' records and its name stayed for good and an operator could
 /// not get rid of it. Do: make a volume over a host directory and snapshot it, remove the directory, restart the daemon
@@ -12905,4 +13384,85 @@ fn assert_gone(instance: &str, id: &str) {
     err.contains("NotFound"),
     "the destroyed volume is not found: {err}"
   );
+}
+
+/// Shape: how long the hold flow leaves its held attachment with no verb: several of the bare term a laptop daemon gives a
+/// CLI attachment nothing renews (its failover delay there, the recovery budget, A-363 and A-384), so only the hold kept
+/// it, and long enough after the hold's end for any term to lapse.
+const HOLD_IDLE: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// A-384, the CLI's holder: `slates attach --hold` keeps a CLI attachment alive from its process, and its end lets the
+/// attachment lapse. Do: on an anchored daemon, create a volume; run `attach ID --write --hold` in the background and
+/// read the attachment it names; leave the attachment with no verb for [`HOLD_IDLE`]; write a file under it from another
+/// `slates` process; kill the holding process; wait [`HOLD_IDLE`] again; write under it once more. Expect the holding
+/// process still running before its kill, the first write accepted (the hold kept the attachment through several bare
+/// terms), and the last refused `AttachmentExpired` (exit 1: the process's end ended the renewals). Gated like the CLI
+/// flow (`SLATES_TEST_CLI=1`): an anchor, its daemon and a process per verb.
+#[test]
+fn attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends() {
+  use std::io::BufRead;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the attach --hold flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-hold-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "held", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mut holder = slates()
+    .arg("--instance")
+    .arg(&instance)
+    .args(["attach", &id, "--write", "--hold"])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  let named = {
+    let stdout = holder.stdout.take().expect("the holder's output");
+    let mut lines = std::io::BufReader::new(stdout).lines();
+    lines.find_map(|line| {
+      line
+        .ok()
+        .and_then(|line| line.strip_prefix("attachment: ").map(str::to_owned))
+    })
+  };
+  let Some(attachment) = named else {
+    // The holder ended without naming one: what it said is the reason.
+    let output = holder.wait_with_output().unwrap();
+    panic!(
+      "the holder named no attachment: {}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+  };
+  #[allow(clippy::disallowed_methods)] // the held attachment with no verb, past several bare terms
+  std::thread::sleep(HOLD_IDLE);
+  let still_holding = holder.try_wait().unwrap().is_none();
+  let (written, _, written_err) =
+    run_with_stdin(&instance, &["write", &id, &attachment, "held.txt"], b"held");
+  let _killed = holder.kill();
+  let _reaped = holder.wait();
+  #[allow(clippy::disallowed_methods)] // the hold ended: any term lapses
+  std::thread::sleep(HOLD_IDLE);
+  let (late, _, late_err) =
+    run_with_stdin(&instance, &["write", &id, &attachment, "late.txt"], b"late");
+  drop(anchor);
+  assert!(
+    still_holding,
+    "the holding process was still running before its kill"
+  );
+  assert_eq!(
+    written, 0,
+    "the hold kept the attachment through several bare terms: {written_err}"
+  );
+  assert_eq!(
+    late, 1,
+    "the attachment lapsed once its holder ended: {late_err}"
+  );
+  assert!(late_err.contains("AttachmentExpired"), "{late_err}");
 }

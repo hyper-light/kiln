@@ -4,6 +4,7 @@
 //! - A landing ([`LandOutcome`]) is written, needs an approval, met conflicts, or was refused by a policy.
 //! - A merge ([`MergeOutcome`]) is merged at a green version, needs an approval, met conflicts, or was refused.
 //! - A rebase ([`RebaseOutcome`]) moved the work onto the green's head, or met conflicts.
+//! - A move of a volume to another fleet member ([`MoveProgress`], A-291) is under way, or done.
 //!
 //! **Conflicts are verdicts, never inferences (D-27, D-26).** The merge engine's verdict is accept, identical or
 //! conflict, and a landing's per-entry verdict is apply, skip, accept-identical or conflict (§4.15 step 4). A conflict
@@ -208,6 +209,8 @@ pub struct ActionTally {
   pub symlink: u64,
   /// Directories emptied and kept.
   pub clear: u64,
+  /// Files whose mode or Windows attribute bits alone are set, their bytes kept (A-458).
+  pub chmod: u64,
 }
 
 impl ActionTally {
@@ -222,6 +225,7 @@ impl ActionTally {
       self.rmdir,
       self.symlink,
       self.clear,
+      self.chmod,
     ]
     .iter()
     .fold(0u64, |sum, count| sum.saturating_add(*count))
@@ -250,8 +254,10 @@ pub struct LandingReport {
   pub held: u64,
   /// The durability the landing achieved (§4.15 step 8).
   pub durability: LandingDurability,
-  /// Every degraded cell met, in order.
+  /// Every degraded cell met, in order, as many as one reply holds (A-267).
   pub degraded: Vec<LandingDegradation>,
+  /// Degraded cells past what one reply holds (A-267).
+  pub degraded_elided: u32,
   /// The batch barriers taken (A-130).
   pub barriers: u64,
   /// How the landing's signature was judged against the manifest it wrote (A-321), as its finished audit record keeps
@@ -309,6 +315,7 @@ pub(crate) fn report_of(outcome: LandingOutcome) -> Result<LandingReport, Error>
     held: outcome.held,
     durability: outcome.durability,
     degraded: outcome.degraded,
+    degraded_elided: outcome.degraded_elided,
     barriers: outcome.barriers,
     verification: Verification::of_wire(outcome.verification),
   })
@@ -328,6 +335,7 @@ pub(crate) fn summary_of(summary: &LandingSummary) -> Summary {
       rmdir: typed.rmdir,
       symlink: typed.symlink,
       clear: typed.clear,
+      chmod: typed.chmod,
     },
     bytes: summary.bytes,
     filtered_out: summary.filtered_out,
@@ -383,6 +391,7 @@ mod tests {
         rmdir: 6,
         symlink: 7,
         clear: 8,
+        chmod: 9,
       },
     };
     let typed = summary_of(&summary);
@@ -396,11 +405,12 @@ mod tests {
         actions.mkdir,
         actions.rmdir,
         actions.symlink,
-        actions.clear
+        actions.clear,
+        actions.chmod
       ],
-      [1, 2, 3, 4, 5, 6, 7, 8]
+      [1, 2, 3, 4, 5, 6, 7, 8, 9]
     );
-    assert_eq!(actions.total(), 36);
+    assert_eq!(actions.total(), 45);
     assert_eq!((typed.bytes, typed.filtered_out), (7, 2));
   }
 
@@ -426,4 +436,24 @@ mod tests {
       Err(Error::Protocol(ProtocolFault::UnknownName { .. }))
     ));
   }
+}
+
+/// Where a volume's move to another fleet member stands after one ask ([`crate::Instance::move_volume`]; §4.10
+/// "Ownership follows the writer", A-291). A move goes on between asks; a consumer asks again until it is
+/// [`MoveProgress::Moved`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveProgress {
+  /// Under way: the volume is frozen on its owner, which waits for its records to be placed or for the configuration to
+  /// name the new owner. Every other verb on it is refused for now ([`crate::RetryCause::Overloaded`]).
+  Moving {
+    /// The member it moves to.
+    to: u64,
+  },
+  /// Done: the configuration names the new owner, where the volume's verbs go now. The new owner answers them once it
+  /// serves the volume (until then [`crate::RetryCause::Overloaded`]), and the old owner lets its copy go once the new
+  /// owner has placed the volume under its own placement.
+  Moved {
+    /// The member it moved to.
+    to: u64,
+  },
 }

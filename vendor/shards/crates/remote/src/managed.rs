@@ -1249,10 +1249,9 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use super::*;
+    use shards_testwait::{party, received, waited};
 
-    /// How long a test waits for what it awaits: a patience of its own.
-    const PATIENCE: Duration = Duration::from_secs(10);
+    use super::*;
 
     fn waiting(at: u64) -> Slot {
         Slot::Waiting {
@@ -1827,6 +1826,8 @@ mod tests {
 
     impl Pair {
         fn subscribed() -> Pair {
+            // Its test's party, before any thread of it is made: its waits count its own.
+            party::of_test();
             let server = Identity::generate().unwrap();
             let owner_identity = Identity::generate().unwrap();
             let (bound, producer, control) =
@@ -1859,11 +1860,11 @@ mod tests {
             let server = server.fingerprint();
             let endpoint_driver = std::thread::Builder::new()
                 .name("managed-endpoint".into())
-                .spawn(move || bound.run())
+                .spawn(party::carried(move || bound.run()))
                 .unwrap();
             let owner_driver = std::thread::Builder::new()
                 .name("managed-owner".into())
-                .spawn(move || driver.run())
+                .spawn(party::carried(move || driver.run()))
                 .unwrap();
             asks.send(Command::Handler(Ask::Connect(address))).unwrap();
             let pair = Pair {
@@ -1878,7 +1879,7 @@ mod tests {
                 heard,
                 changed,
             };
-            let subscribed = pair.until(PATIENCE, |state| matches!(state, State::Ready(_)));
+            let subscribed = pair.until(|state| matches!(state, State::Ready(_)));
             assert!(
                 subscribed.is_ok(),
                 "never subscribed: {subscribed:?}; its owner heard {:?}",
@@ -1898,24 +1899,26 @@ mod tests {
                 .collect()
         }
 
-        /// How long the endpoint's slot took to be as `want` has it, or how it was at `within`.
-        /// Each change of the slot wakes `on_credit`'s waker.
-        fn until(&self, within: Duration, want: impl Fn(State) -> bool) -> Result<Duration, State> {
+        /// How long the endpoint's slot took to be as `want` has it, waited for as long as its
+        /// test's threads run (D215's judged wait, shards-testwait); or how it was where its
+        /// wait was given up on, or its waker went. Each change of the slot wakes `on_credit`'s
+        /// waker.
+        fn until(&self, want: impl Fn(State) -> bool) -> Result<Duration, State> {
             let start = Instant::now();
-            loop {
-                let state = self.control.state();
-                if want(state) {
-                    return Ok(start.elapsed());
+            let got = shards_testwait::answered(|patience| {
+                if want(self.control.state()) {
+                    return Ok(Some(start.elapsed()));
                 }
-                let left = within.checked_sub(start.elapsed()).ok_or(state)?;
-                if self.changed.recv_timeout(left).is_err() {
-                    let state = self.control.state();
-                    return if want(state) {
-                        Ok(start.elapsed())
-                    } else {
-                        Err(state)
-                    };
+                match self.changed.recv_timeout(patience) {
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(()),
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {
+                        Ok(want(self.control.state()).then(|| start.elapsed()))
+                    }
                 }
+            });
+            match got {
+                Ok(Ok(took)) => Ok(took),
+                Ok(Err(())) | Err(_) => Err(self.control.state()),
             }
         }
     }
@@ -1933,18 +1936,25 @@ mod tests {
         }
     }
 
-    /// A subscription quiet for many of its windows (finding H1, docs/research/measurements/
-    /// harness-bringup-v1: a channel a harness says nothing on is no idle connection), then
-    /// given one record: neither side has an idle timeout or a keep-alive to hold it (D180's
-    /// liveness at use), it lives through the silence, and carries the record whole.
+    /// A subscription quiet until its party is still a whole W* past every deadline it waits
+    /// until (finding H1, docs/research/measurements/harness-bringup-v1: a channel a harness
+    /// says nothing on is no idle connection), then given one record: neither side has an idle
+    /// timeout or a keep-alive to hold it (D180's liveness at use), it lives through the
+    /// silence, and carries the record whole. Its silence is no window of the test's: each
+    /// driver's next judgment is its party's deadline (shards-testwait's `Waiting`), so that a
+    /// look of either side's that would end a quiet connection has come before its wait on its
+    /// party's stillness ends; and neither side's transport has a timer that ends one, with no
+    /// idle timeout ([`transport_of`], `tls::transport`).
     #[test]
     fn a_quiet_subscription_lives_with_no_idle_timeout_or_keep_alive() {
         let pair = Pair::subscribed();
-        std::thread::sleep(PATIENCE);
+        let quiet = Instant::now();
+        waited(|| false).unwrap_err();
         let state = pair.control.state();
         assert!(
             matches!(state, State::Ready(_)),
-            "a subscription was let go in {PATIENCE:?} of silence: {state:?}; its owner heard {:?}",
+            "a subscription was let go in {:?} of silence: {state:?}; its owner heard {:?}",
+            quiet.elapsed(),
             pair.heard()
         );
         let record = b"after-quiet\n";
@@ -1957,7 +1967,7 @@ mod tests {
         frame.extend_from_slice(record);
         let mut got = Vec::new();
         while got.len() < frame.len() {
-            match pair.heard.recv_timeout(PATIENCE) {
+            match received(&pair.heard) {
                 Ok(Heard::Bytes(bytes)) => got.extend_from_slice(&bytes),
                 other => panic!("the record after the silence: {other:?}, after {got:?}"),
             }
@@ -1978,6 +1988,8 @@ mod tests {
     /// takes that long to be answered (3.2-3.4 s on adas-mac-studio.local).
     #[test]
     fn a_vanished_owners_place_goes_to_its_successor_as_it_dials() {
+        // Every RTT sample its endpoint takes of its owner comes within its owner's life.
+        let lived = Instant::now();
         let mut pair = Pair::subscribed();
         // A record first, consumed: its endpoint has seen its owner answer, and so has a window
         // to judge it by (a holder whose path showed no answer never stalls, D180's cold start;
@@ -1988,7 +2000,7 @@ mod tests {
         bytes.extend_from_slice(warm);
         pair.producer.submit(bytes).unwrap();
         loop {
-            match pair.heard.recv_timeout(PATIENCE) {
+            match received(&pair.heard) {
                 Ok(Heard::Bytes(bytes)) if bytes.windows(warm.len()).any(|w| w == warm) => break,
                 Ok(Heard::Bytes(_)) => {}
                 other => panic!("the first record never came: {other:?}"),
@@ -1997,20 +2009,26 @@ mod tests {
         pair.owner
             .send(Command::Handler(Ask::Consume(warm.len() as u64)))
             .unwrap();
-        let consumed = pair.until(
-            PATIENCE,
-            |state| matches!(state, State::Ready(at) if at.consumed == warm.len() as u64),
-        );
+        let consumed =
+            pair.until(|state| matches!(state, State::Ready(at) if at.consumed == warm.len() as u64));
         assert!(consumed.is_ok(), "{consumed:?}");
         pair.owner.send(Command::Handler(Ask::Vanish)).unwrap();
         pair.owner_driver.take().unwrap().join().unwrap().unwrap();
+        let life = lived.elapsed();
         let mut bytes = pair.producer.take_buffer().unwrap().unwrap();
         bytes.extend_from_slice(b"to nobody\n");
         pair.producer.submit(bytes).unwrap();
         let start = Instant::now();
-        let patience = PATIENCE * 3;
         let mut refused = 0;
+        // Its endpoint's absence from before its first attempt asks the vanished owner on, which
+        // moves that ask with it (D180, `net::Liveness::absent`).
+        let absence = crate::net::Absence::of(pair.control.sender.view());
+        let mut due: Option<Instant> = None;
         let heard = loop {
+            if let Some(due) = due {
+                let until = due + absence.since();
+                std::thread::sleep(until.saturating_duration_since(Instant::now()));
+            }
             let (hears, heard) = mpsc::channel();
             let config = client_config(&pair.owner_identity, pair.server, admitted()).unwrap();
             let (mut driver, asks) = Driver::bind_bounded(
@@ -2031,16 +2049,35 @@ mod tests {
                 },
             )
             .unwrap();
-            let running = std::thread::spawn(move || driver.run());
+            let running = party::spawn_member(move || driver.run());
+            let began = Instant::now();
             asks.send(Command::Handler(Ask::Connect(pair.address))).unwrap();
-            let got = heard.recv_timeout(patience);
+            let got = received(&heard);
             asks.request_stop();
             running.join().unwrap().unwrap();
             match got {
-                // Dialing again at managed/input.rs's successor's pace.
-                Ok(Heard::Lost(_)) if start.elapsed() < patience => {
+                // Refused while its endpoint still holds the vanished owner's place, which it
+                // asks for an answer (a PING): unheard past its probe timeout since (D180), its
+                // place is the next attempt's, made past that time as its owner's life bounds it
+                // (`probe_timeout_within`), moved on by what its endpoint was absent since before
+                // its ask, as it judges on the time it was there to hear (`Liveness::absent`). A
+                // refusal of an attempt begun past that is the place never let go. Before, its
+                // party's stillness, which its endpoint's probes of its vanished owner never let
+                // come (CI 44227612442, aarch64 gnu: held to the step's limit); then the probe
+                // timeout alone, which a loaded host's absence outlasts (CI 44245219858's net.rs
+                // newcomers).
+                Ok(Heard::Lost(_)) => {
+                    if let Some(due) = due {
+                        let absent = absence.since();
+                        assert!(
+                            began < due + absent,
+                            "refused {:?} past its holder's time (its endpoint absent {absent:?} of it): the vanished owner's place never let go",
+                            began.saturating_duration_since(due + absent)
+                        );
+                    } else {
+                        due = Some(Instant::now() + crate::net::probe_timeout_within(life));
+                    }
                     refused += 1;
-                    std::thread::sleep(Duration::from_millis(100));
                 }
                 other => break other,
             }

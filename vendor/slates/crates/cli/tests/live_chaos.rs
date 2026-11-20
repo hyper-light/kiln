@@ -938,8 +938,8 @@ impl Fleet {
   }
 
   /// [`create_volume`] on `owner`, shared with every other node ([`Self::share`]).
-  fn create_volume(&self, owner: &str, name: &str, live: bool) -> String {
-    let id = create_volume(owner, name, live);
+  fn create_volume(&self, owner: &str, name: &str, live: bool, claim: Claim) -> String {
+    let id = create_volume(owner, name, live, claim);
     self.share(owner, &id);
     id
   }
@@ -1067,7 +1067,7 @@ const FILE_ROOM: usize = 2;
 /// Derived: a flow's volume holds every file a stream can write, `STREAM_FILES` × `WRITE_BYTES` × [`FILE_ROOM`], in
 /// MiB, so no flow is ever refused for space before it is stopped. A fixed 64 MiB held 16,384 writes, and a 10 s
 /// release stream with the live checkpoint fix wrote 16,404 and failed on its last 20 (live-durability, CI
-/// diag-live-durability-7, 2026-11-07). It is a quota, not memory: the daemons hold only what was written.
+/// diag-live-durability-7, 2026-11-07). As a bounded claim it is memory as well as a quota ([`Claim::Bounded`]).
 fn volume_bound_mib() -> usize {
   STREAM_FILES
     .saturating_mul(WRITE_BYTES)
@@ -1075,11 +1075,30 @@ fn volume_bound_mib() -> usize {
     .div_ceil(1 << 20)
 }
 
-/// Creates a volume on `owner` (live-shipped when `live`): its id.
-fn create_volume(owner: &str, name: &str, live: bool) -> String {
+/// How a flow's volume claims its room (§4.2), always up to [`volume_bound_mib`].
+#[derive(Clone, Copy, Debug)]
+enum Claim {
+  /// A bounded claim: its owner's shard reserves the whole bound at the create, and its successor's shard again at a
+  /// takeover (`verbs::make_restored`; §4.2 "sacred bounded claims"), so a pressure hold raised after the create
+  /// refuses none of a stream's writes. The bound is 782 MiB, 76 % of a shard's 1 GiB reserve on CI's 7 GB macOS
+  /// runner (`reserve=1073741824`), so a node there holds one such claim on each of its two shards. A flow that keeps
+  /// one volume makes it so.
+  Bounded,
+  /// A dynamic volume: it holds only what was written, on its owner and on a successor alike (A-342). A flow that
+  /// keeps several volumes on one fleet makes them so, or a successor holding one bounded claim on the shard a later
+  /// volume routes to cannot take that volume over.
+  Dynamic,
+}
+
+/// Creates a volume on `owner` under `claim` (live-shipped when `live`): its id.
+fn create_volume(owner: &str, name: &str, live: bool, claim: Claim) -> String {
   let bound = format!("{}MiB", volume_bound_mib());
+  let class = match claim {
+    Claim::Bounded => "--bounded",
+    Claim::Dynamic => "--dynamic",
+  };
   let id = value_of(
-    &run_ready(owner, &["volume", "create", name, "--bounded", &bound]),
+    &run_ready(owner, &["volume", "create", name, class, &bound]),
     "id",
   );
   if live {
@@ -1722,6 +1741,51 @@ fn read_bound() -> Duration {
     .saturating_add(lease)
 }
 
+/// One write of `file` to `volume` through `instance`, given the fleet wait to be answered (acknowledged or refused): a
+/// reply held longer than the durable wait's bound (the failover SLO, A-354) is a reply held for good. Past it the fleet
+/// is shown whole ([`diagnosis`]) and its daemons killed, so the client is told and the flow fails here with the state
+/// that held the write, where before it hung: the long-log flow waited out its 1,700 s cap after "taken over" on arm64
+/// (CI run 44331494887, main 68148152d), and the lossy flow 21 minutes on a Mac Studio.
+fn write_answered_within(
+  instance: &str,
+  volume: &str,
+  file: usize,
+  began: &Instant,
+) -> Vec<Outcome> {
+  std::thread::scope(|scope| {
+    let writer = scope.spawn(|| {
+      Stream {
+        instance,
+        volume: volume_id_of(volume),
+        began: *began,
+      }
+      .run(file..file + 1, &AtomicBool::new(false))
+    });
+    let waited = Instant::now();
+    while !writer.is_finished() {
+      if waited.elapsed() > FLEET_WAIT {
+        let instances = DIAGNOSED.with(|instances| instances.borrow().clone());
+        eprintln!(
+          "chaos: a write on {instance} was never answered within {FLEET_WAIT:?}:\n{}",
+          diagnosis(&instances, volume)
+        );
+        for node in &instances {
+          if let Some(pid) = daemon_pid(node) {
+            send_signal(pid, rustix::process::Signal::KILL);
+          }
+        }
+        let outcome = writer.join().unwrap();
+        panic!(
+          "a write on {instance} was never answered within {FLEET_WAIT:?} (the fleet's state is printed above): \
+           {outcome:?}"
+        );
+      }
+      pause();
+    }
+    writer.join().unwrap()
+  })
+}
+
 /// Writes through `successor` one file at a time from `files`, until one is acknowledged or the fleet wait passes, then
 /// reads the head it ships `volume` from: its first head, the one [`continuity`] judges (`None` if no write was
 /// acknowledged). Every outcome comes back too, for NoLoss.
@@ -1734,12 +1798,7 @@ fn first_write_through(
   let deadline = Instant::now() + FLEET_WAIT;
   let mut written = Vec::new();
   for file in files {
-    let outcome = Stream {
-      instance: successor,
-      volume: volume_id_of(volume),
-      began: *began,
-    }
-    .run(file..file + 1, &AtomicBool::new(false));
+    let outcome = write_answered_within(successor, volume, file, began);
     let acknowledged = outcome.iter().any(|outcome| outcome.refused.is_none());
     written.extend(outcome);
     if acknowledged || Instant::now() >= deadline {
@@ -2361,7 +2420,7 @@ fn a_candidate_killed_mid_stream_catches_up_and_its_copy_serves_a_takeover() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let killed_index = fleet.others(owner_index)[0];
-  let volume = fleet.create_volume(&owner, "killed-candidate", true);
+  let volume = fleet.create_volume(&owner, "killed-candidate", true, Claim::Bounded);
   let mut verdict = Verdict::new("a candidate killed mid-stream");
   let instances = fleet.instances.clone();
   let (outcomes, samples) = stream_through(&instances, &owner, &volume, 0..STREAM_FILES, |began| {
@@ -2550,7 +2609,7 @@ fn candidates_partitioned_in_turn(tag: &str, flow: &'static str, partition: Part
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, tag, true);
+  let volume = fleet.create_volume(&owner, tag, true, Claim::Bounded);
   let mut verdict = Verdict::new(flow);
   let mut epoch_before = None;
   let mut probes = Vec::new();
@@ -2709,7 +2768,7 @@ fn writes_stream_through_random_candidate_stalls() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "jitter", true);
+  let volume = fleet.create_volume(&owner, "jitter", true, Claim::Bounded);
   let mut verdict = Verdict::new("writes through random candidate stalls");
   let pids: Vec<u32> = fleet
     .others(owner_index)
@@ -2837,7 +2896,7 @@ fn a_live_volume_destroyed_with_writes_waiting_refuses_them_and_keeps_nothing() 
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "destroy-wait", true);
+  let volume = fleet.create_volume(&owner, "destroy-wait", true, Claim::Bounded);
   let mut verdict = Verdict::new("a live volume destroyed with writes waiting");
   let mut destroyed_at = Duration::ZERO;
   let (outcomes, samples) = stream_through(
@@ -2979,7 +3038,7 @@ fn clients_killed_while_their_writes_wait_leave_no_reply_held() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "cut-waiting", true);
+  let volume = fleet.create_volume(&owner, "cut-waiting", true, Claim::Bounded);
   let mut verdict = Verdict::new("clients killed while their writes wait");
   let began = Instant::now();
   let stop_sampling = AtomicBool::new(false);
@@ -3103,7 +3162,7 @@ fn a_destroy_then_the_owners_loss(live: bool, unheard: bool) {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, tag, live);
+  let volume = fleet.create_volume(&owner, tag, live, Claim::Bounded);
   let mut verdict = Verdict::new(match (live, unheard) {
     (true, true) => "a live volume's unheard destroy, then its owner's loss",
     (true, false) => "a live volume's destroy, then its owner's loss",
@@ -3419,7 +3478,7 @@ fn a_candidates_store_destroyed_mid_stream_is_rebuilt_and_serves_a_takeover() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let replaced_index = fleet.others(owner_index)[0];
-  let volume = fleet.create_volume(&owner, "replaced-candidate", true);
+  let volume = fleet.create_volume(&owner, "replaced-candidate", true, Claim::Bounded);
   let mut verdict = Verdict::new("a candidate's store destroyed mid-stream");
   let instances = fleet.instances.clone();
   let fleet_cell = std::cell::RefCell::new(&mut fleet);
@@ -3566,7 +3625,7 @@ fn writes_stream_on_a_quiet_fleet() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "quiet", true);
+  let volume = fleet.create_volume(&owner, "quiet", true, Claim::Bounded);
   let mut verdict = Verdict::new("writes on a quiet fleet");
   let (outcomes, samples) =
     stream_through(&fleet.instances, &owner, &volume, 0..STREAM_FILES, |_| {
@@ -3874,7 +3933,7 @@ fn a_long_live_log_is_taken_over_whole() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "long-log", true);
+  let volume = fleet.create_volume(&owner, "long-log", true, Claim::Bounded);
   let mut verdict = Verdict::new("a long live log taken over");
   // Streamed in steps the stall guard watches (40 durable writes within the fleet wait each), so a write the daemon
   // never answers fails the flow with the fleet printed, where one long stream ran into the test's own timeout.
@@ -3960,7 +4019,7 @@ fn a_live_entry_past_one_chunk_is_taken_over_whole() {
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
-  let volume = fleet.create_volume(&owner, "big-entry", true);
+  let volume = fleet.create_volume(&owner, "big-entry", true, Claim::Bounded);
   let mut verdict = Verdict::new("a live entry past one chunk taken over");
   let id = volume_id_of(&volume);
   let big: Vec<u8> = (0..BIG).map(|at| u8::try_from(at % 251).unwrap()).collect();
@@ -4103,7 +4162,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     .min_by_key(|index| *index == fleet.bootstrap)
     .expect("a five-member fleet seats three voters, so two members hold no seat");
   let owner = instances[owner_index].clone();
-  let volume = fleet.create_volume(&owner, "fresh-member", true);
+  let volume = fleet.create_volume(&owner, "fresh-member", true, Claim::Bounded);
   let mut verdict = Verdict::new("a member that never held the log at a takeover");
   verdict.note(format!(
     "owner {owner}; council seats at {:?}",
@@ -4308,6 +4367,7 @@ fn a_member_that_never_held_the_log_never_stands_in_for_its_holder() {
     (&fleet, &survivors),
     (&volume, &outcomes),
     samples.iter().map(|sample| &sample.state).chain(&last_look),
+    last_look.iter().find(|state| !state.holding),
   );
   drop(fleet);
   verdict.judge();
@@ -4331,6 +4391,42 @@ fn write_set(recorded: &std::collections::BTreeSet<String>, named: &[String]) ->
 /// here again so the judge does not take its rule from the code it judges), and only an unfenced holder can accept one.
 fn stale_owner_can_commit(holders: usize, unfenced: usize, tolerated: usize) -> bool {
   unfenced > 0 && unfenced >= holders.saturating_sub(tolerated).max(tolerated)
+}
+
+/// The holder sets a superseded owner counts a write's durability from, as its own last `live` line showed them before
+/// its loss: its active holders and, while a transition is in flight, the set it is moving to (a joint transition counts
+/// both); the set its catalog records when it shows neither. Empty when the owner showed no shipping line.
+fn superseded_cohorts(superseded: Option<&LiveState>) -> Vec<Vec<String>> {
+  let Some(owner) = superseded.filter(|state| !state.holding) else {
+    return Vec::new();
+  };
+  let cohorts: Vec<Vec<String>> = [&owner.holders, &owner.moving_to]
+    .into_iter()
+    .filter(|cohort| !cohort.is_empty())
+    .cloned()
+    .collect();
+  if cohorts.is_empty() && !owner.recorded.is_empty() {
+    return vec![owner.recorded.clone()];
+  }
+  cohorts
+}
+
+/// [`stale_owner_can_commit`] over a superseded owner's `cohorts` ([`superseded_cohorts`]): it could still commit only
+/// where the holders still below the takeover's fence (`unfenced`, member ids) reach the write count in every cohort it
+/// counts, since a joint transition needs the count in each.
+fn stale_owner_can_commit_jointly(
+  cohorts: &[Vec<String>],
+  unfenced: &[String],
+  tolerated: usize,
+) -> bool {
+  !cohorts.is_empty()
+    && cohorts.iter().all(|cohort| {
+      let below = cohort
+        .iter()
+        .filter(|holder| unfenced.contains(holder))
+        .count();
+      stale_owner_can_commit(cohort.len(), below, tolerated)
+    })
 }
 
 /// StaleNeverCommits on the holders' fences: a violation only where the unfenced holders could still make a write count
@@ -4387,6 +4483,51 @@ fn a_superseded_owner_can_commit_only_where_its_unfenced_holders_reach_the_write
   );
 }
 
+/// §4.8's StaleNeverCommits judged by the superseded owner's own holder sets (goal g229). Do: judge the fresh-member
+/// flow's failing run on main 68148152d (CI run 44331494887, x86_64): the dead owner's holders d and b, the successor d
+/// adding c, whose copy from an older set was still below the fence; then the same owner with b unfenced, and an owner
+/// in a transition. Expect: c, which the dead owner never counted, no violation; b, one of its two, a violation; and in
+/// a transition from `[d, b]` to `[b, c]`, b (in both cohorts) a violation and c (in one) none. The judge read the
+/// successor's sets before, and called the first run's c a violation.
+#[test]
+fn a_superseded_owner_is_judged_by_its_own_holder_sets_not_its_successors() {
+  let owner = |holders: &[&str], moving_to: &[&str]| LiveState {
+    holding: false,
+    head: Some(3345),
+    durable: Some(3344),
+    owed: false,
+    epoch: Some(1),
+    identity: None,
+    fence: 1,
+    holders: holders.iter().map(|host| (*host).to_owned()).collect(),
+    moving_to: moving_to.iter().map(|host| (*host).to_owned()).collect(),
+    recorded: holders.iter().map(|host| (*host).to_owned()).collect(),
+  };
+  let judged = |owner: &LiveState, unfenced: &[&str]| {
+    let unfenced: Vec<String> = unfenced.iter().map(|host| (*host).to_owned()).collect();
+    stale_owner_can_commit_jointly(&superseded_cohorts(Some(owner)), &unfenced, FLEET_F)
+  };
+  let settled = owner(&["d", "b"], &[]);
+  assert!(
+    !judged(&settled, &["c"]),
+    "a holder the dead owner never counted cannot make its write"
+  );
+  assert!(judged(&settled, &["b"]), "one of its two holders can");
+  let moving = owner(&["d", "b"], &["b", "c"]);
+  assert!(
+    judged(&moving, &["b"]),
+    "a holder in both cohorts reaches the count in each"
+  );
+  assert!(
+    !judged(&moving, &["c"]),
+    "a holder in the new cohort alone leaves the old one short"
+  );
+  assert!(
+    superseded_cohorts(None).is_empty(),
+    "an owner that showed no line names no cohort"
+  );
+}
+
 /// The end of the fresh-member flow: a survivor serves `volume` with every acknowledged write, and every holder the
 /// takeover counted is fenced at its epoch. Those are read from the successor: the holder set its catalog records (the
 /// set its phase one counted, which a transition may have recorded before the old owner activated it) and its own
@@ -4397,6 +4538,7 @@ fn judge_served<'a>(
   (fleet, survivors): (&Fleet, &[&str]),
   (volume, outcomes): (&str, &[Outcome]),
   observed: impl IntoIterator<Item = &'a LiveState>,
+  superseded: Option<&LiveState>,
 ) {
   match wait_serving(survivors, volume, outcomes) {
     Some((successor, took)) => {
@@ -4416,13 +4558,32 @@ fn judge_served<'a>(
         .into_iter()
         .flat_map(|state| state.recorded.into_iter().chain(state.holders))
         .collect();
+      // The holders the superseded owner could still count a write from are its own, as its last line before its loss
+      // showed them ([`superseded_cohorts`]), never the successor's: A-343 publishes the volume at its takeover, so the
+      // successor's line names its own holders at once, a transition's new member among them (a run on main 68148152d
+      // judged a holder the successor was only adding, its copy from an older set still below the fence, and called it a
+      // violation: CI run 44331494887, x86_64). The successor's sets stand in only when the owner showed no line.
+      let cohorts = superseded_cohorts(superseded);
+      let owners_holders: std::collections::BTreeSet<&String> = cohorts.iter().flatten().collect();
       let counted: Vec<&str> = hosts
         .iter()
-        .filter(|(host, survivor)| named.contains(host) && **survivor != successor)
+        .filter(|(host, survivor)| {
+          **survivor != successor
+            && if cohorts.is_empty() {
+              named.contains(host)
+            } else {
+              owners_holders.contains(host)
+            }
+        })
         .map(|(_, survivor)| *survivor)
         .collect();
       verdict.note(format!(
-        "the successor's recorded and active holders among the survivors: {counted:?}"
+        "the holders the takeover superseded among the survivors: {counted:?} (by {})",
+        if cohorts.is_empty() {
+          "the successor's recorded and active sets"
+        } else {
+          "the old owner's own sets"
+        }
       ));
       let unfenced = fenced_at_or_above(&counted, volume, epoch);
       if !unfenced.is_empty() {
@@ -4433,7 +4594,34 @@ fn judge_served<'a>(
           diagnosis(&shown, volume)
         ));
       }
-      judge_fences(verdict, write_set(&recorded, &named), unfenced);
+      if cohorts.is_empty() {
+        judge_fences(verdict, write_set(&recorded, &named), unfenced);
+      } else {
+        let unfenced_hosts: Vec<String> = hosts
+          .iter()
+          .filter(|(host, survivor)| {
+            owners_holders.contains(host)
+              && **survivor != successor
+              && !fenced_at_or_above(&[**survivor], volume, epoch).is_empty()
+          })
+          .map(|(host, _)| host.clone())
+          .collect();
+        let violations = if stale_owner_can_commit_jointly(&cohorts, &unfenced_hosts, FLEET_F) {
+          unfenced
+        } else {
+          if !unfenced.is_empty() {
+            verdict.note(format!(
+              "below the takeover's fence, fewer than a write needs of the old owner's holders {cohorts:?}: \
+               {unfenced:?}"
+            ));
+          }
+          Vec::new()
+        };
+        verdict.check(
+          "StaleNeverCommits (the counted holders' fences)",
+          violations,
+        );
+      }
       let others: Vec<&str> = survivors
         .iter()
         .copied()
@@ -4673,6 +4861,13 @@ fn answered_within(
 /// returns; then replace the dead node with a fresh member, which owns the next iteration's volume. Expect a survivor to
 /// serve the probe and every file before it, byte for byte, each time: a write's answer means it is durable on `f + 1`
 /// hosts, so no window between the answer and the owner's death may lose it.
+///
+/// The volumes are dynamic ([`Claim::Dynamic`]): the two survivors keep every iteration's volume they took over. As
+/// bounded claims of the stream's bound, iterations 3 and 4 failed on CI's 7 GB macOS runner (diag-supervisor-live-2,
+/// 2026-11-18): both of their successor's shards already held a taken-over claim of 782 MiB of their 1 GiB, so its
+/// restore was refused `BudgetExceeded` once a period for the failover SLO's 100 periods and the volume given up
+/// (`fleet.materialize.given_up`), while the other survivor held the whole log through the probe (head 9 of an NFS
+/// iteration's log, head 8 of a client-write iteration's, the heads the passing iterations' successors adopted).
 #[test]
 fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor() {
   /// Shape: the iterations, alternating the barrier.
@@ -4686,81 +4881,220 @@ fn a_write_answered_the_instant_before_its_owner_dies_is_served_by_its_successor
   let mut verdict = Verdict::new("a write answered the instant before its owner dies");
   let owner_index = fleet.owner_index();
   for iteration in 0..ITERATIONS {
-    let barrier = if iteration % 2 == 0 {
-      Barrier::ClientWrite
-    } else {
-      Barrier::NfsFileSync
-    };
     let owner = fleet.instances[owner_index].clone();
-    let volume = fleet.create_volume(&owner, &format!("kill-at-ack-{iteration}"), true);
-    let files: Vec<(String, Vec<u8>)> = (0..=BEFORE)
-      .map(|file| {
-        let name = format!("ack-{iteration}-{file}");
-        let body = chaos_body(iteration * (BEFORE + 1) + file);
-        (name, body)
-      })
-      .collect();
-    let (probe, before) = files.split_last().unwrap();
-    let answered = answered_within(&fleet.instances, &volume, || {
-      for (name, body) in before {
-        write_through(&owner, &volume, Barrier::ClientWrite, name, body);
-      }
-      write_through(&owner, &volume, barrier, &probe.0, &probe.1);
-    });
-    if let Err(state) = answered {
-      verdict.check(
-        &format!("every write answered, iteration {iteration} ({barrier:?})"),
-        vec![format!(
-          "a write on {owner} was not answered within the fleet wait:\n{state}"
-        )],
-      );
+    let volume = fleet.create_volume(
+      &owner,
+      &format!("kill-at-ack-{iteration}"),
+      true,
+      Claim::Dynamic,
+    );
+    let round = (iteration, BEFORE, barrier_of(iteration));
+    if kill_at_ack(&mut fleet, (owner_index, &volume), round, &mut verdict) == AckRound::Stopped {
       break;
     }
-    // The instant the probe's answer is back, the owner is gone.
-    fleet.kill_node(owner_index);
-    let survivors: Vec<String> = fleet
-      .others(owner_index)
-      .into_iter()
-      .map(|index| fleet.instances[index].clone())
-      .collect();
-    let refs: Vec<&str> = survivors.iter().map(String::as_str).collect();
-    match wait_reads(&refs, &volume, &probe.0, &probe.1) {
-      Some((successor, took)) => {
-        let lost: Vec<String> = before
-          .iter()
-          .filter(|(name, body)| {
-            Client::connect(successor, deadlines())
-              .ok()
-              .and_then(|mut client| {
-                client
-                  .read(volume_id_of(&volume), &format!("/{name}"), ReadAt::Head)
-                  .ok()
-              })
-              .is_none_or(|bytes| bytes != *body)
-          })
-          .map(|(name, _)| name.clone())
-          .collect();
-        verdict.note(format!(
-          "iteration {iteration} ({barrier:?}): {successor} served the probe {took:?} after the owner's death"
-        ));
-        verdict.check(
-          &format!("NoLoss, iteration {iteration} (earlier files)"),
-          lost,
-        );
-      }
-      None => verdict.check(
-        &format!("NoLoss, iteration {iteration} ({barrier:?})"),
-        vec![format!(
-          "no survivor served {} within the fleet wait:\n{}",
-          probe.0,
-          diagnosis(&survivors, &volume)
-        )],
-      ),
-    }
-    // The dead node's replacement, a fresh member at the same index, owns the next iteration's volume.
-    fleet.replace_node(owner_index);
-    fleet.wait_rejoined();
   }
+  drop(fleet);
+  verdict.judge();
+}
+
+/// The barrier an iteration of the kill-at-acknowledgement flows writes its probe through: the client's `fs_write` and a
+/// userspace NFS `FILE_SYNC` write, in turn.
+fn barrier_of(iteration: usize) -> Barrier {
+  if iteration.is_multiple_of(2) {
+    Barrier::ClientWrite
+  } else {
+    Barrier::NfsFileSync
+  }
+}
+
+/// What one iteration of the kill-at-acknowledgement flows came to ([`kill_at_ack`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AckRound {
+  /// The owner was killed at the probe's answer, a survivor's service judged, and the dead node replaced.
+  Judged,
+  /// A write was not answered within the fleet wait (judged so): the fleet's daemons are gone, and the flow stops.
+  Stopped,
+}
+
+/// One iteration of the kill-at-acknowledgement flows on `volume`, live-shipped from the node at `owner_index`: `before`
+/// files written, then a probe through `barrier`, the owner SIGKILLed the instant the probe's answer returns, the probe
+/// and every file before it required of a survivor byte for byte (NoLoss), and the dead node replaced by a fresh member,
+/// which owns the next iteration's volume.
+fn kill_at_ack(
+  fleet: &mut Fleet,
+  (owner_index, volume): (usize, &str),
+  (iteration, before, barrier): (usize, usize, Barrier),
+  verdict: &mut Verdict,
+) -> AckRound {
+  let owner = fleet.instances[owner_index].clone();
+  let files: Vec<(String, Vec<u8>)> = (0..=before)
+    .map(|file| {
+      let name = format!("ack-{iteration}-{file}");
+      let body = chaos_body(iteration * (before + 1) + file);
+      (name, body)
+    })
+    .collect();
+  let (probe, earlier) = files.split_last().unwrap();
+  let answered = answered_within(&fleet.instances, volume, || {
+    for (name, body) in earlier {
+      write_through(&owner, volume, Barrier::ClientWrite, name, body);
+    }
+    write_through(&owner, volume, barrier, &probe.0, &probe.1);
+  });
+  if let Err(state) = answered {
+    verdict.check(
+      &format!("every write answered, iteration {iteration} ({barrier:?})"),
+      vec![format!(
+        "a write on {owner} was not answered within the fleet wait:\n{state}"
+      )],
+    );
+    return AckRound::Stopped;
+  }
+  // The instant the probe's answer is back, the owner is gone.
+  fleet.kill_node(owner_index);
+  let survivors: Vec<String> = fleet
+    .others(owner_index)
+    .into_iter()
+    .map(|index| fleet.instances[index].clone())
+    .collect();
+  let refs: Vec<&str> = survivors.iter().map(String::as_str).collect();
+  match wait_reads(&refs, volume, &probe.0, &probe.1) {
+    Some((successor, took)) => {
+      let lost: Vec<String> = earlier
+        .iter()
+        .filter(|(name, body)| {
+          Client::connect(successor, deadlines())
+            .ok()
+            .and_then(|mut client| {
+              client
+                .read(volume_id_of(volume), &format!("/{name}"), ReadAt::Head)
+                .ok()
+            })
+            .is_none_or(|bytes| bytes != *body)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+      verdict.note(format!(
+        "iteration {iteration} ({barrier:?}): {successor} served the probe {took:?} after the owner's death"
+      ));
+      verdict.check(
+        &format!("NoLoss, iteration {iteration} (earlier files)"),
+        lost,
+      );
+    }
+    None => verdict.check(
+      &format!("NoLoss, iteration {iteration} ({barrier:?})"),
+      vec![format!(
+        "no survivor served {} within the fleet wait:\n{}",
+        probe.0,
+        diagnosis(&survivors, volume)
+      )],
+    ),
+  }
+  // The dead node's replacement, a fresh member at the same index, owns the next iteration's volume.
+  fleet.replace_node(owner_index);
+  fleet.wait_rejoined();
+  AckRound::Judged
+}
+
+/// The bytes the first shard of `instance`'s daemon reserves for content, as `status` reports it (`reserve=`).
+fn shard_reserve(instance: &str) -> u64 {
+  let out = run_ready(instance, &["status"]);
+  out
+    .lines()
+    .find_map(|line| {
+      line
+        .trim_start()
+        .strip_prefix("shard 0:")?
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("reserve="))?
+        .parse()
+        .ok()
+    })
+    .unwrap_or_else(|| panic!("shard 0's reserve in {out:?}"))
+}
+
+/// Whether a refusal on stderr is the typed one a fleet with no room for a claim answers (§4.2, A-401).
+fn refused_for_room(err: &str) -> bool {
+  err.contains("BudgetExceeded")
+}
+
+/// A-401 (§4.2: "a remote holder makes the same admission against its own machine before acknowledging placement")
+/// across real processes: the kill-at-acknowledgement flow with bounded claims that bind. Do, `ITERATIONS` times on one
+/// fleet, create a bounded volume of three quarters of a shard's content reserve on the owner (the share the stream
+/// bound's 782 MiB took of CI's 7 GB macOS runner's 1 GiB shards, so a daemon's two shards hold two such claims and
+/// refuse a third, on any machine), live-ship it, then run the kill-at-acknowledgement iteration on it. Expect each
+/// iteration either refused typed (`BudgetExceeded`) at its create or its live-ship, before anything ships, or its probe
+/// and every file before it served by a survivor after the owner's death; and at least one iteration served. Before
+/// A-401 the live-ship was answered whatever the candidates could hold, and a successor without room gave a shipped
+/// volume up (`NotRecovered`) while a survivor held every acknowledged write (iterations 3 and 4 on the runner).
+#[test]
+fn a_bounded_claim_is_served_by_its_successor_or_refused_before_it_ships() {
+  /// Shape: the iterations: past the two claims a daemon's shards hold, so the fleet runs out of room.
+  const ITERATIONS: usize = 6;
+  /// Shape: the files written before the probe, as the kill-at-acknowledgement flow writes.
+  const BEFORE: usize = 8;
+  /// Shape: the share of a shard's content reserve each claim takes, as a fraction: three quarters.
+  const CLAIM_SHARE: (u64, u64) = (3, 4);
+  if !gated("bounded-kill-at-ack") {
+    return;
+  }
+  let mut fleet = Fleet::start("bounded-ack", Supervision::Bare);
+  let mut verdict =
+    Verdict::new("a bounded claim served by its successor or refused before it ships");
+  let owner_index = fleet.owner_index();
+  let claim_mib = shard_reserve(&fleet.instances[owner_index])
+    .saturating_mul(CLAIM_SHARE.0)
+    .checked_div(CLAIM_SHARE.1)
+    .unwrap_or(0)
+    >> 20;
+  let bound = format!("{claim_mib}MiB");
+  let (mut served, mut refused) = (0usize, 0usize);
+  for iteration in 0..ITERATIONS {
+    let owner = fleet.instances[owner_index].clone();
+    let name = format!("bounded-ack-{iteration}");
+    let (code, out, err) = run(&owner, &["volume", "create", &name, "--bounded", &bound]);
+    if code != 0 {
+      verdict.check(
+        &format!("a create refused for room is typed, iteration {iteration}"),
+        (!refused_for_room(&err))
+          .then(|| err.clone())
+          .into_iter()
+          .collect(),
+      );
+      refused += 1;
+      continue;
+    }
+    let volume = value_of(&out, "id");
+    fleet.share(&owner, &volume);
+    let (code, _, err) = run(&owner, &["live-ship", &volume]);
+    if code != 0 {
+      verdict.check(
+        &format!("a live-ship refused for room is typed, iteration {iteration}"),
+        (!refused_for_room(&err))
+          .then(|| err.clone())
+          .into_iter()
+          .collect(),
+      );
+      refused += 1;
+      continue;
+    }
+    let round = (iteration, BEFORE, barrier_of(iteration));
+    match kill_at_ack(&mut fleet, (owner_index, &volume), round, &mut verdict) {
+      AckRound::Judged => served += 1,
+      AckRound::Stopped => break,
+    }
+  }
+  verdict.note(format!(
+    "claims of {bound}: {served} shipped and judged after their owner's death, {refused} refused before they shipped"
+  ));
+  verdict.check(
+    "non-vacuity: at least one claim shipped and its owner killed",
+    (served == 0)
+      .then(|| "no iteration shipped".to_owned())
+      .into_iter()
+      .collect(),
+  );
   drop(fleet);
   verdict.judge();
 }
@@ -4831,7 +5165,7 @@ fn writes_stream_through_lossy_paths_and_a_takeover_over_them_loses_nothing() {
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
-  let volume = fleet.create_volume(&owner, "lossy", true);
+  let volume = fleet.create_volume(&owner, "lossy", true, Claim::Bounded);
   let mut verdict = Verdict::new("writes through lossy paths, then a takeover over them");
   let mut probes = Vec::new();
   let (outcomes, samples) = stream_through_reading(
@@ -4942,7 +5276,7 @@ fn writes_stream_past_a_slow_candidate_without_waiting_for_it() {
   let owner = fleet.instances[owner_index].clone();
   let candidates = candidates_of(&fleet, owner_index);
   let slow = fleet.others(owner_index)[0];
-  let volume = fleet.create_volume(&owner, "slow", true);
+  let volume = fleet.create_volume(&owner, "slow", true, Claim::Bounded);
   let mut verdict = Verdict::new("writes past a slow candidate");
   let mut slowed = (Duration::ZERO, Duration::ZERO);
   let mut probes = Vec::new();
@@ -5024,22 +5358,34 @@ fn slow_candidate_waited(outcomes: &[Outcome], slowed: (Duration, Duration)) -> 
   }
 }
 
-/// Derived: the longest a volume may go unserved before a takeover serves it, the operator's failover SLO (§4.8, "the
-/// operator's bound on how long an object may go unserved"; the daemons' default, `slates_server::config::FAILOVER_SLO_NS`),
-/// counted from the partition's start, detection and the takeover's round included. Before A-351 a deafened owner, which
-/// still probes, kept its holders' promotion gate shut and was taken over after 22.7 and 34.8 s (CI diag run
-/// 44315314779), or not at all.
-const FAILOVER_BOUND: Duration = Duration::from_nanos(slates_server::config::FAILOVER_SLO_NS);
-
-/// Derived: the longest a write sent to a partitioned owner may wait for its answer: the failover SLO from its hold, at
-/// which a verb's reply held for durability is refused `DurabilityPending` (A-354, the total bound of the rule every
-/// transport's held reply is judged by, A-292), plus one liveness budget for the record period that judges it and the
-/// reply's way back to its client. A write held longer was held past what the fleet promises to keep: before A-354 the
-/// deafened owner's write waited 41 to 85 s and the cut-off and muted owners' about 20.5 s, each until the relay healed
-/// (CI diag runs 44302631709 and 44315314779, 2026-11-18).
-const HELD_WRITE_BOUND: Duration = Duration::from_nanos(
-  slates_server::config::FAILOVER_SLO_NS.saturating_add(slates_server::daemon::LIVENESS_BUDGET_NS),
-);
+/// The failover delay the fleet measures now (A-363), the largest any of `instances` reports in its status
+/// (`fleet_failover: total_ns=`): the longest a volume may go unserved before a takeover serves it (§4.8, "the
+/// operator's bound on how long an object may go unserved"), counted from the partition's start, detection and the
+/// takeover's round included; and from a write's hold, the total a reply held for durability waits before it is refused
+/// `DurabilityPending` (A-354, A-375). Read before a flow partitions anyone, so it is what the fleet promised for the
+/// partition to come. Until A-525 both bounds were the operator's ten-second placeholder. Before A-351 a deafened owner,
+/// which still probes, kept its holders' promotion gate shut and was taken over after 22.7 and 34.8 s (CI diag run
+/// 44315314779), or not at all; before A-354 the deafened owner's write waited 41 to 85 s and the cut-off and muted
+/// owners' about 20.5 s, each until the relay healed (CI diag runs 44302631709 and 44315314779, 2026-11-18).
+fn live_failover(instances: &[String]) -> Duration {
+  Duration::from_nanos(
+    instances
+      .iter()
+      .filter_map(|instance| {
+        let (_, status, _) = run(instance, &["status"]);
+        status
+          .lines()
+          .find_map(|line| line.strip_prefix("fleet_failover: "))
+          .and_then(|line| {
+            line
+              .split_whitespace()
+              .find_map(|part| part.strip_prefix("total_ns=")?.parse::<u64>().ok())
+          })
+      })
+      .max()
+      .expect("a node of the fleet reports its failover delay"),
+  )
+}
 
 /// How a flow partitions one node mid-stream (goal g229).
 #[derive(Clone, Copy, Debug)]
@@ -5104,6 +5450,10 @@ struct PartitionRun {
   successor_outcomes: Vec<Outcome>,
   /// The reads of the successor's last acknowledged writes, through every survivor and through the old owner.
   probes: Vec<ReadProbe>,
+  /// The failover delay the fleet measured before the partition ([`live_failover`]): the bound on the takeover, and,
+  /// with a liveness budget for the record period that judges it and the reply's way back, on a write held at the old
+  /// owner ([`judge_stale_writes`]).
+  failover: Duration,
 }
 
 /// Sets its flag when dropped, so a stream told to stop by it stops however the code holding it ends: a failed wait that
@@ -5123,8 +5473,9 @@ impl Drop for StopOnDrop<'_> {
 /// survivor, then through the old owner: while the partition lasts when its process runs on (its lease lapsed unrenewed
 /// while it still serves its clients, its peers silent from its side), and the moment it resumes when it was stopped
 /// (its lease lapsed by the clock meanwhile); heal; let the old owner's stream go on. Expect: the volume taken over within
-/// [`FAILOVER_BOUND`]; no write sent to the old owner while it was partitioned acknowledged, and every write to it
-/// answered within [`HELD_WRITE_BOUND`] ([`judge_stale_writes`]); every read refused or answered with the write,
+/// the failover delay the fleet measured before ([`live_failover`]); no write sent to the old owner while it was
+/// partitioned acknowledged, and every write to it answered within that delay and a liveness budget
+/// ([`judge_stale_writes`]); every read refused or answered with the write,
 /// never other bytes and never missing (ReadSafety); every write either owner acknowledged served by the successor
 /// (NoLoss), those made through the old node after the heal included; the successor's first head past every position
 /// durable under the old epoch (Continuity); every copy fenced at or above the successor's epoch; one identity at every
@@ -5136,7 +5487,7 @@ fn an_owner_partitioned(tag: &str, flow: &'static str, partition: Partition) {
   let fleet = partition.fleet(tag);
   let owner_index = fleet.owner_index();
   let owner = fleet.instances[owner_index].clone();
-  let volume = fleet.create_volume(&owner, tag, true);
+  let volume = fleet.create_volume(&owner, tag, true, Claim::Bounded);
   let mut verdict = Verdict::new(flow);
   let mut run = PartitionRun::default();
   let (outcomes, samples) = stream_through(
@@ -5179,6 +5530,7 @@ fn partition_owner_mid_stream(
   let survivors: Vec<&str> = candidates.iter().map(String::as_str).collect();
   let mut run = PartitionRun::default();
   after_writes(owner, volume, BETWEEN_EVENTS);
+  run.failover = live_failover(&fleet.instances);
   partition.begin(fleet, owner_index);
   run.partitioned_at = began.elapsed();
   let taken = wait_taken_over(&survivors, volume);
@@ -5186,11 +5538,12 @@ fn partition_owner_mid_stream(
     "owner {partition:?} at {:?}; taken over: {taken:?}",
     run.partitioned_at
   ));
+  let failover = run.failover;
   verdict.check(
-    "the volume taken over within the failover SLO",
+    "the volume taken over within the failover delay",
     match taken {
-      Some((_, took)) if took > FAILOVER_BOUND => vec![format!(
-        "taken over {took:?} after the owner was {partition:?}, past {FAILOVER_BOUND:?}"
+      Some((_, took)) if took > failover => vec![format!(
+        "taken over {took:?} after the owner was {partition:?}, past the failover delay {failover:?}"
       )],
       _ => Vec::new(),
     },
@@ -5295,6 +5648,7 @@ fn judge_stale_writes(
   verdict: &mut Verdict,
   outcomes: &[Outcome],
   (partitioned_at, healed_at): (Duration, Duration),
+  held_bound: Duration,
 ) {
   let during: Vec<&Outcome> = outcomes
     .iter()
@@ -5326,8 +5680,8 @@ fn judge_stale_writes(
     "every write to the old owner answered within the held-write bound",
     outcomes
       .iter()
-      .filter(|outcome| outcome.took > HELD_WRITE_BOUND)
-      .map(|outcome| format!("{outcome:?} past {HELD_WRITE_BOUND:?}"))
+      .filter(|outcome| outcome.took > held_bound)
+      .map(|outcome| format!("{outcome:?} past {held_bound:?}"))
       .collect(),
   );
 }
@@ -5348,13 +5702,19 @@ fn judge_partition(
     first_head,
     successor_outcomes,
     probes,
+    failover,
   } = run;
   verdict.note(format!(
     "old owner: {}; successor: {}",
     latency_line(outcomes),
     latency_line(&successor_outcomes)
   ));
-  judge_stale_writes(verdict, outcomes, (partitioned_at, healed_at));
+  // A held reply's total is the failover delay from its hold (A-354, A-375), and a liveness budget more brings the
+  // record period that judges it and the reply's way back to its client.
+  let held_bound = failover.saturating_add(Duration::from_nanos(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+  ));
+  judge_stale_writes(verdict, outcomes, (partitioned_at, healed_at), held_bound);
   verdict.note(format!(
     "reads: {}",
     probes
@@ -5849,7 +6209,7 @@ fn a_seeded_nemesis_of_single_faults_keeps_every_register_invariant() {
   }
   let fleet = Fleet::start_relayed("nemesis", Supervision::Bare, &FLEET_NODES);
   let front = fleet.instances[fleet.owner_index()].clone();
-  let volume = fleet.create_volume(&front, "nemesis", true);
+  let volume = fleet.create_volume(&front, "nemesis", true, Claim::Bounded);
   // The relay draws from the flow's seed; the schedule from the same seed turned half a word, so the two differ.
   let seed = chaos_seed("nemesis");
   let schedule = nemesis_schedule(

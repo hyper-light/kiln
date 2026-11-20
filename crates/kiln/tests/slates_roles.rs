@@ -142,7 +142,7 @@ fn w1_kiln_runs_its_slates_instance_as_its_own_executable_and_drives_it_through_
     library.client().fs_write((volume, attached.attachment), "/n.txt", b"n\n", MODE)?;
     library.client().fs_write((volume, attached.attachment), "/.git/HEAD", b"ref: refs/heads/agent\n", MODE)?;
     library.detach(attached.attachment)?;
-    let made = slates::Made { volume: slates_api::volume_id_text(volume), name: "kilnroles-work".into(), mount: state.path().join("never-mounted").to_string_lossy().into_owned() };
+    let made = slates::Made { volume: slates_api::volume_id_text(volume), name: "kilnroles-work".into(), mount: state.path().join("never-mounted").to_string_lossy().into_owned(), base: None };
     let drifted = kiln::rt::block_on({
         let made = made.clone();
         async move { slates::drift(&made).await }
