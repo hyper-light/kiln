@@ -599,7 +599,7 @@ start together (a listed runner joins once the server lists every node, A-734); 
 on its new runner for its next message, kiln's hand-off going with it. What it found by use, each fixed: no runner
 founded the fleet's groups; a moved volume wasn't shared with its new runner; and a moved captured clone wasn't found by
 its name on its new owner, so its mount was refused `NOENT` in four runs of five (Slates' A-756, carried as
-`vendor/patches/slates/0003` until kiln takes a Slates revision with it). Slates still refuses most first asks
+`vendor/patches/slates/0004` until kiln takes a Slates revision with it). Slates still refuses most first asks
 `unplaced` (asked again every 30 s), and kiln's first mount of a workspace doesn't wait on Slates' `refused for now`
 (`LeaseUnconfirmed` across a LAN), so the test starts the agent again on it.
 
