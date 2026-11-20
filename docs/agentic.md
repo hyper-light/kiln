@@ -550,8 +550,9 @@ fleet re-forms** (once the fault ends, every listed runner's node is a member ag
 holds, not of how fast: no latency is judged, and every wait is the fleet's own failover delay as its nodes report it.
 The flows that signal a daemon under its live mounts run on Linux alone, where a workspace is a FUSE mount: on macOS
 it's a kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount has panicked the Mac
-(Slates' record of 2026-10-06). The killed runner's flow stops the owner's runner and lets every mount under it go
-before it kills the instance, so it runs on macOS too (A-750), its survivors alone serving the files. The link faults signal no daemon and run on macOS too; there, as everywhere, the lab's end stops its
+(Slates' record of 2026-10-06). The killed, partitioned and restarted runners' flows stop the runner and let every
+mount under it go before they signal its instance, so they run on macOS too (A-750; the partition and the kill judged by
+the survivors alone); a move's target cut midway, whose target may be mounting the moved workspace, stays Linux's. The link faults signal no daemon and run on macOS too; there, as everywhere, the lab's end stops its
 runners and unmounts every Slates mount under its folder before it ends an instance, and leaves the instances running,
 saying so, where a mount won't go. Gated by `SLATES_FLEET_FAULTS=1` and skipped, saying so, without it,
 since it starts three instances and their anchors:
