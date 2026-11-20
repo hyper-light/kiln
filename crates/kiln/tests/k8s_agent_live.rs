@@ -224,7 +224,8 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
 
     // The agent acts on its opening prompt. Where it hasn't within two minutes, its events are shown and the same message
     // sent again: which of the two it acted on says whether a pod session's opening prompt reached its harness.
-    let acted = |fleet: &common::Fleet| -> anyhow::Result<bool> { Ok(fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})))?.to_string().contains("pod-wrote.txt")) };
+    let written = format!("{folder}/pod-wrote.txt");
+    let acted = |_: &common::Fleet| -> anyhow::Result<bool> { Ok(kubectl(&ns, &["exec", &pod, "-c", "agent", "--", "test", "-f", &written]).is_ok()) };
     let began = Instant::now();
     while !acted(&fleet).unwrap_or(false) && began.elapsed() < Duration::from_secs(120) {
         std::thread::sleep(LOOK);
