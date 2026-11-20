@@ -222,6 +222,29 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
     anyhow::ensure!(line.split_whitespace().nth(2).is_some_and(|t| t.starts_with("nfs4")) && line.contains("xprtsec=mtls") && line.contains(&host), "the pod's folder isn't the home's export over RPC-with-TLS: {line}");
     eprintln!("PROVEN: the pod's folder is kubelet's mount: {line}");
 
+    // The agent acts on its opening prompt. Where it hasn't within two minutes, its events are shown and the same message
+    // sent again: which of the two it acted on says whether a pod session's opening prompt reached its harness.
+    let acted = |fleet: &common::Fleet| -> anyhow::Result<bool> { Ok(fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})))?.to_string().contains("pod-wrote.txt")) };
+    let began = Instant::now();
+    while !acted(&fleet).unwrap_or(false) && began.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(LOOK);
+    }
+    if !acted(&fleet).unwrap_or(false) {
+        let events = fleet.call("GET", &format!("/api/harness/sessions/{id}/events?limit=200"), None).map(|e| e.to_string()).unwrap_or_else(|e| format!("{e:#}"));
+        eprintln!("SEEN: no action on the opening prompt in 120 s; the session's events: {}", events.chars().take(6000).collect::<String>());
+        let sent = fleet.call("POST", "/api/ops/agents.send", Some(&json!({"agent": id, "text": PROMPT})));
+        eprintln!("SEEN: the prompt sent again: {sent:?}");
+        let began = Instant::now();
+        while !acted(&fleet).unwrap_or(false) && began.elapsed() < Duration::from_secs(120) {
+            std::thread::sleep(LOOK);
+        }
+        anyhow::bail!(
+            "a pod session's opening prompt never reached its harness; sent again, it {}\n{}",
+            if acted(&fleet).unwrap_or(false) { "acted on it (the opening prompt is lost)" } else { "didn't act either (no message reaches it)" },
+            seen()
+        );
+    }
+
     // The agent wrote, in its pod, into its home's volume; the folder is as it was.
     let wrote = until(
         "the agent's file in its volume, by its landing's plan",
