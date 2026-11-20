@@ -227,6 +227,47 @@ impl Sandbox for ContainerSandbox {
     }
 }
 
+/// Kind `kind`'s harness for session `spec` as a launch in a container of `image` (docs/agentic.md W9): its program by
+/// its name on the image's `PATH`, started as kiln's adapter drives it (its base arguments, then what the session asks,
+/// as a microVM's member is: `Kind::elsewhere`, so none of this machine's own paths, kiln's MCP config or hooks among
+/// them), with the environment `elsewhere` gives a boundary (the session's locale, its environment's variables, what kiln
+/// fixes), in the session's folder in its workspace's mount. A secret in its environment is refused by `elsewhere`, never
+/// handed in.
+pub fn launch_of(kind: &crate::harness::kinds::Kind, spec: &crate::harness::session::Spec, image: &str) -> anyhow::Result<Launch> {
+    let run = kind.elsewhere(spec)?;
+    let mut args = kind.base_args();
+    args.extend(run.args);
+    Ok(Launch {
+        args,
+        folder: Some(crate::harness::session::resolve_cwd(spec.cwd.as_deref())),
+        env: run.env,
+        limits: kiln_seams::sandbox::Limits::NONE,
+        egress: kiln_seams::sandbox::Egress::Any,
+        boundary: Boundary::Container { image: image.to_owned() },
+        ..Launch::of(kind.program, &[])
+    })
+}
+
+/// Starts session `spec`'s harness of kind `kind` in a container of `image` on its workspace (docs/agentic.md W9): its
+/// workspace volume, mounted already, is the one the container binds; the machine's engine is found and judged by Slates
+/// first; then the container's sandbox launches it ([`ContainerSandbox`]), and its run is the session's pipes. Refused
+/// where its session has no workspace volume of its own, or this machine's engine is none Slates holds evidence for.
+pub async fn launch(kind: &crate::harness::kinds::Kind, spec: &crate::harness::session::Spec, image: &str) -> anyhow::Result<crate::proc::Duplex> {
+    let made = spec.workspace.as_ref().filter(|w| w.kind == "volume").and_then(|w| w.made.clone()).filter(|m| !m.mount.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!("an agent in a container works in a workspace volume of its own, mounted on its machine, and this one has none (a person chose its folder, or its machine makes no volumes)")
+    })?;
+    let launch = launch_of(kind, spec, image)?;
+    let (program, judged) = crate::rt::blocking(|| -> anyhow::Result<(String, EngineProfile)> {
+        let program = crate::runner::docker::find().ok_or_else(|| anyhow::anyhow!("no container engine answers here: neither docker nor podman, or its daemon is down"))?;
+        let judged = slates_api::container_engine::engine_profile(&program).map_err(|fault| anyhow::anyhow!("Slates refused this machine's container engine: {fault}"))?;
+        Ok((program, judged))
+    })
+    .await??;
+    let declared = super::held::Declared::of(&launch);
+    let run = ContainerSandbox::new(program, judged, made).launch(launch).await.map_err(|refused| anyhow::anyhow!("its container: {refused}"))?;
+    Ok(crate::proc::duplex_of_run(run, image.to_owned(), super::narrow::Reach::Whole { why: super::narrow::Whole::Container }, None, declared, None))
+}
+
 #[cfg(test)]
 mod tests {
     use kiln_seams::sandbox::{Limits, Share};
@@ -324,5 +365,29 @@ mod tests {
         assert!(unsupported(refused(Launch { egress: kiln_seams::sandbox::Egress::Only(Vec::new()), ..launch("i") })));
         let share = Share { host: "/Users/u/.ssh".to_owned(), at: "/Users/u/.ssh".to_owned(), writable: false, members: Vec::new() };
         assert!(unsupported(refused(Launch { shares: vec![share], ..launch("i") })));
+    }
+
+    /// W9. Do: make the container launch of a Claude session resumed with a model, in its workspace's folder, with host
+    /// variables and kiln's socket in its environment. Expect the harness by its name on the image's `PATH`, its stream
+    /// flags then the session's own, its folder the session's, the image's container its boundary, and none of the host's
+    /// variables nor kiln's socket handed in: only what a boundary's run is given.
+    #[test]
+    fn w9_a_sessions_container_launch_is_its_harness_by_name_with_what_a_boundary_gives_it() -> anyhow::Result<()> {
+        use crate::harness::kinds::Kind;
+        use crate::harness::session::Spec;
+        let claude = Kind::get("claude").ok_or_else(|| anyhow::anyhow!("no harness claude"))?;
+        let env = vec![("PATH".to_owned(), "/host/bin".to_owned()), ("LANG".to_owned(), "fr_FR.UTF-8".to_owned()), ("KILN_REACH_SOCK".to_owned(), "/host/sock".to_owned())];
+        let spec = Spec { kind: "claude".into(), cwd: Some(format!("{MOUNT}/crates")), env, resume: Some("conversation-1".into()), model: Some("claude-opus-5-5".into()), allow_bypass: false, ..Spec::default() };
+        let launch = launch_of(claude, &spec, "ghcr.io/org/agents:1")?;
+        assert_eq!(launch.program, "claude");
+        let base = claude.base_args();
+        assert_eq!(launch.args.get(..base.len()), Some(base.as_slice()), "its stream flags first: {:?}", launch.args);
+        assert_eq!(launch.args.get(base.len()..), Some(["--model", "claude-opus-5-5", "--resume", "conversation-1"].map(str::to_owned).as_slice()));
+        assert_eq!((launch.folder.as_deref(), &launch.boundary), (Some(format!("{MOUNT}/crates").as_str()), &Boundary::Container { image: "ghcr.io/org/agents:1".to_owned() }));
+        assert!(launch.env.contains(&("LANG".to_owned(), "fr_FR.UTF-8".to_owned())));
+        assert!(!launch.env.iter().any(|(k, _)| k == "PATH" || k.starts_with("KILN_")), "no host variable, no kiln socket: {:?}", launch.env);
+        // What it is, a container's sandbox holds: no limit or narrowed egress it would refuse.
+        assert!(plan_of(&launch, DOCKER, &judged(), &made(), "kiln-a-1".to_owned()).is_ok());
+        Ok(())
     }
 }

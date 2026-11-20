@@ -30,6 +30,10 @@ endpoint: string | null,
  */
 version: string | null, 
 /**
+ * The image its agents run in, as its administrator declared it (`[agent] container_image`).
+ */
+image?: string, 
+/**
  * Why agents here can't run in containers, in words (Slates' own where Slates refused).
  */
 why_not: string | null, 

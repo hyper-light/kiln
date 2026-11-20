@@ -19,7 +19,7 @@ import { formatBytes } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { Link } from "@/lib/router";
 import { LimitMeter } from "./harness/limits";
-import { ENGINE_ICON, START, StartMark, WarmDots } from "./sandbox-marks";
+import { ENGINE_ICON, ENGINE_PLACE, ENGINE_WORD, START, StartMark, WarmDots } from "./sandbox-marks";
 import "./runners-microvms.css";
 
 const VM_STATUS: Record<MicroVm["state"], string> = { running: "running", idle: "succeeded", paused: "queued", failed: "failed", draining: "timed_out" };
@@ -39,7 +39,10 @@ export function EngineCell({ facts }: { facts: Parameters<typeof engineOf>[0] })
     );
   const Icon = ENGINE_ICON[e.engine];
   return (
-    <span className="rv-engine" title={e.why ?? (e.engine === "microvm" ? `In microVMs (${facts?.isolation?.hypervisor ?? "its hypervisor"})` : "On the host")}>
+    <span
+      className="rv-engine"
+      title={e.why ?? (e.engine === "microvm" ? `In microVMs (${facts?.isolation?.hypervisor ?? "its hypervisor"})` : e.engine === "container" ? "In containers on their workspaces" : "On the host")}
+    >
       <Icon size={13} aria-hidden="true" />
       <span className="rv-engine-word">{e.engine}</span>
       {!e.can && <Ban size={12} className="rv-ban" role="img" aria-label={e.why ?? "Can't run microVMs"} />}
@@ -103,8 +106,9 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
       .finally(() => setSending(false));
   };
   const endNow = () => drained(engineApi.endDraining(name), (v) => `Ended ${(v as typeof v & { ended?: string[] }).ended?.length ?? 0}`, "Couldn't end them");
-  const undo = () => drained(engineApi.cancel(name), (v) => `Back on ${v.engine === "microvm" ? "microVMs" : "its host"}`, "Couldn't take the switch back");
+  const undo = () => drained(engineApi.cancel(name), (v) => `Back on ${v.engine ? ENGINE_PLACE[v.engine] : "what it can do"}`, "Couldn't take the switch back");
   const can = e.microvm?.usable ?? false;
+  const boxes = e.container?.usable ?? false;
   const send = (engine: Engine | null) => {
     setSending(true);
     engineApi
@@ -112,7 +116,7 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
       .then((next) => {
         res.setData(() => next);
         setAsking(null);
-        toast({ title: engine ? `Its new sessions run in ${engine === "microvm" ? "microVMs" : "its host"}` : "Its engine is what it can do", tone: "info" });
+        toast({ title: engine ? `Its new sessions run in ${ENGINE_PLACE[engine]}` : "Its engine is what it can do", tone: "info" });
       })
       .catch((err: unknown) => toast.error("Couldn't set its engine", errorMessage(err)))
       .finally(() => setSending(false));
@@ -138,17 +142,18 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
           value={e.engine}
           pending={sending ? (asking ?? null) : null}
           onChange={(v) => v !== e.engine && setAsking(v)}
-          options={(["microvm", "host"] as Engine[]).map((x) => {
+          options={(["microvm", "host", "container"] as Engine[]).map((x) => {
             const Icon = ENGINE_ICON[x];
-            const disabled = !manage || (x === "microvm" && !can);
+            const unable = (x === "microvm" && !can) || (x === "container" && !boxes);
+            const why = x === "microvm" ? e.microvm?.why : x === "container" ? (e.container?.why ?? "Its runner doesn't say whether its agents can run in containers") : null;
             return {
               value: x,
-              disabled,
-              title: !manage ? "Only those who manage runners set its engine" : x === "microvm" && !can ? (e.microvm?.why ?? undefined) : undefined,
+              disabled: !manage || unable,
+              title: !manage ? "Only those who manage runners set its engine" : unable ? (why ?? undefined) : undefined,
               label: (
                 <>
                   <Icon size={13} aria-hidden="true" />
-                  {x === "microvm" ? "microVM" : "host"}
+                  {ENGINE_WORD[x]}
                 </>
               ),
             };

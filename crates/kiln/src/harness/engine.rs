@@ -10,6 +10,11 @@
 //! 2. `microvm` where the runner can hold agents in microVMs now ([`capable`]: the person's decision 3,
 //!    2026-11-14), else `host`, saying why.
 //!
+//! `container` (docs/agentic.md W9): each in an OCI container of its own on its workspace's Slates volume, through the
+//! machine's container engine (`crate::sandbox::container`). Only ever its owner's choice, never a default: it's refused
+//! where the runner's facts say its agents can't run in containers ([`containers`]), and one set where they later can't
+//! is held as `host`, saying why.
+//!
 //! `microvm` is refused, saying why, where the runner can't hold them; one set where it later can't is
 //! held as `host`, saying why. The engine is written into the runner's facts ([`overlay`]:
 //! `isolation.engine`, and `virt.microvm` only on a `microvm` one) by the runner, for its own admission
@@ -96,6 +101,19 @@ pub fn capable(facts: &RunnerFacts) -> Capable {
     }
 }
 
+/// Why a runner whose facts say nothing of containers (a runner from before them) runs its agents in none.
+pub const CONTAINERS_NOT_SAID: &str = "its runner doesn't say whether its agents can run in containers: its kiln is from before them";
+
+/// Whether a runner's agents can run in containers now, and why not, from its facts as its runner says them
+/// (`containers`: `crate::workspace::container::facts`).
+pub fn containers(facts: &RunnerFacts) -> Capable {
+    match &facts.containers {
+        Some(c) if c.available => Capable { usable: true, why: None },
+        Some(c) => Capable { usable: false, why: Some(c.why_not.clone().unwrap_or_else(|| "its agents can't run in containers here".to_owned())) },
+        None => Capable { usable: false, why: Some(CONTAINERS_NOT_SAID.to_owned()) },
+    }
+}
+
 /// The engine a runner holds, where it comes from, and why it's `host` where it can't be `microvm`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Held {
@@ -105,11 +123,15 @@ pub struct Held {
     pub why: Option<String>,
 }
 
-/// What a runner holds: what its owner set, else `microvm` where it can hold microVMs, else `host`.
-/// `microvm` set where it can't any more is held as `host`, saying why.
-pub fn held(asked: Asked, can: &Capable) -> Held {
+/// What a runner holds: what its owner set, else `microvm` where it can hold microVMs (`can`), else `host`.
+/// `microvm` set where it can't any more is held as `host`, saying why, and so is `container` set where its agents
+/// can't run in containers any more (`boxed`).
+pub fn held(asked: Asked, can: &Capable, boxed: &Capable) -> Held {
     match (asked.engine, can.usable) {
         (Some(Engine::Microvm), false) => Held { engine: Engine::Host, from: Source::Default, why: Some(format!("its owner set microvm, but it can't hold microVMs now: {}", can.why.as_deref().unwrap_or(crate::sandbox::NO_MICROVM))) },
+        (Some(Engine::Container), _) if !boxed.usable => {
+            Held { engine: Engine::Host, from: Source::Default, why: Some(format!("its owner set container, but its agents can't run in containers now: {}", boxed.why.as_deref().unwrap_or(CONTAINERS_NOT_SAID))) }
+        }
         (Some(engine), _) => Held { engine, from: Source::Server, why: None },
         (None, true) => Held { engine: Engine::Microvm, from: Source::Default, why: None },
         (None, false) => Held { engine: Engine::Host, from: Source::Default, why: can.why.clone() },
@@ -121,7 +143,7 @@ pub fn held(asked: Asked, can: &Capable) -> Held {
 /// its admission) never sends it a session that needs a microVM while it runs sessions on its host.
 pub fn overlay(facts: &mut RunnerFacts, asked: Asked) -> Held {
     let can = capable(facts);
-    let h = held(asked, &can);
+    let h = held(asked, &can, &containers(facts));
     facts.virt.microvm = can.usable && h.engine == Engine::Microvm;
     if let Some(i) = facts.isolation.as_mut() {
         i.engine = Some(h.engine);
@@ -329,17 +351,28 @@ async fn known(hub: &Hub, name: &str) -> bool {
     hub.agents.load().contains_key(name) || hub.store.agents().await.is_ok_and(|rows| rows.iter().any(|a| a.name == name))
 }
 
+/// The engine a session runs on: a microVM where it's isolated, a container where it's in one, else its host.
+pub fn session_engine(i: &crate::harness::session::Info) -> Engine {
+    if i.isolation.is_some() {
+        Engine::Microvm
+    } else if i.container.is_some() {
+        Engine::Container
+    } else {
+        Engine::Host
+    }
+}
+
 /// Of `sessions` (a runner's), those whose harness still runs (not exited or crashed) on `engine`, and
-/// those on the other, which drain: they finish there.
+/// those on another, which drain: they finish there.
 fn split(sessions: &[crate::harness::session::Info], engine: Engine) -> (Vec<&crate::harness::session::Info>, Vec<&crate::harness::session::Info>) {
     use crate::harness::model::Status;
-    sessions.iter().filter(|i| !matches!(i.status, Status::Exited | Status::Crashed)).partition(|i| i.isolation.is_some() == (engine == Engine::Microvm))
+    sessions.iter().filter(|i| !matches!(i.status, Status::Exited | Status::Crashed)).partition(|i| session_engine(i) == engine)
 }
 
 /// The engine runner `name` holds now, as the server has its facts: none before they've come.
 fn held_now(hub: &Hub, name: &str) -> Option<Held> {
     let facts = hub.agents.load().get(name).and_then(|a| a.facts.as_deref().cloned())?;
-    Some(held(hub.engines.asked(name), &capable(&facts)))
+    Some(held(hub.engines.asked(name), &capable(&facts), &containers(&facts)))
 }
 
 /// The sessions of runner `name` that drain (they run on the engine it doesn't hold: [`split`]),
@@ -357,7 +390,7 @@ fn draining_of(hub: &Hub, name: &str) -> Vec<crate::harness::session::Info> {
         let mut kids = super::lineage::descendants(&all, &i.id);
         kids.reverse();
         for k in kids {
-            if !out.iter().any(|o| o.id == k.id) && k.target == target && !matches!(k.status, crate::harness::model::Status::Exited | crate::harness::model::Status::Crashed) && k.isolation.is_some() != (h.engine == Engine::Microvm) {
+            if !out.iter().any(|o| o.id == k.id) && k.target == target && !matches!(k.status, crate::harness::model::Status::Exited | crate::harness::model::Status::Crashed) && session_engine(&k) != h.engine {
                 out.push(k);
             }
         }
@@ -371,23 +404,24 @@ fn draining_of(hub: &Hub, name: &str) -> Vec<crate::harness::session::Info> {
 /// A draining session as the view lists it: its id and name, its harness, how it stands (as
 /// `agents.list`'s `stand`), the engine it runs on and when it was made (Unix ms).
 fn drained(i: &crate::harness::session::Info) -> Value {
-    json!({"id": i.id, "name": i.name, "kind": i.kind, "state": super::wait::stand(i), "engine": if i.isolation.is_some() { Engine::Microvm } else { Engine::Host }, "created_at": i.created_at})
+    json!({"id": i.id, "name": i.name, "kind": i.kind, "state": super::wait::stand(i), "engine": session_engine(i), "created_at": i.created_at})
 }
 
 /// `GET /api/runners/:name/engine` (and what `PUT` answers): the engine it holds, where that comes
-/// from and why, what its owner set, whether it can hold microVMs now and why not, its isolation facts,
+/// from and why, what its owner set, whether it can hold microVMs now and why not, whether its agents can run in
+/// containers now and why not (`container`, with its container facts, `containers`), its isolation facts,
 /// and its sessions on each engine (`draining`: how many of the other engine, which finish there, and
 /// `draining_sessions`, each of them); with the switch they drain for (`switch`: what was set before,
 /// what it was set to, and when), while any drains.
 pub async fn view(hub: &Hub, name: &str) -> Value {
     let asked = hub.engines.asked(name);
     let facts = hub.agents.load().get(name).and_then(|a| a.facts.as_deref().cloned());
-    let (held, can) = match &facts {
+    let (held, can, boxed) = match &facts {
         Some(f) => {
-            let can = capable(f);
-            (Some(held(asked, &can)), Some(can))
+            let (can, boxed) = (capable(f), containers(f));
+            (Some(held(asked, &can, &boxed)), Some(can), Some(boxed))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     let target = format!("agent:{name}");
     let sessions: Vec<_> = hub.harness.list().into_iter().filter(|i| i.target == target).collect();
@@ -405,6 +439,8 @@ pub async fn view(hub: &Hub, name: &str) -> Value {
         "asked": asked.engine,
         "version": asked.version,
         "microvm": can.as_ref().map(|c| json!({"usable": c.usable, "why": c.why})),
+        "container": boxed.as_ref().map(|c| json!({"usable": c.usable, "why": c.why})),
+        "containers": facts.as_ref().and_then(|f| f.containers.clone()),
         "isolation": facts.as_ref().and_then(|f| f.isolation.clone()),
         "virt": facts.as_ref().map(|f| json!({"microvm": f.virt.microvm, "kvm": f.virt.kvm, "hvf": f.virt.hvf})),
         "sessions": on,
@@ -426,10 +462,10 @@ pub async fn get(hub: &Hub, name: &str) -> Answer {
     read(hub, name).await.map(|v| srv::json(StatusCode::OK, &v))
 }
 
-/// What a `PUT` asks for: `{"engine": "host" | "microvm"}`, or `{"engine": null}` for what the runner
+/// What a `PUT` asks for: `{"engine": "host" | "microvm" | "container"}`, or `{"engine": null}` for what the runner
 /// can do.
 pub fn asked_of(body: &Value) -> Result<Asked, String> {
-    const SHAPE: &str = "expected {\"engine\": \"host\"} or {\"engine\": \"microvm\"}, or {\"engine\": null} for what the runner can do";
+    const SHAPE: &str = "expected {\"engine\": \"host\"}, {\"engine\": \"microvm\"} or {\"engine\": \"container\"}, or {\"engine\": null} for what the runner can do";
     let o = body.as_object().ok_or(SHAPE)?;
     if let Some(k) = o.keys().find(|k| *k != "engine") {
         return Err(format!("{k:?} isn't one: {SHAPE}"));
@@ -439,9 +475,10 @@ pub fn asked_of(body: &Value) -> Result<Asked, String> {
         Value::String(s) => match s.trim() {
             "host" => Ok(Asked { engine: Some(Engine::Host), version: 0 }),
             "microvm" => Ok(Asked { engine: Some(Engine::Microvm), version: 0 }),
-            other => Err(format!("a runner's engine is \"host\" or \"microvm\", not {other:?}")),
+            "container" => Ok(Asked { engine: Some(Engine::Container), version: 0 }),
+            other => Err(format!("a runner's engine is \"host\", \"microvm\" or \"container\", not {other:?}")),
         },
-        v => Err(format!("a runner's engine is \"host\" or \"microvm\", not {v}")),
+        v => Err(format!("a runner's engine is \"host\", \"microvm\" or \"container\", not {v}")),
     }
 }
 
@@ -466,6 +503,15 @@ pub async fn set(hub: &Hub, name: &str, body: &Value, by: &str) -> Result<Value,
             Some(Capable { usable: true, .. }) => {}
             Some(Capable { why, .. }) => return Err(fail(StatusCode::CONFLICT, format!("{} can't run its sessions in microVMs: {}", hub.shown(name), why.as_deref().unwrap_or(crate::sandbox::NO_MICROVM)))),
             None => return Err(fail(StatusCode::CONFLICT, format!("{} hasn't said yet whether it can run microVMs: set its engine once it has", hub.shown(name)))),
+        }
+    }
+    // `container` only where its runner says its agents can run in containers now (docs/agentic.md W9).
+    if asked.engine == Some(Engine::Container) {
+        let facts = hub.agents.load().get(name).and_then(|a| a.facts.as_deref().cloned());
+        match facts.as_ref().map(containers) {
+            Some(Capable { usable: true, .. }) => {}
+            Some(Capable { why, .. }) => return Err(fail(StatusCode::CONFLICT, format!("{} can't run its sessions in containers: {}", hub.shown(name), why.as_deref().unwrap_or(CONTAINERS_NOT_SAID)))),
+            None => return Err(fail(StatusCode::CONFLICT, format!("{} hasn't said yet whether its agents can run in containers: set its engine once it has", hub.shown(name)))),
         }
     }
     // The one before's plus one: a start decided under the setting before is refused by the runner.
@@ -553,11 +599,12 @@ mod tests {
         let set = |e| Asked { engine: Some(e), version: 1 };
         let yes = capable(&facts(Some(able())));
         let no = capable(&facts(Some(unable("no hypervisor"))));
-        assert_eq!(held(Asked::default(), &yes), Held { engine: Engine::Microvm, from: Source::Default, why: None });
-        assert_eq!(held(Asked::default(), &no), Held { engine: Engine::Host, from: Source::Default, why: Some("no hypervisor".into()) });
-        assert_eq!(held(set(Engine::Host), &yes), Held { engine: Engine::Host, from: Source::Server, why: None });
-        assert_eq!(held(set(Engine::Host), &no).engine, Engine::Host);
-        let lost = held(set(Engine::Microvm), &no);
+        let boxed = containers(&facts(None));
+        assert_eq!(held(Asked::default(), &yes, &boxed), Held { engine: Engine::Microvm, from: Source::Default, why: None });
+        assert_eq!(held(Asked::default(), &no, &boxed), Held { engine: Engine::Host, from: Source::Default, why: Some("no hypervisor".into()) });
+        assert_eq!(held(set(Engine::Host), &yes, &boxed), Held { engine: Engine::Host, from: Source::Server, why: None });
+        assert_eq!(held(set(Engine::Host), &no, &boxed).engine, Engine::Host);
+        let lost = held(set(Engine::Microvm), &no, &boxed);
         assert_eq!((lost.engine, lost.from), (Engine::Host, Source::Default));
         assert!(lost.why.is_some_and(|w| w.contains("no hypervisor")));
         assert_eq!(capable(&facts(None)), Capable { usable: false, why: Some(NOT_SAID.into()) }, "a runner from before microVMs");
@@ -600,6 +647,41 @@ mod tests {
         assert_eq!(node_images(&facts(None)), NodeImages::Unknown, "a runner from before microVMs");
     }
 
+    /// W9: `container` is only ever its owner's choice. Given a runner whose agents can run in containers and one whose
+    /// can't (and one from before containers), each able to hold microVMs or not. Expect none to hold `container` unasked;
+    /// `container` set held where its agents can, and held as `host`, saying why, where they can't; and the facts placement
+    /// reads saying so, with no microVM offered on a `container` runner.
+    #[test]
+    fn w9_a_runner_holds_container_only_where_its_owner_set_it_and_its_agents_can_run_in_containers() {
+        use kiln_ci::facts::{ContainerFacts, ContainerMissing};
+        let set = Asked { engine: Some(Engine::Container), version: 1 };
+        let boxes = |available: bool| RunnerFacts {
+            containers: Some(ContainerFacts {
+                available,
+                why_not: (!available).then(|| "no container engine answers here".to_owned()),
+                missing: (!available).then_some(ContainerMissing::Engine),
+                ..ContainerFacts::default()
+            }),
+            ..facts(Some(able()))
+        };
+        let (can, cant) = (boxes(true), boxes(false));
+        assert_eq!(containers(&can), Capable { usable: true, why: None });
+        assert_eq!(containers(&facts(None)), Capable { usable: false, why: Some(CONTAINERS_NOT_SAID.into()) });
+        for f in [&can, &cant] {
+            assert_eq!(held(Asked::default(), &capable(f), &containers(f)).engine, Engine::Microvm, "never container unasked");
+        }
+        assert_eq!(held(set, &capable(&can), &containers(&can)), Held { engine: Engine::Container, from: Source::Server, why: None });
+        let lost = held(set, &capable(&cant), &containers(&cant));
+        assert_eq!((lost.engine, lost.from), (Engine::Host, Source::Default));
+        assert!(lost.why.as_deref().is_some_and(|w| w.contains("its owner set container") && w.contains("no container engine answers here")), "{lost:?}");
+        let mut f = can.clone();
+        overlay(&mut f, set);
+        assert_eq!((f.virt.microvm, of(&f)), (false, Some(Engine::Container)), "a container runner offers no microVM");
+        let mut g = cant.clone();
+        overlay(&mut g, set);
+        assert_eq!(of(&g), Some(Engine::Host));
+    }
+
     /// A start placed under one setting of its runner's engine is refused by the runner once another
     /// is set, saying what it is now; one under the setting it holds, or one that names none, starts.
     #[test]
@@ -612,11 +694,12 @@ mod tests {
         assert!(stale(Some(0), Asked { engine: None, version: 1 }).is_some_and(|w| w.contains("what it can do")));
     }
 
-    /// A `PUT` sets `host`, `microvm` or `null`, and nothing else.
+    /// A `PUT` sets `host`, `microvm`, `container` or `null`, and nothing else.
     #[test]
-    fn a_put_sets_host_microvm_or_null_and_nothing_else() {
+    fn a_put_sets_host_microvm_container_or_null_and_nothing_else() {
         assert_eq!(asked_of(&json!({"engine": "host"})), Ok(Asked { engine: Some(Engine::Host), version: 0 }));
         assert_eq!(asked_of(&json!({"engine": "microvm"})), Ok(Asked { engine: Some(Engine::Microvm), version: 0 }));
+        assert_eq!(asked_of(&json!({"engine": "container"})), Ok(Asked { engine: Some(Engine::Container), version: 0 }));
         assert_eq!(asked_of(&json!({"engine": null})), Ok(Asked::default()));
         for bad in [json!({}), json!({"engin": "host"}), json!({"engine": "docker"}), json!({"engine": 1}), json!({"engine": "host", "x": 1}), json!(["host"])] {
             assert!(asked_of(&bad).is_err(), "{bad} was taken");

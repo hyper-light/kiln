@@ -4,4 +4,4 @@
 /**
  * What a machine lacks to run agents in containers ([`ContainerFacts::missing`]).
  */
-export type ContainerMissing = "workspaces" | "engine" | "profile" | "shared_mount" | "platform";
+export type ContainerMissing = "workspaces" | "engine" | "profile" | "shared_mount" | "platform" | "image";
