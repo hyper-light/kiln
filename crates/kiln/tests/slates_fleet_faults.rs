@@ -21,11 +21,12 @@
 //!
 //! It judges what holds, not how fast: no latency is judged. Each flow waits on the fleet's own failover delay as its
 //! nodes report it (`daemon_status`), never a number of its own. Gated by `SLATES_FLEET_FAULTS=1`, since each flow starts
-//! three Slates instances and their anchors; without it each skips, saying so. Linux alone, where a workspace is a FUSE
-//! mount: on macOS it's a kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount has
-//! panicked the Mac (Slates' record of 2026-10-06), so the macOS flows wait until a runner lets its workspace mounts go
-//! before a fault. The test builds on every Unix, so a change that breaks it is seen where it is made; off Linux each
-//! flow skips, saying why, whatever the switch says.
+//! three Slates instances and their anchors; without it each skips, saying so. The flows that signal a daemon (killed,
+//! partitioned, restarted, a move's target cut) run on Linux alone, where a workspace is a FUSE mount: on macOS it's a
+//! kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount has panicked the Mac (Slates'
+//! record of 2026-10-06). The link faults (A-708) signal no daemon, so they run on macOS too ([`Fault`]); there, as
+//! everywhere, the lab's end stops its runners and unmounts every Slates mount under its folder before it ends an
+//! instance, and leaves the instances running, saying so, where a mount won't go (as `slates_e2e`'s drives do).
 //!
 //!   SLATES_FLEET_FAULTS=1 cargo test -p kiln --test slates_fleet_faults -- --nocapture --test-threads 1
 
@@ -69,17 +70,32 @@ const SLOW_JITTER: Duration = Duration::from_millis(10);
 /// A slow link's loss rate, in parts per million: 1 %.
 const SLOW_LOSS_PPM: u32 = 10_000;
 
-/// Whether the flows run here; a skip says why.
-fn enabled() -> bool {
-    if !cfg!(target_os = "linux") {
-        eprintln!("skipped: kiln's Slates fleet is faulted on Linux alone (a daemon stopped under a macOS workspace's NFS mount has panicked the Mac)");
-        return false;
+/// How a flow faults the fleet, which says where it may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    /// A signal to an instance's daemon (KILL, STOP): Linux alone, since one under a macOS NFS mount has panicked the Mac.
+    Signal,
+    /// A link through the relay (A-708): every daemon runs on, so any Unix.
+    Link,
+}
+
+/// Why a flow of `fault` skips on this host (`linux`) with the switch `on` or off; none when it runs.
+fn skip(fault: Fault, linux: bool, on: bool) -> Option<String> {
+    if fault == Fault::Signal && !linux {
+        return Some("skipped: a daemon is signalled on Linux alone (one stopped under a macOS workspace's NFS mount has panicked the Mac)".to_owned());
     }
-    if std::env::var_os(SWITCH).is_some_and(|v| v == "1") {
-        return true;
+    (!on).then(|| format!("skipped: {SWITCH}=1 runs kiln's Slates fleet under faults (three Slates instances and their anchors)"))
+}
+
+/// Whether a flow of `fault` runs here; a skip says why.
+fn enabled(fault: Fault) -> bool {
+    match skip(fault, cfg!(target_os = "linux"), std::env::var_os(SWITCH).is_some_and(|v| v == "1")) {
+        Some(why) => {
+            eprintln!("{why}");
+            false
+        }
+        None => true,
     }
-    eprintln!("skipped: {SWITCH}=1 runs kiln's Slates fleet under faults (three Slates instances and their anchors)");
-    false
 }
 
 /// One runner of the lab: the name it was started as, its machine key (what `[slates_fleet.nodes]` lists), its Slates
@@ -194,7 +210,52 @@ impl Lab {
             lab.start_runner(i)?;
         }
         lab.until_reformed("the fleet's first forming")?;
+        // No operator step: kiln bootstraps its fleet once, by the runner its server names (A-734).
+        lab.until_one_fleet()?;
+        lab.on_hosts()?;
         Ok(lab)
+    }
+
+    /// Every runner's engine set to its host, and waited for until kiln's facts of it say so (as `vm_e2e::set_engine`
+    /// does): the flows' agent works as a process on its runner in the runner's own workspace volume, which a move takes
+    /// (W7); an isolated agent's microVM is its machine's, and kiln refuses to move it.
+    fn on_hosts(&self) -> anyhow::Result<()> {
+        for n in &self.nodes {
+            let began = Instant::now();
+            loop {
+                let (code, body) = self.fleet.request("PUT", &format!("/api/runners/{}/engine", n.machine), Some(&json!({"engine": "host"})))?;
+                if code == 200 {
+                    break;
+                }
+                anyhow::ensure!(began.elapsed() < WITHIN, "{}'s engine set to host: {code} {}", n.name, String::from_utf8_lossy(&body));
+                std::thread::sleep(LOOK);
+            }
+            loop {
+                let engine = self.fleet.call("GET", &format!("/api/runners/{}/engine", n.machine), None)?;
+                if engine.pointer("/isolation/engine").and_then(Value::as_str) == Some("host") {
+                    break;
+                }
+                anyhow::ensure!(began.elapsed() < WITHIN, "{} never held engine host: {engine}", n.name);
+                std::thread::sleep(LOOK);
+            }
+        }
+        eprintln!("PROVEN: every runner's engine is its host");
+        Ok(())
+    }
+
+    /// Waits until every node's daemon counts every node of the lab among its fleet's members: one fleet of three, where
+    /// each node serving as a member of its own (`until_reformed`) was also three fleets of one (A-734).
+    fn until_one_fleet(&self) -> anyhow::Result<()> {
+        let began = Instant::now();
+        loop {
+            let counts: Vec<usize> = self.nodes.iter().map(|n| slates_api::Instance::attach(&n.instance).and_then(|mut i| i.daemon_status()).map_or(0, |r| r.fleet.members.len())).collect();
+            if counts.iter().all(|c| *c == self.nodes.len()) {
+                eprintln!("PROVEN: one fleet: every node counts all {} members ({:?})", self.nodes.len(), began.elapsed());
+                return Ok(());
+            }
+            anyhow::ensure!(began.elapsed() < WITHIN, "the nodes never formed one fleet: members counted {counts:?}\n{}", self.fleet_seen());
+            std::thread::sleep(LOOK);
+        }
     }
 
     fn node(&self, i: usize) -> anyhow::Result<&Node> {
@@ -212,7 +273,7 @@ impl Lab {
         // Its own machine id (what `common::machine` keys it by): three runners on one host are three machines.
         env.extend([("KILN_MACHINE_ID", name.to_owned()), ("KILN_SLATES_INSTANCE", instance), ("KILN_SLATES_DIRECT", "1".to_owned()), ("KILN_SLATES", String::new())]);
         let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        self.fleet.start_runner_with(name, &env)
+        self.fleet.start_runner_harnessed(name, &env)
     }
 
     /// Waits until every listed runner's node serves as a member ([`slates_faults::not_reformed`]), saying `what`.
@@ -227,7 +288,7 @@ impl Lab {
                 eprintln!("PROVEN: {what}: every listed runner's node serves as a member ({:?})", began.elapsed());
                 return Ok(());
             }
-            anyhow::ensure!(began.elapsed() < WITHIN, "{what}: the fleet didn't re-form within {WITHIN:?}; not serving: {missing:?}\n{}", self.fleet.logs());
+            anyhow::ensure!(began.elapsed() < WITHIN, "{what}: the fleet didn't re-form within {WITHIN:?}; not serving: {missing:?}\n{}\n{}", self.fleet_seen(), self.slates_story());
             std::thread::sleep(LOOK);
         }
     }
@@ -255,9 +316,49 @@ impl Lab {
     /// around the relay would prove nothing of a link fault.
     fn crossed_the_relay(&self) -> anyhow::Result<()> {
         let report = self.relay()?.report();
-        anyhow::ensure!(report.records_forwarded() > 0, "no record-plane datagram crossed the relay: {}", report.summary());
+        anyhow::ensure!(report.records_forwarded() > 0, "no record-plane datagram crossed the relay: {}\n{}", report.summary(), self.fleet_seen());
         eprintln!("RELAY: {}", report.summary());
         Ok(())
+    }
+
+    /// What each node's daemon says of its fleet (its host, the members it knows, the peers it probed, what it refused)
+    /// and every manifest kiln wrote under the lab's folder: what a failure that's about the fleet's links shows.
+    fn fleet_seen(&self) -> String {
+        let mut out = String::new();
+        for n in &self.nodes {
+            let seen = slates_api::Instance::attach(&n.instance).and_then(|mut i| i.daemon_status()).map(|r| {
+                let f = &r.fleet;
+                format!("host {} f {} members {:?} peers_probed {} unknown_id {} sessions_refused {} configuration {} held_records {} takeovers_pending {}", f.host, f.f, f.members, f.peers_probed, f.unknown_id, f.sessions_refused, f.configuration_version, f.held_records, f.takeovers_pending)
+            });
+            out.push_str(&format!("--- {} at {} (bind {:?}): {}\n", n.name, n.address, n.bind, seen.unwrap_or_else(|e| format!("no status: {e}"))));
+        }
+        let mut dirs = vec![self.fleet.root.path().to_owned()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    dirs.push(path);
+                } else if path.file_name().is_some_and(|f| f == kiln::workspace::slates_fleet::MANIFEST) {
+                    out.push_str(&format!("--- {}\n{}\n", path.display(), std::fs::read_to_string(&path).unwrap_or_default()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every line of each runner's whole log that speaks of Slates or kiln's Slates fleet: what a formation failure shows
+    /// (the fleet's own tail is the last lines alone, by then each runner's periodic word).
+    fn slates_story(&self) -> String {
+        let mut out = String::new();
+        for n in &self.nodes {
+            let log = self.fleet.root.path().join(format!("{}.log", n.name));
+            out.push_str(&format!("--- {} (Slates and the fleet, whole log)\n", n.name));
+            for line in std::fs::read_to_string(&log).unwrap_or_default().lines().filter(|l| l.contains("Slates") || l.contains("slates") || l.contains("fleet") || l.contains("move") || l.contains("moving")) {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
     }
 
     /// Each runner's node as a member, by its own instance's word: its member id where it serves as one.
@@ -285,8 +386,19 @@ impl Lab {
     /// An agent of the stand-in started on runner `i` in a workspace of its own: its session and its volume.
     fn start_agent(&self, i: usize) -> anyhow::Result<(String, slates_api::VolumeId)> {
         let on = self.node(i)?.machine.clone();
-        let spec = json!({"kind": "claude", "on": on, "cwd": self.project, "prompt": "wait", "workspace": {"kind": "volume"}});
-        let started = self.fleet.call("POST", "/api/ops/agents.start", Some(&spec))?;
+        let spec = json!({"kind": "claude", "on": on, "cwd": self.project, "prompt": "wait", "workspace": "volume", "isolation": "none"});
+        // Asked again while kiln says the runner hasn't yet said what it has ("try again"): a runner's facts come a
+        // moment after it connects, and a start before them is refused, not failed.
+        let began = Instant::now();
+        let started = loop {
+            let (code, body) = self.fleet.request("POST", "/api/ops/agents.start", Some(&spec))?;
+            let text = String::from_utf8_lossy(&body).into_owned();
+            if (200..300).contains(&code) {
+                break serde_json::from_str::<Value>(&text)?;
+            }
+            anyhow::ensure!(code == 409 && text.contains("try again") && began.elapsed() < WITHIN, "POST /api/ops/agents.start: {code} {text}");
+            std::thread::sleep(LOOK);
+        };
         // `agents.start` answers `{"agents": [brief], "parent"}` (harness/ops.rs `start_ask`).
         let id = ["/agents/0/id"]
             .iter()
@@ -302,6 +414,27 @@ impl Lab {
             anyhow::ensure!(began.elapsed() < WITHIN, "agent {id}'s workspace was never made: {info}");
             std::thread::sleep(LOOK);
         }
+    }
+
+    /// Volume `volume`, owned on runner `owner`, made what Slates' own fleet chaos holds to its NoLoss (`live_chaos.rs`
+    /// `create_volume`, `Fleet::share`): live-shipped, so a write is acknowledged once the owner and `f` copies hold it,
+    /// and shared with this test's user on every other runner's node, since a user means something only on its host
+    /// (A-237) and the survivors read it. Kiln's own workspaces are neither (live shipping is the person's to decide;
+    /// kiln shares a volume only with a move's target, K4), so the lab does it, as Slates' tests do.
+    fn hold_to_no_loss(&self, owner: usize, volume: slates_api::VolumeId) -> anyhow::Result<()> {
+        let n = self.node(owner)?;
+        let mut instance = slates_api::Instance::attach(&n.instance).map_err(|e| anyhow::anyhow!("{}: {e}", n.name))?;
+        let uid = nix::unistd::getuid().as_raw();
+        for (i, other) in self.nodes.iter().enumerate().filter(|(i, _)| *i != owner) {
+            let anchor = slates_api::Instance::attach(&other.instance).and_then(|mut o| o.daemon_status()).map_err(|e| anyhow::anyhow!("{}: {e}", other.name))?.anchor;
+            let principal = slates_api::Principal::Uid { host: anchor, uid };
+            let rights = slates_ipc::protocol::Rights { read: true, write: true, admin: true };
+            instance.client().share(volume, principal, rights).map_err(|e| anyhow::anyhow!("share with runner {i}: {e:?}"))?;
+        }
+        let shipped = instance.client().live_ship(volume, true).map_err(|e| anyhow::anyhow!("live-ship: {e:?}"))?;
+        anyhow::ensure!(shipped, "Slates recorded the volume not live-shipped");
+        eprintln!("NO-LOSS SETUP: the volume live-shipped and shared with the other runners' user");
+        Ok(())
     }
 
     /// kiln's word on agent `id` (`agents.get`).
@@ -337,12 +470,69 @@ impl Lab {
 
 impl Drop for Lab {
     fn drop(&mut self) {
+        // The runners stopped and every Slates mount under the lab's folder unmounted first: no instance is ended under a
+        // live mount (on macOS a kernel NFS mount, whose server's death has panicked the Mac). One that won't go leaves
+        // every instance running, saying so.
+        for n in RUNNERS {
+            self.fleet.stop_runner(n);
+        }
+        let root = std::fs::canonicalize(self.fleet.root.path()).unwrap_or_else(|_| self.fleet.root.path().to_owned());
+        let left = unmount_under(&root);
+        if !left.is_empty() {
+            eprintln!("LEFT RUNNING: the lab's Slates instances, under these mounts that wouldn't go: {left:?}");
+            return;
+        }
         // A stopped instance is let go on first, so its end is heard; then every instance the lab started is ended.
         for i in 0..self.nodes.len() {
             let _ = self.signal(i, "CONT");
             let _ = self.signal(i, "TERM");
         }
     }
+}
+
+/// The Slates mounts a host's table lists under `dir`, by their mount points: Linux's `/proc/self/mountinfo` (its fifth
+/// field, and after ` - ` its type `fuse.slates` or a source `slates:…`), or BSD `mount`'s `<source> on <point> (<type>, …)`.
+fn slates_mounts_under(table: &str, linux: bool, dir: &Path) -> Vec<String> {
+    table
+        .lines()
+        .filter_map(|line| {
+            if linux {
+                let (head, tail) = line.split_once(" - ")?;
+                let at = head.split(' ').nth(4)?.replace("\\040", " ");
+                let mut rest = tail.split(' ');
+                let (kind, source) = (rest.next()?, rest.next()?);
+                (kind == "fuse.slates" || source.starts_with("slates:")).then_some(at)
+            } else {
+                let (source, rest) = line.split_once(" on ")?;
+                let (at, _) = rest.rsplit_once(" (")?;
+                source.starts_with("slates:").then(|| at.to_owned())
+            }
+        })
+        .filter(|at| Path::new(at).starts_with(dir))
+        .collect()
+}
+
+/// This host's Slates mounts under `dir` now; where the table can't be read, a word standing for one, so nothing is ended
+/// unseen.
+fn slates_mounts_now(dir: &Path) -> Vec<String> {
+    let linux = cfg!(target_os = "linux");
+    let table = if linux { std::fs::read_to_string("/proc/self/mountinfo").ok() } else { Command::new("mount").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned()) };
+    table.map_or_else(|| vec!["(the mount table couldn't be read)".to_owned()], |t| slates_mounts_under(&t, linux, dir))
+}
+
+/// Every Slates mount under `dir` unmounted (`umount`, then forced, on macOS; `fusermount3 -u`, then lazily, on Linux):
+/// those still there after.
+fn unmount_under(dir: &Path) -> Vec<String> {
+    let tries: &[&[&str]] = if cfg!(target_os = "linux") { &[&["fusermount3", "-u"], &["fusermount3", "-u", "-z"]] } else { &[&["umount"], &["umount", "-f"]] };
+    for at in slates_mounts_now(dir) {
+        for t in tries {
+            let Some((program, args)) = t.split_first() else { continue };
+            if Command::new(program).args(args.iter()).arg(&at).output().is_ok_and(|o| o.status.success()) {
+                break;
+            }
+        }
+    }
+    slates_mounts_now(dir)
 }
 
 /// Whether a command line names instance `name` (`kiln slates-role --instance <name> ...`).
@@ -374,15 +564,22 @@ fn write_acknowledged(lab: &Lab, i: usize, volume: slates_api::VolumeId, round: 
     let mut acknowledged = BTreeMap::new();
     let mut instance = slates_api::Instance::attach(&n.instance).map_err(|e| anyhow::anyhow!("{}: {e}", n.name))?;
     let attachment = instance.attach_volume(volume, slates_api::Intent::Write).map_err(|e| anyhow::anyhow!("attach: {e}"))?.attachment;
+    // At the volume's root: a file under a folder the volume lacks is refused, whatever the fleet does.
+    let mut refused = None;
     for k in 0..FILES {
-        let path = format!("/faults/{round}-{k}.txt");
+        let path = format!("/faults-{round}-{k}.txt");
         let bytes = format!("{round} {k}: acknowledged before the fault\n").into_bytes();
-        if instance.client().fs_write((volume, attachment), &path, &bytes, 0o644).is_ok() {
-            acknowledged.insert(path, bytes);
+        match instance.client().fs_write((volume, attachment), &path, &bytes, 0o644) {
+            Ok(_) => {
+                acknowledged.insert(path, bytes);
+            }
+            Err(e) => {
+                refused.get_or_insert_with(|| format!("{path}: {e:?}"));
+            }
         }
     }
     let _ = instance.detach(attachment);
-    anyhow::ensure!(acknowledged.len() == FILES, "only {} of {FILES} writes were acknowledged before the fault", acknowledged.len());
+    anyhow::ensure!(acknowledged.len() == FILES, "only {} of {FILES} writes were acknowledged before the fault; the first refused: {}", acknowledged.len(), refused.unwrap_or_default());
     Ok(acknowledged)
 }
 
@@ -419,9 +616,25 @@ fn no_acknowledged_change_lost_through(lab: &Lab, through: &[usize], volume: sla
             eprintln!("PROVEN: {what}: every one of {} acknowledged files served byte for byte ({:?})", acknowledged.len(), began.elapsed());
             return Ok(());
         }
-        anyhow::ensure!(began.elapsed() < WITHIN, "{what}: acknowledged changes lost: {lost:?}\n{}", lab.fleet.logs());
+        // A read every node denies (rights, not loss) is no wait's to end: Slates' access lists are per host (A-237).
+        let first = lost.first().map(String::as_str).unwrap_or_default();
+        let denied = through.iter().filter_map(|i| lab.nodes.get(*i)).all(|n| matches!(slates_api::Instance::attach(&n.instance).and_then(|mut i| i.read(volume, first, slates_api::ReadAt::Head)), Err(slates_api::Error::Denied(_))));
+        anyhow::ensure!(!denied, "{what}: every node of {through:?} denies the read of {first} (Slates' access lists are per host, A-237, and kiln has no library call to share a volume with another host's account)\n{}", read_refusals(lab, through, volume, first));
+        anyhow::ensure!(began.elapsed() < WITHIN, "{what}: acknowledged changes lost: {lost:?}\n{}\n{}\n{}", read_refusals(lab, through, volume, lost.first().map(String::as_str).unwrap_or_default()), lab.fleet_seen(), lab.fleet.logs());
         std::thread::sleep(LOOK);
     }
+}
+
+/// What each node of `through` answers a read of `path` in `volume` now: what a lost file's failure says.
+fn read_refusals(lab: &Lab, through: &[usize], volume: slates_api::VolumeId, path: &str) -> String {
+    through
+        .iter()
+        .filter_map(|i| lab.nodes.get(*i))
+        .map(|n| match slates_api::Instance::attach(&n.instance).and_then(|mut i| i.read(volume, path, slates_api::ReadAt::Head)) {
+            Ok(bytes) => format!("--- {} reads {path}: {} bytes\n", n.name, bytes.len()),
+            Err(e) => format!("--- {} reads {path}: {e:?}\n", n.name),
+        })
+        .collect()
 }
 
 /// W7, A-580: a runner killed. Do: write acknowledged files into the agent's volume on the first runner; kill its
@@ -429,7 +642,7 @@ fn no_acknowledged_change_lost_through(lab: &Lab, through: &[usize], volume: sla
 /// Expect every acknowledged file served byte for byte after the fault, and the fleet re-formed once it's back.
 #[test]
 fn w7_a_killed_runner_loses_no_acknowledged_change_and_the_fleet_reforms() -> anyhow::Result<()> {
-    if !enabled() {
+    if !enabled(Fault::Signal) {
         return Ok(());
     }
     let mut lab = Lab::start()?;
@@ -448,7 +661,7 @@ fn w7_a_killed_runner_loses_no_acknowledged_change_and_the_fleet_reforms() -> an
 /// byte for byte throughout what follows, and the fleet re-formed.
 #[test]
 fn w7_a_partitioned_runner_loses_no_acknowledged_change_and_the_fleet_reforms() -> anyhow::Result<()> {
-    if !enabled() {
+    if !enabled(Fault::Signal) {
         return Ok(());
     }
     let lab = Lab::start()?;
@@ -468,7 +681,7 @@ fn w7_a_partitioned_runner_loses_no_acknowledged_change_and_the_fleet_reforms() 
 /// served byte for byte, and the fleet re-formed with the runner back as the same machine.
 #[test]
 fn w7_a_restarted_runner_rejoins_and_loses_no_acknowledged_change() -> anyhow::Result<()> {
-    if !enabled() {
+    if !enabled(Fault::Signal) {
         return Ok(());
     }
     let mut lab = Lab::start()?;
@@ -490,7 +703,7 @@ fn w7_a_restarted_runner_rejoins_and_loses_no_acknowledged_change() -> anyhow::R
 /// acknowledged file served byte for byte, and the fleet re-formed.
 #[test]
 fn w7_a_move_whose_target_is_cut_off_midway_ends_moved_or_refused_by_kind() -> anyhow::Result<()> {
-    if !enabled() {
+    if !enabled(Fault::Signal) {
         return Ok(());
     }
     let lab = Lab::start()?;
@@ -518,7 +731,7 @@ fn move_settles(lab: &Lab, agent: &str, from: &str, to: &str, refused: Option<&s
         let said = MoveSaid { from, to, runs_on: runs_on.as_deref(), refused };
         match slates_faults::judge_move(&said) {
             Ok(outcome) => break outcome,
-            Err(why) => anyhow::ensure!(began.elapsed() < WITHIN, "the move settled on no verdict W7 allows: {why:?}\n{}", lab.fleet.logs()),
+            Err(why) => anyhow::ensure!(began.elapsed() < WITHIN, "the move settled on no verdict W7 allows: {why:?}\nkiln's word on the agent: {}\n{}", lab.agent(agent).map_or_else(|e| format!("{e:#}"), |v| v.to_string()), lab.slates_story()),
         }
         std::thread::sleep(LOOK);
     };
@@ -535,7 +748,7 @@ fn move_settles(lab: &Lab, agent: &str, from: &str, to: &str, refused: Option<&s
 /// refused by kind, every acknowledged file served byte for byte, and the fleet re-formed.
 #[test]
 fn w7_a708_a_slow_lossy_link_loses_no_acknowledged_change_and_a_move_over_it_ends_moved_or_refused_by_kind() -> anyhow::Result<()> {
-    if !enabled() {
+    if !enabled(Fault::Link) {
         return Ok(());
     }
     let lab = Lab::start_relayed()?;
@@ -543,10 +756,12 @@ fn w7_a708_a_slow_lossy_link_loses_no_acknowledged_change_and_a_move_over_it_end
     lab.relay()?.shape_all(slow);
     eprintln!("FAULT: every link held {SLOW_DELAY:?} ± {SLOW_JITTER:?}, {SLOW_LOSS_PPM} ppm lost");
     let (agent, volume) = lab.start_agent(0)?;
+    lab.hold_to_no_loss(0, volume)?;
     let acknowledged = write_acknowledged(&lab, 0, volume, "slow")?;
     lab.crossed_the_relay()?;
     let (from, to) = (lab.node(0)?.machine.clone(), lab.node(1)?.machine.clone());
     let (code, body) = lab.fleet.request("POST", "/api/ops/agents.move", Some(&json!({"agent": agent, "to": to, "now": true})))?;
+    eprintln!("MOVE: agents.move answered {code} {}", String::from_utf8_lossy(&body));
     let refused = (!(200..300).contains(&code)).then(|| String::from_utf8_lossy(&body).into_owned());
     move_settles(&lab, &agent, &from, &to, refused.as_deref())?;
     no_acknowledged_change_lost(&lab, volume, &acknowledged, "a slow, lossy link")?;
@@ -563,12 +778,15 @@ fn w7_a708_a_slow_lossy_link_loses_no_acknowledged_change_and_a_move_over_it_end
 /// the survivors while it's cut and through any node once healed, and the fleet re-formed.
 #[test]
 fn w7_a708_a_runner_cut_off_while_it_runs_loses_no_acknowledged_change_and_the_fleet_reforms() -> anyhow::Result<()> {
-    if !enabled() {
+    if !enabled(Fault::Link) {
         return Ok(());
     }
     let lab = Lab::start_relayed()?;
     let (_agent, volume) = lab.start_agent(0)?;
+    lab.hold_to_no_loss(0, volume)?;
     let acknowledged = write_acknowledged(&lab, 0, volume, "cut")?;
+    // The control: the survivors serve the files before any fault, so a loss after the cut is the cut's.
+    no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "read through the other runners before the cut")?;
     lab.crossed_the_relay()?;
     let held = lab.failover(1)?;
     lab.relay()?.isolate(0);
@@ -581,4 +799,37 @@ fn w7_a708_a_runner_cut_off_while_it_runs_loses_no_acknowledged_change_and_the_f
     eprintln!("RELAY: {}", lab.relay()?.report().summary());
     no_acknowledged_change_lost(&lab, volume, &acknowledged, "a cut-off runner back")?;
     lab.until_reformed("after a runner cut off")
+}
+
+/// The gate and the end's mount check, which run without the switch.
+mod checks {
+    use super::*;
+
+    /// W7, A-708: the link faults run on any Unix and the signalling flows on Linux alone, each behind the switch; a skip
+    /// says why.
+    #[test]
+    fn a708_the_link_faults_run_off_linux_and_the_signalled_ones_on_linux_alone() {
+        assert_eq!(skip(Fault::Link, false, true), None, "a link fault runs on macOS");
+        assert_eq!(skip(Fault::Link, true, true), None);
+        assert_eq!(skip(Fault::Signal, true, true), None);
+        assert!(skip(Fault::Signal, false, true).is_some_and(|w| w.contains("Linux alone")), "no daemon is signalled under a macOS NFS mount");
+        assert!(skip(Fault::Link, false, false).is_some_and(|w| w.contains(SWITCH)), "off without the switch");
+        assert!(skip(Fault::Signal, true, false).is_some_and(|w| w.contains(SWITCH)));
+    }
+
+    /// W7, A-708: the lab's end finds the Slates mounts under its folder in either table, and no other.
+    #[test]
+    fn a708_the_labs_end_finds_its_slates_mounts_and_no_other() {
+        let lab = Path::new("/private/var/folders/x/T/.tmpAb12");
+        let bsd = "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n\
+                   slates:/kiln-01a1 on /private/var/folders/x/T/.tmpAb12/fleet-a/home/.kiln/workspaces/kiln 01a1 (nfs, nodev, nosuid, mounted by ada)\n\
+                   slates:/persons-own on /Users/ada/mine (nfs, nodev, nosuid, mounted by ada)\n\
+                   map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)\n";
+        assert_eq!(slates_mounts_under(bsd, false, lab), vec!["/private/var/folders/x/T/.tmpAb12/fleet-a/home/.kiln/workspaces/kiln 01a1".to_owned()]);
+        let lab = Path::new("/tmp/.tmpAb12");
+        let info = "36 35 98:0 / / rw,noatime master:1 - ext4 /dev/root rw\n\
+                    90 36 0:51 / /tmp/.tmpAb12/fleet-b/home/.kiln/workspaces/kiln\\04001a1 rw,nosuid,nodev - fuse.slates slates:7 rw\n\
+                    91 36 0:52 / /home/ada/mine rw - fuse.slates slates:8 rw\n";
+        assert_eq!(slates_mounts_under(info, true, lab), vec!["/tmp/.tmpAb12/fleet-b/home/.kiln/workspaces/kiln 01a1".to_owned()]);
+    }
 }

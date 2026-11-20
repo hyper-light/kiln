@@ -485,7 +485,7 @@ refuses what the instance's start would), and starts its instance as the fleet's
 join starts none until it can. A listed runner starts its instance as it starts (a node holds the
 fleet's copies only while its daemon runs), and says its node's member id once it serves. One listed
 runner founds the fleet's consensus groups (its place says `founds`: the first the setting lists, the
-same at every start), bootstrapping the root once its node serves; every other imports it. Until one
+same at every start), bootstrapping the root once, as A-734 below says; every other imports it. Until one
 did, no fleet runner made a workspace ("this node has no consensus group yet": goal 91's live move,
 2026-11-19, seen on three runners of one Mac). A listed runner says, with its member id, the Slates user its kiln is
 on its node (its node's certificate anchor and its uid), and a move shares the volume with the target's
@@ -547,14 +547,33 @@ by kind** (kiln's word on it, once it settles, is the agent working on its targe
 naming a kind W7 lists, `workspace::slates_move::KINDS`, with the agent working where it was: never neither); and **the
 fleet re-forms** (once the fault ends, every listed runner's node is a member again, serving). It is a test of what
 holds, not of how fast: no latency is judged, and every wait is the fleet's own failover delay as its nodes report it.
-Linux alone, where a workspace is a FUSE mount: on macOS it's a kernel NFS mount over loopback, and a daemon killed or
-stopped under a live NFS mount has panicked the Mac (Slates' record of 2026-10-06), so the macOS flows wait until a
-runner lets its workspace mounts go before a fault. Gated by `SLATES_FLEET_FAULTS=1` and skipped, saying so, without it,
+The flows that signal a daemon run on Linux alone, where a workspace is a FUSE mount: on macOS it's a kernel NFS mount
+over loopback, and a daemon killed or stopped under a live NFS mount has panicked the Mac (Slates' record of
+2026-10-06). The link faults signal no daemon and run on macOS too; there, as everywhere, the lab's end stops its
+runners and unmounts every Slates mount under its folder before it ends an instance, and leaves the instances running,
+saying so, where a mount won't go. Gated by `SLATES_FLEET_FAULTS=1` and skipped, saying so, without it,
 since it starts three instances and their anchors:
 
 ```sh
 SLATES_FLEET_FAULTS=1 cargo test -p kiln --test slates_fleet_faults -- --nocapture --test-threads 1
 ```
+
+**How kiln's Slates fleet forms (A-734, found by this test's first runs on macOS, 2026-11-20).** A listed runner writes
+its node's manifest only once the server's directory lists the `2f + 1` nodes a write commits among
+(`slates_fleet::short_of`): runners started together each found themselves alone there and wrote three fleets of one.
+Kiln then makes the fleet's root group itself, once (the person's ruling: no operator step): the fleet's founder (the
+first runner the setting lists) asks the server (`POST /api/agents/slates-fleet/bootstrap`), which records the claim in
+kiln's database before it answers (`slates_fleet_bootstrap`, bound to that machine); once its node holds every node of
+the manifest alive with its probe mesh up (`slates_fleet::meshed`, as Slates' own fleets wait), it asks Slates through
+its library (`ensure_group`) and says it's done. It's never asked again, so a founder started again with a fresh member
+(its anchor's memory lost) never founds a second root group (Slates: a bootstrap run again founds another group, it
+doesn't recover one). A fleet of one is
+bootstrapped the same way. A workspace asked of a node that hasn't imported the groups yet waits for them
+(`workspace::slates::call_grouped`) rather than failing its agent. Each flow proves one fleet before its fault: every
+node counts all three members. Open (the person's to decide): a kiln workspace isn't live-shipped, so a write Slates
+acknowledged is the owner's alone until its next seal, where Slates' own "no acknowledged change lost" is a live-shipped
+volume's; and a workspace is shared with another runner's user only before a move (K4; Slates' access lists are per
+host, A-237), so a survivor is refused a read of a workspace it was never moved.
 
 Not in it: a captured clone landed after its runner's loss and a moved live clone landed against its capture, which are
 Slates' own fleet tests (its A-583); one link cut while every node runs, which needs a relay between the nodes that

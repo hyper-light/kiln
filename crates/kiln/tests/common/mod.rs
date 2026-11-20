@@ -408,6 +408,17 @@ host_seconds = {host_seconds}
 
     /// A runner with `env` besides the fleet's (after it: the same name wins).
     pub fn start_runner_with(&mut self, name: &str, env: &[(&str, &str)]) -> anyhow::Result<()> {
+        self.spawn_runner(name, env, false)
+    }
+
+    /// A runner with `env`, as [`Fleet::start_runner_with`] starts one but with its harness: agents' sessions and
+    /// workspaces, and, where the server's `[slates_fleet]` lists it, its Slates started as the fleet's node at once
+    /// (`agent.rs`: the harness is a terminal runner's alone, so `--no-terminal` starts none).
+    pub fn start_runner_harnessed(&mut self, name: &str, env: &[(&str, &str)]) -> anyhow::Result<()> {
+        self.spawn_runner(name, env, true)
+    }
+
+    fn spawn_runner(&mut self, name: &str, env: &[(&str, &str)], harness: bool) -> anyhow::Result<()> {
         let join = std::fs::read_to_string(self.root.path().join("server").join("join.token"))?.trim().to_owned();
         let dir = self.root.path().join(name);
         let log = self.root.path().join(format!("{name}.log"));
@@ -419,7 +430,8 @@ host_seconds = {host_seconds}
         let out = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
         let child = self
             .command(&dir.join("home"), name)?
-            .args(["agent", "--server", &format!("http://127.0.0.1:{}", self.http), "--token", &join, "--name", name, "--slots", "1", "--labels", "baremetal", "--no-terminal", "--no-reach"])
+            .args(["agent", "--server", &format!("http://127.0.0.1:{}", self.http), "--token", &join, "--name", name, "--slots", "1", "--labels", "baremetal", "--no-reach"])
+            .args((!harness).then_some("--no-terminal"))
             .env("KILN_OTLP_ADDR", format!("127.0.0.1:{otlp}"))
             // OTLP/gRPC's port is a machine's own: a test that wants it gives one of its own.
             .env("KILN_OTLP_GRPC_ADDR", "off")

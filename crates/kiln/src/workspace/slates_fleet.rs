@@ -571,6 +571,105 @@ pub fn source() -> Option<&'static Source> {
     SOURCE.get()
 }
 
+/// The fleet's one-time bootstrap as the server keeps it (A-734; table `slates_fleet_bootstrap`): which machine claimed
+/// it, the Slates member id its bootstrap names, and whether that machine said it was done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapClaim {
+    pub machine: String,
+    pub member: u64,
+    pub done: bool,
+}
+
+/// What the server answers a runner that asks whether it bootstraps the fleet ([`bootstrapper`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bootstrap {
+    /// No runner has claimed it: this one does, and the claim is recorded first.
+    Claim,
+    /// This runner claimed it and never said it was done (it stopped midway, or its word was lost): it asks Slates again,
+    /// which answers a group already made as made.
+    Again,
+    /// Another runner claimed it, or it's done: this runner's node imports the fleet's groups and makes none.
+    Not,
+}
+
+/// Whether the fleet's founder ([`founder`]) bootstraps kiln's Slates fleet now (A-734; main's ruling of 2026-11-20): once,
+/// the claim recorded before it's answered; asked again only while the founder hasn't said it's done; once it has, never
+/// again, it included (a restart, a second runner, a server restart: Slates' docs/deploy.md, a
+/// bootstrap run again doesn't recover a lost group, it founds another). A fleet of one is bootstrapped the same way.
+pub fn bootstrapper(claim: Option<&BootstrapClaim>, machine: &str) -> Bootstrap {
+    match claim {
+        None => Bootstrap::Claim,
+        Some(c) if c.machine == machine && !c.done => Bootstrap::Again,
+        Some(_) => Bootstrap::Not,
+    }
+}
+
+/// The server's side of a runner's ask ([`bootstrapper`]) for fleet `fleet`, which only the fleet's founder (`founds`)
+/// claims, on the store's one writer (`Store::call`
+/// runs each call in a savepoint of the writer's transaction, one call at a time, so it opens none of its own): a new
+/// claim recorded before it's answered, so two runners asking at once can't both be told to bootstrap; `done` (the runner's word that
+/// Slates made the group) marks its own claim done. Answers whether the asking runner bootstraps.
+pub fn ask_bootstrap_on(c: &rusqlite::Connection, fleet: &str, machine: &str, founds: bool, member: u64, done: bool, now: i64) -> anyhow::Result<bool> {
+    if !founds {
+        return Ok(false);
+    }
+    use rusqlite::OptionalExtension as _;
+    let claim = c
+        .query_row("SELECT machine, member, done_at IS NOT NULL FROM slates_fleet_bootstrap WHERE fleet = ?1", [fleet], |r| {
+            Ok(BootstrapClaim { machine: r.get(0)?, member: u64::from_ne_bytes(r.get::<_, i64>(1)?.to_ne_bytes()), done: r.get(2)? })
+        })
+        .optional()?;
+    let member_word = i64::from_ne_bytes(member.to_ne_bytes());
+    let answer = match bootstrapper(claim.as_ref(), machine) {
+        Bootstrap::Claim if done => anyhow::bail!("{machine} says it bootstrapped kiln's Slates fleet, which no runner had claimed"),
+        Bootstrap::Claim => {
+            c.execute("INSERT INTO slates_fleet_bootstrap (fleet, machine, member, claimed_at) VALUES (?1, ?2, ?3, ?4)", rusqlite::params![fleet, machine, member_word, now])?;
+            true
+        }
+        Bootstrap::Again if done => {
+            c.execute("UPDATE slates_fleet_bootstrap SET done_at = ?2, member = ?3 WHERE fleet = ?1", rusqlite::params![fleet, now, member_word])?;
+            false
+        }
+        Bootstrap::Again => true,
+        Bootstrap::Not => false,
+    };
+    Ok(answer)
+}
+
+/// What a runner sends `POST /api/agents/slates-fleet/bootstrap`: its machine's proof, the member id its node serves as,
+/// and whether it says its bootstrap is done (A-734).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskBootstrap {
+    pub cert_pem: String,
+    pub proof_csr: String,
+    pub member: u64,
+    #[serde(default)]
+    pub done: bool,
+}
+
+/// The server's answer to [`AskBootstrap`]: whether this runner bootstraps the fleet.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct Bootstrapper {
+    pub bootstrap: bool,
+}
+
+/// Asks the server whether the runner `source` bootstraps kiln's Slates fleet, its node serving as `member`; `done`
+/// says it did ([`ask_bootstrap_on`]).
+pub async fn ask_bootstrap(source: &Source, member: u64, done: bool) -> anyhow::Result<bool> {
+    use crate::http::client::{Client, Roots};
+    let ask = AskBootstrap { cert_pem: source.machine.cert_pem.clone(), proof_csr: crate::pki::make_csr_with_key(&source.machine_name, &source.machine.key_pem)?, member, done };
+    let http = Client::new(Roots::WebPkiPlusDer(crate::join::pem_der(&source.ca_pem)?), None)?;
+    let url = format!("{}/api/agents/slates-fleet/bootstrap", source.server_url.trim_end_matches('/'));
+    let resp = http.post(&url).json(&ask).send().await.with_context(|| format!("reach {url}"))?;
+    if !resp.is_success() {
+        let status = resp.status();
+        let body = resp.bytes(REFUSAL_BYTES).await.unwrap_or_default();
+        anyhow::bail!("the server refused this runner's word on kiln's Slates fleet's bootstrap ({status}): {}", String::from_utf8_lossy(&body).trim());
+    }
+    let answer: Bootstrapper = resp.json(ANSWER_BYTES).await.context("the server's word on kiln's Slates fleet's bootstrap")?;
+    Ok(answer.bootstrap)
+}
+
 /// What a runner sends `POST /api/agents/slates-fleet/place`: its machine's proof.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AskPlace {
@@ -609,6 +708,16 @@ pub struct Joined {
     pub node: NodeAnnouncement,
     /// Its node founds the fleet's consensus groups ([`Place::founds`]).
     pub founds: bool,
+    /// How many nodes its manifest names: what its node holds alive before it founds the fleet's groups ([`meshed`]).
+    pub nodes: usize,
+}
+
+/// Whether the founder's node may bootstrap the fleet now (A-734), by its daemon's word: it holds every node its manifest
+/// names (`members`) alive, keeps contact with a peer, and has a probe session with every peer in contact, as Slates' own
+/// fleets wait before their one bootstrap (`live_chaos.rs` `wait_formed`: the root group made among nodes already in
+/// contact). A fleet of one at once.
+pub fn meshed(members: usize, listed: usize, in_contact: u32, unmeshed: u32) -> bool {
+    members >= listed && (listed <= 1 || (in_contact > 0 && unmeshed == 0))
 }
 
 /// A runner's start (module docs): what its machine's instance joins the fleet with, when the operator chose it; none
@@ -619,12 +728,41 @@ pub async fn join(source: &Source) -> anyhow::Result<Option<Joined>> {
     };
     let identity = identity(&source.dir, &source.server_url, &source.ca_pem, &source.machine_name, &source.machine, host_of(&place.address)).await?;
     let node = announcement(&identity, &place.address)?;
-    let members = discover(&source.server_url, &source.ca_pem, &source.machine_name, &source.machine, &node).await?;
+    // The manifest waits for a fleet that can commit a write (A-734): written from fewer nodes it would be a fleet of its
+    // own, never told of the rest. The wait has no deadline: a runner whose fleet never forms starts no Slates, and says
+    // why once.
+    let mut said = false;
+    let members = loop {
+        let members = discover(&source.server_url, &source.ca_pem, &source.machine_name, &source.machine, &node).await?;
+        match short_of(&members, place.f) {
+            None => break members,
+            Some(why) if !said => {
+                tracing::info!("{why}");
+                said = true;
+            }
+            Some(_) => {}
+        }
+        crate::rt::sleep(AWAIT_FLEET).await;
+    };
     let manifest = write_manifest(&source.dir, &identity, &source.machine_name, &members, place.f, place.bind.as_deref())?;
     let selection = checked(&manifest, &source.machine_name)?;
     tracing::info!(manifest = %manifest.display(), nodes = members.members.len(), f = place.f, "this runner's Slates joins kiln's Slates fleet");
-    Ok(Some(Joined { selection, node, founds: place.founds }))
+    Ok(Some(Joined { selection, node, founds: place.founds, nodes: members.members.len() }))
 }
+
+/// What the server's directory still lacks before a runner may write its manifest (A-734): a fleet of `f` takes
+/// `2f + 1` nodes (a write commits at `f + 1` of them), and a manifest written from fewer is a fleet of its own that
+/// never learns the rest, since kiln writes it once, at the node's start. Runners started together each found only
+/// themselves in the directory and wrote three fleets of one (slates_fleet_faults' first run, 2026-11-20). `None` once
+/// there are enough.
+pub fn short_of(members: &Members, f: u32) -> Option<String> {
+    let needed = u64::from(f).saturating_mul(2).saturating_add(1);
+    let listed = u64::try_from(members.members.len()).unwrap_or(u64::MAX);
+    (listed < needed).then(|| format!("the server's directory lists {listed} of the {needed} nodes a fleet of f = {f} takes (a write commits at f + 1 of 2f + 1): this runner's Slates waits for the rest to say their word"))
+}
+
+/// How often a runner asks the directory again while it waits for its fleet ([`short_of`]).
+const AWAIT_FLEET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The runner's word said again with the member id its daemon serves as since this start (K4): a daemon started again
 /// is a new member, so its runner says it at every start.
@@ -969,6 +1107,69 @@ mod tests {
         std::fs::copy(scratch.path().join("bench-b").join(KEY), dir.join(KEY))?;
         assert!(checked(&manifest, "bench-a").is_err());
         Ok(())
+    }
+
+    /// A-734 (main's ruling of 2026-11-20): the fleet's bootstrap is claimed by its founder alone, recorded before it's
+    /// answered, asked again only by that runner until it says it's done, and never again after: not by another runner,
+    /// not by itself restarted with a fresh member, not after the server's restart (the claim is in its database).
+    #[test]
+    fn a734_kilns_slates_fleet_is_bootstrapped_once_by_its_founder() -> anyhow::Result<()> {
+        let claim = |machine: &str, done: bool| BootstrapClaim { machine: machine.to_owned(), member: 7, done };
+        assert_eq!(bootstrapper(None, "bench-a"), Bootstrap::Claim);
+        assert_eq!(bootstrapper(Some(&claim("bench-a", false)), "bench-a"), Bootstrap::Again, "its own claim, not done: it asks Slates again");
+        assert_eq!(bootstrapper(Some(&claim("bench-a", false)), "bench-b"), Bootstrap::Not, "another's claim");
+        assert_eq!(bootstrapper(Some(&claim("bench-a", true)), "bench-a"), Bootstrap::Not, "done: never again, its own restart included");
+        let scratch = tempfile::tempdir()?;
+        let path = scratch.path().join("kiln.db");
+        let open = || -> anyhow::Result<rusqlite::Connection> {
+            let c = rusqlite::Connection::open(&path)?;
+            c.execute_batch(include_str!("../store/migrations/20261120-0900_slates_fleet_bootstrap.sql"))?;
+            Ok(c)
+        };
+        // Each ask inside a transaction already open, as `Store::call` runs it (a savepoint of the writer's transaction):
+        // one of its own there was refused "cannot start a transaction within a transaction" on every ask, and no runner
+        // ever bootstrapped (found by use, 2026-11-20).
+        let c = open()?;
+        c.execute_batch("BEGIN")?;
+        assert!(!ask_bootstrap_on(&c, FLEET, "bench-c", false, 33, false, 0)?, "a runner that isn't the founder claims nothing");
+        assert!(ask_bootstrap_on(&c, FLEET, "bench-b", true, 22, false, 1)?, "the founder, asking first, bootstraps");
+        assert!(!ask_bootstrap_on(&c, FLEET, "bench-a", true, 11, false, 2)?, "a second runner doesn't");
+        assert!(ask_bootstrap_on(&c, FLEET, "bench-b", true, 23, false, 3)?, "the claimer restarted midway asks again");
+        assert!(ask_bootstrap_on(&c, FLEET, "bench-a", true, 11, true, 4).is_ok_and(|b| !b), "another's word that it's done changes nothing");
+        assert!(!ask_bootstrap_on(&c, FLEET, "bench-b", true, 23, true, 5)?, "done");
+        c.execute_batch("COMMIT")?;
+        drop(c);
+        let c = open()?;
+        for (machine, member) in [("bench-b", 24), ("bench-a", 11), ("bench-c", 33)] {
+            assert!(!ask_bootstrap_on(&c, FLEET, machine, true, member, false, 6)?, "{machine}: never again, the server restarted");
+        }
+        assert!(ask_bootstrap_on(&c, "another.fleet", "bench-c", true, 33, false, 7)?, "a fleet of its own is bootstrapped once too");
+        Ok(())
+    }
+
+    /// A-734 (found by use): the fleet is bootstrapped only once its bootstrapper holds every node its manifest names
+    /// alive with its probe mesh up; a fleet of one at once.
+    #[test]
+    fn a734_the_bootstrap_waits_for_every_node_in_contact_and_meshed() {
+        assert!(!meshed(1, 3, 0, 0), "alone in a fleet of three");
+        assert!(!meshed(3, 3, 0, 0), "every member known, no peer in contact");
+        assert!(!meshed(3, 3, 2, 1), "a peer in contact not yet probed");
+        assert!(meshed(3, 3, 2, 0));
+        assert!(meshed(1, 1, 0, 0), "a fleet of one bootstraps as it is");
+    }
+
+    /// A-734 (W7; found by use): a runner writes its manifest only once the directory lists a fleet that can commit a
+    /// write, `2f + 1` nodes, and says what it still lacks until then.
+    #[test]
+    fn a734_a_manifest_waits_for_a_fleet_that_can_commit_a_write() {
+        let member = |machine: &str| Member { machine: machine.to_owned(), address: "10.0.0.1:17300".to_owned(), domain: 0, certificate: String::new(), member: None, user: None };
+        let of = |machines: &[&str]| Members { fleet: FLEET.to_owned(), members: machines.iter().map(|m| member(m)).collect() };
+        assert!(short_of(&of(&["bench-a"]), 1).is_some_and(|w| w.contains("1 of the 3")), "a runner alone in the directory writes no fleet of one");
+        assert!(short_of(&of(&["bench-a", "bench-b"]), 1).is_some(), "two of three can't commit at f + 1 once one is lost");
+        assert_eq!(short_of(&of(&["bench-a", "bench-b", "bench-c"]), 1), None);
+        assert_eq!(short_of(&of(&["bench-a", "bench-b", "bench-c", "bench-d"]), 1), None);
+        assert_eq!(short_of(&of(&["bench-a"]), 0), None, "f = 0 is a fleet of one by the operator's word");
+        assert!(short_of(&of(&["bench-a", "bench-b", "bench-c"]), 2).is_some_and(|w| w.contains("3 of the 5")));
     }
 
     /// A-708 (W7, the multi-runner test's link faults): a runner `[slates_fleet.binds]` names is placed with its bind,
