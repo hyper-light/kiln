@@ -74,7 +74,12 @@ test("a session on bare metal has the Engine tab: Environments and Agents, no Sa
   // Nothing changed: nothing to save or discard.
   await expect(form.getByRole("button", { name: "Save release-tools" })).toBeDisabled();
   await expect(form.getByRole("button", { name: "Discard changes to release-tools" })).toBeDisabled();
-  await expect(list.getByRole("list", { name: "Sessions running with release-tools" })).toContainText("Update the docs");
+  // The sessions running with it, a row each in a table: this one marked.
+  const ran = list.getByRole("table", { name: "Sessions running with release-tools" });
+  await expect(ran.getByRole("columnheader")).toHaveText(["Session", "Machine", "State"]);
+  await expect(ran.getByRole("row").nth(1)).toContainText("Update the docs");
+  await expect(ran.getByRole("row").nth(1)).toContainText("this session");
+  await expect(ran.getByRole("row")).toHaveCount(4);
   // Sorted and found: most variables first after this session's; Secrets chosen, only those that give one.
   await body.getByRole("combobox", { name: "Sort environments" }).selectOption("vars");
   await expect(lines.locator(".df-defname")).toHaveText(["release-tools", "aws-agents", "clean-ci"]);

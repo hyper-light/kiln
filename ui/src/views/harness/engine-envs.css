@@ -53,7 +53,7 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin-top: 4px;
+  margin-top: 12px;
 }
 /* Asked again in place (apply, delete): its words wrap at a phone's width. */
 .ms-node.ev-ask {
@@ -267,4 +267,36 @@ input.ev-tag-in:focus {
 [data-list="envs-tab"] > li.ev-new {
   padding-top: 12px;
   padding-bottom: 12px;
+}
+
+/* The sessions running with it: a table, a rule under its head and under each row. */
+.ev-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.ev-table th {
+  padding: 6px 12px 6px 0;
+  border-bottom: 1px solid #25272c;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  text-align: left;
+  text-transform: uppercase;
+}
+.ev-table td {
+  padding: 7px 12px 7px 0;
+  border-bottom: 1px solid #191b1f;
+  vertical-align: baseline;
+}
+.ev-table th:last-child,
+.ev-table td:last-child {
+  padding-right: 0;
+}
+.ev-here {
+  margin-left: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
 }

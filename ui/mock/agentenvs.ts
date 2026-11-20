@@ -45,7 +45,7 @@ function seed(): Map<string, Agentenv> {
       created_at: t - 5 * DAY,
       updated_at: t - 2 * DAY,
       tags: ["release", "github"],
-      sessions: ["fam-docs"],
+      sessions: ["fam-docs", "fam-orch", "fam-tests"],
     },
     {
       id: "env-aws",

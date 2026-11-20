@@ -43,11 +43,16 @@ import {
 import { GroupHead } from "./definitions";
 import { agentLabel } from "./derive";
 import { Fold, useFold } from "./fold";
+import { STANDS } from "./list-tools";
+import { standOf } from "./mission-rows";
 import { useAgentList } from "./use-agents";
 import "./definition.css";
 import "./sandbox.css";
 import "./figure/figure.css";
 import "./engine-envs.css";
+
+/** A session's state in Mission control's words. */
+const STAND_WORD = new Map(STANDS.map((x) => [x.id, x.label]));
 
 const machineOf = (target: string) => labelOf(target.replace(/^agent:/, ""));
 
@@ -222,19 +227,32 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
                 {sessions.length === 0 ? (
                   <span className="df-note">No sessions.</span>
                 ) : (
-                  <ul className="sb-rows ev-rows" aria-label={`Sessions running with ${e.name}`}>
-                    {sessions.map((s) => (
-                      <li key={s.id} className="sb-row ev-session">
-                        <Link to={`/agents/${s.id}`} className="ms-link sb-clip">
-                          {"kind" in s ? agentLabel(s) : s.name}
-                        </Link>
-                        <span className="sb-dim sb-clip">{s.id === at.agentId ? "this session" : s.target ? machineOf(s.target) : ""}</span>
-                      </li>
-                    ))}
-                  </ul>
+                  <table className="ev-table" aria-label={`Sessions running with ${e.name}`}>
+                    <thead>
+                      <tr>
+                        <th scope="col">Session</th>
+                        <th scope="col">Machine</th>
+                        <th scope="col">State</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sessions.map((s) => (
+                        <tr key={s.id}>
+                          <td>
+                            <Link to={`/agents/${s.id}`} className="ms-link">
+                              {"kind" in s ? agentLabel(s) : s.name}
+                            </Link>
+                            {s.id === at.agentId && <span className="df-this ev-here">this session</span>}
+                          </td>
+                          <td className="sb-dim">{s.target ? machineOf(s.target) : "—"}</td>
+                          <td className="sb-dim">{"kind" in s ? (STAND_WORD.get(standOf(s)) ?? standOf(s)) : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 )}
                 <span className="ev-acts">
-                  <Button size="xs" variant="ghost-danger" onClick={() => setAsking(true)}>
+                  <Button size="xs" variant="danger" onClick={() => setAsking(true)}>
                     Delete
                   </Button>
                 </span>
