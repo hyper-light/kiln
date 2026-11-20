@@ -8798,13 +8798,14 @@ mod tests {
         use crate::harness::lineage::NoWorkspace;
         use crate::workspace::slates::WorkspaceMissing as Lacks;
         let no = |missing: Lacks, said: &str| Err(NoWorkspace { missing, said: said.into() });
+        let said = |v: &serde_json::Value, at: &str| v.pointer(at).cloned().unwrap_or_default();
         let whp = super::workspaces_answer(&no(Lacks::WinFsp, "WinFsp isn't installed (winfsp.dev)"), &Ok(()));
-        assert_eq!(whp["available"], false);
-        assert_eq!(whp["why_not"], "WinFsp isn't installed (winfsp.dev)");
-        assert_eq!(whp["served"], serde_json::json!({"available": true}));
+        assert_eq!(said(&whp, "/available"), false);
+        assert_eq!(said(&whp, "/why_not"), "WinFsp isn't installed (winfsp.dev)");
+        assert_eq!(said(&whp, "/served"), serde_json::json!({"available": true}));
         let none = super::workspaces_answer(&no(Lacks::Workspaces, "this kiln keeps no workspaces"), &no(Lacks::Workspaces, "this kiln keeps no workspaces"));
-        assert_eq!((none["available"].clone(), none["served"]["available"].clone()), (false.into(), false.into()));
-        assert_eq!(none["served"]["why_not"], "this kiln keeps no workspaces");
+        assert_eq!((said(&none, "/available"), said(&none, "/served/available")), (false.into(), false.into()));
+        assert_eq!(said(&none, "/served/why_not"), "this kiln keeps no workspaces");
         let both = super::workspaces_answer(&Ok(()), &Ok(()));
         assert_eq!(both, serde_json::json!({"available": true, "served": {"available": true}}));
     }
