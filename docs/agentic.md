@@ -561,6 +561,17 @@ Slates' own fleet tests (its A-583); one link cut while every node runs, which n
 kiln's manifest can't name yet (Slates' `bind`, its A-277); and runners on separate machines, the same flows driven
 through `kiln run --on` once this one holds.
 
+**The live move (goal 91, K4, K5; `tests/slates_fleet_live_move.rs`).** An agent of the stand-in (an ACP harness, whose
+conversation a move carries in words) works in its captured clone on one runner, is moved by `agents.move` to a second,
+and goes on there: its hand-off turn and its own turn work in the moved volume's mount, which holds both runners' work
+byte for byte; the old runner's mount is gone, its node refuses a write attachment by kind and reads nothing stale; the
+end takes the new mount down. `SLATES_FLEET_LIVE_MOVE=local` runs three runners on one Mac; `=<runner B>,<runner C>`
+(with `SLATES_FLEET_LIVE_MOVE_HOST`) runs the second and third on production runners through `kiln run --on`. By use
+(2026-11-19, one Mac, release): it found that no runner founded the fleet's groups and that a moved volume wasn't
+shared with its new runner (both fixed); Slates refuses most first asks `unplaced` (asked again every 30 s), and its
+MOUNT service answers a moved volume `NOENT` in four runs of five (Slates' to fix), so it passes only when Slates
+mounts the volume.
+
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.
 Its workspace of its own is a Slates volume made with no mount (kiln goal 01a1ec34599974448f6b7663ddb07001):
