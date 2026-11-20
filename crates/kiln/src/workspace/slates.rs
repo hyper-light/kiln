@@ -1391,6 +1391,19 @@ pub(crate) async fn policy(m: &Made) -> anyhow::Result<Option<WritePolicy>> {
     call("write policy", move |i| i.write_policy(PolicySubject::Volume(volume))).await
 }
 
+/// Slates' export of workspace `m`'s volume to one client acting as `uid` (docs/agentic.md W10; Slates' A-521,
+/// `Instance::export`): its attachment, which [`detach`] ends with its capability, and the path that capability
+/// authorizes (`/<name>@<attachment>.<token>`, a bearer secret: `Exported`'s `Debug` hides it).
+pub async fn export(m: &Made, uid: u32, read_only: bool) -> anyhow::Result<slates_api::Exported> {
+    let volume = volume_id(&m.volume)?;
+    call("export", move |i| i.export(volume, uid, &slates_api::ExportOptions { read_only, subtree: None })).await
+}
+
+/// Slates' end of attachment `attachment` (an export's, a container's bind): its capability reaches nothing after it.
+pub async fn detach(attachment: u64) -> anyhow::Result<()> {
+    call("detach", move |i| i.detach(attachment)).await
+}
+
 /// What every landing leaves out: git's own directory.
 pub const EXCLUDES: &[&str] = &["/.git"];
 

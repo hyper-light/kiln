@@ -577,10 +577,23 @@ pub(super) fn preview(shared: &Shared, req: u64, session: String, ask: serde_jso
 }
 
 /// A question about the folder agent session `session` works in, answered off the loop: the session says which, so a
-/// question can only be about a folder an agent here works in. What it commits of the agent's work is signed as the agent,
-/// with the key this process holds for its session at its epoch (W27-R03).
+/// question can only be about a folder an agent here works in, or one whose workspace this machine holds for it
+/// (`crate::workspace::held`: a pod's, docs/agentic.md W10), which a hold makes and a release lets go. What it commits of
+/// the agent's work is signed as the agent, with the key this process holds for its session at its epoch (W27-R03).
 pub(super) fn workspace(shared: &Shared, req: u64, session: String, ask: Box<crate::workspace::Ask>) {
     let up = shared.uplink.0.clone();
+    // A workspace held here for a session elsewhere: made, or let go, by the session's id.
+    if matches!(ask.as_ref(), crate::workspace::Ask::Hold(_) | crate::workspace::Ask::Release) {
+        drop(crate::rt::spawn(async move {
+            let done = match *ask {
+                crate::workspace::Ask::Hold(hold) => crate::workspace::held::hold(&session, hold).await,
+                _ => crate::workspace::held::release(&session).await,
+            };
+            let answer = done.unwrap_or_else(|e| serde_json::json!({"error": format!("{e:#}")}));
+            let _ = up.send(Up::Term(AgentMsg::Answer { req, json: Some(answer.to_string()) })).await;
+        }));
+        return;
+    }
     let found = shared.harness.as_ref().and_then(|h| h.get(&session)).map(|s| {
         let ws = s.spec.lock().workspace.clone();
         let info = s.info();
@@ -597,6 +610,8 @@ pub(super) fn workspace(shared: &Shared, req: u64, session: String, ask: Box<cra
         }
         (std::path::PathBuf::from(&info.cwd), std::path::PathBuf::from(info.work_dir()), ws, versions, sign)
     });
+    // Else a workspace held here for it: asked as an isolated session's is, of its volume with no mount.
+    let found = found.or_else(|| crate::workspace::held::find(&session).map(|(cwd, ws)| (cwd.clone(), cwd, Some(ws), crate::workspace::git::Versions::new(), None)));
     drop(crate::rt::spawn(async move {
         let answer = match found {
             None => serde_json::json!({"error": "no such agent on this machine"}),

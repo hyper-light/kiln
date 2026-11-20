@@ -889,7 +889,11 @@ part.
   vendored since contract 50) and kiln's call of it; the PersistentVolume, claim and pod as pure builders, unit-tested
   as a job's pod is (built 2026-11-19: `k8s::volume::objects`, from the home's export, `PodExport`, whose `Debug` hides
   the token; an export a pod can't mount refused typed, `Unbuildable`), with the chart's RBAC (owed with the engine,
-  the first code that makes these objects, so no cluster-wide right is granted before it's used); the engine and the workspace's home; the end and its reaper; the node certificate's issue; the proof.
+  the first code that makes these objects, so no cluster-wide right is granted before it's used); the home's part (built 2026-11-20:
+  `workspace::held`, the `hold` and `release` asks of a runner that names `workspace.hold`: its volume made with no
+  mount, its write policy from the agent's grant, exported to the folder's owner through `Instance::export`, the path,
+  attachment, uid and gid answered, and every question about the pod's folder answered from the holding, as an isolated
+  session's are, never of a folder the server names; let go, the export detached, then the volume ended); the engine and the workspace's home; the end and its reaper; the node certificate's issue; the proof.
 
 ## C: From changes to landed
 
