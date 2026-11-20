@@ -247,13 +247,22 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
     }
 
     // The agent wrote, in its pod, into its home's volume; the folder is as it was.
+    let last_plan = std::cell::RefCell::new(String::new());
     let wrote = until(
         "the agent's file in its volume, by its landing's plan",
         || {
-            let plan = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})))?;
+            let plan = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})));
+            last_plan.replace(match &plan {
+                Ok(p) => p.to_string(),
+                Err(e) => format!("{e:#}"),
+            });
+            let plan = plan?;
             Ok(plan.to_string().contains("pod-wrote.txt").then_some(plan))
         },
-        || format!("{}\n{}", agent(&fleet).map(|a| a.to_string()).unwrap_or_default(), seen()),
+        || {
+            let ws = fleet.call("POST", "/api/ops/agents.workspace", Some(&json!({"agent": id}))).map(|w| w.to_string()).unwrap_or_else(|e| format!("{e:#}"));
+            format!("its last plan: {}\nits workspace: {ws}\n{}\n{}", last_plan.borrow(), agent(&fleet).map(|a| a.to_string()).unwrap_or_default(), seen())
+        },
     )?;
     let in_pod = kubectl(&ns, &["exec", &pod, "-c", "agent", "--", "cat", &format!("{folder}/pod-wrote.txt")])?;
     anyhow::ensure!(in_pod.trim() == format!("written in pod {pod}"), "the pod reads {in_pod:?} back");
