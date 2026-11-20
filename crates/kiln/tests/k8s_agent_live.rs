@@ -287,7 +287,9 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
 fn pod_story(ns: &str, pod: &str) -> String {
     let describe = kubectl(ns, &["describe", "pod", pod]).unwrap_or_else(|e| format!("{e:#}"));
     let log = kubectl(ns, &["logs", pod, "-c", "agent", "--tail", "80"]).unwrap_or_else(|e| format!("{e:#}"));
-    format!("--- pod {pod}\n{describe}\n--- its agent's log\n{log}")
+    // What runs in it and what its runner keeps: whether its harness started.
+    let ps = kubectl(ns, &["exec", pod, "-c", "agent", "--", "sh", "-c", "ps -eo pid,ppid,etime,args 2>&1; find /tmp/.local/share/kiln -maxdepth 4 2>&1 | head -60"]).unwrap_or_else(|e| format!("{e:#}"));
+    format!("--- pod {pod}\n{describe}\n--- its agent's log\n{log}\n--- its processes and its runner's state\n{ps}")
 }
 
 /// The server's and the home's logs' ends, for a failure.
