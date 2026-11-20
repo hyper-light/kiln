@@ -56,7 +56,7 @@ test("a session on bare metal has the Engine tab: Environments and Agents, no Sa
   await expect(body.getByLabel("This session's environment").locator("option").first()).toHaveText("Machine environment (default)");
   const lines = list.locator(":scope > li.df-defrow");
   await expect(lines.first()).toContainText("release-tools");
-  await expect(lines.first()).toContainText("this session");
+  await expect(lines.first().getByRole("img", { name: "This session runs with it" })).toBeVisible();
   await expect(lines.first()).toContainText("Machine base · v3");
   // Opened, its variables are its fields: a secret by its name (never a value), a value as it is, the machine's variable it takes.
   await list.getByRole("button", { name: "Expand release-tools" }).click();
@@ -78,7 +78,8 @@ test("a session on bare metal has the Engine tab: Environments and Agents, no Sa
   const ran = list.getByRole("table", { name: "Sessions running with release-tools" });
   await expect(ran.getByRole("columnheader")).toHaveText(["Session", "Machine", "State"]);
   await expect(ran.getByRole("row").nth(1)).toContainText("Update the docs");
-  await expect(ran.getByRole("row").nth(1)).toContainText("this session");
+  await expect(ran.getByRole("row").nth(1).getByRole("img", { name: "This session runs with it" })).toBeVisible();
+  await expect(ran.getByRole("img", { name: "This session runs with it" })).toHaveCount(1);
   await expect(ran.getByRole("row")).toHaveCount(4);
   // Sorted and found: most variables first after this session's; Secrets chosen, only those that give one.
   await body.getByRole("combobox", { name: "Sort environments" }).selectOption("vars");
@@ -142,8 +143,8 @@ test("one made, changed in place, applied to this session, refused deletion whil
   expect((await put).postDataJSON()).toEqual({ agentenv: expectNow.stringMatching(/^env-/) });
   const lines = list.locator(":scope > li.df-defrow");
   await expect(lines.first()).toContainText("e2e-env");
-  await expect(lines.first()).toContainText("this session");
-  await expect(list.locator(":scope > li.df-defrow", { hasText: "release-tools" })).not.toContainText("this session");
+  await expect(lines.first().getByRole("img", { name: "This session runs with it" })).toBeVisible();
+  await expect(list.locator(":scope > li.df-defrow", { hasText: "release-tools" }).getByRole("img", { name: "This session runs with it" })).toHaveCount(0);
 
   // Deleting it while this session runs with it: refused, in the server's words.
   await press(tree.getByRole("button", { name: "Delete", exact: true }));
@@ -154,7 +155,7 @@ test("one made, changed in place, applied to this session, refused deletion whil
   await choose.selectOption({ label: "Machine environment (default)" });
   await body.getByRole("button", { name: "Restart with the machine environment" }).click();
   await expect(choose.locator("option:checked")).toHaveText("Machine environment (default)");
-  await expect(list.locator(":scope > li.df-defrow", { hasText: "e2e-env" })).not.toContainText("this session");
+  await expect(list.locator(":scope > li.df-defrow", { hasText: "e2e-env" }).getByRole("img", { name: "This session runs with it" })).toHaveCount(0);
   await press(tree.getByRole("button", { name: "Delete", exact: true }));
   await press(tree.getByRole("button", { name: "Delete e2e-env" }));
   await expect(list.locator(":scope > li.df-defrow", { hasText: "e2e-env" })).toHaveCount(0);

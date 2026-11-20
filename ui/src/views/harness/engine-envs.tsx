@@ -185,7 +185,7 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
             <ChevronRight size={12} className={open ? "hx-chev rotate-90" : "hx-chev"} aria-hidden="true" />
           </button>
           <Inline value={e.name} action={`Rename ${e.name}`} label={`${e.name}'s name`} className="df-strong df-defname" onSave={(name) => change(e, { name }, setWhy)} />
-          {here && <span className="df-head-v df-this">this session</span>}
+          {here && <Here />}
         </span>
         <span className="df-head-end">
           <span className="df-head-v">
@@ -242,7 +242,7 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
                             <Link to={`/agents/${s.id}`} className="ms-link">
                               {"kind" in s ? agentLabel(s) : s.name}
                             </Link>
-                            {s.id === at.agentId && <span className="df-this ev-here">this session</span>}
+                            {s.id === at.agentId && <Here />}
                           </td>
                           <td className="sb-dim">{s.target ? machineOf(s.target) : "—"}</td>
                           <td className="sb-dim">{"kind" in s ? (STAND_WORD.get(standOf(s)) ?? standOf(s)) : "—"}</td>
@@ -270,6 +270,9 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
     </>
   );
 }
+
+/** This session runs with it: a dot in the colour kiln marks this session with, its words its label. */
+const Here = () => <span className="ev-here" role="img" aria-label="This session runs with it" title="This session runs with it" />;
 
 /** `e` changed as `patch` says, shown at once and saved over the version shown; a refusal puts it back and says why. */
 function change(e: Agentenv, patch: Partial<Pick<Agentenv, "name" | "tags">> & { description?: string | null }, why: (w: string | null) => void) {
