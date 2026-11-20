@@ -403,6 +403,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "agents", "slates-fleet"]) => return boxed(|| enroll_slates_node(&hub, req)).await,
         (&Method::POST, ["api", "agents", "slates-fleet", "members"]) => return boxed(|| slates_fleet_members(&hub, req)).await,
         (&Method::POST, ["api", "agents", "slates-fleet", "place"]) => return boxed(|| slates_fleet_place(&hub, req)).await,
+        (&Method::POST, ["api", "agents", "slates-fleet", "bootstrap"]) => return boxed(|| slates_fleet_bootstrap(&hub, req)).await,
         (&Method::POST, ["api", "agents", "rekey"]) => return boxed(|| rekey_agent(&hub, req)).await,
         (&Method::GET, ["api", "agents", "tunnel"]) => return agent_tunnel(&hub, req),
         (&Method::POST, ["api", "join-requests"]) => return boxed(|| create_join(&hub, req)).await,
@@ -4681,6 +4682,26 @@ async fn slates_fleet_place(hub: &Hub, req: Request) -> R {
     }
     let place = crate::workspace::slates_fleet::place_of(&hub.cfg.slates_fleet, &name).map_err(|e| err(StatusCode::CONFLICT, e))?;
     Ok(srv::json(StatusCode::OK, &place))
+}
+
+/// `POST /api/agents/slates-fleet/bootstrap`: whether the runner that asks makes kiln's Slates fleet's root group now, the
+/// fleet's one-time bootstrap (A-734; main's ruling of 2026-11-20): its founder alone (`Place::founds`), once, until it
+/// says it's done (`crate::workspace::slates_fleet::ask_bootstrap_on`). Proven
+/// as `/place` is; a runner the setting doesn't list is refused.
+async fn slates_fleet_bootstrap(hub: &Hub, req: Request) -> R {
+    let ask: crate::workspace::slates_fleet::AskBootstrap = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let name = hub.pki.prove_machine(&ask.cert_pem, &ask.proof_csr).map_err(|e| err(StatusCode::FORBIDDEN, format!("{e:#}")))?;
+    let Some(place) = crate::workspace::slates_fleet::place_of(&hub.cfg.slates_fleet, &name).map_err(|e| err(StatusCode::CONFLICT, e))? else {
+        return Err(err(StatusCode::FORBIDDEN, format!("[slates_fleet] doesn't list {name}: it bootstraps no fleet")));
+    };
+    let (member, done) = (ask.member, ask.done);
+    let now = crate::util::now_ms();
+    let bootstrap = hub
+        .store
+        .call(move |c| crate::workspace::slates_fleet::ask_bootstrap_on(c, &place.fleet, &name, place.founds, member, done, now))
+        .await
+        .map_err(|e| err(StatusCode::CONFLICT, format!("{e:#}")))?;
+    Ok(srv::json(StatusCode::OK, &crate::workspace::slates_fleet::Bootstrapper { bootstrap }))
 }
 
 /// `POST /api/capacity/keeper`: a capacity keeper's certificate from kiln's CA, for its request

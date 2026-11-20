@@ -338,6 +338,65 @@ where
     answer.map_err(|e| anyhow::anyhow!("Slates' {verb}: {e}"))
 }
 
+/// [`call`] for a verb that needs the fleet's consensus groups (a volume or base made): on a node of kiln's Slates fleet
+/// that hasn't imported them yet (Slates' `NoGroup`: "on a fleet node, wait for it to import the groups"), asked again
+/// until it has, saying so once (A-734: a node that joins as the fleet forms may be asked for a workspace before its
+/// groups arrive). Anywhere else, and any other answer, as [`call`] answers.
+pub(crate) async fn call_grouped<R, F>(verb: &'static str, f: F) -> anyhow::Result<R>
+where
+    R: Send + 'static,
+    F: Fn(&mut Instance) -> Result<R, slates_api::Error> + Clone + Send + 'static,
+{
+    let mut said = false;
+    loop {
+        let name = instance();
+        let once = f.clone();
+        let answer = crate::rt::blocking(move || Instance::attach(&name).and_then(|mut i| once(&mut i))).await?;
+        match answer {
+            Err(slates_api::Error::Unusable(slates_api::Unusable::NoGroup)) if super::slates_fleet::source().is_some() => {
+                if !said {
+                    tracing::info!(verb, "this runner's Slates node hasn't imported kiln's Slates fleet's groups yet: it waits for them");
+                    said = true;
+                }
+                crate::rt::sleep(GROUPS_LOOK).await;
+            }
+            other => return other.map_err(|e| anyhow::anyhow!("Slates' {verb}: {e}")),
+        }
+    }
+}
+
+/// The fleet's one-time bootstrap where the server names this runner its bootstrapper (A-734): once its node holds every
+/// node of its manifest (`listed`) alive with its probe mesh up (`slates_fleet::meshed`; the root group made before is
+/// the bootstrapper's alone, and the others never import it), Slates makes the group through its library, and the
+/// server is told it's done. Where the server names another, nothing.
+async fn bootstrap_if_named(source: &super::slates_fleet::Source, listed: usize, member: u64) -> anyhow::Result<()> {
+    if !super::slates_fleet::ask_bootstrap(source, member, false).await? {
+        return Ok(());
+    }
+    let mut said = false;
+    loop {
+        let f = call("status", |i| i.daemon_status()).await?.fleet;
+        if super::slates_fleet::meshed(f.members.len(), listed, f.peers_in_contact, f.peers_unmeshed) {
+            break;
+        }
+        if !said {
+            tracing::info!(held = f.members.len(), listed, "this runner bootstraps kiln's Slates fleet once its node holds every node in contact: it waits");
+            said = true;
+        }
+        crate::rt::sleep(GROUPS_LOOK).await;
+    }
+    call("bootstrap", |i| i.ensure_group()).await?;
+    super::slates_fleet::ask_bootstrap(source, member, true).await?;
+    tracing::info!(member, "this runner made kiln's Slates fleet's root group, the fleet's one-time bootstrap");
+    Ok(())
+}
+
+/// How long a runner waits before asking again about a bootstrap it couldn't settle.
+const BOOTSTRAP_AGAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a fleet node waiting for its groups ([`call_grouped`]) asks again.
+const GROUPS_LOOK: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// The instance answers.
 async fn up() -> bool {
     let name = instance();
@@ -487,8 +546,9 @@ async fn up_or_started() -> anyhow::Result<()> {
     {
         anyhow::bail!("{} (its log: {})", start_refused(&e), h.log.display());
     }
-    // A fleet node imports its groups (Slates: never make one there, but at the fleet's founder), and says its member id, which a move of a volume to
-    // it names (K4): its runner's word again, now with the member its daemon serves as since this start.
+    // A fleet node says its member id, which a move of a volume to it names (K4): its runner's word again, now with the
+    // member its daemon serves as since this start. The fleet's founder makes its groups, once (A-734); every other node
+    // imports them (Slates: never make one there).
     if let (Some(joined), Some(source)) = (&joined, super::slates_fleet::source()) {
         match call("member", |i| i.daemon_status()).await {
             Ok(report) => {
@@ -497,16 +557,23 @@ async fn up_or_started() -> anyhow::Result<()> {
                 if let Err(e) = super::slates_fleet::report_member(source, &joined.node, report.fleet.host, user).await {
                     tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't say its member id: no volume moves to it until it does");
                 }
+                // The fleet's one-time bootstrap (A-734), the founder's alone (`slates_fleet::founder`, the first runner
+                // `[slates_fleet]` lists): the server records it before it's made and never names it again, so a founder
+                // started again with a fresh member (its anchor's memory lost) never founds a second root group, which
+                // Slates warns a bootstrap run again does. Asked until it's settled: a start that found its instance up
+                // never comes back here, so a failed ask isn't left to the next start.
+                let mut said = false;
+                while joined.founds
+                    && let Err(e) = bootstrap_if_named(source, joined.nodes, report.fleet.host).await
+                {
+                    if !said {
+                        tracing::warn!(error = %format!("{e:#}"), "this runner couldn't settle kiln's Slates fleet's bootstrap: it asks again");
+                        said = true;
+                    }
+                    crate::rt::sleep(BOOTSTRAP_AGAIN).await;
+                }
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't read its member id: no volume moves to it until it does"),
-        }
-        // The fleet's founder (`slates_fleet::founder`, the first runner `[slates_fleet]` lists) bootstraps its root group,
-        // as Slates' fleet asks of one node: until then no node holds a group, so none makes a workspace ("this node has
-        // no consensus group yet"; goal 91's live move, 2026-11-19). Every other node imports it. Found made already (this
-        // node founded or imported it before): nothing.
-        if joined.founds {
-            call("bootstrap", |i| i.ensure_group()).await?;
-            tracing::info!("this runner's Slates founded kiln's Slates fleet's groups, or found them made");
         }
         return Ok(());
     }
@@ -643,7 +710,7 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
 pub async fn make_unmounted(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
     let spec = VolumeSpec::overlay(name, over, volume_max());
-    let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+    let id = call_grouped("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
     Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None })
 }
 
@@ -654,13 +721,13 @@ pub async fn make_unmounted(name: &str, over: &Path) -> anyhow::Result<Made> {
 pub(super) async fn provision(name: &str, over: &Path, captured: bool) -> anyhow::Result<(VolumeId, Option<Base>)> {
     if !captured {
         let spec = VolumeSpec::overlay(name, over, volume_max());
-        let id = call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+        let id = call_grouped("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
         return Ok((id, None));
     }
     let _held = bases_held().lock().await;
     let base = base_for(over).await?;
     let spec = VolumeSpec::clone_of(name, volume_id(&base.volume)?, slates_api::SnapshotId { value: base.snapshot });
-    match call("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await {
+    match call_grouped("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await {
         Ok(id) => Ok((id, Some(base))),
         Err(e) => {
             // The base may have gone meanwhile (its last clone, moved to another runner, ended there): the next start
@@ -743,7 +810,7 @@ const CAPTURE_TRIES: u32 = 3;
 async fn capture(over: &Path) -> anyhow::Result<Base> {
     let name = format!("kiln-base-{}", crate::util::random_token().chars().filter(char::is_ascii_alphanumeric).take(16).collect::<String>().to_ascii_lowercase());
     let spec = VolumeSpec::overlay(&name, over, volume_max());
-    let id = call("base create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
+    let id = call_grouped("base create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
     let mut captured = call("base capture", move |i| Ok(i.capture_base(id))).await;
     for _ in 1..CAPTURE_TRIES {
         let Ok(Err(slates_api::Error::Retry { pause_ns, .. })) = &captured else { break };
