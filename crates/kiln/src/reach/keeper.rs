@@ -91,6 +91,8 @@ struct Inbox {
     waiting: AtomicBool,
     /// The looks the keeper made, whatever woke it (the tests count an idle one's).
     looks: AtomicU64,
+    /// The times it came to wait, a look done (the tests see it idle: as many as its looks).
+    parked: AtomicU64,
 }
 
 impl std::fmt::Debug for Inbox {
@@ -157,6 +159,20 @@ impl Using {
     #[cfg(test)]
     fn looks(&self) -> u64 {
         self.inbox.looks.load(Ordering::Relaxed)
+    }
+
+    /// Its keeper's looks once it waits again, each done, by `until` (a bound that only ends a hang): the record of what
+    /// it did, as a loaded machine takes what time it takes (goal 9).
+    #[cfg(test)]
+    async fn idle(&self, until: Instant) -> anyhow::Result<u64> {
+        loop {
+            let looks = self.looks();
+            if looks > 0 && self.inbox.parked.load(Ordering::Relaxed) == looks {
+                return Ok(looks);
+            }
+            anyhow::ensure!(Instant::now() < until, "its keeper never came to wait: {looks} looks");
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// Every copy the node noted, as it stands now.
@@ -280,6 +296,7 @@ impl Keeper {
                 continue;
             }
             let due = self.due();
+            self.using.inbox.parked.fetch_add(1, Ordering::Relaxed);
             futures::select_biased! {
                 () = self.using.inbox.wake.notified().fuse() => {}
                 () = crate::rt::due(due).fuse() => {}
@@ -796,6 +813,16 @@ mod tests {
         Ok(serde_json::from_slice(&std::fs::read(base.join(SAVED))?)?)
     }
 
+    /// Its keeper's looks once one more than `looks` has begun and it waits again, by `until` (a bound that only ends a
+    /// hang): an event that woke it, looked at whole.
+    async fn woken(using: &Using, what: &str, looks: u64, until: Instant) -> anyhow::Result<u64> {
+        while using.looks() <= looks {
+            anyhow::ensure!(Instant::now() < until, "{what} didn't wake it ({looks} looks)");
+            crate::rt::sleep(Duration::from_millis(20)).await;
+        }
+        using.idle(until).await
+    }
+
     /// Goal 9: the keeper looks on what changes what it decides, never on a clock (it looked every
     /// 20 s). Do: a keeper over one copy, its node never reaching the server, settled after its
     /// first look; a quiet span; then a use starting, the same use ending, the connection coming
@@ -813,31 +840,24 @@ mod tests {
             let handle = node(state.path(), &base, &using)?;
             let polls = Arc::new(AtomicU64::new(0));
             drop(crate::rt::spawn(crate::rt::counting_polls(Arc::clone(&polls), Keeper::new(handle, Arc::clone(&using), base.clone()).run())));
-            crate::rt::settled(&polls, until).await?;
-            anyhow::ensure!(using.looks() == 1, "{} looks first", using.looks());
+            let first = using.idle(until).await?;
+            anyhow::ensure!(first == 1, "{first} looks first");
             let quiet = polls.load(Ordering::Relaxed);
             crate::rt::sleep(Duration::from_secs(3)).await;
             let woke = polls.load(Ordering::Relaxed).saturating_sub(quiet);
             anyhow::ensure!(woke == 0 && using.looks() == 1, "{woke} polls, {} looks in 3 s, idle", using.looks());
+            // Each event, the keeper waiting: it looks again, and waits again (a look that never comes
+            // ends at `until`, saying so).
             let mut looks = using.looks();
-            let mut step = |what: &str, looks_now: u64| -> anyhow::Result<()> {
-                anyhow::ensure!(looks_now > looks, "{what} didn't wake it ({looks_now} looks)");
-                looks = looks_now;
-                Ok(())
-            };
             let busy = using.busy("mac", "kiln-0123456789", Some("agent-1".into()));
-            crate::rt::settled(&polls, until).await?;
-            step("a use starting", using.looks())?;
+            looks = woken(&using, "a use starting", looks, until).await?;
             drop(busy);
-            crate::rt::settled(&polls, until).await?;
-            step("a use ending", using.looks())?;
+            looks = woken(&using, "a use ending", looks, until).await?;
             using.connected();
-            crate::rt::settled(&polls, until).await?;
-            step("the connection up", using.looks())?;
+            looks = woken(&using, "the connection up", looks, until).await?;
             let rules = Set { system: keep::Rules { newest: Some(1), ..keep::Rules::default() }, ..Set::default() };
             using.told(keep::Answer { set: rules.clone(), asked: 0 });
-            crate::rt::settled(&polls, until).await?;
-            step("the server's word", using.looks())?;
+            woken(&using, "the server's word", looks, until).await?;
             anyhow::ensure!(saved(&base)?.set == rules, "the word's rules taken and kept");
             Ok(())
         })
