@@ -23,6 +23,8 @@
 //!   each started there through `kiln run --on <runner> --no-sync` (this build's `kiln` and the stand-in fetched from a
 //!   file server of the test's own; nodes at LAN addresses; `SLATES_FLEET_LIVE_MOVE_HOST` is this machine's address the
 //!   others reach). The agent moves from this machine to runner B; runner C is the fleet's third node.
+//! - `<runner B>`: the same with the third runner on this machine beside the first, where only one other Mac reaches this
+//!   one: the move still crosses machines, from this one to runner B.
 //!
 //! Unset, the test skips, saying so. Teardown: the agent is stopped first, and no Slates process is signalled on a
 //! machine while its host's mount table lists a mount under the test's folder there (a daemon killed under a live macOS
@@ -79,7 +81,8 @@ mod checks {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Mode {
         Local,
-        Remote { b: String, c: String },
+        /// The second runner on production runner `b`; the third on `c`, or on this machine beside the first.
+        Remote { b: String, c: Option<String> },
     }
 
     /// The switch's word: `local`, or two runner names comma-separated; none, or anything else, says why.
@@ -89,8 +92,9 @@ mod checks {
             return Ok(Mode::Local);
         }
         match said.split(',').map(str::trim).collect::<Vec<_>>().as_slice() {
-            [b, c] if !b.is_empty() && !c.is_empty() && b != c => Ok(Mode::Remote { b: (*b).to_owned(), c: (*c).to_owned() }),
-            _ => Err(format!("{said:?} is neither `local` nor two runner names, comma-separated")),
+            [b] if !b.is_empty() => Ok(Mode::Remote { b: (*b).to_owned(), c: None }),
+            [b, c] if !b.is_empty() && !c.is_empty() && b != c => Ok(Mode::Remote { b: (*b).to_owned(), c: Some((*c).to_owned()) }),
+            _ => Err(format!("{said:?} is neither `local` nor one or two runner names, comma-separated")),
         }
     }
 
@@ -238,9 +242,9 @@ mod checks {
         #[test]
         fn k4_live_move_the_switch_says_where_the_runners_run() {
             assert_eq!(mode(Some("local")), Ok(Mode::Local));
-            assert_eq!(mode(Some(" b.local , c.local ")), Ok(Mode::Remote { b: "b.local".into(), c: "c.local".into() }));
+            assert_eq!(mode(Some(" b.local , c.local ")), Ok(Mode::Remote { b: "b.local".into(), c: Some("c.local".into()) }));
+            assert_eq!(mode(Some("b.local")), Ok(Mode::Remote { b: "b.local".into(), c: None }), "the third runner beside the first");
             assert!(mode(None).is_err());
-            assert!(mode(Some("b.local")).is_err());
             assert!(mode(Some("b.local,b.local")).is_err());
             assert!(mode(Some("a,b,c")).is_err());
         }
@@ -361,9 +365,17 @@ impl Files {
                 };
                 let _ = s.set_nonblocking(false);
                 let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-                let mut head = [0_u8; 1024];
-                let n = s.read(&mut head).unwrap_or(0);
-                let line = String::from_utf8_lossy(head.get(..n).unwrap_or_default()).lines().next().unwrap_or_default().to_owned();
+                // The request read until its headers end (a request line can arrive split across segments on a LAN,
+                // seen 2026-11-20 as a 404 for the binary), at most 8 KiB.
+                let mut head: Vec<u8> = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while head.len() < 8192 && !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(chunk.get(..n).unwrap_or_default()),
+                    }
+                }
+                let line = String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_owned();
                 let path = line.split_whitespace().nth(1).unwrap_or_default().to_owned();
                 let body = match path.as_str() {
                     "/kiln.gz" => Some(gz.clone()),
@@ -413,7 +425,8 @@ fn on(runner: &str, script: &str, timeout_s: u32) -> anyhow::Result<String> {
             return Ok(text);
         }
         let said = String::from_utf8_lossy(&out.stderr).into_owned();
-        if tries < 5 && checks::kiln_unreached(&said) {
+        // kiln says it on either stream (`kiln run` writes its own errors to its standard output too).
+        if tries < 5 && (checks::kiln_unreached(&said) || checks::kiln_unreached(&text)) {
             eprintln!("WAITED: kiln didn't reach {runner} (try {tries}): {}", said.trim().chars().take(200).collect::<String>());
             std::thread::sleep(Duration::from_secs(20));
             continue;
@@ -512,7 +525,7 @@ impl Lab {
         lab.nodes.push(Node { name: a, machine: common::machine(a), instance: instance(a), address: format!("{host}:{}", two_ports(&host)?), at: At::Here, otlp: common::free_port()? });
         let remotes: Vec<(&'static str, Option<String>)> = match mode {
             Mode::Local => vec![(name_b, None), (name_c, None)],
-            Mode::Remote { b, c } => vec![(name_b, Some(b.clone())), (name_c, Some(c.clone()))],
+            Mode::Remote { b, c } => vec![(name_b, Some(b.clone())), (name_c, c.clone())],
         };
         // The server first (its join token is what the remote machines fetch), its fleet listing filled in below.
         let mut prepared: Vec<(&'static str, Option<(String, String, Prepared)>)> = Vec::new();
@@ -534,7 +547,11 @@ impl Lab {
             let url = format!("http://{host}:{}", files.port);
             lab.files = Some(files);
             for (name, runner) in &remotes {
-                let runner = runner.clone().ok_or_else(|| anyhow::anyhow!("no runner for {name}"))?;
+                // The third runner beside the first, on this machine, where no production runner is named for it.
+                let Some(runner) = runner.clone() else {
+                    prepared.push((name, None));
+                    continue;
+                };
                 let dir = format!("$HOME/.cache/kiln-live-move/{run}-{name}");
                 let out = match on(&runner, &format!("{}; echo \"LIVE_MOVE_DIR $d\"", preparation(&dir, &url, &host)), PREPARE_S) {
                     Ok(out) => out,
