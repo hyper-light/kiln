@@ -438,8 +438,9 @@ pub struct Client {
   /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
   /// the ring on a completion-fd signal and matches by id, so replies that arrive out of order (a
   /// deferred verb) do not block another request's. Only replies to `awaited` operations are kept, so
-  /// it never holds more than `awaited` does and nothing is ever evicted (AUD-29-22).
-  pending: Vec<(u64, ReplyBody)>,
+  /// it never holds more than `awaited` does and nothing is ever evicted (AUD-29-22). Each is kept with the stamp the
+  /// daemon wrote with it into the ring (`slates_ipc::slot`, "The stamp"; A-559), for [`Client::poll_reply_stamped`].
+  pending: Vec<(u64, ReplyBody, u32)>,
   /// The caller-owned operations outstanding: begun with [`Client::begin`], their replies not yet taken
   /// ([`Client::poll_reply`]) or abandoned ([`Client::abandon`]). Admission refuses a new one at
   /// `awaited_cap` (AUD-29-22): until 2026-10-01 the reply buffer instead evicted its oldest entry past twice
@@ -530,56 +531,6 @@ impl std::fmt::Debug for Client {
       .field("consumer", &self.consumer.as_ref().map(|d| d.consumer))
       .field("bound", &self.bound)
       .finish()
-  }
-}
-
-/// The synchronous send's wait for a slot on a full command ring (A-232, A-523): what it does next, `elapsed_ns` into
-/// the wait. It spins for the client's wake estimate, since the daemon drains its ring in microseconds; then it parks,
-/// each pause twice the last from the wake estimate and never past the next look at the daemon's life, which comes on
-/// A-443's doubling (`slates_ipc::looks`): first at twice the longer of the wait when first judged and the wake
-/// estimate, then at twice the time waited. Its pauses and looks are made of the wait's own length and this machine's
-/// measured wake, never a fixed time, and a wait of `t` wakes about `log2(t / wake)` times.
-#[derive(Debug, Default)]
-struct RoomWait {
-  /// When the wait next asks the daemon's liveness.
-  looks: slates_ipc::looks::Looks,
-  /// The last pause, nanoseconds; `None` before the first.
-  pause_ns: Option<u64>,
-}
-
-/// What a wait for a ring slot does next ([`RoomWait::next`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RoomStep {
-  /// Try the ring again at once.
-  Spin,
-  /// Ask the daemon's liveness, then try again.
-  Look,
-  /// Park this long, nanoseconds, then try again.
-  Park(u64),
-}
-
-impl RoomWait {
-  /// The next step, `elapsed_ns` into the wait, the client's wake estimate being `wake_ns`.
-  fn next(&mut self, elapsed_ns: u64, wake_ns: u64) -> RoomStep {
-    if elapsed_ns < wake_ns {
-      return RoomStep::Spin;
-    }
-    if self.looks.due(elapsed_ns, wake_ns) {
-      return RoomStep::Look;
-    }
-    let to_look_ns = self.looks.until(elapsed_ns).unwrap_or(wake_ns).max(1);
-    let pause_ns = self
-      .pause_ns
-      .map_or(wake_ns, |pause| pause.saturating_mul(2))
-      .max(1)
-      .min(to_look_ns);
-    self.pause_ns = Some(pause_ns);
-    RoomStep::Park(pause_ns)
-  }
-
-  /// A look made `elapsed_ns` into the wait found the daemon alive: the next comes at twice the time waited.
-  fn looked(&mut self, elapsed_ns: u64) {
-    self.looks.looked(elapsed_ns);
   }
 }
 
@@ -2279,7 +2230,7 @@ impl Client {
     let awaited = self
       .awaited
       .keys()
-      .filter(|word| !self.pending.iter().any(|(held, _)| held == *word))
+      .filter(|word| !self.pending.iter().any(|(held, _, _)| held == *word))
       .map(|word| RequestId::from_word(*word).sequence);
     let held = self
       .retry_held
@@ -2465,7 +2416,7 @@ impl Client {
             // caller when one awaits it, else dropped and counted, as the async drain does (AUD-29-22); this wait
             // goes on. Bounded: no more replies are in flight than the ring has slots.
             let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
-            self.buffer(reply.request, body);
+            self.buffer(reply.request, body, reply.stamp);
             continue;
           }
           return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
@@ -2680,7 +2631,7 @@ impl Client {
   /// terminal channel failure): its buffered reply, if any, is dropped, and a reply that arrives later is
   /// dropped on arrival. Returns whether it was outstanding.
   pub fn abandon(&mut self, word: u64) -> bool {
-    self.pending.retain(|(held, _)| *held != word);
+    self.pending.retain(|(held, _, _)| *held != word);
     if self.edit_chains.remove(&word).is_some()
       || self.list_chains.remove(&word).is_some()
       || self.changed_chains.remove(&word).is_some()
@@ -2750,15 +2701,26 @@ impl Client {
   /// [`Self::poll_reply`] by the request id's word — the form an async pump uses, which holds a
   /// request's id as its `u64` word across the yield to its event loop.
   pub fn poll_reply_word(&mut self, word: u64) -> Result<Option<ReplyBody>, ClientError> {
-    if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
-      let (_, body) = self.pending.remove(pos);
+    self
+      .poll_reply_stamped(word)?
+      .map(|(body, _)| resolved(body))
+      .transpose()
+  }
+
+  /// [`Self::poll_reply_word`] with when the reply landed (A-559): the reply as the daemon wrote it, a refusal as
+  /// `ReplyBody::Refused` rather than an error, and the stamp the daemon wrote with it into the ring
+  /// (`slates_ipc::slot`, "The stamp"), zero where none did. A caller that splits its latency between the daemon and
+  /// itself widens the stamp with `slates_ipc::slot::landed_ns`.
+  pub fn poll_reply_stamped(&mut self, word: u64) -> Result<Option<(ReplyBody, u32)>, ClientError> {
+    if let Some(pos) = self.pending.iter().position(|(held, _, _)| *held == word) {
+      let (_, body, stamp) = self.pending.remove(pos);
       self.awaited.remove(&word);
       // A page taken as a raw reply ends its walk: the caller has the page, and nothing waits on the chain.
       self.list_chains.remove(&word);
       self.changed_chains.remove(&word);
       self.verdict_chains.remove(&word);
       self.note_reply(word, &body, true);
-      return resolved(body).map(Some);
+      return Ok(Some((body, stamp)));
     }
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
@@ -2768,11 +2730,17 @@ impl Client {
         self.changed_chains.remove(&word);
         self.verdict_chains.remove(&word);
         self.note_reply(word, &body, true);
-        return resolved(body).map(Some);
+        return Ok(Some((body, reply.stamp)));
       }
-      self.buffer(reply.request, body);
+      self.buffer(reply.request, body, reply.stamp);
     }
     Ok(None)
+  }
+
+  /// The stamp the last request this client sent was written with as it landed in the command ring (A-559;
+  /// `slates_ipc::slot`, "The stamp"): zero before any. Read right after a send, it is that send's.
+  pub fn request_stamp(&self) -> u32 {
+    self.end.request_stamp()
   }
 
   /// Spins for `spin_ns` taking `id`'s reply if it lands — the async fast path: most replies arrive
@@ -2801,21 +2769,21 @@ impl Client {
   pub fn take_ready(&mut self) -> Result<Vec<u64>, ClientError> {
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
-      self.buffer(reply.request, body);
+      self.buffer(reply.request, body, reply.stamp);
     }
-    Ok(self.pending.iter().map(|(word, _)| *word).collect())
+    Ok(self.pending.iter().map(|(word, _, _)| *word).collect())
   }
 
   /// Buffers a reply drained for another request: kept when an outstanding operation awaits it (bounded by
   /// the admitted outstanding set, so nothing is evicted, item 8), dropped and counted when nothing does —
   /// a protocol-only acknowledgement's reply, or an abandoned operation's (AUD-29-22).
-  fn buffer(&mut self, id_word: u64, body: ReplyBody) {
+  fn buffer(&mut self, id_word: u64, body: ReplyBody, stamp: u32) {
     // A chain step's reply is its chain's: filed under the public word the caller awaits.
     if let Some(public) = self.chain_steps.remove(&id_word) {
       self.awaited.remove(&id_word);
       self.note_reply(id_word, &body, false);
-      if !self.pending.iter().any(|(held, _)| *held == public) {
-        self.pending.push((public, body));
+      if !self.pending.iter().any(|(held, _, _)| *held == public) {
+        self.pending.push((public, body, stamp));
       }
       return;
     }
@@ -2832,12 +2800,13 @@ impl Client {
       }
       return;
     }
-    if self.awaited.contains_key(&id_word) && !self.pending.iter().any(|(held, _)| *held == id_word)
+    if self.awaited.contains_key(&id_word)
+      && !self.pending.iter().any(|(held, _, _)| *held == id_word)
     {
       // Held as soon as it is drained: a reply in `pending` counts as received, so an acknowledgement sent before
       // its caller takes it must already stop below a refusal it will resend.
       self.note_reply(id_word, &body, true);
-      self.pending.push((id_word, body));
+      self.pending.push((id_word, body, stamp));
     } else {
       self.unawaited_dropped = self.unawaited_dropped.saturating_add(1);
     }
@@ -3061,10 +3030,10 @@ impl Client {
   /// still typed: a chain advances on a refusal by ending.
   fn take_held(&mut self, word: u64) -> Result<Option<ReplyBody>, ClientError> {
     self.take_ready()?;
-    let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) else {
+    let Some(pos) = self.pending.iter().position(|(held, _, _)| *held == word) else {
       return Ok(None);
     };
-    let (_, body) = self.pending.remove(pos);
+    let (_, body, _) = self.pending.remove(pos);
     self.awaited.remove(&word);
     Ok(Some(body))
   }
@@ -3257,10 +3226,10 @@ impl Client {
       return self.poll_as(word, extract_edited);
     }
     self.take_ready()?;
-    let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) else {
+    let Some(pos) = self.pending.iter().position(|(held, _, _)| *held == word) else {
       return Ok(None);
     };
-    let (_, body) = self.pending.remove(pos);
+    let (_, body, _) = self.pending.remove(pos);
     self.awaited.remove(&word);
     match resolved(body) {
       Ok(body) => self.advance_chain(word, body),
@@ -3684,36 +3653,24 @@ impl Client {
 
   /// Writes the request into the command ring, waiting for a slot under the module doc's rule (A-232): `true` once
   /// written; `false` when the daemon was found gone instead and the client reconnected (the caller binds and sends
-  /// again). The wait keeps [`RoomWait`]'s schedule (A-523): it spins for the client's wake estimate, since the daemon
-  /// drains its ring in microseconds, then parks, each pause twice the last and never past the next look at the
-  /// daemon's life, which comes on A-443's doubling; while the daemon lives the wait goes on, so a ring a starved daemon
-  /// does not drain costs this thread no core beside it. A slot that frees wakes nothing, so it is found at the next
-  /// try, within the time already waited. Until A-523 the wait spun for a whole reply deadline (a fixed second), asked
-  /// the daemon's liveness at each one, and paced its tries at a tenth of it.
+  /// again). The wait is every client end's (`ClientEnd::send_when_room`, `slates_ipc::room`; A-523, A-571): it spins
+  /// for the client's wake estimate, since the daemon drains its ring in microseconds, then parks, each pause twice the
+  /// last and never past the next look at the daemon's life, which comes on A-443's doubling; while the daemon lives
+  /// the wait goes on, so a ring a starved daemon does not drain costs this thread no core beside it. A slot that frees
+  /// wakes nothing, so it is found at the next try, within the time already waited. Until A-523 the wait spun for a
+  /// whole reply deadline (a fixed second), asked the daemon's liveness at each one, and paced its tries at a tenth of
+  /// it; until A-571 its schedule was this crate's alone.
   fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
-    let started = Instant::now();
-    let mut wait = RoomWait::default();
-    loop {
-      match self.end.send_message(id.word(), body) {
-        Ok(()) => return Ok(true),
-        Err(IpcError::RingFull) => {
-          let elapsed = elapsed_ns(started);
-          match wait.next(elapsed, self.end.wake_estimate_ns()) {
-            RoomStep::Spin => std::hint::spin_loop(),
-            RoomStep::Look => {
-              if self.end.daemon_gone() {
-                self.reconnect()?;
-                return Ok(false);
-              }
-              wait.looked(elapsed);
-            }
-            RoomStep::Park(pause_ns) => {
-              std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));
-            }
-          }
-        }
-        Err(e) => return Err(ClientError::Ipc(e)),
+    match self
+      .end
+      .send_when_room(|end| end.send_message(id.word(), body))
+    {
+      Ok(slates_ipc::room::Roomed::Sent) => Ok(true),
+      Ok(slates_ipc::room::Roomed::DaemonGone) => {
+        self.reconnect()?;
+        Ok(false)
       }
+      Err(e) => Err(ClientError::Ipc(e)),
     }
   }
 
@@ -5460,76 +5417,5 @@ fn fs_done(reply: ReplyBody, verb: &'static str) -> Result<u64, ClientError> {
   match reply {
     ReplyBody::FsDone { size } => Ok(size),
     _ => Err(ClientError::UnexpectedReply { verb }),
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::{RoomStep, RoomWait};
-
-  /// Shape: the client's wake estimate the wait is walked with: 3 µs, a wake measured on Apple silicon.
-  const WAKE_NS: u64 = 3_000;
-  /// Shape: how far one spin moves the clock in the walk: a tenth of the wake.
-  const SPIN_NS: u64 = WAKE_NS / 10;
-  /// Shape: the wait walked across: half again the reply deadline the wait spun through before A-523 (a second).
-  const WAIT_NS: u64 = 1_500_000_000;
-
-  /// A-523 (R3's class C). Do: walk a wait for a ring slot across 1.5 s from the first refusal, spinning, looking (the
-  /// daemon found alive each time) and parking as the schedule says. Expect: a spin only inside the wake estimate; each
-  /// pause no more than twice the last and never past the next look; the looks at twice the time waited from twice the
-  /// wake; and no more looks, nor parks between them, than the logarithm of the wait over the wake plus two. Before
-  /// A-523 the wait spun for a whole reply deadline, a second, and then paced its tries at a tenth of it.
-  #[test]
-  fn a_wait_for_a_ring_slot_spins_for_the_wake_then_parks_and_looks_on_the_doubling() {
-    let mut wait = RoomWait::default();
-    let mut elapsed = 0;
-    let mut looks: Vec<u64> = Vec::new();
-    let mut parks: Vec<u64> = Vec::new();
-    while elapsed < WAIT_NS {
-      match wait.next(elapsed, WAKE_NS) {
-        RoomStep::Spin => {
-          assert!(
-            elapsed < WAKE_NS,
-            "spun at {elapsed} ns, past the wake estimate"
-          );
-          elapsed += SPIN_NS;
-        }
-        RoomStep::Look => {
-          looks.push(elapsed);
-          wait.looked(elapsed);
-        }
-        RoomStep::Park(pause) => {
-          let to_look = wait.looks.until(elapsed).unwrap();
-          assert!(
-            pause <= to_look,
-            "a {pause} ns pause past the next look, {to_look} ns on"
-          );
-          if let Some(last) = parks.last() {
-            assert!(pause <= 2 * last, "a {pause} ns pause after {last} ns");
-          }
-          parks.push(pause);
-          elapsed += pause;
-        }
-      }
-    }
-    assert_eq!(
-      looks.first(),
-      Some(&(2 * WAKE_NS)),
-      "the first look at twice the wake"
-    );
-    for pair in looks.windows(2) {
-      assert_eq!(pair[1], 2 * pair[0], "the looks at {looks:?}");
-    }
-    let bound = u64::from((WAIT_NS / WAKE_NS).ilog2()) + 2;
-    assert!(
-      u64::try_from(looks.len()).unwrap() <= bound,
-      "{} looks, past {bound}",
-      looks.len()
-    );
-    assert!(
-      u64::try_from(parks.len()).unwrap() <= bound,
-      "{} parks, past {bound}",
-      parks.len()
-    );
   }
 }

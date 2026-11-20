@@ -29,6 +29,9 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+// A request that meets a pending S3 base waits for the fetch it met (§4.15 "An S3 base", A-555).
+mod base_wait;
+mod carry;
 pub mod catalog;
 pub mod config;
 mod consensus;
@@ -42,6 +45,7 @@ pub mod daemon;
 pub mod deploy;
 mod direct_map;
 pub mod discovery;
+mod pressure;
 mod retention;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
 // A-record client over the runtime's UDP, resolved at every dial so a rescheduled peer is found.
@@ -71,11 +75,13 @@ mod own_nfs;
 mod checkout;
 // A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
 mod green_adopt;
+pub mod greens;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
-// The judgment a held NFS connection's adoption takes on Linux (A-550): pure, so every host's tests hold it.
-#[cfg_attr(not(test), allow(dead_code))]
+// A held NFS connection's send ledger and the judgment its adoption takes (A-550): kept on Linux alone; elsewhere its
+// pure parts are compiled and held by every host's tests, and only its no-op seams are called.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod held_send;
 pub mod histogram;
 mod image;
@@ -114,6 +120,8 @@ mod delegation;
 mod learned_wait;
 // The helper processes a shard waits on (the FUSE helpers), each wait learned as `learned_wait` learns one (A-525).
 mod helper_runs;
+// The anchor's answers on the Windows hold channel, each exchange's wait learned as `learned_wait` learns one (A-552).
+mod anchor_answers;
 mod listing;
 mod lock_ledger;
 pub mod nfs;
@@ -141,6 +149,10 @@ mod deadlines;
 // process's exit (macOS, Windows), awaited through the shard's driver.
 mod hangup;
 mod reap;
+mod repository;
+// A FUSE or WinFsp mount's journal reader's patience, learned from its own rounds as `learned_wait` learns a wait
+// (A-548).
+mod reader_patience;
 // Whether Windows Error Reporting writes this daemon full crash dumps (A-239): read, logged once and reported.
 pub mod local_dumps;
 mod recovery_slices;

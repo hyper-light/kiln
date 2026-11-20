@@ -535,32 +535,40 @@ pub struct BasePlane {
 }
 
 /// A base directory a recovery could not reacquire ([`BasePlane::unavailable`]): its recorded source and fingerprint,
-/// kept for the next image, and the errno its untouched entries are refused with.
+/// kept for the next image, and the code its untouched entries are refused with, typed by its numbering (A-539; none
+/// where the host named none).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UnavailableDir {
   pub(crate) source: Vec<String>,
   pub(crate) fingerprint: Fingerprint,
-  pub(crate) errno: i32,
+  pub(crate) code: Option<crate::host::OsCode>,
 }
 
-/// Format: the errno a base directory that is no longer the recorded one is refused with, `ENOENT` (2 on Linux and
-/// macOS, and Windows' `ERROR_FILE_NOT_FOUND`): the directory the image recorded is not there, whether removed or
+/// Format: the code a base directory that is no longer the recorded one is refused with, in this platform's numbering:
+/// `ENOENT` (`<errno.h>`, 2 on Linux and macOS): the directory the image recorded is not there, whether removed or
 /// replaced by another at the path (§4.8, A-153).
-pub(crate) const GONE_DIRECTORY_ERRNO: i32 = 2;
+#[cfg(not(windows))]
+pub(crate) const GONE_DIRECTORY: crate::host::OsCode = crate::host::OsCode::Errno(2);
+/// Format: see the other arm; Windows' `ERROR_FILE_NOT_FOUND` (winerror.h, 2), a Win32 error code (A-539).
+#[cfg(windows)]
+pub(crate) const GONE_DIRECTORY: crate::host::OsCode = crate::host::OsCode::Win32(2);
 
-/// The errno a base directory recovery could not reopen is refused with: the host's own, or [`GONE_DIRECTORY_ERRNO`]
-/// when the host says only that it is not there as a directory.
-pub(crate) fn unavailable_errno(error: HostError) -> i32 {
+/// The code a base directory recovery could not reopen is refused with, typed by its numbering (A-539): the host's own;
+/// [`GONE_DIRECTORY`] when the host says only that it is not there as a directory; none for a fetch under way, which no
+/// code names, as a base unavailable with no host at all names none (recovery over an S3 base is A-524's owed
+/// integration).
+pub(crate) fn unavailable_code(error: HostError) -> Option<crate::host::OsCode> {
   match error {
-    HostError::Unavailable(errno) | HostError::OwnMount(errno) => errno,
-    // The record keeps one number (A-527): a Win32 code as its own, which only a reader told it is Windows' reads.
-    HostError::Win32(code) => i32::try_from(code).unwrap_or(i32::MAX),
+    HostError::Exists(code)
+    | HostError::NoSpace(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code)
+    | HostError::Unprivileged(code)
+    | HostError::OwnMount(code) => Some(code),
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
-      GONE_DIRECTORY_ERRNO
+      Some(GONE_DIRECTORY)
     }
-    // A fetch under way is no errno: the directory is unavailable for no reason the host's errno names, as a base
-    // unavailable with no host at all is (`BaseUnavailable(0)`). Recovery over an S3 base is A-524's owed integration.
-    HostError::Pending => 0,
+    HostError::Pending(_) => None,
   }
 }
 
@@ -874,10 +882,14 @@ fn host_refusal(e: HostError) -> VfsError {
     HostError::NotDirectory => VfsError::NotDirectory,
     HostError::NotFile => VfsError::IsDirectory,
     HostError::StaleHandle => VfsError::StaleHandle,
-    HostError::Unavailable(errno) | HostError::OwnMount(errno) => VfsError::BaseUnavailable(errno),
-    // One number past the seam (A-527): a Win32 code as its own.
-    HostError::Win32(code) => VfsError::BaseUnavailable(i32::try_from(code).unwrap_or(i32::MAX)),
-    HostError::Pending => VfsError::BasePending,
+    // The code as the host named it, typed by its numbering (A-539).
+    HostError::Exists(code)
+    | HostError::NoSpace(code)
+    | HostError::Unsupported(code)
+    | HostError::Unavailable(code)
+    | HostError::Unprivileged(code)
+    | HostError::OwnMount(code) => VfsError::BaseUnavailable(Some(code)),
+    HostError::Pending(fetch) => VfsError::BasePending(fetch),
   }
 }
 
@@ -1162,7 +1174,7 @@ impl Volume {
       .and_then(|b| b.listings.get(&node.inode))
       .and_then(|l| l.entries.as_ref())
     else {
-      return Err(VfsError::BaseUnavailable(0));
+      return Err(VfsError::BaseUnavailable(None));
     };
     Ok(entries.iter().all(|e| {
       node
@@ -1289,7 +1301,7 @@ impl Overlay<'_> {
         return Ok(Some(names));
       }
       if let Some(gone) = plane.unavailable.get(&no) {
-        return Err(VfsError::BaseUnavailable(gone.errno));
+        return Err(VfsError::BaseUnavailable(gone.code));
       }
       let Some(listing) = plane.listings.get(&no) else {
         return Ok(None);
@@ -1327,7 +1339,7 @@ impl Overlay<'_> {
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
     if let Some(gone) = plane.unavailable.get(&dir_no) {
-      return Err(VfsError::BaseUnavailable(gone.errno));
+      return Err(VfsError::BaseUnavailable(gone.code));
     }
     let listing = plane
       .listings
@@ -1912,7 +1924,7 @@ impl Overlay<'_> {
   fn listing_dir(&mut self, dir_no: InodeNo) -> Result<HostDir, VfsError> {
     let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
     if let Some(gone) = plane.unavailable.get(&dir_no) {
-      return Err(VfsError::BaseUnavailable(gone.errno));
+      return Err(VfsError::BaseUnavailable(gone.code));
     }
     plane
       .listings
@@ -4717,7 +4729,7 @@ mod tests {
   ) -> Result<Vec<u8>, VfsError> {
     let mut o = vol.with_host(host);
     let size = o.stat(store, no)?.size;
-    let mut buf = vec![0u8; usize::try_from(size).unwrap()];
+    let mut buf = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
     let n = o.read(store, no, 0, &mut buf)?;
     buf.truncate(n);
     Ok(buf)
@@ -4732,6 +4744,307 @@ mod tests {
     opener: Result<Vec<u8>, VfsError>,
     renamed: bool,
     replaced: u64,
+  }
+
+  /// Shape: the bytes a file of the volume holds as of the last publication.
+  const PUBLISHED: &[u8] = b"published, kept!";
+  /// Shape: the bytes a write shows over [`PUBLISHED`] after the last publication and the death loses, as long as it.
+  const UNPUBLISHED: &[u8] = b"shown, then lost";
+  /// Shape: the bytes an outsider writes over a base file in place while no daemon runs.
+  const EDITED: &[u8] = b"the outsider's edit, in place";
+
+  /// The store a restarted daemon rebuilds into (A-64): a fresh [`store`] holding `old`'s region bytes at the same
+  /// offsets, as the anchor's RAM survives the daemon.
+  fn surviving(old: &Store) -> Store {
+    let mut fresh = store();
+    for index in 0..old.content.arena().regions() {
+      let index = u16::try_from(index).unwrap();
+      let bytes = old
+        .content
+        .arena()
+        .region(index)
+        .map(|region| region.bytes().to_vec())
+        .unwrap();
+      fresh
+        .content
+        .arena_mut()
+        .region_mut(index)
+        .unwrap()
+        .bytes_mut()
+        .copy_from_slice(&bytes);
+    }
+    fresh
+  }
+
+  /// A successor's rebuild of `image`, the dead daemon's last publication, over `host`, into the store its anchor kept
+  /// of `old`'s.
+  fn rebuilt(
+    old: &Store,
+    image: &crate::recover::VolumeImage,
+    host: &mut SimHost,
+  ) -> (Volume, Store) {
+    let mut kept = surviving(old);
+    let claims = crate::recover::Claims::prepare(&mut kept, std::iter::once(image)).unwrap();
+    let root = host.root();
+    let volume = Volume::from_image(
+      &mut kept,
+      image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      1 << 16,
+      Some((&mut *host, root)),
+    )
+    .unwrap();
+    (volume, kept)
+  }
+
+  /// The inodes a takeover walk visits, walked whole.
+  fn walked(
+    walk: impl FnOnce(&mut dyn FnMut(u64) -> std::ops::ControlFlow<()>) -> bool,
+  ) -> Vec<u64> {
+    let mut seen = Vec::new();
+    let whole = walk(&mut |ino| {
+      seen.push(ino);
+      std::ops::ControlFlow::Continue(())
+    });
+    assert!(whole, "a walk that never breaks visits the whole set");
+    seen
+  }
+
+  /// A-573 (B10 (a); §4.6, a mount taken over by a restarted daemon; A-158). Do: on an overlay, make a file holding
+  /// [`PUBLISHED`] and publish; after the publication, mount 41's kernel looks the file up and a write shows it
+  /// [`UNPUBLISHED`], which no publication takes; the daemon dies, and a successor rebuilds from the publication.
+  /// Expect: the successor holds [`PUBLISHED`], never the bytes the kernel was shown; the mount's restored references
+  /// do not name the file, since its lookup came after the publication; and the takeover walk of the head names it, so
+  /// the kernel's pages of the lost write are invalidated. Before A-573 the round named only the restored references
+  /// and the replay, and the kernel kept serving bytes the successor never had.
+  #[test]
+  fn a_dirty_read_through_a_lookup_after_the_last_publication_is_named_by_the_takeover() {
+    let mut host = SimHost::new();
+    let mut store = store();
+    let mut vol = overlay(&mut host, &mut store);
+    let root = vol.root_inode(&store).unwrap();
+    let file = vol
+      .with_host(&mut host)
+      .create_file_no(&mut store, root, "draft", 0o644)
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .write(&mut store, file, 0, PUBLISHED)
+      .unwrap();
+    let image = vol.to_image(&store, Some(&mut host)).unwrap();
+    vol
+      .reference_for(&store, file, RefOwner::Attachment(KERNEL))
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .write(&mut store, file, 0, UNPUBLISHED)
+      .unwrap();
+    host.close_files();
+    let (mut successor, mut kept) = rebuilt(&store, &image, &mut host);
+    assert_eq!(
+      read_no(&mut successor, &mut host, &mut kept, file).unwrap(),
+      PUBLISHED,
+      "the successor never had the bytes the kernel was shown"
+    );
+    assert!(
+      !walked(|visit| successor.visit_takeover_inodes(RefOwner::Attachment(KERNEL), None, visit))
+        .contains(&file.0),
+      "premise: no restored reference names a file looked up after the last publication"
+    );
+    assert!(
+      walked(|visit| successor.visit_head_inodes(&kept, None, visit)).contains(&file.0),
+      "the takeover names the file the kernel read the lost write through"
+    );
+  }
+
+  /// A-573 (B10 (b); §4.6, A-151, A-158). Do: on an overlay over a base holding a file, look the file up (its directory
+  /// loaded, an inode issued) and publish; after the publication, mount 41's kernel looks the file up and caches its
+  /// pages; the daemon dies, an outsider writes the file in place while no daemon runs, and a successor rebuilds from
+  /// the publication over the same base. Expect: the successor reads the outsider's bytes through the file's inode; no
+  /// restored reference names the file; and the takeover walk of the head names it, so the kernel's pages of the old
+  /// bytes are invalidated. Before A-573 nothing named it: its names and attributes revalidate within the base's
+  /// timestamp granularity, but its pages stayed, the old bytes served after the outsider's edit.
+  #[test]
+  fn a_base_file_looked_up_after_the_last_publication_is_named_by_the_takeover_after_an_outsiders_edit()
+   {
+    let mut host = SimHost::new();
+    host.replace_file("/notes", OPENED);
+    host.advance_ns(STEP_NS);
+    let mut store = store();
+    let mut vol = overlay(&mut host, &mut store);
+    let file = vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/notes")
+      .unwrap()
+      .inode;
+    let image = vol.to_image(&store, Some(&mut host)).unwrap();
+    vol
+      .reference_for(&store, file, RefOwner::Attachment(KERNEL))
+      .unwrap();
+    host.close_files();
+    host.write_in_place("/notes", EDITED, STEP_NS);
+    let (mut successor, mut kept) = rebuilt(&store, &image, &mut host);
+    assert_eq!(
+      read_no(&mut successor, &mut host, &mut kept, file).unwrap(),
+      EDITED,
+      "the successor reads the outsider's edit through the file's inode"
+    );
+    assert!(
+      !walked(|visit| successor.visit_takeover_inodes(RefOwner::Attachment(KERNEL), None, visit))
+        .contains(&file.0),
+      "premise: no restored reference names a file looked up after the last publication"
+    );
+    assert!(
+      walked(|visit| successor.visit_head_inodes(&kept, None, visit)).contains(&file.0),
+      "the takeover names the base file the kernel cached the old bytes of"
+    );
+  }
+
+  /// Shape: the inode numbers the A-578 tests' store reserves ahead of a volume's counter (A-150): nonzero, so a
+  /// publication's live counter and its reserved ceiling differ (with none they coincide, and no number is unrecorded),
+  /// and past the few numbers each scene issues after its publication.
+  const RESERVE: u64 = 16;
+
+  /// The A-578 scene: with a nonzero reserve, an overlay over a base holding `/dir/notes` is published; after the
+  /// publication a file `draft` is made and `/dir/notes` looked up, its directory loaded for the first time, each
+  /// issuing numbers no publication records; the daemon dies, and a successor rebuilds from the publication. Returns
+  /// the publication, the successor, its store and host, and `draft`'s and `notes`' numbers.
+  fn issued_after_the_publication() -> (
+    crate::recover::VolumeImage,
+    Volume,
+    Store,
+    SimHost,
+    [InodeNo; 2],
+  ) {
+    let mut host = SimHost::new();
+    host.mkdir("/dir");
+    host.replace_file("/dir/notes", OPENED);
+    host.advance_ns(STEP_NS);
+    let mut store = store();
+    store.inode_reserve = RESERVE;
+    let mut vol = overlay(&mut host, &mut store);
+    let image = vol.to_image(&store, Some(&mut host)).unwrap();
+    let root = vol.root_inode(&store).unwrap();
+    let draft = vol
+      .with_host(&mut host)
+      .create_file_no(&mut store, root, "draft", 0o644)
+      .unwrap();
+    let notes = vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/dir/notes")
+      .unwrap()
+      .inode;
+    host.close_files();
+    let (successor, kept) = rebuilt(&store, &image, &mut host);
+    (image, successor, kept, host, [draft, notes])
+  }
+
+  /// A-578 (§4.6, a mount taken over by a restarted daemon; A-150, A-573). Do: the A-578 scene
+  /// ([`issued_after_the_publication`]). Expect: the successor holds neither number the dead daemon issued after its
+  /// last publication, each refused `NotFound` and never served, and its takeover walk of the head names both, so a
+  /// descriptor a kernel opened on one before the death drops its pages. Before A-578 no publication recorded the
+  /// counter they were issued above, and the walk named only what the successor holds.
+  #[test]
+  fn a_number_issued_after_the_last_publication_is_refused_and_named_by_the_takeover() {
+    let (_, mut successor, mut kept, mut host, issued) = issued_after_the_publication();
+    let named = walked(|visit| successor.visit_head_inodes(&kept, None, visit));
+    for no in issued {
+      assert_eq!(
+        successor.with_host(&mut host).stat(&mut kept, no).err(),
+        Some(VfsError::NotFound),
+        "the successor never had {no:?}: refused, never served"
+      );
+      assert!(
+        named.contains(&no.0),
+        "the takeover names {no:?}, issued after the last publication"
+      );
+    }
+  }
+
+  /// A-578. Do: the A-578 scene, then make a file on the successor (a number past the reserved ceiling, its own); walk
+  /// the takeover set whole, and in slices that break after k numbers for k from 1 to 5, each resuming past the last
+  /// number the slice before was given. Expect: the whole walk in ascending counter order, each number once, holding
+  /// every counter from the publication's live counter up to its ceiling and the successor's own file; and every
+  /// slicing joined to the whole walk, across the restored inodes, the unrecorded counters and the successor's own.
+  #[test]
+  fn the_takeover_walk_in_slices_joins_whole_across_the_unrecorded_counters() {
+    let (image, mut successor, mut kept, mut host, issued) = issued_after_the_publication();
+    let root = successor.root_inode(&kept).unwrap();
+    let own = successor
+      .with_host(&mut host)
+      .create_file_no(&mut kept, root, "own", 0o644)
+      .unwrap();
+    let whole = walked(|visit| successor.visit_head_inodes(&kept, None, visit));
+    let counters: Vec<u64> = whole.iter().map(|&no| InodeNo(no).counter()).collect();
+    assert!(
+      counters.windows(2).all(|pair| pair[0] < pair[1]),
+      "ascending counters, each once: {counters:?}"
+    );
+    let unrecorded = image.live_counter..image.next_counter;
+    assert!(
+      !unrecorded.is_empty(),
+      "a nonzero reserve leaves numbers unrecorded"
+    );
+    assert_eq!(
+      counters
+        .iter()
+        .filter(|&&counter| unrecorded.contains(&counter))
+        .count(),
+      usize::try_from(unrecorded.end - unrecorded.start).unwrap(),
+      "every unrecorded counter"
+    );
+    assert!(whole.contains(&own.0), "the successor's own file");
+    assert!(issued.iter().all(|no| whole.contains(&no.0)));
+    for per_slice in 1..=5 {
+      let mut joined = Vec::new();
+      let mut after = None;
+      loop {
+        let mut taken = 0;
+        let finished = successor.visit_head_inodes(&kept, after, &mut |no| {
+          joined.push(no);
+          after = Some(no);
+          taken += 1;
+          if taken == per_slice {
+            std::ops::ControlFlow::Break(())
+          } else {
+            std::ops::ControlFlow::Continue(())
+          }
+        });
+        if finished {
+          break;
+        }
+        assert!(joined.len() <= whole.len(), "the walk ends");
+      }
+      assert_eq!(
+        joined, whole,
+        "slices of {per_slice} join to the whole walk"
+      );
+    }
+  }
+
+  /// A-578, hostile input. Do: take a publication's image, move its live counter past its reserved ceiling, and rebuild
+  /// from it. Expect: refused `RecoveryIncomplete`, never a volume told numbers it could not have issued.
+  #[test]
+  fn an_image_whose_live_counter_passes_its_ceiling_is_refused() {
+    let mut host = SimHost::new();
+    let mut store = store();
+    store.inode_reserve = RESERVE;
+    let vol = overlay(&mut host, &mut store);
+    let mut image = vol.to_image(&store, Some(&mut host)).unwrap();
+    image.live_counter = image.next_counter + 1;
+    let mut kept = surviving(&store);
+    let claims = crate::recover::Claims::prepare(&mut kept, std::iter::once(&image)).unwrap();
+    let root = host.root();
+    let refused = Volume::from_image(
+      &mut kept,
+      &image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      1 << 16,
+      Some((&mut host, root)),
+    );
+    assert_eq!(refused.err(), Some(VfsError::RecoveryIncomplete));
   }
 
   /// A base file opened as a mount's `OPEN` does, its directory's listing current, then a digest of its path with an
@@ -4824,6 +5137,100 @@ mod tests {
     assert!(
       raced > 0 && reached > 0,
       "the replacement landed during {raced} digests, {reached} of them between the listing's check and the open"
+    );
+  }
+
+  /// Shape: the journal a restarted overlay keeps, as [`overlay`] makes one.
+  const JOURNAL: usize = 1 << 16;
+  /// Format: a file's and a directory's mode.
+  const FILE_MODE: u32 = 0o644;
+  const DIR_MODE: u32 = 0o755;
+
+  /// The live entries a restart counts in `image` (§4.2's namespace dimension): the names its directories carry that
+  /// name a child. A whiteout names none.
+  fn named_entries(image: &crate::recover::VolumeImage) -> u64 {
+    image
+      .inodes
+      .iter()
+      .map(|inode| match &inode.body {
+        crate::recover::BodyImage::Directory { entries, .. } => {
+          entries.iter().filter(|entry| entry.child.is_some()).count()
+        }
+        _ => 0,
+      })
+      .map(|named| u64::try_from(named).unwrap())
+      .sum()
+  }
+
+  /// A-572 (A-549's sweep). Do: over a base holding `/top` and three files in `/src`, remove `/top` and two of the files
+  /// through the overlay, which leaves three whiteouts, and make a file and a directory of the overlay's own; image the
+  /// overlay and restart it. Expect its live-entry count before the restart, after it, and the recount of its image (the
+  /// names its directories carry that name a child) all equal. Before A-572 the restart counted each whiteout as an
+  /// entry, three past the live count, and the floor a restart sets the entry allowance at rose by as many.
+  #[test]
+  fn a_restart_counts_no_whiteout_as_a_live_entry() {
+    let mut host = SimHost::new();
+    host.replace_file("/top", OPENED);
+    host.mkdir("/src");
+    for name in ["a", "b", "c"] {
+      host.replace_file(&format!("/src/{name}"), OPENED);
+    }
+    host.advance_ns(STEP_NS);
+    let mut before = store();
+    let mut vol = overlay(&mut host, &mut before);
+    let root = vol.root();
+    let crate::dir::Child::Dir(src) = vol
+      .with_host(&mut host)
+      .resolve(&mut before, "/src")
+      .unwrap()
+      .child
+    else {
+      panic!("/src is a directory");
+    };
+    vol
+      .with_host(&mut host)
+      .unlink(&mut before, root, "top")
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .unlink(&mut before, src, "a")
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .unlink(&mut before, src, "b")
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .create_file(&mut before, root, "mine", FILE_MODE)
+      .unwrap();
+    vol
+      .with_host(&mut host)
+      .mkdir(&mut before, src, "made", DIR_MODE)
+      .unwrap();
+    let image = vol.to_image(&before, Some(&mut host)).unwrap();
+    let live = vol.entry_usage().0;
+    assert_eq!(
+      live,
+      named_entries(&image),
+      "the live count is the named entries of the overlay's image"
+    );
+    host.close_files();
+    let host_root = host.root();
+    let mut after = store();
+    let claims = crate::recover::Claims::prepare(&mut after, [&image]).unwrap();
+    let recovered = Volume::from_image(
+      &mut after,
+      &image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      JOURNAL,
+      Some((&mut host, host_root)),
+    )
+    .unwrap();
+    assert_eq!(
+      recovered.entry_usage().0,
+      live,
+      "the restart counts the entries the live overlay counted, no whiteout among them"
     );
   }
 }
