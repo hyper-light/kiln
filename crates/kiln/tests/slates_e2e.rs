@@ -1710,3 +1710,256 @@ mod microvm {
         Ok(of_instance(&procs, name).into_iter().filter(|p| p.argv.iter().any(|a| a == "daemon")).map(|p| p.pid).collect())
     }
 }
+
+// =================================================================================================
+// The container engine (docs/agentic.md W9, Slates' A-520): an agent in a container of its own on its volume, mounted on
+// the runner's host and bound into the container by Slates, never copied. Skipped in the runner's own words where its
+// facts say its agents can't run in containers.
+// =================================================================================================
+#[cfg(unix)]
+mod container {
+    //! A-520's fifth piece, by use: a runner whose owner set its engine to `container` runs each agent's harness in a
+    //! container of the image its administrator declared (`[agent] container_image`), on the agent's Slates volume
+    //! mounted on the host and bound into the container by Slates' `bind_into_container`. What each drive reads:
+    //!
+    //! 1. **In a container.** The runner's facts say its agents can run in containers and name the image; on a Mac its
+    //!    harness says a Linux kernel (Docker Desktop's VM), and on every host the engine runs a container whose only bind
+    //!    of the workspace has the volume's host mount as its source, at the same path ([`bound_from`]).
+    //! 2. **On its volume, never a copy.** The harness works at the host mount's own path; its three edits are seen
+    //!    through the host's mount before any landing, and the project's folder holds none of them.
+    //! 3. **Review, landing, drift (W3, W4, W6), unchanged.** Its change request holds exactly its changes; a person's
+    //!    landing (`agents.land`) writes them at once where its mode asks nothing and only on approval where it asks; a
+    //!    file the person changed on disk after the agent changed it is drift, and no landing writes over the person's
+    //!    bytes. A harness in a container has no kiln MCP (W9: its socket is the machine's), so the person lands here.
+    //! 4. **Its end.** Ended, its container is gone and its volume's mount leaves the host's table.
+    //!
+    //! The image is built by the drive from a pinned Python base with the stand-in as `claude` on its `PATH`
+    //! ([`stub_image`]). `CONTAINER_E2E=1` makes a runner whose agents can't run in containers a failure, not a skip.
+    //!
+    //!   CONTAINER_E2E=1 cargo test -p kiln --test slates_e2e container:: -- --nocapture --test-threads 1
+    use super::*;
+
+    /// The switch that makes a runner whose agents can't run in containers a failure rather than a skip.
+    const REQUIRED: &str = "CONTAINER_E2E";
+
+    /// The stand-in image's base: Python 3 and `tail` (the keeper's), pinned by its index digest.
+    const BASE: &str = "python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90";
+
+    /// The engine's command line the drive itself asks (the image's build, its containers): `docker` on its own PATH.
+    fn docker() -> Option<PathBuf> {
+        kiln::os::which("docker").filter(|d| std::process::Command::new(d).args(["version", "--format", "{{.Server.Version}}"]).output().is_ok_and(|o| o.status.success()))
+    }
+
+    /// The stand-in's image: [`BASE`] with the stand-in under each harness's name, tagged by the stand-in's own bytes so
+    /// a run reuses one already built.
+    fn stub_image(docker: &Path, dir: &Path) -> anyhow::Result<String> {
+        use std::hash::{Hash as _, Hasher as _};
+        let stub = std::fs::read(vm_e2e::stub_path())?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (BASE, &stub).hash(&mut h);
+        let tag = format!("kiln-e2e-container-stub:{:016x}", h.finish());
+        let ctx = dir.join("image");
+        std::fs::create_dir_all(&ctx)?;
+        std::fs::write(ctx.join("stub"), &stub)?;
+        let links: String = kiln::harness::kinds::Kind::all().iter().map(|k| format!(" && ln -sf /usr/local/bin/kiln-stub /usr/local/bin/{}", k.program)).collect();
+        std::fs::write(ctx.join("Dockerfile"), format!("FROM {BASE}\nCOPY stub /usr/local/bin/kiln-stub\nRUN chmod 0755 /usr/local/bin/kiln-stub{links}\n"))?;
+        let out = std::process::Command::new(docker).args(["build", "--quiet", "--tag", &tag]).arg(&ctx).output()?;
+        anyhow::ensure!(out.status.success(), "docker build {tag}: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        Ok(tag)
+    }
+
+    /// A server and runner of the drive's own under `dir`: [`runner_env`]'s, the engine's command line on its PATH, its
+    /// `[agent] container_image` the stand-in's image; its engine set to `container` once its facts say its agents can
+    /// run in containers. None, said why, where they can't (a failure under [`REQUIRED`]).
+    fn fixture(dir: &Path, instance: &Instance, docker: &Path, image: &str) -> anyhow::Result<Option<vm_e2e::Fixture>> {
+        let mut env = runner_env(dir, instance)?;
+        let engine_bin = dir.join("engine-bin");
+        std::fs::create_dir_all(&engine_bin)?;
+        std::os::unix::fs::symlink(docker, engine_bin.join("docker"))?;
+        for (k, v) in &mut env {
+            if *k == "PATH" {
+                *v = format!("{v}:{}", engine_bin.display());
+            }
+        }
+        let config = dir.join("runner.toml");
+        std::fs::write(&config, format!("[agent]\ncontainer_image = {}\n", toml::Value::String(image.to_owned())))?;
+        env.push(("KILN_CONFIG", config.to_string_lossy().into_owned()));
+        let f = vm_e2e::up_own(dir, "slatesct", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
+        if !workspaces_ready(&f)? {
+            return Ok(None);
+        }
+        let facts = containers_of(&f.get("/api/agents")?, &f.machine);
+        if facts.get("available") != Some(&Value::Bool(true)) {
+            let skip = format!("SKIP: runner {}'s agents can't run in containers: {facts}", f.machine);
+            anyhow::ensure!(std::env::var_os(REQUIRED).is_none(), "{skip} ({REQUIRED}=1 requires them)\n{}", f.runner_log());
+            eprintln!("{skip}");
+            return Ok(None);
+        }
+        anyhow::ensure!(facts.get("image").and_then(Value::as_str) == Some(image), "runner {}'s container facts name another image: {facts}", f.machine);
+        eprintln!("FACTS: runner {}'s containers: {facts}", f.machine);
+        let machine = f.machine.clone();
+        vm_e2e::set_engine(&f, &machine, "container")?;
+        Ok(Some(f))
+    }
+
+    /// What runner `machine`'s facts say of its containers (`facts.containers`), or null.
+    fn containers_of(runners: &Value, machine: &str) -> Value {
+        let list = runners.as_array().or_else(|| runners.get("agents").and_then(Value::as_array));
+        let runner = list.into_iter().flatten().find(|r| r.get("name").and_then(Value::as_str) == Some(machine));
+        runner.and_then(|r| r.pointer("/facts/containers")).cloned().unwrap_or(Value::Null)
+    }
+
+    /// The running containers the engine binds `mount` into, each by its id: (id, the bind's source, its destination,
+    /// whether it's writable), from the engine's own record (`docker inspect`).
+    fn bound_from(docker: &Path, mount: &str) -> anyhow::Result<Vec<(String, String, String, bool)>> {
+        let ids = std::process::Command::new(docker).args(["ps", "--quiet", "--no-trunc", "--filter", &format!("volume={mount}")]).output()?;
+        anyhow::ensure!(ids.status.success(), "docker ps: {}", String::from_utf8_lossy(&ids.stderr));
+        let mut found = Vec::new();
+        for id in String::from_utf8_lossy(&ids.stdout).split_whitespace() {
+            let out = std::process::Command::new(docker).args(["inspect", "--format", "{{json .Mounts}}", id]).output()?;
+            anyhow::ensure!(out.status.success(), "docker inspect {id}: {}", String::from_utf8_lossy(&out.stderr));
+            let mounts: Value = serde_json::from_slice(&out.stdout)?;
+            for m in mounts.as_array().into_iter().flatten() {
+                let word = |k: &str| m.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+                if word("Destination") == mount {
+                    anyhow::ensure!(word("Type") == "bind", "container {id} has {mount} as a {} mount, not a bind: {m}", word("Type"));
+                    found.push((id.to_owned(), word("Source"), word("Destination"), m.get("RW") == Some(&Value::Bool(true))));
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The prompt of a drive's turn in a container: its three edits, and no landing of its own (it has no kiln MCP).
+    fn edits(probe: &str) -> String {
+        format!("WRITE={probe} APPEND={} REMOVE={} do the task", APPENDED.0, REMOVED.0)
+    }
+
+    /// One agent in `mode` in a container on its volume over `project`, checked end to end (the module's 1 to 4).
+    fn drive_agent(f: &vm_e2e::Fixture, dir: &Path, instance: &Instance, docker: &Path, project: &Project, mode: Mode) -> anyhow::Result<()> {
+        let before = tree(&project.path())?;
+        let git_before = project.git_state()?;
+        let probe = vm_e2e::probe_name();
+        let spec = json!({"kind": "claude", "mode": mode.claude(), "cwd": project.dir, "prompt": edits(&probe), "workspace": {"kind": "volume"}});
+        eprintln!("DRIVE: Container, an agent in mode {}, on {}, instance {}", mode.claude(), f.machine, instance.name);
+        let id = vm_e2e::open(f, &spec)?;
+        let mut pace = vm_e2e::Pace::owning(&vm_e2e::host_roots(f.runner_pid)?)?.reporting(landing_reports(&instance.name));
+        let (info, events) = pace.until(f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
+        let lines = vm_e2e::said(&events);
+        let what = format!("Container session {id} ({mode:?})");
+        let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}", f.runner_log(), slates_log(dir));
+        check_edits(&lines, &probe).map_err(fail)?;
+        let made = workspace_of(&info).map_err(fail)?;
+        let fail = |e: String| anyhow::anyhow!("{what}: {e}\n{}\n{}\n{}", f.runner_log(), slates_log(dir), slates_state(&instance.name, &made.volume));
+        let op = |name: &str, input: &Value| op(f, name, input).map_err(|e| anyhow::anyhow!("{e:#}\n{}", slates_state(&instance.name, &made.volume)));
+        anyhow::ensure!(canonical(Path::new(&made.over)) == project.path(), "{what}: its volume lies over {}, not its project {}", made.over, project.dir);
+        // 1 and 2: its harness in a container, at the host mount's own path, the mount Slates' and bound, never copied.
+        let mount = made.mount.clone().ok_or_else(|| fail(format!("kiln names no mount of its volume on its host: {made:?}")))?;
+        let at = mount_point(&mount);
+        anyhow::ensure!(slates_mounted_at(&at)?, "{what}: nothing of Slates' is mounted at {} ({:?})", at.display(), host_mounts()?);
+        let said_cwd = vm_e2e::cwd_said(&lines).ok_or_else(|| fail(format!("its harness never said its folder: {lines:?}")))?;
+        anyhow::ensure!(Path::new(&said_cwd).starts_with(&mount), "{what}: its harness works in {said_cwd}, outside its volume's mount {mount}");
+        let kernel = vm_e2e::where_said(&lines).map(|w| w.kernel).ok_or_else(|| fail(format!("its harness never said where it ran: {lines:?}")))?;
+        if cfg!(target_os = "macos") {
+            anyhow::ensure!(kernel == "Linux", "{what}: its harness ran on {kernel}, the Mac's own kernel, not in a container");
+        }
+        let bound = bound_from(docker, &mount)?;
+        let [(container, source, _, writable)] = bound.as_slice() else { return Err(fail(format!("the engine runs {} containers binding {mount}, not one: {bound:?}", bound.len()))) };
+        anyhow::ensure!(*source == mount && *writable, "{what}: container {container} binds {source} (writable: {writable}), not its volume's mount {mount} for writing");
+        let seen: BTreeMap<String, Option<Vec<u8>>> = [probe.as_str(), APPENDED.0, REMOVED.0].iter().map(|n| ((*n).to_owned(), std::fs::read(at.join(n)).ok())).collect();
+        anyhow::ensure!(seen == expected(&probe), "{what}: the host's mount of its volume holds {seen:?}, not its harness's changes");
+        anyhow::ensure!(tree(&project.path())? == before, "{what}: the project's folder changed before any landing: {:?}", changes(&before, &tree(&project.path())?));
+        eprintln!("PROVEN: {what}: its harness on {kernel} at {said_cwd}, in container {container} binding Slates' mount {mount} of volume {}; its three edits seen through the host's mount, its folder untouched", made.volume);
+        // 3: review, then the person's landing by its mode.
+        let changed = op("agents.change", &json!({"agent": id, "title": "A-520 container end to end"}))?;
+        let branch = changed.pointer("/change_request/branch").and_then(Value::as_str).ok_or_else(|| fail(format!("its change request names no branch: {changed}")))?.to_owned();
+        let proposed = changes(&project.tree_at("main")?, &project.tree_at(&branch)?);
+        anyhow::ensure!(proposed == expected(&probe), "{what}: its change request {branch} holds {proposed:?}, not its harness's changes");
+        anyhow::ensure!(tree(&project.path())? == before, "{what}: its change request wrote to the project's folder");
+        eprintln!("PROVEN: {what}: its change request {branch} holds exactly its changes");
+        let landed = op("agents.land", &json!({"agent": id}))?;
+        match mode {
+            Mode::Bypass => written(&landed).map_err(fail)?,
+            Mode::Ask => {
+                let shown = approval_manifest(&landed).map_err(fail)?;
+                anyhow::ensure!(tree(&project.path())? == before, "{what}: showing a person the approval request wrote to the project's folder");
+                written(&op("agents.land", &json!({"agent": id, "manifest": shown}))?).map_err(fail)?;
+                eprintln!("PROVEN: {what}: its landing held for a person's approval of {shown}, then approved");
+            }
+        }
+        let after = tree(&project.path())?;
+        anyhow::ensure!(changes(&before, &after) == expected(&probe), "{what}: its landing changed {:?}, not its harness's changes", changes(&before, &after));
+        anyhow::ensure!(project.git_state()? == git_before, "{what}: its landing changed the project's git HEAD or index");
+        eprintln!("PROVEN: {what}: its folder holds exactly its changes, git's HEAD and index as they were");
+        // 4: its end.
+        pace.stop(f, &id)?;
+        mount_gone(&at).map_err(|e| fail(format!("{e:#}")))?;
+        let left = bound_from(docker, &mount)?;
+        anyhow::ensure!(left.is_empty(), "{what}: its containers outlived it: {left:?}");
+        eprintln!("PROVEN: {what}: ended, its container gone and its mount out of the host's table");
+        Ok(())
+    }
+
+    /// The module's 1 to 4: two agents in containers, each on its own volume; the one whose mode asks nothing lands at
+    /// the person's word at once, the one whose mode asks only once the person approves.
+    #[test]
+    fn a520_in_a_container_on_its_volume_an_agents_work_is_reviewed_and_landed_by_its_mode() -> anyhow::Result<()> {
+        let Some(docker) = docker() else {
+            anyhow::ensure!(std::env::var_os(REQUIRED).is_none(), "no container engine answers here ({REQUIRED}=1 requires one)");
+            eprintln!("SKIP: no container engine answers here");
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let dir = canonical(dir.path());
+        let instance = Instance::new(&dir);
+        let image = stub_image(&docker, &dir)?;
+        let Some(f) = fixture(&dir, &instance, &docker, &image)? else { return Ok(()) };
+        links_pinned(&f)?;
+        let mut looks = Looks::default();
+        for mode in Mode::ALL {
+            let project = Project::new(&dir.join(mode.word()))?;
+            drive_agent(&f, &dir, &instance, &docker, &project, mode)?;
+            looks.look(&instance, None)?;
+        }
+        looks.check().map_err(|e| anyhow::anyhow!("{e}\n{}", f.runner_log()))
+    }
+
+    /// W6's drift in a container, in either mode: a file the agent changed in its volume, then changed on disk by a
+    /// person, is drift (`agents.workspace`), and no landing the person asks or approves writes over the person's bytes.
+    #[test]
+    fn a520_in_a_container_a_file_changed_on_disk_after_the_agent_changed_it_is_drift_and_no_landing_writes_over_it() -> anyhow::Result<()> {
+        let Some(docker) = docker() else {
+            anyhow::ensure!(std::env::var_os(REQUIRED).is_none(), "no container engine answers here ({REQUIRED}=1 requires one)");
+            eprintln!("SKIP: no container engine answers here");
+            return Ok(());
+        };
+        let dir = tempfile::tempdir()?;
+        let dir = canonical(dir.path());
+        let instance = Instance::new(&dir);
+        let image = stub_image(&docker, &dir)?;
+        let Some(f) = fixture(&dir, &instance, &docker, &image)? else { return Ok(()) };
+        for mode in Mode::ALL {
+            let project = Project::new(&dir.join(mode.word()))?;
+            let spec = json!({"kind": "claude", "mode": mode.claude(), "cwd": project.dir, "prompt": format!("APPEND={} do the task", APPENDED.0), "workspace": {"kind": "volume"}});
+            let id = vm_e2e::open(&f, &spec)?;
+            let mut pace = vm_e2e::Pace::default().reporting(landing_reports(&instance.name));
+            let (_, events) = pace.until(&f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
+            let lines = vm_e2e::said(&events);
+            anyhow::ensure!(lines.iter().any(|l| *l == format!("APPENDED {}", APPENDED.0)), "{mode:?}: {lines:?}");
+            anyhow::ensure!(vm_e2e::where_said(&lines).is_some_and(|w| !cfg!(target_os = "macos") || w.kernel == "Linux"), "{mode:?}: not in a container: {lines:?}");
+            let persons = b"the person's\n".to_vec();
+            std::fs::write(project.path().join(APPENDED.0), &persons)?;
+            let ws = op(&f, "agents.workspace", &json!({"agent": id}))?;
+            anyhow::ensure!(drifted(&ws).iter().any(|d| d.contains(APPENDED.0)), "{mode:?}: its drift doesn't name {}: {ws}", APPENDED.0);
+            let shown = op(&f, "agents.land", &json!({"agent": id}))?;
+            let said = match outcome_of(&shown) {
+                Ok(Outcome::ApprovalRequired { manifest }) => op(&f, "agents.land", &json!({"agent": id, "manifest": manifest})).map_or_else(|e| format!("{e:#}"), |v| v.to_string()),
+                _ => shown.to_string(),
+            };
+            anyhow::ensure!(std::fs::read(project.path().join(APPENDED.0))? == persons, "{mode:?}: a landing wrote over the person's {}: {said}", APPENDED.0);
+            eprintln!("PROVEN: {mode:?} session {id} in a container: the person's change of {} is drift ({:?}), and its landing kept the person's bytes: {said}", APPENDED.0, drifted(&ws));
+            pace.stop(&f, &id)?;
+        }
+        Ok(())
+    }
+}
