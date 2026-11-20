@@ -862,8 +862,11 @@ part.
   certificate; Issuer) uniquely identifies the RPC client", RFC 9289 §5.2.1). kiln's CA issues it to the cluster's
   operator for each node's `tlshd` (`x509.truststore` kiln's CA, `x509.certificate` and `x509.private_key` the node's,
   its key `0600`, as Slates' `deploy/kind/tlshd.conf` has them), installed once per node by the operator, as
-  `user_allow_other` is: never a privilege kiln or Slates holds. Owed: that issue (an operator's call, recorded as every
-  certificate kiln issues is, W27-R01).
+  `user_allow_other` is: never a privilege kiln or Slates holds. Built 2026-11-20: `POST /api/kubernetes/node-certificates`
+  `{node, csr}` (who manages settings) answers the node's certificate and kiln's CA for `tlshd`, for a key made on the
+  node (`Pki::sign_kubernetes_node`: clientAuth alone, named for the node, never the server's name, its organization
+  `kiln kubernetes node`), recorded (W27-R01, kind `k8s-node`), audited, and its key refused on kiln's link, as a
+  runner's role would otherwise take it.
 - **Review, drift and landing at home.** The server asks the volume's home, not the pod's runner (a workspace names its
   home runner where the two differ): its change request is built from the volume's own changes (`workspace::review`, as
   W8's), its drift is Slates' drift of the overlay there (W3), and its landing is W6's: the agent's granted mode, set by

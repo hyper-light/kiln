@@ -708,6 +708,8 @@ pub static ROUTES: &[Rule] = &[
     r("GET", "/api/identities/revocations", "runners.read", At::Server),
     r("GET", "/api/identities", "runners.read", At::Server),
     r("POST", "/api/identities/revoke", "settings.manage", At::Server),
+    // A Kubernetes node's tlshd certificate (docs/agentic.md W10), issued to the cluster's operator.
+    r("POST", "/api/kubernetes/node-certificates", "settings.manage", At::Server),
     // Custody of what changes hands (W27-R08): a signed record taken from anyone signed in (its
     // signature says who it's from); chains, breaks and refusals read by those who read the audit.
     r("GET", "/api/trail/checkpoints", "audit.read", At::Server),
