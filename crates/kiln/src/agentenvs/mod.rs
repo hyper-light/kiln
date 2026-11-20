@@ -14,16 +14,22 @@
 //!   audited by name, into what the session's runner gets ([`crate::harness::agentenv::Resolved`]), and
 //!   opened again (its newest version, its secrets read again) whenever that session's harness starts:
 //!   started, restarted, resumed from kiln's copy, moved or taken over by another runner process.
-//! - **Which each session runs with** is kept by the session's id (`agentenv_sessions`), and here in
-//!   memory ([`Held`]) for the updates that ask, so one some session runs with can't be deleted.
+//! - **Which each session runs with** is a stack, top first, kept by the session's id (`agentenv_stacks`), and here
+//!   in memory ([`Held`]) for the updates that ask, so one some session's stack holds can't be deleted. It's opened as
+//!   one environment ([`resolve::open_stack`]): no runner learns of stacks.
+//! - **Scoped** ([`scope`]): each says where it's offered and applied on its own; one with `auto` on joins the stacks
+//!   of its owner's sessions its scope matches, as each starts ([`autos`]) and as its scope or `auto` changes
+//!   ([`rematch`]), under those given by name.
 //!
 //! The same operations serve the console (`/api/agentenvs`, `PUT /api/harness/sessions/:id/agentenv`),
 //! kiln's MCP server and code mode ([`ops`]).
 
 pub mod ops;
 pub mod resolve;
+pub mod scope;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use http::StatusCode;
 use rusqlite::{OptionalExtension as _, params};
@@ -32,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use crate::harness::agentenv::{Base, From as VarFrom, Var};
 use crate::hub::Hub;
 use crate::wire::events::{AgentenvChange, ServerEvent};
+use scope::{Chip, Facts};
 
 /// An environment, as kept and shown: its variables as its owner wrote them, never a secret's value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -50,11 +57,15 @@ pub struct Agentenv {
     pub vars: Vec<Var>,
     /// Its owner's own labels for it, in the order given: found by the Engine tab's filter.
     pub tags: Vec<String>,
+    /// Where it's offered and applied on its own ([`scope`]), in order: none, everywhere.
+    pub scope: Vec<Chip>,
+    /// It joins the stacks of its owner's sessions its scope matches on its own.
+    pub auto: bool,
     /// Up by one with each change.
     pub version: i64,
     pub created_at: i64,
     pub updated_at: i64,
-    /// The sessions that run with it, by id.
+    /// The sessions whose stacks hold it, by id.
     pub sessions: Vec<String>,
 }
 
@@ -66,8 +77,8 @@ pub struct Listing {
     pub agentenvs: Vec<Agentenv>,
 }
 
-/// The environment a session runs with, as its info says it (`AgentInfo::agentenv`): the version it
-/// started with.
+/// The environment a session runs with, as its info says it (`AgentInfo::agentenv`): its stack opened as one
+/// ([`resolve::open_stack`]), with the version it started with (a stack of more than one: 0).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentenvBrief"))]
@@ -84,15 +95,39 @@ impl Brief {
     }
 }
 
-/// What `agentenvs.apply` did: the session, the environment it runs with now (none: its machine's user's),
-/// and whether its harness was started again on it.
+/// One environment of a session's stack, as `agentenvs.apply` and `agentenvs.session` say it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvStackEntry"))]
+pub struct StackEntry {
+    pub id: String,
+    pub name: String,
+    /// Its version now: the one the session's harness takes as it next starts.
+    pub version: i64,
+    /// It joined on its own (its scope matched, `auto` on), and leaves on its own; else it was given by name.
+    pub auto: bool,
+}
+
+/// What `agentenvs.apply` did: the session, its stack now, top first (none: its machine's user's environment), and
+/// whether its harness was started again on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentenvApplied"))]
 pub struct Applied {
     pub agent: String,
-    pub agentenv: Option<Brief>,
+    pub stack: Vec<StackEntry>,
     pub restarted: bool,
+}
+
+/// A session as scopes see it (`agentenvs.session`): what it is, its stack, top first, and the ids of the caller's
+/// environments whose scope matches it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(rename = "AgentenvSession"))]
+pub struct SessionEnvs {
+    pub facts: Facts,
+    pub stack: Vec<StackEntry>,
+    pub matching: Vec<String>,
 }
 
 /// Why an environment's operation, or a start or a restart with one, is refused: each with the code the
@@ -107,8 +142,8 @@ pub enum Refusal {
     /// Changed since the version the change was made over: the version it's at now.
     #[error("it was changed since version {asked}, which this change was made over: it's version {now} now. Read it again and make your change over that")]
     Stale { asked: i64, now: i64 },
-    /// Sessions run with it: their ids.
-    #[error("sessions run with it: {}. Apply another environment to each (or none) first", .0.join(", "))]
+    /// Sessions whose stacks hold it: their ids.
+    #[error("sessions run with it: {}. Take it out of each one's environments first (or turn off its applying on its own)", .0.join(", "))]
     InUse(Vec<String>),
     /// Secrets it names that its owner holds none of: their names.
     #[error("it names {}, which isn't one of your secrets: set it at /api/me/secrets (secrets.mine.set), or take the variable out", .0.join(", "))]
@@ -201,6 +236,8 @@ pub struct Draft {
     pub base: Base,
     pub vars: Vec<Var>,
     pub tags: Vec<String>,
+    pub scope: Vec<Chip>,
+    pub auto: bool,
 }
 
 /// A change: what's given changes (`description: Some(None)` takes it out).
@@ -211,6 +248,8 @@ pub struct Patch {
     pub base: Option<Base>,
     pub vars: Option<Vec<Var>>,
     pub tags: Option<Vec<String>>,
+    pub scope: Option<Vec<Chip>>,
+    pub auto: Option<bool>,
 }
 
 /// `tags` as kept: each trimmed, the empty dropped, each once (the first of those that differ only in
@@ -308,15 +347,30 @@ struct Record {
     base: String,
     vars: String,
     tags: String,
+    scope: String,
+    auto: bool,
     version: i64,
     created_at: i64,
     updated_at: i64,
 }
 
-const COLUMNS: &str = "id, owner, name, description, base, vars, tags, version, created_at, updated_at";
+const COLUMNS: &str = "id, owner, name, description, base, vars, tags, scope, auto, version, created_at, updated_at";
 
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
-    Ok(Record { id: r.get(0)?, owner: r.get(1)?, name: r.get(2)?, description: r.get(3)?, base: r.get(4)?, vars: r.get(5)?, tags: r.get(6)?, version: r.get(7)?, created_at: r.get(8)?, updated_at: r.get(9)? })
+    Ok(Record {
+        id: r.get(0)?,
+        owner: r.get(1)?,
+        name: r.get(2)?,
+        description: r.get(3)?,
+        base: r.get(4)?,
+        vars: r.get(5)?,
+        tags: r.get(6)?,
+        scope: r.get(7)?,
+        auto: r.get(8)?,
+        version: r.get(9)?,
+        created_at: r.get(10)?,
+        updated_at: r.get(11)?,
+    })
 }
 
 impl Record {
@@ -325,7 +379,22 @@ impl Record {
         let base: Base = serde_json::from_value(serde_json::Value::String(self.base.clone())).map_err(|e| anyhow::anyhow!("environment {}'s base {:?} isn't one: {e}", self.id, self.base))?;
         let vars: Vec<Var> = serde_json::from_str(&self.vars).map_err(|e| anyhow::anyhow!("environment {}'s variables can't be read: {e}", self.id))?;
         let tags: Vec<String> = serde_json::from_str(&self.tags).map_err(|e| anyhow::anyhow!("environment {}'s tags can't be read: {e}", self.id))?;
-        Ok(Agentenv { id: self.id, owner: self.owner, name: self.name, description: self.description, base, vars, tags, version: self.version, created_at: self.created_at, updated_at: self.updated_at, sessions })
+        let scope: Vec<Chip> = serde_json::from_str(&self.scope).map_err(|e| anyhow::anyhow!("environment {}'s scope can't be read: {e}", self.id))?;
+        Ok(Agentenv {
+            id: self.id,
+            owner: self.owner,
+            name: self.name,
+            description: self.description,
+            base,
+            vars,
+            tags,
+            scope,
+            auto: self.auto,
+            version: self.version,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            sessions,
+        })
     }
 }
 
@@ -353,9 +422,9 @@ fn unknown(id: &str) -> Refusal {
     Refusal::Unknown(format!("you have no environment {id}"))
 }
 
-/// The sessions kiln runs that run with environment `id`, by id (a session it no longer runs isn't one).
+/// The sessions kiln runs whose stacks hold environment `id`, by id (a session it no longer runs isn't one).
 pub fn sessions_of(hub: &Hub, id: &str) -> Vec<String> {
-    let mut out: Vec<String> = hub.agentenvs.links.load().iter().filter(|(s, e)| *e == id && hub.harness.location(s).is_some()).map(|(s, _)| s.clone()).collect();
+    let mut out: Vec<String> = hub.agentenvs.links.load().iter().filter(|(s, st)| st.iter().any(|l| l.id == id) && hub.harness.location(s).is_some()).map(|(s, _)| s.clone()).collect();
     out.sort();
     out
 }
@@ -394,23 +463,36 @@ pub async fn get(hub: &Hub, person: &str, id: &str) -> R<Agentenv> {
     }
 }
 
-/// The environment session `session` runs with, whoever's: none, its machine's user's.
-pub async fn of_session(hub: &Hub, session: &str) -> R<Option<Agentenv>> {
-    match linked(hub, session) {
-        Some(id) => any(hub, &id).await,
-        None => Ok(None),
+/// The environments of session `session`'s stack, top first, whoever's, each with whether it joined on its own: none,
+/// its machine's user's. One deleted since is left out.
+pub async fn of_session(hub: &Hub, session: &str) -> R<Vec<(Agentenv, bool)>> {
+    let mut out = Vec::new();
+    for l in stack(hub, session) {
+        if let Some(e) = any(hub, &l.id).await? {
+            out.push((e, l.auto));
+        }
     }
+    Ok(out)
 }
 
-/// Environment `id`, whoever's: the one a session runs with, opened as its owner's.
+/// Environment `id`, whoever's: one a session runs with, opened as its owner's.
 async fn any(hub: &Hub, id: &str) -> R<Option<Agentenv>> {
     let i = id.to_owned();
     let found = hub.store.read(move |c| Ok(get_in(c, &i)?)).await?;
     Ok(found.map(|r| r.read(Vec::new())).transpose()?)
 }
 
-/// A new environment of `person`'s: version 1.
-pub async fn create(hub: &Hub, person: &str, draft: Draft) -> R<Agentenv> {
+/// `scope` as a person may keep it ([`scope::problem`], [`scope::kept`]).
+fn scope_of(scope: Vec<Chip>) -> R<Vec<Chip>> {
+    match scope::problem(&scope) {
+        Some(why) => Err(Refusal::BadVar(why)),
+        None => Ok(scope::kept(scope)),
+    }
+}
+
+/// A new environment of `person`'s: version 1. One applied on its own joins the stacks of their running sessions its
+/// scope matches ([`rematch`]).
+pub async fn create(hub: &Arc<Hub>, person: &str, draft: Draft) -> R<Agentenv> {
     let name = draft.name.trim().to_owned();
     if let Some(why) = name_problem(&name) {
         return Err(Refusal::BadVar(why));
@@ -418,7 +500,8 @@ pub async fn create(hub: &Hub, person: &str, draft: Draft) -> R<Agentenv> {
     checked(hub, person, &draft.vars).await?;
     let vars = serde_json::to_string(&draft.vars).map_err(anyhow::Error::from)?;
     let tags = serde_json::to_string(&tags_of(draft.tags).map_err(Refusal::BadVar)?).map_err(anyhow::Error::from)?;
-    let (id, owner, now) = (crate::util::new_id(), person.to_owned(), crate::util::now_unix());
+    let scope = serde_json::to_string(&scope_of(draft.scope)?).map_err(anyhow::Error::from)?;
+    let (id, owner, now, auto) = (crate::util::new_id(), person.to_owned(), crate::util::now_unix(), draft.auto);
     let (i, n, d, b) = (id.clone(), name.clone(), draft.description.clone(), base_text(draft.base));
     let made = hub
         .store
@@ -427,7 +510,10 @@ pub async fn create(hub: &Hub, person: &str, draft: Draft) -> R<Agentenv> {
             if named_in(&tx, &owner, &n, &i)? {
                 return Ok(None);
             }
-            tx.execute("INSERT INTO agentenvs (id, owner, name, description, base, vars, tags, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)", params![i, owner, n, d, b, vars, tags, now])?;
+            tx.execute(
+                "INSERT INTO agentenvs (id, owner, name, description, base, vars, tags, scope, auto, version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?10)",
+                params![i, owner, n, d, b, vars, tags, scope, auto, now],
+            )?;
             let r = get_in(&tx, &i)?;
             tx.commit()?;
             Ok(r)
@@ -435,11 +521,17 @@ pub async fn create(hub: &Hub, person: &str, draft: Draft) -> R<Agentenv> {
         .await?;
     let made = made.ok_or_else(|| taken(&name))?.read(Vec::new())?;
     told(hub, &made.owner, &made.id, false);
+    if made.auto {
+        let changed = rematch(hub, &made).await?;
+        resend(hub, changed, "an environment applied on its own made");
+    }
     Ok(made)
 }
 
-/// Environment `id` of `person`'s changed as `patch` says, over its version `version`: one version up.
-pub async fn update(hub: &Hub, person: &str, id: &str, version: i64, patch: Patch) -> R<Agentenv> {
+/// Environment `id` of `person`'s changed as `patch` says, over its version `version`: one version up. Where its scope,
+/// `auto` or variables changed, the stacks of its owner's running sessions it joins or leaves on its own follow
+/// ([`rematch`]).
+pub async fn update(hub: &Arc<Hub>, person: &str, id: &str, version: i64, patch: Patch) -> R<Agentenv> {
     let old = get(hub, person, id).await?;
     if old.version != version {
         return Err(Refusal::Stale { asked: version, now: old.version });
@@ -456,11 +548,18 @@ pub async fn update(hub: &Hub, person: &str, id: &str, version: i64, patch: Patc
         Some(t) => tags_of(t).map_err(Refusal::BadVar)?,
         None => old.tags.clone(),
     };
-    if name == old.name && description == old.description && base == old.base && vars == old.vars && tags == old.tags {
+    let scope = match patch.scope {
+        Some(s) => scope_of(s)?,
+        None => old.scope.clone(),
+    };
+    let auto = patch.auto.unwrap_or(old.auto);
+    if name == old.name && description == old.description && base == old.base && vars == old.vars && tags == old.tags && scope == old.scope && auto == old.auto {
         return Ok(old);
     }
+    let matched_by = (scope != old.scope, auto != old.auto, vars != old.vars);
     let json = serde_json::to_string(&vars).map_err(anyhow::Error::from)?;
     let tags = serde_json::to_string(&tags).map_err(anyhow::Error::from)?;
+    let scope = serde_json::to_string(&scope).map_err(anyhow::Error::from)?;
     let (i, n, now, b) = (id.to_owned(), name.clone(), crate::util::now_unix(), base_text(base));
     let written = hub
         .store
@@ -474,16 +573,26 @@ pub async fn update(hub: &Hub, person: &str, id: &str, version: i64, patch: Patc
             if named_in(&tx, &now_is.owner, &n, &i)? {
                 return Ok(Written::Taken);
             }
-            tx.execute("UPDATE agentenvs SET name = ?2, description = ?3, base = ?4, vars = ?5, tags = ?6, version = ?7, updated_at = ?8 WHERE id = ?1", params![i, n, description, b, json, tags, version.saturating_add(1), now])?;
+            tx.execute(
+                "UPDATE agentenvs SET name = ?2, description = ?3, base = ?4, vars = ?5, tags = ?6, scope = ?7, auto = ?8, version = ?9, updated_at = ?10 WHERE id = ?1",
+                params![i, n, description, b, json, tags, scope, auto, version.saturating_add(1), now],
+            )?;
             let r = get_in(&tx, &i)?;
             tx.commit()?;
-            Ok(r.map_or(Written::Missing, Written::Done))
+            Ok(r.map_or(Written::Missing, |r| Written::Done(Box::new(r))))
         })
         .await?;
     match written {
         Written::Done(r) => {
             let e = r.read(sessions_of(hub, id))?;
             told(hub, &e.owner, &e.id, false);
+            // Its scope or `auto` says which sessions it joins on its own; its variables, whether a microVM's may have it
+            // (one with a secret never joins one on its own).
+            if matched_by.0 || matched_by.1 || (matched_by.2 && (e.auto || !e.sessions.is_empty())) {
+                let changed = rematch(hub, &e).await?;
+                resend(hub, changed, "an environment applied on its own changed");
+                return Ok(Agentenv { sessions: sessions_of(hub, id), ..e });
+            }
             Ok(e)
         }
         Written::Missing => Err(unknown(id)),
@@ -494,13 +603,13 @@ pub async fn update(hub: &Hub, person: &str, id: &str, version: i64, patch: Patc
 
 /// What a change's write found.
 enum Written {
-    Done(Record),
+    Done(Box<Record>),
     Missing,
     Taken,
     Moved(i64),
 }
 
-/// Environment `id` of `person`'s, gone, unless a session runs with it: what it was.
+/// Environment `id` of `person`'s, gone, unless a session's stack holds it: what it was.
 pub async fn delete(hub: &Hub, person: &str, id: &str) -> R<Agentenv> {
     let was = get(hub, person, id).await?;
     if !was.sessions.is_empty() {
@@ -512,9 +621,9 @@ pub async fn delete(hub: &Hub, person: &str, id: &str) -> R<Agentenv> {
         .call(move |c| {
             let tx = crate::store::tx(c)?;
             let n = tx.execute("DELETE FROM agentenvs WHERE id = ?1", params![i])?;
-            // Sessions kiln no longer runs that ran with it: they name nothing now. (One applied to a session meanwhile
-            // finds it gone as its harness next starts, and runs with its machine's user's: `resolve::again`.)
-            tx.execute("DELETE FROM agentenv_sessions WHERE agentenv_id = ?1", params![i])?;
+            // Sessions kiln no longer runs whose stacks held it: they hold it no more. (One applied to a session meanwhile
+            // finds it gone as its harness next starts, and is taken out of its stack: `resolve::again`.)
+            tx.execute("DELETE FROM agentenv_stacks WHERE agentenv_id = ?1", params![i])?;
             tx.commit()?;
             Ok(n > 0)
         })
@@ -527,71 +636,215 @@ pub async fn delete(hub: &Hub, person: &str, id: &str) -> R<Agentenv> {
     Ok(was)
 }
 
-/// The environment session `session` runs with, by id: none, its machine's user's.
-pub fn linked(hub: &Hub, session: &str) -> Option<String> {
-    hub.agentenvs.links.load().get(session).cloned()
+/// One environment of a session's stack: by id, and whether it joined on its own ([`rematch`], [`autos`]) or was given
+/// by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub id: String,
+    pub auto: bool,
 }
 
-/// Session `session` runs with environment `agentenv` from now on (none: its machine's user's), by `by`;
-/// both environments' owners are told which sessions run with them now.
-pub async fn link(hub: &Hub, session: &str, agentenv: Option<&Agentenv>, by: &str) -> R<()> {
-    let was = linked(hub, session);
-    let (s, e, now, b) = (session.to_owned(), agentenv.map(|a| a.id.clone()), crate::util::now_unix(), by.to_owned());
+impl Link {
+    /// One given by name.
+    pub fn named(id: &str) -> Link {
+        Link { id: id.to_owned(), auto: false }
+    }
+}
+
+/// Session `session`'s stack, top first: none, its machine's user's environment.
+pub fn stack(hub: &Hub, session: &str) -> Vec<Link> {
+    hub.agentenvs.links.load().get(session).cloned().unwrap_or_default()
+}
+
+/// Whether session `session` runs with any environment.
+pub fn stacked(hub: &Hub, session: &str) -> bool {
+    hub.agentenvs.links.load().get(session).is_some_and(|s| !s.is_empty())
+}
+
+/// A stack's id as its runner holds it ([`resolve::open_stack`]): its ids, top first, joined by `+`.
+pub fn stack_id<'a>(ids: impl IntoIterator<Item = &'a str>) -> String {
+    ids.into_iter().collect::<Vec<_>>().join("+")
+}
+
+/// `links` as `agentenvs.apply` and `agentenvs.session` say them, each at its version now: one deleted since left out.
+pub async fn entries(hub: &Hub, links: &[Link]) -> R<Vec<StackEntry>> {
+    let mut out = Vec::with_capacity(links.len());
+    for l in links {
+        if let Some(e) = any(hub, &l.id).await? {
+            out.push(StackEntry { id: e.id, name: e.name, version: e.version, auto: l.auto });
+        }
+    }
+    Ok(out)
+}
+
+/// Session `session` runs with stack `links` from now on, top first (none: its machine's user's), by `by`; the owners
+/// of the environments it held and holds are told which sessions run with them now.
+pub async fn set_stack(hub: &Hub, session: &str, links: &[Link], by: &str) -> R<()> {
+    let was = stack(hub, session);
+    let (s, rows, now, b) = (session.to_owned(), links.iter().map(|l| (l.id.clone(), l.auto)).collect::<Vec<_>>(), crate::util::now_unix(), by.to_owned());
     hub.store
         .call(move |c| {
-            match &e {
-                Some(id) => c.execute(
-                    "INSERT INTO agentenv_sessions (session, agentenv_id, applied_at, applied_by) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(session) DO UPDATE SET agentenv_id = ?2, applied_at = ?3, applied_by = ?4",
-                    params![s, id, now, b],
-                )?,
-                None => c.execute("DELETE FROM agentenv_sessions WHERE session = ?1", params![s])?,
-            };
+            let tx = crate::store::tx(c)?;
+            tx.execute("DELETE FROM agentenv_stacks WHERE session = ?1", params![s])?;
+            for (position, (id, auto)) in rows.iter().enumerate() {
+                let position = i64::try_from(position).unwrap_or(i64::MAX);
+                tx.execute("INSERT INTO agentenv_stacks (session, position, agentenv_id, auto, applied_at, applied_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![s, position, id, auto, now, b])?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await?;
     hub.agentenvs.links.update(|l| {
-        match agentenv {
-            Some(a) => l.insert(session.to_owned(), a.id.clone()),
-            None => l.remove(session),
-        };
+        if links.is_empty() {
+            l.remove(session);
+        } else {
+            l.insert(session.to_owned(), links.to_vec());
+        }
     });
-    if let Some(a) = agentenv {
-        told(hub, &a.owner, &a.id, false);
-    }
-    if let Some(old) = was.filter(|w| agentenv.is_none_or(|a| a.id != *w))
-        && let Ok(Some(o)) = any(hub, &old).await
-    {
-        told(hub, &o.owner, &o.id, false);
+    let mut ids: Vec<&str> = links.iter().chain(&was).map(|l| l.id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    for id in ids {
+        if let Ok(Some(e)) = any(hub, id).await {
+            told(hub, &e.owner, &e.id, false);
+        }
     }
     Ok(())
 }
 
-/// What the server holds in memory of environments: which each session runs with (as `agentenv_sessions`
-/// keeps it), and the runner process each was last given to ([`resolve::opened`]).
+/// How environments applied on their own lie in a stack, top first: one with more chips over one with fewer (more
+/// specific first), then by name.
+fn auto_order(a: &Agentenv, b: &Agentenv) -> std::cmp::Ordering {
+    b.scope.len().cmp(&a.scope.len()).then_with(|| a.name.cmp(&b.name)).then_with(|| a.id.cmp(&b.id))
+}
+
+/// Whether `env` joins on its own a session that is `facts`, in a microVM or not: `auto` on, its scope matching, and,
+/// in a microVM, no `secret` variable (skipped there, never refusing the start).
+fn joins(env: &Agentenv, facts: &Facts, microvm: bool) -> bool {
+    env.auto && scope::matches(&env.scope, facts) && !(microvm && !secret_vars(&env.vars).is_empty())
+}
+
+/// `person`'s environments that join on their own a session that is `facts` as it starts (in a microVM or not), but
+/// for those of `given` (its stack given by name), in their order ([`auto_order`]).
+pub async fn autos(hub: &Hub, person: &str, facts: &Facts, microvm: bool, given: &[String]) -> R<Vec<Agentenv>> {
+    let mut out: Vec<Agentenv> = list(hub, person).await?.into_iter().filter(|e| !given.contains(&e.id) && joins(e, facts, microvm)).collect();
+    out.sort_by(auto_order);
+    Ok(out)
+}
+
+/// What `env`, just made or changed, does to the stacks of the sessions kiln holds of its owner's on its own: it joins each it now
+/// matches that doesn't hold it (under those given by name, among those that joined on their own as [`auto_order`]
+/// puts them), and leaves each it joined on its own that it no longer matches; a stack it's in by name stays as it is.
+/// A session whose runner runs no environment isn't joined. Kept at once; the running sessions whose stacks changed, each
+/// with whether it's in a microVM, are what's to be sent their stacks ([`resend`]), which their harnesses take as they
+/// next start (one that ended opens its stack as it's started again).
+pub async fn rematch(hub: &Hub, env: &Agentenv) -> R<Vec<(String, bool)>> {
+    let mut changed = Vec::new();
+    for info in hub.harness.list() {
+        let mut links = stack(hub, &info.id);
+        let at = links.iter().position(|l| l.id == env.id);
+        let microvm = info.isolation.is_some();
+        match at.and_then(|i| links.get(i)) {
+            // By name: the person's to take out.
+            Some(l) if !l.auto => continue,
+            None if !env.auto => continue,
+            _ => {}
+        }
+        let wants = env.auto && {
+            let target = if info.target.is_empty() { "local" } else { info.target.as_str() };
+            let speaks = target.strip_prefix("agent:").is_none_or(|m| resolve::speaks(hub, m));
+            speaks && crate::mcp::whose(hub, &info.id).await.as_deref() == Some(env.owner.as_str()) && joins(env, &scope::of_session(hub, &info).await?, microvm)
+        };
+        match (at, wants) {
+            (Some(i), false) => {
+                links.remove(i);
+            }
+            (None, true) => {
+                // Under the last given by name, then past those that joined on their own and go over it.
+                let mut i = links.iter().rposition(|l| !l.auto).map_or(0, |p| p.saturating_add(1));
+                while let Some(l) = links.get(i) {
+                    let over = match any(hub, &l.id).await? {
+                        Some(other) => auto_order(&other, env) == std::cmp::Ordering::Less,
+                        None => true,
+                    };
+                    if !over {
+                        break;
+                    }
+                    i = i.saturating_add(1);
+                }
+                links.insert(i.min(links.len()), Link { id: env.id.clone(), auto: true });
+            }
+            _ => continue,
+        }
+        set_stack(hub, &info.id, &links, &format!("kiln (applied on its own: {})", env.name)).await?;
+        // One that ended takes it as it's started again (`resolve::again`): nothing to send it now.
+        if info.status != crate::harness::model::Status::Exited {
+            changed.push((info.id.clone(), microvm));
+        }
+    }
+    Ok(changed)
+}
+
+/// Each of `sessions` (each with whether it's in a microVM) given its stack opened again, its harness taking it as it
+/// next starts (`restart` false), `why` saying what changed it; in the background, each failure logged (a runner that
+/// was away is given it as it announces the session again: [`resolve::opened`]).
+pub fn resend(hub: &Arc<Hub>, sessions: Vec<(String, bool)>, why: &'static str) {
+    if sessions.is_empty() {
+        return;
+    }
+    let hub = Arc::clone(hub);
+    drop(crate::rt::spawn(async move {
+        for (session, microvm) in sessions {
+            let opened = match resolve::again(&hub, &session, microvm, why).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(target: "kiln.agentenvs", %session, error = %e, "a session's environments couldn't be opened after one applied on its own changed");
+                    continue;
+                }
+            };
+            let sent = hub.harness.send_agentenv(&hub, &session, opened, false).await;
+            if let Some((_, why)) = sent.failure() {
+                tracing::warn!(target: "kiln.agentenvs", %session, %why, "a session's environments couldn't be given to it after one applied on its own changed");
+            }
+        }
+    }));
+}
+
+/// What the server holds in memory of environments: each session's stack (as `agentenv_stacks` keeps it), and the
+/// runner process each was last given to ([`resolve::opened`]).
 #[derive(Default)]
 pub struct Held {
-    links: crate::rcu::Rcu<HashMap<String, String>>,
+    links: crate::rcu::Rcu<HashMap<String, Vec<Link>>>,
     /// By session: the runner process it was last sent its environment in (`machine/instance/pid/build`).
     given: parking_lot::Mutex<HashMap<String, String>>,
 }
 
 impl Held {
-    /// What `agentenv_sessions` keeps, read as the server starts.
+    /// What `agentenv_stacks` keeps, read as the server starts.
     pub async fn load(&self, store: &crate::store::Store) -> anyhow::Result<()> {
-        let rows: Vec<(String, String)> = store
+        let rows: Vec<(String, String, bool)> = store
             .read(|c| {
-                let mut st = c.prepare("SELECT session, agentenv_id FROM agentenv_sessions")?;
-                let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+                let mut st = c.prepare("SELECT session, agentenv_id, auto FROM agentenv_stacks ORDER BY session, position")?;
+                let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             })
             .await?;
-        self.links.set(rows.into_iter().collect());
+        let mut links: HashMap<String, Vec<Link>> = HashMap::new();
+        for (session, id, auto) in rows {
+            links.entry(session).or_default().push(Link { id, auto });
+        }
+        self.links.set(links);
         Ok(())
     }
 
-    /// Environment `id` is gone: no session names it.
+    /// Environment `id` is gone: no stack holds it.
     fn forget(&self, id: &str) {
-        self.links.update(|l| l.retain(|_, e| e != id));
+        self.links.update(|l| {
+            for st in l.values_mut() {
+                st.retain(|e| e.id != id);
+            }
+            l.retain(|_, st| !st.is_empty());
+        });
     }
 
     /// Session `session` was given its environment in runner process `process`.
