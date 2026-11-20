@@ -284,13 +284,14 @@ jobs:
         run: |
           python --version || py -3 --version
       # Each check builds and runs in one cargo call (see the priority checks: the build script runs
-      # again at every call in a fetched checkout).
+      # again at every call in a fetched checkout). The microVM drive is whp-drive.yml's: this
+      # runner has WHP, so it would boot guests here too.
       - id: e2e
         name: The bare-metal drive and drift on WinFsp drives (slates_e2e)
         timeout-minutes: 90
         env:
           SLATES_E2E: "1"
-        run: cargo test -p kiln --locked --test slates_e2e -- --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/e2e.txt"
+        run: cargo test -p kiln --locked --test slates_e2e -- --skip microvm:: --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/e2e.txt"
       - id: workspace
         name: The workspace's tests over Slates (kiln's library)
         if: ${{ !cancelled() }}
