@@ -1031,7 +1031,7 @@ pub(crate) struct Host {
     pub(crate) said: Output,
 }
 
-/// `served`'s streams sent on a run host's links socket `links` (D286): `SERVED_SHARES` messages
+/// `served`'s streams sent on a run host's links socket `links` (D287): `SERVED_SHARES` messages
 /// of `shards_ipc::MAX_FDS` descriptors at most and no payload, in order, as its host takes them
 /// before its request.
 #[cfg(unix)]
@@ -1272,7 +1272,7 @@ impl Begun {
     /// Sends the host the run `request` (`CREATE`), its leases' `lessor` (D242) and the
     /// references its grants name set first, and its members whose stdin it asks for named,
     /// for their flows to be made with its start (`take`): none of them can be asked of or
-    /// answered sooner than the request. Its shares another server serves (D286) go first,
+    /// answered sooner than the request. Its shares another server serves (D287) go first,
     /// `served`'s streams in the request's order ([`Begun::hand_served`]).
     pub(super) fn create(
         &self,
@@ -1298,7 +1298,7 @@ impl Begun {
         self.send(wire::to_host::CREATE, request)
     }
 
-    /// `served`, the streams of the run's shares another server serves (D286), handed to its
+    /// `served`, the streams of the run's shares another server serves (D287), handed to its
     /// host before its request, one for each of `request`'s, in its order: on Unix on the host's
     /// links socket (`SERVED_SHARES`, `shards_ipc::MAX_FDS` a message), whose copies its host
     /// holds once sent, this process keeping its own until the run has started (M24: XNU flushes
@@ -3578,15 +3578,15 @@ mod tests {
         let path = dir.join("diagnostics");
         let before = b"shards api-run: before its file\n".to_vec();
         let after: Vec<u8> = (0..said_kept() * 2).map(|i| b'a' + (i % 26) as u8).collect();
+        shards_testwait::party::of_test();
         std::thread::scope(|s| {
-            let keeping = s.spawn(|| keep_said(&shared, said));
+            let keeping = shards_testwait::party::spawn_in(s, || keep_said(&shared, said));
             host.write_all(&before).unwrap();
-            // What the host wrote is kept before its file is named.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while lock(&shared.state).said.len() < before.len() {
-                assert!(Instant::now() < deadline, "its first words were never kept");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            // What the host wrote is kept before its file is named: waited for as long as its
+            // keeping thread runs (D215's judged wait; before, 10 s, R03).
+            shards_testwait::until("its first words were never kept", || {
+                lock(&shared.state).said.len() >= before.len()
+            });
             shared
                 .keep_diagnostics(std::fs::File::create(&path).unwrap(), u64::MAX)
                 .unwrap();
@@ -4014,16 +4014,20 @@ mod tests {
             },
         );
         let (reader, mut held_writer) = input_pipe(&shared, 1, 0).unwrap();
+        // Its waits judged by its test's party (D215, shards-testwait): this thread and its
+        // feeder, a feeder that never reads, or is never let go, given up on as they stay
+        // still. Before, 1 s each (R03).
+        shards_testwait::party::of_test();
         let (entered, entering) = std::sync::mpsc::channel();
         let (done, finished) = std::sync::mpsc::channel();
         let feeding = {
             let shared = shared.clone();
-            std::thread::spawn(move || {
+            shards_testwait::party::spawn_member(move || {
                 feed(&shared, 1, 0, Entered { reader, entered });
                 done.send(()).unwrap();
             })
         };
-        entering.recv_timeout(Duration::from_secs(1)).unwrap();
+        shards_testwait::received(&entering).expect("its feeder never read");
         let end = wire::InputEnded {
             member: 1,
             generation: 0,
@@ -4032,7 +4036,7 @@ mod tests {
         }
         .encode();
         take(&shared, wire::to_client::INPUT_ENDED, &end).unwrap();
-        let released = finished.recv_timeout(Duration::from_secs(1));
+        let released = shards_testwait::received(&finished);
         // Observe the thread's actual exit before checking that all its descriptors
         // have closed. A broken old feeder is released first so the red test also joins.
         if released.is_err() {
@@ -5206,8 +5210,9 @@ mod tests {
         assert!(lock(&s.state).rates.is_empty());
     }
 
-    /// How long a test waits for what should come at once: only a failing test waits it
-    /// out, as crates/shards/tests/api_image.rs's `TIMEOUT` bounds its waits.
+    /// The patience a test gives the session's own waits (`Shared::wait`, the API's input),
+    /// which a correct run answers at once: only a failing one waits it out (R03, ruled in
+    /// D215's amendment). The tests' own waits are judged (shards-testwait).
     const BOUND: Duration = Duration::from_secs(120);
 
     /// A wait with no clock for the readiness past `seen`, on a thread of its own, its
@@ -5218,7 +5223,12 @@ mod tests {
     ) -> std::sync::mpsc::Receiver<Result<Option<Ready>, ImageRefusal>> {
         let (tx, rx) = std::sync::mpsc::channel();
         let s = Arc::clone(s);
-        std::thread::spawn(move || {
+        // Of its test's party from its making (shards-testwait's `spawn_member`): its test's
+        // judged wait on its answer holds while its host has yet to run it. Made by std alone, it
+        // was of no party, and its test's wait on this process's threads, which reads none of
+        // their states, was refused at its first look while it waited for a CPU (ROOT,
+        // 2026-11-18, #36: 1 of 10 under load).
+        shards_testwait::party::spawn_member(move || {
             let _ = tx.send(s.wait(Duration::MAX, |st| ready_past(st, true, seen)).transpose());
         });
         rx
@@ -5232,6 +5242,9 @@ mod tests {
     /// one.
     #[test]
     fn readiness_is_told_as_it_moves() {
+        // Its waits judged by its test's party (D215, shards-testwait): this thread and its
+        // waiters.
+        shards_testwait::party::of_test();
         let s = Arc::new(shared());
         let wait = |seen, timeout| s.wait(timeout, |st| ready_past(st, true, seen)).transpose();
         assert_eq!(wait(None, Duration::ZERO), Ok(None));
@@ -5240,7 +5253,10 @@ mod tests {
             take(&s, wire::to_client::READY, &Ready::Passed(3).encode()),
             Ok(false)
         );
-        assert_eq!(first.recv_timeout(BOUND).unwrap(), Ok(Some(Ready::Passed(3))));
+        assert_eq!(
+            shards_testwait::received(&first).unwrap(),
+            Ok(Some(Ready::Passed(3)))
+        );
         assert_eq!(wait(None, Duration::ZERO), Ok(Some(Ready::Passed(3))));
         assert_eq!(wait(Some(Ready::Passed(3)), Duration::ZERO), Ok(None));
         let next = waiter(&s, Some(Ready::Passed(3)));
@@ -5248,7 +5264,10 @@ mod tests {
             take(&s, wire::to_client::READY, &Ready::Late(9).encode()),
             Ok(false)
         );
-        assert_eq!(next.recv_timeout(BOUND).unwrap(), Ok(Some(Ready::Late(9))));
+        assert_eq!(
+            shards_testwait::received(&next).unwrap(),
+            Ok(Some(Ready::Late(9)))
+        );
         for malformed in [&[1, 0, 0, 0, 0, 0, 0, 0, 1][..], &[], &[2; 10]] {
             assert!(
                 take(&s, wire::to_client::READY, malformed).is_err(),
@@ -5305,18 +5324,11 @@ mod tests {
     }
 
     impl Orchestrator {
-        /// Whether `done` comes to hold of its ledger within [`BOUND`].
+        /// Whether `done` comes to hold of its ledger: waited for as long as this process's
+        /// threads run (D215's judged wait, shards-testwait; its lessor is called on the
+        /// session's own threads, of no test's party). Before, within [`BOUND`] (R03).
         fn until(&self, done: impl Fn(&Ledger) -> bool) -> bool {
-            let deadline = Instant::now() + BOUND;
-            let mut l = lock(&self.ledger);
-            while !done(&l) {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return false;
-                }
-                l = self.changed.wait_timeout(l, left).unwrap().0;
-            }
-            true
+            shards_testwait::waited(|| done(&lock(&self.ledger))).is_ok()
         }
     }
 
@@ -5420,16 +5432,13 @@ mod tests {
         says(host, wire::to_client::OUTPUT, &payload);
     }
 
-    /// Waits for the session's reader to take the run's end, which closes the host's stdin.
+    /// Waits for the session's reader to take the run's end, which closes the host's stdin:
+    /// for as long as this process's threads run (D215's judged wait, shards-testwait; the
+    /// reader is the session's own thread, of no test's party). Before, 10 s (R03).
     fn until_its_channel_closes(shared: &Shared) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while lock(&shared.to_host).is_some() {
-            assert!(
-                Instant::now() < deadline,
-                "the run's end never closed its host's channel"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        shards_testwait::until("the run's end never closed its host's channel", || {
+            lock(&shared.to_host).is_none()
+        });
     }
 
     /// A member's output the session took before the run's end reaches its owner whole
@@ -6264,7 +6273,7 @@ mod tests {
         assert_eq!(layer_files(&home), [others], "its run host's layer outlived it");
     }
 
-    /// D286: a run's served shares' streams go on its host's links socket in their order,
+    /// D287: a run's served shares' streams go on its host's links socket in their order,
     /// `shards_ipc::MAX_FDS` a message at most and no payload, as its host takes them before
     /// its request. Do: send one more than a message carries. Expect: two `SERVED_SHARES`
     /// messages, the first full, each descriptor the very socket sent in its place (a byte

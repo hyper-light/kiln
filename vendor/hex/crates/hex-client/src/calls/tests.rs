@@ -1155,14 +1155,17 @@ mod release_frame {
 
 /// AC-T7.4.1: the plain kinds' waits keep their order, the scheduler's and a physical report's after a hello, a list
 /// and the network namespaces' counts; a call naming a box or a class is no plain kind's, its box kind's wait its
-/// class's ([`BoxKind`]), a member's hand-over (joint plan step 17) appended last among them. Do: map each plain kind
-/// and each box kind's request. Expect: each plain kind at its place in a table of 21, the person's release of a
-/// capacity holder appended, then the node's links, then a connection's lessors (docs/design/credential-grants.md C7),
-/// then the capacity view keeper's word last (the review's A-10); each box kind's none there, and its own kind and class.
+/// class's ([`BoxKind`]), a member's hand-over (joint plan step 17) appended among them, an image box's pause and
+/// resume (kiln plan P5.5b) after it, its components' swap, restore and read (Shards' D270 slice 4) after those, and its
+/// change as it runs (kiln plan P6b.3) last. Do: map
+/// each plain kind and each box kind's request. Expect: each plain kind at its place in a table of 21, the person's
+/// release of a capacity holder appended, then the node's links, then a connection's lessors
+/// (docs/design/credential-grants.md C7), then the capacity view keeper's word last (the review's A-10); each box kind's
+/// none there, and its own kind and class, in a table of 20.
 #[test]
 fn plain_kinds_keep_their_order_and_box_kinds_are_their_classs() {
     let waits = <Memory as Transport>::answers();
-    assert_eq!((KINDS, BOX_KINDS, CLASSES), (21, 14, 5));
+    assert_eq!((KINDS, BOX_KINDS, CLASSES), (21, 20, 5));
     for (request, index) in [
         (
             Request::Hello {
@@ -1265,6 +1268,31 @@ fn plain_kinds_keep_their_order_and_box_kinds_are_their_classs() {
             }),
             BoxKind::Mcp,
         ),
+        // Kiln plan P5.5b: an image box's pause and resume, each its own kind, timed by the box's class.
+        (Request::Call(Call::Pause(b.clone())), BoxKind::Pause),
+        (Request::Call(Call::Resume(b.clone())), BoxKind::Resume),
+        // Shards' D270 slice 4: an image box's swap, restore and components, each its own kind.
+        (
+            Request::Call(Call::Swap {
+                id: b.clone(),
+                at: "/harness/claude".to_owned(),
+                digest: hex_api::sim::SIM_COMPONENT.to_owned(),
+                when: hex_api::SwapWhen::Now,
+            }),
+            BoxKind::Swap,
+        ),
+        (
+            Request::Call(Call::Restore {
+                id: b.clone(),
+                at: "/harness/claude".to_owned(),
+                when: hex_api::SwapWhen::NextStart,
+            }),
+            BoxKind::Restore,
+        ),
+        (
+            Request::Call(Call::Components(b.clone())),
+            BoxKind::Components,
+        ),
     ] {
         assert!(kind_of(waits, &request).is_none(), "{request:?}");
         assert_eq!(box_kind_of(&request).map(|(kind, _)| kind), Some(kind));
@@ -1346,6 +1374,12 @@ fn every_kind_and_class_has_its_own_census_name() {
             "member",
             "started",
             "mcp",
+            "pause",
+            "resume",
+            "swap",
+            "restore",
+            "components",
+            "change",
         ];
         for wait in T::answers() {
             assert!(seen.insert(wait.name()), "{} twice", wait.name());

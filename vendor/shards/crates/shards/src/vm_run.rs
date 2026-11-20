@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use shards_vmm::vm::{
-    self, AfterSnapshot, Config, Console, Disk, ExitReason, Handle, RestoreConfig, Running, SnapshotPolicy,
-    VsockHost,
+    self, AfterSnapshot, Config, Console, Disk, ExitReason, Handle, RECORD_FOR, RestoreConfig, Running,
+    SnapshotPolicy, VsockHost,
 };
 
 use crate::spec::Options;
@@ -94,7 +94,7 @@ const RUN_USAGE: &str = "usage: shards run vm --kernel PATH [--initrd PATH | --i
 
 const RESTORE_USAGE: &str = "usage: shards restore vm DIR [--hold] [--vsock PATH] [--no-console [--console-said N]] [--gpu] [--backing PATH[:ro]]... [--layer PATH [--layer-cloned GENERATION]] [--snapshot-dir DIR [--snapshot-then stop|resume]]
        shards restore vm DIR [--hold] [--backing PATH[:ro]]... [--layer PATH [--layer-cloned GENERATION]] [WORKLOAD OPTIONS] -- COMMAND [ARG...]
-       shards restore vm DIR [--working-set FD] ...
+       shards restore vm DIR [--working-set FD [--record-until FD]] ...
        shards restore vm DIR --warm FD [--backing PATH[:ro]]... [--layer PATH [--layer-cloned GENERATION]]
        shards restore vm DIR --resume FD [--backing PATH[:ro]]... [--layer PATH [--layer-cloned GENERATION]]
        shards restore vm MICROVM [SNAPSHOT]
@@ -114,6 +114,10 @@ const RESTORE_USAGE: &str = "usage: shards restore vm DIR [--hold] [--vsock PATH
                  a newline, to descriptor FD, for its spawner to keep beside the
                  generation: no VM writes its snapshot (D30). A restore of a generation
                  that has one maps it ahead.
+  --record-until: with --working-set and no COMMAND: end the recording, and write the
+                  working set, as soon as a byte or the end arrives on descriptor FD, as a
+                  run's ends when its command answers; without a word, a while after the
+                  start, as before.
   --warm: resume at once and connect, then take one command, with the stdio and connection
           of the client it is for, from the daemon on the Unix socket at descriptor FD.
   --resume: DIR is a run's snapshot, its command running already: take its run's stdio,
@@ -298,6 +302,15 @@ impl Common {
                     return Err(format!("--cwd: {} is not an absolute path", dir.display()));
                 }
                 CWD.set(dir).map_err(|_| "--cwd given twice".to_string())?;
+            }
+            "--durable" => {
+                let home = PathBuf::from(value("--durable")?);
+                if !home.is_absolute() {
+                    return Err(format!("--durable: {} is not an absolute path", home.display()));
+                }
+                DURABLE
+                    .set(home)
+                    .map_err(|_| "--durable given twice".to_string())?;
             }
             "--grants" => grants(&text(value("--grants")?)?)?,
             "-e" | "--env" => w.env.push(text(value("--env")?)?),
@@ -789,6 +802,10 @@ struct Restore {
     /// pipe by): where the working set this restore records goes, for its spawner to keep
     /// (D30).
     working_set_to: Option<LinkArg>,
+    /// `--record-until FD` (Windows: `--record-until NAME`): where its spawner says when a
+    /// restore whose guest runs no command has run what it is for, which ends its
+    /// recording as a run's command's answer ends a run's (D25).
+    record_until: Option<LinkArg>,
     /// `--resume FD`, in place of `--warm FD`: the snapshot is a run's, whose command goes
     /// on (D176).
     resume: bool,
@@ -806,6 +823,7 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
     let mut layer = None;
     let mut layer_cloned = None;
     let mut working_set_to = None;
+    let mut record_until = None;
     let (mut gpu_report, mut gpu_scope) = (None, None);
     // Each word with the value `spec::next_vm_word` gives it, a value only for a flag
     // `spec::RUN_VALUED` or `spec::RESTORE_VALUED` lists, as the command line is read ahead
@@ -839,6 +857,9 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
             "--layer-cloned" => layer_cloned = Some(text(value("--layer-cloned")?)?),
             "--working-set" => {
                 working_set_to = Some(link_arg("--working-set", text(value("--working-set")?)?)?)
+            }
+            "--record-until" => {
+                record_until = Some(link_arg("--record-until", text(value("--record-until")?)?)?)
             }
             "--warm" => warm = Some(link_arg("--warm", text(value("--warm")?)?)?),
             // Its renderer's report as it rejoins its snapshot's selection (D233).
@@ -882,6 +903,13 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
     }
     if warm.is_some() && working_set_to.is_some() {
         return Err("--warm hands its working set to the daemon: no --working-set".into());
+    }
+    if record_until.is_some()
+        && (working_set_to.is_none() || warm.is_some() || !common.workload.argv.is_empty())
+    {
+        return Err(
+            "--record-until ends the recording of a restore whose guest runs no command: it needs --working-set, and no --warm, --resume or command".into(),
+        );
     }
     // A warm restore's report (D233), as a warm boot's: its run host's, which names the scope
     // before it launches it; the snapshot's selection is checked as it restores.
@@ -932,6 +960,7 @@ fn parse_restore(args: impl Iterator<Item = OsString>) -> Result<Restore, String
         workload: common.workload,
         warm,
         working_set_to,
+        record_until,
         resume,
         said_to: common.said_to.take(),
         gpu_report,
@@ -1653,20 +1682,267 @@ fn arm_input(_args: &[OsString]) -> std::io::Result<InputOwner> {
     Ok(InputOwner::Console)
 }
 
+/// Console input as the thread that forwards it would find it, decided before that thread
+/// starts, without waiting for it ([`pending`]), on every host.
+#[derive(Debug, PartialEq, Eq)]
+enum Pending {
+    /// Ended: no more will come. A first read took nothing, or there is no input at all.
+    Ended,
+    /// Nothing to read yet: the thread waits for it.
+    Waiting,
+    /// What a first read took, which the thread forwards first.
+    Read(usize),
+}
+
+/// What `from` holds before a thread waits on it: where a read would not wait (POSIX's
+/// "ready for reading", [`ready`]), a first read ([`first_read`]) takes it. Input that has
+/// already ended so starts no thread: a bare restore's stdin of /dev/null, as the Firecracker
+/// comparison's restores have, made one that ended at once, its stack unmapped under the page
+/// table of its top, which the stack above it kept (mm/memory.c `free_pgd_range`): a page-table
+/// page mapping nothing in every such VM. Input that is not open has ended; any other refusal
+/// is said by the caller, which starts no thread.
+#[cfg(unix)]
+fn pending(from: &mut (impl Read + std::os::fd::AsRawFd), buf: &mut [u8]) -> std::io::Result<Pending> {
+    match ready(from.as_raw_fd()) {
+        Ok(false) => Ok(Pending::Waiting),
+        Ok(true) => first_read(from, buf),
+        Err(e) if e.raw_os_error() == Some(libc::EBADF) => Ok(Pending::Ended),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a read of `fd` would not wait, asked without waiting: poll(2), which Linux answers
+/// for every file (a file without a poll method reads without waiting: fs/select.c
+/// `DEFAULT_POLLMASK`), its POLLNVAL saying that `fd` is not open.
+#[cfg(target_os = "linux")]
+fn ready(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+    let mut event = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: poll(2) of one pollfd of ours, waiting for nothing.
+        if unsafe { libc::poll(&raw mut event, 1, 0) } >= 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+    if (event.revents & libc::POLLNVAL) != 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+    }
+    Ok(event.revents != 0)
+}
+
+/// Whether a read of `fd` would not wait, asked without waiting: select(2), which asks a
+/// device's own select routine, where macOS's poll(2) supports no device (poll(2), BUGS: it
+/// answers POLLNVAL for /dev/null and /dev/zero, macOS 26.4, which select(2) answers readable,
+/// and a pipe and a pseudo-terminal alike either way).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ready(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+    match usize::try_from(fd) {
+        Err(_) => return Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+        Ok(fd) if fd >= libc::FD_SETSIZE => {
+            return Err(std::io::Error::other(format!(
+                "descriptor {fd} lies past what select(2) takes"
+            )));
+        }
+        Ok(_) => {}
+    }
+    loop {
+        // SAFETY: an fd_set is plain data, all zeros when empty (FD_ZERO's own).
+        let mut set: libc::fd_set = unsafe { std::mem::zeroed() };
+        let mut now = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        // SAFETY: `fd` lies below FD_SETSIZE (above); `set` and `now` are ours, the one
+        // descriptor's set and a wait of nothing.
+        let answered = unsafe {
+            libc::FD_SET(fd, &raw mut set);
+            libc::select(
+                fd + 1,
+                &raw mut set,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut now,
+            )
+        };
+        if answered >= 0 {
+            // SAFETY: `set` as select(2) left it, `fd` below FD_SETSIZE.
+            return Ok(answered > 0 && unsafe { libc::FD_ISSET(fd, &raw const set) });
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// [`pending`] on Windows, decided by the kind of input its handle is (GetFileType): a pipe by
+/// what waits in it (PeekNamedPipe, which says ERROR_BROKEN_PIPE once its writer has gone and
+/// nothing is left in it); a file by a first read, which never waits; a console as waiting,
+/// its input typed as it comes; NUL as ended, by its device type ([`device_type`]). Any other
+/// device's input cannot be told without a read that may wait: said, starting no thread. No
+/// handle, or one not open, has ended.
+#[cfg(windows)]
+fn pending(
+    from: &mut (impl Read + std::os::windows::io::AsRawHandle),
+    buf: &mut [u8],
+) -> std::io::Result<Pending> {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_TYPE_CHAR, FILE_TYPE_DISK, FILE_TYPE_PIPE, FILE_TYPE_UNKNOWN, GetFileType,
+    };
+    use windows_sys::Win32::System::Console::GetConsoleMode;
+    use windows_sys::Win32::System::Ioctl::FILE_DEVICE_NULL;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let handle = from.as_raw_handle();
+    if handle.is_null() {
+        return Ok(Pending::Ended);
+    }
+    // SAFETY: GetFileType of the handle `from` holds, which says a handle not open as such.
+    match unsafe { GetFileType(handle) } {
+        FILE_TYPE_DISK => first_read(from, buf),
+        FILE_TYPE_PIPE => {
+            let mut waiting = 0u32;
+            // SAFETY: a peek of no bytes at the pipe's end `from` holds, its count ours.
+            let peeked = unsafe {
+                PeekNamedPipe(
+                    handle,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &raw mut waiting,
+                    std::ptr::null_mut(),
+                )
+            };
+            if peeked == 0 {
+                let e = std::io::Error::last_os_error();
+                return if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    Ok(Pending::Ended)
+                } else {
+                    Err(e)
+                };
+            }
+            if waiting == 0 {
+                Ok(Pending::Waiting)
+            } else {
+                first_read(from, buf)
+            }
+        }
+        FILE_TYPE_CHAR => {
+            let mut mode = 0u32;
+            // SAFETY: the handle `from` holds, and a mode of ours for the call to fill.
+            if unsafe { GetConsoleMode(handle, &raw mut mode) } != 0 {
+                return Ok(Pending::Waiting);
+            }
+            match device_type(handle)? {
+                FILE_DEVICE_NULL => Ok(Pending::Ended),
+                other => Err(std::io::Error::other(format!(
+                    "its standard input is a device (type {other:#x}) whose input cannot be told without a read that may wait"
+                ))),
+            }
+        }
+        FILE_TYPE_UNKNOWN => {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == i32::try_from(ERROR_INVALID_HANDLE).ok() {
+                Ok(Pending::Ended)
+            } else {
+                Err(std::io::Error::other(format!(
+                    "its standard input is of a kind Windows does not say: {e}"
+                )))
+            }
+        }
+        other => Err(std::io::Error::other(format!(
+            "its standard input is of kind {other:#x}"
+        ))),
+    }
+}
+
+/// The device type of the file `handle` holds (NtQueryVolumeInformationFile's
+/// FileFsDeviceInformation): FILE_DEVICE_NULL for NUL.
+#[cfg(windows)]
+fn device_type(handle: windows_sys::Win32::Foundation::HANDLE) -> std::io::Result<u32> {
+    use windows_sys::Wdk::Storage::FileSystem::{FileFsDeviceInformation, NtQueryVolumeInformationFile};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    /// FILE_FS_DEVICE_INFORMATION (ntifs.h): the device's type, then its characteristics.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Device {
+        kind: u32,
+        _characteristics: u32,
+    }
+    let mut device = Device::default();
+    // SAFETY: an IO_STATUS_BLOCK is plain data (a status or pointer, and a count), which the
+    // call fills; zero is a valid one.
+    let mut status: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(size_of::<Device>()).map_err(std::io::Error::other)?;
+    // SAFETY: the handle the caller holds, and a Device and an IO_STATUS_BLOCK of ours for
+    // the call to fill, of their own sizes.
+    let got = unsafe {
+        NtQueryVolumeInformationFile(
+            handle,
+            &raw mut status,
+            (&raw mut device).cast(),
+            size,
+            FileFsDeviceInformation,
+        )
+    };
+    if got < 0 {
+        // SAFETY: no pointers; an NTSTATUS as Win32 says it.
+        let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(got) };
+        return Err(std::io::Error::from_raw_os_error(code.cast_signed()));
+    }
+    Ok(device.kind)
+}
+
+/// A first read of input that a read does not wait for: nothing is its end, and what it takes
+/// the thread forwards first. Interrupted, it is made again; where another reader of the same
+/// input took what was there first (EAGAIN), more is still to come.
+fn first_read(from: &mut impl Read, buf: &mut [u8]) -> std::io::Result<Pending> {
+    loop {
+        match from.read(buf) {
+            Ok(0) => return Ok(Pending::Ended),
+            Ok(n) => return Ok(Pending::Read(n)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(Pending::Waiting),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn forward_stdin(handle: vm::Handle) {
+    // As much as a buffer the guest posts takes: the rest waits in stdin.
+    let mut buf = [0u8; shards_vmm::devices::virtio::console::INPUT_AT_ONCE];
+    // Read here, the guest is given it on the thread: the console takes input only as its
+    // guest posts buffers, and this thread waits next for the VM's end.
+    let first = match pending(&mut std::io::stdin(), &mut buf) {
+        Ok(Pending::Ended) => return,
+        Ok(Pending::Waiting) => 0,
+        Ok(Pending::Read(n)) => n,
+        Err(e) => {
+            report(format!("console input unavailable: {e}"));
+            return;
+        }
+    };
     let spawned = std::thread::Builder::new()
         .name("console-in".into())
         .spawn(move || {
             let mut stdin = std::io::stdin().lock();
-            // As much as a buffer the guest posts takes: the rest waits in stdin.
-            let mut buf = [0u8; shards_vmm::devices::virtio::console::INPUT_AT_ONCE];
             let mut typed = Vec::with_capacity(buf.len());
             let mut escape = false;
+            let mut n = first;
             loop {
-                let n = match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => n,
-                };
+                if n == 0 {
+                    n = match stdin.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                }
                 // What was read goes to the guest at once, its escapes taken out: one
                 // buffer of the guest's for as much as it holds, not one for each byte.
                 typed.clear();
@@ -1684,6 +1960,7 @@ fn forward_stdin(handle: vm::Handle) {
                     escape = !escape && b == 0x01;
                 }
                 handle.console_input(&typed);
+                n = 0;
             }
         });
     if let Err(e) = spawned {
@@ -1854,6 +2131,7 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
         workload,
         warm,
         working_set_to,
+        record_until,
         resume,
         said_to,
         gpu_report,
@@ -1876,6 +2154,13 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
     }
     let to = match working_set_to.map(WorkingSetTo::new).transpose() {
         Ok(to) => to,
+        Err(e) => {
+            report(e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let until = match record_until.map(|u| handed("--record-until", u)).transpose() {
+        Ok(until) => until,
         Err(e) => {
             report(e);
             return ExitCode::FAILURE;
@@ -1904,7 +2189,7 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
             cfg.vsock = Some(vsock);
             let started = restore_vm(cfg).map_err(vm::StartError::from);
             if let (Ok((handle, _)), Some(to)) = (&started, to)
-                && let Some(h) = to.hand_after(handle, RECORD_FOR)
+                && let Some(h) = to.hand_after(handle, RECORD_FOR, None)
             {
                 let _ = slot.set(h);
             }
@@ -1921,7 +2206,7 @@ pub fn restore(args: impl Iterator<Item = OsString>) -> ExitCode {
         wait_for_release(handle);
     }
     let handing = match (&started, to) {
-        (Ok((handle, _)), Some(to)) => to.hand_after(handle, RECORD_FOR),
+        (Ok((handle, _)), Some(to)) => to.hand_after(handle, RECORD_FOR, until),
         _ => None,
     };
     let code = supervise(started, console, false, said_to, InputOwner::Console, None);
@@ -1970,16 +2255,26 @@ impl WorkingSetTo {
         handed("--working-set", given).map(WorkingSetTo)
     }
 
-    /// Hands what `handle` records once `after` has passed since its vCPUs started, or the
-    /// VM has ended ([`Handing::now`]), whichever is first, on a thread of its own: a
-    /// restore has no request to end its recording, as a warm VM's has. None where it
-    /// records nothing.
-    fn hand_after(self, handle: &Handle, after: std::time::Duration) -> Option<Handing> {
+    /// Hands what `handle` records once `after` has passed since its vCPUs started, the VM
+    /// has ended ([`Handing::now`]), or its spawner has said so on `until`
+    /// (`--record-until`, [`told`]), whichever is first, on a thread of its own: a restore
+    /// has no request to end its recording, as a warm VM's has. None where it records
+    /// nothing.
+    fn hand_after(
+        self,
+        handle: &Handle,
+        after: std::time::Duration,
+        until: Option<std::fs::File>,
+    ) -> Option<Handing> {
         if !handle.recording() {
             return None;
         }
         let handle = handle.clone();
         let (done, ended) = std::sync::mpsc::channel::<()>();
+        if let Some(until) = until {
+            // Its thread ends with the word or the process: none waits on it.
+            let _ = told(until, done.clone());
+        }
         let spawned = std::thread::Builder::new()
             .name("working-set".into())
             .spawn(move || {
@@ -2010,6 +2305,29 @@ impl WorkingSetTo {
         self.0
             .write_all(&framed)
             .map_err(|e| format!("handing it to its spawner: {e}"))
+    }
+}
+
+/// Wakes a restore's hand-off on `done` as its spawner says its guest has run what it is
+/// for (`--record-until`, D25): a byte, or the end of `until`, whichever comes first, as a
+/// run's command's answer ends a run's recording. Its thread, where the system made one.
+fn told(
+    mut until: impl std::io::Read + Send + 'static,
+    done: std::sync::mpsc::Sender<()>,
+) -> Option<std::thread::JoinHandle<()>> {
+    let spawned = std::thread::Builder::new()
+        .name("record-until".into())
+        .spawn(move || {
+            let _ = until.read(&mut [0u8; 1]);
+            let _ = done.send(());
+        });
+    match spawned {
+        Ok(thread) => Some(thread),
+        Err(e) => {
+            // The recording then ends as it did without the word.
+            shards_vmm::debug!("the recording's end: {e}");
+            None
+        }
     }
 }
 
@@ -2189,6 +2507,10 @@ fn serve_workload(
         static TIMING: workload::Timing = workload::Timing::new();
         let to_guest = &TO_GUEST;
         let warm = matches!(command, Command::Warm(..));
+        // A warm VM restored from a template for its daemon's pool, not a run's save resumed:
+        // where it ends for its template's sake before it takes a run, its status says so
+        // (`shards_ipc::TEMPLATE_FAILED_STATUS`, D26).
+        let refill = matches!(command, Command::Warm(_, false));
         // The run a warm VM took (`warm::receive`, as it says TAKEN): its end goes to its owner
         // once (`warm::Taken::end`), and what its machine used in all once it is down (D260's
         // final use) on a handle of the link of its own, from this thread, beside the
@@ -2209,6 +2531,11 @@ fn serve_workload(
         }
         let (handle, running) = match start(vsock) {
             Ok(started) => started,
+            // Its template's files did not read: the template's fault ([`SNAPSHOT_UNREAD`]).
+            Err(e) if refill && SNAPSHOT_UNREAD.get().is_some() => {
+                report(e);
+                return ExitCode::from(shards_ipc::TEMPLATE_FAILED_STATUS);
+            }
             Err(e) => return failed(e),
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2312,15 +2639,25 @@ fn serve_workload(
                                 (timing, working_set)
                             });
                         };
-                        let saved = |used| crate::warm::layer_saved(&link, used);
+                        // Its layer's word, or why it has none (D37).
+                        let saved = |came: Result<Option<u64>, String>| match came {
+                            Ok(used) => crate::warm::layer_saved(&link, used),
+                            Err(why) => crate::warm::layer_lost(&link, &why),
+                        };
                         // A layer that stays in its file (D190) is the daemon's to read
                         // once the machine is gone, nothing of it writing the file then:
                         // whether this run's may stay, and whether its guest kept it.
                         let layer_stays = std::sync::atomic::AtomicBool::new(false);
                         let layer_kept = std::sync::atomic::AtomicBool::new(false);
-                        let kept = |used| match crate::warm::hold_kept(&link, used) {
-                            Ok(()) => layer_kept.store(true, std::sync::atomic::Ordering::Relaxed),
-                            Err(e) => shards_vmm::debug!("holding the kept layer's word: {e}"),
+                        let kept = |came: Result<Option<u64>, String>| {
+                            let held = came.and_then(|used| {
+                                crate::warm::hold_kept(&link, used)
+                                    .map_err(|e| format!("holding its word that it kept them: {e}"))
+                            });
+                            match held {
+                                Ok(()) => layer_kept.store(true, std::sync::atomic::Ordering::Relaxed),
+                                Err(why) => crate::warm::layer_lost(&link, &why),
+                            }
                         };
                         let processes = |records: &[u8]| crate::warm::processes(&link, records);
                         let members = |ended: &[u8]| crate::warm::member_ended(&link, ended);
@@ -2545,8 +2882,15 @@ fn serve_workload(
             }
         });
         // Its joiners (D119), which the guest ended with its workload, tell the daemon how
-        // each ended before this process goes, as the relay has had 5 s to (below).
-        crate::warm::await_joiners(std::time::Duration::from_secs(5));
+        // each ended before this process goes, as the relay has had 5 s to (below). Those
+        // that had not, whose links close with it, their layers too, are said.
+        let within = std::time::Duration::from_secs(5);
+        let unfinished = crate::warm::await_joiners(within);
+        if unfinished > 0 {
+            shards_vmm::warn!(
+                "{unfinished} of its joiners had not told their ends and layers within {within:?}: its VM ends with their links"
+            );
+        }
         // A warm VM's client printed its timing line from the exit status.
         if !warm {
             report_timing(&handle, Some(timing));
@@ -2554,9 +2898,31 @@ fn serve_workload(
         match &reason {
             ExitReason::Error(e) => report(e),
             // The host's hypervisor refused to enter a vCPU (D261): said as the host's, with
-            // what its host model's records hold of its count.
-            ExitReason::Refused(refused) => report(refused),
+            // what its host model's records hold of its count. A warm VM's own log is its
+            // daemon's (review 8.10), where its stderr, its client's as it served, is let go of
+            // by its run's end: said there too, by its VM process, so that the run it could not
+            // serve is told by its refusal (CI 44189693085, x86_64 musl: a pool's run ended 125,
+            // its VM's refusal said nowhere).
+            ExitReason::Refused(refused) => {
+                report(refused);
+                if shards_vmm::log::redirected() {
+                    shards_vmm::warn!("{refused}");
+                }
+            }
             _ => {}
+        }
+        // A warm VM whose guest reset or powered off before it took a run (its kernel
+        // panicking, which `panic=-1` resets; its init ending) failed for its template's
+        // guest, so for its template, said by its status (D26). Its host's refusal to enter
+        // it (D261), its VMM's error and its stop are no fault of its template's.
+        if refill && TAKEN.get().is_none() && matches!(reason, ExitReason::Reset | ExitReason::PowerOff) {
+            report("its guest ended before it took a run");
+            return ExitCode::from(shards_ipc::TEMPLATE_FAILED_STATUS);
+        }
+        // One its host refused to enter before it took a run, said above, says so by its
+        // status too: its daemon then starts no VM into its host's refusals (D26, D261).
+        if refill && TAKEN.get().is_none() && matches!(reason, ExitReason::Refused(_)) {
+            return ExitCode::from(shards_ipc::HOST_REFUSED_STATUS);
         }
         // The guest waits for its status to be read before it powers off, so the relay
         // has finished unless the guest never ran the command.
@@ -2584,21 +2950,6 @@ fn serve_workload(
         }
     }
 }
-
-/// How long a VM records its working set after its command starts, at most, unless the
-/// command answers first: a command still running then has long passed its start. The
-/// whole way from the request to the start is recorded, however long a host takes over
-/// it (a nested KVM host took 28 ms, PM M33).
-/// - HVF: 50 ms. Recording slows the guest about sixfold (a pooled `true` took 9.9 ms
-///   against 1.5, PM M30), so this is some 8 ms of the command's own time, past the 5 ms
-///   a run should take.
-/// - KVM: 1 s. Recording costs nothing, and a nested host took 125 ms to run `true` (PM
-///   M33).
-const RECORD_FOR: std::time::Duration = if shards_vmm::vm::RESTORES_RECORD {
-    std::time::Duration::from_secs(1)
-} else {
-    std::time::Duration::from_millis(50)
-};
 
 /// Saves the working set `after` from now, if the VM still records it then.
 fn end_recording_in(handle: &Handle, after: std::time::Duration) {
@@ -2905,8 +3256,8 @@ fn restore_reported(
             // On Windows before the state is read too, which looks at each file it names,
             // as an AppContainer may not at one it was not handed (PM M345).
             #[cfg(windows)]
-            refuse_unasked(&shards_vmm::snapshot::backing_named(&cfg.dir)?)?;
-            let pinned = shards_vmm::snapshot::read(&cfg.dir)?;
+            refuse_unasked(&snapshot_read(shards_vmm::snapshot::backing_named(&cfg.dir))?)?;
+            let pinned = snapshot_read(shards_vmm::snapshot::read(&cfg.dir))?;
             refuse_unasked(&shards_vmm::snapshot::backing_of(&pinned))?;
             pinned
         }
@@ -2917,10 +3268,10 @@ fn restore_reported(
         // newer generation in between names others.
         #[cfg(windows)]
         None => {
-            let named = shards_vmm::snapshot::backing_named(&cfg.dir)?;
+            let named = snapshot_read(shards_vmm::snapshot::backing_named(&cfg.dir))?;
             add(&mut paths, &named);
             confine(&paths)?;
-            let pinned = shards_vmm::snapshot::read(&cfg.dir)?;
+            let pinned = snapshot_read(shards_vmm::snapshot::read(&cfg.dir))?;
             if shards_vmm::snapshot::backing_of(&pinned) != named {
                 return Err(format!(
                     "{}: its snapshot was saved again as it was read",
@@ -2931,7 +3282,7 @@ fn restore_reported(
         }
         #[cfg(not(windows))]
         None => {
-            let pinned = shards_vmm::snapshot::read(&cfg.dir)?;
+            let pinned = snapshot_read(shards_vmm::snapshot::read(&cfg.dir))?;
             add(&mut paths, &shards_vmm::snapshot::backing_of(&pinned));
             confine(&paths)?;
             pinned
@@ -2962,6 +3313,24 @@ fn restore_reported(
     }
 }
 
+/// Whether this process's restore found its snapshot's files unreadable
+/// ([`snapshot_read`]): their fault, its template's where a warm VM restores one, which such
+/// a VM's status tells its daemon ([`serve_workload`], D26), not its host's.
+static SNAPSHOT_UNREAD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// What a read of the snapshot's files gave, a failure kept ([`SNAPSHOT_UNREAD`]): the one way
+/// each read of a restore's snapshot goes, its state read and pinned
+/// (`shards_vmm::snapshot::read`) and, on Windows, the read before it of the files that state
+/// names (`shards_vmm::snapshot::backing_named`), which fails as surely where the state does
+/// not read. One that went around it was its template's fault unsaid: its warm VM exited 125,
+/// not `TEMPLATE_FAILED_STATUS`, and its daemon refilled from the template for ever (CI
+/// 44227612442, windows-2025, images.rs `repeat_runs_restore_a_template_of_the_image`).
+fn snapshot_read<T>(read: Result<T, String>) -> Result<T, String> {
+    read.inspect_err(|_| {
+        let _ = SNAPSHOT_UNREAD.set(());
+    })
+}
+
 /// `path` made whole against the working directory, and normalized as
 /// `std::path::absolute` normalizes it (on Windows, its separators made `\`).
 fn absolute(path: &Path) -> Result<PathBuf, String> {
@@ -2979,6 +3348,36 @@ static BACKING: std::sync::OnceLock<Vec<(PathBuf, bool)>> = std::sync::OnceLock:
 /// The directory relative paths are of (`--cwd DIR`): the VM's starter's own on macOS, where App
 /// Sandbox starts a VM process in its container instead.
 static CWD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The home this process declares its durable writes in (`--durable HOME`, D286): its
+/// spawner's, which follows it by them (D215).
+static DURABLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// The slot file of [`DURABLE`]'s home, where it was given one.
+fn durable_file() -> Option<PathBuf> {
+    DURABLE.get().map(|home| home.join(shards_durable::FILE))
+}
+
+/// Declares this process's durable writes in its spawner's home's slot file (D286), where it
+/// was given one (`--durable`): on macOS and Windows the file its spawner granted it, opened to
+/// be written (`Access::Write`), which its spawner made first; on Linux opened here, before
+/// Landlock, which gives no rule for it, as its vCPU records are held (D261). One that cannot
+/// be installed fails its start: its writes would go undeclared, as no judge may take them.
+fn durable_installed() -> Result<(), String> {
+    let Some(path) = durable_file() else {
+        return Ok(());
+    };
+    #[cfg(any(target_os = "macos", windows))]
+    let file = shards_vmm::platform::open_input(&path, true);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(&path);
+    file.and_then(shards_durable::install_file).map_err(|e| {
+        format!(
+            "{}: its home's declarations of durable writes: {e}",
+            path.display()
+        )
+    })
+}
 
 /// What a VM that saves a snapshot gives up once it is committed (review 8.2): the
 /// snapshot's directory, which only the save writes. A template's saver goes on to serve a
@@ -3433,6 +3832,7 @@ fn granted(paths: &crate::confine::Paths) -> Result<(), String> {
         .chain(paths.write.iter().map(|p| (Access::Write, p.clone())))
         .chain(paths.write_under.iter().map(|p| (Access::MakeDir, p.clone())))
         .chain(paths.records.iter().map(|p| (Access::Keep, p.clone())))
+        .chain(durable_file().map(|p| (Access::Write, p)))
         .chain(paths.vsock.iter().map(|p| (Access::Listen, p.clone())))
         .collect();
     // The last it asks for: on macOS its link closes after unless it dials (`confine`); on
@@ -3565,15 +3965,21 @@ impl shards_vmm::platform::Stager for SpawnerStages {
         crate::grant_ask::ranges(link, file, len)
     }
 
+    /// Its end waited for with the link let go: the spawner answers this VM's other asks
+    /// meanwhile, its vsock listener's next pair among them, which a resumed VM's device
+    /// waited for as long as the generation's fsyncs took (D30, D272, amended 2026-11-18).
     fn commit(&self, _dir: &Path, name: &str) -> std::io::Result<()> {
-        let grants = GRANTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let link = grants.as_ref().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "no spawner to commit a snapshot through",
-            )
-        })?;
-        crate::grant_ask::commit(link, name)
+        let word = {
+            let grants = GRANTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let link = grants.as_ref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "no spawner to commit a snapshot through",
+                )
+            })?;
+            crate::grant_ask::commit(link, name)?
+        };
+        crate::grant_ask::durable(&word)
     }
 }
 
@@ -3602,20 +4008,23 @@ fn confine(paths: &crate::confine::Paths) -> Result<(), String> {
     // The last it asks for: the link closes, and the spawner grants nothing more, unless
     // the guest's connections to host ports go through it.
     #[cfg(target_os = "macos")]
-    return granted(paths).and_then(|()| match &paths.vsock {
-        Some(vsock) => dial_through_spawner(vsock),
-        None => {
-            if let Some(link) = GRANTS.get() {
-                shards_ipc::end(link);
+    return granted(paths)
+        .and_then(|()| durable_installed())
+        .and_then(|()| match &paths.vsock {
+            Some(vsock) => dial_through_spawner(vsock),
+            None => {
+                if let Some(link) = GRANTS.get() {
+                    shards_ipc::end(link);
+                }
+                Ok(())
             }
-            Ok(())
-        }
-    });
+        });
     // Its sockets narrowed, every connect refused, then Landlock, on every thread; and
     // its vsock path bound, and its dials beside it made, by its spawner (D30), whose link
     // closes where it has none to make.
     #[cfg(target_os = "linux")]
     return crate::confine::sockets()
+        .and_then(|()| durable_installed())
         .and_then(|()| crate::confine::landlock(paths))
         .and_then(|()| match &paths.vsock {
             Some(vsock) => {
@@ -3641,6 +4050,7 @@ fn confine(paths: &crate::confine::Paths) -> Result<(), String> {
     {
         shards_vmm::hv::forbid_dynamic_code_once_set_up();
         granted(paths)?;
+        durable_installed()?;
         // Its spawner stages its snapshots and reads its files' ranges for it, as long as
         // the link stays: it may make no FSCTL (D141), and a restore copies a template's
         // writable layer by its ranges (D196), as any save of it copies its layer and swap
@@ -4406,6 +4816,36 @@ mod lifeline_tests {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod console_input_tests {
+    use super::*;
+
+    /// The null device, whose every read takes nothing.
+    #[cfg(unix)]
+    const NULL: &str = "/dev/null";
+    #[cfg(windows)]
+    const NULL: &str = "NUL";
+
+    /// Console input that has already ended starts no thread (`pending`, which `forward_stdin`
+    /// returns on before it spawns one), on every host: a pipe whose writer has gone, and the
+    /// null device, the stdin of the Firecracker comparison's bare restores. Input still to
+    /// come waits on its thread, and input already there is read for it.
+    #[test]
+    fn console_input_that_has_already_ended_starts_no_thread() {
+        let mut buf = [0u8; 8];
+        let (mut reader, mut writer) = std::io::pipe().unwrap();
+        assert_eq!(pending(&mut reader, &mut buf).unwrap(), Pending::Waiting);
+        writer.write_all(b"ab").unwrap();
+        assert_eq!(pending(&mut reader, &mut buf).unwrap(), Pending::Read(2));
+        assert!(buf.starts_with(b"ab"));
+        drop(writer);
+        assert_eq!(pending(&mut reader, &mut buf).unwrap(), Pending::Ended);
+        let mut null = std::fs::File::open(NULL).unwrap();
+        assert_eq!(pending(&mut null, &mut buf).unwrap(), Pending::Ended);
+    }
+}
+
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -4505,6 +4945,52 @@ mod tests {
         let restore = parse_restore(args(&[b"/t", b"--layer", b"/l", b"--layer-cloned", b"--hold"])).unwrap();
         assert_eq!(restore.cfg.layer_cloned.as_deref(), Some("--hold"));
         assert!(!restore.cfg.hold);
+    }
+
+    /// `--record-until` ends the recording of a restore whose guest runs no command (D25): it
+    /// needs `--working-set`, and refuses `--warm` and a command, which end theirs as their
+    /// command answers.
+    #[test]
+    fn record_until_is_a_bare_restores_with_its_working_set() {
+        let restore = |extra: &[&str]| {
+            let w: Vec<&[u8]> = std::iter::once("/t")
+                .chain(extra.iter().copied())
+                .map(str::as_bytes)
+                .collect();
+            parse_restore(args(&w))
+        };
+        let told = restore(&["--working-set", "3", "--record-until", "4"][..]).unwrap();
+        assert_eq!((told.working_set_to, told.record_until), (Some(3), Some(4)));
+        let refused: [&[&str]; 3] = [
+            &["--record-until", "4"],
+            &["--record-until", "4", "--warm", "5"],
+            &["--working-set", "3", "--record-until", "4", "--", "true"],
+        ];
+        for refused in refused {
+            let e = restore(refused)
+                .err()
+                .unwrap_or_else(|| panic!("{refused:?}: taken"));
+            assert!(e.contains("--record-until"), "{refused:?}: {e}");
+        }
+    }
+
+    /// A restore's spawner ends its recording with a byte, or with its pipe's end, and nothing
+    /// ends it before either (`--record-until`, D25).
+    #[test]
+    fn a_spawners_word_ends_a_bare_restores_recording() {
+        for by_byte in [true, false] {
+            let (read, mut write) = std::io::pipe().unwrap();
+            let (done, woken) = std::sync::mpsc::channel();
+            let reader = told(read, done).unwrap();
+            assert_eq!(woken.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+            if by_byte {
+                std::io::Write::write_all(&mut write, b"\n").unwrap();
+            } else {
+                drop(write);
+            }
+            reader.join().unwrap();
+            assert_eq!(woken.try_recv(), Ok(()), "by a byte: {by_byte}");
+        }
     }
 
     fn args(list: &[&[u8]]) -> impl Iterator<Item = OsString> {

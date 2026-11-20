@@ -1,7 +1,7 @@
 /**
  * Where a session runs: in a microVM, or on its machine itself (bare metal). Only a session in a microVM
- * has sandboxes, settings and experiments to show: its Mission row's groups after its subagents, and agent
- * chat's Engine tab.
+ * has sandboxes, settings and experiments to show: its Mission row's groups after its subagents, and the
+ * Sandboxes section of agent chat's Engine tab (which every session has).
  */
 import * as React from "react";
 import { sandboxesRes, type Engine } from "@/api/microvms";

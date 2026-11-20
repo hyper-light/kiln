@@ -57,9 +57,17 @@ pub fn call(f: &Fixture, via: Via, op: &str, arguments: Value) -> anyhow::Result
     })
 }
 
-/// The agent `agents.start` started.
-fn started(answer: &Value) -> anyhow::Result<String> {
-    answer.pointer("/agents/0/id").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow::anyhow!("agents.start started none: {answer}"))
+/// The agent `agents.start` started under `id`, the drive's own (its `ids`): in its answer; or, where kiln
+/// queued the start for room on the runner (its `queued`: "it starts there as soon as there's room"), once
+/// kiln opened it, waited on as kiln said ([`vm_e2e::queued_start`]). Before, a queued start failed its drive
+/// at once and went on by itself (r735's code mode on jupiter: "1 machine under strain").
+fn started(f: &Fixture, answer: &Value, id: &str, what: &str) -> anyhow::Result<()> {
+    if let Some(got) = answer.pointer("/agents/0/id").and_then(Value::as_str) {
+        anyhow::ensure!(got == id, "{what}: agents.start started {got}, not {id}, the id it was given: {answer}");
+        return Ok(());
+    }
+    let queued = answer.get("queued").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("{what}: agents.start started none: {answer}"))?;
+    vm_e2e::queued_start(f, id, what, queued)
 }
 
 /// Whether the turn of the words carrying `nonce` is under way: kiln delivered them (a person's
@@ -100,9 +108,11 @@ pub fn drive(f: &Fixture, via: Via, kind: &str, image: &str, project: &str) -> a
     let mut ends = vm_e2e::Ends::new(f);
     eprintln!("DRIVE: {kind} from {image} in a microVM on {} through {}", f.machine, via.through());
 
-    // Start, naming its Agentfile and the runner that starts microVMs.
-    let id = started(&call(f, via, "agents.start", json!({"kind": kind, "on": f.machine, "cwd": project, "prompt": prompt, "image": image}))?)?;
+    // Start, naming its Agentfile, the runner that starts microVMs, and the id it starts under.
+    let id = kiln::util::new_id();
+    let answer = call(f, via, "agents.start", json!({"kind": kind, "on": f.machine, "cwd": project, "prompt": prompt, "image": image, "ids": [id]}))?;
     ends.started(&id);
+    started(f, &answer, &id, &format!("{what}: its start"))?;
     let (info, _) = pace.until(f, &id, vm_e2e::Asked::Opening, &format!("{what}: its first turn"), done)?;
     anyhow::ensure!(
         info.pointer("/isolation/kind").and_then(Value::as_str) == Some("microvm") && info.pointer("/isolation/image").and_then(Value::as_str) == Some(image),
@@ -140,8 +150,10 @@ pub fn drive(f: &Fixture, via: Via, kind: &str, image: &str, project: &str) -> a
 
     // Resume: a new agent takes the conversation up again, in a microVM from the same Agentfile.
     let again = vm_e2e::task("VM_E2E_RESUMED_PROMPT", kind, &n, format!("do the task again {n}"));
-    let resumed = started(&call(f, via, "agents.start", json!({"kind": kind, "on": f.machine, "cwd": project, "prompt": again, "image": image, "resume": hs}))?)?;
+    let resumed = kiln::util::new_id();
+    let answer = call(f, via, "agents.start", json!({"kind": kind, "on": f.machine, "cwd": project, "prompt": again, "image": image, "resume": hs, "ids": [resumed]}))?;
     ends.started(&resumed);
+    started(f, &answer, &resumed, &format!("{what}: its conversation taken up again"))?;
     let (i, _) = pace.until(f, &resumed, vm_e2e::Asked::Opening, &format!("{what}: taking its conversation up again"), done)?;
     anyhow::ensure!(i.get("harness_session").and_then(Value::as_str) == Some(hs.as_str()), "{what}: the resumed agent's harness session is {}, not {hs}", i.get("harness_session").unwrap_or(&Value::Null));
     anyhow::ensure!(i.pointer("/isolation/image").and_then(Value::as_str) == Some(image), "{what}: resumed outside its Agentfile: {}", i.get("isolation").unwrap_or(&Value::Null));

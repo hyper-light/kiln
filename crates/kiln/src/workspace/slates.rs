@@ -89,7 +89,8 @@ pub const INSTANCE: &str = "kiln";
 /// (`mount::unmount_busy`: detached on Linux, forced on macOS), where 23's `unmount_lazy` was
 /// Linux's alone and a Mac kept the mount ([`remove`]); since 2026-11-18 it lets go of none: an
 /// ended agent's mount is asked to go once its processes have ended, and one still held keeps its
-/// volume, refused by kind ([`MountStays`]). It shows two counts the contract added: the
+/// volume, refused by kind ([`MountStays`]). Since 2026-11-19 it lets go of the workspace mounts a
+/// gone instance left, those alone, on its last daemon's end (`follow`). It shows two counts the contract added: the
 /// drifted entries too long for any reply to name (26, `DriftReport::elided`, [`drift_lines`]) and
 /// a written landing's degraded cells past what one reply holds (27,
 /// `LandingReport::degraded_elided`, `report_json`). It needs none of the rest: the failover
@@ -126,10 +127,21 @@ pub const INSTANCE: &str = "kiln";
 /// (`StillMounted`) and a table that could not be read (`MountTable`), kiln shows in Slates' words as
 /// it shows every unmount's, tells by the first two the kind of an ended agent's mount that stays
 /// ([`MountStays`]: busy, naming what holds it, or still listed), and maps, as every mount fault it
-/// is not told is missing, to its own can't-mount refusal (`missing_of`). It lets none go by force,
-/// so 36's `unmount_busy` is called no more. The revision brings Slates' A-511 too: a mount's
+/// is not told is missing, to its own can't-mount refusal (`missing_of`). It lets go by force only
+/// of the workspace mounts a gone instance left, on its last daemon's end (36's `unmount_busy`,
+/// `follow`); an ended agent's own mount is asked to go once. The revision brings Slates' A-511 too: a mount's
 /// attachment ends at the kernel's own unmount event, never at its `UMNT`.
-pub const CONTRACT: u32 = 42;
+///
+/// 48 since kiln took Slates at de1031f1d (from 42; Slates' A-520, kiln's W9). kiln uses 44, 47 and 48 for agents in
+/// containers (`super::container`): a workspace's mount bound into a container (44, `Instance::bind_into_container`,
+/// whose entry kiln hands its engine word for word), the bind's source checked again just before the engine binds it (47,
+/// `ContainerBind::check_source`) and the engine's profile judged (47, `container_engine::engine_profile`), rootless
+/// podman's among the profiles that hold evidence (48, `IdentityRule::ContainerRootAsMountingUser`). It maps 43's
+/// `MountMissing::PrivateLoopback` (a Mac whose loopback more than root can capture, Slates' A-535) to its own can't-mount
+/// refusal, Slates' words naming the remedy (`missing_of`), and builds 45's `MountFault::Busy`, which carries the holders
+/// the kernel's own tables show (`MountHolders`, Slates' A-537), as it builds every unmount refusal. It needs none of the
+/// rest: an S3 base's names (46, Mantle's).
+pub const CONTRACT: u32 = 48;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
@@ -276,7 +288,9 @@ pub async fn facts() -> Facts {
 /// What a machine lacks for workspaces, as Slates' typed answer to whether it can mount names it (`mount::available`).
 /// Every fault is named, so a contract that adds one fails to build here until kiln places it: one that says what the
 /// machine lacks maps to that lack, and every other (a mount or an unmount refused, the mount table unread: 42's
-/// `Busy`, `StillMounted` and `MountTable` among them) to kiln's own can't-mount refusal.
+/// `Busy`, `StillMounted` and `MountTable` among them) to kiln's own can't-mount refusal. 43's `PrivateLoopback` (a Mac
+/// whose loopback a group or another user can capture) goes there too: what it lacks is no program or device kiln names,
+/// and the fault's own words, which the runner's facts carry, say how to give `/dev/bpf*` back to root.
 fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
     use slates_api::MountFault;
     match fault {
@@ -285,7 +299,10 @@ fn missing_of(fault: &slates_api::MountFault) -> WorkspaceMissing {
             slates_api::MountMissing::FuseDevice => WorkspaceMissing::FuseDevice,
             slates_api::MountMissing::WinFsp => WorkspaceMissing::WinFsp,
             slates_api::MountMissing::MountNfs => WorkspaceMissing::MountNfs,
-            slates_api::MountMissing::SharedMount | slates_api::MountMissing::WindowsSubtreeOrShared | slates_api::MountMissing::MountManager => WorkspaceMissing::Mount,
+            slates_api::MountMissing::SharedMount
+            | slates_api::MountMissing::WindowsSubtreeOrShared
+            | slates_api::MountMissing::MountManager
+            | slates_api::MountMissing::PrivateLoopback => WorkspaceMissing::Mount,
         },
         MountFault::MountPoint { .. }
         | MountFault::NoNfsListener
@@ -417,8 +434,17 @@ fn starting() -> &'static futures::lock::Mutex<()> {
     STARTING.get_or_init(|| futures::lock::Mutex::new(()))
 }
 
-/// The instance answers, its anchor started (and its one-node group made) when it wasn't running.
+/// The instance answers, its anchor started (and its one-node group made) when it wasn't running, and is followed from
+/// then on (Unix: `follow`), so the workspace mounts it would leave behind if it went are let go of on its daemon's end.
 pub async fn ensure_up() -> anyhow::Result<()> {
+    up_or_started().await?;
+    #[cfg(unix)]
+    follow().await;
+    Ok(())
+}
+
+/// The instance answers, its anchor started (and its one-node group made) when it wasn't running.
+async fn up_or_started() -> anyhow::Result<()> {
     if up().await {
         return Ok(());
     }
@@ -1149,6 +1175,167 @@ async fn take_down(steps: &impl TakeDown, mount: &str) -> anyhow::Result<()> {
     steps.destroy().await
 }
 
+/// A daemon of the machine's instance, as Slates' own status names it: its process, and how many daemons its anchor
+/// has restarted so far (`DaemonReport::restarts`; a new anchor counts from none).
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Daemon {
+    pid: u32,
+    restarts: u64,
+}
+
+/// How following the machine's instance ended ([`let_go_when_gone`]).
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Followed {
+    /// Its anchor is gone: each workspace mount the kernel's table listed as its last daemon ended, let go of, and how
+    /// (or Slates' refusal, in its words).
+    LetGo(Vec<(PathBuf, Result<slates_api::LetGo, String>)>),
+    /// A daemon's end the OS can't tell: nothing more is followed, nothing let go.
+    Unwatched(Vec<crate::os::watch::Unwatched>),
+    /// The mount table couldn't be read as a daemon ended, in its words: nothing let go.
+    Unlisted(String),
+    /// Slates' refusal of the look after a daemon's end, in its words, which says neither restarted nor gone: nothing let go.
+    Unknown(String),
+}
+
+/// What [`let_go_when_gone`] asks of this machine, apart so a test injects a daemon's end: that end as the OS tells it,
+/// Slates' answer after it, the workspace mounts the kernel's table lists, and one let go of though processes hold it.
+#[cfg(unix)]
+trait Gone {
+    /// Until daemon `pid` has ended, as the OS tells it (`os::watch::exited`), or why the OS can't tell its end.
+    async fn ended(&self, pid: u32) -> Result<(), Vec<crate::os::watch::Unwatched>>;
+    /// Slates' answer to an attach now: the daemon serving and its anchor's restarts; none where no daemon answers and no
+    /// anchor holds the instance's rendezvous (Slates' `Unavailable`), which a connect waits on while an anchor does; or
+    /// any other refusal, in its words.
+    async fn answered(&self) -> Result<Option<Daemon>, String>;
+    /// The workspace mounts the kernel's table lists now under this machine's place for workspaces.
+    async fn mounts(&self) -> anyhow::Result<Vec<PathBuf>>;
+    /// `mount` let go of though processes hold it (Slates' `mount::unmount_busy`): how, or its refusal in its words.
+    async fn let_go(&self, mount: PathBuf) -> Result<slates_api::LetGo, String>;
+}
+
+/// Follows the machine's instance from its daemon `first`, by `gone`, until it is gone, then lets go of the workspace
+/// mounts it left (Slates' `mount::unmount_busy`: forced off on macOS, detached on Linux): each step an event of the
+/// OS's or Slates' own word, never a clock. At each daemon's end, as the OS tells it, the table's workspace mounts are
+/// read, every one of them its instance's (kiln keeps one on a machine, and a later one has mounted nothing yet); then
+/// Slates is asked. A daemon its anchor restarted (the anchor's restarts past the ended one's) serves the same mounts
+/// again, as its anchor holds the NFS listener and the daemon's descriptors (Slates' §4.6), so its end is followed
+/// next. No anchor holding the instance (unavailable) or another instance (a new anchor counts from none) means nothing
+/// will serve those mounts again, and a process stuck on a hard NFS mount ends only once it's forced off, so each is
+/// let go of. The ended daemon itself answering is no end at all, said rather than acted on.
+#[cfg(unix)]
+async fn let_go_when_gone(gone: &impl Gone, first: Daemon) -> Followed {
+    let mut daemon = first;
+    loop {
+        if let Err(unwatched) = gone.ended(daemon.pid).await {
+            return Followed::Unwatched(unwatched);
+        }
+        let mounts = match gone.mounts().await {
+            Ok(mounts) => mounts,
+            Err(e) => return Followed::Unlisted(format!("{e:#}")),
+        };
+        match gone.answered().await {
+            Ok(Some(next)) if next.pid == daemon.pid => return Followed::Unknown(format!("daemon {} answers after its end was told", next.pid)),
+            Ok(Some(next)) if next.restarts > daemon.restarts => daemon = next,
+            Ok(Some(_) | None) => {
+                let mut let_go = Vec::with_capacity(mounts.len());
+                for mount in mounts {
+                    let how = gone.let_go(mount.clone()).await;
+                    let_go.push((mount, how));
+                }
+                return Followed::LetGo(let_go);
+            }
+            Err(refusal) => return Followed::Unknown(refusal),
+        }
+    }
+}
+
+/// [`Gone`] on this machine.
+#[cfg(unix)]
+struct LiveGone;
+
+#[cfg(unix)]
+impl Gone for LiveGone {
+    async fn ended(&self, pid: u32) -> Result<(), Vec<crate::os::watch::Unwatched>> {
+        crate::os::watch::exited(&[pid]).await
+    }
+
+    async fn answered(&self) -> Result<Option<Daemon>, String> {
+        let name = instance();
+        match crate::rt::blocking(move || Instance::attach(&name).and_then(|mut i| i.daemon_status())).await {
+            Ok(Ok(report)) => Ok(Some(Daemon { pid: report.pid, restarts: report.restarts })),
+            Ok(Err(refused)) if refused.is_unavailable() => Ok(None),
+            Ok(Err(refused)) => Err(refused.to_string()),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
+
+    async fn mounts(&self) -> anyhow::Result<Vec<PathBuf>> {
+        let root = super::place::real(&here()?.root);
+        let table = crate::rt::blocking(super::place::mount_table).await??;
+        Ok(table.into_iter().filter(|at| at.starts_with(&root)).collect())
+    }
+
+    async fn let_go(&self, mount: PathBuf) -> Result<slates_api::LetGo, String> {
+        let path = mount.to_string_lossy().into_owned();
+        match crate::rt::blocking(move || slates_api::mount::unmount_busy(&path)).await {
+            Ok(answer) => answer.map_err(|fault| fault.to_string()),
+            Err(e) => Err(format!("{e:#}")),
+        }
+    }
+}
+
+/// Whether a task of this process follows the machine's instance now (`follow`).
+#[cfg(unix)]
+static FOLLOWING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The machine's instance followed from now on, once however many ask ([`ensure_up`] asks before every workspace): its
+/// daemon as Slates' own status names it, that daemon's end and each next one's waited on by a task of its own, and the
+/// workspace mounts it left let go of once it's gone ([`let_go_when_gone`]), what came of it said. Where its status
+/// can't be read nothing follows it, said, and the next ask tries again; so does the next ask once a follow has ended.
+#[cfg(unix)]
+async fn follow() {
+    use std::sync::atomic::Ordering;
+    if FOLLOWING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let first = match call("daemon status", |i| i.daemon_status()).await {
+        Ok(report) => Daemon { pid: report.pid, restarts: report.restarts },
+        Err(e) => {
+            FOLLOWING.store(false, Ordering::Release);
+            tracing::warn!(error = %format!("{e:#}"), "the machine's Slates instance isn't followed: its daemon's status wasn't read, so a mount it would leave behind isn't let go of");
+            return;
+        }
+    };
+    drop(crate::rt::spawn(async move {
+        say_followed(&let_go_when_gone(&LiveGone, first).await);
+        FOLLOWING.store(false, Ordering::Release);
+    }));
+}
+
+/// What following the machine's instance came to ([`Followed`]), said.
+#[cfg(unix)]
+fn say_followed(followed: &Followed) {
+    match followed {
+        Followed::LetGo(let_go) if let_go.is_empty() => tracing::info!("the machine's Slates instance is gone, and left no workspace mount behind"),
+        Followed::LetGo(let_go) => {
+            for (mount, how) in let_go {
+                match how {
+                    Ok(how) => tracing::warn!(mount = %mount.display(), ?how, "the machine's Slates instance is gone: a workspace mount it left is let go of, so what was stuck on it can end"),
+                    Err(refusal) => tracing::warn!(mount = %mount.display(), %refusal, "the machine's Slates instance is gone: a workspace mount it left wasn't let go of"),
+                }
+            }
+        }
+        Followed::Unwatched(unwatched) => {
+            let said: Vec<String> = unwatched.iter().map(ToString::to_string).collect();
+            tracing::warn!(unwatched = %said.join("; "), "the machine's Slates instance isn't followed: the OS can't tell its daemon's end");
+        }
+        Followed::Unlisted(why) => tracing::warn!(%why, "a Slates daemon ended and the mount table couldn't be read: no workspace mount is let go of"),
+        Followed::Unknown(refusal) => tracing::warn!(%refusal, "a Slates daemon ended and Slates' answer says neither restarted nor gone: no workspace mount is let go of"),
+    }
+}
+
 /// The files of the folder below workspace `m` that changed on disk after the agent changed them
 /// in its workspace, each as kiln shows it (`/README.md (Modified)`, `drift_lines`).
 pub async fn drift(m: &Made) -> anyhow::Result<Vec<String>> {
@@ -1628,7 +1815,12 @@ mod tests {
         }
         // Linux's `fusermount3 -u` refused: its exit code alone. macOS's `unmount(2)` refused `EBUSY`.
         let failed = || Some(Err(MountFault::Unmount { path: POINT.to_owned(), status: Some(1), errno: None }));
-        let busy = || Some(Err(MountFault::Busy { path: POINT.to_owned() }));
+        // Contract 45 (Slates' A-537): a busy unmount carries the holders the kernel's tables show; on macOS none are read,
+        // since every libproc answer stats the file, which a `hard` NFS mount whose daemon has gone waits on.
+        let busy = || {
+            let unread = slates_api::MountHolders { pids: Vec::new(), unreadable: 0, unread: Some(slates_api::HoldersUnread::NoReader { platform: "macos" }) };
+            Some(Err(MountFault::Busy { path: POINT.to_owned(), holders: unread }))
+        };
         let named = || Ok(vec!["4242 zsh".to_owned(), "4243 vim".to_owned()]);
         let refused = |lsof: &str| Held::Refused { refusal: REFUSAL.to_owned(), lsof: lsof.to_owned() };
         let stuck = [
@@ -1666,6 +1858,81 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(lsof_holders("p4242\nczsh\nf5\np4243\ncvim\n"), ["4242 zsh", "4243 vim"], "lsof's -F pc fields, each process once");
         Ok(())
+    }
+
+    /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2; UI goal 89): the workspace mounts a Slates instance that is gone
+    /// left behind are let go of on its daemon's end alone, as the OS tells it, never on a clock: a hard NFS mount that no
+    /// server will answer again holds whatever touched it until it's forced off (Slates' `mount::unmount_busy`). The
+    /// mounts are those the table listed as the daemon ended, each let go of once Slates says no anchor holds the
+    /// instance (unavailable) or another instance answers (its anchor's restarts not past the ended one's: a new anchor
+    /// counts from none). A daemon its anchor restarted serves the same mounts again (the anchor holds the NFS listener and
+    /// the daemon's descriptors), so then nothing is let go and the next daemon's end is followed. While the daemon lives
+    /// nothing is done; an end the OS can't tell, or an answer that says neither, lets go of nothing. The daemon's end is
+    /// injected: the fake's, at once.
+    #[cfg(unix)]
+    #[test]
+    fn w3_a_gone_instances_mounts_are_let_go_of_on_its_daemons_end_alone() {
+        use crate::os::watch::{Unwatchable, Unwatched};
+        use futures::FutureExt as _;
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        /// A machine whose instance's daemon ends as `end` says (at once; never, `None`; or untold), whose Slates answers
+        /// each look after an end as `answers` say in turn, and whose table lists `mounts`.
+        struct Fake {
+            end: Option<Result<(), Vec<Unwatched>>>,
+            answers: RefCell<VecDeque<Result<Option<Daemon>, String>>>,
+            mounts: Vec<PathBuf>,
+            ended: RefCell<Vec<u32>>,
+            let_go: RefCell<Vec<PathBuf>>,
+        }
+        impl Gone for Fake {
+            async fn ended(&self, pid: u32) -> Result<(), Vec<Unwatched>> {
+                self.ended.borrow_mut().push(pid);
+                match &self.end {
+                    Some(end) => end.clone(),
+                    None => std::future::pending().await,
+                }
+            }
+            async fn answered(&self) -> Result<Option<Daemon>, String> {
+                self.answers.borrow_mut().pop_front().unwrap_or_else(|| Err("asked once too often".to_owned()))
+            }
+            async fn mounts(&self) -> anyhow::Result<Vec<PathBuf>> {
+                Ok(self.mounts.clone())
+            }
+            async fn let_go(&self, mount: PathBuf) -> Result<slates_api::LetGo, String> {
+                self.let_go.borrow_mut().push(mount);
+                Ok(slates_api::LetGo::Forced)
+            }
+        }
+        let (a, b) = (PathBuf::from("/state/workspaces/kiln-a"), PathBuf::from("/state/workspaces/kiln-b"));
+        let fake = |end, answers: Vec<Result<Option<Daemon>, String>>| Fake { end, answers: RefCell::new(answers.into()), mounts: vec![a.clone(), b.clone()], ended: RefCell::new(Vec::new()), let_go: RefCell::new(Vec::new()) };
+        let both = vec![(a.clone(), Ok(slates_api::LetGo::Forced)), (b.clone(), Ok(slates_api::LetGo::Forced))];
+        let first = Daemon { pid: 10, restarts: 0 };
+
+        let gone = fake(Some(Ok(())), vec![Ok(None)]);
+        assert_eq!(let_go_when_gone(&gone, first).now_or_never(), Some(Followed::LetGo(both.clone())), "no anchor holds it: each mount let go of at its daemon's end");
+        assert_eq!(*gone.ended.borrow(), [10]);
+
+        let restarted = fake(Some(Ok(())), vec![Ok(Some(Daemon { pid: 11, restarts: 1 })), Ok(Some(Daemon { pid: 20, restarts: 0 }))]);
+        assert_eq!(let_go_when_gone(&restarted, first).now_or_never(), Some(Followed::LetGo(both)), "a restarted daemon followed, then a new anchor's instance: let go of");
+        assert_eq!(*restarted.ended.borrow(), [10, 11], "the restarted daemon's end followed");
+
+        let lives = fake(None, Vec::new());
+        assert_eq!(let_go_when_gone(&lives, first).now_or_never(), None, "nothing while its daemon lives");
+        assert!(lives.let_go.borrow().is_empty());
+
+        let unsaid = fake(Some(Ok(())), vec![Err("Slates' contract differs".to_owned())]);
+        assert_eq!(let_go_when_gone(&unsaid, first).now_or_never(), Some(Followed::Unknown("Slates' contract differs".to_owned())));
+        assert!(unsaid.let_go.borrow().is_empty(), "an answer that says neither lets go of nothing");
+
+        let still = fake(Some(Ok(())), vec![Ok(Some(first))]);
+        assert!(matches!(let_go_when_gone(&still, first).now_or_never(), Some(Followed::Unknown(_))), "the ended daemon itself answering is no end");
+        assert!(still.let_go.borrow().is_empty(), "a live daemon's mounts are never forced off");
+
+        let untold_end = vec![Unwatched { pid: 10, why: Unwatchable::Unsupported }];
+        let untold = fake(Some(Err(untold_end.clone())), Vec::new());
+        assert_eq!(let_go_when_gone(&untold, first).now_or_never(), Some(Followed::Unwatched(untold_end)));
+        assert!(untold.let_go.borrow().is_empty(), "an end the OS can't tell lets go of nothing");
     }
 
     /// W8 (kiln goal 01a1ec34599974448aed2672bafaf9a2): what git ignores in a workspace with no mount (an isolated agent's,
@@ -1769,7 +2036,11 @@ mod tests {
         assert_eq!(missing_of(&MountFault::NoNfsListener), WorkspaceMissing::Mount, "any other refusal: a mount kiln makes");
         // Contract 42's unmount refusals (Slates' A-507) say nothing the machine lacks: kiln's own can't-mount refusal.
         let path = || "/state/workspaces/kiln-a".to_owned();
-        for fault in [MountFault::Busy { path: path() }, MountFault::StillMounted { path: path() }, MountFault::MountTable { path: path(), errno: None }] {
+        // Contract 43's private loopback (Slates' A-535) names nothing kiln installs: its can't-mount refusal, in Slates' words.
+        assert_eq!(of(MountMissing::PrivateLoopback), WorkspaceMissing::Mount);
+        // Contract 45's busy unmount carries the holders the kernel's tables show (Slates' A-537): a refusal all the same.
+        let busy = MountFault::Busy { path: path(), holders: slates_api::MountHolders { pids: vec![4242], unreadable: 0, unread: None } };
+        for fault in [busy, MountFault::StillMounted { path: path() }, MountFault::MountTable { path: path(), errno: None }] {
             assert_eq!(missing_of(&fault), WorkspaceMissing::Mount, "{fault}");
         }
     }

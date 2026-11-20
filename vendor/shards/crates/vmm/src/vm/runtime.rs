@@ -39,9 +39,12 @@ pub fn restores_here() -> bool {
     super::SNAPSHOTS && hv::restores()
 }
 
-/// The most vCPUs one VM can have on this host.
+/// The most vCPUs one VM can have on this host: its hypervisor's most for a partition, and on a
+/// host whose Hyper-V is nested within another's partition no more than its logical processors
+/// (D261, ROOT's ruling of 2026-11-17).
 pub fn max_vcpus() -> Result<u32, String> {
-    hv::max_vcpus().map_err(|e| e.to_string())
+    let partition = hv::max_vcpus().map_err(|e| e.to_string())?;
+    Ok(super::limits::most_vcpus(partition, super::nested_processors()))
 }
 
 /// What reads a run of a live move's layer or swap into a buffer (D176 part 7).
@@ -1109,6 +1112,8 @@ struct Shared {
     /// Its host model's vCPU records (D261) until its outcome is kept there
     /// ([`take_records`](Self::take_records)).
     records: Mutex<Option<Limits>>,
+    /// Whether its guest has run on any of its vCPUs, as D261's gate reads it ([`Entered`]).
+    ran: AtomicBool,
 }
 
 /// What a snapshot the host asks for reads of the machine (D176): its VM and devices by
@@ -1198,6 +1203,7 @@ impl Shared {
             governor: Mutex::new(None),
             group_governor: Mutex::new(None),
             records: Mutex::new(None),
+            ran: AtomicBool::new(false),
         }
     }
 
@@ -1239,10 +1245,11 @@ impl Shared {
     }
 
     /// Keeps that its host refused to enter vCPU `vcpu` (D261), on that vCPU as its machine
-    /// ends: what its host model's records hold of its count then, for its refusal to say.
-    fn keep_refused(&self, vcpu: usize) -> Option<super::limits::Evidence> {
+    /// ends, and `refusal` beside the counts for D261's gate: what its host model's records hold
+    /// of its count then, for its refusal to say.
+    fn keep_refused(&self, vcpu: usize, refusal: super::limits::Refusal) -> Option<super::limits::Evidence> {
         let (records, file, vcpus) = self.take_records()?;
-        match super::limits::keep(file, vcpus, Outcome::Refused { vcpu }) {
+        match super::limits::keep_refusal(file, vcpus, vcpu, refusal) {
             Ok(all) => Some(records.evidence(vcpus, &all)),
             Err(e) => {
                 debug!("keeping its refusal in {}: {e}", records.file().display());
@@ -1469,15 +1476,22 @@ impl Drop for Running {
     }
 }
 
-fn check_vcpus(vcpus: u32) -> Result<(), String> {
-    if vcpus == 0 {
-        return Err("at least one vCPU is required".into());
+/// Why this host refuses a machine of `vcpus`, typed (`limits::VcpusRefused`: past its
+/// hypervisor's partition, or past its logical processors where its Hyper-V is nested, D261);
+/// none where it may start ([`max_vcpus`]). What `start` refuses it with, for a caller that
+/// expects this host's own refusal of a count, whichever it is.
+pub fn vcpus_refused(vcpus: u32) -> Result<Option<super::limits::VcpusRefused>, String> {
+    let partition = hv::max_vcpus().map_err(|e| e.to_string())?;
+    Ok(super::limits::vcpus_within(vcpus, partition, super::nested_processors()).err())
+}
+
+/// Whether a machine of `vcpus` may start here ([`vcpus_refused`]): refused, typed, where it
+/// may not.
+fn check_vcpus(vcpus: u32) -> Result<(), super::StartError> {
+    match vcpus_refused(vcpus)? {
+        None => Ok(()),
+        Some(refused) => Err(super::StartError::Vcpus(refused)),
     }
-    let max = max_vcpus()?;
-    if vcpus > max {
-        return Err(format!("{vcpus} vCPUs requested; this host supports {max}"));
-    }
-    Ok(())
 }
 
 /// Boots a VM. Returns [`super::StartError`] in place of the earlier `String`:
@@ -1582,10 +1596,12 @@ pub fn restore_reported(
     let snapshot::Pinned {
         snapshot: snap,
         memory: memory_file,
+        layer: kept_layer,
+        window_heads,
         path: generation,
         name,
     } = pinned;
-    check_vcpus(snap.config.vcpus)?;
+    check_vcpus(snap.config.vcpus).map_err(|refused| refused.to_string())?;
     let mut working_set = if cfg.prefetch {
         snapshot::read_working_set(&generation, machine::PAGE, guest_pages(&snap)).unwrap_or_else(|e| {
             warn!("{e}; restoring without prefetching it");
@@ -1604,13 +1620,12 @@ pub fn restore_reported(
     // Its writable layer (D190): the head as the snapshot kept it, and the restore's own
     // copy of its file system, this very generation's: the clone of it the restore was
     // given, or a copy made here into the file it was given, empty or a clone of another
-    // generation's. One the snapshot and the restore do not agree on is refused as the
-    // machine is checked (`check_hosts`).
-    let layer = match &cfg.layer {
-        Some(path) if snap.config.layer_mib > 0 => {
+    // generation's. The snapshot's own were opened as it was read, its template's files
+    // (`snapshot::Pinned`, D26). One the snapshot and the restore do not agree on is refused
+    // as the machine is checked (`check_hosts`).
+    let layer = match (&cfg.layer, kept_layer) {
+        (Some(path), Some((head, kept))) => {
             let at = |e: std::io::Error| format!("{}: its writable layer: {e}", generation.display());
-            let head = platform::open_beneath_input(&generation, &[snapshot::LAYER_HEAD]).map_err(at)?;
-            let kept = platform::open_beneath_input(&generation, &[snapshot::LAYER]).map_err(at)?;
             let file = platform::open_input(path, true).map_err(|e| format!("{}: {e}", path.display()))?;
             let len = kept.metadata().map_err(at)?.len();
             let given = file.metadata().map_err(at)?.len();
@@ -1621,25 +1636,18 @@ pub fn restore_reported(
                 // Written back as it restores, ahead of its run, rather than as the VM lets
                 // go of the file, where its host waits to read what its run left (macOS, PM
                 // M278), on a thread of its own: the restore goes on.
-                platform::write_back_ahead(&file).map_err(at)?;
+                shards_durable::ahead(&file, |e| crate::debug!("writing back: {e}")).map_err(at)?;
             }
             Some(Arc::new(pmem::Layer::restore(head, file)?))
         }
-        Some(path) => {
+        (Some(path), None) => {
             return Err(format!(
                 "{}: a writable layer for a snapshot that has none",
                 path.display()
             ));
         }
-        None => None,
+        (None, _) => None,
     };
-    // Its DAX windows' heads (D189), as the snapshot kept them.
-    let window_heads = super::has_windows(&snap.config)
-        .then(|| {
-            platform::open_beneath_input(&generation, &[snapshot::WINDOW_HEADS])
-                .map_err(|e| format!("{}: its DAX windows' heads: {e}", generation.display()))
-        })
-        .transpose()?;
     let machine = machine::restore(
         &snap,
         &memory_file,
@@ -1929,6 +1937,8 @@ fn vcpu_thread(
             None
         }
     };
+    // Whether its state is a snapshot's, which the VMM restores (D261's gate, [`Entered`]).
+    let restored = matches!(start, machine::VcpuStart::Restore { .. });
     // Its part of the start goes with its setup.
     let (mut vcpu, set_up) = match machine::setup_vcpu(vm, index, start) {
         Ok(v) => v,
@@ -1965,6 +1975,12 @@ fn vcpu_thread(
     if index == 0 {
         let _ = sh.entered_at_us.set(crate::log::uptime_us());
     }
+    // Its way to its machine's devices, which tells D261's gate whether its guest has run.
+    let entered = Entered {
+        io,
+        own: AtomicBool::new(false),
+        machine: &sh.ran,
+    };
     loop {
         if sh.exiting() {
             return;
@@ -1974,21 +1990,78 @@ fn vcpu_thread(
         if sh.hold.wait(&|| sh.exiting() || sh.snapshot.requested()) {
             vcpu.went_on();
         }
-        match vcpu.run(io) {
+        match vcpu.run(&entered) {
             Ok(hv::Exit::Canceled) => sh.park_for_snapshot(index, &vcpu),
             Ok(hv::Exit::Shutdown) => return sh.stop(ExitReason::PowerOff),
             Ok(hv::Exit::Reset) => return sh.stop(ExitReason::Reset),
             Ok(hv::Exit::Refused(reason)) => {
-                let evidence = sh.keep_refused(index);
+                let refusal = super::limits::Refusal::now(entered.ran(restored));
+                let evidence = sh.keep_refused(index, refusal);
                 return sh.stop(ExitReason::Refused(super::limits::EntryRefused {
                     vcpu: index,
                     reason,
+                    refusal,
                     host: super::limits::HostModel::here(),
                     evidence,
                 }));
             }
             Err(e) => return sh.stop(ExitReason::Error(format!("vCPU {index}: {e}"))),
         }
+    }
+}
+
+/// A vCPU's way to its machine's devices that tells D261's gate whether its guest has run
+/// (`limits::Refusal::entered`): port and memory-mapped I/O come only of a guest's own
+/// instructions, so its host had entered whatever made one. Kept for the vCPU and for its
+/// machine ([`Shared::ran`]). The VMM sets a booted machine's vCPUs' state before any of them
+/// runs (their CPUID, the boot vCPU's registers), so once one has run, its host had entered
+/// the state the VMM gave each; a restored vCPU's state is its own, and only its own I/O
+/// counts.
+struct Entered<'a> {
+    io: &'a dyn hv::Io,
+    own: AtomicBool,
+    machine: &'a AtomicBool,
+}
+
+impl Entered<'_> {
+    /// An exit only the guest's own instructions make, seen.
+    fn saw(&self) {
+        if !self.own.load(Ordering::Relaxed) {
+            self.own.store(true, Ordering::Relaxed);
+            self.machine.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether its guest had run, as D261's gate reads it: on this vCPU, or, unless it was
+    /// `restored`, on any of its machine's.
+    fn ran(&self, restored: bool) -> bool {
+        self.own.load(Ordering::Relaxed) || (!restored && self.machine.load(Ordering::Relaxed))
+    }
+}
+
+impl hv::Io for Entered<'_> {
+    fn mmio_read(&self, addr: u64, data: &mut [u8]) {
+        self.saw();
+        self.io.mmio_read(addr, data);
+    }
+
+    fn mmio_write(&self, addr: u64, data: &[u8]) {
+        self.saw();
+        self.io.mmio_write(addr, data);
+    }
+
+    fn pio_read(&self, port: u16, data: &mut [u8]) {
+        self.saw();
+        self.io.pio_read(port, data);
+    }
+
+    fn pio_write(&self, port: u16, data: &[u8]) {
+        self.saw();
+        self.io.pio_write(port, data);
+    }
+
+    fn memory_fault(&self, gpa: Option<u64>) -> bool {
+        self.io.memory_fault(gpa)
     }
 }
 

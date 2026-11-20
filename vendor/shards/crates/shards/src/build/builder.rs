@@ -351,8 +351,11 @@ pub struct Boot<'a> {
     /// The most memory the builder may have, in MiB: it boots with `boot_mib` of it, and
     /// the rest is plugged as the build needs it (D133).
     pub memory_mib: u64,
-    /// What it boots with, in MiB: what its home learned its guest needs to boot, else all
-    /// it may have (`build::builder_boot`, memory-15).
+    /// What it boots with, in MiB: what its home learned its guest needs to boot; with
+    /// nothing learned, all it may have where its host charges guest RAM as it is touched
+    /// (Unix), and the least a guest of its architecture boots in where it charges it as it
+    /// is reserved (Windows), the rest plugged as its build needs (`build::builder_boot`,
+    /// memory-15, D133).
     pub boot_mib: u64,
     /// Its guest's identity in its home's record (`build::builder_identity`).
     pub identity: &'a str,
@@ -639,10 +642,12 @@ fn dialed(vm: &shards_ipc::Child, listener: &UnixListener) -> Result<UnixStream,
                             }
                             return Err(format!(
                                 "the builder did not start: it ran nothing for {:?}, past the \
-                                 slowest boot seen ({:?}), {:?} after it began",
+                                 slowest boot seen ({:?}) and its spread ({:?}), {:?} after it began{}",
                                 stall.over(),
                                 stall.slowest(),
-                                began.elapsed()
+                                stall.spread(),
+                                began.elapsed(),
+                                stall.account()
                             ));
                         }
                         // Unreadable while it lives: never taken for no progress.
@@ -1605,9 +1610,11 @@ impl Drop for Builder {
         super::end(&self.conn);
         if let VmEnd::Stalled(stall) = follow_to_end(&self.vm, &ENDED) {
             shards_vmm::debug!(
-                "the builder's VM ran nothing over {:?} after its guest was told to power off, past the slowest builder end seen, {:?}: killed",
+                "the builder's VM ran nothing over {:?} after its guest was told to power off, past the slowest builder end seen, {:?}, and its spread, {:?}: killed{}",
                 stall.over(),
-                stall.slowest()
+                stall.slowest(),
+                stall.spread(),
+                stall.account()
             );
         }
         // The network process goes with its VM; its directory, a field, after this.
@@ -1635,7 +1642,7 @@ mod tests {
     #[cfg(unix)]
     fn learned(slowest: Duration) -> Record {
         let record = Record::new();
-        record.teach(slowest, slowest / 1000);
+        record.teach(slowest, shards_api::Work::of_cpu(slowest / 1000));
         record
     }
 
@@ -1650,14 +1657,22 @@ mod tests {
     fn a_builders_vm_is_followed_to_its_end_while_it_goes_on() {
         let dir = shards_testdir::TempDir::new("builder-end").unwrap();
         let cold = Record::new();
-        let slow = sh("exec /bin/sleep 6", &dir);
+        // Read before its stand-in is made, whose 6 s run from no sooner than this. Read after
+        // it, the stand-in's sleep may begin first, this thread descheduled between the two
+        // (CI 44245219858, aarch64 musl: 5.998 s).
         let began = Instant::now();
+        let slow = sh("exec /bin/sleep 6", &dir);
+        let following = Instant::now();
         assert!(matches!(follow_to_end(&slow, &cold), VmEnd::Exited));
         assert!(began.elapsed() >= Duration::from_secs(6), "{:?}", began.elapsed());
+        // Its end learned: no more than the follow waited, whose clock starts inside
+        // `follow_to_end`. It has no lower bound to hold: the stand-in's sleep begins as its
+        // spawn runs it, before or after that clock starts, so the follow sees less of its 6 s
+        // by as long as this thread took to reach it, which nothing here bounds.
         let shards_api::Seen::Learned { slowest, .. } = cold.seen() else {
             panic!("its own end taught nothing");
         };
-        assert!(slowest >= Duration::from_secs(6), "{slowest:?}");
+        assert!(slowest <= following.elapsed(), "{slowest:?}");
         let slowest = Duration::from_millis(200);
         let record = learned(slowest);
         // Busy, as one writing its disks back is, until its file comes: then it ends.

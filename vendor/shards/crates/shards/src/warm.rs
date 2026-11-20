@@ -601,6 +601,8 @@ pub fn receive(
     } else {
         None
     };
+    // Its layer's word owed its daemon from here ([`LAYER_OWED`]).
+    LAYER_OWED.store(layer_out.is_some(), std::sync::atomic::Ordering::SeqCst);
     // Its swap (D159), a sparse file of what its limits allow.
     let swap = if flags & shards_ipc::RUN_SWAP != 0 {
         Some(File::from(next()?))
@@ -834,7 +836,8 @@ enum Run {
     Going,
     /// Its end told ([`Taken::end`]), its layer still to keep or send: from here its daemon
     /// lets go of its link once done with it, its layer settled and its joiners ended, and goes
-    /// on.
+    /// on. What remains of its run past here, its layer's word and its joiners, serves its
+    /// daemon alone.
     Told,
     /// Its end had: told, its layer kept or sent as asked ([`run_over`]). Its machine goes on
     /// only for what its guest serves past it: its joiners (D119).
@@ -845,14 +848,16 @@ enum Run {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Daemon {
     There,
-    /// A link of its closed while the run on it went on, which a daemon that goes on closes
-    /// only past that run's end: nothing reaches a run of this VM again.
+    /// A link of its closed while it still followed the run on it ([`Course::shows_gone`]),
+    /// which a daemon that goes on closes only once done with that run: nothing reaches a run
+    /// of this VM again.
     Gone,
 }
 
-/// This VM's course: its run's and its daemon's. Its machine ends once its run's end is had and
+/// This VM's course: its run's and its daemon's. Its machine ends once its run's end is told and
 /// its daemon has gone ([`Course::ends`]), whatever its guest keeps up past that end, which no
-/// one can reach then: a joiner its guest serves (D119), and anything else its guest waits on.
+/// one can reach then: its layer's ask, which serves its daemon alone, a joiner its guest serves
+/// (D119), and anything else its guest waits on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Course {
     run: Run,
@@ -891,11 +896,27 @@ impl Course {
         }
     }
 
-    /// Its machine ends: its run's end had, and its daemon gone.
+    /// Its machine ends: its run's end told, and its daemon gone. Its layer's word is not
+    /// waited for: it is its daemon's, and an ask its guest never answers would hold the
+    /// machine for ever (CI 44077430171).
     fn ends(self) -> bool {
-        self.run == Run::Over && self.daemon == Daemon::Gone
+        self.run != Run::Going && self.daemon == Daemon::Gone
+    }
+
+    /// Whether its own link to its daemon closing shows its daemon gone: while its run goes on,
+    /// or while its daemon still follows it for its layer's word (`layer_owed`, [`LAYER_OWED`]).
+    /// A daemon that goes on lets go of a run's link only once done with it, its end taken and
+    /// its layer settled; one that ends closes every link, whatever it still waited on.
+    fn shows_gone(self, layer_owed: bool) -> bool {
+        self.run == Run::Going || layer_owed
     }
 }
+
+/// Whether this VM owes its daemon its run's layer's word (D37, D190), for which its daemon
+/// follows its link past the run's end: from the run's taking, where it asks for the layer, to
+/// the word that it is sent (`layer_saved`). A layer kept in its file is said once its machine
+/// is down (`tell_kept`), and is owed until then.
+static LAYER_OWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// One run a VM process (M34), and so one course.
 static COURSE: std::sync::Mutex<Course> = std::sync::Mutex::new(Course::START);
@@ -922,7 +943,7 @@ fn course(event: Event, only: impl FnOnce(Course) -> bool) -> Course {
     if after.ends() && !before.ends() {
         let _ = writeln!(
             io::stderr(),
-            "shards: its daemon gone and its run's end had: its microVM ends"
+            "shards: its daemon gone and its run's end told: its microVM ends"
         );
         crate::vm_run::stop();
     }
@@ -930,7 +951,8 @@ fn course(event: Event, only: impl FnOnce(Course) -> bool) -> Course {
 }
 
 /// The run's end had: told, and its layer kept or sent as asked. Where its daemon has gone, its
-/// machine ends here, whatever its guest serves past that end (D26, D119): whether it does.
+/// machine has ended as its end was told, or ends here, whatever its guest serves past that end
+/// (D26, D119): whether it does.
 pub fn run_over() -> bool {
     course(Event::Over, |_| true).after(Event::Over).ends()
 }
@@ -1402,10 +1424,14 @@ fn relay_signals(conn: &UnixStream, to: &'static ToGuest, from: From<'_>) {
         course(Event::DaemonGone, |_| true);
     }
     // The daemon gone with the run going: its stop, so that no run outlives its daemon
-    // unreachable ([`stop_orphaned`]), and its machine's end once its end is had ([`Course`]).
+    // unreachable ([`stop_orphaned`]), and its machine's end once its end is told ([`Course`]).
     // Past its end told, its daemon lets go of the link once done with it and goes on: what
-    // then shows it gone is its joiners' links, above.
-    if matches!(from, From::Daemon(_)) && course(Event::DaemonGone, |c| c.run == Run::Going).run == Run::Going
+    // then shows it gone is the link's closing while its layer's word is owed, and its joiners'
+    // links, above. A daemon that ends settles no layer still to come: CI 44077430171's
+    // (x86_64 musl, containers.rs `run_limits_a_microvms_resources`) went as its home was
+    // removed, and its microVM, past its end told, its layer's ask unanswered, ran on.
+    let owed = LAYER_OWED.load(std::sync::atomic::Ordering::SeqCst);
+    if matches!(from, From::Daemon(_)) && course(Event::DaemonGone, |c| c.shows_gone(owed)).run == Run::Going
     {
         let _ = writeln!(io::stderr(), "shards: the daemon is gone: the run stops");
         stop_orphaned(to, order);
@@ -1629,21 +1655,23 @@ pub fn joined() -> bool {
     JOINED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Waits, up to `within`, until every joiner this VM served has told the daemon its end:
-/// as the VM ends, the guest has ended them all, and each says so on its own connection.
-pub fn await_joiners(within: std::time::Duration) {
+/// Waits, up to `within`, until every joiner this VM served has told the daemon its end and
+/// its layer's word: as the VM ends, the guest has ended them all, and each says so on its
+/// own connection. How many had not by then, whose links close with this process.
+pub fn await_joiners(within: std::time::Duration) -> usize {
     let mut count = JOINERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let deadline = std::time::Instant::now() + within;
     while *count > 0 {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return;
+            break;
         }
         count = JOINER_ENDED
             .wait_timeout(count, left)
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .0;
     }
+    *count
 }
 
 /// Takes the joiner the daemon's `JOIN` brings (D119): its own connection to the daemon,
@@ -1850,22 +1878,30 @@ fn joiner(link: &UnixStream, range: Result<(u64, u64), String>, to: &'static ToG
             },
         );
         // Its writable layer, kept as it stops once its end is told, as a run's (D37):
-        // where its command started, and so its root was built.
-        if let (Ok(e), Some(mut conn), Some(out)) = (&ended, conn, layer_out)
-            && e.not_run.is_none()
-        {
-            match workload::receive_layer(&mut conn, out) {
+        // where its command started, and so its root was built. One that will not come is
+        // said in its word's place, with why (`LAYER_LOST`). Its guest's connection goes
+        // here, asked of or not.
+        let came = match (layer_out, &ended, conn) {
+            (None, ..) => None,
+            (Some(out), Ok(e), Some(mut conn)) if e.not_run.is_none() => Some(
+                workload::receive_layer(&mut conn, out).map_err(|err| format!("saving its files: {err}")),
+            ),
+            (Some(_), Ok(_), _) => Some(Err("its command never ran".to_string())),
+            (Some(_), Err(e), _) => Some(Err(format!("its run failed: {e}"))),
+        };
+        if let Some(came) = came {
+            let _ = match came {
                 Ok(used) => {
                     let payload = used.map(u64::to_be_bytes);
-                    let _ = to_daemon(
+                    to_daemon(
                         link,
                         kind::LAYER_SAVED,
                         payload.as_ref().map_or(&[][..], |p| p),
                         &[],
-                    );
+                    )
                 }
-                Err(e) => shards_vmm::debug!("saving a joiner's files: {e}"),
-            }
+                Err(why) => to_daemon(link, kind::LAYER_LOST, why.as_bytes(), &[]),
+            };
         }
         // Its connection's reads end here, whatever the daemon does with its end.
         shards_ipc::end(link);
@@ -2504,6 +2540,15 @@ pub fn layer_saved(link: &Link, used: Option<u64>) {
         payload.as_ref().map_or(&[][..], |p| p),
         &[],
     );
+    // Said: its daemon, done with it, may let go of its link from here ([`Course::shows_gone`]).
+    LAYER_OWED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Tells the daemon the microVM's writable layer it asked for will not come as asked, and
+/// why (`LAYER_LOST`): its word, in [`layer_saved`]'s or [`tell_kept`]'s place.
+pub fn layer_lost(link: &Link, why: &str) {
+    let _ = to_daemon(&link.daemon, kind::LAYER_LOST, why.as_bytes(), &[]);
+    LAYER_OWED.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// The daemon's word that the microVM's writable layer stays in its own file (D190),
@@ -2777,11 +2822,13 @@ mod tests {
     }
 
     /// Do take a VM's course through its run's end told, its end had and its daemon's going, in
-    /// every order. Expect: its machine ends at the one move that brings both its end had and
-    /// its daemon gone, never before and only once, and its run never goes back: an end told
+    /// every order. Expect: its machine ends at the one move that brings both its end told (by
+    /// `Told` or `Over`, whichever comes first) and its daemon's going, never before and only
+    /// once, its layer's word unwaited for (CI 44077430171: a guest that never answered its
+    /// layer's ask held its microVM past its daemon); and its run never goes back: an end told
     /// after it was had leaves it had (D26).
     #[test]
-    fn a_vms_machine_ends_once_its_run_is_over_and_its_daemon_gone() {
+    fn a_vms_machine_ends_once_its_runs_end_is_told_and_its_daemon_gone() {
         use Event::{DaemonGone, Over, Told};
         let orders = [
             [Told, Over, DaemonGone],
@@ -2802,11 +2849,40 @@ mod tests {
                 }
                 course = next;
             }
-            let at = |e: Event| order.iter().position(|o| *o == e);
-            assert_eq!(ended_at, [at(Over).max(at(DaemonGone)).unwrap()], "{order:?}");
+            let at = |e: Event| order.iter().position(|o| *o == e).unwrap();
+            assert_eq!(
+                ended_at,
+                [at(Told).min(at(Over)).max(at(DaemonGone))],
+                "{order:?}"
+            );
             assert!(course.ends(), "{order:?}: {course:?}");
         }
         assert!(!Course::START.ends());
+        assert!(
+            !Course::START.after(DaemonGone).ends(),
+            "its run going: its stop first"
+        );
+    }
+
+    /// Do close a VM's own link to its daemon at each point of its course, its layer's word owed
+    /// or not. Expect: the daemon shown gone while the run goes on, and past its end told while
+    /// the word is owed, as its daemon still followed it then (CI 44077430171: a daemon whose home
+    /// was removed ended with a microVM's layer still to come, and the microVM, its end told,
+    /// waited on its guest's answer for ever); not where the word was said, a daemon done with
+    /// the run letting go of its link and going on.
+    #[test]
+    fn a_daemons_link_closing_shows_it_gone_while_it_follows_the_run() {
+        use Event::{DaemonGone, Over, Told};
+        let going = Course::START;
+        let told = going.after(Told);
+        let over = told.after(Over);
+        assert!(going.shows_gone(false) && going.shows_gone(true));
+        assert!(told.shows_gone(true));
+        assert!(!told.shows_gone(false), "its word said: the daemon let go of it");
+        assert!(over.shows_gone(true));
+        assert!(!over.shows_gone(false));
+        // Its end told, its word owed, its daemon gone: its machine ends there and then.
+        assert!(told.after(DaemonGone).ends());
     }
 
     /// A side [`pass`] reads: its bytes, then how it ends (`Ok(0)`, its writes' end, or an

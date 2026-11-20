@@ -332,7 +332,7 @@ fn host(answers: &Answers) -> Result<(), No> {
     hosted::run(answers, &request, ready_by, input, served)
 }
 
-/// The streams of the run's shares another server serves (D286), one for each of `request`'s,
+/// The streams of the run's shares another server serves (D287), one for each of `request`'s,
 /// in its order: on Unix those its orchestrator sent on this process's links socket before its
 /// request (`kind::SERVED_SHARES`), each a socket; refused `Request` where fewer came whole, more
 /// came, a message of another kind came first, or the request names a handle, which no Unix
@@ -718,7 +718,7 @@ struct Given {
 }
 
 /// Each share `request` gives members as they start (D277), its shares another server serves
-/// among them (D286): each member one the image declares that runs, or every such member for one
+/// among them (D287): each member one the image declares that runs, or every such member for one
 /// given to every member; refused by name otherwise, as a staged member is.
 fn share_members(request: &wire::Request, members: &[wire::MemberInfo]) -> Result<Vec<Given>, No> {
     let places = request
@@ -3395,7 +3395,7 @@ mod hosted {
         /// The host directories its shares give its guest, canonical: where no save of it is
         /// made (D259).
         reached: Vec<PathBuf>,
-        /// It has shares another server serves (D286), whose state that server keeps: no save of
+        /// It has shares another server serves (D287), whose state that server keeps: no save of
         /// it is made.
         served: bool,
         /// Its GPU report's scope, where its orchestrator asked for one (D233).
@@ -3405,7 +3405,7 @@ mod hosted {
     }
 
     /// The run `request`, its deadline `ready_by`, its shares another server serves on `served`
-    /// (D286, [`super::served_streams`]), on a host of its own.
+    /// (D287, [`super::served_streams`]), on a host of its own.
     pub(super) fn run(
         answers: &Answers,
         request: &wire::Request,
@@ -3679,7 +3679,7 @@ mod hosted {
             let cpu_baseline = crate::daemon::home_baseline(home);
             let share_window_mib =
                 crate::daemon::share_window_mib(&|line| say(line)).map_err(no(Cause::Boot))?;
-            // Its shares another server serves (D286) have their slots after these (`plan`).
+            // Its shares another server serves (D287) have their slots after these (`plan`).
             let shares = opened
                 .dirs
                 .len()
@@ -3745,7 +3745,7 @@ mod hosted {
         Ok((shaped, layering))
     }
 
-    /// The run's shares another server serves (D286) given the share slots after its own in
+    /// The run's shares another server serves (D287) given the share slots after its own in
     /// `opened`, one for each of `asked`, in order: each slot's descriptor its stream from
     /// `streams`, which the run's share process hands its VM as it is (share.rs, as it hands a
     /// client's relay on Unix, D228; on Windows its VM's end itself, [`start_shares`]), and its
@@ -3855,7 +3855,7 @@ mod hosted {
         // output, what it stages, its members' ends asked for, and its own command or
         // `ATTEND`.
         let (_, _, most) = crate::run::sizes(&run.resources, crate::build::host_memory());
-        // Its shares another server serves (D286), in the slots after its own shares'.
+        // Its shares another server serves (D287), in the slots after its own shares'.
         served_slots(&mut opened, &request.served, served)?;
         // The shares it gives members as they start (D277), told in their entries.
         let given = super::share_members(request, &members)?;
@@ -4064,7 +4064,7 @@ mod hosted {
     /// The run's share process (share.rs), and what of it its VM is handed: on Unix its
     /// connection, on which it hands the VM each share's stream; on Windows each share's
     /// stream itself (D197), sent after the run's request, a share another server serves
-    /// (D286) its own stream, and no share process where every share is such a one.
+    /// (D287) its own stream, and no share process where every share is such a one.
     struct Shares {
         #[cfg(unix)]
         child: shards_ipc::Child,
@@ -4635,7 +4635,10 @@ mod hosted {
     ) -> Result<Shares, String> {
         let exe = std::env::current_exe().map_err(|e| format!("this binary: {e}"))?;
         let (door, share) = Stream::pair().map_err(|e| format!("the share process's connection: {e}"))?;
+        // Where its servers declare their durable writes (D286): this run's home.
+        let durable = crate::helpers::durable_words()?;
         let mut args: Vec<&OsStr> = vec![OsStr::new("share")];
+        args.extend(durable.iter().map(OsString::as_os_str));
         // Its notices of what its host changes (D235), on a pipe past its others.
         let told = tags.filter(|t| t.len() == dirs.len()).map(|t| t.join(","));
         let notices = match &told {
@@ -4683,7 +4686,7 @@ mod hosted {
     /// the home's private directory at 4 + n and each share's end of its stream at
     /// 5 + n + i, as its Unix twin is numbered; made in the run's job, detached from the
     /// console, out of reach of a Ctrl-C meant for this process's owner. A share another
-    /// server serves (D286) comes as its stream's pipe, which the VM is handed as it is, in its
+    /// server serves (D287) comes as its stream's pipe, which the VM is handed as it is, in its
     /// place, and the share process serves none of; none is started where every share is
     /// such a one, as the daemon starts none for clients' relays (daemon.rs `started_shares`,
     /// D228; a pipe's handle told from a directory's by GetFileType).
@@ -4730,7 +4733,10 @@ mod hosted {
             .map(|_| crate::os::share_pipe())
             .collect::<io::Result<Vec<_>>>()
             .map_err(|e| format!("a share's stream: {e}"))?;
+        // Where its servers declare their durable writes (D286): this run's home.
+        let durable = crate::helpers::durable_words()?;
         let mut args: Vec<&OsStr> = vec![OsStr::new("share")];
+        args.extend(durable.iter().map(OsString::as_os_str));
         // Its notices of what its host changes (D235), on a pipe past its others.
         let told = served_tags.join(",");
         let notices = if tags.is_some() && served_tags.len() == served_here.len() {
@@ -6756,7 +6762,7 @@ mod hosted {
         pause_asks: Mutex<Option<Vec<Asked<Unheld>>>>,
         /// The host directories its shares give its guest, canonical (D259).
         reached: &'a [PathBuf],
-        /// It has shares another server serves (D286): no save of it is made.
+        /// It has shares another server serves (D287): no save of it is made.
         served: bool,
         /// What its own lanes of its agent-control endpoint are served with, where its
         /// orchestrator asked for the endpoint (D238, D252, D254).
@@ -7880,7 +7886,7 @@ mod hosted {
                 return Err(e);
             }
         };
-        // No served share's stream (D286): its share process started before its run asked, so a
+        // No served share's stream (D287): its share process started before its run asked, so a
         // run naming one is another microVM's than this one (its exemplar's check above), and
         // one this host's exemplar names is refused by `served_slots` for its streams' want.
         let plan = match plan(&request, ready_by, shaped, Vec::new()) {
@@ -9810,7 +9816,7 @@ mod hosted {
                 "this host's microVMs take no snapshots".into(),
             ));
         }
-        // A share another server serves (D286) keeps its state in that server, which a snapshot
+        // A share another server serves (D287) keeps its state in that server, which a snapshot
         // holds none of: its guest restored would ask it of a server that never answered it.
         if live.served {
             return Err((
@@ -10442,7 +10448,7 @@ mod hosted {
             OwnedFd::from(std::fs::File::open(&at).unwrap())
         }
 
-        /// D286. Do: give a run with one share of its own two served shares, the first read-only
+        /// D287. Do: give a run with one share of its own two served shares, the first read-only
         /// at a place to be cleaned, the second whose files may not be run. Expect: each takes
         /// the slot after the run's own (`shards1`, `shards2`), its descriptor its stream,
         /// read-only as asked, its entry mounting it at its place, clean, as a bind's is (`ro`,
@@ -13433,7 +13439,7 @@ mod hosted {
             bridges.close();
         }
 
-        /// D286. Do: ask a save of a run that has a share another server serves. Expect: refused
+        /// D287. Do: ask a save of a run that has a share another server serves. Expect: refused
         /// `Unsupported`, where this host's microVMs take snapshots in the words naming that
         /// share's server, and nothing made where it was asked.
         #[test]
@@ -14238,7 +14244,7 @@ mod tests {
         );
     }
 
-    /// D286 beside D277: a share another server serves is given its members as a share is, and
+    /// D287 beside D277: a share another server serves is given its members as a share is, and
     /// is no `-v` bind. Do: give a run a share to every member that runs and a served share to
     /// its harness by name. Expect: no bind but the share's, and each given its harness by its
     /// index, the share's first. Do: give a served share to the agent of files alone, and to

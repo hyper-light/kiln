@@ -15,7 +15,7 @@ impl OwnerId {
 }
 fn next(counter: &AtomicU64) -> Result<u64, MemoryError> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
             value.checked_add(1)
         })
         .map_err(|_| MemoryError::CounterExhausted("owner identity"))?

@@ -45,7 +45,7 @@
 //!
 //! Explicit inputs only, each by its own variable; a missing one fails by name. Run alone, `--ignored`: on Linux
 //! inside a cgroup delegated to this binary (`HEX_DELEGATED`); with image_real's node inputs (`SHARDS_BIN`, Hex's
-//! `shards`, `scripts/shards-gpu/build.sh`'s at the Shards revision vendor/shards pins, whose run host speaks the image
+//! `shards`, Shards' own release at the revision Hex's Cargo.toml pins, whose run host speaks the image
 //! channel the node's vendored API writes; `SHARDS_KERNEL` and `SHARDS_INIT`, the kernel the run hosts boot and the
 //! init beside it, which Shards takes together, the init that same `shards` build carries (build.sh's
 //! `shards-init`); the node's `HEX_GUEST_*`, `HEX_IMAGE_CPU_MILLI`, `HEX_IMAGE_MEMORY_BYTES`, `HEX_IMAGE_WORK`, a
@@ -676,29 +676,75 @@ fn a_publish_reaching_the_runs_own_command_stops_it(
     client.delete(&id).unwrap();
 }
 
-/// The probe's arguments for three targets: a listener of this test's, a port nothing holds and a name RFC 6761 §6.4
-/// reserves as never resolving, the probe listening at the host's loopback on a port the OS picks.
-/// The closed target's port: a listener of this test's on a port below the range this host gives a connection's source
-/// port and a bind to port 0 from ([`ephemeral_first`]), held while the probe binds its own listener and let go
-/// (dropped) just before the probe connects to its targets. No bind to port 0 is given it, the probe's own listener's
-/// among them, and no connection takes it as its source port and meets itself: a port from bind(0) let go could be
-/// both (goal 5's r878 on Linux; ROOT's macOS gate at 45fc1605, where the probe's connection was given the port just let
-/// go, the one after its open target's, and met itself: "closed connected"). Held without listening it would do no
-/// better: macOS drops a connection to a port bound but not listening, so it times out, never refused.
-fn closed_port() -> TcpListener {
-    // Each port picked once in this process, so a test running beside another never binds the port the other let go
+/// The closed target's port, held to the test's end ([`closed_port`]): its address, and what holds it.
+///
+/// The port is below the range this host gives a connection's source port and a bind to port 0 from
+/// ([`ephemeral_first`]). So no bind to port 0 is given it, the probe's own listener's among them, and no connection takes
+/// it as its source port and meets itself, as a port from bind(0) could be both (goal 5's r878 on Linux; ROOT's macOS gate
+/// at 45fc1605, where the probe's connection was given the port just let go, the one after its open target's, and met
+/// itself: "closed connected").
+///
+/// It's held by a socket bound to it (without SO_REUSEADDR) and connected to a listener of this test's, so it never
+/// listens there. A listener held there and let go (dropped) just before the probe connected left the port to whatever
+/// took it first (r798, Hex 071934813 on macOS: "egress closed 127.0.0.1:49151 connected"). A connection to a port held
+/// so is refused on each OS, by a reset, since no socket listens there and none takes the connection:
+/// - Linux: a connected socket is no listener (listen(2): `listen()` marks a socket passive, "a socket that will be used
+///   to accept incoming connection requests"); connect(2): "ECONNREFUSED: A connect() on a stream socket found no one
+///   listening on the remote address."
+/// - macOS: an incoming connection's socket is looked up by its four addresses, then among unconnected sockets alone
+///   (XNU, apple-oss-distributions/xnu main read 2026-11-17: bsd/netinet/in_pcb.c `in_pcblookup_hash`, lines 2569-2627).
+///   With none found it is answered by a reset, "closed port" (bsd/netinet/tcp_input.c, lines 3119-3120). connect(2):
+///   "[ECONNREFUSED] The attempt to connect was ignored (because the target is not listening for connections) or
+///   explicitly rejected." A socket bound there and neither listening nor connected would be found in state CLOSED, and
+///   the connection dropped unanswered (tcp_input.c, lines 3195-3198: "tp state TCPS_CLOSED"): it would time out, never
+///   be refused.
+/// - Windows: no socket listens there (listen: "places a socket in a state in which it is listening for an incoming
+///   connection"); WSAECONNREFUSED (10061, Windows Sockets Error Codes): "No connection could be made because the
+///   target computer actively refused it. This usually results from trying to connect to a service that is inactive on
+///   the foreign host—that is, one with no server application running."
+///
+/// While it's held, a bind of its address by another socket is refused (EADDRINUSE; WSAEADDRINUSE). Only a socket asking
+/// to share the port could still take it: on macOS a wildcard bind with SO_REUSEADDR, on Windows a bind with
+/// SO_REUSEADDR. That takes a program binding this very port by number; nothing that binds port 0 or connects does it.
+struct Closed {
+    at: SocketAddr,
+    _held: socket2::Socket,
+    _peer: (TcpListener, TcpStream),
+}
+
+/// The closed target's port ([`Closed`]): the highest below this host's ephemeral range that a socket of this test's
+/// binds, then connects from to a listener of this test's.
+fn closed_port() -> Closed {
+    // Each port picked once in this process, so a test running beside another never binds the port the other holds
     // for its probe to find closed.
     static PICKED: std::sync::Mutex<std::collections::BTreeSet<u16>> =
         std::sync::Mutex::new(std::collections::BTreeSet::new());
     let first = ephemeral_first();
     let mut picked = PICKED.lock().unwrap();
-    let listener = (1..first)
+    let (held, at) = (1..first)
         .rev()
         .filter(|port| !picked.contains(port))
-        .find_map(|port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).ok())
+        .find_map(|port| {
+            let at = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            let held = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .ok()?;
+            held.bind(&at.into()).ok()?;
+            Some((held, at))
+        })
         .unwrap_or_else(|| panic!("no port below this host's ephemeral range, {first}, is free"));
-    picked.insert(listener.local_addr().unwrap().port());
-    listener
+    picked.insert(at.port());
+    let peer = TcpListener::bind("127.0.0.1:0").unwrap();
+    held.connect(&peer.local_addr().unwrap().into()).unwrap();
+    let (accepted, _) = peer.accept().unwrap();
+    Closed {
+        at,
+        _held: held,
+        _peer: (peer, accepted),
+    }
 }
 
 /// The first port of the range this host gives a connection's source port and a bind to port 0 from, as its OS is
@@ -739,8 +785,10 @@ fn ephemeral_first() -> u16 {
         .unwrap_or_else(|| panic!("no first ephemeral port in {said:?}"))
 }
 
-fn three_targets(open: &TcpListener, closed: &TcpListener) -> Vec<std::ffi::OsString> {
-    let closed = closed.local_addr().unwrap();
+/// The probe's arguments for three targets: a listener of this test's, a port nothing listens on ([`Closed`]) and a name
+/// RFC 6761 §6.4 reserves as never resolving, the probe listening at the host's loopback on a port the OS picks.
+fn three_targets(open: &TcpListener, closed: &Closed) -> Vec<std::ffi::OsString> {
+    let closed = closed.at;
     [
         "--address".to_owned(),
         "127.0.0.1".to_owned(),
@@ -758,7 +806,7 @@ fn three_targets(open: &TcpListener, closed: &TcpListener) -> Vec<std::ffi::OsSt
 }
 
 /// Joint plan step 15 (the probe, no VM): do start the probe at the host's loopback with three targets, a listener of
-/// this test's, a port nothing holds and a name RFC 6761 §6.4 reserves as never resolving, then connect to it. Expect
+/// this test's, a port nothing listens on and a name RFC 6761 §6.4 reserves as never resolving, then connect to it. Expect
 /// its answer to read back typed: the port it came in on, then each target in turn, connected, refused and
 /// unresolved. Each target is answered by this host's own TCP stack and resolver (a listener, a closed port's reset,
 /// the resolver's answer), which the probe waits for, with no wait of its own: the test waits on those facts.
@@ -771,8 +819,6 @@ fn the_probe_answers_each_connection_with_its_targets_outcomes() {
     let [at] = started.at.as_slice() else {
         panic!("{:?}", started.at);
     };
-    // The probe's listener is bound: the closed target's port is let go now, before the probe connects to it.
-    drop(closed);
     let mut answer = String::new();
     TcpStream::connect(at)
         .unwrap()
@@ -794,8 +840,9 @@ fn the_probe_answers_each_connection_with_its_targets_outcomes() {
         ],
         "{answer}"
     );
-    // Its servers run on for the VM's life; this test's end ends them.
+    // Its servers run on for the VM's life; this test's end ends them. The closed target's port is held to here.
     drop(started.servers);
+    drop(closed);
 }
 
 /// Joint plan step 15 (the hand-over, no VM; R03): do ask a hand-over of a fake that answers `Lifecycle { Pending }`
@@ -859,7 +906,6 @@ fn the_probe_answers_each_line_on_its_stdin_with_its_targets_outcomes() {
     let open = TcpListener::bind("127.0.0.1:0").unwrap();
     let closed = closed_port();
     let told = probe::Told::read(&three_targets(&open, &closed)).unwrap();
-    drop(closed);
     let mut out = Vec::new();
     probe::answer("\nagain\n".as_bytes(), &mut out, &told.targets).unwrap();
     let text = String::from_utf8(out).unwrap();
@@ -885,6 +931,8 @@ fn the_probe_answers_each_line_on_its_stdin_with_its_targets_outcomes() {
             "{text}"
         );
     }
+    // The closed target's port is held to here, past the probe's answers.
+    drop(closed);
 }
 
 /// Joint plan step 15 (the probe, no VM): do write a report of every outcome, asked on a port and on the probe's

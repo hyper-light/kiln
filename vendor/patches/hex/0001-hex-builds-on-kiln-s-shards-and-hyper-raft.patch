@@ -1,5 +1,5 @@
 Subject: Hex builds on kiln's Shards and hyper-raft
-Why: kiln holds one copy of each project (docs/vendoring.md), with one record of its changes: Hex's records of hyper-raft's changes are kiln's (Hex's suite reading among them, kiln's 0005; its qlog and buffer-growth changes left for Hex and kiln to agree). Its hyper-raft and Shards pins are kiln's own (e0613f52, d993d83e) since Hex 414aa30d, so this change's pin parts dropped out as upstream's own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 16 and 17).
+Why: kiln holds one copy of each project (docs/vendoring.md), with one record of its changes: Hex's records of hyper-raft's changes are kiln's (Hex's suite reading among them, kiln's 0005; its qlog and buffer-growth changes left for Hex and kiln to agree). Its hyper-raft pin is kiln's own (e0613f52) since Hex 414aa30d, so this change's pin parts dropped out as upstream's own; Hex takes Shards' crates by git, which kiln's root [patch] points at kiln's copy (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 16 and 17).
 
 diff --git a/vendor/patches/hyper-raft/0001-hyper-transport-takes-hyper-quic-without-its-qlog-traces.patch b/vendor/patches/hyper-raft/0001-hyper-transport-takes-hyper-quic-without-its-qlog-traces.patch
 deleted file mode 100644

@@ -2526,6 +2526,14 @@ pub enum Command {
     /// egress grant, a network or a volume. Its session takes it as its own record, then its microVM and its harness,
     /// each as it can, and keeps it for its harness's every start.
     Override { change: super::overrides::Change },
+    /// Its environment replaced (docs/agents.md, "Environments"), then its harness started again on its
+    /// conversation unless `restart` is false: what kiln's server resolved, its secrets' values opened,
+    /// or none (the machine's user's environment). The server's alone: one from a client is refused.
+    Agentenv {
+        #[cfg_attr(test, ts(skip))]
+        agentenv: Option<super::agentenv::Resolved>,
+        restart: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -36,7 +36,6 @@ pub mod control;
 pub mod demand;
 pub mod host;
 pub mod image;
-mod judge;
 mod native;
 pub mod networks;
 pub mod physical;
@@ -63,12 +62,16 @@ pub use client::{
     prepare_boot, prepare_native_boot, recorded_console_bytes, recorded_console_bytes_at, vm_process_file,
 };
 pub use host::{CheckRefusal, HostCheck, Unusable, host_check};
-pub use judge::{Found, Judge, Rate, Rated, Record, Seen, Span, Stall};
+#[cfg(windows)]
+pub use native::app_container_records;
 pub use native::{
     ImageIdentity, NativeBoot, NativeImages, NativeStartup, release_app_containers, verify_native_image,
 };
 pub use physical::{GpuName, GpuProbe, GpuProbeError, PhysicalGpu, PhysicalGpuError, ResolvedGpu};
-pub use progress::{Awaited, Bound, Follow, Followed, Unfollowed, Watch, runnable_threads};
+pub use progress::{Awaited, Bound, Follow, Followed, Listing, Threads, Unfollowed, Watch, starved};
+pub use shards_judge::{Found, Judge, LOOKS_TO_REFUSE, Rate, Rated, Record, SPREAD, Seen, Span, Stall, Work};
+#[cfg(windows)]
+pub use shards_judge::{ThreadsHeld, threads_held};
 
 /// A guest to boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +412,9 @@ pub enum ProcessOperation {
     /// macOS: sysctl(3) of `kern.clockrate`, the clock tick in whose steps a VM process's
     /// CPU times show.
     ClockRate,
+    /// macOS: proc_pidinfo(3) `PROC_PIDT_SHORTBSDINFO` of a process whose exit has begun,
+    /// which tells an exit its kernel still does from one done, a zombie.
+    ProcBsdInfo,
     /// Windows: CreateToolhelp32Snapshot, a snapshot of the system's processes.
     Snapshot,
     /// Windows: Process32FirstW or Process32NextW, a snapshot's processes.
@@ -629,8 +635,9 @@ pub enum Refusal {
     Connect { port: u32, failure: HandshakeError },
     /// A wait that follows its guest's VM process ([`Guest::connect_while_runs`],
     /// [`Guest::wait_while_runs`]) found it stalled ([`Stall`]): it had run no CPU at all
-    /// over the time since the look before, a whole W*, the slowest answer of the wait's kind
-    /// this process has seen ([`Seen`]). The guest is not stopped: it is still its caller's.
+    /// over the time since the look before, a whole window, the slowest answer of the wait's
+    /// kind this process has seen ([`Seen`]) and its spread. The guest is not stopped: it is
+    /// still its caller's.
     Stalled(Stall),
     /// A managed guest's VM process held its vCPUs to no rate it was told (D255), in its
     /// words: its microVM not started, its governor's thread not made, or an answer none of
@@ -735,34 +742,39 @@ impl std::fmt::Display for Refusal {
             Refusal::Stalled(stall) if let (Some(rate), Some(least)) = (stall.rate(), stall.least()) => {
                 write!(
                     f,
-                    "the guest's VM process ran too slowly to be answering: {:?} into the wait, {:?} \
-                 of CPU in the {:?} it was seen to run, below the least a VM process ran here and \
-                 still answered ({:?} in {:?}) and more than any answer took ({:?}), past the \
-                 slowest answer seen ({:?})",
+                    "the guest's VM process ran too slowly to be answering: {:?} into the wait, {} \
+                 in the {:?} it was seen to run, below the least a VM process ran here and still \
+                 answered ({} in {:?}) and more than any answer took ({}) and its spread ({}), past \
+                 the slowest answer seen ({:?}) and its spread ({:?}){}",
                     stall.waited(),
-                    rate.cpu,
+                    rate.work,
                     rate.over,
-                    least.cpu,
+                    least.work,
                     least.over,
                     stall.most().unwrap_or_default(),
-                    stall.slowest()
+                    stall.work_spread().unwrap_or_default(),
+                    stall.slowest(),
+                    stall.spread(),
+                    stall.account()
                 )
             }
             Refusal::Stalled(stall) => write!(
                 f,
                 "the guest's VM process stalled: {:?} into the wait it ran no CPU in {:?}, past the \
-                 slowest answer seen ({:?}); {}",
+                 slowest answer seen ({:?}) and its spread ({:?}); {}",
                 stall.waited(),
                 stall.over(),
                 stall.slowest(),
+                stall.spread(),
                 stall.least().map_or_else(
                     || "no answer of its kind had its CPU read".to_string(),
                     |least| format!(
-                        "the least a VM process ran here and still answered was {:?} in {:?}",
-                        least.cpu, least.over
+                        "the least a VM process ran here and still answered was {} in {:?}",
+                        least.work, least.over
                     )
                 )
-            ),
+            )
+            .and_then(|()| f.write_str(&stall.account())),
             Refusal::Rate(why) => write!(f, "the guest's rate: {why}"),
             Refusal::HostUse(broken) => write!(f, "the guest's use: its VM process answered {broken}"),
             Refusal::Release(why) => write!(f, "the VM's AppContainers: {why}"),
@@ -963,10 +975,11 @@ pub trait Guest: Send + Sync {
     fn identity(&self) -> Result<Identity, Refusal>;
     /// A stream to its vsock `port`, as [`connect`](Guest::connect) with no clock gives one,
     /// waited for while its VM process runs (D215). It is refused as `connect` refuses, and
-    /// [`Refusal::Stalled`] where the VM process ran no CPU at all for a whole W*: the
+    /// [`Refusal::Stalled`] where the VM process ran no CPU at all for a whole window: the
     /// slowest `OK` of its kind this process has seen ([`Awaited::Boot`] while the guest has
-    /// answered no connect yet, else [`Awaited::Connect`]), looked at once each W* past the
-    /// wait's start. Its answer teaches its kind ([`Shards::seen`]).
+    /// answered no connect yet, else [`Awaited::Connect`]), W*, and its spread, W* less the
+    /// quickest, looked at once each window past the wait's start. Its answer teaches its kind
+    /// ([`Shards::seen`]).
     ///
     /// For a wait in which the VM works toward its answer (a boot to its listener): a guest
     /// that idles before it answers (on a timer, an input) runs nothing and is refused; ask
@@ -982,8 +995,8 @@ pub trait Guest: Send + Sync {
         self.connect(port, Duration::MAX)
     }
     /// Its end, as [`wait_for`](Guest::wait_for) with no clock gives it, waited for while its
-    /// VM process runs (D215): [`Refusal::Stalled`] where it ran no CPU at all for a whole W*,
-    /// the slowest end this process has seen ([`Awaited::End`]), as
+    /// VM process runs (D215): [`Refusal::Stalled`] where it ran no CPU at all for a whole
+    /// window, the slowest end this process has seen ([`Awaited::End`]) and its spread, as
     /// [`connect_while_runs`](Guest::connect_while_runs) judges, with its contract: for a guest
     /// that works toward its end (a workload that powers off). An end it did not
     /// [`stop`](Guest::stop) teaches its kind.
@@ -1017,11 +1030,9 @@ pub fn backend() -> Result<Backend, Refusal> {
     backend_of(std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// The least memory a guest of `arch` boots in, in MiB: shards-vmm's `MIN_MEMORY_MIB`
-/// (`crates/vmm/src/vm/aarch64.rs:28`, `crates/vmm/src/vm/x86_64.rs:28`).
-pub fn min_memory_mib(arch: &str) -> u64 {
-    if arch == "x86_64" { 128 } else { 64 }
-}
+/// The least memory a guest of `arch` boots in, in MiB: shards-abi's, which shards-vmm
+/// refuses less than; one source, which this crate takes without linking the VMM (D30).
+pub use shards_abi::bounds::min_memory_mib;
 
 /// Guest memory's unit, in MiB: shards-vmm boots an even number of MiB alone (`ram_bytes`
 /// in `vm/aarch64.rs`, `ram_ranges` in `vm/x86_64.rs`). On arm64 that keeps the DTB at

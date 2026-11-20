@@ -403,14 +403,15 @@ mod tests {
     /// A key held here and certified by `pki` as a leg, under the server's [`DELEGATION`], as a
     /// runner holds one while the leg runs: its identity and where it's held. It's held as an
     /// agent's slot, so no test holds a leg's key, which keeps this process undumpable while
-    /// runner::identity's own test looks.
+    /// runner::identity's own test looks; kept as it is (`given` holds an agent's slot to that
+    /// agent's identity).
     fn held(pki: &crate::pki::Pki, dir: &std::path::Path, job: &str) -> anyhow::Result<(Identity, String)> {
         let asked: crate::proto::IdentityAsk = serde_json::from_str(&crate::runner::identity::ask("agent", Some(job), Some(1))?)?;
         let identity = Identity::new(pki.organization(), Actor::Leg { enrolled_by: "ada".into(), machine: "fedora-2".into(), instance: "01a174ed".into(), run: 812, attempt: 1, leg: "e2e".into() });
         let facts = [(kiln_ci::identity::chain::fulcio::BUILD_SIGNER_URI, "https://kiln.home/hyper-light/kiln/.kiln/ci.yml@refs/heads/main"), (kiln_ci::identity::chain::fulcio::SOURCE_REPOSITORY_DIGEST, "4c1e2a90d1f3b5a7c9e1f3a5b7c9d1e3f5a7b9c1")];
         let pem = pki.issue_identity(&asked.csr, &identity, &facts, time::Duration::hours(1))?;
         let given = crate::proto::IdentityGiven { kind: asked.kind, of: asked.of, epoch: asked.epoch, uri: identity.uri()?, cert_pem: Some(pem), error: None, delegation: Some(DELEGATION.into()) };
-        crate::runner::identity::given(given, dir, "main")?;
+        crate::runner::identity::given_as_is(given, dir, "main")?;
         Ok((identity, crate::runner::identity::slot("agent", Some(job), Some(1))))
     }
 
@@ -631,8 +632,9 @@ mod tests {
                 let st = state.clone();
                 crate::rt::spawn(async move {
                     crate::rt::sleep(Duration::from_millis(100)).await;
-                    if let Ok(g) = serde_json::from_str(&answer) {
-                        let _ = crate::runner::identity::given(g, &st, "main");
+                    if let Ok(g) = serde_json::from_str::<crate::proto::IdentityGiven>(&answer) {
+                        // A refusal as kiln gives it; the certificate as `held` keeps one.
+                        let _ = if g.cert_pem.is_some() { crate::runner::identity::given_as_is(g, &st, "main") } else { crate::runner::identity::given(g, &st, "main") };
                     }
                 });
                 let t = Instant::now();

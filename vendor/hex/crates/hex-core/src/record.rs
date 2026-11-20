@@ -265,6 +265,7 @@ impl BoxRecord {
             ended: self.ended.clone(),
             control: None,
             control_wake: None,
+            live: None,
             credentials: Vec::new(),
         })
     }

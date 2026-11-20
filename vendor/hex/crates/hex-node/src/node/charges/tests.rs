@@ -1362,6 +1362,7 @@ fn w14_a_last_resort_end_shows_in_inspect_and_survives_a_restart() {
         ended: None,
         control: None,
         control_wake: None,
+        live: None,
         credentials: Vec::new(),
     };
     with_last_resort(&mut info, &ended).unwrap();

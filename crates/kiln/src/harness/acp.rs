@@ -641,7 +641,7 @@ impl Acp {
                     self.change(core, id, value);
                 }
             }
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
             Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { task: None, .. } | Command::Perms { task: None, .. } | Command::Branch { .. } => {}
             Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
@@ -1421,7 +1421,7 @@ impl Acp {
                             _ => None,
                         });
                         let first = known.is_none();
-                        let call = merge(known, u, &core.state.cwd);
+                        let call = merge(known, u, &self.cwd(core));
                         if let Some(t) = core.state.tasks.iter_mut().find(|t| t.id == id) {
                             t.tool_uses += u64::from(first);
                             t.last_tool = Some(call.title.clone());
@@ -1832,7 +1832,7 @@ impl Acp {
             Body::Tool(t) => Some(t.as_ref().clone()),
             _ => None,
         });
-        let call = merge(known, &tc, &core.state.cwd);
+        let call = merge(known, &tc, &self.cwd(core));
         let options: Vec<(String, String)> = p
             .get("options")
             .and_then(Value::as_array)
@@ -1909,7 +1909,7 @@ impl Acp {
             detail: call.detail.clone(),
             input: call.input.clone(),
             command: (call.tool == ToolKind::Shell).then(|| call.title.clone()),
-            cwd: core.state.cwd.clone(),
+            cwd: self.cwd(core),
             diffs: call.diffs.clone(),
             reason,
             always,
@@ -1992,7 +1992,7 @@ impl Acp {
                     Body::Tool(t) => Some(t.as_ref().clone()),
                     _ => None,
                 });
-                let mut call = merge(known, u, &core.state.cwd);
+                let mut call = merge(known, u, &self.cwd(core));
                 if call.name == "mcp__kiln__agents_wait" && call.status == ToolStatus::Done && let Some(result) = u.get("rawOutput") { core.observe_handoff_result(&tid, result); }
                 // opencode's subagent tool names the subagent it started (or followed up) by its
                 // session id, as its child sessions are known (`child_update`).
@@ -2004,9 +2004,10 @@ impl Acp {
                     self.befores.insert(tid.clone(), entries);
                 }
                 if call.status == ToolStatus::Done {
+                    let seen_cwd = self.cwd(core);
                     for (path, old) in self.befores.remove(&tid).unwrap_or_default() {
-                        let abs = if std::path::Path::new(&path).is_absolute() { path.clone() } else { format!("{}/{path}", core.state.cwd.trim_end_matches('/')) };
-                        let rel = super::claude::rel(&path, &core.state.cwd);
+                        let abs = crate::sandbox::isolated::host_file(self.seen.as_ref(), &seen_cwd, &path);
+                        let rel = super::claude::rel(&path, &seen_cwd);
                         core.note_baseline(&abs, old.map_or(Baseline::Absent, Baseline::Text));
                         core.want_change(&abs, &rel, super::model::BY_AGENT);
                     }
@@ -2293,12 +2294,12 @@ mod tests {
 
     /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: an isolated ACP agent's session is
     /// opened, new or loaded, in its project as its microVM has it (`sandbox::isolated::guest_path`): a
-    /// Windows machine's folder at `/work/<name>`, a Unix one at its own path; an agent on its machine
-    /// opens it in the machine's.
+    /// Windows machine's folder at its path as WSL names it (`/mnt/c/…`, Shards' D235), a Unix one at its
+    /// own path; an agent on its machine opens it in the machine's.
     #[test]
     fn s17_an_isolated_acp_session_opens_in_its_guest_folder() {
         use super::super::session::{Isolation, Spec};
-        for (host, told, isolation) in [(r"C:\src\app", "/work/app", Some(Isolation::microvm())), ("/Users/ada/src/app", "/Users/ada/src/app", Some(Isolation::microvm())), (r"C:\src\app", r"C:\src\app", None)] {
+        for (host, told, isolation) in [(r"C:\src\app", "/mnt/c/src/app", Some(Isolation::microvm())), ("/Users/ada/src/app", "/Users/ada/src/app", Some(Isolation::microvm())), (r"C:\src\app", r"C:\src\app", None)] {
             for (resume, method) in [(None, "session/new"), (Some("s0".to_owned()), "session/load")] {
                 let spec = Spec { kind: "gemini".into(), cwd: Some(host.into()), isolation: isolation.clone(), resume, ..Spec::default() };
                 let mut core = TestCore::new();
@@ -2311,6 +2312,37 @@ mod tests {
                 assert_eq!(opened, Some(json!(told)), "{host}: {method}");
             }
         }
+    }
+
+    /// Step 17 part 7: an isolated ACP agent on a Windows machine names its files at its microVM's
+    /// `/mnt/c/…`: its calls show them by their place in its project, and its edit joins the changeset as
+    /// the machine's file, where kiln reads it.
+    #[test]
+    fn s17_an_isolated_acp_agents_files_are_shown_in_its_folder_and_read_as_the_machines() {
+        use super::super::session::{Isolation, Spec};
+        let spec = Spec { kind: "gemini".into(), cwd: Some(r"C:\src\app".into()), isolation: Some(Isolation::microvm()), ..Spec::default() };
+        let mut core = TestCore::new();
+        core.state.cwd = r"C:\src\app".into();
+        let mut a = Acp::from_spec(&spec);
+        a.start(&mut core);
+        a.command(&mut core, Command::Send { id: "m1".into(), text: "edit it".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None });
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": 1, "agentCapabilities": {}}})]);
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}})]);
+        feed(
+            &mut a,
+            &mut core,
+            &[
+                json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Edit", "kind": "edit", "status": "pending", "locations": [{"path": "/mnt/c/src/app/src/main.rs"}], "content": [{"type": "diff", "path": "/mnt/c/src/app/src/main.rs", "oldText": "fn a() {}\n", "newText": "fn b() {}\n"}]}}}),
+                json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed"}}}),
+            ],
+        );
+        let t = core.events().find_map(|e| match &e.body {
+            Body::Tool(t) if t.tool_id == "t1" => Some(t.as_ref().clone()),
+            _ => None,
+        });
+        assert_eq!(t.as_ref().map(|t| (t.detail.as_deref(), t.diffs.first().map(|d| d.path.as_str()))), Some((Some("src/main.rs"), Some("src/main.rs"))));
+        let jobs: Vec<(String, String)> = core.take_change_jobs().into_iter().map(|j| (j.abs, j.rel)).collect();
+        assert_eq!(jobs, [(r"C:\src\app\src\main.rs".to_owned(), "src/main.rs".to_owned())]);
     }
 
     fn acp_kinds() -> impl Iterator<Item = &'static str> {

@@ -9,5 +9,14 @@
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> std::process::ExitCode {
+    // A lint of a target whose Shards isn't built where the lint runs (build.rs, `KILN_SHARDS=lint`) carries no
+    // Shards: it checks kiln's code and is never a kiln to run.
+    #[cfg(kiln_lint)]
+    {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "kiln: this is a lint build (KILN_SHARDS=lint), which carries no Shards: build kiln to run it");
+        return std::process::ExitCode::FAILURE;
+    }
+    #[cfg(not(kiln_lint))]
     kiln::entry::main()
 }

@@ -16,6 +16,7 @@ use shards_ipc::Stream as UnixStream;
 use shards_ipc::fd::{AsFd as _, BorrowedFd};
 use shards_ipc::{Run, kind};
 
+use super::health::{ReadAt, read_at, teach_answer};
 use super::{Daemon, Inbox, Keep, LAYER_NEW, REQUEST, RunState, Threads, lock, log, network, open_layer};
 
 impl<D: crate::containers::Disk> Daemon<D> {
@@ -223,6 +224,9 @@ impl<D: crate::containers::Disk> Daemon<D> {
         prepared.spec.encode_into(&mut payload);
         // No network: nothing of the image's runs.
         let start = network::Start::Attach(network::Net::None);
+        // When a VM was given the run, before its RUN is sent: the time alone, no read of its
+        // process (D222, amended 2026-11-17).
+        let mut asked = None;
         let started = self.start_run(
             threads,
             id,
@@ -250,13 +254,17 @@ impl<D: crate::containers::Disk> Daemon<D> {
                 engine: None,
                 volumes,
             },
-            || self.warm_for(threads, &prepared, &start, &|_| {}, &|_| {}),
+            || {
+                let ready = self.warm_for(threads, &prepared, &start, &|_| {}, &|_| {})?;
+                asked = Some(Instant::now());
+                Ok(ready)
+            },
         );
         drop(prepared.lease.take());
         drop(fds);
         drop((theirs, null, layer_in, layer_out, link));
         let inbox = started?;
-        let held = self.await_holding(id, &inbox);
+        let held = self.await_holding(id, &inbox, asked);
         self.follow(threads, id.to_string(), inbox);
         if let Err(e) = held {
             // Why, as its VM told its client: what it said on stderr, read until it ends.
@@ -283,9 +291,17 @@ impl<D: crate::containers::Disk> Daemon<D> {
     /// (`Answers::held`), as a warm VM's READY is (`ready`): before its first, the VM's
     /// liveness alone, its connection's end; then past W*, the slowest hold seen, looked at
     /// each W* and given up on where a whole W* shows its process ran no CPU, its host not the
-    /// reason. A hold there as its wait begins teaches nothing (D222's wait of nothing). It
-    /// was `READY_STALL`'s 10 s looks and `READY_TIMEOUT`'s 60 s, picked (ROOT's (3)).
-    pub(super) fn await_holding(&self, id: &str, inbox: &Arc<Mutex<Inbox>>) -> Result<(), String> {
+    /// reason. Its VM's process is read only once the wait has lasted W*, timed from `asked`,
+    /// when its RUN was sent (D215's rule, `health::read_at`; D222, amended 2026-11-17): a
+    /// hold within W* teaches its time from the RUN alone, with no read of the process
+    /// (`health::teach_answer`). It was `READY_STALL`'s 10 s looks and `READY_TIMEOUT`'s 60 s,
+    /// picked (ROOT's (3)).
+    pub(super) fn await_holding(
+        &self,
+        id: &str,
+        inbox: &Arc<Mutex<Inbox>>,
+        asked: Option<Instant>,
+    ) -> Result<(), String> {
         // Its end, the inbox's still: what a wait for its messages polls.
         let stream = lock(inbox)
             .socket
@@ -294,45 +310,68 @@ impl<D: crate::containers::Disk> Daemon<D> {
             .map_err(|e| format!("its VM's connection: {e}"))?;
         let pid = lock(inbox).pid;
         let began = Instant::now();
-        // Begun once its first look finds it not holding yet.
+        // When its RUN was sent: always said, as `start_run` hands a run only to a VM its
+        // acquire gave, which takes the time. Where none was, as its wait began.
+        let asked = asked.unwrap_or(began);
+        // Its VM's process, followed once its wait has lasted W* (within: none where it could
+        // not be followed); none before.
         let mut follow: Option<Option<shards_api::Follow<'_>>> = None;
         loop {
             let ended = self.take_messages(id, inbox);
             {
                 let held = lock(inbox);
                 if held.started && !held.ended {
-                    if let Some(Some(follow)) = follow.as_mut() {
-                        follow.answered();
-                    }
+                    teach_answer(
+                        &self.answers.held,
+                        asked,
+                        follow.as_mut().and_then(Option::as_mut),
+                    );
                     return Ok(());
                 }
                 if ended || held.ended {
                     return Err("its VM ended before it held".into());
                 }
             }
-            let follow = follow.get_or_insert_with(|| {
-                shards_api::Followed::of_pid(pid).ok().flatten().and_then(|f| {
-                    shards_api::Follow::begin(&self.answers.held, f, shards_api::Bound::Rate)
-                        .ok()
-                        .flatten()
-                })
-            });
-            let wait = follow
-                .as_ref()
-                .and_then(shards_api::Follow::due)
-                .map(|due| due.saturating_duration_since(Instant::now()));
+            // Until its wait has lasted W*, its connection alone, until then; its kind with no
+            // hold yet, its connection alone throughout. Past W*, its process followed from then,
+            // its connection until its judge's next look, or until its end where it could not be
+            // followed.
+            let wait = 'wait: {
+                if follow.is_none() {
+                    match read_at(&self.answers.held, asked) {
+                        ReadAt::Never => break 'wait None,
+                        ReadAt::Until(due) => {
+                            break 'wait Some(due.saturating_duration_since(Instant::now()));
+                        }
+                        ReadAt::Now => {
+                            follow = Some(shards_api::Followed::of_pid(pid).ok().flatten().and_then(|f| {
+                                shards_api::Follow::begin(&self.answers.held, f, shards_api::Bound::Rate)
+                                    .ok()
+                                    .flatten()
+                            }));
+                        }
+                    }
+                }
+                follow
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .and_then(shards_api::Follow::due)
+                    .map(|due| due.saturating_duration_since(Instant::now()))
+            };
             if super::readable_within(&stream, wait) {
                 continue;
             }
-            let Some(followed) = follow.as_mut() else {
+            let Some(Some(followed)) = follow.as_mut() else {
                 continue;
             };
             followed.look().map_err(|why| match why {
                 shards_api::Unfollowed::Stalled(stall) => format!(
-                    "its VM ran nothing of its start for {:?}, past the slowest hold seen ({:?}), {:?} after it began",
+                    "its VM ran nothing of its start for {:?}, past the slowest hold seen ({:?}) and its spread ({:?}), {:?} after it began{}",
                     stall.over(),
                     stall.slowest(),
-                    began.elapsed()
+                    stall.spread(),
+                    began.elapsed(),
+                    stall.account()
                 ),
                 shards_api::Unfollowed::Process { failure, .. } => {
                     format!("its VM's process could not be read: {failure}")

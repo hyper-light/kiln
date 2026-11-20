@@ -197,6 +197,12 @@ pub fn login_path() -> Option<String> {
     LOGIN_ENV.get()?.lock().as_ref()?.1.iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.clone())
 }
 
+/// The environment the login shell said last (however long ago), without asking it: none before
+/// [`login_env`] first answered.
+pub fn login_said() -> Option<Vec<(String, String)>> {
+    LOGIN_ENV.get()?.lock().as_ref().map(|(_, env)| env.clone())
+}
+
 /// Where a run starts. `mirror_root`: the synced copy it runs in, when it names one.
 pub fn resolve_cwd(spec: &RunSpec, mirror_root: Option<&Path>) -> anyhow::Result<PathBuf> {
     let home = crate::os::home_dir();

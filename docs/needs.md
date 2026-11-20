@@ -840,13 +840,40 @@ device would give a new run's I/O under its load now. The load-balancing kernel 
   sources (macOS), `/sys/class/power_supply` (Linux), `GetSystemPowerStatus` (Windows); it drains
   through place's runner, beside the server's draining.
 - **When**: at each run's start (the signals it's learned against) and end, when the directory
-  gives it a new speed, and on the OS's events, never a timer: a PSI trigger per resource (a
+  gives it a new speed, and on the OS's events: a PSI trigger per resource (a
   window's stall past 1/1024 of it, the least that moves slowness a unit; 2 s windows unprivileged
   since Linux 6.4, 500 ms with `CAP_SYS_RESOURCE`), read again once a window after the last, to see
   it end; power-supply uevents (Linux); notify(3)'s thermal and power-source notifications
-  (macOS); a power-setting callback (Windows). None of it is on the decision path: an admission
+  (macOS); a power-setting callback (Windows). Never on a timer, but a strain's follow-up (below).
+  None of it is on the decision path: an admission
   only carries the last pace in its words. What a runner learns of itself is kept in
   `<state>/reach/pace.json`.
+- **A strain's end where the kernel keeps no stall time** (`crate::reach::place`, `FOLLOW_UP_MS`;
+  AUDIT L1):
+  - **The gap:** on macOS, Windows and a Linux without PSI, health's strain rests on the stand-ins
+    above (the work device's ρ, swap-ins' share). Only the events in **When** read them again, and a
+    strained runner takes nothing new. So an idle one met no event, and its strain stood for good:
+    every start placed there waited (kiln goal 3cd82843's E2E on a Windows desktop, 2026-11-17:
+    `queued: 0 of 1 can start it now (1 machine under strain)`).
+  - **The follow-up:** a measure that finds strain there reads the stand-ins again 2 s on, and again
+    while the strain stands. Where PSI keeps stall times, its trigger says the end itself.
+  - **The 2 s is Linux's own, borrowed:** the least PSI window an unprivileged process may arm, over
+    which the kernel notifies at most once and after which the calm is read once more (**When**).
+    Documentation/accounting/psi.rst (torvalds/linux blob `d455db3e5808`, read 2026-11-17): "The
+    kernel accepts window sizes ranging from 500ms to 10s"; "Unprivileged users can also create
+    monitors, with the only limitation that the window size must be a multiple of 2s, in order to
+    prevent excessive resource usage"; "Notifications to the userspace are rate-limited to one per
+    tracking window". So every OS sees a strain's end within the same 2 s of it.
+  - **Cold start:** a strain found by the runner's first measure is followed up from its node's
+    first timers.
+  - **Uncertainty:** a stand-in over 2 s is read over the same span a PSI window covers. A measure
+    on any other event in between moves the follow-up 2 s past it.
+  - **Overflow:** the follow-up time is a saturating sum, in ms.
+  - **Adversarial input:** none comes in from outside. A device kept busy costs one read of the
+    stand-ins and one of the machine each 2 s while its strain stands; a calm, idle runner wakes no
+    more than before (W05-R26).
+  - **Its log:** each onset (with why) and end goes in the runner's log, as `placement: this machine
+    is under strain: …` and `placement: this machine is no longer under strain`.
 - **Root would add**: 500 ms PSI windows and triggers on system services' own cgroups (Linux), CPU
   clocks (macOS `powermetrics`), thermal zone temperatures (Windows WMI). None is needed.
 

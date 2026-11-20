@@ -163,6 +163,11 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     if !installed {
         return Err(format!("{named} is not installed on {}", hub.shown(&to)));
     }
+    // Its environment goes on with it, opened again there (docs/agents.md, "Where they apply"): never to a runner
+    // that runs none, where it would go on without it.
+    if crate::agentenvs::linked(hub, id).is_some() && !crate::agentenvs::resolve::speaks(hub, &to) {
+        return Err(format!("it runs with an environment, and {}'s kiln runs no session with one: upgrade it (System → Updates)", hub.shown(&to)));
+    }
     if local {
         if kind.is_some() {
             return Err(format!("from the kiln server it goes on in {} alone", info.kind_name));

@@ -1158,6 +1158,8 @@ pub enum FromServer {
     /// `Volumes`: the agent volumes its microVMs' store keeps of the names asked, or one cleared (kiln plan 01a1dd2e…,
     /// P6.2).
     Volumes { req: u64, ask: crate::agentdefs::volumes::Ask },
+    /// `UserEnv`: which variables its user has, by name (docs/agents.md, "Environments").
+    UserEnv { req: u64, ask: crate::harness::agentenv::Ask },
 }
 
 impl Carries for ServerMsg {
@@ -1232,6 +1234,7 @@ impl Carries for ServerMsg {
                 return Err(Box::new(Unreadable { of: "Replay", what: "Replay".into(), code: Code::Unknown, why: "replays were withdrawn from experiments: no runner runs one".into(), session: None, waits: Some(Waits::Asking(req)) }));
             }
             ServerMsg::Volumes { req, json } => FromServer::Volumes { req, ask: payload(W, "Volumes", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
+            ServerMsg::UserEnv { req, json } => FromServer::UserEnv { req, ask: payload(W, "UserEnv", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
             m @ (ServerMsg::Welcome { .. }
             | ServerMsg::Refused { .. }
             | ServerMsg::Assign(_)

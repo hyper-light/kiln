@@ -1127,9 +1127,15 @@ impl ShardsGuest {
         // A failure or a reset (a kernel's panic) before any answer is the boot's; a power-off
         // or a stop is a normal end.
         if !state.ready && matches!(end, End::Failed(_) | End::Reset) {
-            // shards-vmm's own refusal of the vCPUs its hypervisor won't run
-            // (`crates/vmm/src/vm/runtime.rs:1065`), as shards reports it.
-            if state.said.contains("vCPUs requested; this host supports") {
+            // shards-vmm's own refusal of the vCPUs its host won't run (its `check_vcpus`), as
+            // shards reports it: either of `vm::limits::VcpusRefused`'s, past its hypervisor's
+            // partition, or past its logical processors where its Hyper-V is nested within
+            // another's (D261). Read by its words, as this client links no VMM (D215).
+            if state.said.contains("vCPUs requested; this host supports")
+                || state
+                    .said
+                    .contains("vCPUs: this host's Hyper-V is nested within another Hyper-V's partition")
+            {
                 return Some(Refusal::Bounds {
                     what: "vcpus",
                     why: state.ended_as.clone(),
@@ -4915,7 +4921,7 @@ mod tests {
     fn records(learned: &[(Awaited, Duration, Duration)]) -> &'static Records {
         let records: &'static Records = Box::leak(Box::new(Records::new()));
         for &(awaited, slowest, cpu) in learned {
-            records.teach(awaited, slowest, cpu);
+            records.teach(awaited, slowest, crate::Work::of_cpu(cpu));
         }
         records
     }
@@ -4950,7 +4956,7 @@ mod tests {
         let dir = shards_testdir::TempDir::new("api-stall").unwrap();
         let guest = following(warmed(&dir, "exec sleep 3"), learned);
         let least = crate::Rate {
-            cpu: slowest,
+            work: crate::Work::of_cpu(slowest),
             over: slowest,
         };
         for (what, refused) in [

@@ -207,6 +207,10 @@ pub struct Pi {
     /// A compaction asked for during a turn: it runs once the turn ends (its instructions).
     #[serde(default)]
     compact: Option<String>,
+    /// Where it sees its project, in a microVM that sees it elsewhere than this machine
+    /// (`sandbox::isolated::Seen`): what it says of its files is shown against its folder as it sees it.
+    #[serde(default)]
+    seen: Option<crate::sandbox::isolated::Seen>,
 }
 
 impl Pi {
@@ -239,7 +243,13 @@ impl Pi {
             images: None,
             asks: HashMap::new(),
             compact: None,
+            seen: crate::sandbox::isolated::Seen::of(spec),
         }
+    }
+
+    /// The folder it works in, as it sees it ([`Self::seen`]): what it says of its files is shown against it.
+    fn cwd(&self, core: &Core) -> String {
+        crate::sandbox::isolated::said(self.seen.as_ref(), &core.state.cwd)
     }
 
     fn notice(&mut self, core: &mut Core, level: Level, text: impl Into<String>) {
@@ -399,7 +409,7 @@ impl Pi {
             Command::Control { id, value } => {
                 super::goback::control(core, &id, value.as_ref());
             }
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } => {}
             // A pause's commands are the session's (`harness::pause`); it has no subagents.
             Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { .. } | Command::Perms { .. } | Command::Branch { .. } => {}
             // Its own commands, its extensions', templates and skills run as "/name args" messages.
@@ -1144,7 +1154,7 @@ impl Pi {
                 let id = self.tool_event(tid);
                 self.tools.insert(tid.to_owned(), id.clone());
                 if core.get(&id).is_none() {
-                    let mut c = tool_call(&id, name, call.get("arguments").unwrap_or(&Value::Null), &core.state.cwd);
+                    let mut c = tool_call(&id, name, call.get("arguments").unwrap_or(&Value::Null), &self.cwd(core));
                     c.status = ToolStatus::Pending;
                     core.upsert(&id, None, Body::Tool(Box::new(c)));
                 }
@@ -1226,7 +1236,7 @@ impl Pi {
         self.tools.insert(tid.to_owned(), id.clone());
         let mut call = match core.get(&id).map(|e| &e.body) {
             Some(Body::Tool(t)) => t.as_ref().clone(),
-            _ => tool_call(&id, name, v.get("args").unwrap_or(&Value::Null), &core.state.cwd),
+            _ => tool_call(&id, name, v.get("args").unwrap_or(&Value::Null), &self.cwd(core)),
         };
         match v.get("type").and_then(Value::as_str) {
             Some("tool_execution_start") => {

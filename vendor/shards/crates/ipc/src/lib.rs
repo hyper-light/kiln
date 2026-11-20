@@ -527,12 +527,16 @@ pub mod kind {
     /// a range of one protocol's ports, and the way a flow opens. Taken back, every flow it
     /// let open that no other grant admits ends. Answered as `NET_JOIN` is.
     pub const NET_PEER_GRANT: u8 = 116;
-    /// Orchestrator → run host, on its links socket (D286, Unix): the streams of the run's
+    /// Orchestrator → run host, on its links socket (D287, Unix): the streams of the run's
     /// shares another server serves (`shards_api::image::wire::Request::served`), in the
     /// request's order, [`MAX_FDS`](super::MAX_FDS) a message at most and no payload, all of
     /// them sent before the run's request (`CREATE`), which says how many. Not answered: its
-    /// sender holds its copies until the run has started or been refused (M24).
-    pub const SERVED_SHARES: u8 = 117;
+    /// sender holds its copies until the run has started or been refused (M24). 118, the first
+    /// number no other kind has (`LAYER_LOST` took 117 first; no two kinds share one,
+    /// `tests::every_message_kind_has_its_own_number`). kiln's recorded change, which carried it
+    /// before this did, numbers it 117: a run host of either build refuses the other's as a
+    /// message of another kind where its streams were due (`Cause::Request`).
+    pub const SERVED_SHARES: u8 = 118;
     /// Daemon → a running microVM's VM process: a run joins its network (D119). Its number
     /// (a big-endian u64, which `EXEC_TAKEN` answers), with the VM's end of the joiner's
     /// own connection to the daemon, on which the joiner's run goes as a warm VM's does
@@ -647,6 +651,13 @@ pub mod kind {
     /// once nothing of the VM's machine writes it, the file the daemon's from then on;
     /// with the disk it used in the guest (a big-endian u64), where the guest said.
     pub const LAYER_KEPT: u8 = 67;
+    /// Warm VM → daemon, in `LAYER_SAVED`'s or `LAYER_KEPT`'s place: the writable layer
+    /// `RUN_LAYER_OUT` asked for will not come as asked, and why, in words: its guest's
+    /// refusal (`shards_abi::run::kind::SYSTEM_ERR`), its guest's connection ending amid it,
+    /// its run failed or its command never ran. What came of it goes, and the layer it had
+    /// before stays; where its layer is in its own file (D190), that file is kept once the
+    /// VM has gone, as it is where the VM goes without a word.
+    pub const LAYER_LOST: u8 = 117;
     /// Daemon → a running run's VM: the CPUs whose time its vCPUs may use of the host's
     /// together (8, big-endian), 0 for every one, as `update` changes the run's CPU limits
     /// (D191): before its guest's cgroup is written.
@@ -865,6 +876,24 @@ pub const SAVE_DELTA: u8 = 2;
 /// The status of a run its save stopped (D176), as a shell says of a job it stopped, 128
 /// plus SIGTSTP's number on Linux (20): not ended, but stopped where it is, to be resumed.
 pub const SAVED_STATUS: u8 = 148;
+
+/// The status of a warm VM that took no run and ended for its template's sake (D26, ROOT's
+/// ruling of 2026-11-17): its template's files did not read, or its guest reset or powered
+/// off before it asked for its command. Its daemon counts this end alone against the
+/// template; a VM that ended any other way before its run (its host refusing to enter it,
+/// D261; its VMM's error; its stop) failed for no fault of its template's. sysexits(3)'s
+/// EX_DATAERR, "the input data was incorrect in some way": a template is a restore's input.
+/// Read only of a VM that took no run, which has no command whose status it could be.
+pub const TEMPLATE_FAILED_STATUS: u8 = 65;
+
+/// The status of a warm VM that took no run and ended as its host's hypervisor refused to
+/// enter it (D261): its daemon starts none ahead of its runs, nor for a run that comes, until
+/// its host has refused none for a burst width (D26, ROOT's ruling of 2026-11-18; CI
+/// 44245219858, where a pool restored straight into its host's refusals, 17 VMs a second).
+/// sysexits(3)'s EX_TEMPFAIL, "temporary failure, indicating something that is not really an
+/// error ... the request should be reattempted later". Read only of a VM that took no run, as
+/// [`TEMPLATE_FAILED_STATUS`] is.
+pub const HOST_REFUSED_STATUS: u8 = 75;
 
 /// An `ATTACH_RUN` flag: the client's stdin goes to the command's.
 pub const ATTACH_STDIN: u8 = 1;
@@ -2324,7 +2353,8 @@ pub const RUN_PUBLISHED: u8 = 16;
 /// under the microVM's layer device.
 pub const RUN_LAYER_IN: u8 = 32;
 /// A `kind::RUN` flag: the microVM stays once it stops, and its writable layer goes to
-/// a descriptor after those, told by `kind::LAYER_SAVED` once whole.
+/// a descriptor after those, told by `kind::LAYER_SAVED` once whole, or by
+/// `kind::LAYER_LOST` with why it will not be.
 pub const RUN_LAYER_OUT: u8 = 64;
 /// A `kind::RUN` flag: the run's swap comes with it (D159), a sparse file of what its
 /// limits allow, after the layers' descriptors, for its microVM's join disk to take as a
@@ -2528,7 +2558,9 @@ pub const MAX_FDS: usize = run_fds::CLIENT
     + run_fds::CAPTURE;
 
 mod host_memory;
-pub use host_memory::{holdable, holdable_known, host_available, host_memory};
+#[cfg(windows)]
+pub use host_memory::memory_refused_said;
+pub use host_memory::{holdable, holdable_known, host_available, host_committable, host_memory};
 pub mod size;
 mod window;
 pub use window::{Window, WindowRefusal};
@@ -2547,13 +2579,17 @@ mod pipe;
 pub use pipe::{
     Arriving, Event, ExitWatch, Listener, Message, Pipe, Poller, RandomFailed, Stream, VSOCK_QUOTA,
     VsockConn, VsockListener, VsockNames, await_any, await_streams, byte_pair, end, fill_random, hung_up,
-    input_pair, output_pair, readable_raw, recv, recv_by, recv_judged, send, send_judged, vsock_instance,
-    vsock_listen, vsock_open, vsock_pair,
+    input_pair, output_pair, readable_raw, recv, recv_by, recv_judged, send, send_judged, vsock_carried,
+    vsock_instance, vsock_listen, vsock_open, vsock_pair,
 };
 
 /// When a judged wait (`send_judged`, `recv_judged`) next asks its judge, and whether it goes
-/// on: asked as the wait begins and each time the time it named passes with its stream not
-/// ready; `Ok(None)` waits on the stream's readiness alone, an error ends the wait with it.
+/// on: asked first once a look finds its stream not ready (each wait looks before it asks: its
+/// write or read itself, then a look with no wait), and each time the time it named passes
+/// with its stream not ready still; `Ok(None)` waits on the stream's readiness alone, an error
+/// ends the wait with it. A wait whose stream is ready at its first look never asks: a judge
+/// that reads its party as it is first asked reads it only where its wait has to wait (D215,
+/// amended 2026-11-17).
 pub type Judge<'a> = dyn FnMut() -> std::io::Result<Option<std::time::Instant>> + 'a;
 #[cfg(windows)]
 mod windows;
@@ -3346,6 +3382,124 @@ mod tests {
         assert!(!daemon_lives(&home), "{pid}, exited and unreaped, lives");
         assert!(!exiting(&home), "{pid}, exited and unreaped, is ending its runs");
         let _ = child.wait();
+    }
+
+    /// A process whose main thread, its thread group's leader, has ended while another of its
+    /// threads runs lives until that thread ends, and then, unreaped, no more (ROOT's ruling of
+    /// 2026-11-17, D185): its leader reads as a zombie (`/proc/<pid>/stat` state `Z`) while the
+    /// rest run, hold its files and do its work (kernel/exit.c `delay_group_leader`, fs/file.c
+    /// `put_files_struct`). Red before, where a zombie leader was the process's end: a daemon
+    /// SIGKILLed whose leader went first was no daemon while its other threads still held its
+    /// clients' slots open (CI 44077430171, x86_64 musl,
+    /// `a_container_outlives_a_daemon_that_dies`). Its child is this binary run for
+    /// [`leader_gone_child`] alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_whose_leader_ended_lives_while_its_threads_run() {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::leader_gone_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SHARDS_LEADER_GONE_CHILD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let named = Named {
+            pid,
+            start: started(pid).unwrap(),
+        };
+        // What it says once its leader has ended alone: `Z`, or `?` where it never did.
+        let mut said = [0u8; 1];
+        let errors = child.stderr.as_mut().unwrap();
+        while !matches!(said, [b'Z' | b'?']) {
+            errors.read_exact(&mut said).unwrap();
+        }
+        assert_eq!(&said, b"Z", "{pid}'s leader did not end alone");
+        assert!(
+            named.lives(),
+            "{pid}, its leader a zombie and its other threads running, does not live"
+        );
+        // Its stdin's end ends the rest of it; waitid's WNOWAIT leaves it unreaped, every thread
+        // of it gone.
+        drop(child.stdin.take());
+        let id = libc::id_t::try_from(pid).unwrap();
+        // SAFETY: a siginfo_t, plain data, for waitid(2) to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid(2) of our own child into a siginfo_t of ours; WNOWAIT leaves it
+        // unreaped.
+        let waited = unsafe { libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
+        assert!(
+            !named.lives(),
+            "{pid}, every thread of it ended and unreaped, lives"
+        );
+        let _ = child.wait();
+    }
+
+    /// [`a_process_whose_leader_ended_lives_while_its_threads_run`]'s child, which does nothing
+    /// in a run of the tests. Its main thread ends alone, by exit(2) of one thread in a signal's
+    /// handler, while another thread waits on its stdin and ends the process, exit_group(2),
+    /// once that ends; a third says `Z` on its stderr once its leader is a zombie
+    /// (`/proc/self/task/<pid>/stat` state `Z`), or `?` where it is not in 30 s.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn leader_gone_child() {
+        if std::env::var_os("SHARDS_LEADER_GONE_CHILD").is_none() {
+            return;
+        }
+        // Ends the thread that takes it, that one alone.
+        extern "C" fn end_this_thread(_: libc::c_int) {
+            // SAFETY: exit(2) of the calling thread, async-signal-safe.
+            unsafe { libc::syscall(libc::SYS_exit, 0) };
+        }
+        std::thread::spawn(|| {
+            let mut byte = [0u8; 1];
+            // SAFETY: read(2) of this process's stdin into a byte of ours.
+            while unsafe { libc::read(0, byte.as_mut_ptr().cast(), 1) } > 0 {}
+            // SAFETY: _exit(2) of the whole process.
+            unsafe { libc::_exit(0) };
+        });
+        let pid = std::process::id();
+        std::thread::spawn(move || {
+            let leader = format!("/proc/self/task/{pid}/stat");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let said: &[u8] = loop {
+                let stat = std::fs::read_to_string(&leader).unwrap_or_default();
+                if stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_ascii_whitespace().next())
+                    == Some("Z")
+                {
+                    break b"Z";
+                }
+                if std::time::Instant::now() > deadline {
+                    break b"?";
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            // SAFETY: write(2) of a byte of ours to this process's stderr, no lock taken.
+            unsafe { libc::write(2, said.as_ptr().cast(), 1) };
+        });
+        let id = libc::pid_t::try_from(pid).unwrap();
+        // SAFETY: sigaction(2) giving SIGUSR1 the handler above, then tgkill(2) of this
+        // process's main thread, whose thread ID is the process's: the test's thread or
+        // another, either way the leader.
+        unsafe {
+            let mut ending: libc::sigaction = std::mem::zeroed();
+            ending.sa_sigaction = end_this_thread as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &ending, std::ptr::null_mut()), 0);
+            libc::syscall(libc::SYS_tgkill, id, id, libc::SIGUSR1);
+        }
+        loop {
+            std::thread::park();
+        }
     }
 
     /// A working set goes in parts each within a message's payload, and comes back whole,

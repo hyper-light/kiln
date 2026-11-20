@@ -129,3 +129,11 @@ tree-sitter-yaml = { path = "vendor/vorpal/grammars/tree-sitter-yaml" }
 # Hex's image class drives, and crates/shards), the revision kiln takes: its one copy here (vendor/hyper-raft).
 [patch."https://github.com/hyper-light/hyper-raft"]
 hyper-quic = { path = "vendor/hyper-raft/crates/hyper-quic" }
+# Hex names Shards' crates by their git revision (vendor/hex's root manifest: Hex vendors no Shards of its own), the
+# revision kiln takes: its one copy here (vendor/shards), so Hex builds on kiln's Shards.
+[patch."https://github.com/hyper-light/shards"]
+shards-abi = { path = "vendor/shards/crates/abi" }
+shards-afunix = { path = "vendor/shards/crates/afunix" }
+shards-api = { path = "vendor/shards/crates/api" }
+shards-ipc = { path = "vendor/shards/crates/ipc" }
+shards-remote = { path = "vendor/shards/crates/remote" }

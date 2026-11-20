@@ -13,30 +13,42 @@
 //! passed, and each slice after while its VM process is seen to go on with it (any CPU at
 //! all, as D215's readers see it, or memory its host frees of it, or its host holding it
 //! from running, which is no stall), and its VM killed only once it has done none of these
-//! for a slice, or is stopped or frozen. A killed VM process is followed the same way. So is
-//! a run's network or share process once its VM has gone and its spawner holds nothing of it
-//! (`netproc::reap`): it goes as its VM's links close, and one that neither runs nor frees
-//! what it holds for a slice is ended (PM M546).
+//! for a slice, or is stopped or frozen, or has done more work than any teardown of this
+//! home's took (C*, D215's rule for starts: [`Followed::past`]). A killed VM process is
+//! followed the same way. So is a run's network or share process once its VM has gone and
+//! its spawner holds nothing of it (`netproc::reap`): it goes as its VM's links close, and
+//! one that neither runs nor frees what it holds for a slice is ended (PM M546). A joiner's teardown (D119) runs in its
+//! provider's microVM, whose VM process also runs the provider's own command and ticks: it
+//! goes on only by that process's work beyond an idle microVM's (PM M357,
+//! [`Followed::of_provider`]).
 //!
-//! The slice is this host's own, W*: the slowest end of its kind this home's processes have
-//! heard (the home's [`RECORD`]), kept as each is heard, so that a host whose guests stall on
-//! its disk for 9 s before they end (PM M419) gives its teardowns that long. A home with none
-//! of a kind yet has no slice: its end is followed by its process's liveness alone, to the
-//! end that teaches it. A daemon and the run hosts of a home keep one record: each end kept
-//! is put with what the record holds then.
+//! The slice is this host's own, W* and its spread: the slowest end of its kind this home's
+//! processes have heard (the home's [`RECORD`]), kept as each is heard, so that a host whose
+//! guests stall on its disk for 9 s before they end (PM M419) gives its teardowns that long,
+//! and the slowest less the quickest, as D215's judge takes its record's spread (amended
+//! 2026-11-19): the next end may be slower than the slowest by as much as those heard
+//! differed. A home with none of a kind yet has no slice: its end is followed by its
+//! process's liveness alone, to the end that teaches it. A daemon and the run hosts of a home
+//! keep one record: each end kept is put with what the record holds then.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use shards_vmm::platform::{Look, Progress};
+use shards_vmm::platform::{Look, Progress, progressed};
 
 use super::lock;
 
-/// The home's record of this host's ends: `teardown MS`, `exit MS`, `helper MS` and `start MS`,
-/// the slowest a SIGKILLed command's end was heard after its SIGKILL, a killed VM process's
-/// after its kill, a network or share process's after its VM had gone, and a daemon's start
-/// from its home's lock to its slots' lists, in milliseconds.
+/// The home's record of this host's ends: `teardown MS QUICKEST`, `exit MS QUICKEST`, `helper
+/// MS QUICKEST` and `start MS QUICKEST`, the slowest and the quickest a SIGKILLed command's
+/// end was heard after its SIGKILL, a killed VM process's after its kill, a network or share
+/// process's after its VM had gone, and a daemon's start from its home's lock to its slots'
+/// lists, in milliseconds ([`Took`]); and, once a teardown's work was read through its end,
+/// `teardown-work KEY WORK LEAST ANSWERS`, the most work a microVM's own VM process did from
+/// its command's SIGKILL to that command's end (C*) and the least, counted as KEY says
+/// ([`work_key`]: CPU nanoseconds, on Windows cycles, and the CPU's model), and how many
+/// teardowns taught them ([`MostWork`]). A line kept before the minima were (`teardown MS`,
+/// `teardown-work KEY WORK ANSWERS`) is read whole, its minimum its maximum: a spread of none.
 pub(crate) const RECORD: &str = "ends";
 
 /// Which end was heard.
@@ -58,21 +70,197 @@ pub(crate) enum End {
 #[derive(Debug)]
 pub(crate) struct Ends {
     path: PathBuf,
-    /// The slowest of each heard: a teardown's and an exit's.
-    slowest: Mutex<Slowest>,
+    /// What each kind of end heard has shown.
+    shown: Mutex<Shown>,
 }
 
-/// The slowest end of each kind heard.
+/// The slowest and the quickest end of each kind heard, and the most and least work a
+/// teardown took.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Slowest {
-    teardown: Duration,
-    exit: Duration,
-    helper: Duration,
-    start: Duration,
+struct Shown {
+    teardown: Took,
+    exit: Took,
+    helper: Took,
+    start: Took,
+    teardown_work: MostWork,
 }
 
-impl Slowest {
-    fn of(&mut self, kind: End) -> &mut Duration {
+/// The slowest and the quickest end of a kind heard, none of either until one is: its slice
+/// is the slowest and its spread, the slowest less the quickest ([`Took::slice`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Took {
+    slowest: Duration,
+    quickest: Duration,
+}
+
+impl Took {
+    /// An end heard `took` after its signal: the slowest rises to it and the quickest falls to
+    /// it. One heard in no time teaches nothing, as a D215 answer no time long does.
+    fn learn(&mut self, took: Duration) {
+        if !took.is_zero() {
+            *self = self.with(Took {
+                slowest: took,
+                quickest: took,
+            });
+        }
+    }
+
+    /// The slower of the two slowest and the quicker of the two quickest, of those heard.
+    fn with(self, other: Took) -> Took {
+        if self.slowest.is_zero() {
+            return other;
+        }
+        if other.slowest.is_zero() {
+            return self;
+        }
+        Took {
+            slowest: self.slowest.max(other.slowest),
+            quickest: self.quickest.min(other.quickest),
+        }
+    }
+
+    /// How long an end of its kind is given before its work is looked at, and again each
+    /// time it is seen to go on: the slowest heard and its spread (D215 amended 2026-11-19);
+    /// none until one is heard.
+    fn slice(self) -> Option<Duration> {
+        (!self.slowest.is_zero()).then(|| {
+            self.slowest
+                .saturating_add(self.slowest.saturating_sub(self.quickest))
+        })
+    }
+
+    /// `MS QUICKEST` as the record keeps them, in milliseconds: none unless each is read whole
+    /// and the quickest is no slower than the slowest. One kept before the quickest was, `MS`
+    /// alone, is its own quickest: a spread of none.
+    fn read(text: &str) -> Option<Took> {
+        let mut words = text.split_whitespace();
+        let (Some(slowest), quickest, None) = (words.next(), words.next(), words.next()) else {
+            return None;
+        };
+        let slowest = slowest.parse::<u64>().ok()?;
+        let quickest = quickest.map_or(Some(slowest), |q| q.parse::<u64>().ok())?;
+        (quickest <= slowest).then(|| Took {
+            slowest: Duration::from_millis(slowest),
+            quickest: Duration::from_millis(quickest),
+        })
+    }
+}
+
+/// The most work a microVM's teardown took (C*) and the least, its VM process's work
+/// (`shards_api::Work`) from its command's SIGKILL to that command's end, and how many
+/// teardowns taught them, as D215's judge keeps a kind's (`shards_api::Rated`): each teardown
+/// taught adds one, and a record merged in counts the more of the two, never their sum. It
+/// refuses once `shards_api::SPREAD` have taught it, one teardown's most work being that
+/// one's (D217, ROOT's ruling of 2026-11-18), and then a teardown past C* and its spread, C*
+/// less the least ([`MostWork::bound`]; D215 amended 2026-11-19).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MostWork {
+    most: shards_api::Work,
+    lightest: shards_api::Work,
+    answers: u64,
+}
+
+/// The first word of [`MostWork`]'s line in the record.
+const WORK: &str = "teardown-work";
+
+impl MostWork {
+    /// `KEY WORK LEAST ANSWERS` as the record keeps them, of this host's key ([`work_key`]):
+    /// none unless all are read whole and the least is no more than the most. A line of
+    /// another key is work counted in another unit or on another CPU model, which weighs
+    /// nothing here; one kept before lines were keyed (`NS ANSWERS`: CPU nanoseconds, on
+    /// Windows whole clock ticks' (CI 44347282760)) is read as none, its C* taught anew. One
+    /// kept before the least was, `KEY WORK ANSWERS`, is its own least: a spread of none.
+    fn read(text: &str) -> Option<MostWork> {
+        let mut words = text.split_whitespace();
+        let (Some(key), Some(work), Some(second), third, None) = (
+            words.next(),
+            words.next(),
+            words.next(),
+            words.next(),
+            words.next(),
+        ) else {
+            return None;
+        };
+        if key != work_key() {
+            return None;
+        }
+        let (lightest, answers) = third.map_or((work, second), |answers| (second, answers));
+        let (most, lightest) = (work.parse::<u64>().ok()?, lightest.parse::<u64>().ok()?);
+        if lightest > most {
+            return None;
+        }
+        Some(MostWork {
+            most: shards_api::Work::of(most),
+            lightest: shards_api::Work::of(lightest),
+            answers: answers.parse().ok()?,
+        })
+    }
+
+    /// A teardown's work taught: C* rises to it, the least falls to it, one more counted.
+    fn learn(&mut self, work: shards_api::Work) {
+        let lightest = if self.answers == 0 {
+            work
+        } else {
+            self.lightest.min(work)
+        };
+        *self = MostWork {
+            most: self.most.max(work),
+            lightest,
+            answers: self.answers.saturating_add(1),
+        };
+    }
+
+    /// The more of the two C*s and the less of the two leasts, of records that hold any, and
+    /// the more of the two counts.
+    fn with(self, other: MostWork) -> MostWork {
+        if self.answers == 0 {
+            return other;
+        }
+        if other.answers == 0 {
+            return self;
+        }
+        MostWork {
+            most: self.most.max(other.most),
+            lightest: self.lightest.min(other.lightest),
+            answers: self.answers.max(other.answers),
+        }
+    }
+
+    /// The most work a teardown took (C*).
+    pub(crate) fn most(self) -> shards_api::Work {
+        self.most
+    }
+
+    /// C*'s spread: C* less the least work a teardown took.
+    pub(crate) fn spread(self) -> shards_api::Work {
+        self.most.saturating_sub(self.lightest)
+    }
+
+    /// The work past which a teardown not ended is given up: C* and its spread.
+    pub(crate) fn bound(self) -> shards_api::Work {
+        self.most.saturating_add(self.spread())
+    }
+}
+
+/// What this host's teardown work is counted in, as its line in the home's record names it:
+/// its unit (`shards_api::Work::UNIT`: CPU nanoseconds, on Windows cycles) and its CPU's model
+/// (`shards_vmm::vm::limits::HostModel`'s key, as D261's records and the tests' kept ratings
+/// key one), `UNIT:MODEL`. Cycles are no time ("Do not attempt to convert the CPU clock cycles
+/// returned by QueryThreadCycleTime to elapsed time", Microsoft Learn), and their rate is their
+/// CPU's: a home read on another host weighs nothing of its work.
+fn work_key() -> &'static str {
+    static KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        format!(
+            "{}:{}",
+            shards_api::Work::UNIT,
+            shards_vmm::vm::limits::HostModel::here().key()
+        )
+    })
+}
+
+impl Shown {
+    fn of(&mut self, kind: End) -> &mut Took {
         match kind {
             End::Teardown => &mut self.teardown,
             End::Exit => &mut self.exit,
@@ -84,33 +272,64 @@ impl Slowest {
     /// The record at `path` as it is now, its newest version (platform `write_in`, which on
     /// Windows lands `ends.~N` beside it and removes the plain name): none of a kind it
     /// holds no line of, or that is not there or not read.
-    fn read(path: &Path) -> Slowest {
-        let mut slowest = Slowest::default();
+    fn read(path: &Path) -> Shown {
+        let mut shown = Shown::default();
         for line in newest(path).unwrap_or_default().lines() {
-            let (name, ms) = line.split_once(' ').unwrap_or((line, ""));
-            let Ok(ms) = ms.trim().parse::<u64>() else {
+            let (name, rest) = line.split_once(' ').unwrap_or((line, ""));
+            if name == WORK {
+                if let Some(work) = MostWork::read(rest) {
+                    shown.teardown_work = work;
+                }
+                continue;
+            }
+            let Some(took) = Took::read(rest) else {
                 continue;
             };
-            let ms = Duration::from_millis(ms);
             match name {
-                "teardown" => slowest.teardown = ms,
-                "exit" => slowest.exit = ms,
-                "helper" => slowest.helper = ms,
-                "start" => slowest.start = ms,
+                "teardown" => shown.teardown = took,
+                "exit" => shown.exit = took,
+                "helper" => shown.helper = took,
+                "start" => shown.start = took,
                 _ => {}
             }
         }
-        slowest
+        shown
     }
 
-    /// Each kind's slower of `self`'s and `other`'s.
-    fn with(self, other: Slowest) -> Slowest {
-        Slowest {
-            teardown: self.teardown.max(other.teardown),
-            exit: self.exit.max(other.exit),
-            helper: self.helper.max(other.helper),
-            start: self.start.max(other.start),
+    /// Each kind's slower slowest and quicker quickest of `self`'s and `other`'s, and the
+    /// teardowns' work of both.
+    fn with(self, other: Shown) -> Shown {
+        Shown {
+            teardown: self.teardown.with(other.teardown),
+            exit: self.exit.with(other.exit),
+            helper: self.helper.with(other.helper),
+            start: self.start.with(other.start),
+            teardown_work: self.teardown_work.with(other.teardown_work),
         }
+    }
+
+    /// As the home's record keeps it ([`RECORD`]): each slice's times in whole milliseconds
+    /// ([`whole_ms`]), and the teardowns' work where one was read through its end.
+    fn text(&self) -> String {
+        let took = |took: Took| format!("{} {}", whole_ms(took.slowest), whole_ms(took.quickest));
+        let mut text = format!(
+            "teardown {}\nexit {}\nhelper {}\nstart {}\n",
+            took(self.teardown),
+            took(self.exit),
+            took(self.helper),
+            took(self.start)
+        );
+        let work = self.teardown_work;
+        if work.answers > 0 {
+            text.push_str(&format!(
+                "{WORK} {} {} {} {}\n",
+                work_key(),
+                work.most.count(),
+                work.lightest.count(),
+                work.answers
+            ));
+        }
+        text
     }
 }
 
@@ -136,44 +355,67 @@ impl Ends {
     /// read.
     pub(crate) fn kept_in(home: &Path) -> Ends {
         let path = home.join(RECORD);
-        let slowest = Slowest::read(&path);
+        let shown = Shown::read(&path);
         Ends {
             path,
-            slowest: Mutex::new(slowest),
+            shown: Mutex::new(shown),
         }
     }
 
     /// How long an end of `kind` is given before its work is looked at, and again each
-    /// time it is seen to go on: the slowest of its kind this host has shown (W*); none
-    /// where it has shown none, its end then followed by its process's liveness alone.
+    /// time it is seen to go on: the slowest of its kind this host has shown (W*) and its
+    /// spread ([`Took::slice`]); none where it has shown none, its end then followed by its
+    /// process's liveness alone.
     pub(crate) fn slice(&self, kind: End) -> Option<Duration> {
-        let slowest = *lock(&self.slowest).of(kind);
-        (!slowest.is_zero()).then_some(slowest)
+        lock(&self.shown).of(kind).slice()
     }
 
-    /// An end of `kind` heard `took` after its signal: kept where it is the slowest yet, in
-    /// memory ([`learn`](Self::learn)) and in the home ([`keep`](Self::keep)).
+    /// An end of `kind` heard `took` after its signal: kept where it is the slowest or the
+    /// quickest yet, in memory ([`learn`](Self::learn)) and in the home ([`keep`](Self::keep)).
     pub(crate) fn heard(&self, kind: End, took: Duration) -> Result<(), String> {
         self.learn(kind, took);
         self.keep()
     }
 
     /// An end of `kind` heard `took` after its signal, kept in this process's memory where it
-    /// is the slowest yet: its kind's slice from now. It waits on no file: a stop of many
-    /// keeps the ends it hears in the home once, as it ends (`end_all`), where a keep of
-    /// each, two flushes of the disk on macOS (`platform::write_in`), held up every end
-    /// after it (D217).
+    /// is the slowest or the quickest yet: its kind's slice from now. It waits on no file: a
+    /// stop of many keeps the ends it hears in the home once, as it ends (`end_all`), where a
+    /// keep of each, two flushes of the disk on macOS (`platform::write_in`), held up every
+    /// end after it (D217).
     pub(crate) fn learn(&self, kind: End, took: Duration) {
-        let mut slowest = lock(&self.slowest);
-        let was = slowest.of(kind);
-        *was = (*was).max(took);
+        lock(&self.shown).of(kind).learn(took);
+    }
+
+    /// A microVM's teardown ended, its VM process having done `work` since its command's
+    /// SIGKILL, read through its end ([`Followed::worked`]): kept in this process's memory as
+    /// its C* where it is the most yet and its least where it is the least, one more teardown
+    /// counted, and in the home at the next [`keep`](Self::keep). One whose work read none
+    /// teaches nothing: no work holds no bound (D215, `Record::teach`, CI 44076016255's
+    /// Windows ticks).
+    pub(crate) fn learn_work(&self, work: shards_api::Work) {
+        if work.is_zero() {
+            return;
+        }
+        lock(&self.shown).teardown_work.learn(work);
+    }
+
+    /// The most work a microVM's teardown has taken (C*) and its spread, past both of which
+    /// one that has not ended is given up whatever its rate ([`MostWork::bound`]): none until
+    /// `shards_api::SPREAD` teardowns have taught it (D217, by D215's rule for starts, ROOT's
+    /// ruling of 2026-11-18; its spread, D215 amended 2026-11-19).
+    pub(crate) fn most_work(&self) -> Option<MostWork> {
+        let kept = lock(&self.shown).teardown_work;
+        (kept.answers >= shards_api::SPREAD).then_some(kept)
     }
 
     /// What this process has learned, put with what the home's record holds now (another
     /// process of the home, a daemon or a run's host, may have kept one since this read it),
-    /// in memory and in the home where either is slower: written whole, then renamed over
-    /// the record, so that a reader finds the old record or the new. The memory's lock is
-    /// not held over the record's lock or its flush, which a slice wanted meanwhile would
+    /// in memory and in the home where either goes past the other: written whole, then
+    /// renamed over the record, so that a reader finds the old record or the new. Nothing is
+    /// written where the record would say what it says now, compared as it keeps them, in
+    /// whole milliseconds: a quickest end known to the nanosecond in memory and rounded up in
+    /// the record is no change, nor its two flushes (`platform::write_in`). The memory's lock
+    /// is not held over the record's lock or its flush, which a slice wanted meanwhile would
     /// wait on. A record that cannot be written leaves this process's own, for the next keep,
     /// and says why.
     pub(crate) fn keep(&self) -> Result<(), String> {
@@ -182,31 +424,30 @@ impl Ends {
         // record's inode. Locked releases flock before close (M244).
         let _writing =
             shards_image::store::Locked::exclusive(&self.path.with_extension("lock")).map_err(fail)?;
-        let recorded = Slowest::read(&self.path);
+        let recorded = Shown::read(&self.path);
         let kept = {
-            let mut slowest = lock(&self.slowest);
-            *slowest = slowest.with(recorded);
-            *slowest
+            let mut shown = lock(&self.shown);
+            *shown = shown.with(recorded);
+            *shown
         };
-        if kept == recorded {
+        let text = kept.text();
+        if text == recorded.text() {
             return Ok(());
         }
-        let text = format!(
-            "teardown {}\nexit {}\nhelper {}\nstart {}\n",
-            kept.teardown.as_millis(),
-            kept.exit.as_millis(),
-            kept.helper.as_millis(),
-            kept.start.as_millis()
-        );
         let dir = shards_vmm::platform::open_dir(home_of(&self.path)).map_err(fail)?;
         shards_vmm::platform::write_in(&dir, RECORD, text.as_bytes()).map_err(fail)
     }
 }
 
-/// A SIGKILLed command's teardown in its own microVM, a killed VM process's end, or a
-/// network or share process's once its VM has gone, followed by what its process runs and
-/// frees from then on; none for a joiner (D119), whose VM is its provider's and runs the
-/// provider's command too, so that it is held to one slice.
+/// Processes whose usage reads fail at their follows' looks in this test process, each with
+/// what its read says: a look that fails, which no host fails on purpose, followed through the
+/// daemon's callers to its log ([`GoesOn::Unread`]).
+#[cfg(test)]
+pub(crate) static UNREADABLE: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+
+/// A SIGKILLed command's teardown in its own microVM or, a joiner's (D119), in its provider's,
+/// a killed VM process's end, or a network or share process's once its VM has gone, followed
+/// by what its process runs and frees from then on.
 #[derive(Debug)]
 pub(crate) struct Followed {
     /// Its CPU and what its host does to it, as D215's readers see them, and when they last
@@ -215,54 +456,252 @@ pub(crate) struct Followed {
     looked: Instant,
     /// What it holds, which its host frees as its end goes on, and what it did, for the log.
     usage: Option<Progress>,
+    /// Whether its process is a joiner's provider's ([`Followed::of_provider`]).
+    provider: bool,
+    /// Its work as it began to be followed: what its work since is counted from.
+    from: Option<shards_api::Work>,
+    /// Why its process could not be followed as it began to be, where it could not: its work
+    /// is then unread, which [`work`](Self::work) says, never taken for none.
+    unread: Option<String>,
 }
 
 impl Followed {
-    /// The end, from now, of process `pid`'s work.
+    /// The end, from now, of process `pid`'s work. A process none has (it has gone) has no
+    /// work to follow; one that could not be read says why ([`work`](Self::work)).
     pub(crate) fn of(pid: Option<u32>) -> Followed {
-        let watch = pid
-            .and_then(|pid| shards_api::Followed::of_pid(pid).ok().flatten())
-            .and_then(|followed| shards_api::Watch::of(followed).ok().flatten());
+        let (watch, unread) = match pid.map(Self::watch) {
+            None => (None, None),
+            Some(Ok(watch)) => (watch, None),
+            Some(Err(why)) => (None, Some(why)),
+        };
         Followed {
+            from: watch.as_ref().map(shards_api::Watch::work),
             watch,
             looked: Instant::now(),
             usage: pid.map(Progress::of),
+            provider: false,
+            unread,
         }
     }
 
-    /// Whether its VM process went on with its end since it was last looked at: ran any CPU,
-    /// or held less than it did, its host freeing it, or its host held it from running, which
-    /// is no stall of its own (ROOT's ruling, 2026-11-13); and what it did, for the log.
-    /// Waited on for another slice if so; given up on if not, as one stopped or frozen is,
-    /// and one whose CPU could not be read, as before. A slice shorter than its CPU reading
-    /// shows (`Watch::resolution`, a clock tick) is no evidence of a stall: it goes on, the
-    /// look before kept, until the slices since add up to one.
-    pub(crate) fn goes_on(&mut self) -> Option<Look> {
+    /// Process `pid` followed by D215's readers: none where no process has it; why not where
+    /// it could not be read.
+    fn watch(pid: u32) -> Result<Option<shards_api::Watch>, String> {
+        let Some(followed) = shards_api::Followed::of_pid(pid).map_err(|e| format!("process {pid}: {e}"))?
+        else {
+            return Ok(None);
+        };
+        shards_api::Watch::of(followed, &shards_api::Listing::new())
+            .map_err(|e| format!("process {pid}'s CPU: {e}"))
+    }
+
+    /// Where its VM process, a microVM's own, has done more work since it began to be
+    /// followed, by its last look, than `most` allows, the most any of its kind took (C*,
+    /// [`Ends::most_work`]) and its spread ([`MostWork::bound`]): that work, and C*. Such an
+    /// end is given up whatever its rate, its VM process killed, as D215 gives up a start
+    /// (`Bound::Work`, (b); D217, ROOT's ruling of 2026-11-18): CI 44245219858's nine VMs, their
+    /// guests spinning, ran at their host's share for 348 s and were followed for as long, a
+    /// stop with them. None where no C* is learned, for a joiner's provider, whose work is the
+    /// provider's own too ([`Followed::of_provider`]), and where it has done no more; why not
+    /// where its work is unread ([`work`](Self::work)): its caller says it, and takes nothing
+    /// of the bound from that look.
+    pub(crate) fn past(
+        &self,
+        most: Option<MostWork>,
+    ) -> Result<Option<(shards_api::Work, MostWork)>, String> {
+        let Some(most) = most else {
+            return Ok(None);
+        };
+        Ok(self
+            .work()?
+            .filter(|&work| work > most.bound())
+            .map(|work| (work, most)))
+    }
+
+    /// The work its VM process, a microVM's own, has done since it began to be followed, by
+    /// its last look: none for a joiner's provider ([`Followed::of_provider`]), nor where no
+    /// process was there to follow; why not where its process could not be read as it began
+    /// to be followed.
+    pub(crate) fn work(&self) -> Result<Option<shards_api::Work>, String> {
+        if self.provider {
+            return Ok(None);
+        }
+        match (&self.watch, self.from, &self.unread) {
+            (Some(watch), Some(from), _) => Ok(Some(watch.work().saturating_sub(from))),
+            (_, _, Some(why)) => Err(why.clone()),
+            _ => Ok(None),
+        }
+    }
+
+    /// The work its VM process has done since it began to be followed, read through its end
+    /// heard: looked at once more. None for a joiner's provider, where no process was there to
+    /// follow, and where its process has gone since (reaped before its last CPU was read: no
+    /// work read through its end); why not where it could not be read. What a teardown teaches
+    /// of C* ([`Ends::learn_work`]).
+    pub(crate) fn worked(&mut self) -> Result<Option<shards_api::Work>, String> {
+        if self.provider {
+            return Ok(None);
+        }
+        if let Some(why) = &self.unread {
+            return Err(why.clone());
+        }
+        let (Some(watch), Some(from)) = (self.watch.as_mut(), self.from) else {
+            return Ok(None);
+        };
+        match watch.look(&shards_api::Listing::new()) {
+            Ok(shards_api::Found::Gone) => Ok(None),
+            Ok(_) => Ok(Some(watch.work().saturating_sub(from))),
+            Err(e) => Err(format!("its VM process's CPU at its end: {e}")),
+        }
+    }
+
+    /// A joiner's teardown (D119), from now, in its provider's microVM, whose VM process is
+    /// `pid` (ROOT's ruling, 2026-11-18). That process runs the provider's own command and
+    /// ticks whether or not the joiner's end goes on. So it goes on by work beyond an idle
+    /// microVM's (`IDLE_VM_CPU`, PM M357: 63 ms of CPU in 10 s, the most an idle run's microVM
+    /// took, on windows-2025; 31 ms on windows-2022) over the time in a slice its host let it
+    /// run: the slice less its threads' wait for a CPU in it (`Watch::waited`), so that a
+    /// working provider its host starves shows its own rate (case 5 under the parallel suite:
+    /// 2 to 24 ms of CPU a 50 ms slice, some slices below an idle microVM's rate, its joiner's
+    /// kill given up). A slice it ran nothing in, its host holding it (D215's `Held`), goes on
+    /// too, as no stall of its own. What its host frees of it is no sign: an idle provider's
+    /// give-back frees it too. Before, a joiner's teardown was followed by nothing: held to one
+    /// slice, then to a killed VM process's, and given up while its provider's guest still
+    /// tore it down (CI 44245219858, x86_64 gnu: `stop -t 1` of a joiner exited 1, 5.98 ms into
+    /// the second slice).
+    pub(crate) fn of_provider(pid: u32) -> Followed {
+        Followed {
+            provider: true,
+            ..Followed::of(Some(pid))
+        }
+    }
+
+    /// What its process did with its end since it was last looked at ([`GoesOn`]): went on
+    /// where it ran any CPU, or held less than it did, its host freeing it, or its host held it
+    /// from running, which is no stall of its own (ROOT's ruling, 2026-11-13), and what it did,
+    /// for the log; still where it did none of these, or is stopped or frozen, or has gone;
+    /// unread where it lives and could not be read, then or as it began to be followed, which
+    /// its caller gives up on as one still, saying why (the person's rule of 2026-11-18: no
+    /// failure taken for a stillness, nor waited on for another slice; as D215's judge gives up
+    /// a process it cannot read, `Refusal::Process`). A slice shorter than its CPU reading shows
+    /// (`Watch::resolution`, a clock tick) is no evidence of a stall: it goes on, the look
+    /// before kept, until the slices since add up to one.
+    pub(crate) fn goes_on(&mut self) -> GoesOn {
+        if let Some(why) = &self.unread {
+            return GoesOn::Unread(why.clone());
+        }
+        // No process to follow: gone before its end was.
+        let Some(usage) = self.usage.as_mut() else {
+            return GoesOn::Still;
+        };
         let unresolved = self
             .watch
             .as_ref()
             .is_some_and(|watch| self.looked.elapsed() < watch.resolution());
+        // A provider's work is judged over no less than its CPU reading resolves: until the
+        // slices since add up to that, the look before is kept, and it goes on.
+        if self.provider && unresolved {
+            return GoesOn::Went(Look {
+                ran: true,
+                before: None,
+                now: None,
+                over: usage.since(),
+                unread: Some("its slices since the look before shorter than its CPU reading resolves".into()),
+            });
+        }
+        // Its usage first, then D215's look: a usage unread as its process ends is told by
+        // that look, which then finds it ending or gone.
+        let look = usage.look();
+        // A test's failed read (`UNREADABLE`): what its usage read says replaced by the failure.
+        #[cfg(test)]
+        let look = match lock(&UNREADABLE).iter().find(|(pid, _)| *pid == usage.pid()) {
+            Some((_, why)) => Look {
+                ran: false,
+                now: None,
+                unread: Some(why.clone()),
+                ..look
+            },
+            None => look,
+        };
         let found = match self.watch.as_mut() {
             Some(_) if unresolved => None,
-            watch => {
+            Some(watch) => {
                 self.looked = Instant::now();
-                watch.map(shards_api::Watch::look)
+                match watch.look(&shards_api::Listing::new()) {
+                    Ok(shards_api::Found::Gone) => return GoesOn::Still,
+                    Ok(found) => Some(found),
+                    Err(e) => return GoesOn::Unread(format!("process {}'s CPU: {e}", usage.pid())),
+                }
             }
+            // Gone as its follow began.
+            None => return GoesOn::Still,
         };
-        let look = self.usage.as_mut()?.look();
-        let freed = matches!((look.before, look.now), (Some(b), Some(n)) if n.resident < b.resident);
-        let went = unresolved
-            || matches!(
-                found,
-                Some(Ok(shards_api::Found::Progressed | shards_api::Found::Held))
-            );
-        (went || freed).then_some(look)
+        let ending = self.watch.as_ref().is_some_and(shards_api::Watch::ended);
+        if let Some(why) = &look.unread
+            && found.is_some()
+            && !ending
+        {
+            return GoesOn::Unread(why.clone());
+        }
+        let went = if self.provider {
+            // Its wait for a CPU in the slice, none counted on Windows; unread, the look is.
+            let waited = match self.watch.as_ref().map(shards_api::Watch::waited) {
+                Some(Ok(waited)) => waited,
+                Some(Err(e)) => return GoesOn::Unread(format!("process {}: {e}", usage.pid())),
+                None => None,
+            };
+            found == Some(shards_api::Found::Held)
+                || progressed(
+                    look.before.map(|u| u.cpu_ns),
+                    look.now.map(|u| u.cpu_ns),
+                    look.over.saturating_sub(waited.unwrap_or_default()),
+                )
+        } else {
+            let freed = matches!((look.before, look.now), (Some(b), Some(n)) if n.resident < b.resident);
+            freed
+                || unresolved
+                || matches!(
+                    found,
+                    Some(shards_api::Found::Progressed | shards_api::Found::Held)
+                )
+        };
+        if went { GoesOn::Went(look) } else { GoesOn::Still }
     }
+}
+
+/// What a look at an end found of its process since the look before ([`Followed::goes_on`]).
+#[derive(Debug)]
+pub(crate) enum GoesOn {
+    /// It went on with its end: what it did, for the log.
+    Went(Look),
+    /// It went on with nothing of its end, or is stopped or frozen, or has gone, or there was
+    /// no process to follow.
+    Still,
+    /// It lives and could not be read: why. Given up on as one still is, and said.
+    Unread(String),
+}
+
+/// A slice as the home's record keeps it, in whole milliseconds, rounded up: a heard end
+/// that took less than one is kept as one, never as none, which [`Ends::slice`] would read
+/// as nothing learned (Windows CI 44408928475: a kill's end heard in under a millisecond,
+/// kept as `teardown 0`).
+fn whole_ms(took: Duration) -> u128 {
+    took.as_nanos().div_ceil(1_000_000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether a look found its end going on: a look that could not read it fails the test,
+    /// saying why.
+    fn went_on(found: GoesOn) -> bool {
+        match found {
+            GoesOn::Went(_) => true,
+            GoesOn::Still => false,
+            GoesOn::Unread(why) => panic!("its look could not read it: {why}"),
+        }
+    }
 
     /// The record as a later process reads it: its newest version.
     fn recorded(home: &Path) -> String {
@@ -277,11 +716,13 @@ mod tests {
 
     /// A record published as `heard` publishes it is read back by the next process, over
     /// and over: on Windows each publication is a new version beside the name, which a
-    /// read of the plain name never finds (runs-12).
+    /// read of the plain name never finds (runs-12). Its slice is the slowest heard and its
+    /// spread: 1 s, then 3 s and the 2 s it is past the 1 s, then the same (a 2 s end is
+    /// neither); a record kept before the quickest was is read as a spread of none.
     #[test]
     fn each_published_record_is_read_back_by_the_next_process() {
         let home = shards_testdir::TempDir::new("ends-versions").unwrap();
-        for (ms, kept) in [(1_000u64, 1_000u64), (3_000, 3_000), (2_000, 3_000)] {
+        for (ms, kept) in [(1_000u64, 1_000u64), (3_000, 5_000), (2_000, 5_000)] {
             Ends::kept_in(&home)
                 .heard(End::Teardown, Duration::from_millis(ms))
                 .unwrap();
@@ -299,7 +740,8 @@ mod tests {
     }
 
     /// Another writer owns the stable record lock and is about to publish a slower
-    /// teardown. A helper's update must wait, reread it, and preserve both maxima.
+    /// teardown. A helper's update must wait, reread it, and preserve both maxima, with the
+    /// quicker teardown this process read before it: the slowest 9 s and its spread, 8 s.
     #[test]
     fn concurrent_end_writers_keep_each_others_maxima() {
         let home = shards_testdir::TempDir::new("ends-race").unwrap();
@@ -323,14 +765,20 @@ mod tests {
                 .unwrap();
         });
         let kept = Ends::kept_in(&home);
-        assert_eq!(kept.slice(End::Teardown), Some(Duration::from_secs(9)));
+        assert_eq!(kept.slice(End::Teardown), Some(Duration::from_secs(17)));
         assert_eq!(kept.slice(End::Helper), Some(Duration::from_secs(8)));
+        assert_eq!(
+            recorded(&home),
+            "teardown 9000 1000\nexit 0 0\nhelper 8000 8000\nstart 0 0\n"
+        );
     }
 
     /// A home with no record gives no end a slice: each is followed by its process's
     /// liveness alone, as the person's rule has a cold wait (red with `LEAST_SLICE`, 10 s of
-    /// shards' own). Each end heard slower than the slowest is kept, in the home too, and
-    /// read back by the next daemon; a faster one changes nothing.
+    /// shards' own). Each end heard slower than the slowest or quicker than the quickest is
+    /// kept, in the home too, and read back by the next daemon; one between them changes
+    /// nothing. Its slice is the slowest and its spread (D215 amended 2026-11-19): one end
+    /// heard, the slowest alone; 900 ms and 19.383 s heard, 37.866 s.
     #[test]
     fn a_hosts_ends_are_learned_and_kept_in_its_home() {
         let home = shards_testdir::TempDir::new("ends").unwrap();
@@ -344,15 +792,39 @@ mod tests {
         ends.heard(End::Teardown, Duration::from_millis(19_383)).unwrap();
         ends.heard(End::Teardown, Duration::from_millis(12_000)).unwrap();
         ends.heard(End::Exit, Duration::from_millis(1_400)).unwrap();
-        assert_eq!(ends.slice(End::Teardown), Some(Duration::from_millis(19_383)));
-        assert_eq!(recorded(&home), "teardown 19383\nexit 1400\nhelper 0\nstart 0\n");
+        assert_eq!(ends.slice(End::Teardown), Some(Duration::from_millis(37_866)));
+        assert_eq!(
+            recorded(&home),
+            "teardown 19383 900\nexit 1400 1400\nhelper 0 0\nstart 0 0\n"
+        );
         let next = Ends::kept_in(&home);
-        assert_eq!(next.slice(End::Teardown), Some(Duration::from_millis(19_383)));
+        assert_eq!(next.slice(End::Teardown), Some(Duration::from_millis(37_866)));
         assert_eq!(next.slice(End::Exit), Some(Duration::from_millis(1_400)));
         assert_eq!(next.slice(End::Helper), None);
-        // A record it cannot read is no record.
-        publish(&home, "teardown many\n");
-        assert_eq!(Ends::kept_in(&home).slice(End::Teardown), None);
+        // A record it cannot read is no record, nor one whose quickest is past its slowest.
+        for unread in [
+            "teardown many\n",
+            "teardown 900 19383\n",
+            "teardown 19383 900 1\n",
+        ] {
+            publish(&home, unread);
+            assert_eq!(Ends::kept_in(&home).slice(End::Teardown), None, "{unread}");
+        }
+    }
+
+    /// An end heard under a millisecond is kept as one, slowest and quickest, and a keep that
+    /// would write what the record says, compared in its whole milliseconds, writes nothing:
+    /// the quickest known to the nanosecond in memory is no change to the millisecond the
+    /// record rounds it up to, nor a reason for two more flushes of the disk.
+    #[test]
+    fn a_keep_that_changes_no_whole_millisecond_writes_nothing() {
+        let home = shards_testdir::TempDir::new("ends-same").unwrap();
+        let ends = Ends::kept_in(&home);
+        ends.heard(End::Exit, Duration::from_micros(300)).unwrap();
+        assert_eq!(recorded(&home), "teardown 0 0\nexit 1 1\nhelper 0 0\nstart 0 0\n");
+        publish(&home, "teardown 0 0\nexit 1 1\nhelper 0 0\nstart 0 0\nunread\n");
+        ends.heard(End::Exit, Duration::from_micros(400)).unwrap();
+        assert!(recorded(&home).ends_with("unread\n"), "rewritten unchanged");
     }
 
     /// Two processes of a home keep one record: a run's host keeps its network process's
@@ -367,15 +839,220 @@ mod tests {
         host.heard(End::Helper, Duration::from_millis(12_500)).unwrap();
         daemon.heard(End::Exit, Duration::from_millis(11_000)).unwrap();
         assert_eq!(daemon.slice(End::Helper), Some(Duration::from_millis(12_500)));
-        assert_eq!(recorded(&home), "teardown 0\nexit 11000\nhelper 12500\nstart 0\n");
+        assert_eq!(
+            recorded(&home),
+            "teardown 0 0\nexit 11000 11000\nhelper 12500 12500\nstart 0 0\n"
+        );
         let gone = shards_testdir::TempDir::new("ends-gone").unwrap();
         let lost = Ends::kept_in(&gone.join("no-such-home"));
         let said = lost.heard(End::Helper, Duration::from_secs(11)).unwrap_err();
         assert!(said.starts_with("keeping this host's ends in "), "{said}");
     }
 
+    /// A teardown's work read through its end teaches its C* and its least, kept in the home
+    /// beside the slices, keyed by the unit and CPU model it was counted in ([`work_key`]), and
+    /// read back by the next process; it bounds nothing until two teardowns have taught it
+    /// (`shards_api::SPREAD`), and then C* and its spread (D215 amended 2026-11-19), and one
+    /// whose work read none teaches nothing (D217, ROOT's ruling of 2026-11-18). A line kept
+    /// before the least was is read as a spread of none. A record whose work line does not read
+    /// whole keeps none, nor does one whose least is past its most, one of another key, nor
+    /// one kept before lines were keyed (on Windows a count of whole clock ticks: CI
+    /// 44347282760), its slices kept.
+    #[test]
+    fn a_teardowns_work_teaches_its_c_star_kept_in_its_home() {
+        let work = shards_api::Work::of;
+        let taught = |ends: &Ends| {
+            ends.most_work()
+                .map(|kept| (kept.most(), kept.spread(), kept.bound()))
+        };
+        let home = shards_testdir::TempDir::new("ends-work").unwrap();
+        let ends = Ends::kept_in(&home);
+        ends.learn_work(shards_api::Work::ZERO);
+        ends.learn_work(work(3_000_000));
+        assert_eq!(ends.most_work(), None, "one teardown's work bounds nothing");
+        ends.learn_work(work(2_000_000));
+        let both = Some((work(3_000_000), work(1_000_000), work(4_000_000)));
+        assert_eq!(taught(&ends), both);
+        ends.learn(End::Teardown, Duration::from_millis(40));
+        ends.keep().unwrap();
+        assert_eq!(
+            recorded(&home),
+            format!(
+                "teardown 40 40\nexit 0 0\nhelper 0 0\nstart 0 0\nteardown-work {} 3000000 2000000 2\n",
+                work_key()
+            )
+        );
+        assert_eq!(taught(&Ends::kept_in(&home)), both);
+        publish(
+            &home,
+            &format!("teardown 40\nteardown-work {} 3000000 2\n", work_key()),
+        );
+        assert_eq!(
+            taught(&Ends::kept_in(&home)),
+            Some((work(3_000_000), work(0), work(3_000_000))),
+            "kept before the least was"
+        );
+        for (line, what) in [
+            ("teardown-work many 2".to_string(), "not whole"),
+            (
+                "teardown-work 3000000 2".to_string(),
+                "kept before lines were keyed",
+            ),
+            (
+                "teardown-work cycles:Another_CPU 3000000 2".to_string(),
+                "another key's",
+            ),
+            (
+                format!("teardown-work {} 3000000 4000000 2", work_key()),
+                "its least past its most",
+            ),
+            (
+                format!("teardown-work {} 3000000 2000000 2 1", work_key()),
+                "a word more",
+            ),
+        ] {
+            publish(&home, &format!("teardown 40\n{line}\n"));
+            let kept = Ends::kept_in(&home);
+            assert_eq!(kept.most_work(), None, "{what}");
+            assert_eq!(
+                kept.slice(End::Teardown),
+                Some(Duration::from_millis(40)),
+                "{what}"
+            );
+        }
+    }
+
+    /// What `SPREAD` teardowns taught: the most work one took (C*) and the least.
+    fn most_work(most: u64, lightest: u64) -> MostWork {
+        MostWork {
+            most: shards_api::Work::of(most),
+            lightest: shards_api::Work::of(lightest),
+            answers: shards_api::SPREAD,
+        }
+    }
+
+    /// A teardown whose VM process has done more work since its SIGKILL than C* and its spread
+    /// is past them: this process spinning a CPU past a millisecond, by its look, and never
+    /// past no C*. One past C* by less than its spread goes on (D215 amended 2026-11-19): its
+    /// work at that look, C* one below it, goes on with a spread of one and is past with a
+    /// spread of none. A joiner's provider, whose work is its own command's too, never is.
+    #[test]
+    fn a_teardown_past_c_star_is_said_past_it_and_a_providers_never() {
+        // C* of one count of work (a nanosecond's CPU, on Windows a cycle): 50 ms of spinning
+        // passes it on any host.
+        let most = most_work(1, 1);
+        let spin = || {
+            let t0 = std::time::Instant::now();
+            let mut x = 0u64;
+            while t0.elapsed() < Duration::from_millis(50) {
+                x = std::hint::black_box(x.wrapping_add(1));
+            }
+        };
+        let mut own = Followed::of(Some(std::process::id()));
+        spin();
+        assert!(went_on(own.goes_on()));
+        let (work, said) = own.past(Some(most)).unwrap().expect("past C*");
+        assert!(work > most.bound() && said == most, "{work:?} {said:?}");
+        assert_eq!(own.past(None), Ok(None));
+        let below = work.count().checked_sub(1).unwrap();
+        assert_eq!(
+            own.past(Some(most_work(below, below - 1))),
+            Ok(None),
+            "past C* within its spread"
+        );
+        assert!(own.past(Some(most_work(below, below))).unwrap().is_some());
+        let mut provider = Followed::of_provider(std::process::id());
+        spin();
+        let _ = provider.goes_on();
+        assert_eq!(provider.past(Some(most)), Ok(None));
+        assert_eq!(provider.work(), Ok(None));
+    }
+
+    /// A teardown whose VM process could not be read as its follow began says why its work
+    /// is unread, at its bound and at its end, never taking it for none (the person's rule of
+    /// 2026-11-18: no fallbacks); with no C* learned there is no bound to judge; and one with
+    /// no process to follow has no work, which is a reading.
+    #[test]
+    fn a_teardowns_unread_work_is_said_never_taken_for_none() {
+        let why = "process 1: refused".to_string();
+        let mut unread = Followed {
+            unread: Some(why.clone()),
+            ..Followed::of(None)
+        };
+        assert_eq!(unread.work(), Err(why.clone()));
+        assert_eq!(unread.past(Some(most_work(1, 1))), Err(why.clone()));
+        assert_eq!(unread.past(None), Ok(None), "no C*, no bound to judge");
+        assert_eq!(unread.worked(), Err(why));
+        let mut none = Followed::of(None);
+        assert_eq!(none.work(), Ok(None));
+        assert_eq!(none.worked(), Ok(None));
+    }
+
+    /// A look that cannot read its living process is unread, with why, never still nor gone on
+    /// (the person's rule of 2026-11-18: no fallbacks): here its usage, read of a process none
+    /// has beside D215's look of this one, which lives, at each look; and a follow that could
+    /// not begin, at its first. Its caller gives it up at that look, saying why. Red
+    /// (lanes/redgreen/own-38h-goes-on-unread.patch) with a usage unread taken for nothing, as
+    /// before: D215's look alone judged it.
+    #[test]
+    fn a_live_process_whose_look_fails_is_unread_with_why() {
+        let mut unreadable = Followed {
+            usage: Some(Progress::of(u32::MAX)),
+            ..Followed::of(Some(std::process::id()))
+        };
+        let resolution = unreadable.watch.as_ref().unwrap().resolution();
+        for _ in 0..2 {
+            std::thread::sleep(resolution);
+            match unreadable.goes_on() {
+                GoesOn::Unread(why) => assert!(why.starts_with("process 4294967295's usage: "), "{why}"),
+                found => panic!("a live process unread was found {found:?}"),
+            }
+        }
+        let why = "process 1: refused".to_string();
+        let mut unbegun = Followed {
+            unread: Some(why.clone()),
+            ..Followed::of(None)
+        };
+        assert!(matches!(unbegun.goes_on(), GoesOn::Unread(said) if said == why));
+    }
+
+    /// A process that ends between two looks is its end, never unread, whatever its usage
+    /// reads of it then: under way at the look that first finds it ended, then gone (D215's
+    /// look, read after its usage, tells an end from a failure).
+    #[cfg(unix)]
+    #[test]
+    fn a_process_ending_between_looks_is_its_end_never_unread() {
+        let child = Killed(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let mut ending = Followed::of(Some(pid));
+        let resolution = ending.watch.as_ref().unwrap().resolution();
+        let id = libc::pid_t::try_from(pid).unwrap();
+        // SAFETY: kill(2) of this test's own child.
+        assert_eq!(unsafe { libc::kill(id, libc::SIGKILL) }, 0);
+        // SAFETY: a siginfo_t, plain data, for waitid(2) to fill.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid(2) of this test's own child, to its end; WNOWAIT leaves it unreaped.
+        let waited = unsafe { libc::waitid(libc::P_PID, pid, &raw mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(waited, 0);
+        std::thread::sleep(resolution);
+        let first = ending.goes_on();
+        assert!(matches!(first, GoesOn::Went(_)), "its end under way: {first:?}");
+        std::thread::sleep(resolution);
+        let then = ending.goes_on();
+        assert!(
+            matches!(then, GoesOn::Still),
+            "its end found again, gone: {then:?}"
+        );
+    }
+
     /// An end is waited on past its slice while its VM process runs: this process spinning
-    /// a CPU is seen to go on, and a joiner's, which has no VM of its own to follow, never is.
+    /// a CPU is seen to go on, and one with no process to follow never is.
     #[test]
     fn an_end_is_followed_while_its_vm_process_runs() {
         let mut busy = Followed::of(Some(std::process::id()));
@@ -384,8 +1061,8 @@ mod tests {
         while t0.elapsed() < Duration::from_millis(300) {
             x = std::hint::black_box(x.wrapping_add(1));
         }
-        assert!(busy.goes_on().is_some());
-        assert!(Followed::of(None).goes_on().is_none());
+        assert!(went_on(busy.goes_on()));
+        assert!(!went_on(Followed::of(None).goes_on()));
     }
 
     /// Set in the child of `an_end_goes_on_at_any_rate_and_not_asleep_or_stopped`: it runs a
@@ -431,7 +1108,7 @@ mod tests {
         let mut trickling = Followed::of(Some(trickler.0.id()));
         std::thread::sleep(Duration::from_millis(300));
         assert!(
-            trickling.goes_on().is_some(),
+            went_on(trickling.goes_on()),
             "a fiftieth of a CPU is its end going on"
         );
         // Asleep over a window as long as its reading shows (`Watch::resolution`: a shorter
@@ -442,17 +1119,19 @@ mod tests {
         let pid = asleep.0.id();
         let mut sleeping = loop {
             let followed = shards_api::Followed::of_pid(pid).unwrap().unwrap();
-            let mut witness = shards_api::Watch::of(followed).unwrap().unwrap();
-            let from = witness.cpu();
+            let mut witness = shards_api::Watch::of(followed, &shards_api::Listing::new())
+                .unwrap()
+                .unwrap();
+            let from = witness.work();
             let mut sleeping = Followed::of(Some(pid));
             std::thread::sleep(witness.resolution());
-            while trickling.goes_on().is_none() {
+            while !went_on(trickling.goes_on()) {
                 std::thread::yield_now();
             }
-            let went = sleeping.goes_on();
-            witness.look().unwrap();
-            if witness.cpu() == from {
-                assert!(went.is_none(), "asleep, it goes on with nothing");
+            let went = went_on(sleeping.goes_on());
+            witness.look(&shards_api::Listing::new()).unwrap();
+            if witness.work() == from {
+                assert!(!went, "asleep, it goes on with nothing");
                 break sleeping;
             }
         };
@@ -466,11 +1145,57 @@ mod tests {
         assert_eq!(waited, 0);
         let resolution = shards_api::Followed::of_pid(pid)
             .unwrap()
-            .and_then(|followed| shards_api::Watch::of(followed).unwrap())
+            .and_then(|followed| shards_api::Watch::of(followed, &shards_api::Listing::new()).unwrap())
             .unwrap()
             .resolution();
         std::thread::sleep(resolution);
-        assert!(sleeping.goes_on().is_none(), "stopped, it goes on with nothing");
+        assert!(!went_on(sleeping.goes_on()), "stopped, it goes on with nothing");
+    }
+
+    /// A joiner's teardown (D119) goes on by its provider's VM process's work beyond an idle
+    /// microVM's alone (`IDLE_VM_CPU`, PM M357, ROOT's ruling of 2026-11-18). This process
+    /// spinning a CPU goes on. One trickling a fiftieth of a CPU, below an idle microVM's rate,
+    /// as an idle provider's ticks are, does not, where a teardown in its own VM goes on at
+    /// that rate (D217). Red (lanes/redgreen/own-35d-joiner-end.patch) with a joiner's
+    /// teardown followed by nothing, as before: the spinning provider is no going on.
+    #[cfg(unix)]
+    #[test]
+    fn a_joiners_teardown_goes_on_by_its_providers_work_beyond_an_idle_microvm() {
+        let mut busy = Followed::of_provider(std::process::id());
+        let t0 = std::time::Instant::now();
+        let mut x = 0u64;
+        while t0.elapsed() < Duration::from_millis(300) {
+            x = std::hint::black_box(x.wrapping_add(1));
+        }
+        assert!(went_on(busy.goes_on()), "a provider spinning a CPU goes on");
+        let trickler = Killed(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon::ends::tests::an_end_goes_on_at_any_rate_and_not_asleep_or_stopped",
+                ])
+                .env(TRICKLE, "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = trickler.0.id();
+        // Settled into its trickle: a window in which it ran no more than an idle microVM's
+        // rate, as it does once its start's own CPU is past.
+        let mut settling = Progress::of(pid);
+        loop {
+            std::thread::sleep(Duration::from_millis(300));
+            if !settling.look().ran {
+                break;
+            }
+        }
+        let mut provider = Followed::of_provider(pid);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !went_on(provider.goes_on()),
+            "a fiftieth of a CPU, an idle provider's ticks, is no joiner's end going on"
+        );
     }
 
     /// A child killed as it drops.

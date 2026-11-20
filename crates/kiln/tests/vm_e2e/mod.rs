@@ -82,21 +82,56 @@ fn bare(line: &str) -> &str {
 /// harness's reply arrives in chunks that kiln joins into one event), and its tools' output (a real
 /// harness asked to print something may print it through its shell).
 pub fn said(events: &[Value]) -> Vec<String> {
+    events.iter().flat_map(said_in).collect()
+}
+
+/// The lines one timeline event says: an assistant's text, a tool's output.
+fn said_in(e: &Value) -> Vec<String> {
+    let text = match e.get("kind").and_then(Value::as_str) {
+        Some("assistant") => e.get("text"),
+        Some("tool") => e.get("output"),
+        _ => None,
+    };
+    text.and_then(Value::as_str).unwrap_or("").lines().map(bare).filter(|b| !b.is_empty()).map(str::to_owned).collect()
+}
+
+/// Whether timeline event `e` is a message kiln delivered (a person's words, or a child's news kiln
+/// queues to its parent, `told.rs`): the start of a turn of its own.
+fn is_delivered(e: &Value) -> bool {
+    e.get("kind").and_then(Value::as_str) == Some("user")
+}
+
+/// What the harness said past the timeline's first `n` lines, in the turn they were said in: up to
+/// the next message kiln delivered after them. A message kiln queued meanwhile (a child's news,
+/// "told, not made to wait", docs/agents.md) starts a turn of its own once the stopped one is over,
+/// and its lines are that turn's, never the stopped turn's (rest on Linux, 2026-11-19: amp's, devin's
+/// and goose's stopped turns taken for going on by their next turn's lines).
+fn said_past(events: &[Value], n: usize) -> Vec<String> {
+    let mut seen = 0usize;
     let mut out = Vec::new();
     for e in events {
-        let text = match e.get("kind").and_then(Value::as_str) {
-            Some("assistant") => e.get("text"),
-            Some("tool") => e.get("output"),
-            _ => None,
-        };
-        for line in text.and_then(Value::as_str).unwrap_or("").lines() {
-            let b = bare(line);
-            if !b.is_empty() {
-                out.push(b.to_owned());
+        if seen >= n && is_delivered(e) {
+            break;
+        }
+        for line in said_in(e) {
+            if seen >= n {
+                out.push(line);
             }
+            seen = seen.saturating_add(1);
         }
     }
     out
+}
+
+/// What the harness said in the turn kiln's message `client` started: its lines after the message's
+/// delivery, up to the next message kiln delivered (a later turn's lines are not this turn's).
+pub fn said_in_turn(events: &[Value], client: &str) -> Vec<String> {
+    let Some(at) = delivered_at(events, client) else {
+        return Vec::new();
+    };
+    let rest = events.get(at + 1..).unwrap_or_default();
+    let end = rest.iter().position(is_delivered).unwrap_or(rest.len());
+    said(rest.get(..end).unwrap_or_default())
 }
 
 /// What follows `key` on the last line that has it.
@@ -107,6 +142,17 @@ fn last_after(lines: &[String], key: &str) -> Option<String> {
 /// Whether the harness said `marker` (the stand-in's [`STUB_DONE`], or ROOT's for a real task).
 pub fn said_marker(lines: &[String], marker: &str) -> bool {
     lines.iter().any(|l| l.contains(marker))
+}
+
+/// What the harness said in its first turn: `lines` up to and including the first that has `marker`. The look that
+/// finds that turn ended can come after a later one, and kiln's word that an agent the harness started ended its
+/// turn starts one that quotes the agent's own `CWD` and `WHERE` (`harness::told`), which r41 read as devin's and
+/// cursor's.
+pub fn first_turn(mut lines: Vec<String>, marker: &str) -> Vec<String> {
+    if let Some(end) = lines.iter().position(|l| l.contains(marker)) {
+        lines.truncate(end + 1);
+    }
+    lines
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -242,20 +288,21 @@ pub fn check_all_links(links: &[LinkSuites]) -> Result<(), String> {
     links.iter().try_for_each(check_link)
 }
 
-/// Why a drive's links can't pass the checks above where kiln's own word on its session says why: a gap of the built
-/// system's, named, so a run's red reads as that gap rather than as a check's words (gaps.json's `link_report`).
+/// Why a drive's links can't pass the checks above where kiln's own word on its session says why, named, so a run's
+/// red reads as that cause rather than as a check's words. kiln reports a microVM's link (gaps.json's `link_report`,
+/// which holds for every harness): this names a run it reported none of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkGap {
-    /// kiln says the session runs in a microVM and reports no agent-control link of it (`/runs/control` absent).
-    /// kiln's runner holds its microVMs through Hex's image runtime (`sandbox::held_in`), whose `Runtime` signals the
-    /// member and takes kiln's MCP lane over that link but has no call that reports it, so `HexRun::link` answers none.
+    /// kiln says the session runs in a microVM and has no `/runs/control` for it. `HexRun::link` asks Hex's
+    /// `Runtime::link`, which waits for its run's agent-control endpoint to report (`sandbox::hexvm`), and answers none
+    /// only where that run ended before its endpoint reported, or where Hex refused the call.
     HexReportsNoLink,
 }
 
 impl std::fmt::Display for LinkGap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HexReportsNoLink => f.write_str("Hex reports no agent-control link: Hex has no Runtime call for it yet"),
+            Self::HexReportsNoLink => f.write_str("kiln has no /runs/control for this microVM's run: Hex reported no agent-control link of it"),
         }
     }
 }
@@ -278,7 +325,7 @@ pub struct LinksFailed {
 impl std::fmt::Display for LinksFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.gap {
-            Some(gap) => write!(f, "{gap} (kiln says the session runs in a microVM and reports no /runs/control: gaps.json's link_report gap); its links' checks said: {}", self.said),
+            Some(gap) => write!(f, "{gap}; its links' checks said: {}", self.said),
             None => f.write_str(&self.said),
         }
     }
@@ -945,49 +992,25 @@ impl Wake {
     }
 
     /// Waits for kiln's next change: until a frame comes down the socket, or `within` passes (none: no
-    /// bound). Frames that follow it within `settle` (how long a look takes) are read with it, so looks
-    /// never outrun kiln's answers. The socket is opened as it's first waited on, and again after it
-    /// ended; that wait returns at once, so a change made while it opened is looked at. An opening
-    /// that fails pauses as long as it took. What it read, each frame's JSON, is its answer (a session's
-    /// admission's word on a message among them: [`Watch::heard`]).
+    /// bound). Frames that follow it within `settle` of it (how long a look takes) are read with it
+    /// ([`frames`]), so looks never outrun kiln's answers. The socket is opened as it's first waited on, and
+    /// again after it ended; that wait returns at once, so a change made while it opened is looked at. An
+    /// opening that fails pauses as long as it took. What it read, each frame's JSON, is its answer (a
+    /// session's admission's word on a message among them: [`Watch::heard`]).
     pub fn next(&mut self, within: Option<Duration>, settle: Duration) -> Vec<Value> {
-        let mut said = Vec::new();
         if self.sock.is_none() {
             let began = Instant::now();
             match self.open() {
                 Ok(s) => self.sock = Some(s),
                 Err(_) => std::thread::sleep(began.elapsed()),
             }
-            return said;
+            return Vec::new();
         }
         if within.is_some_and(|w| w.is_zero()) {
-            return said;
+            return Vec::new();
         }
-        let Some(s) = self.sock.as_mut() else { return said };
-        // A frame within `t` (none: no bound), each read with its own bound: a frame that began is
-        // read whole, with none.
-        let mut read = |s: &mut std::net::TcpStream, t: Option<Duration>| -> anyhow::Result<bool> {
-            s.set_read_timeout(t)?;
-            let Some(payload) = frame_or_quiet(s)? else { return Ok(false) };
-            if let Ok(v) = serde_json::from_slice::<Value>(&payload) {
-                said.push(v);
-            }
-            Ok(true)
-        };
-        let ended = match read(s, within) {
-            Ok(true) => {
-                !settle.is_zero()
-                    && loop {
-                        match read(s, Some(settle)) {
-                            Ok(true) => {}
-                            Ok(false) => break false,
-                            Err(_) => break true,
-                        }
-                    }
-            }
-            Ok(false) => false,
-            Err(_) => true,
-        };
+        let Some(s) = self.sock.as_mut() else { return Vec::new() };
+        let (said, ended) = frames(s, within, settle);
         if ended {
             self.sock = None;
         }
@@ -1001,6 +1024,45 @@ impl Wake {
         }
         Ok(s)
     }
+}
+
+/// What kiln's socket `s` says to a wait ([`Wake::next`]): its next frame, waited for up to `within` (none: no
+/// bound), and the frames that follow it within `settle` of it, each frame's JSON; and whether `s` ended or broke.
+/// Those that come later are the next look's: kiln's events socket is never quiet for long (its server samples
+/// itself every `[telemetry] sample_seconds`), so a wait that read on while each frame followed the last within
+/// `settle` never looked again. pre2's start, asked twice under strain and each POST unanswered for its 75 s, was
+/// never asked a third time, the strain's end and five clear hours after it included (adacachy, 2026-11-18).
+pub fn frames(s: &mut std::net::TcpStream, within: Option<Duration>, settle: Duration) -> (Vec<Value>, bool) {
+    let mut said = Vec::new();
+    // A frame within `t` (none: no bound), each read with its own bound: a frame that began is
+    // read whole, with none.
+    let mut read = |s: &mut std::net::TcpStream, t: Option<Duration>| -> anyhow::Result<bool> {
+        s.set_read_timeout(t)?;
+        let Some(payload) = frame_or_quiet(s)? else { return Ok(false) };
+        if let Ok(v) = serde_json::from_slice::<Value>(&payload) {
+            said.push(v);
+        }
+        Ok(true)
+    };
+    let ended = match read(s, within) {
+        Ok(true) => {
+            let until = Instant::now().checked_add(settle);
+            loop {
+                let left = until.map_or(Duration::ZERO, |u| u.saturating_duration_since(Instant::now()));
+                if left.is_zero() {
+                    break false;
+                }
+                match read(s, Some(left)) {
+                    Ok(true) => {}
+                    Ok(false) => break false,
+                    Err(_) => break true,
+                }
+            }
+        }
+        Ok(false) => false,
+        Err(_) => true,
+    };
+    (said, ended)
 }
 
 /// One WebSocket frame off `s`, the server's (unmasked): its payload where one came; none where none
@@ -1238,6 +1300,22 @@ pub fn open(f: &Fixture, spec: &Value) -> anyhow::Result<String> {
     })
 }
 
+/// Session `id`, whose start kiln queued for room on the fixture's runner (`agents.start` answered
+/// `queued`, its words `queued`: "it starts there as soon as there's room"), once kiln opened it
+/// under `id` as it said it would; until then kiln has no such session (404). Followed as a setup
+/// wait is ([`setup`]): no window, its parties' liveness and kiln's word alone.
+pub fn queued_start(f: &Fixture, id: &str, what: &str, queued: &str) -> anyhow::Result<()> {
+    let path = format!("/api/harness/sessions/{id}");
+    setup_on(f, &format!("{what}: its start, queued: {queued}"), || {
+        let (code, body) = common::http(f.port, "GET", &path, &f.admin, None)?;
+        Ok(match code {
+            200 => Setup::Ready(()),
+            404 => Setup::Wait,
+            _ => server_said(code, &body),
+        })
+    })
+}
+
 /// The session as kiln lists it.
 pub fn info(f: &Fixture, id: &str) -> anyhow::Result<Value> {
     f.get(&format!("/api/harness/sessions/{id}"))
@@ -1468,7 +1546,7 @@ fn t_within(t: f64, nu: u32) -> f64 {
     let theta = (t / f64::from(nu).sqrt()).atan();
     let (sin, cos) = theta.sin_cos();
     let cos2 = cos * cos;
-    if nu % 2 == 0 {
+    if nu.is_multiple_of(2) {
         let (mut term, mut sum) = (1.0, 1.0);
         for j in 1..=(nu - 2) / 2 {
             term *= f64::from(2 * j - 1) / f64::from(2 * j) * cos2;
@@ -1724,7 +1802,8 @@ impl<'a> Watch<'a> {
             return Some(Stuck::Asks(asks));
         }
         if let Asked::Stop { said: Some(n) } = self.asked {
-            return said(events).get(n..).filter(|more| !more.is_empty()).map(|more| Stuck::NotStopped(more.to_vec()));
+            let more = said_past(events, n);
+            return (!more.is_empty()).then_some(Stuck::NotStopped(more));
         }
         let client = self.message(info).and_then(|m| may_have_answered(info, events, &m))?;
         state.is_some_and(|s| answered_in(s, &client)).then_some(Stuck::Answered)
@@ -2196,7 +2275,7 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     ends.started(&id);
     let (first_info, events) = pace.until(f, &id, Asked::Opening, &format!("{kind}'s first turn"), |i, e| status(i) == "idle" && said_marker(&said(e), ask.marker))?;
     look(&mut inventory)?;
-    let first = said(&events);
+    let first = first_turn(said(&events), ask.marker);
 
     // Steer: a message into a turn under way (where the harness takes none mid-turn, kiln sends it
     // next), answered.
@@ -2220,7 +2299,7 @@ pub fn drive(f: &Fixture, ask: &Ask<'_>, roots: &[u32], programs: &[&str]) -> an
     let held = if ask.stub() { Some(said(&self::events(f, &id)?).len()) } else { None };
     let (_, e) = pace.until(f, &id, Asked::Stop { said: held }, &format!("{kind} stopping its turn"), |i, _| status(i) == "idle")?;
     if ask.stub() {
-        anyhow::ensure!(!said_marker(&said_after(&e, &stop_me), ask.marker), "{kind}: the stopped turn ran to its end");
+        anyhow::ensure!(!said_marker(&said_in_turn(&e, &stop_me), ask.marker), "{kind}: the stopped turn ran to its end");
     }
 
     // Every link's suite, from both ends, while the session runs.
@@ -2610,9 +2689,11 @@ pub fn stub_host_env(dir: &Path) -> anyhow::Result<Vec<(&'static str, String)>> 
     let bin = dir.join("bin");
     if !bin.exists() {
         std::fs::create_dir_all(&bin)?;
-        let python = stub_python()?;
+        // cmd.exe expands `%` in a batch file's lines, quoted or not: each of a path's doubled. No path holds a `"`.
+        let in_batch = |p: &Path| p.display().to_string().replace('%', "%%");
+        let (python, stub) = (in_batch(stub_python()?.as_path()), in_batch(stub_path().as_path()));
         for k in kiln::harness::kinds::Kind::all() {
-            let shim = format!("@set \"VM_STUB_PROTOCOL={}\"\r\n@\"{}\" \"{}\" %*\r\n", k.program, python.display(), stub_path().display());
+            let shim = format!("@set \"VM_STUB_PROTOCOL={}\"\r\n@\"{python}\" \"{stub}\" %*\r\n", k.program);
             std::fs::write(bin.join(format!("{}.cmd", k.program)), shim)?;
         }
     }

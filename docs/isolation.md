@@ -97,8 +97,17 @@ the machine's network) is replaced by an Agentfile image's members.
   do (`proc::STDOUT_CHUNKS`, `STDERR_CHUNKS`, one bound for both): no number of its own, and the same
   backpressure on the member as on a process. The adapters are the ones host sessions use, unchanged
   but for the folder they name: Codex's requests and ACP's `session/new` and `session/load` name the
-  project as its microVM sees it (`sandbox::isolated::Seen`, 2806f93b6: a Windows machine's `C:\src\app`
-  at `/work/app`), which is the machine's own path for a Unix project and for every session on its host.
+  project as its microVM sees it (`sandbox::isolated::Seen`: a Windows machine's `C:\src\app` at
+  `/mnt/c/src/app`, its path as WSL names it, Shards' D235), which is the machine's own path for a Unix
+  project and for every session on its host. What a harness says of the folder it works in (Claude Code's
+  `init` and worktrees, Codex's thread) is the machine's folder again (`Seen::host_of`), the session's own,
+  where kiln reads its files. What every adapter shows of the files a harness names (Claude Code's, Codex's,
+  ACP's, Antigravity's and Pi's calls and diffs) is read against its folder as it sees it; a file kiln reads
+  for it (a change's baseline and its file now, an approval's preview) is the machine's
+  (`isolated::host_file`): rooted in the harness's view as it is (`/mnt/c/x`, which Windows'
+  `Path::is_absolute` takes for no absolute path), else beneath its folder, then as the machine names it.
+  Isolated sessions a Windows machine started before kiln `d081df523` saw their project at `/work/<name>`;
+  they are left as they are, not moved to the new path: only test runs ever had them.
 - **It's no process of the machine's**: its session has no pid (`Duplex::host_pid` is none), nothing
   of it is in the session's group of processes, and it is never handed across an in-place upgrade
   (it stops, and starts again in the next image, its conversation going on).
@@ -221,7 +230,7 @@ its own through Hex (`sandbox::hexvm`).
   kiln vendored before (1969a423e, on Shards 9975d1f55): its image class gave a start share to the run's root alone,
   so a harness never started in its project (Shards D277: `Setup (entering its working directory): errno 2`), its
   run ended failed, and kiln said exit -1; the switch ended nothing, the session having ended before it. The Hex
-  kiln vendors now (955e15c06, on Shards 04481e36b) gives a share its members (`hex_api::Mount`), and kiln maps
+  kiln vendors now (84c870b0f, on Shards v0.8.0, aa819b058) gives a share its members (`hex_api::Mount`), and kiln maps
   `Share::members` in `sandbox::hexvm` (P1.4); its run on that Hex is owed.
 
 ## Live overrides
@@ -241,9 +250,13 @@ it at its start (`Spec::egress_ceiling`). A folder is plugged as Shards' `ImageG
 folder or a volume of its store, for every member or those named, strictly beneath a root, read-only or not), and
 unplugged by where it is; one outside every root is refused until a member restarted can take it (D270); egress past
 the ceiling is refused. Ports go as Shards' `ImageGuest::publish` and `unpublish` take them (D269): a guest port at a
-host address and port, let go of by the address it's bound at. A microVM that takes no change live refuses it
-in its own words, kept on the override (`took: refused`): Hex's microVMs do until its wire calls land (P6b.3,
-`sandbox::hexvm::NO_LIVE`). A session on its machine's host refuses ports, egress and networks, naming its engine.
+host address and port, let go of by the address it's bound at. Hex's microVMs take each through Hex's one call
+for a running box's changes (its P6b.3, `Runtime::change`): a port published as its harness member's, which Hex holds
+it to; egress its harness member's by TCP within the ceiling; a network's grant whole; a folder of the machine's
+plugged in, its files run from it or not (`exec`, Shards' D279). A member other than its harness, a volume of its store
+plugged in live and a component's swap are refused, saying why. A microVM that takes no change live refuses it in its
+own words, kept on the override (`took: refused`). A session on its machine's host refuses ports, egress and networks,
+naming its engine.
 
 ## An agent's volumes
 
@@ -359,9 +372,11 @@ Built, each where it is:
 - **A member's run-time arguments** (Shards' D256, `MemberSpec::args`; Hex's `ImageMember::args`): its
   command line is its image's command, then the session's flags (`--resume`, `--model`).
 - **The project at its host path as the harness starts**: its folder shared at its own path as its box is
-  made (Hex's `ShardsImage::shares`), and its working directory there. Each start share is given to its harness
-  member as it starts (Shards' D277, Hex's `Mount::members`, `hexvm::mount_of`), so its harness works in its
-  project from its first instruction; one given to a member a launch doesn't drive is refused, typed.
+  made (Hex's `ShardsImage::shares`), and its working directory there; a Windows host's at its path as WSL
+  names it, `C:\X` at `/mnt/c/X` (`sandbox::isolated::guest_path`, D235's root of a Windows host's drives).
+  Each start share is given to its harness member as it starts (Shards' D277, Hex's `Mount::members`,
+  `hexvm::mount_of`), so its harness works in its project from its first instruction; one given to a
+  member a launch doesn't drive is refused, typed.
 - **A workspace of its own served, never mounted** (kiln goal 01a1ec34599974448f6b7663ddb07001; Shards' D286, Hex's
   `ShardsImage::served`): where a session's workspace is a Slates volume made with no mount, its project is no folder
   of the machine's but that volume, served to its microVM by Slates over Slates' own virtio-fs device and DAX window,

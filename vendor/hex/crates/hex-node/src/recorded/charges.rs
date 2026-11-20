@@ -687,6 +687,9 @@ struct Read {
     at: Instant,
     /// Whether `cpu_ns` holds the vCPUs' guest time (D265), as the VM process said it.
     charged: hex_api::Charged,
+    /// The time its owner held it paused so far (kiln plan P5.5b): an image VM's, as its run host tells it with its host
+    /// use (Shards' D267); none for a managed VM, which nothing pauses.
+    paused: Duration,
 }
 
 impl Read {
@@ -707,6 +710,7 @@ impl Read {
                 life: Some(host.window),
                 at,
                 charged: host.charged,
+                paused: host.paused,
             });
         }
         // Its scope's use read on each side of its VM process's sample of its vCPUs' guest time (D260), its CPU taken at
@@ -744,6 +748,7 @@ impl Read {
             life,
             at,
             charged,
+            paused: Duration::ZERO,
         })
     }
 
@@ -1493,6 +1498,9 @@ struct Vm {
     receipt: CapacityResources,
     /// Its VMM's CPU so far, in nanoseconds, and the instant it holds at ([`Read::at`]).
     last: (u64, Instant),
+    /// The time its owner held it paused as of that reading ([`Read::paused`]): a reading that tells more holds a pause,
+    /// and is no sample (kiln plan P5.5b).
+    paused: Duration,
     /// Each vCPU's guest time at that reading, where its host reads it (D241, D260).
     guest_ns: Option<Vec<u64>>,
     /// Its VMM's own CPU as last read apart from its vCPUs', in milli-CPU (D260: over its last window; at its first
@@ -1953,6 +1961,14 @@ impl Learner {
                 }
             };
             if let Some(vm) = self.vms.get_mut(&scope) {
+                // A span its owner held it paused for any of is no sample of its use (kiln plan P5.5b): the pause cut its
+                // use, as a cap cuts it (Karn's point, C1), and a whole pause's windows of its VMM's own alone would take
+                // its charge, and its booking with it, down to nothing, so the room it keeps for its resume would go to
+                // others. Its charge and booking stay as its windows before the pause made them, and its reading starts its
+                // next span all the same. Its paused time only grows within a run, so its having moved says the span held
+                // a pause, whole or in part, however short; no number is picked.
+                let sampled = read.paused == vm.paused;
+                vm.paused = read.paused;
                 // Over the span between its own reads (the review's A-11), not between the windows' starts.
                 let (before, at) = vm.last;
                 let cpu_ns = read.cpu_ns.saturating_sub(before);
@@ -1970,18 +1986,20 @@ impl Learner {
                     Cpu::Split { own, .. } => milli_over(nanos(*own), span),
                     Cpu::Whole(_) => read.own_over_life(),
                 };
-                self.node
-                    .observe(
-                        vm.lifetime,
-                        &Sample {
-                            cpu,
-                            span,
-                            mem_bytes: read.memory_bytes,
-                            disk_bytes: None,
-                            cap_milli: Some(vm.rate),
-                        },
-                    )
-                    .map_err(refused)?;
+                if sampled {
+                    self.node
+                        .observe(
+                            vm.lifetime,
+                            &Sample {
+                                cpu,
+                                span,
+                                mem_bytes: read.memory_bytes,
+                                disk_bytes: None,
+                                cap_milli: Some(vm.rate),
+                            },
+                        )
+                        .map_err(refused)?;
+                }
                 let milli = u128::from(cpu_ns)
                     .checked_mul(u128::from(CPU_MILLI))
                     .and_then(|n| n.checked_div(span.as_nanos().max(1)))
@@ -2042,6 +2060,7 @@ impl Learner {
                     class,
                     receipt,
                     last: (read.cpu_ns, read.at),
+                    paused: read.paused,
                     guest_ns,
                     own,
                     rate: allocation.resources.cpu_milli,

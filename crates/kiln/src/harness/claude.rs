@@ -250,6 +250,11 @@ pub struct Claude {
     /// 01a1dd2e…, P6c.5).
     #[serde(default)]
     context: Option<String>,
+    /// Where it sees its project, in a microVM that sees it elsewhere than this machine
+    /// (`sandbox::isolated::Seen`): what it says of its files is read against its folder as it sees it,
+    /// and where it says it works is this machine's folder again.
+    #[serde(default)]
+    seen: Option<crate::sandbox::isolated::Seen>,
     output_styles: Vec<String>,
     /// Its configuration directory (user skills and commands live under it).
     config_dir: String,
@@ -359,6 +364,7 @@ impl Claude {
             fast: HashMap::new(),
             speed: None,
             context: None,
+            seen: None,
             output_styles: Vec::new(),
             config_dir: String::new(),
             commands: Vec::new(),
@@ -406,6 +412,18 @@ impl Claude {
     pub fn with_speed(mut self, speed: Option<String>) -> Self {
         self.speed = speed.filter(|s| s.is_empty() || s == FAST);
         self
+    }
+
+    /// Where it sees its project, isolated (`sandbox::isolated::Seen::of`); none on its machine.
+    #[must_use]
+    pub fn with_seen(mut self, seen: Option<crate::sandbox::isolated::Seen>) -> Self {
+        self.seen = seen;
+        self
+    }
+
+    /// The folder it works in, as it sees it ([`Self::seen`]): what it says of its files is read against it.
+    fn cwd(&self, core: &Core) -> String {
+        crate::sandbox::isolated::said(self.seen.as_ref(), &core.state.cwd)
     }
 
     /// Note a conversation entry (`prompt`: the event id when it is a person's prompt).
@@ -915,7 +933,7 @@ impl Claude {
             }
             // Restarts and snapshots are the session's (it owns the process and the sink).
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } => {}
             Command::McpEnable { name, enabled } => {
                 let what = format!("{} {name}", if enabled { "Enable" } else { "Disable" });
                 self.request(core, Pending::McpChange(what), json!({"subtype": "mcp_toggle", "serverName": name, "enabled": enabled}));
@@ -2355,7 +2373,7 @@ impl Claude {
         let tool_name = str_of(req, "tool_name").unwrap_or("tool").to_owned();
         let input = req.get("input").cloned().unwrap_or(Value::Null);
         let tool_id = str_of(req, "tool_use_id").map(str::to_owned);
-        let cwd = core.state.cwd.clone();
+        let cwd = self.cwd(core);
         let (tool, title, detail) = describe(&tool_name, &input, &cwd);
         let always = if req.get("suppress_always_allow_rule").and_then(Value::as_bool) == Some(true) {
             Vec::new()
@@ -2385,7 +2403,7 @@ impl Claude {
             at: Core::now(),
         };
         if tool == ToolKind::Edit {
-            core.previews.push(PreviewJob { approval: id.clone(), cwd, tool: tool_name.clone(), input: input.clone() });
+            core.previews.push(PreviewJob { approval: id.clone(), cwd, tool: tool_name.clone(), input: input.clone(), seen: self.seen.clone() });
         }
         if let Some(tid) = tool_id.as_deref() {
             set_tool_status(core, tid, ToolStatus::Pending);
@@ -2408,7 +2426,7 @@ impl Claude {
                     core.state.harness_session = Some(s.to_owned());
                 }
                 if let Some(c) = str_of(v, "cwd") {
-                    core.state.cwd = c.to_owned();
+                    core.state.cwd = crate::sandbox::isolated::host_of(self.seen.as_ref(), c);
                 }
                 if let Some(m) = str_of(v, "model") {
                     core.state.model = m.to_owned();
@@ -2837,7 +2855,7 @@ impl Claude {
                     let tid = str_of(&block, "id").unwrap_or(&id).to_owned();
                     let name = str_of(&block, "name").unwrap_or("tool").to_owned();
                     let input = block.get("input").cloned().unwrap_or(Value::Null);
-                    let (tool, title, detail) = describe(&name, &input, &core.state.cwd);
+                    let (tool, title, detail) = describe(&name, &input, &self.cwd(core));
                     let todos = if tool == ToolKind::Todo { todos(&input) } else { Vec::new() };
                     if !todos.is_empty() && parent.is_none() {
                         core.state.todos = todos.clone();
@@ -3061,7 +3079,7 @@ impl Claude {
             if let Some(code) = o.get("exitCode").or_else(|| o.get("exit_code")).and_then(Value::as_i64) {
                 exit_code = i32::try_from(code).ok();
             }
-            diffs = patch_diffs(o, &core.state.cwd);
+            diffs = patch_diffs(o, &self.cwd(core));
         }
         // A command run on another runner (kiln reach): its output and exit code, not the tool's JSON.
         let reach = crate::reach::shown(&name, &Value::String(text.clone()));
@@ -3081,8 +3099,9 @@ impl Claude {
         };
         if status == ToolStatus::Done {
             let by = core.get(tid).and_then(|e| e.parent.clone()).unwrap_or_else(|| super::model::BY_AGENT.to_owned());
-            track_changes(core, structured, &by);
-            follow_worktree(core, &name, structured);
+            let seen_cwd = self.cwd(core);
+            track_changes(core, self.seen.as_ref(), structured, &by, &seen_cwd);
+            follow_worktree(core, self.seen.as_ref(), &name, structured);
         }
         self.relayed(core, tid, status == ToolStatus::Done, &text);
         let (output, truncated) = clip_middle(&text, OUTPUT_MAX);
@@ -3103,7 +3122,7 @@ impl Claude {
             t.ended = Some(Core::now());
         } else if !name.is_empty() {
             // A result whose call we never saw (it started before we attached).
-            let (tool, title, detail) = describe(&name, &input, &core.state.cwd);
+            let (tool, title, detail) = describe(&name, &input, &self.cwd(core));
             core.upsert(
                 tid,
                 None,
@@ -4004,13 +4023,12 @@ pub fn doing(t: &ToolCall) -> String {
 
 /// Note the files a finished edit changed, for the session's changeset, `by` having made it (the
 /// agent itself, or the subagent run its call is in).
-fn track_changes(core: &mut Core, structured: &Value, by: &str) {
+/// `cwd`: its folder as it sees it, against which what it says of its files is read; each file the
+/// machine's (`seen`, `isolated::host_file`), where kiln reads it.
+fn track_changes(core: &mut Core, seen: Option<&crate::sandbox::isolated::Seen>, structured: &Value, by: &str, cwd: &str) {
     use super::core::{BASELINE_MAX, Baseline};
     let Some(o) = structured.as_object() else { return };
-    let cwd = core.state.cwd.clone();
-    let abs = |p: &str| -> String {
-        if std::path::Path::new(p).is_absolute() || cwd.is_empty() { p.to_owned() } else { format!("{}/{p}", cwd.trim_end_matches('/')) }
-    };
+    let abs = |p: &str| crate::sandbox::isolated::host_file(seen, cwd, p);
     if let Some(fp) = o.get("filePath").and_then(Value::as_str) {
         let a = abs(fp);
         if o.contains_key("originalFile") {
@@ -4021,31 +4039,32 @@ fn track_changes(core: &mut Core, structured: &Value, by: &str) {
             };
             core.note_baseline(&a, before);
         }
-        core.want_change(&a, &rel(fp, &cwd), by);
+        core.want_change(&a, &rel(fp, cwd), by);
     }
     // Files a shell command changed that the agent had read or edited before.
     if let Some(files) = o.get("bashEditDiff").and_then(|b| b.get("files")).and_then(Value::as_array) {
         for f in files {
             if let Some(fp) = f.get("filePath").and_then(Value::as_str) {
-                core.want_change(&abs(fp), &rel(fp, &cwd), by);
+                core.want_change(&abs(fp), &rel(fp, cwd), by);
             }
         }
     }
 }
 
 /// Claude Code's worktree tools move the session: into the worktree `EnterWorktree` made
-/// (`worktreePath`), back where `ExitWorktree` left it (`restoredCwd`). Its next turn's `init` says
-/// so too; followed at once, the agent's folder is where it works from that call on.
-fn follow_worktree(core: &mut Core, name: &str, structured: &Value) {
+/// (`worktreePath`), back where `ExitWorktree` left it (`restoredCwd`), each this machine's folder where
+/// it says one in a microVM that sees it elsewhere (`seen`). Its next turn's `init` says so too; followed
+/// at once, the agent's folder is where it works from that call on.
+fn follow_worktree(core: &mut Core, seen: Option<&crate::sandbox::isolated::Seen>, name: &str, structured: &Value) {
     let to = match name {
         "EnterWorktree" => structured.get("worktreePath"),
         "ExitWorktree" => structured.get("restoredCwd"),
         _ => None,
     };
-    if let Some(to) = to.and_then(Value::as_str).filter(|t| !t.is_empty())
+    if let Some(to) = to.and_then(Value::as_str).filter(|t| !t.is_empty()).map(|t| crate::sandbox::isolated::host_of(seen, t))
         && core.state.cwd != to
     {
-        core.state.cwd = to.to_owned();
+        core.state.cwd = to;
         core.touch_state();
     }
 }
@@ -4393,10 +4412,12 @@ fn patch_diffs(o: &serde_json::Map<String, Value>, cwd: &str) -> Vec<FileDiff> {
     vec![FileDiff { path, created: false, hunks }]
 }
 
-/// What an edit tool would change, against the file as it is now (runs off the event loop).
-pub fn preview(tool: &str, input: &Value, cwd: &str) -> Vec<FileDiff> {
+/// What an edit tool would change, against the file as it is now (runs off the event loop): the file it
+/// names read where the machine has it (`seen`, `isolated::host_file`), shown against `cwd`, its folder as
+/// it sees it.
+pub fn preview(tool: &str, input: &Value, cwd: &str, seen: Option<&crate::sandbox::isolated::Seen>) -> Vec<FileDiff> {
     let Some(path) = str_of(input, "file_path").or_else(|| str_of(input, "notebook_path")) else { return Vec::new() };
-    let full = if std::path::Path::new(path).is_absolute() { std::path::PathBuf::from(path) } else { std::path::Path::new(cwd).join(path) };
+    let full = std::path::PathBuf::from(crate::sandbox::isolated::host_file(seen, cwd, path));
     let current = std::fs::metadata(&full)
         .ok()
         .filter(|m| m.is_file() && m.len() <= super::diff::MAX_FILE)
@@ -5464,6 +5485,76 @@ mod tests {
         assert_eq!(core.state.cwd, "/w/repo");
     }
 
+    /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: an isolated Claude Code on a Windows machine
+    /// says it works in its project as its microVM sees it (`/mnt/c/…`, Shards' D235), and in its worktrees
+    /// there; the session's folder stays the machine's (`sandbox::isolated::Seen::host_of`), where kiln reads
+    /// its files, and what it says of its files is read against its folder as it sees it (xplat r801, before:
+    /// "kiln has the session in /work/project, not the project's host path").
+    #[test]
+    fn s17_an_isolated_claudes_folder_stays_the_machines() -> anyhow::Result<()> {
+        use super::super::session::{Isolation, Spec};
+        let spec = Spec { kind: "claude".into(), cwd: Some(r"C:\src\app".into()), isolation: Some(Isolation::microvm()), ..Spec::default() };
+        let mut c = Claude::new(false).with_seen(crate::sandbox::isolated::Seen::of(&spec));
+        let mut core = Core::new();
+        core.state.cwd = r"C:\src\app".into();
+        c.line(&mut core, &json!({"type": "system", "subtype": "init", "cwd": "/mnt/c/src/app", "session_id": "s1", "model": "m", "permissionMode": "default"}).to_string());
+        assert_eq!(core.state.cwd, r"C:\src\app");
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"tw","name":"EnterWorktree","input":{"name":"feature"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tw","type":"tool_result","content":"Created worktree."}]},"tool_use_result":{"worktreePath":"/mnt/c/src/app/.claude/worktrees/feature","worktreeBranch":"worktree-feature","message":"Created worktree"}}"#);
+        assert_eq!(core.state.cwd, r"C:\src\app\.claude\worktrees\feature");
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"tx","name":"ExitWorktree","input":{"action":"keep"}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"tx","type":"tool_result","content":"Left the worktree."}]},"tool_use_result":{"action":"keep","restoredCwd":"/mnt/c/src/app"}}"#);
+        assert_eq!(core.state.cwd, r"C:\src\app");
+        c.line(&mut core, r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"tool_use","id":"te","name":"Edit","input":{"file_path":"/mnt/c/src/app/notes.txt","old_string":"alpha","new_string":"beta","replace_all":false}}]},"parent_tool_use_id":null}"#);
+        c.line(&mut core, r#"{"type":"user","message":{"role":"user","content":[{"tool_use_id":"te","type":"tool_result","content":"ok"}]},"tool_use_result":{"filePath":"/mnt/c/src/app/notes.txt","oldString":"alpha","newString":"beta","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-alpha","+beta"]}],"userModified":false,"replaceAll":false}}"#);
+        let t = tool(&core, "te").cloned().ok_or_else(|| anyhow::anyhow!("no tool"))?;
+        assert_eq!(t.title, "notes.txt");
+        assert_eq!(t.diffs.first().map(|d| d.path.as_str()), Some("notes.txt"));
+        Ok(())
+    }
+
+    /// Step 17 part 7: an isolated Claude Code's edits on a Windows machine, of a file it names at its
+    /// microVM's `/mnt/c/…` (no absolute path to Windows' `Path::is_absolute`) or relative to its folder,
+    /// join the changeset as the machine's files, where kiln reads them, each shown by its place in its
+    /// project; and an approval's preview is asked with where it sees its project.
+    #[test]
+    fn s17_an_isolated_claudes_edits_are_the_machines_files() -> anyhow::Result<()> {
+        use super::super::session::{Isolation, Spec};
+        let spec = Spec { kind: "claude".into(), cwd: Some(r"C:\src\app".into()), isolation: Some(Isolation::microvm()), ..Spec::default() };
+        let seen = crate::sandbox::isolated::Seen::of(&spec);
+        let mut c = Claude::new(false).with_seen(seen.clone());
+        let mut core = Core::new();
+        core.state.cwd = r"C:\src\app".into();
+        for (tid, named) in [("te", "/mnt/c/src/app/notes.txt"), ("tr", "docs/a.md")] {
+            c.line(&mut core, &json!({"type": "assistant", "message": {"id": format!("m-{tid}"), "content": [{"type": "tool_use", "id": tid, "name": "Edit", "input": {"file_path": named, "old_string": "alpha", "new_string": "beta", "replace_all": false}}]}, "parent_tool_use_id": null}).to_string());
+            c.line(&mut core, &json!({"type": "user", "message": {"role": "user", "content": [{"tool_use_id": tid, "type": "tool_result", "content": "ok"}]}, "tool_use_result": {"filePath": named, "oldString": "alpha", "newString": "beta", "originalFile": "alpha\n", "structuredPatch": [{"oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": ["-alpha", "+beta"]}], "userModified": false, "replaceAll": false}}).to_string());
+        }
+        let jobs: Vec<(String, String)> = core.take_change_jobs().into_iter().map(|j| (j.abs, j.rel)).collect();
+        assert_eq!(jobs, [(r"C:\src\app\notes.txt".to_owned(), "notes.txt".to_owned()), (r"C:\src\app\docs\a.md".to_owned(), "docs/a.md".to_owned())]);
+        c.line(&mut core, r#"{"type":"control_request","request_id":"r9","request":{"subtype":"can_use_tool","tool_name":"Write","input":{"file_path":"/mnt/c/src/app/b.txt","content":"x\n"},"tool_use_id":"t9"}}"#);
+        let job = core.previews.first().cloned().ok_or_else(|| anyhow::anyhow!("no preview asked"))?;
+        assert_eq!((job.cwd.as_str(), job.seen), ("/mnt/c/src/app", seen));
+        Ok(())
+    }
+
+    /// Step 17 part 7: an approval's preview reads the file an isolated harness names where the machine has
+    /// it: its microVM's `/mnt/c/…` mapped back to the machine's folder (here this test's own, a stand-in for
+    /// a Windows machine's `C:\…`), shown by its place in its project; not mapped, it reads no file there and
+    /// shows the edit alone.
+    #[test]
+    fn s17_an_isolated_claudes_preview_reads_the_machines_file() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}\nfn b() {}\n")?;
+        let seen: crate::sandbox::isolated::Seen = serde_json::from_value(json!({"host": dir.path().to_string_lossy(), "at": "/mnt/c/src/app"}))?;
+        let input = json!({"file_path": "/mnt/c/src/app/a.rs", "old_string": "fn b() {}", "new_string": "fn b() { 1 }"});
+        let d = preview("Edit", &input, "/mnt/c/src/app", Some(&seen));
+        assert_eq!(d.first().map(|d| d.path.as_str()), Some("a.rs"));
+        assert_eq!(d.first().and_then(|d| d.hunks.first()).map(|h| h.lines.clone()), Some(vec![" fn a() {}".to_owned(), "-fn b() {}".to_owned(), "+fn b() { 1 }".to_owned()]));
+        let unmapped = preview("Edit", &input, "/mnt/c/src/app", None);
+        assert_eq!(unmapped.first().and_then(|d| d.hunks.first()).map(|h| h.lines.clone()), Some(vec!["-fn b() {}".to_owned(), "+fn b() { 1 }".to_owned()]));
+        Ok(())
+    }
+
     #[test]
     fn edit_results_and_previews_are_real_diffs() -> anyhow::Result<()> {
         let mut c = Claude::new(false);
@@ -5479,11 +5570,11 @@ mod tests {
         let f = dir.path().join("a.rs");
         std::fs::write(&f, "fn a() {}\nfn b() {}\nfn c() {}\n")?;
         let cwd = dir.path().to_string_lossy().into_owned();
-        let d = preview("Edit", &json!({"file_path": f.to_string_lossy(), "old_string": "fn b() {}", "new_string": "fn b() { 1 }"}), &cwd);
+        let d = preview("Edit", &json!({"file_path": f.to_string_lossy(), "old_string": "fn b() {}", "new_string": "fn b() { 1 }"}), &cwd, None);
         let lines = d.first().and_then(|d| d.hunks.first()).map(|h| h.lines.clone()).unwrap_or_default();
         assert_eq!(lines, vec![" fn a() {}", "-fn b() {}", "+fn b() { 1 }", " fn c() {}"]);
         assert_eq!(d.first().map(|d| d.path.as_str()), Some("a.rs"));
-        let w = preview("Write", &json!({"file_path": "new.txt", "content": "one\ntwo\n"}), &cwd);
+        let w = preview("Write", &json!({"file_path": "new.txt", "content": "one\ntwo\n"}), &cwd, None);
         assert!(w.first().is_some_and(|d| d.created && d.hunks.first().is_some_and(|h| h.new_lines == 2)));
         Ok(())
     }

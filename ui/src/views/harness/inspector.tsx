@@ -25,7 +25,6 @@ const NO_AGENTS: readonly AgentInfo[] = [];
 
 export { prepareInspectorTab, type InspectorTab } from "./inspector-code";
 import { inspectorTabsRes, prepareInspectorTab, type InspectorTab } from "./inspector-code";
-import { OnMicroVm } from "./engine-of";
 type Tabs = typeof import("./inspector-tabs");
 
 function PlanTab(props: React.ComponentProps<Tabs["PlanTab"]>) {
@@ -156,7 +155,7 @@ export function Inspector({
   // At work now: its turn runs, or subagents it sent off still work (as Mission control has it); the goal under way shimmers.
   const working = useSession(store, (s) => workingNow(s.info, s.state, kiln));
   const meta = useSession(store, (s) => s.meta);
-  // Where it runs: only a session in a microVM has the Engine tab (bare metal has no sandboxes).
+  // Where it runs: every session has the Engine tab (its sandboxes in a microVM only, inside it).
   const target = useSession(store, (s) => s.info?.target);
   // What one who changed its files did alone: its session answers, or its events show it edit by edit.
   const answers = meta?.features.includes("own_edits") ?? false;
@@ -209,13 +208,7 @@ export function Inspector({
         <div className="hx-inspector-head" hidden={hideTabs}>
           <div className="hx-tabs" role="tablist">
             {tabs.map(tabButton)}
-            {agentId && target && (
-              <React.Suspense fallback={null}>
-                <OnMicroVm id={agentId} target={target}>
-                  {tabButton({ id: "engine", label: "Engine" })}
-                </OnMicroVm>
-              </React.Suspense>
-            )}
+            {agentId && target && tabButton({ id: "engine", label: "Engine" })}
           </div>
           {actions}
         </div>

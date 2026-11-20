@@ -295,8 +295,8 @@ fn emptied(events: &Path, procs: &Path, record: &shards_api::Record) -> std::io:
     changed.file(&opened)?;
     let mut judge = shards_api::Judge::begin(record);
     // Each process as it was first seen: its pid, its watch, and what it had run then.
-    let mut watched: Vec<(u32, shards_api::Watch, std::time::Duration)> = Vec::new();
-    let mut ran = std::time::Duration::ZERO;
+    let mut watched: Vec<(u32, shards_api::Watch, shards_api::Work)> = Vec::new();
+    let mut ran = shards_api::Work::ZERO;
     loop {
         changed.clear();
         let text = match std::fs::read_to_string(events) {
@@ -314,6 +314,8 @@ fn emptied(events: &Path, procs: &Path, record: &shards_api::Record) -> std::io:
             .filter_map(|l| l.trim().parse().ok())
             .collect();
         watched.retain(|(pid, ..)| pids.contains(pid));
+        // One read of what the OS lists of every thread for all of this pass's readings (D215).
+        let listing = shards_api::Listing::new();
         for pid in pids {
             if watched.iter().any(|(p, ..)| *p == pid) {
                 continue;
@@ -321,9 +323,9 @@ fn emptied(events: &Path, procs: &Path, record: &shards_api::Record) -> std::io:
             let watch = shards_api::Followed::of_pid(pid)
                 .ok()
                 .flatten()
-                .and_then(|followed| shards_api::Watch::of(followed).ok().flatten());
+                .and_then(|followed| shards_api::Watch::of(followed, &listing).ok().flatten());
             if let Some(watch) = watch {
-                let from = watch.cpu();
+                let from = watch.work();
                 watched.push((pid, watch, from));
             }
         }
@@ -336,9 +338,12 @@ fn emptied(events: &Path, procs: &Path, record: &shards_api::Record) -> std::io:
                 .map(|(_, watch, _)| watch.resolution())
                 .max()
                 .unwrap_or_default();
+            // Its host's hold of a process of it, as that process measured it (`Watch::held`).
+            let mut held = std::time::Duration::ZERO;
             for (_, watch, from) in &mut watched {
-                let look = watch.look().unwrap_or(shards_api::Found::Held);
-                ran = ran.max(watch.cpu().saturating_sub(*from));
+                let look = watch.look(&listing).unwrap_or(shards_api::Found::Held);
+                held = held.max(watch.held());
+                ran = ran.max(watch.work().saturating_sub(*from));
                 found = match (found, look) {
                     (shards_api::Found::Progressed, _) | (_, shards_api::Found::Progressed) => {
                         shards_api::Found::Progressed
@@ -354,12 +359,14 @@ fn emptied(events: &Path, procs: &Path, record: &shards_api::Record) -> std::io:
                 resolution,
                 own: std::time::Duration::ZERO,
                 work: None,
+                held,
             };
             judge.found_over(found, span).map_err(|stall| {
                 std::io::Error::other(format!(
-                    "its processes ran nothing for {:?}, past the slowest a leaf emptied in ({:?})",
+                    "its processes ran nothing for {:?}, past the slowest a leaf emptied in ({:?}) and its spread ({:?})",
                     stall.over(),
-                    stall.slowest()
+                    stall.slowest(),
+                    stall.spread()
                 ))
             })?;
         }
@@ -592,7 +599,7 @@ mod tests {
         // Its W* learned (taught here): a process that runs nothing, given up on past it.
         let slowest = Duration::from_millis(200);
         let record = shards_api::Record::new();
-        record.teach(slowest, Duration::from_millis(1));
+        record.teach(slowest, shards_api::Work::of_cpu(Duration::from_millis(1)));
         // Stopped, waited for to its stop: an asleep one is woken by a cgroup freezer's
         // cycles, a kiln run's about six a second (PM M562), which no stopped one is
         // (kernel/cgroup/freezer.c wakes interruptible and uninterruptible sleepers alone).

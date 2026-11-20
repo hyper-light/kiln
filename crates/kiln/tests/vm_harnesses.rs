@@ -405,6 +405,39 @@ mod checks {
         assert!(said_marker(&lines, STUB_DONE));
     }
 
+    /// r41 (jupiter, kiln 7d760b850): what devin said by the drive's look, its first turn and the turn kiln started
+    /// to tell it the agent it started had ended, whose `HEARD` quotes that agent's `CWD` and `WHERE`. Its folder
+    /// and kernel are its first turn's. Red: `first_turn` keeping every line, failing with r41's own words.
+    #[test]
+    fn s34_the_first_turn_ends_at_its_marker() {
+        let project = r"C:\Users\corph\.cache\xplat\windows\w\t\.tmpidbtmV\project";
+        let read: Vec<String> = [
+            "CWD /mnt/c/Users/corph/.cache/xplat/windows/w/t/.tmpidbtmV/project",
+            "WHERE Linux aa598e29-87e9-4e06-b668-874bbe7986fa",
+            "HEARD WRITE=vm-e2e-2e500e28699c.txt MCP_PING SPAWN=devin do the task",
+            "WROTE vm-e2e-2e500e28699c.txt",
+            "MCP_OK 109 code_run",
+            "MCP_AS 01a1ed46e72273e29f44b28bd7f23623",
+            "SPAWN_OK 01a1ed53df777712af1c3c050921205f",
+            "line 00000",
+            "line 00001",
+            "STUB_DONE",
+            "CWD /mnt/c/Users/corph/.cache/xplat/windows/w/t/.tmpidbtmV/project",
+            "WHERE Linux aa598e29-87e9-4e06-b668-874bbe7986fa",
+            "HEARD Agent \u{201c}Devin\u{201d} (01a1ed53), which you started, ended its turn: CWD /mnt/c/Users/corph/.cache/xplat/windows/w/t/.tmpidbtmV/project WHERE Linux 5607892d-31f9-4e54-b0d2-d34b1d4422d0 HEARD CHILD do the task",
+            "line 00000",
+            "line 00001",
+            "STUB_DONE",
+        ]
+        .iter()
+        .map(|l| (*l).to_owned())
+        .collect();
+        let first = first_turn(read, STUB_DONE);
+        assert_eq!(check_project_path(Some(project), cwd_said(&first).as_deref(), project, "windows"), Ok(()));
+        assert_eq!(where_said(&first), Some(Where { kernel: "Linux".into(), boot: Some("aa598e29-87e9-4e06-b668-874bbe7986fa".into()) }));
+        assert_eq!(first.last().map(String::as_str), Some(STUB_DONE), "the first turn keeps its marker");
+    }
+
     #[test]
     fn s34_kilns_mcp_server_is_reached_from_where_the_harness_runs() {
         let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
@@ -825,6 +858,36 @@ mod waits {
         assert_eq!((frame_or_quiet(&mut client)?, frame_or_quiet(&mut client)?), (Some(b"hello".to_vec()), Some(b"hi".to_vec())), "two frames, each whole");
         drop(server);
         assert!(frame_or_quiet(&mut client).is_err(), "it ended");
+        Ok(())
+    }
+
+    /// A wait reads the frames that follow kiln's next change within a look's time of it, never past, so a socket
+    /// kiln keeps busy (its server samples itself every `[telemetry] sample_seconds`) can't keep it from looking
+    /// again. Here kiln speaks every twentieth of a look's time for twenty looks' time: a wait that reads on while
+    /// each frame follows the last within a look's time reads until kiln stops, as pre2's start's wait read kiln's
+    /// frames for hours, never asking again (adacachy, 2026-11-18).
+    #[test]
+    fn s35_a_busy_socket_never_holds_a_wait_past_a_looks_time() -> anyhow::Result<()> {
+        use std::io::Write as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let mut client = std::net::TcpStream::connect(listener.local_addr()?)?;
+        let (mut server, _) = listener.accept()?;
+        let look = s(1);
+        let (every, speaks_for) = (look / 20, look.saturating_mul(20));
+        let busy = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            while began.elapsed() < speaks_for {
+                if server.write_all(&[0x81, 2, b'{', b'}']).is_err() {
+                    return;
+                }
+                std::thread::sleep(every);
+            }
+        });
+        let (said, ended) = frames(&mut client, None, look);
+        drop(client);
+        let _ = busy.join();
+        assert!(!said.is_empty(), "kiln's next change heard");
+        assert!(!ended, "it read kiln's {} frames until kiln stopped speaking, past a look's time", said.len());
         Ok(())
     }
 

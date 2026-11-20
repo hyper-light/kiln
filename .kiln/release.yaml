@@ -21,7 +21,8 @@ jobs:
   linux:
     name: Linux (x86-64, ARM64)
     # Any open Linux machine with rustup, python3 and node (W25): v1 places it on the runner
-    # meeting `requires` with the most room; build.sh adds its own rust targets and pinned zig.
+    # meeting `requires` with the most room; build.sh adds its own rust targets and pinned zig,
+    # and packs the Shards each binary carries (ci/shards/pack.sh, docs/shards.md).
     runs-on: [baremetal]
     requires: ["os == linux", "tools has cargo", "tools has python3", "tools has node"]
     timeout-minutes: 90
@@ -41,8 +42,32 @@ jobs:
         run: nice -n 10 ci/release/build.sh aarch64-unknown-linux-musl
     artifacts: ["dist/*"]
 
+  # The Shards kiln's Windows binary carries (docs/shards.md), packed on Windows: Shards builds and
+  # tests its Windows binaries with MSVC on Windows (its .github/workflows/release.yml), which a
+  # Linux machine has no toolchain for. Like macOS's build waiting for a Mac, Windows's waits for
+  # a Windows machine. Its steps run in Git Bash, found beside git: `shell: bash` would take
+  # whichever bash.exe Windows finds first, WSL's in System32 among them.
+  shards-windows:
+    name: Shards for Windows (x86-64), on Windows
+    runs-on: [baremetal, windows]
+    requires: ["os == windows", "arch == x86_64", "tools has cargo", "tools has git"]
+    timeout-minutes: 90
+    steps:
+      - name: pack
+        shell: powershell
+        run: |
+          $git = Split-Path (Get-Command git -ErrorAction Stop).Source
+          $bash = @('..\bin\bash.exe', '..\usr\bin\bash.exe', '..\..\bin\bash.exe') | ForEach-Object { Join-Path $git $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $bash) { throw "no Git Bash beside git ($git)" }
+          & $bash ci/shards/pack.sh x86_64-pc-windows-msvc
+      - uses: kiln/upload@v1
+        with:
+          name: shards-x86_64-pc-windows-msvc
+          path: target/shards-carried/x86_64-pc-windows-msvc
+
   windows:
     name: Windows (x86-64, cross-built)
+    needs: [shards-windows]
     runs-on: [baremetal]
     requires: ["os == linux", "tools has cargo", "tools has python3", "tools has node"]
     timeout-minutes: 90
@@ -53,6 +78,12 @@ jobs:
       # (W28-R72). The PATH line is for a Mac's launchd service, whose PATH has no tools in it.
       - name: ui
         run: export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH" && npm ci --prefix ui --no-audit --no-fund && KILN_UI_SERVER=off npm run --prefix ui build
+      # Where kiln's build finds the Shards it carries for the target it is cross-built as
+      # (x86_64-pc-windows-gnu; crates/kiln/build.rs).
+      - uses: kiln/download@v1
+        with:
+          name: shards-x86_64-pc-windows-msvc
+          path: target/shards-carried/x86_64-pc-windows-gnu
       - name: build
         run: nice -n 10 ci/release/build.sh x86_64-pc-windows-msvc
     artifacts: ["dist/*"]

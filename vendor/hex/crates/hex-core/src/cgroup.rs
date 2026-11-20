@@ -247,6 +247,7 @@ pub fn since(now: &Usage, base: &Baseline, peak: u64) -> Usage {
         io_write_bytes: now.io_write_bytes.saturating_sub(base.io_write_bytes),
         guest: None,
         started_from: None,
+        paused_ns: None,
     }
 }
 
@@ -283,6 +284,7 @@ pub fn usage(f: &UsageFiles) -> Usage {
         io_write_bytes,
         guest: None,
         started_from: None,
+        paused_ns: None,
     }
 }
 
@@ -424,6 +426,7 @@ mod managed_usage_tests {
                 io_write_bytes: 211,
                 guest: None,
                 started_from: None,
+                paused_ns: None,
             })
         );
         files.io_stat.clear();
@@ -649,6 +652,7 @@ mod tests {
                 io_write_bytes: 202,
                 guest: None,
                 started_from: None,
+                paused_ns: None,
             }
         );
         assert_eq!(usage(&UsageFiles::default()), Usage::default());
@@ -734,6 +738,7 @@ mod tests {
             io_write_bytes: 20,
             guest: None,
             started_from: None,
+            paused_ns: None,
         };
         let base = Baseline::of(&before);
         let now = Usage {
@@ -747,6 +752,7 @@ mod tests {
             io_write_bytes: 20,
             guest: None,
             started_from: None,
+            paused_ns: None,
         };
         assert_eq!(
             since(&now, &base, 8192),
@@ -761,6 +767,7 @@ mod tests {
                 io_write_bytes: 0,
                 guest: None,
                 started_from: None,
+                paused_ns: None,
             }
         );
         // A counter read under its baseline, as a wrong baseline would give, reads 0, not a wrap.

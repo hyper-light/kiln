@@ -19,4 +19,9 @@ at: string, access: LiveAccess,
 /**
  * Who sees it: a host session's harness alone.
  */
-members: Array<LiveMember>, };
+members: Array<LiveMember>, 
+/**
+ * Whether its files may be run from it: where not, each member's mount of it is `noexec` (Shards' D279), a
+ * microVM's alone. Said only where off.
+ */
+exec?: boolean, };

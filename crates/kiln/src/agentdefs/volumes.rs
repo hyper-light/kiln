@@ -288,7 +288,8 @@ fn refused(r: Refusal) -> Answer {
         Refusal::Invalid { .. }
         | Refusal::NoSuchProgram(_)
         | Refusal::Full { .. }
-        | Refusal::Ended => Cause::Failed,
+        | Refusal::Ended
+        | Refusal::Failed(_) => Cause::Failed,
     };
     Answer::Refused { cause, why }
 }

@@ -19,6 +19,8 @@
 //!   loop and its adapter treat a microVM's member as they treat a process of the machine's.
 //! - [`pools`]: the warm pools kiln names on the machine's microVMs from its agents' starts, and lets
 //!   go of after their keep window (kiln plan 01a1dd2e…, P3.2), and each runner's as the server shows them.
+//! - [`windows_path`]: a Windows folder's place, judged from its text as Windows judges it, on any host: what an
+//!   isolated session's harness on a Windows machine is told of its folders (docs/agentic.md W8, piece 2).
 
 #[cfg(test)]
 pub mod fake;
@@ -30,6 +32,7 @@ pub mod isolated;
 pub mod narrow;
 pub mod pools;
 pub mod served;
+pub mod windows_path;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -225,9 +228,6 @@ pub fn microvm() -> Option<Arc<Microvms>> {
 pub async fn hold(state: &std::path::Path, ledger: Option<Arc<dyn kiln_seams::Records>>, leasing: Option<Leasing>) -> anyhow::Result<Option<Arc<Microvms>>> {
     if let Some(held) = HELD.get() {
         return Ok(Some(Arc::clone(held)));
-    }
-    if !crate::shards::carried() {
-        return Ok(None);
     }
     let state = state.to_path_buf();
     let vms = crate::rt::blocking(move || -> anyhow::Result<Microvms> {

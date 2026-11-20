@@ -583,6 +583,7 @@ impl MacRuntime {
             ended: None,
             control: None,
             control_wake: None,
+            live: None,
             credentials: Vec::new(),
         })
     }
@@ -667,6 +668,7 @@ impl BoxUser {
             io_write_bytes: 0,
             guest: None,
             started_from: None,
+            paused_ns: None,
         })
     }
 
@@ -809,6 +811,7 @@ fn info(id: BoxId, bounds: Bounds, state: BoxState) -> BoxInfo {
         ended: None,
         control: None,
         control_wake: None,
+        live: None,
         credentials: Vec::new(),
     }
 }

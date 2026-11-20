@@ -274,7 +274,14 @@ fn p6b_4_ac3_a_volume_on_a_host_session_joins_its_harnesss_folders_and_its_scope
         let first = said(&log, "start");
         anyhow::ensure!(first.len() == 1, "{first:?}");
         let pid = first.first().map(|(p, _)| *p).unwrap_or(0);
-        let answer = call(owner(&hub), "sessions.volumes.add", json!({"agent": "host-vol", "path": data, "access": "rw"})).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
+        // As the UI's form sends it, its permissions beside its access (`perms`): execute off is a microVM's, refused on
+        // its host naming its engine; read off, always.
+        let perms = |read: bool, exec: bool| json!({"agent": "host-vol", "path": data, "access": "rw", "perms": {"read": read, "write": true, "exec": exec}});
+        let shut = call(owner(&hub), "sessions.volumes.add", perms(true, false)).await.err().ok_or_else(|| anyhow::anyhow!("execute off was taken on its host"))?;
+        anyhow::ensure!(shut.0 == http::StatusCode::CONFLICT && shut.1.contains("(engine host)"), "{shut:?}");
+        let unread = call(owner(&hub), "sessions.volumes.add", perms(false, true)).await.err().ok_or_else(|| anyhow::anyhow!("read off was taken"))?;
+        anyhow::ensure!(unread.0 == http::StatusCode::BAD_REQUEST && unread.1.contains("always allows reading"), "{unread:?}");
+        let answer = call(owner(&hub), "sessions.volumes.add", perms(true, true)).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
         anyhow::ensure!(answer.get("taken") == Some(&json!(true)) && answer.get("engine") == Some(&json!("host")), "{answer}");
         let v = shows(&hub, "host-vol", "its volume, taken", |v| took(v, "volumes", "harness") == Some("now") && took(v, "volumes", "scope") == Some("now")).await?;
         anyhow::ensure!(v.pointer("/state/overrides/volumes/0/volume/path") == Some(&json!(data)) && v.pointer("/state/overrides/volumes/0/volume/at") == Some(&json!(data)), "{v}");
@@ -313,7 +320,8 @@ fn microvms(hub: &Hub, dir: &Path, program: &Path) -> anyhow::Result<Arc<crate::
 
 /// P6b.4 AC1, AC2 and AC3 in a microVM (the person: "If MicroVMs, it adds the volume to the microvm(s) for that
 /// session, grants the permissions specified, and adds it to the harness's/agent's allow directories and session's
-/// scope"): a port published, egress granted, a network joined and a folder plugged in, each taken by the session's
+/// scope"): a port published, egress granted, a network joined and a folder plugged in (read-only, its files kept from
+/// running, as the UI's form asks), each taken by the session's
 /// microVM live (the stand-in runtime records each on the same microVM, none launched again) and its harness told the
 /// folder in the same process; `agents.get` offers every operation there and shows each override as its microVM took
 /// it. Started again (by force), a new run comes back with all four given again, its harness given the folder as it
@@ -356,7 +364,8 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         let backwards = call(owner(&hub), "sessions.networks.connect", backwards).await.err().ok_or_else(|| anyhow::anyhow!("ports out of order were taken"))?;
         anyhow::ensure!(backwards.0 == http::StatusCode::BAD_REQUEST && backwards.1.contains("the first at most the last"), "{backwards:?}");
         ask("sessions.networks.connect", connection.clone()).await?;
-        ask("sessions.volumes.add", json!({"agent": "vm-live", "path": data, "access": "ro"})).await?;
+        // As the UI's form sends it: read-only, its files kept from running (each member's mount of it `noexec`, D279).
+        ask("sessions.volumes.add", json!({"agent": "vm-live", "path": data, "access": "ro", "perms": {"read": true, "write": false, "exec": false}})).await?;
         // Past what its launch declared: egress past its ceiling, a folder outside its plug roots with nothing restarted.
         let past = call(owner(&hub), "sessions.egress.grant", json!({"agent": "vm-live", "host": "elsewhere.example.com", "port": 443})).await.err().ok_or_else(|| anyhow::anyhow!("egress past its ceiling was taken"))?;
         anyhow::ensure!(past.0 == http::StatusCode::CONFLICT && past.1.contains("past the most egress"), "{past:?}");
@@ -364,7 +373,7 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         anyhow::ensure!(outside.0 == http::StatusCode::CONFLICT && outside.1.contains("outside every folder") && outside.1.contains(crate::sandbox::isolated::VOLUMES), "{outside:?}");
         // Beneath its session's volume root by default, plugged as Shards' ImageGuest::plug takes one.
         let at = format!("{}/data", crate::sandbox::isolated::VOLUMES);
-        let plug = Seam::Plug { source: PlugSource::Host(data.clone()), to: PlugFor::Members(vec![member()]), at: at.clone(), read_only: true };
+        let plug = Seam::Plug { source: PlugSource::Host(data.clone()), to: PlugFor::Members(vec![member()]), at: at.clone(), read_only: true, exec: false };
         // Its name lowercased, as Shards' D285 leases a name (RFC 4343).
         let granted = || SeamGrant { name: "alice".into(), peer: "bob.team".into(), ports: Ports { udp: false, first: 8080, last: 8081 }, way: SeamWay::Out };
         let all = vec![
@@ -377,7 +386,7 @@ fn p6b_4_a_microvm_session_takes_each_change_live_and_again_as_it_starts() -> an
         until("its microVM took all four", || on("fake-vm-1") == all).await?;
         let v = shows(&hub, "vm-live", "each override, taken by its microVM", |v| ["ports", "egress", "networks", "volumes"].iter().all(|l| took(v, l, "microvm") == Some("now"))).await?;
         anyhow::ensure!(took(&v, "volumes", "harness") == Some("now") && took(&v, "volumes", "scope") == Some("now"), "{v}");
-        anyhow::ensure!(v.pointer("/state/overrides/volumes/0/volume/access") == Some(&json!("ro")), "{v}");
+        anyhow::ensure!(v.pointer("/state/overrides/volumes/0/volume/access") == Some(&json!("ro")) && v.pointer("/state/overrides/volumes/0/volume/exec") == Some(&json!(false)), "{v}");
         anyhow::ensure!(v.pointer("/state/overrides/volumes/0/volume/at") == Some(&json!(at)), "{v}");
         // In place: the same microVM, none launched again, and its harness the same process, told the folder where it sees it.
         until("its harness told the folder", || told_dirs(&log) == Some(json!([at.clone()]))).await?;
@@ -472,7 +481,7 @@ fn p6b_4_ac3_a_volume_is_the_sessions_scope_as_its_access_says() {
     let mut core = crate::harness::core::Core::new();
     core.state.cwd = "/work/proj".into();
     let volume = |path: &str, access| super::HeldVolume {
-        volume: super::Volume { path: path.into(), at: path.into(), access, members: vec![super::Member::Harness("claude".into())] },
+        volume: super::Volume { path: path.into(), at: path.into(), access, members: vec![super::Member::Harness("claude".into())], exec: true },
         harness: super::Took::Now { how: String::new() },
         scope: super::Took::Now { how: String::new() },
         microvm: None,
@@ -519,18 +528,18 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
         Change::Grant(Egress { member: harness(), host: "example.com".into(), port: 0 }),
         Change::Publish(Port { bind: "localhost".into(), host_port: 1, guest_port: 1, protocol: Protocol::Udp }),
         Change::Connect(Network { member: Member::Harness("codex".into()), name: "team".into(), grant: Some(grant("alice", "bob", Way::Out)) }),
-        Change::Add(Volume { path: "relative/dir".into(), at: "relative/dir".into(), access: Access::Rw, members: vec![harness()] }),
+        Change::Add(Volume { path: "relative/dir".into(), at: "relative/dir".into(), access: Access::Rw, members: vec![harness()], exec: true }),
     ] {
         assert!(check(&bad, true, "claude").is_err(), "{bad:?}");
     }
-    let host_volume = Volume { path: "/data".into(), at: "/data".into(), access: Access::Ro, members: vec![harness()] };
+    let host_volume = Volume { path: "/data".into(), at: "/data".into(), access: Access::Ro, members: vec![harness()], exec: true };
     assert!(check(&Change::Add(host_volume.clone()), false, "claude").is_ok());
     assert!(check(&Change::Add(Volume { at: "/elsewhere".into(), ..host_volume.clone() }), false, "claude").is_err());
     assert!(check(&Change::Add(Volume { members: vec![Member::Mcp("db".into())], ..host_volume }), false, "claude").is_err_and(|e| e.contains("one member, its harness")));
     // What its microVM declared: a folder strictly beneath a plug root fits, as Shards plugs one (D271); egress within its
     // ceiling alone.
     let declared = Overrides { roots: vec!["/work".into(), "/volumes".into()], ceiling: vec!["api.example.com:443".into(), "[::1]:8080".into()], ..Overrides::default() };
-    let vol = |at: &str| Change::Add(Volume { path: "/data".into(), at: at.into(), access: Access::Rw, members: vec![harness()] });
+    let vol = |at: &str| Change::Add(Volume { path: "/data".into(), at: at.into(), access: Access::Rw, members: vec![harness()], exec: true });
     assert!(fits(&vol("/volumes/data"), &declared).is_ok());
     assert!(fits(&vol("/work/proj/sub"), &declared).is_ok());
     assert!(fits(&vol("/volumes"), &declared).is_err(), "a root itself is no plug's place: strictly beneath one");
@@ -549,6 +558,42 @@ fn p6b_4_the_record_takes_each_change_once_and_refuses_what_it_cant() -> anyhow:
     assert_eq!(Member::read(None, "claude"), Ok(harness()));
     assert_eq!(Member::read(Some("agent:helper"), "claude"), Ok(Member::Agent("helper".into())));
     assert!(Member::read(Some("worker"), "claude").is_err());
+    Ok(())
+}
+
+/// P6b.4, a volume's permissions as the UI's form says them (read, write and execute, each its own, beside `access`):
+/// the add's input takes them; read can't be off, and write is `access`'s. Execute off keeps its files from running, a
+/// microVM's alone (refused on its host, naming its engine): held on the volume, said only where off (a volume held
+/// before it runs its files), and given to its microVM's plug (Shards' D279, `noexec`).
+#[test]
+fn p6b_4_a_volumes_execute_off_is_its_microvms_noexec_plug_and_refused_on_its_host() -> anyhow::Result<()> {
+    use super::*;
+    // What the UI's form sends (`overridesApi.addVolume`): `perms` beside `access`.
+    let said: input::Add = serde_json::from_value(json!({"agent": "a", "path": "/data", "access": "ro", "perms": {"read": true, "write": false, "exec": false}}))?;
+    assert_eq!(exec_of(said.access, said.perms), Ok(false));
+    let perms = |read, write, exec| Some(input::Perms { read, write, exec });
+    assert_eq!(exec_of(Access::Rw, None), Ok(true), "none said: its files run");
+    assert_eq!(exec_of(Access::Rw, perms(true, true, true)), Ok(true));
+    assert!(exec_of(Access::Ro, perms(false, false, true)).is_err_and(|e| e.contains("always allows reading")));
+    assert!(exec_of(Access::Ro, perms(true, true, true)).is_err_and(|e| e.contains("disagree")));
+    assert!(exec_of(Access::Rw, perms(true, false, true)).is_err_and(|e| e.contains("disagree")));
+    let harness = || Member::Harness("claude".into());
+    let shut = Volume { path: "/data".into(), at: "/volumes/data".into(), access: Access::Ro, members: vec![harness()], exec: false };
+    assert!(check(&Change::Add(shut.clone()), true, "claude").is_ok());
+    let on_host = Volume { at: "/data".into(), ..shut.clone() };
+    assert!(check(&Change::Add(on_host.clone()), false, "claude").is_err_and(|e| e.contains("(engine host)")));
+    assert!(check(&Change::Add(Volume { exec: true, ..on_host }), false, "claude").is_ok());
+    // Held: said only where off; one held before it (no `exec`) runs its files.
+    assert_eq!(serde_json::to_value(&shut)?.get("exec"), Some(&json!(false)));
+    assert_eq!(serde_json::to_value(Volume { exec: true, ..shut.clone() })?.get("exec"), None);
+    let before: Volume = serde_json::from_value(json!({"path": "/data", "at": "/data", "access": "rw", "members": [{"kind": "harness", "name": "claude"}]}))?;
+    assert!(before.exec);
+    // Its microVM's plug, as Shards' ImageGuest::plug takes one.
+    assert!(matches!(seam_plug(&shut), kiln_seams::sandbox::Change::Plug { read_only: true, exec: false, .. }));
+    // Asked again otherwise: refused, saying what it holds.
+    let mut o = Overrides::default();
+    take(&mut o, &Change::Add(shut.clone())).map_err(anyhow::Error::msg)?;
+    assert!(take(&mut o, &Change::Add(Volume { exec: true, ..shut })).is_err_and(|e| e.contains("its files not run")));
     Ok(())
 }
 

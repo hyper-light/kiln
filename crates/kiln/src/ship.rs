@@ -4521,6 +4521,11 @@ mod tests {
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
             });
+            // What it's handed waits in its mail until the server's pump hands it over (W20, 0ff338877).
+            let h = std::sync::Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::mail_delivery::run(h).await;
+            });
             // An agent that stays up and says nothing, keeping what it's given.
             let dir = tempfile::tempdir()?;
             let (program, heard) = (dir.path().join("quiet-claude"), dir.path().join("heard.jsonl"));
@@ -4594,6 +4599,11 @@ mod tests {
             let h = std::sync::Arc::clone(&hub);
             crate::rt::spawn(async move {
                 let _ = crate::harness::registry::Registry::run_local(h).await;
+            });
+            // What it's handed waits in its mail until the server's pump hands it over (W20, 0ff338877).
+            let h = std::sync::Arc::clone(&hub);
+            crate::rt::spawn(async move {
+                let _ = crate::harness::mail_delivery::run(h).await;
             });
             // (diff id, number, kind, state, branch, its v1 commit, its v2 commit, its name)
             let changes = [

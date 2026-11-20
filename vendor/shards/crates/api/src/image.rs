@@ -215,7 +215,7 @@ pub struct ImageShare {
     pub members: Option<PlugFor>,
 }
 
-/// A share another server serves, which the guest sees at `at` (D286): the image run's form of a
+/// A share another server serves, which the guest sees at `at` (D287): the image run's form of a
 /// direct boot's `--slates-fs-fd`, as `slates shards VOLUME --fd N` hands one a slates volume. Its
 /// server answers the guest's FUSE requests on [`stream`](Self::stream), and the mappings of the
 /// share slot's DAX window where it has one (D189), as slates' does; nothing of the host is
@@ -369,7 +369,7 @@ pub struct ImageSpec {
     /// is not internal): else refused. Empty: nothing past the image's grants. Part of what a
     /// warm host is made for ([`ImagePools`]): its network process is held to it from its start.
     pub egress_ceiling: Vec<MemberCeiling>,
-    /// Its shares another server serves (D286), each in a share slot after
+    /// Its shares another server serves (D287), each in a share slot after
     /// [`shares`](Self::shares)', none at a place a share or another served share takes. Empty:
     /// none. A run with any boots on a run host of its own ([`ServedShare`]).
     pub served: Vec<ServedShare>,
@@ -1364,7 +1364,7 @@ fn plug_roots(roots: &[String]) -> Result<Vec<String>, ImageRefusal> {
 }
 
 /// Where a share is seen and whom it is given to as they start (D277), a served share's alike
-/// (D286), as its request carries them: refused by field where its place is not absolute, or its
+/// (D287), as its request carries them: refused by field where its place is not absolute, or its
 /// members name none or one twice.
 fn share_to(at: &str, members: Option<&PlugFor>) -> Result<Option<wire::ShareTo>, ImageRefusal> {
     if !at.starts_with('/') {
@@ -1504,7 +1504,7 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
             exec: s.exec,
         });
     }
-    // Its shares another server serves (D286): each one's place and members as a share's; its
+    // Its shares another server serves (D287): each one's place and members as a share's; its
     // stream goes beside the request, never in it (`session::Begun::create`).
     let mut served = Vec::with_capacity(spec.served.len());
     for s in &spec.served {
@@ -2147,7 +2147,7 @@ mod tests {
         assert!(!request(&spec()).unwrap().members[0].input);
     }
 
-    /// D286: a share another server serves rides its request by its place, modes and members
+    /// D287: a share another server serves rides its request by its place, modes and members
     /// alone, its stream beside it, never in it. Do: give a spec two, the second read-only,
     /// its files not to be run, given to its harness. Expect: each carried as asked, in order,
     /// no handle named, the spec equal to its clone and to no spec of another stream. Do: one

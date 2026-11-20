@@ -14,7 +14,19 @@ pub use checked::copy_checked;
 pub use copy::COPIED;
 pub use copy::{copy_in, copy_out};
 pub use progress::{IDLE_VM_CPU, Look, Progress, progressed};
-pub use shards_ipc::{holdable, holdable_known, host_available, host_memory};
+pub use shards_ipc::{holdable, holdable_known, host_available, host_committable, host_memory};
+
+/// What `e` says and, where it is its host refusing memory (Windows: ERROR_NO_SYSTEM_RESOURCES,
+/// 1450; ERROR_COMMITMENT_LIMIT, 1455), what the host's memory was as it refused
+/// (`shards_ipc::memory_refused_said`): a VM refused its RAM said with what its host had,
+/// for the refusal's diagnosis (CI 44227612442, windows-2025: 1450 and 1455 said nothing of it).
+pub fn memory_said(e: &io::Error) -> String {
+    #[cfg(windows)]
+    if let Some(said) = e.raw_os_error().and_then(shards_ipc::memory_refused_said) {
+        return format!("{e}; {said}");
+    }
+    e.to_string()
+}
 
 #[cfg(unix)]
 mod unix;
@@ -44,9 +56,10 @@ mod windows_process;
 mod windows_watch;
 #[cfg(windows)]
 pub use windows_files::{
-    FileIdentity, allocation_unit, append_new_in, create_in, deallocate, deallocation_unit, file_identity,
-    make_sparse, names_in, newest_in, open_beneath, open_dir_beneath, open_in, open_newest_beneath,
-    open_newest_in, punch_hole, remove_in, sync_entries, unlink_in, version_of, write_in,
+    EntryKind, FileIdentity, allocation_unit, append_new_in, create_in, deallocate, deallocation_unit,
+    entry_kind, file_identity, make_sparse, names_in, newest_in, open_beneath, open_dir_beneath, open_in,
+    open_newest_beneath, open_newest_in, punch_hole, remove_in, sync_entries, unlink_in, version_of,
+    write_in,
 };
 #[cfg(windows)]
 pub use windows_process::{
@@ -145,7 +158,8 @@ pub use shards_syscall_filter as seccomp;
 /// watches the thread while it is held (macos_thread.rs): one that runs long goes to
 /// timeshare before XNU's fail-safe would depress it (PM M317). On Windows a priority
 /// governor does (windows_thread.rs): one that uses more than half of its CPU, by more
-/// than a period (D191's, 2g) over a stretch, goes back to normal priority.
+/// than a period (D191's, 2g) over a stretch, goes a step below normal priority, beneath
+/// its host's threads.
 #[derive(Debug)]
 pub struct Prioritized {
     #[cfg(target_os = "macos")]
@@ -160,8 +174,9 @@ pub struct Prioritized {
 /// whose CPUs are busy each of a guest's wakeups of another vCPU (an IPI, a woken task)
 /// waited for the busy thread's slice to run out, and a run's start in a microVM of every
 /// CPU of the host took twice as long as in one of one (PM M292, M440). On Windows a step
-/// above normal priority while the thread uses no more than half of its CPU, its governor's
-/// credit carrying a period across its clock's coarse steps (windows_thread.rs), where
+/// above normal priority while the thread uses no more than half of its CPU, and a step below
+/// while it uses more, its governor's credit carrying a period across its clock's coarse
+/// steps (windows_thread.rs), where
 /// on 4 CPUs that 4 busy loops hold a run's start waited 217 to 337 ms at p50 for its guest
 /// to begin the command, and 8 to 10 so (PM M495, D191).
 pub fn prioritize_vcpu_thread() -> Result<Prioritized, String> {
@@ -276,9 +291,9 @@ fn read_whole(file: &File, name: &str, len: u64, max: u64) -> io::Result<Option<
 }
 
 /// Makes the entries of the directory at `path` durable: the renames into it survive a
-/// crash once this returns. Linux takes an fsync of the directory itself (fsync(2)); macOS
-/// takes `sync_durable`'s flush, whose `F_FULLFSYNC` directories accept (PM M46); Windows
-/// takes FlushFileBuffers of a handle to it that may write (windows_files.rs).
+/// crash once this returns (`shards_durable::entries`, D286): Linux an fsync of the directory
+/// itself (fsync(2)); macOS its `F_FULLFSYNC`, which directories accept (PM M46); Windows
+/// FlushFileBuffers of a handle to it that may write (windows_files.rs).
 pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
     sync_entries(&open_dir(path)?)
 }
@@ -287,42 +302,6 @@ pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
 /// descriptor or mapping, writes its pages back before it returns, as whoever reads the
 /// file meanwhile waits: macOS (APFS, PM M278). Linux writes back in its own time.
 pub const LET_GO_WRITES_BACK: bool = cfg!(target_os = "macos");
-
-/// Has what was written to `file` written back now, on a thread of its own, where its OS
-/// would make whoever lets go of the file last wait for it: macOS writes a file's dirty
-/// pages back as its last writable descriptor or mapping goes, and whoever reads the file
-/// meanwhile waits too (APFS, PM M278). fsync(2) alone, which writes them to the drive, not
-/// through its cache as `F_FULLFSYNC` does: nothing here asks to be durable. Its own
-/// descriptor of the file, which it closes once written back; the caller goes on at once,
-/// or waits for it where no thread starts. Elsewhere nothing: Linux writes back in its own
-/// time, and a close never waits for it.
-pub fn write_back_ahead(file: &File) -> io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::os::fd::AsRawFd as _;
-        let fsync = |file: &File| {
-            // SAFETY: fsync(2) of the descriptor `file` holds.
-            if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        };
-        let own = file.try_clone()?;
-        let spawned = std::thread::Builder::new()
-            .name("write-back".into())
-            .spawn(move || {
-                if let Err(e) = fsync(&own) {
-                    crate::debug!("writing back: {e}");
-                }
-            });
-        if spawned.is_err() {
-            return fsync(file);
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = file;
-    Ok(())
-}
 
 /// Fills `buf` from `file` at `offset`, failing on a short file.
 pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -426,20 +405,6 @@ pub fn stdout_file() -> io::Result<File> {
 mod tests {
     use super::*;
     use std::io::Write;
-
-    /// What a filesystem without F_FULLFSYNC holds is made durable with fsync instead:
-    /// /dev/null refuses F_FULLFSYNC and takes fsync, as an SMB share does, where std's
-    /// sync_all fails (review 1.13).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_file_without_full_fsync_is_synced_still() {
-        let null = std::fs::OpenOptions::new().write(true).open("/dev/null").unwrap();
-        assert!(null.sync_all().is_err(), "std's sync_all took F_FULLFSYNC here");
-        sync_durable(&null).unwrap();
-        let held = shards_testdir::TempDir::new("sync").unwrap();
-        let dir = std::fs::File::open(&held).unwrap();
-        sync_entries(&dir).unwrap();
-    }
 
     fn temp_file(tag: &str, contents: &[u8]) -> (shards_testdir::TempDir, File) {
         let dir = shards_testdir::TempDir::new(&format!("platform-{tag}")).unwrap();
@@ -794,7 +759,7 @@ mod tests {
         assert_eq!(unsafe { read_at(&file, buf.as_mut_ptr(), 4, 10) }.unwrap(), 0);
         // SAFETY: the source is a live 3-byte buffer; writing past the end extends the file.
         assert_eq!(unsafe { write_at(&file, b"abc".as_ptr(), 3, 12) }.unwrap(), 3);
-        sync_durable(&file).unwrap();
+        shards_durable::data(&file).unwrap();
         let mut whole = [0u8; 15];
         read_exact_at(&file, &mut whole, 0).unwrap();
         assert_eq!(&whole, b"0123456789\0\0abc");

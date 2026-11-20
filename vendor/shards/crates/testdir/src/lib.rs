@@ -4,9 +4,12 @@
 //! (a daemon's log, a run's stderr, a VM's sample), which says why it failed; and each
 //! panic of a process that made one is said on stderr as it happens. Each test
 //! process's are under `shards-tests/<pid>/`, so that a process killed before it removed
-//! its own leaves them where the next one finds them: the first directory a process makes
-//! removes those of every process that has ended. Only that directory is swept, and only
-//! a process's that no longer runs.
+//! its own, or one that kept one as long as it ran (a `static`'s), leaves them where the
+//! next one finds them: the first directory a process makes removes those of every process
+//! that has ended, on every host, and any under its own ID, which only an ended process that
+//! had the ID before it can have left (IDs are reused: CI 44245219858's windows-2022 job gave
+//! a process an ended one's `docker-config-0`). Only that directory is swept, and only a
+//! process's that no longer runs.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -100,6 +103,12 @@ fn say_panics() {
     }));
 }
 
+/// This test process's directory: `shards-tests/<pid>` under the system's temporary
+/// directory, where each [`TempDir`] it makes is. Read, never made here.
+pub fn this_process() -> PathBuf {
+    parent().join(std::process::id().to_string())
+}
+
 /// A test's directory, made empty, removed as it is dropped.
 #[derive(Debug)]
 pub struct TempDir(PathBuf);
@@ -109,6 +118,9 @@ impl TempDir {
     /// under the system's temporary directory, each character no Windows name may hold
     /// (`<>:"/\|?*` and the control characters: Naming Files, Paths, and Namespaces) a `-`
     /// on every host, so that a name made of an image's (`oom-x:1`) is one directory there.
+    /// Made, never found: one there already, an ended process's that its sweep could not
+    /// remove (a file of it still held), fails its making (AlreadyExists, its path said)
+    /// rather than be taken as it was.
     pub fn new(name: &str) -> io::Result<TempDir> {
         let name: String = name
             .chars()
@@ -123,18 +135,21 @@ impl TempDir {
         static SWEPT: Once = Once::new();
         static N: AtomicUsize = AtomicUsize::new(0);
         let parent = parent();
+        let me = std::process::id();
+        // Once, before this process makes any directory, as each other thread's first waits
+        // for it: what is under its own ID then is an ended process's (`sweep`).
         SWEPT.call_once(|| {
             #[cfg(unix)]
             raise_descriptor_limit();
-            sweep(&parent);
+            sweep(&parent, me);
             say_panics();
         });
         let n = N.fetch_add(1, Ordering::Relaxed);
-        let dir = parent
-            .join(std::process::id().to_string())
-            .join(format!("{name}-{n}"));
+        let own = parent.join(me.to_string());
+        let dir = own.join(format!("{name}-{n}"));
         let mut live = LIVE.lock().unwrap_or_else(PoisonError::into_inner);
-        std::fs::create_dir_all(&dir)
+        std::fs::create_dir_all(&own)
+            .and_then(|()| std::fs::create_dir(&dir))
             .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", dir.display())))?;
         *live += 1;
         Ok(TempDir(dir))
@@ -258,38 +273,68 @@ fn remove(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Removes the directories of test processes that have ended, under `parent`: each named
-/// by its process's ID, removed once no process has that ID (kill(2) with no signal:
-/// ESRCH). One whose ID another process has taken since stays until that one ends too.
-#[cfg(unix)]
-fn sweep(parent: &Path) {
+/// Removes the directories of test processes that have ended, under `parent`, each named by
+/// its process's ID: `me`'s, which process `me` makes only after this (its first
+/// [`TempDir::new`] sweeps before it makes any), so that what is there was left by an ended
+/// process that had the ID before it; and each other's once its process is [`gone`]. One
+/// whose ID another process has taken since stays until that one ends too.
+fn sweep(parent: &Path, me: u32) {
     let Ok(entries) = std::fs::read_dir(parent) else {
         return;
     };
-    let me = std::process::id();
     for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<u32>().ok())
-            .filter(|&pid| pid != me)
-            .and_then(|pid| libc::pid_t::try_from(pid).ok())
-            .filter(|&pid| pid > 0)
-        else {
+        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
             continue;
         };
-        // SAFETY: kill(2) with no signal sends nothing; it asks whether the process is.
-        let gone = unsafe { libc::kill(pid, 0) } != 0
-            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
+        if pid == me || gone(pid) {
             remove(&entry.path());
         }
     }
 }
 
-/// Windows tests run on runners made for each run, where nothing is left from before.
-#[cfg(not(unix))]
-fn sweep(_: &Path) {}
+/// Whether no process has ID `pid`: kill(2) with no signal says ESRCH.
+#[cfg(unix)]
+fn gone(pid: u32) -> bool {
+    let Some(pid) = libc::pid_t::try_from(pid).ok().filter(|&pid| pid > 0) else {
+        return false;
+    };
+    // SAFETY: kill(2) with no signal sends nothing; it asks whether the process is.
+    let asked = unsafe { libc::kill(pid, 0) };
+    asked != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether the process with ID `pid` has ended, or no process has the ID. OpenProcess
+/// ("Opens an existing local process object") opens one that has ended while any handle to
+/// it is open, its parent's among them, as its object lasts until the last is closed
+/// ("Terminating a Process"); signalled then, which a wait of no time sees
+/// (WaitForSingleObject, with the one right it needs, SYNCHRONIZE: "Process Security and
+/// Access Rights"), where its exit code would take one that ended with STILL_ACTIVE, 259,
+/// for one that runs (GetExitCodeProcess). OpenProcess fails ERROR_INVALID_PARAMETER for an
+/// ID no process has (CI 44189693085, windows-2022), as its page says it does for the
+/// System Idle Process's, 0, which never ends; and ERROR_ACCESS_DENIED for a process that
+/// user-level code may not open (the System process, CSRSS's), which runs. Any other
+/// failure is taken for a process that runs, whose directory stays.
+#[cfg(windows)]
+fn gone(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: OpenProcess of an ID, for waiting alone, its handle not inherited: a handle,
+    // closed below, or null.
+    let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if process.is_null() {
+        // SAFETY: GetLastError takes nothing; it reads this thread's last error, OpenProcess's.
+        return unsafe { GetLastError() } == ERROR_INVALID_PARAMETER;
+    }
+    // SAFETY: a wait of no time on the handle just opened, then its close.
+    unsafe {
+        let ended = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
+        CloseHandle(process);
+        ended
+    }
+}
 
 /// The program `text` at `path`, run by its owner alone or by anyone (0755), written by a
 /// process of its own on Unix. A file a test process writes itself is held open to write by
@@ -350,6 +395,9 @@ fn write_apart(path: &Path, source: Source<'_>) -> io::Result<()> {
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
+    // As the program is written, where another test thread's fork can come.
+    #[cfg(test)]
+    tests::forked::while_written(path);
     let mut status = 0;
     // SAFETY: waitpid(2) of this function's own child, into a local.
     while unsafe { libc::waitpid(pid, &mut status, 0) } != pid {
@@ -632,24 +680,85 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
+    /// Another process's directories are swept once it has ended, never while it runs, and a
+    /// name that is no process's ID stays.
     #[test]
     fn an_ended_processs_directories_are_swept() {
         let parent = TempDir::new("sweep").unwrap();
-        // A process that ended, and one that runs: this one's parent, which never ends
-        // before its child.
-        let mut child = std::process::Command::new("true").spawn().unwrap();
+        // A process that ended, its `Child` held through the sweep (on Windows its handle,
+        // which keeps its ID from another process), and one that runs: this one.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
         let ended = child.id();
         child.wait().unwrap();
-        let running = std::os::unix::process::parent_id();
+        let running = std::process::id();
         for pid in [ended, running] {
             std::fs::create_dir_all(parent.join(pid.to_string()).join("left-0")).unwrap();
         }
         std::fs::create_dir_all(parent.join("not-a-pid")).unwrap();
-        sweep(&parent);
+        // Swept as a process that is neither sweeps.
+        sweep(&parent, ended.max(running) + 1);
         assert!(!parent.join(ended.to_string()).exists());
         assert!(parent.join(running.to_string()).exists());
         assert!(parent.join("not-a-pid").exists());
+    }
+
+    /// What an ended process left under the ID this process has now is swept, though this
+    /// process runs: IDs are reused, and CI 44245219858's windows-2022 job gave a process an
+    /// ended one's, whose `docker-config-0` (a `static`'s, which no test drops) held
+    /// `certs.d`, which the new one failed to make again (os error 183). Red with `me`'s
+    /// directory swept only as another's, once its process is gone: it stays.
+    #[test]
+    fn directories_left_under_this_processs_id_are_swept() {
+        let parent = TempDir::new("reused").unwrap();
+        let me = std::process::id();
+        std::fs::create_dir_all(parent.join(me.to_string()).join("x-0").join("certs.d")).unwrap();
+        sweep(&parent, me);
+        assert!(!parent.join(me.to_string()).exists());
+    }
+
+    /// A process given an ID an ended test process had makes its directories empty, though
+    /// that one left its own: the process [`made_under_a_reused_id`] runs, with a temporary
+    /// directory of this test's for the system's (TMPDIR; on Windows TMP, then TEMP:
+    /// GetTempPath2W), so that it sweeps nothing of any other process's. Red with its own ID's
+    /// directory left out of its first directory's sweep: making `certs.d` fails, as in CI
+    /// 44245219858.
+    #[test]
+    fn a_reused_ids_directories_are_made_empty() {
+        let tmp = TempDir::new("tmp").unwrap();
+        let ran = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::made_under_a_reused_id", "--ignored"])
+            .env("SHARDS_TESTDIR_REUSED", "1")
+            .env("TMPDIR", tmp.path())
+            .env("TMP", tmp.path())
+            .env("TEMP", tmp.path())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&ran.stdout);
+        assert!(
+            ran.status.success() && said.contains("1 passed"),
+            "{said}{}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+    }
+
+    /// The process [`a_reused_ids_directories_are_made_empty`] runs: it leaves what an ended
+    /// process with its ID would have, its first directory with `certs.d` in it, then makes
+    /// that directory and `certs.d` in it.
+    #[test]
+    #[ignore = "a process of its own for a_reused_ids_directories_are_made_empty, which runs it"]
+    fn made_under_a_reused_id() {
+        if std::env::var_os("SHARDS_TESTDIR_REUSED").is_none() {
+            return;
+        }
+        let left = parent().join(std::process::id().to_string()).join("x-0");
+        std::fs::create_dir_all(left.join("certs.d")).unwrap();
+        let dir = TempDir::new("x").unwrap();
+        assert_eq!(dir.path(), left);
+        std::fs::create_dir(dir.join("certs.d")).unwrap();
     }
 
     /// Programs are written and copied on a host with no tools to run, as the L1 guest of
@@ -711,5 +820,134 @@ mod tests {
         };
         program_copy(&dir.join("source"), &dir.join("copied")).unwrap();
         program(&dir.join("written"), "#!/bin/sh\nexit 0\n").unwrap();
+    }
+
+    /// A child forked as a program is written, as another test thread's can be, which holds
+    /// every descriptor this process had at the fork until it execs: here until its test
+    /// lets it go.
+    #[cfg(unix)]
+    pub(crate) mod forked {
+        use super::*;
+        use std::io::Write as _;
+        use std::os::fd::AsRawFd as _;
+
+        /// A test's watch on the next program written on its thread: the pipe its child
+        /// reads until it is let go, then that child's ID and whether this process held the
+        /// program open to write as it forked.
+        struct Watch {
+            release: (std::io::PipeReader, std::io::PipeWriter),
+            forked: Option<(libc::pid_t, bool)>,
+        }
+
+        thread_local! {
+            static WATCH: std::cell::RefCell<Option<Watch>> = const { std::cell::RefCell::new(None) };
+        }
+
+        /// [`write_apart`]'s hook as it writes `path`: where its thread's test watches, a
+        /// child forked, which reads the watch's pipe until a byte comes, or its end as this
+        /// process ends, and exits.
+        pub(crate) fn while_written(path: &Path) {
+            WATCH.with_borrow_mut(|watch| {
+                let Some(watch) = watch else {
+                    return;
+                };
+                let held = held_to_write(path);
+                let (read, write) = (watch.release.0.as_raw_fd(), watch.release.1.as_raw_fd());
+                let interrupted = || io::Error::last_os_error().kind() == io::ErrorKind::Interrupted;
+                // SAFETY: fork(2); the child calls only close(2), read(2) and _exit(2), which
+                // are async-signal-safe, and reads errno, on memory made before the fork.
+                let pid = unsafe { libc::fork() };
+                if pid == 0 {
+                    let mut byte = 0u8;
+                    // SAFETY: close(2) of the child's copy of the write end, so that the pipe
+                    // ends with this process's; read(2) of a byte into a local, again where a
+                    // signal cut it; _exit(2).
+                    unsafe {
+                        libc::close(write);
+                        while libc::read(read, (&raw mut byte).cast(), 1) < 0 && interrupted() {}
+                        libc::_exit(0)
+                    }
+                }
+                assert!(pid > 0, "fork: {}", io::Error::last_os_error());
+                watch.forked = Some((pid, held));
+            });
+        }
+
+        /// Whether this process holds the file at `path` open to write: a descriptor of its
+        /// own, each of which /dev/fd names (on Linux, /proc/self/fd), open for writing on it.
+        fn held_to_write(path: &Path) -> bool {
+            use std::os::unix::ffi::OsStrExt as _;
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: stat is a C struct of integers, which all-zero bytes are a value of.
+            let (mut file, mut st): (libc::stat, libc::stat) = unsafe { std::mem::zeroed() };
+            // SAFETY: stat(2) of a NUL-terminated path, into a local.
+            if unsafe { libc::stat(path.as_ptr(), &mut file) } != 0 {
+                return false;
+            }
+            let fds = std::fs::read_dir("/dev/fd").unwrap().flatten();
+            fds.filter_map(|fd| fd.file_name().to_str()?.parse::<libc::c_int>().ok())
+                .any(|fd| {
+                    // SAFETY: fcntl(2) of a descriptor's status flags, and fstat(2) of it into
+                    // a local: one closed since /dev/fd named it fails either.
+                    let (flags, stated) =
+                        unsafe { (libc::fcntl(fd, libc::F_GETFL), libc::fstat(fd, &mut st)) };
+                    flags >= 0
+                        && flags & libc::O_ACCMODE != libc::O_RDONLY
+                        && stated == 0
+                        && (st.st_dev, st.st_ino) == (file.st_dev, file.st_ino)
+                })
+        }
+
+        /// `write`, which writes the program at `path`, watched; then the program run while
+        /// the child forked as it was written lives. Whether this process held the program
+        /// open to write as that child forked, and the run's exit code.
+        fn run_while_held(
+            path: &Path,
+            write: impl FnOnce() -> io::Result<()>,
+        ) -> (bool, io::Result<Option<i32>>) {
+            WATCH.set(Some(Watch {
+                release: std::io::pipe().unwrap(),
+                forked: None,
+            }));
+            write().unwrap();
+            let mut watch = WATCH.take().unwrap();
+            let (child, held) = watch.forked.unwrap();
+            let ran = std::process::Command::new(path).status().map(|s| s.code());
+            watch.release.1.write_all(&[0]).unwrap();
+            let mut status = 0;
+            // SAFETY: waitpid(2) of the child `while_written` forked, into a local.
+            assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+            (held, ran)
+        }
+
+        /// A program runs at once though a child this process forked as it was written lives
+        /// on, as a child another test thread forks lives until it execs: the descriptor that
+        /// writes the program is never this process's, so no fork copies it ([`write_apart`]).
+        /// Do: write a program, and copy one, each watched. Expect: neither held open to write
+        /// by this process as its child forked, and each runs, exiting 7. Red with the program
+        /// written by a descriptor of this process, as `std::fs::write` writes (`api`'s
+        /// stand-ins, CI 44379986478): held as its child forks, and on Linux, whose exec
+        /// refuses a file open to write (ETXTBSY), not run.
+        #[test]
+        fn a_program_runs_while_a_child_forked_as_it_was_written_lives() {
+            let dir = TempDir::new("forked").unwrap();
+            let text = "#!/bin/sh\nexit 7\n";
+            // Read alone, never run.
+            std::fs::write(dir.join("source"), text).unwrap();
+            let (written, copied) = (dir.join("written"), dir.join("copied"));
+            let seen = [
+                ("written", run_while_held(&written, || program(&written, text))),
+                (
+                    "copied",
+                    run_while_held(&copied, || program_copy(&dir.join("source"), &copied)),
+                ),
+            ];
+            for (name, (held, ran)) in seen {
+                assert!(
+                    !held && matches!(ran, Ok(Some(7))),
+                    "{name}: held to write as its child forked: {held}; its run: {ran:?}"
+                );
+            }
+        }
     }
 }

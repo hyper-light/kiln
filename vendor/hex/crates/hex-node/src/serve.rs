@@ -2512,6 +2512,23 @@ impl<O: Os> Shared<O> {
             // A start followed to its end on this worker, as decision 9 has a wait follow its party: a boot past its W*
             // is followed to its answer here, so its remote caller waits on the fact (ROOT, 2026-11-14).
             Call::Started(id) => host.started(&id).map(Answer::Info),
+            // Kiln plan P5.5b: an image box's pause and resume, answered once its VM holds or lets go its vCPUs, a move
+            // of its VMM's own that waits on nothing of its guest.
+            Call::Pause(id) => host.pause(&id).map(|()| Answer::Done),
+            Call::Resume(id) => host.resume(&id).map(|()| Answer::Done),
+            // Shards' D270 slice 4: a box's member given a component or its image's own back, answered once its run host
+            // holds it, and, now, once its member's next generation has started; and its components, from what its node
+            // holds.
+            Call::Swap {
+                id,
+                at,
+                digest,
+                when,
+            } => host.swap(&id, &at, &digest, when).map(Answer::Swapped),
+            Call::Restore { id, at, when } => host.restore(&id, &at, when).map(Answer::Swapped),
+            Call::Components(id) => host.components(&id).map(Answer::Components),
+            // Kiln plan P6b.3: a running box's network or folders changed in place, answered once its run holds it.
+            Call::Change { id, change } => host.change(&id, change).map(|()| Answer::Done),
             // The machine's capacity view's word, kept for the node's charge learner (the review's A-10).
             Call::Reserved(word) => host.reserved(word).map(|()| Answer::Done),
             Call::Usage(id) => host.usage(&id).map(Answer::Usage),

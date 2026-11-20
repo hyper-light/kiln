@@ -200,30 +200,36 @@ impl Drop for Waits {
 }
 
 /// Until one of `pids` exits (goal 9): a thread-pool wait on each one's handle tells a notifier;
-/// one already gone (no handle) at once; with none to watch, never.
-pub(super) async fn exited(pids: &[u32]) {
+/// one already gone (no handle) at once; with none to watch, never. Refused, each with the OS's
+/// error code, where it can watch none: every wait the thread pool wouldn't register.
+pub(super) async fn exited(pids: &[u32]) -> Result<(), Vec<super::Unwatched>> {
     let notify = Box::new(crate::rt::Notify::new());
     let mut waits = Waits(Vec::new());
+    let mut unwatched = Vec::new();
     for pid in pids {
         // SAFETY: an access mask and a pid; a handle or null.
         let process = unsafe { OpenProcess(SYNCHRONIZE, 0, *pid) };
         if process.is_null() {
-            return;
+            return Ok(());
         }
         let mut wait: *mut c_void = std::ptr::null_mut();
         let context = std::ptr::from_ref::<crate::rt::Notify>(&*notify).cast_mut().cast::<c_void>();
         // SAFETY: a live process handle; a callback and context that outlive the wait (`Waits`
         // unregisters it, waiting, before `notify` goes).
         if unsafe { RegisterWaitForSingleObject(&raw mut wait, process, ended, context, INFINITE, ONCE) } == 0 {
+            // Its refusal's code, read before the close below can set another.
+            let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             // SAFETY: the handle just opened, closed once.
             unsafe { CloseHandle(process) };
+            unwatched.push(super::Unwatched { pid: *pid, why: super::Unwatchable::Refused(code) });
             continue;
         }
         waits.0.push((wait as usize, process as usize));
     }
     if waits.0.is_empty() {
-        return std::future::pending().await;
+        return if unwatched.is_empty() { std::future::pending().await } else { Err(unwatched) };
     }
     notify.notified().await;
     drop(waits);
+    Ok(())
 }

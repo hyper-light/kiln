@@ -1577,7 +1577,7 @@ impl Codex {
             Command::SetSpeed { speed } => self.notice(core, Level::Warn, format!("{speed}: not a speed Codex lists for its models")),
             Command::Control { id, value } => self.control(core, &id, value),
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } => {}
             // A terminal Codex left running: Codex has no way to stop it from outside, so kiln stops
             // the process itself (the newest one under Codex running that command).
             // A subagent: its turn under way is interrupted, as a person asked.
@@ -2322,7 +2322,7 @@ impl Codex {
             detail: None,
             input: clip_json(&args, 64 * 1024),
             command,
-            cwd: input.get("cwd").and_then(Value::as_str).unwrap_or(core.state.cwd.as_str()).to_owned(),
+            cwd: input.get("cwd").and_then(Value::as_str).map_or_else(|| self.cwd(core), str::to_owned),
             diffs: Vec::new(),
             reason: Some(why),
             always: Vec::new(),
@@ -2759,7 +2759,7 @@ impl Codex {
                     self.speed_reported(core, tier.as_str());
                 }
                 if let Some(c) = result.get("cwd").and_then(Value::as_str) {
-                    core.state.cwd = c.to_owned();
+                    core.state.cwd = crate::sandbox::isolated::host_of(self.seen.as_ref(), c);
                 }
                 if let Some(p) = result.get("modelProvider").and_then(Value::as_str) {
                     self.provider = Some(p.to_owned());
@@ -3157,7 +3157,7 @@ impl Codex {
             }
             Pending::Plain(_) => {}
             Pending::Suggest(client) => {
-                let cwd = core.state.cwd.clone();
+                let cwd = self.cwd(core);
                 let files: Vec<Value> = result
                     .get("files")
                     .and_then(Value::as_array)
@@ -3177,7 +3177,7 @@ impl Codex {
             other => other.to_string(),
         };
         let item_id = p.get("itemId").and_then(Value::as_str).map(str::to_owned);
-        let cwd = p.get("cwd").and_then(Value::as_str).map_or_else(|| core.state.cwd.clone(), str::to_owned);
+        let cwd = p.get("cwd").and_then(Value::as_str).map_or_else(|| self.cwd(core), str::to_owned);
         let reason = p.get("reason").and_then(Value::as_str).map(str::to_owned).filter(|r| !r.trim().is_empty());
         // What Codex offers for this request (newer servers list it; older ones take all four).
         let offered: Option<Vec<Value>> = p.get("availableDecisions").and_then(Value::as_array).cloned();
@@ -3223,7 +3223,7 @@ impl Codex {
                     Body::Tool(t) => Some(t.diffs.clone()),
                     _ => None,
                 });
-                let diffs = diffs.unwrap_or_else(|| file_changes(p.get("changes").or_else(|| p.get("fileChanges")), &core.state.cwd));
+                let diffs = diffs.unwrap_or_else(|| file_changes(p.get("changes").or_else(|| p.get("fileChanges")), &self.cwd(core)));
                 let title = diffs.iter().map(|d| d.path.clone()).collect::<Vec<_>>().join(", ");
                 let always = if offers("acceptForSession") {
                     vec![AlwaysOption { label: "Allow edits for the session".into(), scope: "this session".into(), value: json!("acceptForSession") }]
@@ -4045,7 +4045,7 @@ impl Codex {
         let parent = thread.and_then(|thread| core.state.tasks.iter().find(|t| t.id == thread)).and_then(|t| t.tool_id.clone());
         let ty = item.get("type").and_then(Value::as_str).unwrap_or("");
         let (started, ended) = item_times(core, &id, item, done);
-        let cwd = thread.and_then(|thread| core.state.tasks.iter().find(|t| t.id == thread)).and_then(|t| t.cwd.clone()).unwrap_or_else(|| core.state.cwd.clone());
+        let cwd = thread.and_then(|thread| core.state.tasks.iter().find(|t| t.id == thread)).and_then(|t| t.cwd.clone()).unwrap_or_else(|| self.cwd(core));
         match ty {
             "userMessage" => {
                 let text = item
@@ -4196,7 +4196,7 @@ impl Codex {
                     let by = parent.clone().or_else(|| thread.map(str::to_owned)).unwrap_or_else(|| super::model::BY_AGENT.to_owned());
                     for c in &changes {
                         let Some(path) = c.get("path").and_then(Value::as_str) else { continue };
-                        let abs = if std::path::Path::new(path).is_absolute() { path.to_owned() } else { format!("{}/{path}", cwd.trim_end_matches('/')) };
+                        let abs = crate::sandbox::isolated::host_file(self.seen.as_ref(), &cwd, path);
                         let kind = c.get("kind").and_then(|k| k.get("type")).and_then(Value::as_str).unwrap_or("update");
                         let diff = c.get("diff").and_then(Value::as_str).unwrap_or("");
                         let baseline = match kind {
@@ -5101,7 +5101,7 @@ mod tests {
         let mut core = super::super::core::Core::new();
         core.state.mode = "auto".into();
         assert_eq!(c.policies(&core).2, serde_json::json!({"type": "workspaceWrite"}), "no folder given: as it was");
-        let held = |path: &str, access| HeldVolume { volume: Volume { path: path.into(), at: path.into(), access, members: vec![Member::Harness("codex".into())] }, harness: Took::Nothing { why: String::new() }, scope: Took::Nothing { why: String::new() }, microvm: None };
+        let held = |path: &str, access| HeldVolume { volume: Volume { path: path.into(), at: path.into(), access, members: vec![Member::Harness("codex".into())], exec: true }, harness: Took::Nothing { why: String::new() }, scope: Took::Nothing { why: String::new() }, microvm: None };
         core.state.overrides.volumes = vec![held("/data", Access::Rw), held("/docs", Access::Ro)];
         let (_, sandbox, turn) = c.policies(&core);
         assert_eq!(sandbox, "workspace-write");
@@ -5178,12 +5178,14 @@ mod tests {
 
     /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 part 7: an isolated Codex is told its project
     /// as its microVM has it (`sandbox::isolated::guest_path`), in each request that names it: a
-    /// Windows machine's folder at `/work/<name>`, a Unix one at its own path; Codex on its machine
-    /// is told the machine's.
+    /// Windows machine's folder at its path as WSL names it (`/mnt/c/…`, Shards' D235), a Unix one at its
+    /// own path; Codex on its machine is told the machine's. The folder its thread says it works in is the
+    /// machine's again, the session's own (xplat r801, before: "kiln has the session in /work/project, not
+    /// the project's host path").
     #[test]
     fn s17_an_isolated_codex_is_told_its_guest_folder() {
         use super::super::session::{Isolation, Spec};
-        for (host, told, isolation) in [(r"C:\src\app", "/work/app", Some(Isolation::microvm())), ("/Users/ada/src/app", "/Users/ada/src/app", Some(Isolation::microvm())), (r"C:\src\app", r"C:\src\app", None)] {
+        for (host, told, isolation) in [(r"C:\src\app", "/mnt/c/src/app", Some(Isolation::microvm())), ("/Users/ada/src/app", "/Users/ada/src/app", Some(Isolation::microvm())), (r"C:\src\app", r"C:\src\app", None)] {
             let spec = Spec { kind: "codex".into(), cwd: Some(host.into()), isolation, ..Spec::default() };
             let mut core = Core::new();
             core.state.cwd = host.into();
@@ -5195,7 +5197,37 @@ mod tests {
             for (method, at) in [("thread/start", "/params/cwd"), ("skills/list", "/params/cwds/0"), ("hooks/list", "/params/cwds/0"), ("config/read", "/params/cwd"), ("plugin/installed", "/params/cwds/0")] {
                 assert_eq!(said(method, at), Some(json!(told)), "{host}: {method}");
             }
+            // Its thread starts where it was told, which it says back: the session stays in the machine's folder.
+            let thread = said("thread/start", "/id");
+            feed(&mut c, &mut core, &[json!({"id": thread, "result": {"thread": {"id": "th1", "turns": []}, "cwd": told}})]);
+            assert_eq!(core.state.cwd, host, "{host}: the session's folder");
+            assert_eq!(c.cwd(&core), told, "{host}: its folder as it sees it");
         }
+    }
+
+    /// Step 17 part 7: an isolated Codex's file change on a Windows machine, of a file at its microVM's
+    /// `/mnt/c/…`, joins the changeset as the machine's file, where kiln reads it, shown by its place in its
+    /// project.
+    #[test]
+    fn s17_an_isolated_codexs_edits_are_the_machines_files() {
+        use super::super::session::{Isolation, Spec};
+        let spec = Spec { kind: "codex".into(), cwd: Some(r"C:\src\app".into()), isolation: Some(Isolation::microvm()), ..Spec::default() };
+        let mut core = Core::new();
+        core.state.cwd = r"C:\src\app".into();
+        let mut c = Codex::from_spec(&spec);
+        c.start(&mut core);
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "initialize", json!({"userAgent": "codex_cli_rs/0.162.1"}));
+        let w = written(&mut core);
+        respond(&mut c, &mut core, &w, "thread/start", json!({"thread": {"id": "th1", "turns": []}, "cwd": "/mnt/c/src/app"}));
+        feed(&mut c, &mut core, &[
+            json!({"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "inProgress", "items": []}}}),
+            json!({"method": "item/completed", "params": {"threadId": "th1", "turnId": "t1", "item": {"type": "fileChange", "id": "f1", "status": "completed", "changes": [{"path": "/mnt/c/src/app/src/a.rs", "kind": {"type": "update"}, "diff": "@@ -1,1 +1,1 @@\n-old\n+new\n"}]}}}),
+        ]);
+        let jobs: Vec<(String, String)> = core.take_change_jobs().into_iter().map(|j| (j.abs, j.rel)).collect();
+        assert_eq!(jobs, [(r"C:\src\app\src\a.rs".to_owned(), "src/a.rs".to_owned())]);
+        assert!(core.events().any(|e| matches!(&e.body, Body::Tool(t) if t.diffs.first().is_some_and(|d| d.path == "src/a.rs"))));
+        assert_eq!(core.state.cwd, r"C:\src\app");
     }
 
     /// CP-T3.2: a steer received before turn/start answers still reaches that turn. A second

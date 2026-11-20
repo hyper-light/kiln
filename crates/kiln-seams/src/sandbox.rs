@@ -545,6 +545,10 @@ pub enum Refusal {
     /// (kiln plan 01a1dd2e…, P6.2; Shards' D281).
     #[error("a volume, {cause}: {why}")]
     Volume { cause: VolumeCause, why: String },
+    /// Its run failed as it started, in its boundary's words: its command never started, or its boundary failed it
+    /// (Hex's `Failed`, Shards' D249). The launch was valid: the run is what failed.
+    #[error("its run failed: {0}")]
+    Failed(String),
 }
 
 /// What held a volume of a boundary's store from a launch or a clearing ([`Refusal::Volume`]; Shards' D281), each by
@@ -610,8 +614,9 @@ pub enum Change {
     Disconnect { member: Member, network: String, grant: NetworkGrant },
     /// `source` plugged into the members `to` at `at` (absolute, strictly beneath one of its plug
     /// roots: its launch's [`Launch::plug_roots`] and each share's top-level directory), read-only
-    /// where it says, as Shards' `ImageGuest::plug` takes one (D271).
-    Plug { source: PlugSource, to: PlugFor, at: String, read_only: bool },
+    /// where it says, its files run from it only where `exec` (else each member's mount of it is
+    /// `noexec`, Shards' D279), as Shards' `ImageGuest::plug` takes one (D271).
+    Plug { source: PlugSource, to: PlugFor, at: String, read_only: bool, exec: bool },
     /// The folder plugged in at `at`, unplugged.
     Unplug { at: String },
     /// The component at `at`, a member's directory in its image, swapped for `component` (kiln plan 01a1dd2e…, P6c.3;

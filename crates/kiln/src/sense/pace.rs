@@ -371,6 +371,21 @@ pub fn at_start() -> Option<Signals> {
     Some(k.read.signals)
 }
 
+/// The machine read again for a strain that rests on [`stand_ins`]: where the kernel keeps no I/O
+/// stall time (macOS, Windows), only an event reads them, and an idle machine may have none to
+/// come, so placement reads them once more a window after it measured a strain from them
+/// (`crate::reach::place::Placer::follow_up_due`), as Linux's PSI trigger reads the calm once more
+/// a window after a stall (`crate::os::pace_linux`). Its pace told if it changed; nothing counted
+/// as a move: placement measures once the node's input is done.
+pub fn read_again() {
+    let Ok(mut k) = keeper().lock() else { return };
+    if k.reader.is_none() {
+        return;
+    }
+    k.measure();
+    k.tell();
+}
+
 /// A run ended: what it says of this machine's slowdown learned, kept, and the machine read again.
 pub fn ended(o: &Observation) {
     moved(false);

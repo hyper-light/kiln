@@ -34,7 +34,14 @@
 //!   cost sizes (`Allocation::vm_size`);
 //! - `HEX_IMAGE_WORK`: a directory of this run's own, made here; `HEX_IMAGE_WAIT_MS`: the run's explicit deadline
 //!   for the whole suite (the node's start waits for the node while it lives, `image_node::Node::start`);
-//!   `HEX_WAITS_CENSUS_MAX`: the census's most lines.
+//!   `HEX_WAITS_CENSUS_MAX`: the census's most lines;
+//! - `HEX_IMAGE_COMPONENT`, `AT@DIGEST`: a component the node's Shards home holds for a member the image runs (Shards'
+//!   D270 slice 4: an OSI artifact of that member's kind for this host's platform, by its manifest digest), at that
+//!   member's path (`/harness/cat` for `image_harness`'s), which HEX-IMG-11 swaps in and out. Unset, HEX-IMG-11 fails
+//!   saying no component is named, as no swap can be held to the contract without one; the other cases run as ever.
+//! - `HEX_IMAGE_NETWORK`: the name of a network this run makes in the node's Shards home, its own (`shards network
+//!   create`, as Shards keeps networks by home), which HEX-IMG-13 connects the image's harness to (kiln plan P6b.3;
+//!   Shards' D285); none, and HEX-IMG-13 fails.
 //!
 //! Run on Linux: build it with `cargo test --release --locked -p hex-cli --test image_real --no-run`, which names the
 //! test binary it built (`target/release/deps/image_real-<hash>`), then start that binary alone in the delegated
@@ -54,6 +61,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -83,10 +91,17 @@ enum Source {
 }
 
 /// Shards image VMs of the pinned image, each admitted for the run's workload: running its members alone, or a
-/// command for the act a case asks of its run.
+/// command for the act a case asks of its run; and the component its node holds for one of its members, where the run
+/// names one (`HEX_IMAGE_COMPONENT`).
 struct ImageBoxes {
     image: String,
     allocation: Allocation,
+    component: Option<conformance::Component>,
+    /// A host directory of the run's own, which HEX-IMG-12 plugs in (kiln plan P6b.3).
+    plugged: PathBuf,
+    /// A network this run made in the node's Shards home (`HEX_IMAGE_NETWORK`), which HEX-IMG-13 connects to (Shards'
+    /// D285); none, and HEX-IMG-13 fails.
+    network: Option<String>,
 }
 
 /// The command a run's act is, in the image's own shell: the image cases ask a run to fail with a code (HEX-IMG-3)
@@ -136,6 +151,18 @@ impl Fixture for ImageBoxes {
         let args = command(act);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
         Program::of(&args)
+    }
+
+    fn component(&self) -> Option<conformance::Component> {
+        self.component.clone()
+    }
+
+    fn plug_source(&self) -> Option<PathBuf> {
+        Some(self.plugged.clone())
+    }
+
+    fn network(&self) -> Option<String> {
+        self.network.clone()
     }
 }
 
@@ -246,6 +273,20 @@ fn descendants(root: u32) -> Vec<Listed> {
     found
 }
 
+/// Makes network `name` in the node's Shards home, this run's own (`image_node::shards_dirs`), as a person makes one
+/// (`shards network create`; Shards keeps its networks by home, D285), then ends the daemon that left there, so none of
+/// its processes runs beside the node: HEX-IMG-13 connects the image's harness to it (kiln plan P6b.3; AC-T7.4.1).
+fn network_made(shards: &Path, name: &str, state: &Path) {
+    let (home, cache) = image_node::shards_dirs(state);
+    image_node::in_home(
+        Command::new(shards).args(["network", "create", name]),
+        &home,
+        &cache,
+    );
+    image_node::in_home(Command::new(shards).args(["daemon", "stop"]), &home, &cache);
+    eprintln!("IMAGE network {name} made in {home:?}");
+}
+
 /// Goal 54's change 4 (joint plan step 12's item B; AC-T7.4.1): a VM's delete returns once its processes are gone and
 /// their memory returned, never earlier, so kiln's keeper frees no room a VM still holds. Do start an image VM of its
 /// members alone, list the node's descendants before its create and once it runs (its run host and the VM and network
@@ -318,7 +359,19 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
     assert!(!wait.is_zero(), "HEX_IMAGE_WAIT_MS is 0");
     let work = PathBuf::from(input("HEX_IMAGE_WORK"));
     assert!(!work.exists(), "a run's own directory: {work:?} exists");
+    let component = std::env::var("HEX_IMAGE_COMPONENT").ok().map(|named| {
+        let (at, digest) = named
+            .split_once('@')
+            .unwrap_or_else(|| panic!("HEX_IMAGE_COMPONENT {named:?} isn't AT@DIGEST"));
+        conformance::Component {
+            at: at.to_owned(),
+            digest: digest.to_owned(),
+        }
+    });
     fs::create_dir_all(work.join("state")).unwrap();
+    let plugged = work.join("plugged");
+    fs::create_dir_all(&plugged).unwrap();
+    let network = std::env::var("HEX_IMAGE_NETWORK").ok();
     // A VM's start boots it: a wait past its W* tells its run-out and follows its party (decision 9), and the run's
     // deadline bounds the whole suite.
     assert!(
@@ -342,6 +395,9 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
         }
     };
     ShardsImage::new(&image).check().unwrap();
+    if let Some(name) = &network {
+        network_made(&shards, name, &work.join("state"));
+    }
     let node = Node::start(&work, boxes.as_deref());
     let socket = node.socket.clone();
     let node_pid = node.child.id();
@@ -354,7 +410,13 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
             "{:?}",
             client.classes()
         );
-        let fixture = ImageBoxes { image, allocation };
+        let fixture = ImageBoxes {
+            image,
+            allocation,
+            component,
+            plugged,
+            network,
+        };
         let begun = Instant::now();
         let failures = conformance::run_image(&client, &fixture);
         let released = release(&client, &fixture, node_pid);

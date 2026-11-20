@@ -1299,7 +1299,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "sessions.pause",
-            summary: "Pause a session where it is (yours, or an agent's you started), and the subagents kiln started under it: on its machine's host its processes stop where they are, held by the machine's pacer; in a microVM its microVM is paused, through Hex. Taken isn't paused: agents.get says it is once its machine holds it (stand `paused`, `frozen` since when), and its timeline says why not where it can't be (a microVM's, until Hex pauses one: kiln plan 01a1dd2e…, P5.5b). One paused already is refused (409). sessions.resume lets it go on.",
+            summary: "Pause a session where it is (yours, or an agent's you started), and the subagents kiln started under it: on its machine's host its processes stop where they are, held by the machine's pacer; in a microVM its microVM is paused, through Hex. Taken isn't paused: agents.get says it is once its machine holds it (stand `paused`, `frozen` since when), and its timeline says why not where it can't be. One paused already is refused (409). sessions.resume lets it go on.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentsInterrupt>(),
@@ -1562,6 +1562,10 @@ pub mod input {
         pub reach: Option<String>,
         /// The terminal session it belongs to, where a person starts it from one.
         pub shell: Option<String>,
+        /// One of your environments it starts with (docs/agents.md, "Environments"), by id: its variables over the
+        /// machine's user's environment, or a clean one. Left out: an agent's agents run with its own, a person's
+        /// with the machine's user's.
+        pub agentenv: Option<String>,
         /// Its task apart from the words of the agent definition it runs (as agentdefs_run starts one): what
         /// a split's variant that's another agent is told after that agent's words. Which definition it runs is
         /// kiln's to say, as agentdefs_run starts it.
@@ -2403,7 +2407,9 @@ for line in sys.stdin:
         /// The source's own: while it owes kiln an answer, a still source is asked whether its CPU time
         /// moved ([`source_until`]).
         Source,
-        /// Kiln's own: its mail pump's, its goal driver's ([`kiln_until`]).
+        /// Kiln's own: its mail pump's, its goal driver's ([`kiln_until`]). Unix's alone, as its one
+        /// waiter's test is.
+        #[cfg(unix)]
         Kiln,
     }
 
@@ -2434,7 +2440,9 @@ for line in sys.stdin:
     /// waits at the gate) says nothing of the wait, which follows its liveness alone, as it does for
     /// kiln's next move after a turn. Kiln runs r700 and r712 refused "one real refill goal" by its
     /// source's CPU time, at windows of 670 ms and 10 ms, its source held at the test's result gate and
-    /// kiln's pump yet to deliver the goal.
+    /// kiln's pump yet to deliver the goal. Unix's alone, as the one test that waits so is: on Windows
+    /// it and its party were never used, which clippy's dead-code lint refused.
+    #[cfg(unix)]
     pub(crate) async fn kiln_until<F, Fut>(hub: &Hub, id: &str, what: &str, check: F) -> anyhow::Result<()>
     where F: FnMut() -> Fut, Fut: std::future::Future<Output = anyhow::Result<bool>> {
         until(hub, id, what, Party::Kiln, check).await
