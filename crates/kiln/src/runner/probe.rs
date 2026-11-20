@@ -383,6 +383,7 @@ pub async fn gather(work_dir: &Path, declared: &Declared, looked: bool) -> Runne
     }
     f.kiln = Some(crate::updates::kiln_facts().await);
     f.workspaces = Some(crate::workspace::slates::facts().await);
+    f.containers = Some(crate::workspace::container::facts(f.workspaces.as_ref()).await);
     f.probed_at = crate::util::now_unix();
     // A tool a run here couldn't find, found now: work that needs it is offered again (S6).
     let path = crate::harness::kinds::search_path();

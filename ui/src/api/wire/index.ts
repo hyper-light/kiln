@@ -91,6 +91,8 @@ export type { CompareRefs } from "./CompareRefs";
 export type { Compared } from "./Compared";
 export type { ConflictChange } from "./ConflictChange";
 export type { Consumption } from "./Consumption";
+export type { ContainerFacts } from "./ContainerFacts";
+export type { ContainerMissing } from "./ContainerMissing";
 export type { Control } from "./Control";
 export type { ControlKind } from "./ControlKind";
 export type { ControlOption } from "./ControlOption";
