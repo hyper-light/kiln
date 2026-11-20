@@ -377,8 +377,8 @@ export interface Spec {
   workspace?: { kind: "folder" | "volume" };
   /** How it's held when not as a process on its machine: a microVM of its own (`microvm`), made from the Agentfile `image` names (api/agentfiles.ts; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31). */
   isolation?: Isolation;
-  /** The person's environment it runs with (`agentenvs`, docs/agents.md, "Environments"), by id; none: its machine's user's. */
-  agentenv?: string;
+  /** The person's environments it runs with (`agentenvs`, docs/agents.md, "Environments"), a stack by id, top first; none: its machine's user's (those applied on their own join under them). */
+  agentenvs?: string[];
 }
 
 /** Where agents can have workspaces of their own, by target (`local`, `agent:<name>`). */
@@ -524,7 +524,7 @@ export function startAsk(target: string, spec: Spec, count: number, ids?: string
     ...(spec.speed !== undefined ? { speed: spec.speed } : {}),
     ...(spec.reach !== undefined ? { reach: spec.reach } : {}),
     ...(spec.shell ? { shell: spec.shell } : {}),
-    ...(spec.agentenv ? { agentenv: spec.agentenv } : {}),
+    ...(spec.agentenvs?.length ? { agentenvs: spec.agentenvs } : {}),
   };
 }
 

@@ -1539,6 +1539,14 @@ export function familyInfos(): AgentInfo[] {
   return [...family.values()].map((m) => m.info);
 }
 
+/** Agent `id`'s environment as its runner holds it now (agentenvs.ts: its stack, applied as it started again): its page is told. */
+export function holdAgentenv(id: string, agentenv: AgentInfo["agentenv"]) {
+  const m = family.get(id);
+  if (!m) return;
+  m.info.agentenv = agentenv;
+  emitEvent({ type: "harness", info: m.info });
+}
+
 /** Agent `id`'s runner sent an update of it kiln couldn't read, `what` it was: its page is told, as kiln's is (`POST /api/mock/refuse`). */
 export function refuseAgent(id: string, what: string): AgentInfo["refused"] | null {
   const m = family.get(id);
