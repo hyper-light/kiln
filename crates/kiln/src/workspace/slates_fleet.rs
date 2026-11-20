@@ -316,6 +316,21 @@ pub struct NodeAnnouncement {
     pub certificate: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<u64>,
+    /// The Slates user kiln acts as on this node, said with its member id: what a volume moved here is shared with
+    /// ([`NodeUser`]). None from an older runner, or one on a system whose user is no uid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<NodeUser>,
+}
+
+/// The Slates principal a runner's kiln is to its node (Slates' `Principal::Uid`, §4.13): its user's uid on the host the
+/// node's certificate anchor names. A volume's owner holds every right on it and no other principal holds any unless
+/// shared, and the owner names its host: a volume moved to another runner's node is owned by the source's user, so the
+/// target's kiln can't even read its status ("the caller's rights on the volume do not include status", goal 91's live
+/// move, 2026-11-19) until the source shares it with the target's user before the move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeUser {
+    pub anchor: u64,
+    pub uid: u32,
 }
 
 /// What a runner sends `POST /api/agents/slates-fleet/members`: its machine's proof (its current certificate, and a
@@ -337,6 +352,9 @@ pub struct Member {
     pub certificate: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member: Option<u64>,
+    /// The Slates user its runner's kiln acts as there ([`NodeUser`]), as its runner last said it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<NodeUser>,
 }
 
 /// What the server answers: the fleet's name and its nodes whose runners are connected, by machine.
@@ -362,7 +380,7 @@ pub fn admit(pki: &Pki, ask: &Announce) -> anyhow::Result<Member> {
         "that certificate isn't {machine}'s node's at {}: it doesn't name the fleet {FLEET} for {machine}'s domain at the host it announces",
         ask.node.address
     );
-    Ok(Member { machine, address: ask.node.address.clone(), domain, certificate: ask.node.certificate.clone(), member: ask.node.member })
+    Ok(Member { machine, address: ask.node.address.clone(), domain, certificate: ask.node.certificate.clone(), member: ask.node.member, user: ask.node.user })
 }
 
 /// The fleet's nodes as their runners last said, by machine (one each: a runner's newer word replaces its older), held
@@ -389,7 +407,7 @@ impl Directory {
 pub fn announcement(identity: &NodeIdentity, address: &str) -> anyhow::Result<NodeAnnouncement> {
     check_address(address)?;
     let der = std::fs::read(&identity.certificate).with_context(|| format!("read {}", identity.certificate.display()))?;
-    Ok(NodeAnnouncement { address: address.to_owned(), certificate: b64(&der), member: None })
+    Ok(NodeAnnouncement { address: address.to_owned(), certificate: b64(&der), member: None, user: None })
 }
 
 /// The runner's side of discovery (module docs): its node's word, with `machine`'s proof, to the server at
@@ -610,8 +628,8 @@ pub async fn join(source: &Source) -> anyhow::Result<Option<Joined>> {
 
 /// The runner's word said again with the member id its daemon serves as since this start (K4): a daemon started again
 /// is a new member, so its runner says it at every start.
-pub async fn report_member(source: &Source, node: &NodeAnnouncement, member: u64) -> anyhow::Result<()> {
-    let node = NodeAnnouncement { member: Some(member), ..node.clone() };
+pub async fn report_member(source: &Source, node: &NodeAnnouncement, member: u64, user: Option<NodeUser>) -> anyhow::Result<()> {
+    let node = NodeAnnouncement { member: Some(member), user, ..node.clone() };
     discover(&source.server_url, &source.ca_pem, &source.machine_name, &source.machine, &node).await.map(|_| ())
 }
 
@@ -998,7 +1016,7 @@ mod tests {
     /// K4: a runner's word carries the member id its daemon serves as, once it serves, and the server's list carries it
     /// for a move to name; a newer word replaces it (a daemon started again is a new member, said again once it serves).
     #[test]
-    fn k4_a_nodes_member_id_rides_its_runners_word() -> anyhow::Result<()> {
+    fn k4_a_nodes_member_id_and_user_ride_its_runners_word() -> anyhow::Result<()> {
         let scratch = tempfile::tempdir()?;
         let pki = Pki::open_scratch(&scratch.path().join("pki"))?;
         let directory = Directory::default();
@@ -1013,6 +1031,16 @@ mod tests {
         said.node.member = None;
         directory.admit(admit(&pki, &said)?);
         assert_eq!(member_of(&directory), None, "started again: said again once it serves");
+        // Goal 91's live move: the user kiln acts as on the node rides with the member id, for a move to share the volume
+        // with; a runner that says none (an older one) leaves none.
+        let user = NodeUser { anchor: 9, uid: 501 };
+        said.node.member = Some(43);
+        said.node.user = Some(user);
+        directory.admit(admit(&pki, &said)?);
+        assert_eq!(directory.members(|_| true).members.first().and_then(|m| m.user), Some(user));
+        assert!(serde_json::to_string(&said.node)?.contains(r#""user":{"anchor":9,"uid":501}"#));
+        let older: NodeAnnouncement = serde_json::from_str(r#"{"address":"10.0.0.1:17300","certificate":"","member":43}"#)?;
+        assert_eq!(older.user, None);
         Ok(())
     }
 

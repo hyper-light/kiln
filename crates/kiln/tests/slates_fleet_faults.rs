@@ -270,6 +270,7 @@ impl Lab {
                 domain: 0,
                 certificate: String::new(),
                 member: slates_api::Instance::attach(&n.instance).and_then(|mut i| i.member()).ok(),
+                user: None,
             })
             .collect()
     }

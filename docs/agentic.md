@@ -487,7 +487,10 @@ fleet's copies only while its daemon runs), and says its node's member id once i
 runner founds the fleet's consensus groups (its place says `founds`: the first the setting lists, the
 same at every start), bootstrapping the root once its node serves; every other imports it. Until one
 did, no fleet runner made a workspace ("this node has no consensus group yet": goal 91's live move,
-2026-11-19, seen on three runners of one Mac).
+2026-11-19, seen on three runners of one Mac). A listed runner says, with its member id, the Slates user its kiln is
+on its node (its node's certificate anchor and its uid), and a move shares the volume with the target's
+user before Slates moves it: a volume's owner is a user of the host that made it, so until then the
+target's kiln couldn't mount what moved ("the caller's rights on the volume do not include status").
 
 Its fourth: an agent moves with its workspace volume (Move to…, `harness::relocate`;
 `workspace::slates_move`). The server plans it: both runners in `[slates_fleet]`, the target's node

@@ -490,9 +490,11 @@ async fn up_or_started() -> anyhow::Result<()> {
     // A fleet node imports its groups (Slates: never make one there, but at the fleet's founder), and says its member id, which a move of a volume to
     // it names (K4): its runner's word again, now with the member its daemon serves as since this start.
     if let (Some(joined), Some(source)) = (&joined, super::slates_fleet::source()) {
-        match call("member", |i| i.member()).await {
-            Ok(member) => {
-                if let Err(e) = super::slates_fleet::report_member(source, &joined.node, member).await {
+        match call("member", |i| i.daemon_status()).await {
+            Ok(report) => {
+                // With its member, the user kiln acts as on this node, which a volume moved here is shared with.
+                let user = own_uid().map(|uid| super::slates_fleet::NodeUser { anchor: report.anchor, uid });
+                if let Err(e) = super::slates_fleet::report_member(source, &joined.node, report.fleet.host, user).await {
                     tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't say its member id: no volume moves to it until it does");
                 }
             }
@@ -883,6 +885,33 @@ pub(super) async fn unmount_for_move(m: &Made) -> anyhow::Result<()> {
 pub(super) async fn ask_move(volume: &str, member: u64) -> anyhow::Result<Result<slates_api::MoveProgress, slates_api::Error>> {
     let id = volume_id(volume)?;
     call("move", move |i| Ok(i.move_volume(id, member))).await
+}
+
+/// Volume `volume` shared with `user` with every right (Slates' `share`, §4.13): the target's kiln before a move, since
+/// the volume's owner is this host's user and the target's kiln is another host's (`slates_fleet::NodeUser`).
+pub(super) async fn share_with(volume: &str, user: super::slates_fleet::NodeUser) -> anyhow::Result<()> {
+    let id = volume_id(volume)?;
+    let principal = slates_api::Principal::Uid { host: user.anchor, uid: user.uid };
+    let rights = slates_ipc::protocol::Rights { read: true, write: true, admin: true };
+    let name = instance();
+    let answer = crate::rt::blocking(move || -> anyhow::Result<()> {
+        let mut i = Instance::attach(&name).map_err(|e| anyhow::anyhow!("{e}"))?;
+        i.client().share(id, principal, rights).map_err(|e| anyhow::anyhow!("{e:?}"))
+    })
+    .await?;
+    answer.map_err(|e| anyhow::anyhow!("Slates' share: {e:#}"))
+}
+
+/// The uid this process runs as: the user kiln is to its Slates node (none where a user is no uid).
+fn own_uid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(nix::unistd::getuid().as_raw())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// A pause between two asks of a move, of a mount of a volume that just moved here, of a capture, or of a destroy's end.
