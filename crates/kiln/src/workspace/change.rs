@@ -158,6 +158,8 @@ fn fail(code: StatusCode, msg: impl Into<String>) -> Fail {
 /// Asks the machine agent `info` works on about its folder: the answer's JSON, or why not.
 pub async fn ask_machine(hub: &Hub, info: &Info, ask: &super::Ask) -> Result<Value, Fail> {
     let machine = crate::harness::wait::machine(&info.target).to_owned();
+    // A session in an agent's pod: its home holds its workspace, by its id (docs/agentic.md W10).
+    let machine = crate::k8s::agent::home_of(hub, &machine).unwrap_or(machine);
     let answer = if machine == "local" {
         // The server's own agents: their versions aren't kept here, so an agent's point is refused,
         // saying so; and the server holds no agent's key, so what it commits of one stays unsigned.
