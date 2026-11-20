@@ -570,7 +570,10 @@ end takes the new mount down. `SLATES_FLEET_LIVE_MOVE=local` runs three runners 
 (2026-11-19, one Mac, release): it found that no runner founded the fleet's groups and that a moved volume wasn't
 shared with its new runner (both fixed); Slates refuses most first asks `unplaced` (asked again every 30 s), and its
 MOUNT service answers a moved volume `NOENT` in four runs of five (Slates' to fix), so it passes only when Slates
-mounts the volume.
+mounts the volume. Across three Macs (2026-11-20: this one, adas-mac-studio-2 and -3, LAN): the fleet forms, the agent
+works on the first and kiln moves it to the second, whose kiln then waits on Slates' adoption of the volume with no end
+in ten minutes; kiln's first mount of a workspace doesn't wait on Slates' `refused for now` (`LeaseUnconfirmed`) as its
+mount of a moved volume does, so the test starts the agent again on it.
 
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.

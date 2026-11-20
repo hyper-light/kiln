@@ -63,6 +63,8 @@ const FIRST: &str = "WRITE=made.txt APPEND=README.md REMOVE=gone.txt";
 /// agent moves (`harness::moving::record`). Claude Code's moves carry its own transcript file, which the stand-in (no
 /// model) never writes, so a stand-in `claude` can't move ("Claude Code's record of session ... is not on this machine").
 const HARNESS: &str = "opencode";
+/// How long a remote machine's preparation may take, fetching this build's kiln over the LAN, in seconds.
+const PREPARE_S: u32 = 1800;
 /// How many times the test asks kiln to move the agent while Slates refuses it `unplaced`.
 const MOVES: usize = 10;
 /// How long the test waits on one ask to move before asking again.
@@ -171,9 +173,27 @@ mod checks {
         (!kind.is_empty()).then(|| kind.to_owned())
     }
 
-    /// Whether a session's end says its node hadn't imported its consensus groups yet (Slates' `ConsensusNotInitialized`).
-    pub fn groups_not_imported(said: &str) -> bool {
-        said.contains("no consensus group yet")
+    /// Whether `kiln run` failed reaching its runner rather than running the script: kiln's own words for it.
+    pub fn kiln_unreached(said: &str) -> bool {
+        ["did not answer in", "the kiln server did not answer in time", "no longer has this run (its runner restarted)", "no runner suits"].iter().any(|w| said.contains(w))
+    }
+
+    /// Whether a move's refusal says to ask again: Slates' `unplaced`, or the workspace's mount found busy as the source let
+    /// it go (holders macOS can't name, seen across the LAN 2026-11-20), the agent going on where it was either way.
+    pub fn asked_again(notice: &str) -> bool {
+        match refused_kind(notice).as_deref() {
+            Some("unplaced") => true,
+            Some("slates") => notice.contains("Slates' unmount:") && notice.contains("is busy"),
+            _ => false,
+        }
+    }
+
+    /// Whether a session's end says its workspace was refused only for now: its node hadn't imported its consensus groups
+    /// yet (Slates' `ConsensusNotInitialized`), or its first mount was refused for now (Slates' `Retry`, such as a lease
+    /// its members across the LAN hadn't confirmed yet, `LeaseUnconfirmed`, 2026-11-20), which kiln's first mount
+    /// doesn't wait on as its mount of a moved volume does.
+    pub fn refused_for_now(said: &str) -> bool {
+        said.contains("no consensus group yet") || said.contains("Slates' mount: refused for now")
     }
 
     /// How many nodes a runner's word that it joins kiln's Slates fleet says it heard (`nodes=<n>`).
@@ -259,6 +279,28 @@ mod checks {
         }
 
         #[test]
+        fn k4_live_move_a_workspace_refused_for_now_is_started_again() {
+            assert!(refused_for_now("its workspace: Slates' base create: this node has no consensus group yet; create it once"));
+            assert!(refused_for_now(r#""error":"its workspace: Slates' mount: refused for now (LeaseUnconfirmed { version: 7 }""#));
+            assert!(!refused_for_now("its workspace: Slates' mount: the daemon's MOUNT service refused the export (mountstat3 2)"));
+        }
+
+        #[test]
+        fn k4_live_move_a_move_is_asked_again_only_where_its_refusal_says_to() {
+            assert!(asked_again("Couldn't move to b: Slates couldn't place its workspace's records in time [kind: unplaced] — it goes on here"));
+            assert!(asked_again("Couldn't move to b: Slates refused to move its workspace: Slates' unmount: /w is busy: its holders were not read [kind: slates] — it goes on here"));
+            assert!(!asked_again("Couldn't move to b: Slates refused: something else [kind: slates]"));
+            assert!(!asked_again("Couldn't move to b [kind: not_plain]"));
+        }
+
+        #[test]
+        fn k4_live_move_kiln_not_reaching_a_runner_is_told_from_the_scripts_failure() {
+            assert!(kiln_unreached("ERROR b24c5c951260dcdfd0972f2aeaf3cf51 did not answer in 15s"));
+            assert!(kiln_unreached("ERROR 2768d0d5 no longer has this run (its runner restarted)"));
+            assert!(!kiln_unreached("curl: (22) The requested URL returned error: 404"));
+        }
+
+        #[test]
         fn k4_live_move_a_join_says_how_many_nodes_it_heard() {
             let line = "2026-11-20T06:23:12Z \u{1b}[32m INFO\u{1b}[0m this runner's Slates joins kiln's Slates fleet \u{1b}[3mmanifest\u{1b}[0m\u{1b}[2m=\u{1b}[0m/x/fleet.json \u{1b}[3mnodes\u{1b}[0m\u{1b}[2m=\u{1b}[0m2 \u{1b}[3mf\u{1b}[0m\u{1b}[2m=\u{1b}[0m1";
             assert_eq!(nodes_heard(line), Some(2));
@@ -297,6 +339,11 @@ struct Files {
 
 impl Files {
     fn start(join: String) -> anyhow::Result<Files> {
+        // This build's kiln gzipped once (about 260 MB, about 100 MB gzipped): a LAN link between two of the Macs ran
+        // at 280 KB/s (2026-11-20), and the whole binary didn't arrive within the preparation's ten minutes.
+        let gz = Command::new("/usr/bin/gzip").args(["-6", "-c"]).arg(common::BIN).output()?;
+        anyhow::ensure!(gz.status.success() && !gz.stdout.is_empty(), "gzip {}: {}", common::BIN, String::from_utf8_lossy(&gz.stderr));
+        let gz = gz.stdout;
         let listener = std::net::TcpListener::bind("0.0.0.0:0")?;
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
@@ -316,7 +363,7 @@ impl Files {
                 let line = String::from_utf8_lossy(head.get(..n).unwrap_or_default()).lines().next().unwrap_or_default().to_owned();
                 let path = line.split_whitespace().nth(1).unwrap_or_default().to_owned();
                 let body = match path.as_str() {
-                    "/kiln" => std::fs::read(common::BIN).ok(),
+                    "/kiln.gz" => Some(gz.clone()),
                     "/stub" => std::fs::read(vm_e2e::stub_path()).ok(),
                     "/join" if joins_left > 0 => {
                         joins_left -= 1;
@@ -350,11 +397,26 @@ fn production_kiln() -> Command {
 }
 
 /// `script` run on production runner `runner` in its home folder: its output, or what it said failing.
+/// Asked again, after a pause, while kiln itself says it couldn't reach the runner (its server or the runner didn't
+/// answer in time, or the runner restarted under the run: production runners flap), up to five times; every script the
+/// test runs this way can run again.
 fn on(runner: &str, script: &str, timeout_s: u32) -> anyhow::Result<String> {
-    let out = production_kiln().args(["run", "-q", "--on", runner, "--no-sync", "--timeout", &timeout_s.to_string(), "--", script]).stdin(Stdio::null()).output()?;
-    let text = String::from_utf8_lossy(&out.stdout).into_owned();
-    anyhow::ensure!(out.status.success(), "on {runner}: {script}\n{}: {text}\n{}", out.status, String::from_utf8_lossy(&out.stderr));
-    Ok(text)
+    let mut tries = 0_u32;
+    loop {
+        tries = tries.saturating_add(1);
+        let out = production_kiln().args(["run", "-q", "--on", runner, "--no-sync", "--timeout", &timeout_s.to_string(), "--", script]).stdin(Stdio::null()).output()?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        if out.status.success() {
+            return Ok(text);
+        }
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        if tries < 5 && checks::kiln_unreached(&said) {
+            eprintln!("WAITED: kiln didn't reach {runner} (try {tries}): {}", said.trim().chars().take(200).collect::<String>());
+            std::thread::sleep(Duration::from_secs(20));
+            continue;
+        }
+        anyhow::bail!("on {runner}: {script}\n{}: {text}\n{said}", out.status);
+    }
 }
 
 /// Where a runner runs.
@@ -402,8 +464,9 @@ fn two_ports(ip: &str) -> anyhow::Result<u16> {
 fn preparation(dir: &str, files: &str, host: &str) -> String {
     format!(
         r#"set -e; d="{dir}"; mkdir -p "$d/bin" "$d/home" "$d/state" "$d/work"; cd "$d"
-for f in kiln stub join; do curl -fsS -o "$f" "{files}/$f"; done
-chmod 755 kiln stub; chmod 600 join; ln -sf "$d/stub" "$d/bin/opencode"
+curl -fsS "{files}/kiln.gz" | gunzip > kiln
+for f in stub join; do curl -fsS -o "$f" "{files}/$f"; done
+chmod 755 kiln stub; chmod 600 join; ln -sf "$d/stub" "$d/bin/opencode"; "$d/kiln" --version > /dev/null
 printf '#!/bin/sh\nPATH=%s/bin:/usr/bin:/bin:/usr/sbin:/sbin\nexport PATH\nwhile [ $# -gt 1 ]; do shift; done\nexec /bin/sh -c "$1"\n' "$d" > login-shell; chmod 755 login-shell
 /usr/bin/python3 -c '
 import socket, sys
@@ -470,7 +533,14 @@ impl Lab {
             for (name, runner) in &remotes {
                 let runner = runner.clone().ok_or_else(|| anyhow::anyhow!("no runner for {name}"))?;
                 let dir = format!("$HOME/.cache/kiln-live-move/{run}-{name}");
-                let out = on(&runner, &format!("{}; echo \"LIVE_MOVE_DIR $d\"", preparation(&dir, &url, &host)), 600)?;
+                let out = match on(&runner, &format!("{}; echo \"LIVE_MOVE_DIR $d\"", preparation(&dir, &url, &host)), PREPARE_S) {
+                    Ok(out) => out,
+                    Err(e) => {
+                        // Nothing runs there yet: its folder goes.
+                        let _ = on(&runner, &format!("rm -rf \"{dir}\""), 60);
+                        return Err(e);
+                    }
+                };
                 let p = checks::prepared(&out).map_err(|e| anyhow::anyhow!("{runner}: {e}"))?;
                 let dir = out.lines().find_map(|l| l.strip_prefix("LIVE_MOVE_DIR ")).map(str::to_owned).unwrap_or(dir);
                 eprintln!("PREPARED: {name} on {runner} at {} (node {}:{})", dir, p.ip, p.base);
@@ -832,8 +902,10 @@ fn k4_k5_an_agent_moved_with_its_live_volume_carries_on_and_the_old_runner_lets_
         lab.agent = Some(id.clone());
         match lab.until_turns(&id, 1, "its first turn") {
             Ok(lines) => break (id, lines),
-            Err(e) if checks::groups_not_imported(&format!("{e:#}")) && began.elapsed() < WITHIN => {
-                eprintln!("WAITED: start {starts}: {}'s node hasn't imported its groups yet ({:?})", name_a, began.elapsed());
+            Err(e) if checks::refused_for_now(&format!("{e:#}")) && began.elapsed() < WITHIN => {
+                let why = format!("{e:#}");
+                let why = why.lines().next().unwrap_or_default().chars().take(300).collect::<String>();
+                eprintln!("WAITED: start {starts} on {name_a} refused for now ({:?}): {why}", began.elapsed());
                 std::thread::sleep(Duration::from_secs(5));
             }
             Err(e) => return Err(e),
@@ -865,7 +937,7 @@ fn k4_k5_an_agent_moved_with_its_live_volume_carries_on_and_the_old_runner_lets_
         }
         let refusals = lab.refusals(&id)?;
         if let Some(last) = refusals.last() {
-            anyhow::ensure!(checks::refused_kind(last).as_deref() == Some("unplaced"), "the move was refused by kind: {last}\n{}\n{}", lab.fleet.logs(), lab.remote_logs());
+            anyhow::ensure!(checks::asked_again(last), "the move was refused by kind: {last}\n{}\n{}", lab.fleet.logs(), lab.remote_logs());
         }
         // kiln says a refusal once however often it's repeated: asked again each ASK_AGAIN while it hasn't moved.
         if last_ask.is_none_or(|t| t.elapsed() >= ASK_AGAIN) {
