@@ -17,7 +17,8 @@
 //! - `KILN_K8S_HOST`: this host's address on the cluster's network (the nodes' gateway);
 //! - `KILN_K8S_NODES`: the nodes' container names, comma-separated;
 //! - `KILN_K8S_IMAGE`: the agents' image, loaded into the cluster;
-//! - `KILN_K8S_NAMESPACE` (default `kiln-agents-live`): the namespace, made already, with its `default` service account.
+//! - `KILN_K8S_NAMESPACE` (default `kiln-agents-live`): the namespace, made already, with its `default` service account;
+//! - `KILN_K8S_LOGS` (optional): a folder the server's, the home's and the pod's whole logs are copied to as the test ends.
 //!
 //!   KILN_K8S_LIVE=1 KUBECONFIG=... KILN_K8S_HOST=192.168.58.1 KILN_K8S_NODES=k90-close,k90-close-m02 \
 //!   KILN_K8S_IMAGE=k90-close-agent:live cargo test -p kiln --test k8s_agent_live -- --nocapture
@@ -104,6 +105,33 @@ fn until<T>(what: &str, mut f: impl FnMut() -> anyhow::Result<Option<T>>, seen: 
     }
 }
 
+/// What the test leaves behind as it ends, where `KILN_K8S_LOGS` names a folder: every log of its fleet's folder and its
+/// pod's whole log, copied before the fleet's folder goes (it's dropped first, being made after the fleet).
+struct Kept {
+    root: std::path::PathBuf,
+    ns: String,
+    pod: std::cell::RefCell<Option<String>>,
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        let Some(to) = std::env::var_os("KILN_K8S_LOGS").map(std::path::PathBuf::from) else { return };
+        if std::fs::create_dir_all(&to).is_err() {
+            return;
+        }
+        for entry in std::fs::read_dir(&self.root).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "log") {
+                let _ = std::fs::copy(&path, to.join(entry.file_name()));
+            }
+        }
+        if let Some(pod) = self.pod.borrow().as_deref() {
+            let log = kubectl(&self.ns, &["logs", pod, "-c", "agent"]).unwrap_or_else(|e| format!("{e:#}"));
+            let _ = std::fs::write(to.join(format!("{pod}.log")), format!("{}\n{log}", pod_story(&self.ns, pod)));
+        }
+    }
+}
+
 /// W10 on a real cluster. Do: start the stand-in through kiln in a pod of its own, its home the fleet's one node; it
 /// writes in its folder; ask for its change request, change a file it changed in the folder, land it with the person's
 /// grant, end it. Expect: the pod running kiln's runner for that session, its folder kubelet's `nfs4` mount with
@@ -130,6 +158,7 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
 
     // The folder: a clone of a bare repository (its change requests' branches are pushed there).
     let root = fleet.root.path().to_path_buf();
+    let kept = Kept { root: root.clone(), ns: ns.clone(), pod: std::cell::RefCell::new(None) };
     let bare = root.join("origin.git");
     let project = root.join("project");
     run("git", &["init", "-q", "--bare", "-b", "main", &bare.to_string_lossy()], None)?;
@@ -181,6 +210,7 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
     )?;
     let id = started.pointer("/agents/0/id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no session in {started}"))?.to_owned();
     let pod = kiln::k8s::agent::pod_name(&id);
+    kept.pod.replace(Some(pod.clone()));
     let agent = |fleet: &common::Fleet| fleet.call("POST", "/api/ops/agents.get", Some(&json!({"agent": id})));
     let seen = || format!("{}\n{}", pod_story(&ns, &pod), fleet_logs(&root));
     until("the agent's pod running", || Ok((kubectl(&ns, &["get", "pod", &pod, "-o", "jsonpath={.status.phase}"])? == "Running").then_some(())), seen)?;
