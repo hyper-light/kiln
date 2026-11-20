@@ -334,6 +334,7 @@ classes! {
         ServerMsg::Replay { .. } => Class::Ask,
         ServerMsg::Prebuild { .. } => PARKED,
         ServerMsg::Volumes { .. } => Class::Ask,
+        ServerMsg::UserEnv { .. } => Class::Ask,
     }
 }
 
@@ -361,6 +362,7 @@ classes! {
         Command::Control { .. } => REFUSED,
         Command::StopTask { .. } => REFUSED,
         Command::Restart => REFUSED,
+        Command::Agentenv { .. } => REFUSED,
         Command::Suggest { .. } => Class::Ask,
         Command::Snapshot => Class::Ask,
         Command::StateRead { .. } => Class::Ask,

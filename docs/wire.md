@@ -725,6 +725,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   volume that arrived with a session before its harness starts; the server moves a volume only between
   two runners that name it, and refuses the move by kind otherwise (an older runner would hand the
   session over without its volume).
+  `agentenv`: the runner runs sessions with the environments the server resolves for them
+  (`Spec::agentenv`, `Command::Agentenv`; docs/agents.md, "Environments"), and says which variables
+  its user has, by name and where each is set, as the server asks (`ServerMsg::UserEnv`); a runner
+  that didn't name it is sent none: a start with an environment there is refused, saying so.
 
 ## Registry
 
@@ -792,6 +796,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 83 | `Replay` | | main, withdrawn (kiln plan 01a1dd2e…, P7.1b: replays were never part of experiments): its place kept, as `Prebuild` follows it; no server sends it, and a runner refuses it as a kind it doesn't know, its `req` answered why |
 | `ServerMsg` | 84 | `Prebuild` | | main (kiln plan 01a1dd2e…, P4.5): an Agentfile to build ahead of its sessions, JSON, to a runner that named `agentfiles.prebuild`; `{"end": <id>}`, a deleted Agentfile's builds to end, to one that named `agentfiles.prebuild.end` |
 | `ServerMsg` | 85 | `Volumes` | | this line (kiln plan 01a1dd2e…, P6.2): agent volumes of a runner's microVMs' store listed by their names, or one cleared, JSON, to a runner that named `agents.volumes` |
+| `ServerMsg` | 86 | `UserEnv` | | this line (docs/agents.md, "Environments"): which variables a runner's user has, by name and where each is set, JSON, to a runner that named `agentenv` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
@@ -1055,6 +1060,7 @@ Four edges are left, and the lab steers clear of each:
 | `Replay` | ask | Withdrawn (P7.1b): sent by no server; a runner refuses it as a kind it doesn't know, answering its `req` why. | As its class says. |
 | `Prebuild` | command, parked | Build an Agentfile ahead of its sessions (`agentfiles::prebuild::Ask`, JSON: `{agentfile, version, harness, text, secrets?}`): its text at a version, beside kiln's harness directory for one of kiln's harnesses, given the secrets it names (P4.7), into the store the runner's microVMs boot from, as a session of that harness builds it there, so the session that starts after it builds nothing. Answered by `Prebuilt` as it goes. | New: to the newest process of a runner that named `agentfiles.prebuild`, at each save of the Agentfile (or of an agent definition naming it), and again for those not done or failed each time one of its processes names the feature. |
 | `Volumes` | ask | An agent's volumes on the runner's microVMs (`agentdefs::volumes::Ask`, JSON: `{"list": {stores}}`, the store names asked, or `{"clear": {store}}`): those of the names asked that its store keeps, each with the bytes its files take, its bound, its charge and when it was made, or one cleared once no session holds it. Answered by `Answer` (`agentdefs::volumes::Answer`: `listed`, `cleared`, or `refused` with its cause: `in_use`, `unknown`, `bound`, `clearing`, `unsupported` where the machine keeps none, `failed`). | New: to runners that named `agents.volumes`; a runner that didn't isn't asked. |
+| `UserEnv` | ask | Which variables the runner's user has (`harness::agentenv::Ask`, JSON: `{}`): each by name, with where it's set (`login_shell`, `launchd`, `systemd_user`, `pam`, `user_registry`, `system_registry`, `runner`), never a value. Answered by `Answer` (`harness::agentenv::Answer`: `{vars: [{name, sources}]}`). | New: to runners that named `agentenv`; a runner that didn't isn't asked. |
 
 ## Commands to a session: `Command`
 
@@ -1082,6 +1088,7 @@ travels in `HarnessCmd`.
 | `Control` | command, refused while away | A control's value, or an action. | Fire-and-forget. |
 | `StopTask` | command, refused while away | Stops one task now. | Fire-and-forget. |
 | `Restart` | command, refused while away | Starts the harness again now. | Fire-and-forget. |
+| `Agentenv` | command, refused while away | A session's environment replaced (`{agentenv, restart}`: `harness::agentenv::Resolved` or none, its secrets' values opened), then its harness started again unless `restart` is false. kiln's server's alone: one from a client is refused. | New: to runners that named `agentenv`. |
 | `Suggest` | ask | Answered by a `Reply` to its client. | As its class says. |
 | `Snapshot` | ask | The whole session, for a server that lost track of it. A resume by revision replaces it. | Asked for by a server that restarted. |
 | `StateRead` | ask | A bounded page or range of deferred session detail, at its field revision. | Reply to the requesting client; stale reads are refused. |

@@ -1,0 +1,309 @@
+/* The Engine tab's Environments (engine-envs.tsx): cards as its agents' are (definition.css
+   [data-list="agents-tab"]): nothing in them folds, so nothing is indented for an arrow. */
+[data-list="envs-tab"],
+[data-list="envs-tab"] .ms-tree-rows {
+  --dd-lane: 0px;
+  --dd-content: 0px;
+  --dd-body: 0px;
+}
+[data-list="envs-tab"] li.ms-node {
+  padding-right: 0;
+}
+[data-list="envs-tab"] > .ms-tree + .df-defrow,
+[data-list="envs-tab"] > .df-body + .df-defrow,
+[data-list="envs-tab"] > .ev-new + .ms-tree {
+  border-top: 1px solid #25272c;
+}
+/* Its lists (variables, sessions): the card's width, a row each. */
+.ev-rows {
+  justify-self: stretch;
+}
+/* A variable: its name with where it comes from beside it, then what it gives at the row's right edge. */
+.sb-row.ev-var {
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+}
+.ev-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.ev-gives {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  justify-self: end;
+  gap: 5px;
+  text-align: right;
+  color: #d4d6dc;
+}
+.ev-gives > svg {
+  flex: none;
+  color: #d8cbb0;
+}
+.ev-var[data-from="unset"] .ev-gives {
+  color: #7b7e88;
+}
+/* A session running with it: its name, then its machine. */
+.sb-row.ev-session {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.ev-acts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+/* Asked again in place (apply, delete): its words wrap at a phone's width. */
+.ms-node.ev-ask {
+  display: block;
+  padding: 6px 0 10px;
+}
+.ev-confirm {
+  flex-wrap: wrap;
+  padding: 4px 4px 4px 12px;
+  border-radius: 16px;
+  white-space: normal;
+}
+/* The form: a variable two rows (its name, where from and its moves; then what it takes). */
+.ev-form {
+  padding-top: 10px;
+}
+.ev-k {
+  margin-top: 6px;
+}
+.ev-vrow {
+  display: grid;
+  gap: 6px;
+  padding: 6px 0 8px;
+  border-bottom: 1px solid #191b1f;
+}
+.ev-vname {
+  flex: 1 1 140px;
+}
+.ev-vacts {
+  margin-left: auto;
+}
+/* This session's environment, chosen above the list; a change asks first, as it restarts the session. */
+.ev-choose {
+  display: grid;
+  gap: 8px;
+  padding: 4px 0 12px;
+}
+.ev-src {
+  font-size: 12px;
+}
+.ev-src {
+  flex-basis: 100%;
+}
+
+/* Quiet rows: no rule under each variable or session, nor under the head and description. */
+[data-list="envs-tab"] li.ms-node,
+[data-list="envs-tab"] li.ms-tree,
+[data-list="envs-tab"] li.df-defrow,
+[data-list="envs-tab"] .ms-tree-rows > li,
+[data-list="envs-tab"] .sb-rows > .sb-row {
+  border-top: 0;
+  border-bottom: 0;
+}
+/* Each environment set apart by a clear rule (no gap: a folded one is its line alone); inside it, each section's head (Variables,
+   Sessions) between rules of its own. */
+[data-list="envs-tab"] > li.df-defrow {
+  border-top: 1px solid #3a3c43;
+}
+[data-list="envs-tab"] li.ms-node.df-group {
+  border-top: 1px solid #25272c;
+  border-bottom: 1px solid #25272c;
+}
+[data-list="envs-tab"] .sb-row.ev-var,
+[data-list="envs-tab"] .sb-row.ev-session {
+  min-height: 26px;
+}
+.ev-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+.ev-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid #2a2d34;
+  border-radius: 999px;
+  color: #a9acb6;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.ev-tag-x {
+  display: inline-grid;
+  place-items: center;
+  margin-right: -3px;
+  padding: 1px;
+  border-radius: 50%;
+  color: #7b7e88;
+}
+.ev-tag-x:hover,
+.ev-tag-x:focus-visible {
+  color: #e6e7eb;
+}
+.ev-tag-add {
+  border-style: dashed;
+  background: none;
+  color: #7b7e88;
+  cursor: pointer;
+}
+.ev-tag-add:hover,
+.ev-tag-add:focus-visible {
+  color: #d4d6dc;
+}
+input.ev-tag-in {
+  width: 9ch;
+  background: none;
+  color: #e6e7eb;
+  outline: none;
+}
+/* Text edited where it's shown: it reads as text until pressed. */
+.ev-inline {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  text-align: left;
+  cursor: text;
+}
+/* A name stays on one line, as it did before it could be edited; a long one is cut. */
+.ev-inline.df-defname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ev-inline.df-note {
+  font-size: 13px;
+  line-height: 19px;
+}
+.ev-inline:hover,
+.ev-inline:focus-visible {
+  text-decoration: underline dotted #6b6e78;
+  text-underline-offset: 3px;
+}
+.ev-inline.df-note {
+  color: #97999f;
+}
+.ev-tagrow {
+  padding-top: 2px;
+}
+.ev-placeholder {
+  color: #6b6e78;
+}
+input.ev-inline-in {
+  min-width: 12ch;
+  height: 26px;
+}
+
+/* Its fold: the chevron before its name, as the sections' (fold.tsx). */
+.ev-chev {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  margin-right: -2px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  color: #7b7e88;
+  cursor: pointer;
+}
+.ev-chev:hover {
+  color: #d4d6dc;
+}
+.ev-chev:focus-visible {
+  outline: 1px solid #6b6e78;
+}
+
+/* The form's dropdowns: their arrow drawn inset from the right edge, as the left edge's padding. */
+.ev-form select.sb-in {
+  appearance: none;
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239a9ca4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-position: right 10px center;
+  background-repeat: no-repeat;
+  background-size: 12px;
+}
+
+/* A field in focus: its own border lit, as definitions' fields are (definition.css .ms-edit-in), not a
+   ring outside it that runs into what's beside it. */
+.ev-form .sb-in:focus,
+.ev-form .sb-in:focus-visible,
+input.ev-inline-in:focus,
+input.ev-tag-in:focus {
+  outline: none;
+  border-color: #bab0e3;
+}
+
+/* Its base and the + beside it, as far from the section's rule above as from the first variable
+   below: 10px each (the form's top; this row's foot and the space the first variable keeps over it). */
+.ev-baserow {
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 2px;
+}
+/* The + is smaller than the ✓ and × that save. */
+.fig-round.ev-add {
+  width: 24px;
+  height: 24px;
+}
+/* "New environment": as far from the rule above as from the one below. */
+[data-list="envs-tab"] > li.ev-new {
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+
+/* The sessions running with it: a table, a rule under its head and under each row. */
+.ev-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.ev-table th {
+  padding: 6px 12px 6px 0;
+  border-bottom: 1px solid #25272c;
+  color: #7b7e88;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  text-align: left;
+  text-transform: uppercase;
+}
+.ev-table td {
+  padding: 7px 12px 7px 0;
+  border-bottom: 1px solid #191b1f;
+  vertical-align: baseline;
+}
+.ev-table th:last-child,
+.ev-table td:last-child {
+  padding-right: 0;
+}
+/* This session runs with it: a dot in this session's colour (definition.css .df-this), haloed. */
+.ev-here {
+  display: inline-block;
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-left: 8px;
+  border-radius: 50%;
+  background: #cdc6ea;
+  box-shadow: 0 0 0 3px rgb(205 198 234 / 16%);
+  vertical-align: middle;
+}

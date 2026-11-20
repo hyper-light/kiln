@@ -108,6 +108,12 @@ fn roots(c: &mut Collect<'_>) {
     c.visit::<crate::agentfiles::check::Check>();
     // An Agentfile's harnesses and agents as settings (`agentfiles.settings`, kiln plan 01a1dd2e… P5.3).
     c.visit::<crate::agentfiles::settings::Viewed>();
+    // Environments for agent sessions (`agentenvs.*`, docs/agents.md "Environments"): the list, one (each with its
+    // variables as kept), what applying one did, and what a machine's user has (`agentenvs.machine`).
+    c.visit::<crate::agentenvs::Listing>();
+    c.visit::<crate::agentenvs::Agentenv>();
+    c.visit::<crate::agentenvs::Applied>();
+    c.visit::<crate::harness::agentenv::Answer>();
     // Agent definitions' experiments (`agentdefs.experiments.*`, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d P7.1):
     // one as each answers it, its variants and criteria.
     c.visit::<crate::agentdefs::experiments::Experiment>();

@@ -439,12 +439,19 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agentfile: Option<String>,
     /// The secrets a build of that Agentfile is given (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
-    /// decision 6, P4.7): each its `LABEL kiln.secret.<ID>=user:<NAME>` names, read by kiln's server
-    /// from its person's own as it started (`secrets::mine::for_build`). Set by kiln, never from what
+    /// decision 6, P4.7; a person's secrets reach their sessions too since 2026-11-18, by their
+    /// environments alone: [`Spec::agentenv`]): each its `LABEL kiln.secret.<ID>=user:<NAME>` names, read
+    /// by kiln's server from its person's own as it started (`secrets::mine::for_build`). Set by kiln, never from what
     /// was asked; its machine takes them out of the session as it starts it, for its build alone, so
     /// no copy of the session (a move, a hand-over, a resume) carries them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub build_secrets: Vec<crate::secrets::mine::BuildSecret>,
+    /// Its environment (docs/agents.md, "Environments"), as kiln's server resolved it as it started:
+    /// its secrets' values opened. Set by kiln, never from what was asked; its machine takes it out of
+    /// the session as it starts it and keeps it in memory alone, so no record or copy of the session
+    /// carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agentenv: Option<super::agentenv::Resolved>,
     /// What a person branched it from (`Command::Branch`): a session's id, or `<session>/<task>`
     /// for one of that session's harness's own subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -546,6 +553,7 @@ impl Default for Spec {
             isolation: None,
             agentfile: None,
             build_secrets: Vec::new(),
+            agentenv: None,
             variant_of: None,
             opener: None,
             dirs: Vec::new(),
@@ -898,6 +906,13 @@ pub struct Info {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(optional))]
     pub isolation: Option<Isolation>,
+    /// The environment it runs with (docs/agents.md, "Environments"), as its machine holds it: the version
+    /// its harness started with. None: its machine's user's. Its runner says it; the server gives it again
+    /// to a runner process that announces the session without the one kiln keeps it runs with
+    /// (`crate::agentenvs::resolve::opened`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
+    pub agentenv: Option<crate::agentenvs::Brief>,
     /// Where its harness runs now (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17): a process of
     /// its machine's, by its pid, or its image's member in a microVM of its own, which no host pid
     /// is. None while none runs.
@@ -1054,7 +1069,7 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, runs, starts } = self;
+        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, agentenv, runs, starts } = self;
         !(*deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
@@ -1120,6 +1135,7 @@ impl Info {
             && *launched == o.launched
             && *workspace == o.workspace
             && *isolation == o.isolation
+            && *agentenv == o.agentenv
             && *runs == o.runs
             && *starts == o.starts)
     }
@@ -1802,6 +1818,11 @@ pub struct Session {
     ended: std::sync::atomic::AtomicBool,
     ended_changed: crate::rt::Changed,
     pub(crate) owned_reach: Mutex<std::collections::HashMap<String, std::sync::Arc<crate::reach::owned::Run>>>,
+    /// Its environment (docs/agents.md, "Environments"), its secrets' values opened: taken out of its
+    /// spec as it opens (`Spec::agentenv`), replaced by `Command::Agentenv`, and given to its harness
+    /// at its every start here (a restart, a crash's). In this process's memory alone: no record of
+    /// it (`resume_spec`, the host's record, a move, a hand-over) carries it.
+    agentenv: Mutex<Option<super::agentenv::Resolved>>,
 }
 
 impl Session {
@@ -2093,6 +2114,26 @@ impl Session {
         s.max_subagents = core.state.max_subagents;
         s
     }
+}
+
+/// An environment as a session's timeline names it; none, the machine's user's.
+fn agentenv_words(agentenv: Option<&super::agentenv::Resolved>) -> String {
+    match agentenv {
+        Some(e) => format!("Environment {} (version {})", e.name, e.version),
+        None => "The machine's user's environment".to_owned(),
+    }
+}
+
+/// Its environment's `machine` variables the machine's user hasn't (`user`), said in its timeline as
+/// its harness starts with each left unset (docs/agents.md, "What one is").
+fn unset_machine_vars(s: &Session, env: &super::agentenv::Resolved, user: &[(String, String)]) {
+    let missing = super::agentenv::missing(env, user);
+    if missing.is_empty() {
+        return;
+    }
+    let names: Vec<String> = missing.iter().map(|(k, of)| if k == of { k.clone() } else { format!("{k} (from {of})") }).collect();
+    let text = format!("This machine's user has no {}: environment {} leaves {} unset", names.join(", "), env.name, if missing.len() == 1 { "it" } else { "them" });
+    s.core.lock().upsert(&format!("agentenv-unset:{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text });
 }
 
 /// Stop what it left running that kiln took back over: one (its task id), or all of them.
@@ -2572,7 +2613,7 @@ fn named_ahead(meta: &mut super::model::Meta, kind: &Kind, model: Option<&str>) 
 /// A session with this core, its task started (`adopt`: going on with a harness process the
 /// previous image of this process handed over).
 #[allow(clippy::too_many_arguments)]
-fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
+fn begin(id: String, mut spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
     core.session_id.clone_from(&id);
     core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
@@ -2651,10 +2692,13 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         launched: Some(spec.launched_level()),
         workspace: spec.workspace.clone(),
         isolation: spec.isolation.clone(),
+        agentenv: spec.agentenv.as_ref().map(crate::agentenvs::Brief::of),
         runs: None,
         starts: Vec::new(),
     };
     let (ctl, ctl_rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+    // Its environment, out of its spec before anything can record it.
+    let agentenv = spec.agentenv.take();
     let s = Arc::new(Session {
         id,
         spec: Mutex::new(spec),
@@ -2672,6 +2716,7 @@ fn begin(id: String, spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink
         ended: std::sync::atomic::AtomicBool::new(false),
         ended_changed: crate::rt::Changed::new(),
         owned_reach: Mutex::new(std::collections::HashMap::new()),
+        agentenv: Mutex::new(agentenv),
     });
     let run = Arc::clone(&s);
     // On the shard that owns it, where its lane runs and its frames are taken (runner-fan): its pipes are served there too
@@ -3571,6 +3616,8 @@ fn effects(s: &Arc<Session>, kind: &'static Kind, files: &Files, done: &crate::m
             super::core::Effect::AllowBypass => s.spec.lock().allow_bypass = true,
             super::core::Effect::Run { job, args } => {
                 let mut spec = s.spec.lock().clone();
+                // Its harness's own CLI runs as its harness does: with its environment.
+                spec.agentenv = s.agentenv.lock().clone();
                 let tx = done.clone();
                 // Nothing of an isolated session's harness runs on this host (kiln goal 3cd82843, r734: a stand-in
                 // antigravity in a microVM had the host's `agy models` and `agy --version` run): its CLI's answer is its
@@ -5212,6 +5259,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             on_change();
         }
         let mut spec = if first { s.spec.lock().clone() } else { s.resume_spec() };
+        // Its environment, for this start alone: this copy of its spec goes nowhere else.
+        spec.agentenv = s.agentenv.lock().clone();
         if let Some(at) = rewind_to.take() {
             spec.resume_at = at;
         }
@@ -5258,10 +5307,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 }
                 let blocked = if spec.takeover_pid.is_some() { takeover_ready(&s, &sink, Duration::from_secs(3)).await } else { None };
                 let isolated = spec.isolation.is_some();
-                // One the machine's own PATH lacks may be on its user's: their login shell is asked
-                // first (once, then kept ten minutes).
-                if blocked.is_none() && !isolated && spec.program.is_none() && !kind.available() {
-                    crate::reach::serve::login_env().await;
+                // It runs with its user's environment as it is now (its PATH, and an API key it signs
+                // in by: `kinds::set_env`), its login shell's among it (asked, unless what it said is
+                // kept until one of its startup files changes); and its environment's `machine`
+                // variables are read from it, in a microVM too. One its user hasn't is said.
+                if blocked.is_none() && (!isolated || spec.agentenv.is_some()) {
+                    let user = super::agentenv::refresh().await;
+                    if let Some(env) = &spec.agentenv {
+                        unset_machine_vars(&s, env, &user.vars);
+                    }
                 }
                 // What it needs before it starts (kiln's MCP server in Antigravity's own config).
                 if blocked.is_none() && !isolated {
@@ -5476,6 +5530,24 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 if s.core.lock().state.status == Status::Exited {
                                     rewind_to = Some(None);
                                 }
+                            }
+                            // Its environment replaced: its harness takes it as it starts, so it starts again
+                            // (the conversation goes on) once nothing is under way, unless told to wait.
+                            Command::Agentenv { agentenv, restart } => {
+                                let words = agentenv_words(agentenv.as_ref());
+                                *s.agentenv.lock() = agentenv;
+                                let mut core = s.core.lock();
+                                let text = if restart {
+                                    let when = if settled_core(&core) { "now" } else { "once this turn ends" };
+                                    core.hold = true;
+                                    reloading = true;
+                                    format!("{words} — {} starts again with it {when}; the conversation goes on", kind.name)
+                                } else {
+                                    format!("{words} — {} takes it when it next starts", kind.name)
+                                };
+                                core.upsert(&format!("agentenv:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                                drop(core);
+                                on_change();
                             }
                             Command::ForceStop => {
                                 // You ended the turn: a restart before it's back doesn't take it up again.
@@ -6150,6 +6222,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         }
                         start_asked = true;
                     }
+                    // Its environment replaced while its harness is down: it starts with it, now where
+                    // asked to (as a restart), else at its next start.
+                    Command::Agentenv { agentenv, restart } => {
+                        let text = format!("{} — {} starts with it {}", agentenv_words(agentenv.as_ref()), kind.name, if restart { "now" } else { "when it next starts" });
+                        *s.agentenv.lock() = agentenv;
+                        s.core.lock().upsert(&format!("agentenv:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                        on_change();
+                        if restart {
+                            if s.core.lock().has_room() {
+                                break;
+                            }
+                            start_asked = true;
+                        }
+                    }
                     Command::Snapshot => {
                         for u in s.snapshot() {
                             let _ = sink.send((s.id.clone(), u)).await;
@@ -6538,6 +6624,7 @@ mod tests {
             ended: std::sync::atomic::AtomicBool::new(false),
             ended_changed: crate::rt::Changed::new(),
             owned_reach: Mutex::new(std::collections::HashMap::new()),
+            agentenv: Mutex::new(None),
         };
         (s, rx)
     }
@@ -7468,6 +7555,119 @@ for line in sys.stdin:
             let words: Vec<&str> = given.iter().filter_map(|p| p.pointer("/prompt/0/text").and_then(Value::as_str)).collect();
             anyhow::ensure!(words.first() == Some(&PICK_UP), "its agent was given {given:?}");
             anyhow::Ok(())
+        })
+    }
+
+    /// docs/agents.md, "Environments": a session's environment, its secret's value among it, is taken
+    /// out of its spec as it opens, so nothing that records or moves it carries it (its spec, what
+    /// resumes it, the host's record); its harness starts with it, and with the one a person applies
+    /// (`Command::Agentenv`), started again on its conversation for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_sessions_environment_is_its_harnesss_in_memory_alone_and_applied_by_a_restart() -> anyhow::Result<()> {
+        use super::super::agentenv::{Base, Resolved, Set};
+        use std::os::unix::fs::PermissionsExt as _;
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let program = dir.path().join("acp.py");
+            let seen = dir.path().join("seen");
+            // Says the variable it started with, then serves ACP as an idle agent does.
+            std::fs::write(&program, r##"#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["ACP_SEEN"], "a") as f:
+    f.write(os.environ.get("AGENTENV_PROBE", "-") + "\n")
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}
+    elif method in ("session/new", "session/load"):
+        result = {"sessionId": "s1"} if method == "session/new" else {}
+    else:
+        result = {}
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"##)?;
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+            let env = |value: &str| Resolved { id: "e1".into(), name: "work".into(), version: 1, base: Base::User, vars: vec![("AGENTENV_PROBE".into(), Set::Value(value.into()))] };
+            let (sink, updates) = async_channel::unbounded();
+            let files = attachment_files(dir.path().to_owned());
+            let s = start(crate::util::new_id(), Spec {
+                kind: "gemini".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()),
+                reach: Some("off".into()), env: vec![("ACP_SEEN".into(), seen.to_string_lossy().into_owned())], agentenv: Some(env("fake-secret-1")),
+                ..Spec::default()
+            }, sink, Arc::new(|| {}), files)?;
+            let lines = || std::fs::read_to_string(&seen).unwrap_or_default().lines().map(str::to_owned).collect::<Vec<_>>();
+            let mut was = Status::Starting;
+            // Until its harness has said it started `n` times and the session is idle.
+            let mut started = async |n: usize| -> anyhow::Result<()> {
+                while lines().len() < n || was != Status::Idle {
+                    if let (_, Update::State { state }) = updates.recv().await? {
+                        was = state.status;
+                    }
+                }
+                Ok(())
+            };
+            let result = crate::rt::timeout(Duration::from_secs(60), async {
+                started(1).await?;
+                anyhow::ensure!(lines() == ["fake-secret-1"], "its harness started with {:?}", lines());
+                // Nothing that records it, or goes with it, has its environment.
+                let spec = serde_json::to_string(&*s.spec.lock())?;
+                let kept = [spec, serde_json::to_string(&s.resume_spec())?];
+                anyhow::ensure!(kept.iter().all(|k| !k.contains("fake-secret") && !k.contains("agentenv")), "{kept:?}");
+                anyhow::ensure!(s.command(Command::Agentenv { agentenv: Some(env("fake-secret-2")), restart: true }), "the session took no command");
+                started(2).await?;
+                anyhow::ensure!(lines() == ["fake-secret-1", "fake-secret-2"], "started again with {:?}", lines());
+                anyhow::ensure!(s.resume_spec().agentenv.is_none() && !serde_json::to_string(&s.resume_spec())?.contains("fake-secret"));
+                anyhow::Ok(())
+            }).await;
+            s.close();
+            let _ = crate::rt::timeout(Duration::from_secs(10), async { while !matches!(updates.recv().await, Ok((_, Update::Closed)) | Err(_)) {} }).await;
+            result.map_err(|_| anyhow::anyhow!("timed out; its harness saw {:?}, the session {was:?}", lines()))?
+        })
+    }
+
+    /// Live, with the Claude Code installed here and its user's API key exported in their shell's
+    /// startup file (as `ANTHROPIC_API_KEY` in `~/.zshrc`): a session with no environment of its own
+    /// signs in by that key, which a runner's service never read (it ran on the subscription and paused
+    /// at its usage limits, 2026-11-18); one whose environment takes the key away signs in as the
+    /// Claude account it's logged in to. Nothing is asked of it: Claude Code says how it signed in as
+    /// it starts (its `initialize`), before a turn.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "starts the Claude Code installed here, signed in, with its user's API key in their shell"]
+    fn live_claude_signs_in_by_the_users_key_unless_its_environment_takes_it_away() -> anyhow::Result<()> {
+        use super::super::agentenv::{Base, Resolved, Set};
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let plan = async |agentenv: Option<Resolved>| -> anyhow::Result<Option<String>> {
+                // Its user's environment as a session's start reads it.
+                super::super::agentenv::refresh().await;
+                let (sink, updates) = async_channel::unbounded();
+                let s = start(crate::util::new_id(), Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), reach: Some("off".into()), agentenv, ..Spec::default() }, sink, Arc::new(|| {}), attachment_files(dir.path().to_owned()))?;
+                let said = crate::rt::timeout(Duration::from_secs(90), async {
+                    loop {
+                        if let (_, Update::State { state }) = updates.recv().await?
+                            && state.plan.is_some()
+                        {
+                            return anyhow::Ok(state.plan);
+                        }
+                    }
+                })
+                .await;
+                s.close();
+                let _ = crate::rt::timeout(Duration::from_secs(10), async { while !matches!(updates.recv().await, Ok((_, Update::Closed)) | Err(_)) {} }).await;
+                said.map_err(|_| anyhow::anyhow!("Claude Code said no plan in 90 s"))?
+            };
+            let keyed = plan(None).await?;
+            println!("LIVE no environment: {keyed:?}");
+            anyhow::ensure!(keyed.as_deref() == Some("API key"), "a session with its user's environment signed in as {keyed:?}");
+            let without = Resolved { id: "e".into(), name: "no key".into(), version: 1, base: Base::User, vars: vec![("ANTHROPIC_API_KEY".into(), Set::Unset)] };
+            let account = plan(Some(without)).await?;
+            println!("LIVE environment without the key: {account:?}");
+            anyhow::ensure!(account.is_some() && account.as_deref() != Some("API key"), "with the key taken away it signed in as {account:?}");
+            Ok(())
         })
     }
 
@@ -8518,6 +8718,7 @@ sys.exit(1)
             launched: None,
             workspace: None,
             isolation: None,
+            agentenv: None,
             runs: None,
             starts: Vec::new(),
         };

@@ -787,6 +787,9 @@ pub struct Hub {
     pub agent_limits: crate::harness::limit::AgentLimits,
     /// Each runner's engine as its owner set it here (`crate::harness::engine`).
     pub engines: crate::harness::engine::Engines,
+    /// Which environment each agent session runs with, and the runner process each was given it in
+    /// (`crate::agentenvs`).
+    pub agentenvs: crate::agentenvs::Held,
     /// Each runner's headroom settings and what it reports (docs/headroom.md).
     pub headrooms: crate::headroom::control::Headrooms,
     /// Peered clusters (`crate::peers`).
@@ -1010,6 +1013,7 @@ impl Hub {
             live,
             agent_limits: crate::harness::limit::AgentLimits::default(),
             engines: crate::harness::engine::Engines::default(),
+            agentenvs: crate::agentenvs::Held::default(),
             headrooms: crate::headroom::control::Headrooms::default(),
             peered: crate::peers::Peers::default(),
             tailnet: crate::frontdoor::tailnet::TailnetDns::default(),

@@ -11,6 +11,7 @@ pub mod accounts;
 pub mod audit;
 pub mod agent;
 pub mod agentdefs;
+pub mod agentenvs;
 pub mod agentfiles;
 pub mod confirms;
 pub mod aisessions;
