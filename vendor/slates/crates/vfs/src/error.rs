@@ -61,8 +61,9 @@ pub enum VfsError {
   /// mapping ends (Shards part 3, step 4): a guest's writable map over the file's backing holds stores not yet written
   /// back, which a `rewitness` would have to discard.
   DaxMapped,
-  /// The base beneath an overlay entry cannot be served: the host's errno.
-  BaseUnavailable(i32),
+  /// The base beneath an overlay entry cannot be served: the code the host named, typed by its numbering (A-539); none
+  /// where the volume met no host to ask (none lent, or one away).
+  BaseUnavailable(Option<crate::host::OsCode>),
   /// A witnessed base entry changed on disk beneath an unpinned range: the read refuses rather
   /// than return torn bytes; `status` lists the drift.
   BaseDrift,
@@ -108,8 +109,9 @@ pub enum VfsError {
   /// `NFS4ERR_DELAY`, `EAGAIN`).
   Delegated,
   /// The overlay's base is fetching what the operation reads (an S3 base's miss, `HostError::Pending`, A-524): nothing
-  /// changed, and the operation succeeds once the fetch lands, when the caller runs it again.
-  BasePending,
+  /// changed, and the operation succeeds once the fetch lands, when the caller runs it again. It names the fetch the host
+  /// answered under (A-555), so the caller can park the request on that fetch alone.
+  BasePending(crate::host::FetchId),
   /// A sealed chunk's segment did not open (A-99): its bytes or its tag changed in RAM, or the key it names is gone.
   /// Nothing is returned for it, never bytes that did not authenticate.
   Integrity,
@@ -185,7 +187,7 @@ impl VfsError {
       | Self::RecoveryVersion { .. } => "EIO",
       Self::NotOverlay => "ENODEV",
       Self::DigestNotClean => "ENODATA",
-      Self::DigestUnverified | Self::PublishNeeded | Self::Delegated | Self::BasePending => {
+      Self::DigestUnverified | Self::PublishNeeded | Self::Delegated | Self::BasePending(_) => {
         "EAGAIN"
       }
       Self::DigestCacheFull => "ENOSPC",

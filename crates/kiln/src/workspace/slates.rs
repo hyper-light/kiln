@@ -141,7 +141,14 @@ pub const INSTANCE: &str = "kiln";
 /// refusal, Slates' words naming the remedy (`missing_of`), and builds 45's `MountFault::Busy`, which carries the holders
 /// the kernel's own tables show (`MountHolders`, Slates' A-537), as it builds every unmount refusal. It needs none of the
 /// rest: an S3 base's names (46, Mantle's).
-pub const CONTRACT: u32 = 48;
+///
+/// 50 since kiln took Slates at 38ed3dfd8 (from 48; Slates' A-587, kiln's W8). kiln takes the revision for A-587: a
+/// Shards guest's owner word is read in the SETXATTR form the guest's INIT kept, so an isolated agent's run, a user other
+/// than the host's in its microVM, writes the volume Slates serves it, where the guest's kernel refused its create
+/// `EACCES` (main's macOS microVM drive, r134). It uses neither 49, a host refusal's code carrying its numbering
+/// (`HostFault::Base` names an `OsCode`; kiln matches only `HostFault::Target`), nor 50, a volume exported to one client
+/// (`Instance::export`, for kiln's Kubernetes engine, W10).
+pub const CONTRACT: u32 = 50;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.
