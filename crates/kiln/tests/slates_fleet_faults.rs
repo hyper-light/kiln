@@ -18,11 +18,12 @@
 //! three Slates instances and their anchors; without it each skips, saying so. Linux alone, where a workspace is a FUSE
 //! mount: on macOS it's a kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount has
 //! panicked the Mac (Slates' record of 2026-10-06), so the macOS flows wait until a runner lets its workspace mounts go
-//! before a fault.
+//! before a fault. The test builds on every Unix, so a change that breaks it is seen where it is made; off Linux each
+//! flow skips, saying why, whatever the switch says.
 //!
 //!   SLATES_FLEET_FAULTS=1 cargo test -p kiln --test slates_fleet_faults -- --nocapture --test-threads 1
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 mod vm_e2e;
@@ -51,6 +52,10 @@ const LOOK: Duration = Duration::from_millis(250);
 
 /// Whether the flows run here; a skip says why.
 fn enabled() -> bool {
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipped: kiln's Slates fleet is faulted on Linux alone (a daemon stopped under a macOS workspace's NFS mount has panicked the Mac)");
+        return false;
+    }
     if std::env::var_os(SWITCH).is_some_and(|v| v == "1") {
         return true;
     }
