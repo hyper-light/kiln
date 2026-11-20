@@ -680,12 +680,14 @@ In order, each its own piece:
 4. **Where a served volume is offered.** `/api/harness/workspaces` says per machine whether it gives a volume served
    to a microVM beside whether it gives a mounted one, so the composer offers Own volume for an isolated agent on a
    host without WinFsp, and the e2e microVM drive's readiness reads it.
-5. **The drive on Windows.** `tests/slates_e2e.rs`'s `microvm::` drive is still `#[cfg(unix)]`, where its bare-metal
-   sibling runs on Windows since 2026-11-19 (a drive letter judged Slates' by `slates_mounted_at`, the host's
-   processes read through CIM's `Win32_Process` as `vm_e2e` reads them); its stand-in runs in the guest, so opening
-   its gate is those looks over a session with no mount, which no drive letter may show.
-6. **The runs, main's:** the `microvm::` drive on adacachy (KVM, now) and on jupiter (WHP, once 2, 3 and 5 are in),
-   each through `kiln run` on a kiln carrying Shards packed for that host.
+5. **Built (2026-11-20): the drive on Windows.** `tests/slates_e2e.rs`'s `microvm::` drive runs on Windows as on Unix
+   (its resync drive, `g90_`, stays Unix's: Windows' channel names a handle Shards' device takes none of yet). Its
+   looks at the host are its bare-metal sibling's (the host's processes through CIM's `Win32_Process`), and a session
+   with no mount is one no drive letter of the host's holds Slates' file system for (`host_mounts`' `SLATES_DRIVE`).
+6. **The runs:** the `microvm::` drive on adacachy (KVM) and on Windows WHP, each on a kiln carrying Shards packed
+   for that host. WHP runs on GitHub's windows-2025 (`.github/workflows/whp-drive.yml`, on a push of it or by hand),
+   whose image has the hypervisor platform on and lets Shards make its VMs' AppContainer profiles, which jupiter
+   takes Ada's word for.
 
 A Slates daemon's restart no longer ends a microVM's share (kiln goal 90; built 2026-11-19 on macOS and Linux):
 Slates hands a successor daemon's fresh stream to a device over its resync channel (A-316, A-339), and

@@ -1,0 +1,78 @@
+# kiln's microVM drive on Windows WHP (docs/agentic.md W8 piece 6; kiln goal 90, part
+# 01a1f1249c5e75b5bc82c9eb011550f4): `slates_e2e`'s `microvm::` drive, the same one that passes on
+# macOS HVF and runs on Linux KVM, on GitHub's windows-2025, whose image has the Windows Hypervisor
+# Platform on (Shards' own CI runs WHP partitions there: its ci.yml, SHARDS_REQUIRE_VMS=1). kiln's
+# build packs the Shards it carries from vendor/shards as on every host (crates/kiln/build.rs,
+# ci/shards/pack.sh: NASM and zig into this user's cache, Shards' toolchain with its musl targets).
+# SLATES_E2E=1 and VM_E2E=1 make a runner that gives no volume or starts no microVM a failure, not a
+# skip. The stand-in's image is built from kiln's repository at this commit, so it runs on a pushed
+# commit. Runs when this file changes, or when asked.
+name: whp drive
+
+on:
+  push:
+    paths:
+      - .github/workflows/whp-drive.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # kiln's tests build without ui/dist.
+  KILN_SKIP_UI_BUILD: "1"
+  # aws-lc-sys on x86_64 Windows (kiln's own TLS): the crate's shipped objects, as ci.yml builds it.
+  AWS_LC_SYS_PREBUILT_NASM: "1"
+
+jobs:
+  drive:
+    name: microvm drive (windows-2025, WHP)
+    runs-on: windows-2025
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Host
+        shell: pwsh
+        run: |
+          (Get-CimInstance Win32_Processor).Name
+          [System.Environment]::OSVersion.VersionString
+          "HypervisorPresent: " + (Get-CimInstance Win32_ComputerSystem).HypervisorPresent
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, Used, Free
+      - id: drive
+        name: The microVM drive on WHP
+        timeout-minutes: 220
+        run: |
+          set -o pipefail
+          SLATES_E2E=1 VM_E2E=1 cargo test --locked -p kiln --test slates_e2e microvm:: -- --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/drive.txt"
+          # A drive that compiled none of its tests in proves nothing.
+          grep -q -E '^test microvm::g266_[a-z_]+ \.\.\. ok$' "$RUNNER_TEMP/drive.txt"
+      # What the drive said, without cargo's progress, as one annotation: its last 150 lines, or,
+      # where no test ran (the build failed), 150 from its first error.
+      - name: Report
+        if: ${{ always() }}
+        env:
+          OUTCOME: ${{ steps.drive.outcome }}
+        run: |
+          set +e +o pipefail
+          out="$RUNNER_TEMP/drive.txt"
+          if [ ! -s "$out" ]; then exit 0; fi
+          plain=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Blocking|Downloaded|Downloading|Updating|Locking) ')
+          text=$(printf '%s\n' "$plain" | tail -n 150)
+          if ! printf '%s\n' "$plain" | grep -q -E '^running [0-9]+ tests?$'; then
+            first=$(printf '%s\n' "$plain" | sed -n '/^error/,$p' | head -n 150)
+            if [ -n "$first" ]; then text=$first; fi
+          fi
+          level=notice
+          if [ "$OUTCOME" != success ]; then level=error; fi
+          echo "::$level title=microvm drive $OUTCOME::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
