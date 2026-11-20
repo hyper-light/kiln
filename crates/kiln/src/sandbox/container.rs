@@ -112,7 +112,7 @@ fn plan_of(launch: &Launch, program: &str, judged: &EngineProfile, made: &Made, 
     Ok(Plan {
         program: program.to_owned(),
         engine: judged.profile.engine,
-        tested: judged.tested.clone(),
+        tested: judged.tested,
         name,
         image: image.to_owned(),
         entrypoint: Some(KEEPER.to_owned()),

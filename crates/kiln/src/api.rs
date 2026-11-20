@@ -8794,6 +8794,7 @@ mod tests {
     /// W8 piece 4: a runner without a host mount (a Windows host without WinFsp) is said to give a volume served to a
     /// microVM beside giving none mounted on its host, each with its own why; one that keeps no workspaces gives neither.
     #[test]
+    #[allow(clippy::indexing_slicing, reason = "a missing key reads as null and fails its assertion")]
     fn w8_p4_a_runners_workspaces_say_a_served_volume_beside_a_mounted_one() {
         use crate::harness::lineage::NoWorkspace;
         use crate::workspace::slates::WorkspaceMissing as Lacks;

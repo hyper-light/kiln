@@ -358,6 +358,7 @@ where
                     tracing::info!(verb, "this runner's Slates node hasn't imported kiln's Slates fleet's groups yet: it waits for them");
                     said = true;
                 }
+                #[allow(clippy::disallowed_methods)] // (c) Slates' node sends no notification when it has imported kiln's fleet's groups: asked again
                 crate::rt::sleep(GROUPS_LOOK).await;
             }
             other => return other.map_err(|e| anyhow::anyhow!("Slates' {verb}: {e}")),
@@ -383,6 +384,7 @@ async fn bootstrap_if_named(source: &super::slates_fleet::Source, listed: usize,
             tracing::info!(held = f.members.len(), listed, "this runner bootstraps kiln's Slates fleet once its node holds every node in contact: it waits");
             said = true;
         }
+        #[allow(clippy::disallowed_methods)] // (c) Slates' node sends no notification when it holds every node in contact: asked again
         crate::rt::sleep(GROUPS_LOOK).await;
     }
     call("bootstrap", |i| i.ensure_group()).await?;
@@ -570,6 +572,7 @@ async fn up_or_started() -> anyhow::Result<()> {
                         tracing::warn!(error = %format!("{e:#}"), "this runner couldn't settle kiln's Slates fleet's bootstrap: it asks again");
                         said = true;
                     }
+                    #[allow(clippy::disallowed_methods)] // (c) Slates' node sends no notification when a bootstrap can be settled: asked again
                     crate::rt::sleep(BOOTSTRAP_AGAIN).await;
                 }
             }
@@ -1005,6 +1008,7 @@ async fn held_across_fleet(id: VolumeId) -> anyhow::Result<()> {
                     tracing::info!(?silent, "a new workspace waits for every member of kiln's Slates fleet to say its user, to be shared with it");
                     said = true;
                 }
+                #[allow(clippy::disallowed_methods)] // (c) kiln's Slates fleet sends no notification when every member has said its user: asked again
                 crate::rt::sleep(GROUPS_LOOK).await;
             }
         }
@@ -1227,13 +1231,29 @@ pub async fn remove(m: &Made) -> anyhow::Result<()> {
 pub async fn remove_after_container(m: &Made) -> anyhow::Result<()> {
     match remove(m).await {
         Err(e) if lets_go_after_container(&e) => {
-            let path = m.mount.clone();
-            let let_go = crate::rt::blocking(move || slates_api::mount::unmount_busy(&path)).await?.map_err(|fault| anyhow::anyhow!("Slates' let-go of {}: {fault}", m.mount))?;
-            tracing::info!(mount = %m.mount, how = ?let_go, "an ended container's workspace, still held by its engine's file sharing, is let go of");
+            let_go_busy(&m.mount, e).await?;
             remove(m).await
         }
         done => done,
     }
+}
+
+/// Lets go of a container's workspace mount that stays only as it's busy ([`remove_after_container`]): Slates'
+/// `mount::unmount_busy` (forced off on macOS, detached on Linux).
+#[cfg(not(windows))]
+async fn let_go_busy(mount: &str, _stays: anyhow::Error) -> anyhow::Result<()> {
+    let path = mount.to_owned();
+    let let_go = crate::rt::blocking(move || slates_api::mount::unmount_busy(&path)).await?.map_err(|fault| anyhow::anyhow!("Slates' let-go of {mount}: {fault}"))?;
+    tracing::info!(mount = %mount, how = ?let_go, "an ended container's workspace, still held by its engine's file sharing, is let go of");
+    Ok(())
+}
+
+/// On Windows a workspace's WinFsp drive is its daemon's own, and Slates has no let-go of a busy one
+/// (`mount::unmount_busy` is its Unix hosts' alone; nor does Slates' container form run on Windows): the mount that
+/// stays keeps its volume, refused as W3's are, with why.
+#[cfg(windows)]
+async fn let_go_busy(mount: &str, stays: anyhow::Error) -> anyhow::Result<()> {
+    Err(stays.context(format!("Slates has no let-go of a busy WinFsp drive ({mount}): its volume is kept")))
 }
 
 /// Whether a container's workspace whose [`remove`] failed with `e` is let go of ([`remove_after_container`]): its mount
