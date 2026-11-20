@@ -268,7 +268,7 @@ fn what_kiln_cd_deploys_observe_counts_alerts_on_and_dora_measures() -> anyhow::
     let c1 = commit(&repo, now - 3 * HOUR, &[("deploy/config.yaml", CONFIG), ("deploy/web.yaml", &deployment(&image, 120))], "Add web");
     let url = file_url(&repo);
 
-    let tables = Tables { cd: "enabled = true\npoll_seconds = 2", host_seconds: 2 };
+    let tables = Tables { cd: "enabled = true\npoll_seconds = 2", host_seconds: 2, ..Tables::default() };
     let f = Fleet::with_tables(&tables, |_| format!("[[repos]]\nname = \"acme/web\"\nclone_url = \"{url}\"\nbranches = [\"main\"]\npoll_seconds = 3600\n"), &[])?;
     let t0 = now_ms();
 
