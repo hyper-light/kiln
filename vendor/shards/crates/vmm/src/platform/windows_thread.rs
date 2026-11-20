@@ -66,15 +66,24 @@
 //!
 //! A thread's half bounds what it takes alone, not what raised threads take together: three
 //! that share one CPU each run a third of it, each under its half, and keep it from the
-//! host's threads between them (platform-10). So the raised threads that may run on one set
+//! host's threads between them (platform-10). So the watched threads that may run on one set
 //! of CPUs (GetThreadGroupAffinity: a processor group and a mask in it, read at each look)
-//! also share a pool, credited half of each of those CPUs' time and charged what they ran
-//! raised, kept to a period of each either way: a thread is raised only while its own credit
-//! and its set's pool both have some, and lowered while either has none. Raised threads so
-//! take half of the CPUs they run on over any long stretch, and two periods of each more at
-//! most, however many share them, and lowered ones only what no host's thread wants. A
-//! pool is the governor's, one a process: the raised threads of other processes (other VM
-//! processes on the host) draw on pools of their own, which no owner here sees (owed, D191).
+//! also share a pool, credited half of each of those CPUs' time and charged all they ran,
+//! raised or lowered, as each thread's own credit is, kept to a period of each either way: a
+//! thread is raised only while its own credit and its set's pool both have some, and lowered
+//! while either has none. Watched threads so take half of the CPUs they run on over any long
+//! stretch, by the clock the governor reads, and two periods of each more at most, however
+//! many share them and whatever Windows runs them at. Lowered, they run where no host's
+//! thread wants their CPU, and what they run there leaves their pool in debt, a period at
+//! most, which they pay before they are raised again. A pool charged only what its threads
+//! ran raised, as until 2026-11-19, left out what its clock charged them lowered: on
+//! windows-2022 three spinners beside a normal thread on one CPU were raised in 49.8% of the
+//! governor's looks, ran 53.4% of the CPU's cycles (QueryThreadCycleTime), and were charged
+//! 78.6% of 3 s by GetThreadTimes, the steps it lands on them across the looks that lower
+//! them charged to no pool (PM M620; the test below failed there twice, CI 44379986478 and
+//! 44408928475). A pool is the governor's, one a process: the watched threads of other
+//! processes (other VM processes on the host) draw on pools of their own, which no owner here
+//! sees (owed, D191).
 //!
 //! The credit is what keeps a thread that waits raised, as GetThreadTimes counts: in whole
 //! steps of its clock, 15.625 ms (PM M294), each charged to the thread that runs as it
@@ -403,10 +412,10 @@ impl Governed {
     }
 
     /// One look at every watched thread at `now`, over `period`: each charged what it used
-    /// since its last ([`charge`]), and its CPUs' pool what it ran raised; then each raised
-    /// where its own credit and its pool's both have some, else lowered.
+    /// since its last ([`charge`]), and its CPUs' pool all of it, raised or lowered; then each
+    /// raised where its own credit and its pool's both have some, else lowered.
     fn look(&mut self, now: Instant, period: Duration) {
-        // Each set of CPUs a thread may run on, and what its threads ran raised.
+        // Each set of CPUs a thread may run on, and what its threads ran.
         let mut sets: Vec<(Cpus, u64)> = Vec::new();
         for w in &mut self.threads {
             let used = charge(w, now, period).unwrap_or(0);
@@ -439,8 +448,8 @@ impl Governed {
 
 /// A watched thread's look at `now`, once a `period` has passed since its last: its credit
 /// given half of the time since and charged the CPU time it used, and its CPUs read again.
-/// What it ran raised, its pool's to be charged: `None` where no look was due or its time is
-/// unread.
+/// What it used, its pool's to be charged too, whatever its level: `None` where no look was
+/// due or its time is unread.
 fn charge(w: &mut Watched, now: Instant, period: Duration) -> Option<u64> {
     let passed = now.saturating_duration_since(w.at);
     if passed < period {
@@ -461,10 +470,7 @@ fn charge(w: &mut Watched, now: Instant, period: Duration) -> Option<u64> {
         Ok(cpus) => w.cpus = cpus,
         Err(e) => crate::debug!("a watched thread's CPUs are those last read: {e}"),
     }
-    Some(match w.level {
-        Level::Raised => used,
-        Level::Lowered | Level::Normal => 0,
-    })
+    Some(used)
 }
 
 /// Sets a watched thread at `level`, where it is not at it already; refused, it stays at the
@@ -484,6 +490,63 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriorityBoost};
+    #[cfg(target_arch = "x86_64")]
+    use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+
+    /// The calling thread's CPU cycles (QueryThreadCycleTime), which x86-64's Windows counts
+    /// in its time stamp counter's ticks, one rate on every CPU (an invariant TSC): a thread's
+    /// share of a window's ticks is its share of that time, with none of the clock steps
+    /// GetThreadTimes charges in, which on windows-2022 charged three governed spinners 78.6% of
+    /// a window whose cycles they ran 53.4% of (PM M620).
+    #[cfg(target_arch = "x86_64")]
+    fn cycles() -> u64 {
+        let mut cycles = 0u64;
+        // SAFETY: the calling thread's pseudo-handle, and a count to write.
+        let read = unsafe { QueryThreadCycleTime(GetCurrentThread(), &raw mut cycles) };
+        assert_ne!(read, 0, "{}", io::Error::last_os_error());
+        cycles
+    }
+
+    /// The time stamp counter now: the window [`cycles`] are a share of.
+    #[cfg(target_arch = "x86_64")]
+    fn stamp() -> u64 {
+        // SAFETY: RDTSC reads the counter, as every x86-64 CPU has it.
+        unsafe { std::arch::x86_64::_rdtsc() }
+    }
+
+    /// What a thread used, by GetThreadTimes ([`ThreadClock`]) and, on x86-64, in cycles.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct Used {
+        clock: u64,
+        cycles: u64,
+    }
+
+    impl Used {
+        /// The calling thread's, so far.
+        fn now(clock: &ThreadClock) -> Used {
+            Used {
+                clock: clock.read().unwrap(),
+                #[cfg(target_arch = "x86_64")]
+                cycles: cycles(),
+                #[cfg(not(target_arch = "x86_64"))]
+                cycles: 0,
+            }
+        }
+
+        fn since(self, from: Used) -> Used {
+            Used {
+                clock: self.clock - from.clock,
+                cycles: self.cycles - from.cycles,
+            }
+        }
+
+        fn add(self, other: Used) -> Used {
+            Used {
+                clock: self.clock + other.clock,
+                cycles: self.cycles + other.cycles,
+            }
+        }
+    }
 
     /// The priority of thread `id` of this process, read from another thread.
     fn priority_of(id: u32) -> i32 {
@@ -668,22 +731,25 @@ mod tests {
     /// Do: pin a thread of normal priority to one CPU, spinning, then three threads there
     /// that the governor watches, spinning too, for 3 s. Expect the three to have used no
     /// more than half of the time and two periods, the module's bound for one CPU, and the
-    /// normal thread to have run. Raised, they take what their pool is credited (its
-    /// arithmetic held by granule's `a_share_takes_half_its_cpu_and_two_periods_over_any_stretch`);
-    /// lowered, they run "only when there are no executable threads at a higher level"
-    /// (SetThreadPriority), and the normal thread, ready on their CPU throughout, is at one.
-    /// Their boost on waking is off: one woken from a wait for the governor's lock would be
-    /// lifted to the normal thread's priority or past it, a level less each time slice it
-    /// completed (Priority Boosts). Their use is read from their own clocks (GetThreadTimes),
-    /// whose steps the governor charges them. Lowered to the normal thread's priority, as until
-    /// 2026-11-18, they kept the CPU between them, and on windows-2022 the normal thread was
-    /// charged no step in the 3 s (CI 44347282760).
+    /// normal thread to have run. Their pool is credited half of the CPU and charged all
+    /// they ran (its arithmetic held by granule's
+    /// `a_share_takes_half_its_cpu_and_two_periods_over_any_stretch`); lowered, they run
+    /// "only when there are no executable threads at a higher level" (SetThreadPriority), and
+    /// the normal thread, ready on their CPU throughout, is at one. Their boost on waking is
+    /// off: one woken from a wait for the governor's lock would be lifted to the normal
+    /// thread's priority or past it, a level less each time slice it completed (Priority
+    /// Boosts). Their use is read from their own clocks (GetThreadTimes), whose steps the
+    /// governor charges them. Lowered to the normal thread's priority, as until 2026-11-18,
+    /// they kept the CPU between them, and on windows-2022 the normal thread was charged no
+    /// step in the 3 s (CI 44347282760); their pool charged only what they ran raised, as until
+    /// 2026-11-19, they were charged 2.25 s of 3.0 there, the steps of their lowered looks
+    /// uncharged (CI 44408928475, PM M620).
     #[test]
     fn raised_threads_sharing_a_cpu_take_no_more_than_half_of_it() {
         const RAISED_THREADS: usize = 3;
         let cpu = last_cpu();
         let spinning = AtomicBool::new(true);
-        let (raised_ran, host_ran, elapsed) = std::thread::scope(|s| {
+        let (raised_ran, host_ran, elapsed, stamps) = std::thread::scope(|s| {
             let stop = Stop(&spinning);
             let spinning = &spinning;
             // The normal thread, on the CPU before the three are watched: ready there
@@ -692,14 +758,17 @@ mod tests {
             let normal = s.spawn(move || {
                 pin(cpu);
                 let clock = ThreadClock::current().unwrap();
+                let from = Used::now(&clock);
                 on_cpu.send(()).unwrap();
                 while spinning.load(Ordering::Relaxed) {
                     std::hint::spin_loop();
                 }
-                clock.read().unwrap()
+                Used::now(&clock).since(from)
             });
             is_on_cpu.recv().unwrap();
             let began = Instant::now();
+            #[cfg(target_arch = "x86_64")]
+            let stamped = stamp();
             let raised: Vec<_> = (0..RAISED_THREADS)
                 .map(|_| {
                     s.spawn(move || {
@@ -708,11 +777,11 @@ mod tests {
                         pin(cpu);
                         let watch = raise_current().unwrap().unwrap();
                         let clock = ThreadClock::current().unwrap();
-                        let from = clock.read().unwrap();
+                        let from = Used::now(&clock);
                         while spinning.load(Ordering::Relaxed) {
                             std::hint::spin_loop();
                         }
-                        let ran = clock.read().unwrap() - from;
+                        let ran = Used::now(&clock).since(from);
                         drop(watch);
                         ran
                     })
@@ -720,18 +789,51 @@ mod tests {
                 .collect();
             std::thread::sleep(Duration::from_secs(3));
             drop(stop);
-            let raised_ran: u64 = raised.into_iter().map(|thread| thread.join().unwrap()).sum();
+            let raised_ran = raised
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .fold(Used::default(), Used::add);
             let elapsed = began.elapsed();
-            (Duration::from_nanos(raised_ran), normal.join().unwrap(), elapsed)
+            #[cfg(target_arch = "x86_64")]
+            let stamps = stamp() - stamped;
+            #[cfg(not(target_arch = "x86_64"))]
+            let stamps = 0;
+            (raised_ran, normal.join().unwrap(), elapsed, stamps)
         });
         let period = period().unwrap();
         let bound = elapsed / 2 + period * 2;
         let said = format!(
-            "the three used {raised_ran:?} of {elapsed:?} (at most {bound:?}: half of it and two \
-             periods of {period:?}); the normal thread was charged {host_ran} ns"
+            "the three were charged {:?} of {elapsed:?} by GetThreadTimes (half of it and two \
+             periods of {period:?}: {bound:?}), and ran {} of its {stamps} counter ticks; the normal \
+             thread was charged {} ns, and ran {} ticks",
+            Duration::from_nanos(raised_ran.clock),
+            raised_ran.cycles,
+            host_ran.clock,
+            host_ran.cycles,
         );
-        assert!(raised_ran <= bound, "past their bound: {said}");
-        assert!(host_ran > 0, "the normal thread never ran: {said}");
+        // On x86-64, what they ran, in cycles of the window's counter ticks, not the steps
+        // GetThreadTimes charged them in (PM M620); the bound's periods as many ticks as the
+        // window's ticks a nanosecond.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let per_ns = |d: Duration| {
+                u64::try_from(u128::from(stamps) * d.as_nanos() / elapsed.as_nanos().max(1)).unwrap()
+            };
+            let most = stamps / 2 + per_ns(period * 2);
+            assert!(
+                raised_ran.cycles <= most,
+                "past their bound of {most} ticks: {said}"
+            );
+            assert!(host_ran.cycles > 0, "the normal thread never ran: {said}");
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            assert!(
+                Duration::from_nanos(raised_ran.clock) <= bound,
+                "past their bound: {said}"
+            );
+            assert!(host_ran.clock > 0, "the normal thread never ran: {said}");
+        }
     }
 
     /// A set of CPUs' pool is credited half of each CPU's time and kept to a period of each:

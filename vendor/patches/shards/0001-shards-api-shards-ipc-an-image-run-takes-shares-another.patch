@@ -284,10 +284,10 @@ index 7535c206fb64f6e359d3dc5fad35ee6249986bc8..d8d49211d390d331d364ef3381a50959
      /// directory of the members' view; one that is relative, nested, one of init's own or
      /// granted twice is refused by field before any run host starts, as the guest would refuse
 diff --git a/crates/api/src/image/pool.rs b/crates/api/src/image/pool.rs
-index 44102a4b671a7c7cdbe8fcf59a0254d8b294e3be..daad732531ba66212d500d474df62d9a37fbeb38 100644
+index ece7f4eac80393005210db42b705bbb802281cf1..32fdfce16c6d8ca0b8160d1c4a566e1b5d38f82b 100644
 --- a/crates/api/src/image/pool.rs
 +++ b/crates/api/src/image/pool.rs
-@@ -179,7 +179,10 @@ fn sized(request: &wire::Request) -> wire::Request {
+@@ -182,7 +182,10 @@ fn sized(request: &wire::Request) -> wire::Request {
  }
  
  fn pool_of(spec: &ImageSpec, request: &wire::Request) -> Result<Option<Of>, ImageRefusal> {
@@ -299,7 +299,7 @@ index 44102a4b671a7c7cdbe8fcf59a0254d8b294e3be..daad732531ba66212d500d474df62d9a
          return Ok(None);
      }
      let request = sized(request);
-@@ -1956,6 +1959,7 @@ mod tests {
+@@ -1960,6 +1963,7 @@ mod tests {
              upstream_roots: Vec::new(),
              plug_roots: Vec::new(),
              egress_ceiling: Vec::new(),
@@ -307,7 +307,7 @@ index 44102a4b671a7c7cdbe8fcf59a0254d8b294e3be..daad732531ba66212d500d474df62d9a
              gpu_report: None,
          }
      }
-@@ -1979,6 +1983,7 @@ mod tests {
+@@ -1983,6 +1987,7 @@ mod tests {
              upstream_roots: Vec::new(),
              plug_roots: Vec::new(),
              egress_ceiling: Vec::new(),
@@ -315,7 +315,7 @@ index 44102a4b671a7c7cdbe8fcf59a0254d8b294e3be..daad732531ba66212d500d474df62d9a
              gpu_report: None,
          }
      }
-@@ -2177,6 +2182,38 @@ mod tests {
+@@ -2181,6 +2186,38 @@ mod tests {
          room.balanced();
      }
  

@@ -40,18 +40,15 @@ impl Warmup {
 /// Whether a runner whose owner set its engine to `engine` (none: none set), its kiln carrying Shards or not
 /// (`carried`), surely runs its sessions on its host (`harness::engine`): its owner set `host`, or none was set and it
 /// can hold no microVMs. One that may run them in microVMs asks no harness on its host for anything.
-fn sessions_on_host(engine: Option<crate::harness::engine::Engine>, carried: bool) -> bool {
-    match engine {
-        Some(crate::harness::engine::Engine::Host) => true,
-        Some(crate::harness::engine::Engine::Microvm) => false,
-        None => !carried,
-    }
+fn sessions_on_host(engine: Option<crate::harness::engine::Engine>) -> bool {
+    // None set: kiln carries Shards, so its sessions may run in microVMs.
+    matches!(engine, Some(crate::harness::engine::Engine::Host))
 }
 
 #[cfg(not(test))]
 pub(super) fn warm_models() {
     // Asked again at each listing of kinds (`kinds::offered`): a runner set to `host` later warms it then.
-    if !sessions_on_host(crate::harness::engine::here().engine, crate::shards::carried()) {
+    if !sessions_on_host(crate::harness::engine::here().engine) {
         return;
     }
     static STATE: std::sync::LazyLock<parking_lot::Mutex<Warmup>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(Warmup::default()));
@@ -234,11 +231,9 @@ mod tests {
     #[test]
     fn s35_a_microvm_runner_asks_no_harness_on_its_host_for_its_catalog() {
         use crate::harness::engine::Engine;
-        assert!(!super::sessions_on_host(Some(Engine::Microvm), true));
-        assert!(!super::sessions_on_host(Some(Engine::Microvm), false));
-        assert!(!super::sessions_on_host(None, true), "none set, its kiln carrying Shards: its sessions may run in microVMs");
-        assert!(super::sessions_on_host(Some(Engine::Host), true));
-        assert!(super::sessions_on_host(None, false));
+        assert!(!super::sessions_on_host(Some(Engine::Microvm)));
+        assert!(!super::sessions_on_host(None), "none set, its kiln carrying Shards: its sessions may run in microVMs");
+        assert!(super::sessions_on_host(Some(Engine::Host)));
     }
 
     use super::*;

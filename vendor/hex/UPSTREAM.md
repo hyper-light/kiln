@@ -23,8 +23,10 @@ The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e8
   and folders changed in place (`Runtime::change`, `Call::Change` 0x0027, `Refusal::Live`, `BoxInfo::live`; kiln plan
   01a1dd2e…, P6b.3).
   It takes Shards' crates by git at `460675322` (Shards' v0.8.0 tag, `aa819b058`, with D286's two commits: the Shards
-  ROOT's branch `p/served-shares-on-v0.8.0`, until Shards' main holds them), whose crates are byte for byte kiln's copy
-  of Shards (v0.8.0 with D286's API side recorded: vendor/shards/UPSTREAM.md), and hyper-raft at `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
+  ROOT's branch `p/served-shares-on-v0.8.0`, until Shards' main holds them), which kiln's root manifest points at
+  kiln's copy of Shards (`[patch."https://github.com/hyper-light/shards"]`): Shards' main `9e649df34e`, v0.8.0 and its
+  fixes since, with the same served-shares change recorded (vendor/shards/UPSTREAM.md), so Hex's crates build on
+  kiln's Shards; and hyper-raft at `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
   of what kiln touches: docs/shards.md).
 - **How kiln uses it:** `hex-node`, and through it Hex's runtime, client, QUIC wire, scheduler simulation, health
   and GPU telemetry, by name; kiln's root `[patch.crates-io]` points the name here, and `seccompiler` (third-party

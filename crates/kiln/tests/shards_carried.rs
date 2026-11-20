@@ -21,10 +21,6 @@ const WITHIN: Duration = Duration::from_secs(300);
 
 #[test]
 fn step16_kilns_carried_vm_process_boots_a_guest() -> anyhow::Result<()> {
-    if !kiln::shards::carried() {
-        eprintln!("SKIP: this kiln carries no Shards: ci/shards/pack.sh builds it, then build kiln");
-        return Ok(());
-    }
     let base = tempfile::tempdir()?;
     let held = kiln::shards::write_out(base.path())?;
     for f in [&held.shards, &held.vm, &held.net] {

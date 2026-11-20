@@ -749,7 +749,7 @@ index aa793b76eccc4393aad4acf5767475a4303f7033..5286b3fe11083958d302d5715450e053
      use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
      use windows_sys::Win32::System::Console::{
 diff --git a/crates/shards/src/daemon.rs b/crates/shards/src/daemon.rs
-index b04884f3bb143b59e88b322181c74d095e4c2ed6..ec5bea84b3b8cc75312fb0e46971511f480c1f8b 100644
+index 3bce0349bc6b9c03582b4ef4ce38cfbd16fe450d..51fabb4a07effa1f143f65c67b6fc5d3e40a4c6b 100644
 --- a/crates/shards/src/daemon.rs
 +++ b/crates/shards/src/daemon.rs
 @@ -171,9 +171,10 @@ type JoinDoor = (UnixStream, u32);

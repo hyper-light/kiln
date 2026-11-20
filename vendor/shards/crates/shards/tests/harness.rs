@@ -1709,6 +1709,37 @@ fn a_drain_whose_requests_stop_ending_is_refused_and_keeps_nothing() {
     drop(end);
 }
 
+/// A rate's drain refused in a span its host refused VM entries in, every refusal its host's by
+/// D261's gate, is its host's, not the bench's failure, as the rest of that rate is
+/// (`common::drained`; ROOT's ruling (c) of 2026-11-18); refused in any other span it is a stall,
+/// the bench's failure; its requests all ended, neither. CI 44379986478's firecracker job, rate
+/// 40 on EC2's nested KVM: 8 requests never ended in a span its host refused entries in, and the
+/// bench failed on the stall before it read its span's refusals. Do: one drain refused after two
+/// of its ends, read with its span its host's and not; one that ended. Expect: its host's, a
+/// stall, and its ends, each with the ends that came.
+#[test]
+fn a_drain_refused_in_its_hosts_span_is_its_hosts_and_elsewhere_a_stall() {
+    let refused = || Err::<Vec<u32>, _>((vec![7, 8], "a request's next end made no progress".to_string()));
+    match common::drained(refused(), true) {
+        common::Drained::HostsSpan(came, why) => assert_eq!(came, [7, 8], "{why}"),
+        common::Drained::Came(_) | common::Drained::Stalled(..) => {
+            panic!("a drain refused in its host's span not taken for its host's")
+        }
+    }
+    match common::drained(refused(), false) {
+        common::Drained::Stalled(came, why) => assert_eq!(came, [7, 8], "{why}"),
+        common::Drained::Came(_) | common::Drained::HostsSpan(..) => {
+            panic!("a drain refused in a span not its host's not taken for a stall")
+        }
+    }
+    match common::drained(Ok(vec![7, 8, 9]), true) {
+        common::Drained::Came(came) => assert_eq!(came, [7, 8, 9]),
+        common::Drained::HostsSpan(..) | common::Drained::Stalled(..) => {
+            panic!("a drain that ended taken for refused")
+        }
+    }
+}
+
 /// A call that blocks until its answer or its run's end (`common::judged`: shards-api's calls
 /// given no bound, `Duration::MAX`, in api_image.rs, member_exec.rs and nesting.rs, and their
 /// reads of a run's channels) goes on while what this test's process started works, as a
@@ -3147,6 +3178,48 @@ fn a_failed_runs_vm_refusal_is_read_by_its_vms_pid() {
     assert_eq!(common::run_refusal(&said, &other), "");
 }
 
+/// A container's VM's refusal is read from its daemon's log by the container's own ID, where
+/// no client heard its run's words (`common::container_refusal`, what
+/// `common::container_host_refused` gates): the VM its daemon logged as unable to serve that
+/// container's run, and that VM's refusal, not another container's VM's, nor one whose ID only
+/// begins with its own. CI 44379986478, x86_64 musl, daemon.rs
+/// `idle_followers_cost_nothing_and_end_with_their_container`: `run -d`'s VM 201354 refused
+/// (0x7, after its guest ran), the container ended with it, and `kill up` failed "it is not
+/// running" with no refusal its test could read. A stand-in log, as the daemon and a warm VM's
+/// own log write it, in the order that run's did: the VM's refusal before the daemon's line.
+#[test]
+fn a_containers_vm_refusal_is_read_by_its_id() {
+    let refusal = |pid: u32| {
+        format!(
+            "vCPU 3: VM entry failed (hardware reason 0x7): the host's hypervisor (KVM under \
+             KVMKVMKVM) refused to enter it (after its guest ran, at 1795033598.145239 s, VM \
+             process {pid})"
+        )
+    };
+    let unserved = "the guest stopped before the command ended: failed to fill whole buffer";
+    let up = "1c2045a27baf0a278652f9f8377d363b5815934a74966c74f407e6b235962e5f";
+    let log = format!(
+        "[201354 2141091us WARN] {}\n\
+         [999 120us WARN] {}\n\
+         [31337 120us WARN] {}\n\
+         shards daemon 201193: container {up}: its VM 201354 could not serve its run: {unserved}\n\
+         shards daemon 201193: container 85674155d5e9: its VM 999 could not serve its run: {unserved}\n\
+         shards daemon 201193: container {up}0: its VM 31337 could not serve its run: {unserved}\n",
+        refusal(201354),
+        refusal(999),
+        refusal(31337),
+    );
+    let read = common::container_refusal(up, &log);
+    assert!(
+        read.contains("VM process 201354")
+            && !read.contains("VM process 999")
+            && !read.contains("VM process 31337"),
+        "{read}"
+    );
+    // A container whose VM its daemon logged nothing of: none, its failure its test's.
+    assert_eq!(common::container_refusal("85674155d5e9aa", &log), "");
+}
+
 /// A stream that a process still holds as its run's wait gives it up is taken whole, every byte
 /// its command wrote before its end among it, however late its reader runs
 /// (`common::Collected::ask`). KVM, 32 CPUs at load ~50, rust:1.98.1 glibc, at 45fdaf49a6:
@@ -3382,12 +3455,14 @@ fn a_kept_rating_weighs_only_work_counted_as_this_host_counts_it() {
                 over: ns(over),
             },
             most: shards_api::Work::of(most),
+            lightest: shards_api::Work::of(most),
             answers,
         })
     };
     let slowest = ns(240_614_800);
     let none = |others: Vec<String>| common::Kept {
         slowest,
+        quickest: slowest,
         rated: None,
         others,
     };
@@ -3408,6 +3483,7 @@ fn a_kept_rating_weighs_only_work_counted_as_this_host_counts_it() {
         )),
         Some(common::Kept {
             slowest,
+            quickest: slowest,
             rated: rated(62_500_000, 87_289_400, 343_750_000, 3),
             others: vec![theirs.clone()],
         })
@@ -3436,7 +3512,96 @@ fn a_kept_rating_weighs_only_work_counted_as_this_host_counts_it() {
     kind.keep();
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
-        format!("100000000 rated {ours} 7 50000000 9 2 {theirs}\n")
+        format!("100000000 50000000 rated {ours} 7 50000000 9 7 2 {theirs}\n")
+    );
+}
+
+/// A kind's kept record keeps the quickest answer after its W* and the least work after each
+/// rating's C*, so that a later run's judge takes the spreads its answers showed (D215
+/// amended 2026-11-19). One kept before the minima, as CI's cache brings records back from
+/// runs before (`target/judge-records`), is read whole, each minimum its maximum: spreads of
+/// none, as its judge took them then, never refused for it and never broken. Do: read records
+/// of each shape; keep a kind taught two answers and read it back in another; keep an older
+/// record read in. Expect: each read as above, a least past its most and a rating of six
+/// numbers broken; what was kept read back the same; the older one written with its minima.
+#[test]
+fn a_kept_record_keeps_its_spreads_and_one_kept_before_reads_as_none() {
+    let ours = common::rated_key();
+    let ns = Duration::from_nanos;
+    let rated = |least: u64, over: u64, most: u64, lightest: u64, answers: u64| {
+        Some(shards_api::Rated {
+            least: shards_api::Rate {
+                work: shards_api::Work::of(least),
+                over: ns(over),
+            },
+            most: shards_api::Work::of(most),
+            lightest: shards_api::Work::of(lightest),
+            answers,
+        })
+    };
+    let kept = |text: &str| common::kept_record(text, true, ours);
+    assert_eq!(
+        kept(&format!(
+            "served 240614800 200000000 rated {ours} 62500000 87289400 343750000 300000000 3"
+        )),
+        Some(common::Kept {
+            slowest: ns(240_614_800),
+            quickest: ns(200_000_000),
+            rated: rated(62_500_000, 87_289_400, 343_750_000, 300_000_000, 3),
+            others: Vec::new(),
+        })
+    );
+    assert_eq!(
+        kept(&format!(
+            "served 240614800 rated {ours} 62500000 87289400 343750000 3"
+        )),
+        Some(common::Kept {
+            slowest: ns(240_614_800),
+            quickest: ns(240_614_800),
+            rated: rated(62_500_000, 87_289_400, 343_750_000, 343_750_000, 3),
+            others: Vec::new(),
+        }),
+        "kept before the minima"
+    );
+    for broken in [
+        "served 240614800 300000000".to_string(),
+        format!("served 240614800 rated {ours} 62500000 87289400 343750000 400000000 3"),
+        format!("served 240614800 rated {ours} 62500000 87289400 343750000 300000000 3 1"),
+    ] {
+        assert_eq!(kept(&broken), None, "{broken}");
+    }
+    let home = TempDir::new("kept-spreads");
+    let file = home.join("record");
+    let ms = Duration::from_millis;
+    let kind = common::WaitKind::apart(file.clone());
+    kind.record().teach(ms(50), shards_api::Work::of(9));
+    kind.record().teach(ms(20), shards_api::Work::of(7));
+    kind.keep();
+    let written = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(
+        written,
+        format!("50000000 20000000 rated {ours} 9 50000000 9 7 2\n")
+    );
+    let back = common::WaitKind::apart(file.clone());
+    back.keep();
+    assert_eq!(back.record().seen(), kind.record().seen());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+    let before = format!("240614800 rated {ours} 62500000 87289400 343750000 3\n");
+    std::fs::write(&file, &before).unwrap();
+    let older = common::WaitKind::apart(file.clone());
+    older.keep();
+    assert_eq!(
+        older.record().seen(),
+        shards_api::Seen::Learned {
+            slowest: ns(240_614_800),
+            quickest: ns(240_614_800),
+            rated: rated(62_500_000, 87_289_400, 343_750_000, 343_750_000, 3),
+        },
+        "its spreads none"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("240614800 240614800 rated {ours} 62500000 87289400 343750000 343750000 3\n")
     );
 }
 

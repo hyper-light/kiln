@@ -229,9 +229,6 @@ pub async fn hold(state: &std::path::Path, ledger: Option<Arc<dyn kiln_seams::Re
     if let Some(held) = HELD.get() {
         return Ok(Some(Arc::clone(held)));
     }
-    if !crate::shards::carried() {
-        return Ok(None);
-    }
     let state = state.to_path_buf();
     let vms = crate::rt::blocking(move || -> anyhow::Result<Microvms> {
         let shards = crate::shards::write_out(&state)?;

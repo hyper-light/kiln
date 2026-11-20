@@ -3,9 +3,9 @@
 //! Shards' binary, `shards`, built to be carried (`SHARDS_HELPERS=beside`, Shards' D237), and its VM and
 //! network processes, which Shards keeps processes of their own binaries (its D36: every VM maps the
 //! binary it runs, and on macOS the VM process alone runs in App Sandbox, granted by entitlements that
-//! are its binary's signature). ci/shards/pack.sh builds the three from vendor/shards for the platform
-//! kiln is built for, and build.rs embeds them (`cfg(kiln_shards)`); a kiln built without them says so
-//! when they're asked for.
+//! are its binary's signature). kiln's build makes the three from vendor/shards for the platform kiln is
+//! built for (build.rs, through ci/shards/pack.sh) and embeds them: kiln is one binary with its microVM
+//! engine in it, and a build that can't carry Shards fails rather than make a kiln without it.
 //!
 //! [`write_out`] writes them into `<base>/shards/<id>/`, beside each other, as the carried `shards`
 //! looks for its helpers: the folder named by what's carried (and, on a Mac, by who signs it), written
@@ -22,23 +22,14 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use sha2::{Digest as _, Sha256};
 
 use crate::os::macsign::{self, Signer};
 
-#[cfg(kiln_shards)]
 const SHARDS: &[u8] = include_bytes!(env!("KILN_SHARDS_BIN"));
-#[cfg(kiln_shards)]
 const VM: &[u8] = include_bytes!(env!("KILN_SHARDS_VM"));
-#[cfg(kiln_shards)]
 const NET: &[u8] = include_bytes!(env!("KILN_SHARDS_NET"));
-#[cfg(not(kiln_shards))]
-const SHARDS: &[u8] = &[];
-#[cfg(not(kiln_shards))]
-const VM: &[u8] = &[];
-#[cfg(not(kiln_shards))]
-const NET: &[u8] = &[];
 
 /// Shards' entitlements, as its build signs its VM and network processes with them (its
 /// `resources/vm.entitlements` and `net.entitlements`).
@@ -67,11 +58,6 @@ fn carried_binaries() -> [Carried; 3] {
     ]
 }
 
-/// Whether this kiln carries Shards.
-pub fn carried() -> bool {
-    carried_binaries().iter().all(|c| !c.bytes.is_empty())
-}
-
 /// Shards written out: its binary and its VM and network processes beside it, which no other process
 /// removes while this is kept.
 #[derive(Debug)]
@@ -88,9 +74,6 @@ pub struct Held {
 
 /// The carried Shards, written out under `base` if it isn't there yet, and held while the answer is kept.
 pub fn write_out(base: &Path) -> anyhow::Result<Held> {
-    if !carried() {
-        bail!("this kiln is built without Shards: ci/shards/pack.sh builds it for kiln's build to carry (docs/shards.md)");
-    }
     write_out_of(base, &carried_binaries(), &macsign::signer())
 }
 
@@ -346,16 +329,5 @@ mod tests {
         assert_eq!(format!("{id}{}", Signer::AdHoc.tag()), format!("{id}-a"));
         assert_eq!(Signer::Kiln("2B69812442C0B2F687D4E3A7457F270114BB36D6".into()).tag(), "-k2b69812442c0b2f687d4e3a7457f270114bb36d6");
         assert_ne!(hash_of(&fake([b"s", b"v", b"n2"])), id);
-    }
-
-    #[test]
-    fn step16_a_kiln_without_shards_says_so() {
-        if carried() {
-            return;
-        }
-        let Ok(base) = tempfile::tempdir() else { return };
-        let said = write_out(base.path()).map(|h| h.dir).err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(said.contains("built without Shards"), "{said}");
-        assert!(!base.path().join("shards").exists());
     }
 }

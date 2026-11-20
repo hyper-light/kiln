@@ -108,19 +108,17 @@ target_dir=${CARGO_TARGET_DIR:-$root/target}
 dist=${KILN_DIST:-$root/dist}
 mkdir -p "$dist"
 
-# The Shards each target carries (above), one folder per target: a KILN_SHARDS_DIR would give every
-# target of this build the same one.
-unset KILN_SHARDS_DIR
-shards=${KILN_SHARDS:-on}
-case $shards in
-  on | off) ;;
-  *) echo "KILN_SHARDS is on or off, not $shards" >&2; exit 1 ;;
-esac
-# Shards for target $1, built as $2 (its own triple unless given): packed here where it builds here,
-# and said whether its build carries it.
+# The Shards each target carries, one folder per target, given to kiln's build as KILN_SHARDS_DIR for that
+# target's builds (kiln's build.rs takes it from there; every kiln carries Shards, and a build that can't fails).
+# KILN_SHARDS=lint is a lint's alone (build.rs), never a release's.
+if [ "${KILN_SHARDS:-}" = lint ]; then
+  echo "build.sh: KILN_SHARDS=lint makes no kiln to release" >&2
+  exit 1
+fi
+# Shards for target $1, built as $2 (its own triple unless given): packed here where it builds here (Windows' comes
+# from its own platform, the release's shards-windows job), and handed to kiln's build.
 shards_for() {
   local t=$1 as=${2:-$1} exe="" f
-  [ "$shards" = on ] || return 0
   case $t in
     *-unknown-linux-musl) if ! $native_mac; then ci/shards/pack.sh "$t"; fi ;;
     *-apple-darwin) if $native_mac; then ci/shards/pack.sh "$t"; fi ;;
@@ -128,11 +126,12 @@ shards_for() {
   case $as in *-windows-*) exe=.exe ;; esac
   for f in shards shards-vm shards-net; do
     if [ ! -f "$root/target/shards-carried/$as/$f$exe" ]; then
-      echo "build.sh: kiln for $t is built without Shards: target/shards-carried/$as has no $f$exe (docs/shards.md)" >&2
-      return 0
+      echo "build.sh: kiln for $t carries Shards, and target/shards-carried/$as has no $f$exe (docs/shards.md)" >&2
+      exit 1
     fi
   done
-  echo "build.sh: kiln for $t carries Shards (target/shards-carried/$as)"
+  export KILN_SHARDS_DIR="$root/target/shards-carried/$as"
+  echo "build.sh: kiln for $t carries Shards ($KILN_SHARDS_DIR)"
 }
 
 # On a Mac: its own toolchain and SDK, no zig.

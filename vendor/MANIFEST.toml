@@ -22,8 +22,8 @@ format = 1
 gate = [
   "cargo clippy --locked --all-targets -- -D warnings",
   "cargo test --locked --no-fail-fast",
-  "cargo-zigbuild clippy --locked --all-targets --target aarch64-apple-darwin -- -D warnings",
-  "cargo-zigbuild clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings",
+  "KILN_SHARDS=lint cargo-zigbuild clippy --locked --all-targets --target aarch64-apple-darwin -- -D warnings",
+  "KILN_SHARDS=lint cargo-zigbuild clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings",
   "npm ci --ignore-scripts --prefix ui --no-audit --no-fund",
   "npm run --prefix ui typecheck",
   "npm run --prefix ui lint",
@@ -213,7 +213,7 @@ own = ["UPSTREAM.md"]
 [projects.shards]
 kind = "git"
 repository = "https://github.com/hyper-light/shards"
-commit = "aa819b0585649563d7185298db58bda8ac9dd533"
+commit = "9e649df34e8d2babf6b33090baef6741c60ad6f7"
 path = "vendor/shards"
 take = [
   ".cargo",

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 #[allow(dead_code)]
 mod ui_pack;
 
-fn main() {
+fn main() -> Result<(), String> {
     println!("cargo:rerun-if-changed=build.rs");
     let target = std::env::var("TARGET").unwrap_or_default();
     println!("cargo:rustc-env=KILN_TARGET={target}");
@@ -65,39 +65,130 @@ fn main() {
 
     ui_server();
     ui_packed();
-    shards_carried();
+    shards_carried()
 }
 
-/// The Shards this kiln carries (`crate::shards`, docs/shards.md): its binary and its VM and network
-/// processes for the platform it's built for, from `target/shards-carried/<target>/` (or
-/// `KILN_SHARDS_DIR`), where ci/shards/pack.sh builds them from vendor/shards, embedded under
-/// `cfg(kiln_shards)` with their paths in `KILN_SHARDS_BIN`, `KILN_SHARDS_VM` and `KILN_SHARDS_NET`.
-/// Without all three, kiln builds without Shards, and a release build says so.
-fn shards_carried() {
-    println!("cargo:rustc-check-cfg=cfg(kiln_shards)");
+/// The Shards this kiln carries (`crate::shards`, docs/shards.md): its binary and its VM and network processes for
+/// the platform kiln is built for, embedded with their paths in `KILN_SHARDS_BIN`, `KILN_SHARDS_VM` and
+/// `KILN_SHARDS_NET`. kiln is one binary with its microVM engine in it, so every build carries them: made here from
+/// vendor/shards by ci/shards/pack.sh (into `OUT_DIR`, its cargo target dir beside kiln's, so a build where
+/// vendor/shards hasn't changed takes its last), or, for a target whose Shards is built only on its own platform
+/// (Windows' MSVC build, which a Linux release cross-builds kiln beside), from the folder `KILN_SHARDS_DIR` names. A
+/// build that can't carry them fails, saying why: there's no kiln without Shards.
+fn shards_carried() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=KILN_SHARDS_DIR");
+    println!("cargo:rerun-if-env-changed=KILN_SHARDS");
+    println!("cargo:rustc-check-cfg=cfg(kiln_lint)");
     let target = std::env::var("TARGET").unwrap_or_default();
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
-    let dir = std::env::var_os("KILN_SHARDS_DIR").map_or_else(|| manifest.join("../../target/shards-carried").join(&target), PathBuf::from);
+    let root = manifest.join("../..");
     let exe = if std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows") { ".exe" } else { "" };
-    // Watched only where it is, as the UI server's packs are.
-    let watch = if dir.is_dir() { Some(dir.clone()) } else { dir.parent().filter(|p| p.is_dir()).map(PathBuf::from) };
-    if let Some(w) = watch {
-        println!("cargo:rerun-if-changed={}", w.display());
+    // A lint of a target whose Shards isn't built here (kiln's gate's clippy through zig for macOS and Windows, from
+    // Linux): asked by name, it checks kiln's code against empty stand-ins, and the binary it makes refuses to run
+    // (src/bin/kiln.rs, `cfg(kiln_lint)`), so no lint build is ever a kiln.
+    if std::env::var("KILN_SHARDS").is_ok_and(|v| v == "lint") {
+        let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default()).join("shards-lint");
+        std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+        for (var, name) in [("KILN_SHARDS_BIN", "shards"), ("KILN_SHARDS_VM", "shards-vm"), ("KILN_SHARDS_NET", "shards-net")] {
+            let f = out.join(name);
+            std::fs::write(&f, []).map_err(|e| format!("{}: {e}", f.display()))?;
+            println!("cargo:rustc-env={var}={}", f.display());
+        }
+        println!("cargo:rustc-cfg=kiln_lint");
+        return Ok(());
     }
+    let dir = match std::env::var_os("KILN_SHARDS_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => shards_packed(&root, &target)?,
+    };
     let files: Vec<(&str, PathBuf)> = [("KILN_SHARDS_BIN", "shards"), ("KILN_SHARDS_VM", "shards-vm"), ("KILN_SHARDS_NET", "shards-net")]
         .into_iter()
         .map(|(var, name)| (var, dir.join(format!("{name}{exe}"))))
         .collect();
-    if files.iter().all(|(_, f)| f.is_file()) {
-        for (var, f) in &files {
-            println!("cargo:rerun-if-changed={}", f.display());
-            println!("cargo:rustc-env={var}={}", f.display());
-        }
-        println!("cargo:rustc-cfg=kiln_shards");
-    } else if std::env::var("PROFILE").is_ok_and(|p| p == "release") {
-        println!("cargo:warning=kiln is built without Shards: its binary and VM and network processes aren't in {} (ci/shards/pack.sh builds them)", dir.display());
+    if let Some((_, missing)) = files.iter().find(|(_, f)| !f.is_file()) {
+        return Err(format!("kiln for {target} carries Shards, and {} isn't there (docs/shards.md)", missing.display()));
     }
+    for (var, f) in &files {
+        println!("cargo:rerun-if-changed={}", f.display());
+        println!("cargo:rustc-env={var}={}", f.display());
+    }
+    Ok(())
+}
+
+/// Shards for `target`, made by ci/shards/pack.sh from vendor/shards into `OUT_DIR/shards-carried`: release's profile
+/// for a release build, test-release's otherwise (a guest's boot in a test, as Shards tests its own). Refused for a
+/// target whose Shards isn't built on this platform (Windows' is built on Windows: `KILN_SHARDS_DIR` names it). The
+/// outer build's flags and tools are its own target's, and its Rust kiln's: none reaches Shards' build, which takes
+/// its own toolchain file, as Shards' build.rs keeps its own nested builds apart.
+fn shards_packed(root: &Path, target: &str) -> Result<PathBuf, String> {
+    let host = std::env::var("HOST").unwrap_or_default();
+    let builds_here = match target {
+        t if t.ends_with("-apple-darwin") => host.ends_with("-apple-darwin"),
+        t if t.contains("-linux-") => host.contains("-linux-") || host.ends_with("-apple-darwin"),
+        t if t.ends_with("-pc-windows-msvc") => host.ends_with("-pc-windows-msvc"),
+        _ => false,
+    };
+    if !builds_here {
+        return Err(format!(
+            "kiln for {target} carries Shards built on its own platform: KILN_SHARDS_DIR names the folder ci/shards/pack.sh made there (docs/shards.md)"
+        ));
+    }
+    println!("cargo:rerun-if-changed={}", root.join("vendor/shards").display());
+    println!("cargo:rerun-if-changed={}", root.join("ci/shards/pack.sh").display());
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default()).join("shards-carried");
+    let profile = if std::env::var("PROFILE").is_ok_and(|p| p == "release") { "release" } else { "test-release" };
+    let mut pack = std::process::Command::new(bash());
+    pack.arg(root.join("ci/shards/pack.sh")).arg(target).current_dir(root).env("KILN_SHARDS_DIR", &out).env("KILN_SHARDS_PROFILE", profile);
+    for name in [
+        "CARGO_ENCODED_RUSTFLAGS",
+        "RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+        "CARGO_BUILD_TARGET",
+        "TARGET_CC",
+        "TARGET_CXX",
+        "TARGET_AR",
+        "TARGET_CFLAGS",
+        "TARGET_CXXFLAGS",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTUP_TOOLCHAIN",
+        "CARGO",
+    ] {
+        pack.env_remove(name);
+    }
+    // macOS's dynamic loader paths as cargo sets them for a build script are kiln's toolchain's: rust-lld under
+    // Shards' toolchain must find its own libLLVM.
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("DYLD_") {
+            pack.env_remove(&name);
+        }
+    }
+    let status = pack.status().map_err(|e| format!("ci/shards/pack.sh for {target} didn't start: {e}"))?;
+    if !status.success() {
+        return Err(format!("ci/shards/pack.sh for {target} failed ({status}): kiln carries Shards, so it isn't built without it"));
+    }
+    Ok(out)
+}
+
+/// The bash that runs ci/shards/pack.sh: the one on `PATH`, or on Windows, where none may be, Git for Windows' own,
+/// beside the git on `PATH` (`<git>/../bin/bash.exe`, or `<git>/../../bin/bash.exe` from Git's `cmd` folder), as the
+/// release's Windows job finds it.
+fn bash() -> PathBuf {
+    if !cfg!(windows) || std::process::Command::new("bash").arg("--version").output().is_ok_and(|o| o.status.success()) {
+        return PathBuf::from("bash");
+    }
+    let git = std::process::Command::new("where").arg("git").output().ok().and_then(|o| String::from_utf8(o.stdout).ok());
+    for line in git.as_deref().unwrap_or("").lines() {
+        let git = Path::new(line.trim());
+        for up in [git.parent().and_then(Path::parent), git.parent().and_then(Path::parent).and_then(Path::parent)] {
+            if let Some(bash) = up.map(|d| d.join("bin").join("bash.exe")).filter(|b| b.is_file()) {
+                return bash;
+            }
+        }
+    }
+    PathBuf::from("bash")
 }
 
 /// The UI's files worth packing (`ui/dist/client`, which rust-embed embeds), packed here with brotli and with gzip

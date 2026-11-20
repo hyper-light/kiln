@@ -16,8 +16,9 @@ each at one revision, with kiln's recorded changes, and one copy of each project
   names Shards' crates by git at one revision (its root manifest's `[workspace.dependencies]`), which kiln's root
   manifest points at kiln's own copy (`[patch."https://github.com/hyper-light/shards"]`), so one Shards revision
   serves Hex and kiln. Hex's is Shards' v0.8.0 tag (`aa819b058`) with D286's two commits (`460675322`, the Shards
-  ROOT's branch `p/served-shares-on-v0.8.0`), whose crates are byte for byte kiln's copy: v0.8.0 with D286's API
-  side recorded (`vendor/shards/UPSTREAM.md`). kiln's copy holds Hex's `vendor/MANIFEST.toml` and `vendor/patches`,
+  ROOT's branch `p/served-shares-on-v0.8.0`); kiln's copy, which Hex builds on, is Shards' main (`9e649df34e`, v0.8.0
+  and its fixes since) with the same served-shares change recorded (`vendor/shards/UPSTREAM.md`), until Shards' main
+  holds it and Hex pins that. kiln's copy holds Hex's `vendor/MANIFEST.toml` and `vendor/patches`,
   so `scripts/vendor.py check` holds Hex's pins of what it does vendor to kiln's. The two move together:
   `scripts/vendor.py shards <commit>` at Hex's new Shards revision, then `scripts/vendor.py hex <commit>`; and
   hyper-raft with them where Hex's pin of it moves (`e0613f52` since Shards' agent-control link reads the negotiated
@@ -45,18 +46,18 @@ Shards writes out its own (Shards' D36, D182):
 | `shards-vm` | the VM process: one per microVM, on macOS in App Sandbox with the hypervisor entitlement |
 | `shards-net` | the network process: one per networked microVM, on macOS in App Sandbox with the network's client and server |
 
-- **Built** by `ci/shards/pack.sh` from `vendor/shards`, for the platform kiln is built for, into
-  `target/shards-carried/<target>/` (or `KILN_SHARDS_DIR`), with Shards' own toolchain file (its Rust, its
-  musl targets) and the zig it pins for its guests' C (`scripts/install-zig` installs it where none is on
-  `PATH`). On Linux the VM and network processes are static (musl), as Shards builds its own.
-- **Embedded** by `crates/kiln/build.rs` (`cfg(kiln_shards)`) when all three are there. Without them kiln builds
-  without Shards, and a release build says so; `crate::shards::write_out` refuses, saying so.
-- **Released** in every platform's binary (`.kiln/release.yaml`, `ci/release/build.sh`): Linux's (static, musl)
-  packed on Linux and macOS's on a Mac, each by the build of the binary that carries it; Windows's packed on
-  Windows by the release's `shards-windows` job, with MSVC as Shards builds and tests its own, and handed to the
-  Linux job that cross-builds kiln for Windows (`kiln/upload@v1`, `kiln/download@v1`). A pack that fails fails its
-  binary's build, and a Windows build waits for a Windows machine as macOS's waits for a Mac. A binary a machine
-  builds itself (`crate::fleet`, when no release has its commit yet) carries none.
+- **Built** by kiln's own build: `crates/kiln/build.rs` runs `ci/shards/pack.sh` from `vendor/shards` for the
+  platform kiln is built for (its output in `OUT_DIR`, its cargo target directory `target/shards` beside kiln's, so a
+  build where `vendor/shards` hasn't changed takes its last), with Shards' own toolchain file (its Rust, its musl
+  targets) and the zig it pins for its guests' C (`scripts/install-zig` installs it where none is on `PATH`); on
+  Windows, Git for Windows' bash runs it where none is on `PATH`. On Linux the VM and network processes are static
+  (musl), as Shards builds its own. A target whose Shards is built only on its own platform (Windows' MSVC build,
+  which the release's Linux job cross-builds kiln beside) takes it from the folder `KILN_SHARDS_DIR` names, made
+  there by the same script (`.kiln/release.yaml`'s `shards-windows`).
+- **Embedded**, always: kiln is one binary with its microVM engine in it. A build that can't carry Shards fails,
+  saying why; no kiln is built without it. The one exception is a lint, asked by name (`KILN_SHARDS=lint`, kiln's
+  gate's clippy through zig for macOS and Windows from Linux): it checks kiln's code against empty stand-ins, and
+  the binary it makes refuses to start.
 - **Written out** by `crate::shards::write_out` into `<base>/shards/<id>/`: named by what's carried and, on a
   Mac, by who signs it; written whole (beside its place, each file synced and signed, its ready mark last,
   then renamed into place), so no process runs half a folder or another build's. A process holds the folder
