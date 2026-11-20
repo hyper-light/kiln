@@ -13,6 +13,12 @@
 //!   refusal naming a kind a move is refused by with the agent where it was;
 //! - **the fleet re-forms**: once the fault ends, every listed runner's node serves as a member again.
 //!
+//! The link faults (A-708) put Slates' own fault relay (`vendor/slates/crates/cli/tests/support/relay.rs`, A-277)
+//! between the nodes: each runner is listed at a block of ports the relay holds and binds its node's sockets elsewhere
+//! (`[slates_fleet.binds]`), so every datagram between two nodes crosses the relay and meets its path's rule: a slow,
+//! lossy link (a hold of `delay ± jitter`, so datagrams reorder, and a loss rate), or a runner cut off while its
+//! processes run on. Every draw comes from one seed, printed with the relay's counts.
+//!
 //! It judges what holds, not how fast: no latency is judged. Each flow waits on the fleet's own failover delay as its
 //! nodes report it (`daemon_status`), never a number of its own. Gated by `SLATES_FLEET_FAULTS=1`, since each flow starts
 //! three Slates instances and their anchors; without it each skips, saying so. Linux alone, where a workspace is a FUSE
@@ -28,7 +34,14 @@
 mod common;
 mod vm_e2e;
 
+/// Slates' fault relay, as Slates' own chaos flows use it (A-277), included unchanged from the vendored tree (A-708).
+#[allow(dead_code, clippy::all, clippy::pedantic, clippy::nursery, clippy::restriction)]
+#[path = "../../../vendor/slates/crates/cli/tests/support/relay.rs"]
+mod relay;
+
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -49,6 +62,12 @@ const FILES: usize = 8;
 const WITHIN: Duration = Duration::from_secs(900);
 /// How often a flow looks again while it waits.
 const LOOK: Duration = Duration::from_millis(250);
+/// A slow link (A-708): each datagram held this long, give or take [`SLOW_JITTER`], so datagrams reorder.
+const SLOW_DELAY: Duration = Duration::from_millis(40);
+/// The spread of a slow link's hold.
+const SLOW_JITTER: Duration = Duration::from_millis(10);
+/// A slow link's loss rate, in parts per million: 1 %.
+const SLOW_LOSS_PPM: u32 = 10_000;
 
 /// Whether the flows run here; a skip says why.
 fn enabled() -> bool {
@@ -64,19 +83,23 @@ fn enabled() -> bool {
 }
 
 /// One runner of the lab: the name it was started as, its machine key (what `[slates_fleet.nodes]` lists), its Slates
-/// instance and where its node is reached.
+/// instance, where its node is reached, and where its node binds when the relay stands between it and its peers.
 struct Node {
     name: &'static str,
     machine: String,
     instance: String,
     address: String,
+    bind: Option<SocketAddrV4>,
 }
 
-/// The lab: a server of the test's own and three runners forming kiln's Slates fleet.
+/// The lab: a server of the test's own and three runners forming kiln's Slates fleet; with the relay (A-708) between
+/// their nodes, the daemon pid it attributes each node's sockets by.
 struct Lab {
     fleet: common::Fleet,
     nodes: Vec<Node>,
     project: PathBuf,
+    relay: Option<relay::Relay>,
+    rooted: RefCell<Vec<Option<u32>>>,
 }
 
 /// Two consecutive UDP ports free on loopback: a node's base and the one after it (the base of its two UDP ports, W7).
@@ -89,6 +112,27 @@ fn two_ports() -> anyhow::Result<u16> {
         }
     }
     anyhow::bail!("no two consecutive UDP ports free on loopback")
+}
+
+/// Two consecutive UDP sockets the test holds on loopback: a relayed node's advertised block, the relay's to listen on.
+fn advertised_pair() -> anyhow::Result<([UdpSocket; 2], u16)> {
+    for _ in 0..64 {
+        let first = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let base = first.local_addr()?.port();
+        let Some(next) = base.checked_add(1) else { continue };
+        if let Ok(second) = UdpSocket::bind((Ipv4Addr::LOCALHOST, next)) {
+            return Ok(([first, second], base));
+        }
+    }
+    anyhow::bail!("no two consecutive UDP ports free on loopback for a relayed node")
+}
+
+/// The relay's seed: `SLATES_CHAOS_SEED` replays a run's, as in Slates' own chaos flows; else one of this run's.
+fn seed() -> u64 {
+    std::env::var("SLATES_CHAOS_SEED")
+        .ok()
+        .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok())
+        .unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() ^ u64::from(d.subsec_nanos())))
 }
 
 /// A nonce for this run's instance names.
@@ -104,15 +148,48 @@ impl Lab {
         let mut nodes = Vec::new();
         for name in RUNNERS {
             let port = two_ports()?;
-            nodes.push(Node { name, machine: common::machine(name), instance: format!("kilnflt{run}{name}").replace('-', ""), address: format!("127.0.0.1:{port}") });
+            nodes.push(Node { name, machine: common::machine(name), instance: format!("kilnflt{run}{name}").replace('-', ""), address: format!("127.0.0.1:{port}"), bind: None });
         }
+        Lab::with_nodes(nodes, None)
+    }
+
+    /// [`Lab::start`] with Slates' fault relay between the nodes (A-708): each runner listed at a block the relay holds,
+    /// its node bound at a block of its own (`[slates_fleet.binds]`), every path forwarding at once until a flow shapes it.
+    fn start_relayed() -> anyhow::Result<Lab> {
+        let run = nonce();
+        let mut nodes = Vec::new();
+        let mut relayed = Vec::new();
+        for name in RUNNERS {
+            let (advertised, at) = advertised_pair()?;
+            let bound = SocketAddrV4::new(Ipv4Addr::LOCALHOST, two_ports()?);
+            nodes.push(Node { name, machine: common::machine(name), instance: format!("kilnflt{run}{name}").replace('-', ""), address: format!("127.0.0.1:{at}"), bind: Some(bound) });
+            relayed.push(relay::RelayedNode { advertised, bound });
+        }
+        let seed = seed();
+        let relay = relay::Relay::start(relayed, seed);
+        for (i, n) in nodes.iter().enumerate() {
+            let base = n.bind.map_or(0, |b| b.port());
+            for port in [Some(base), base.checked_add(1)].into_iter().flatten() {
+                relay.claim(port, i);
+            }
+        }
+        eprintln!("RELAY: seed {seed:#x} (SLATES_CHAOS_SEED replays it)");
+        Lab::with_nodes(nodes, Some(relay))
+    }
+
+    /// The server with `[slates_fleet]` listing `nodes` (and their binds), the project, and every runner started; returns
+    /// once every runner's node serves as a member.
+    fn with_nodes(nodes: Vec<Node>, relay: Option<relay::Relay>) -> anyhow::Result<Lab> {
         let listed: String = nodes.iter().map(|n| format!("\"{}\" = \"{}\"\n", n.machine, n.address)).collect();
-        let extra = format!("[slates_fleet]\nf = 1\n[slates_fleet.nodes]\n{listed}");
+        let binds: String = nodes.iter().filter_map(|n| n.bind.map(|b| format!("\"{}\" = \"{b}\"\n", n.machine))).collect();
+        let binds = if binds.is_empty() { binds } else { format!("[slates_fleet.binds]\n{binds}") };
+        let extra = format!("[slates_fleet]\nf = 1\n[slates_fleet.nodes]\n{listed}{binds}");
         // `Fleet::with` starts the server itself.
         let fleet = common::Fleet::with(move |_| extra.clone())?;
         let project = fleet.root.path().join("project");
         make_project(&project)?;
-        let mut lab = Lab { fleet, nodes, project };
+        let rooted = RefCell::new(vec![None; nodes.len()]);
+        let mut lab = Lab { fleet, nodes, project, relay, rooted };
         for i in 0..lab.nodes.len() {
             lab.start_runner(i)?;
         }
@@ -143,6 +220,7 @@ impl Lab {
         let listed: Vec<&str> = self.nodes.iter().map(|n| n.machine.as_str()).collect();
         let began = Instant::now();
         loop {
+            self.reroot();
             let members = self.members();
             let missing = slates_faults::not_reformed(&listed, &members);
             if missing.is_empty() {
@@ -152,6 +230,34 @@ impl Lab {
             anyhow::ensure!(began.elapsed() < WITHIN, "{what}: the fleet didn't re-form within {WITHIN:?}; not serving: {missing:?}\n{}", self.fleet.logs());
             std::thread::sleep(LOOK);
         }
+    }
+
+    /// The relay told each node's daemon, so the record links it dials from fresh sockets are attributed to its node
+    /// (the relay drops what no census attributes); again whenever a node's daemon is another process than last told.
+    fn reroot(&self) {
+        let Some(relay) = &self.relay else { return };
+        let mut rooted = self.rooted.borrow_mut();
+        for (i, n) in self.nodes.iter().enumerate() {
+            let Ok(pid) = slates_api::Instance::attach(&n.instance).and_then(|mut d| d.daemon_status()).map(|r| r.pid) else { continue };
+            if let Some(told) = rooted.get_mut(i).filter(|told| **told != Some(pid)) {
+                relay.root(i, pid);
+                *told = Some(pid);
+            }
+        }
+    }
+
+    /// The relay between the nodes, for a flow that shapes its paths.
+    fn relay(&self) -> anyhow::Result<&relay::Relay> {
+        self.relay.as_ref().ok_or_else(|| anyhow::anyhow!("this lab has no relay between its nodes"))
+    }
+
+    /// Fails unless the record plane's datagrams crossed the relay at all (A-330's check): a flow whose record links went
+    /// around the relay would prove nothing of a link fault.
+    fn crossed_the_relay(&self) -> anyhow::Result<()> {
+        let report = self.relay()?.report();
+        anyhow::ensure!(report.records_forwarded() > 0, "no record-plane datagram crossed the relay: {}", report.summary());
+        eprintln!("RELAY: {}", report.summary());
+        Ok(())
     }
 
     /// Each runner's node as a member, by its own instance's word: its member id where it serves as one.
@@ -279,11 +385,12 @@ fn write_acknowledged(lab: &Lab, i: usize, volume: slates_api::VolumeId, round: 
     Ok(acknowledged)
 }
 
-/// Every acknowledged file read back through each node in turn, until one serves the volume: what is served now.
-fn served(lab: &Lab, volume: slates_api::VolumeId, paths: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
+/// Every acknowledged file read back through each node of `through` in turn, until one serves the volume: what is
+/// served now.
+fn served(lab: &Lab, through: &[usize], volume: slates_api::VolumeId, paths: &BTreeMap<String, Vec<u8>>) -> BTreeMap<String, Vec<u8>> {
     let mut found = BTreeMap::new();
     for path in paths.keys() {
-        for n in &lab.nodes {
+        for n in through.iter().filter_map(|i| lab.nodes.get(*i)) {
             if let Ok(bytes) = slates_api::Instance::attach(&n.instance).and_then(|mut i| i.read(volume, path, slates_api::ReadAt::Head)) {
                 found.insert(path.clone(), bytes);
                 break;
@@ -296,9 +403,17 @@ fn served(lab: &Lab, volume: slates_api::VolumeId, paths: &BTreeMap<String, Vec<
 /// Waits until no acknowledged file is lost ([`slates_faults::lost`]), which a takeover may take the failover delay to
 /// give, and fails saying which are lost once [`WITHIN`] has passed.
 fn no_acknowledged_change_lost(lab: &Lab, volume: slates_api::VolumeId, acknowledged: &BTreeMap<String, Vec<u8>>, what: &str) -> anyhow::Result<()> {
+    let every: Vec<usize> = (0..lab.nodes.len()).collect();
+    no_acknowledged_change_lost_through(lab, &every, volume, acknowledged, what)
+}
+
+/// [`no_acknowledged_change_lost`], read through the nodes of `through` alone: a runner cut off still answers from what
+/// it held, so the fleet's keeping is read through the others.
+fn no_acknowledged_change_lost_through(lab: &Lab, through: &[usize], volume: slates_api::VolumeId, acknowledged: &BTreeMap<String, Vec<u8>>, what: &str) -> anyhow::Result<()> {
     let began = Instant::now();
     loop {
-        let lost = slates_faults::lost(acknowledged, &served(lab, volume, acknowledged));
+        lab.reroot();
+        let lost = slates_faults::lost(acknowledged, &served(lab, through, volume, acknowledged));
         if lost.is_empty() {
             eprintln!("PROVEN: {what}: every one of {} acknowledged files served byte for byte ({:?})", acknowledged.len(), began.elapsed());
             return Ok(());
@@ -387,10 +502,19 @@ fn w7_a_move_whose_target_is_cut_off_midway_ends_moved_or_refused_by_kind() -> a
     std::thread::sleep(held.saturating_add(held));
     lab.signal(1, "CONT")?;
     let refused = (!(200..300).contains(&code)).then(|| String::from_utf8_lossy(&body).into_owned());
+    move_settles(&lab, &agent, &from, &to, refused.as_deref())?;
+    no_acknowledged_change_lost(&lab, volume, &acknowledged, "a link lost mid-move")?;
+    lab.until_reformed("after a link lost mid-move")
+}
+
+/// Waits until kiln's word on agent `agent`'s move `from -> to` settles on a verdict W7 allows
+/// ([`slates_faults::judge_move`]), `refused` being kiln's answer to the ask where it refused it, and says which.
+fn move_settles(lab: &Lab, agent: &str, from: &str, to: &str, refused: Option<&str>) -> anyhow::Result<MoveOutcome> {
     let began = Instant::now();
     let outcome = loop {
-        let runs_on = lab.runs_on(&agent)?;
-        let said = MoveSaid { from: &from, to: &to, runs_on: runs_on.as_deref(), refused: refused.as_deref() };
+        lab.reroot();
+        let runs_on = lab.runs_on(agent)?;
+        let said = MoveSaid { from, to, runs_on: runs_on.as_deref(), refused };
         match slates_faults::judge_move(&said) {
             Ok(outcome) => break outcome,
             Err(why) => anyhow::ensure!(began.elapsed() < WITHIN, "the move settled on no verdict W7 allows: {why:?}\n{}", lab.fleet.logs()),
@@ -401,6 +525,59 @@ fn w7_a_move_whose_target_is_cut_off_midway_ends_moved_or_refused_by_kind() -> a
         MoveOutcome::Moved { to } => eprintln!("PROVEN: the move completed: the agent works on {to}"),
         MoveOutcome::Refused { kind } => eprintln!("PROVEN: the move refused by kind {kind}, the agent where it was"),
     }
-    no_acknowledged_change_lost(&lab, volume, &acknowledged, "a link lost mid-move")?;
-    lab.until_reformed("after a link lost mid-move")
+    Ok(outcome)
+}
+
+/// W7, A-708: a slow, lossy link. Do: with the relay between the nodes, hold every datagram on every path 40 ms ± 10 ms
+/// (so they reorder) and lose 1 %; write acknowledged files on the first runner over it; ask kiln to move the agent to
+/// the second; let the move settle; heal the links. Expect the record links to have crossed the relay, the move moved or
+/// refused by kind, every acknowledged file served byte for byte, and the fleet re-formed.
+#[test]
+fn w7_a708_a_slow_lossy_link_loses_no_acknowledged_change_and_a_move_over_it_ends_moved_or_refused_by_kind() -> anyhow::Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let lab = Lab::start_relayed()?;
+    let slow = relay::PathRule { loss_ppm: SLOW_LOSS_PPM, delay: SLOW_DELAY, jitter: SLOW_JITTER, ..relay::PathRule::default() };
+    lab.relay()?.shape_all(slow);
+    eprintln!("FAULT: every link held {SLOW_DELAY:?} ± {SLOW_JITTER:?}, {SLOW_LOSS_PPM} ppm lost");
+    let (agent, volume) = lab.start_agent(0)?;
+    let acknowledged = write_acknowledged(&lab, 0, volume, "slow")?;
+    lab.crossed_the_relay()?;
+    let (from, to) = (lab.node(0)?.machine.clone(), lab.node(1)?.machine.clone());
+    let (code, body) = lab.fleet.request("POST", "/api/ops/agents.move", Some(&json!({"agent": agent, "to": to, "now": true})))?;
+    let refused = (!(200..300).contains(&code)).then(|| String::from_utf8_lossy(&body).into_owned());
+    move_settles(&lab, &agent, &from, &to, refused.as_deref())?;
+    no_acknowledged_change_lost(&lab, volume, &acknowledged, "a slow, lossy link")?;
+    lab.relay()?.heal();
+    eprintln!("RELAY: {}", lab.relay()?.report().summary());
+    no_acknowledged_change_lost(&lab, volume, &acknowledged, "a slow link healed")?;
+    lab.until_reformed("after a slow, lossy link")
+}
+
+/// W7, A-708: a runner cut off while it runs, the partition SIGSTOP can't make (its processes run on, their leases
+/// lapsing and their peers judged dead from their side). Do: with the relay between the nodes, write acknowledged files
+/// on the first runner; cut every path into and out of its node past the fleet's failover delay; read the files through
+/// the other two; heal. Expect the cut to have dropped datagrams, every acknowledged file served byte for byte through
+/// the survivors while it's cut and through any node once healed, and the fleet re-formed.
+#[test]
+fn w7_a708_a_runner_cut_off_while_it_runs_loses_no_acknowledged_change_and_the_fleet_reforms() -> anyhow::Result<()> {
+    if !enabled() {
+        return Ok(());
+    }
+    let lab = Lab::start_relayed()?;
+    let (_agent, volume) = lab.start_agent(0)?;
+    let acknowledged = write_acknowledged(&lab, 0, volume, "cut")?;
+    lab.crossed_the_relay()?;
+    let held = lab.failover(1)?;
+    lab.relay()?.isolate(0);
+    eprintln!("FAULT: {} cut off from its peers, its processes running", lab.node(0)?.name);
+    std::thread::sleep(held.saturating_add(held));
+    no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "a runner cut off while it runs")?;
+    let report = lab.relay()?.report();
+    anyhow::ensure!(report.cut(0, 1).saturating_add(report.cut(1, 0)) > 0, "the cut dropped nothing: {}", report.summary());
+    lab.relay()?.heal();
+    eprintln!("RELAY: {}", lab.relay()?.report().summary());
+    no_acknowledged_change_lost(&lab, volume, &acknowledged, "a cut-off runner back")?;
+    lab.until_reformed("after a runner cut off")
 }

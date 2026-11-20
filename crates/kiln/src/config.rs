@@ -84,11 +84,23 @@ pub struct Config {
 /// "adas-macbook-pro" = "192.168.1.21:17300"
 /// "adas-mac-mini" = "192.168.1.22:17300"
 /// ```
+///
+/// A runner whose node is reached through a port mapping (a NAT, or the fault relay of kiln's
+/// multi-runner test, W7) binds elsewhere than it is listed: `[slates_fleet.binds]` names, by
+/// machine, the IPv4 address and nonzero base port its node's two serve sockets bind (Slates'
+/// manifest `bind`, A-277; kiln A-708). A runner it doesn't name binds where it's listed.
+///
+/// ```toml
+/// [slates_fleet.binds]
+/// "adas-mac-mini" = "0.0.0.0:17300"
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SlatesFleet {
     pub f: u32,
     pub nodes: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub binds: BTreeMap<String, String>,
 }
 
 /// `[capacity]` (docs/lb.md "A machine's keeper"; Hex's capacity-view.md; kiln plan
