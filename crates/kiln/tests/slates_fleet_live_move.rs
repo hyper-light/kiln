@@ -58,7 +58,9 @@ const NAMES: [&str; 3] = ["live-a", "live-b", "live-c"];
 const WITHIN: Duration = Duration::from_secs(600);
 const LOOK: Duration = Duration::from_millis(500);
 /// The first turn's words and the second's (the stand-in's, `tests/fixtures/vm-stub/harness/stub`).
-const FIRST: &str = "WRITE=made.txt APPEND=README.md REMOVE=gone.txt";
+/// Each word once across both, and none of the second's in the first: the stand-in acts on the first of each word it
+/// hears, and the second runner's turn hears kiln's hand-off, which quotes the first turn's words, before its own.
+const FIRST: &str = "WRITE=made.txt REMOVE=gone.txt";
 /// The harness the stand-in plays: an ACP one, whose conversation kiln carries in words from its own timeline when the
 /// agent moves (`harness::moving::record`). Claude Code's moves carry its own transcript file, which the stand-in (no
 /// model) never writes, so a stand-in `claude` can't move ("Claude Code's record of session ... is not on this machine").
@@ -69,7 +71,7 @@ const PREPARE_S: u32 = 1800;
 const MOVES: usize = 10;
 /// How long the test waits on one ask to move before asking again.
 const ASK_AGAIN: Duration = Duration::from_secs(30);
-const SECOND: &str = "WRITE=on-b.txt APPEND=made.txt";
+const SECOND: &str = "APPEND=made.txt";
 
 /// The pure checks: what the switch says, what a remote preparation printed, and the files the moved volume holds.
 mod checks {
@@ -132,15 +134,13 @@ mod checks {
         files
     }
 
-    /// What the moved volume holds: the project as it was, its first turn's three edits and its second's two; where the
-    /// second runner's turn heard kiln's hand-off (`replayed`), the first turn's words again too, so README.md holds two
-    /// appended lines: the first proves the first runner's append moved.
-    pub fn expected(replayed: bool) -> std::collections::BTreeMap<String, Option<String>> {
-        let readme = if replayed { "the project\nAPPENDED README.md\nAPPENDED README.md\n" } else { "the project\nAPPENDED README.md\n" };
+    /// What the moved volume holds: the project as it was with its first turn's two edits and its second's append to the
+    /// file the first wrote. A hand-off the second turn hears replays the first turn's write and removal before it (the
+    /// stand-in acts on the first of each word), which leaves the same files: `made.txt` written again, then appended to.
+    pub fn expected() -> std::collections::BTreeMap<String, Option<String>> {
         [
-            ("README.md", Some(readme)),
+            ("README.md", Some("the project\n")),
             ("made.txt", Some("made.txt\nAPPENDED made.txt\n")),
-            ("on-b.txt", Some("on-b.txt\n")),
             ("src/lib.rs", Some("pub fn f() {}\n")),
             ("gone.txt", None),
         ]
@@ -257,12 +257,12 @@ mod checks {
 
         #[test]
         fn k4_live_move_a_listing_reads_back_each_file_or_its_absence() {
-            let out = "== README.md\nthe project\nAPPENDED README.md\nAPPENDED README.md\n== made.txt\nmade.txt\nAPPENDED made.txt\n== on-b.txt\non-b.txt\n== src/lib.rs\npub fn f() {}\n-- absent gone.txt\n";
-            assert_eq!(listing(out), expected(true));
+            let out = "== README.md\nthe project\n== made.txt\nmade.txt\nAPPENDED made.txt\n== src/lib.rs\npub fn f() {}\n-- absent gone.txt\n";
+            assert_eq!(listing(out), expected());
             let short = "== README.md\nthe project\n-- absent gone.txt\n";
-            assert_ne!(listing(short), expected(true));
-            let once = "== README.md\nthe project\nAPPENDED README.md\n== made.txt\nmade.txt\nAPPENDED made.txt\n== on-b.txt\non-b.txt\n== src/lib.rs\npub fn f() {}\n-- absent gone.txt\n";
-            assert_eq!(listing(once), expected(false), "no hand-off heard: README appended once");
+            assert_ne!(listing(short), expected());
+            let not_moved = "== README.md\nthe project\n== made.txt\nAPPENDED made.txt\n== src/lib.rs\npub fn f() {}\n-- absent gone.txt\n";
+            assert_ne!(listing(not_moved), expected(), "an append to a made.txt that didn't move");
         }
 
         #[test]
@@ -901,7 +901,7 @@ fn make_project(dir: &Path) -> anyhow::Result<()> {
 
 /// The listing of the moved volume's files under `mount` (`checks::listing`'s shape).
 fn listing_script(mount: &str) -> String {
-    format!(r#"cd "{mount}" && for f in README.md made.txt on-b.txt src/lib.rs gone.txt; do if [ -e "$f" ]; then echo "== $f"; cat "$f"; else echo "-- absent $f"; fi; done"#)
+    format!(r#"cd "{mount}" && for f in README.md made.txt src/lib.rs gone.txt; do if [ -e "$f" ]; then echo "== $f"; cat "$f"; else echo "-- absent $f"; fi; done"#)
 }
 
 /// K4, K5: an agent with a live Slates volume, moved by kiln from one runner to another, carries on there with its
@@ -944,7 +944,7 @@ fn k4_k5_an_agent_moved_with_its_live_volume_carries_on_and_the_old_runner_lets_
         }
     };
     eprintln!("PROVEN: the agent started on {} at start {starts} ({:?} after the fleet formed)", name_a, began.elapsed());
-    for want in ["WROTE made.txt", "APPENDED README.md", "REMOVED gone.txt"] {
+    for want in ["WROTE made.txt", "REMOVED gone.txt"] {
         anyhow::ensure!(lines.iter().any(|l| l.contains(want)), "its first turn didn't say {want}: {lines:?}");
     }
     let info = lab.session(&id)?;
@@ -992,13 +992,10 @@ fn k4_k5_an_agent_moved_with_its_live_volume_carries_on_and_the_old_runner_lets_
     // gone.txt gone (the first runner's removal moved with the volume) and whose append adds a second README line.
     let (code, said) = lab.op("agents.send", &json!({"agent": id, "text": SECOND}))?;
     anyhow::ensure!((200..300).contains(&code), "kiln refused the second turn's message: {code} {said}");
-    let lines = lab.until_said(&id, "WROTE on-b.txt", "its turn on the second runner")?;
+    let lines = lab.until_said(&id, "APPENDED made.txt", "its turn on the second runner")?;
     let second: Vec<String> = lines.iter().skip_while(|l| !l.contains(vm_e2e::STUB_DONE)).skip(1).cloned().collect();
-    for want in ["WROTE on-b.txt", "APPENDED made.txt"] {
-        anyhow::ensure!(second.iter().any(|l| l.contains(want)), "its turn on the second runner didn't say {want}: {second:?}");
-    }
-    let replayed = second.iter().any(|l| l.contains("kiln_handoff"));
-    if replayed {
+    anyhow::ensure!(!second.iter().any(|l| l.contains("APPEND_FAIL")), "its turn on the second runner found no made.txt to append to: {second:?}");
+    if second.iter().any(|l| l.contains("kiln_handoff")) {
         anyhow::ensure!(second.iter().any(|l| l.contains("REMOVE_FAIL")), "the hand-off's replay found gone.txt on the second runner: {second:?}");
     }
     let info = lab.session(&id)?;
@@ -1009,7 +1006,7 @@ fn k4_k5_an_agent_moved_with_its_live_volume_carries_on_and_the_old_runner_lets_
     anyhow::ensure!(cwd_b.contains(mount_b.trim_start_matches("/private")), "its second turn worked in {cwd_b}, outside its volume's mount {mount_b} on {}", name_b);
     let listed = lab.run_on(1, &listing_script(&mount_b))?;
     let got = checks::listing(&listed);
-    anyhow::ensure!(got == checks::expected(replayed), "the moved volume on {} holds {got:?}, not {:?}", name_b, checks::expected(replayed));
+    anyhow::ensure!(got == checks::expected(), "the moved volume on {} holds {got:?}, not {:?}", name_b, checks::expected());
     eprintln!("PROVEN: carried on: its second turn on {} appended to the file its first wrote; the mount {mount_b} holds both turns' work byte for byte", name_b);
 
     // 5. The old runner let go.
