@@ -487,7 +487,7 @@ async fn up_or_started() -> anyhow::Result<()> {
     {
         anyhow::bail!("{} (its log: {})", start_refused(&e), h.log.display());
     }
-    // A fleet node imports its groups (Slates: never make one there), and says its member id, which a move of a volume to
+    // A fleet node imports its groups (Slates: never make one there, but at the fleet's founder), and says its member id, which a move of a volume to
     // it names (K4): its runner's word again, now with the member its daemon serves as since this start.
     if let (Some(joined), Some(source)) = (&joined, super::slates_fleet::source()) {
         match call("member", |i| i.member()).await {
@@ -497,6 +497,14 @@ async fn up_or_started() -> anyhow::Result<()> {
                 }
             }
             Err(e) => tracing::warn!(error = %format!("{e:#}"), "this runner's Slates node couldn't read its member id: no volume moves to it until it does"),
+        }
+        // The fleet's founder (`slates_fleet::founder`, the first runner `[slates_fleet]` lists) bootstraps its root group,
+        // as Slates' fleet asks of one node: until then no node holds a group, so none makes a workspace ("this node has
+        // no consensus group yet"; goal 91's live move, 2026-11-19). Every other node imports it. Found made already (this
+        // node founded or imported it before): nothing.
+        if joined.founds {
+            call("bootstrap", |i| i.ensure_group()).await?;
+            tracing::info!("this runner's Slates founded kiln's Slates fleet's groups, or found them made");
         }
         return Ok(());
     }
