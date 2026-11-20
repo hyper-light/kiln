@@ -66,6 +66,8 @@ fn a_sessions_updates_survive_a_cut_link() -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "the runner never connected: {body}\n{}\n{}", runner_log(), s.log());
         std::thread::sleep(Duration::from_millis(300));
     }
+    // Its sessions on its host, where the stand-in is.
+    agents::on_host(s.port, &s.admin, "wire-runner", &dir.path().join("wire-runner-state"), Duration::from_secs(120))?;
 
     // A session there, streaming through the cuts. It's opened just after the runner connects
     // again: opening isn't on the channel yet (plan step 3), so a cut as it goes would lose it.
@@ -220,6 +222,7 @@ fn frames_lost_below_the_channel_are_made_up_for() -> anyhow::Result<()> {
     std::fs::create_dir_all(&work)?;
     let (_runner, log_path) = runner_with(dir.path(), s.port, "shed-runner", "shed=term/46:7", LINES)?;
     let runner_log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    agents::connected(s.port, &s.admin, "shed-runner", &log_path, Duration::from_secs(120))?;
     let open = json!({"target": format!("agent:{}", machine("shed-runner")), "spec": {"kind": "claude", "cwd": work.display().to_string(), "prompt": "stream"}});
     let deadline = Instant::now() + Duration::from_secs(90);
     let id = loop {

@@ -302,7 +302,7 @@ A runner says which variables its user has and where each is set, by name alone,
 | System | Where it looks | `sources` |
 |---|---|---|
 | macOS | the login shell (`$SHELL -l -i`, above); launchd's user domain (`launchctl getenv`, for the names `launchctl` reports set) | `login_shell`, `launchd` |
-| Linux | the login shell; the systemd user manager, where one answers (`systemctl --user show-environment`: `environment.d`, `systemctl --user set-environment`); PAM's `pam_env`, where a PAM stack loads it (`/etc/security/pam_env.conf`, `/etc/environment`, each from `/usr/etc` where `/etc` has none; `~/.pam_environment` where a stack sets `user_readenv=1`) | `login_shell`, `systemd_user`, `pam` |
+| Linux | the login shell; the systemd user manager, where one answers (`systemctl --user show-environment`: `environment.d`, `systemctl --user set-environment`; not the `HOME`, `USER`, `LOGNAME` and `SHELL` it sets for itself from the user record, systemd.exec(5), which the runner's process has from where it started); PAM's `pam_env`, where a PAM stack loads it (`/etc/security/pam_env.conf`, `/etc/environment`, each from `/usr/etc` where `/etc` has none; `~/.pam_environment` where a stack sets `user_readenv=1`) | `login_shell`, `systemd_user`, `pam` |
 | Windows | the user's and the system's environment in the registry (`HKCU\Environment`, `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`), `REG_EXPAND_SZ` expanded as Windows does | `user_registry`, `system_registry` |
 | every | the runner's own process | `runner` |
 
