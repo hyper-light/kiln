@@ -230,11 +230,11 @@ impl Sandbox for ContainerSandbox {
 /// Kind `kind`'s harness for session `spec` as a launch in a container of `image` (docs/agentic.md W9): its program by
 /// its name on the image's `PATH`, started as kiln's adapter drives it (its base arguments, then what the session asks,
 /// as a microVM's member is: `Kind::elsewhere`, so none of this machine's own paths, kiln's MCP config or hooks among
-/// them), with the environment `elsewhere` gives a boundary (the session's locale, its environment's variables, what kiln
-/// fixes), in the session's folder in its workspace's mount. A secret in its environment is refused by `elsewhere`, never
-/// handed in.
+/// them), with the environment a boundary is given (the session's locale, its environment's variables, what kiln fixes),
+/// its environment's secrets among them (`Kind::in_container`: its sign-in, granted by name to this session), in the
+/// session's folder in its workspace's mount.
 pub fn launch_of(kind: &crate::harness::kinds::Kind, spec: &crate::harness::session::Spec, image: &str) -> anyhow::Result<Launch> {
-    let run = kind.elsewhere(spec)?;
+    let run = kind.in_container(spec)?;
     let mut args = kind.base_args();
     args.extend(run.args);
     Ok(Launch {
@@ -386,6 +386,14 @@ mod tests {
         assert_eq!((launch.folder.as_deref(), &launch.boundary), (Some(format!("{MOUNT}/crates").as_str()), &Boundary::Container { image: "ghcr.io/org/agents:1".to_owned() }));
         assert!(launch.env.contains(&("LANG".to_owned(), "fr_FR.UTF-8".to_owned())));
         assert!(!launch.env.iter().any(|(k, _)| k == "PATH" || k.starts_with("KILN_")), "no host variable, no kiln socket: {:?}", launch.env);
+        // A secret its environment grants it by name reaches the container's run as a variable named on the engine's
+        // command line, its value never there (`exec_args`).
+        use crate::harness::agentenv::{Base, Resolved, Set};
+        let granted = Spec { agentenv: Some(Resolved { id: "e".into(), name: "sign-in".into(), version: 1, base: Base::User, vars: vec![("ANTHROPIC_API_KEY".into(), Set::Secret("not-a-real-key".into()))] }), ..spec.clone() };
+        let signed = launch_of(claude, &granted, "ghcr.io/org/agents:1")?;
+        assert!(signed.env.contains(&("ANTHROPIC_API_KEY".to_owned(), "not-a-real-key".to_owned())));
+        let args = exec_args(&signed, "c0ffee", MOUNT);
+        assert!(args.windows(2).any(|w| w == ["--env", "ANTHROPIC_API_KEY"]) && !args.iter().any(|a| a.contains("not-a-real-key")), "{args:?}");
         // What it is, a container's sandbox holds: no limit or narrowed egress it would refuse.
         assert!(plan_of(&launch, DOCKER, &judged(), &made(), "kiln-a-1".to_owned()).is_ok());
         Ok(())

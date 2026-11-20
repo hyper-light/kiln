@@ -37,7 +37,8 @@ impl ImageClass {
     /// node's server now, for this boot alone, in its spec's order; at its place, read-only as asked, its files run from
     /// it as every share's of the class are (D279), and given to the members it names as they start (D277). The streams
     /// go with the boot's spec, whose run host is handed its own copies with the run's request; this process's go as
-    /// the boot answers. The first a server refuses refuses the start, before any effect.
+    /// the boot answers, the share's resync channel with it where its server gives one (Shards' D288). The first a server
+    /// refuses refuses the start, before any effect.
     pub(super) fn served(
         &self,
         id: &BoxId,
@@ -58,9 +59,10 @@ impl ImageClass {
                 bound: image.served.len(),
             })?;
         for share in &image.served {
-            let stream = servers.stream(id, share)?;
+            let (stream, resync) = servers.stream_resyncing(id, share)?;
             lowered.push(ServedShare {
                 stream: ServedStream::new(stream),
+                resync: resync.map(ServedStream::new),
                 at: share.destination.clone(),
                 read_only: share.read_only,
                 exec: true,

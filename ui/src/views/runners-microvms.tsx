@@ -238,7 +238,7 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
       )}
       {asking && (
         <Confirm
-          label={`Run its new sessions in ${asking === "microvm" ? "microVMs" : "its host"}`}
+          label={`Run its new sessions in ${ENGINE_PLACE[asking]}`}
           actions={
             <>
               <Button size="xs" pending={sending} onClick={() => send(asking)}>

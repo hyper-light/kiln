@@ -1254,6 +1254,36 @@ pub fn container_at(hub: &Hub, target: &str) -> Result<Option<crate::harness::se
     }
 }
 
+/// What `isolation` asks for a session in a pod of its own (docs/agentic.md W10).
+pub const POD: &str = "pod";
+
+/// `n` sessions of `spec` in pods of their own, their workspaces held by runner `target` (their home): each under its
+/// asked id (`ids`) or a new one, its pod started (`K8s::start_agent`), answered as it starts, its target its pod's runner.
+async fn start_pods(hub: &Hub, target: &str, spec: &Spec, n: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
+    let home = target.strip_prefix("agent:").ok_or_else(|| anyhow::anyhow!("a pod's workspace is held by a runner, not the server itself"))?;
+    let k8s = hub.k8s.get().and_then(Option::as_ref).ok_or_else(|| anyhow::anyhow!("the server runs no Kubernetes engine (`[kubernetes]`)"))?;
+    let mut infos = Vec::with_capacity(n);
+    for k in 0..n {
+        let id = ids.get(k).cloned().unwrap_or_else(crate::util::new_id);
+        let pod = k8s.start_agent(hub, &id, spec.clone(), home).await?;
+        infos.push(pod_info(&id, &pod, spec));
+    }
+    Ok(infos)
+}
+
+/// A session in pod `pod` as it starts, before its runner has opened it: its id, harness, folder and target.
+fn pod_info(id: &str, pod: &str, spec: &Spec) -> Info {
+    Info {
+        id: id.to_owned(),
+        kind: spec.kind.clone(),
+        name: spec.name.clone().unwrap_or_else(|| spec.kind.clone()),
+        target: format!("agent:{pod}"),
+        cwd: crate::harness::session::resolve_cwd(spec.cwd.as_deref()),
+        status: crate::harness::model::Status::Starting,
+        ..Info::default()
+    }
+}
+
 /// What the facts the server has of `target`'s runner say of its Hex node's image class
 /// (`crate::harness::engine::node_images`).
 fn images_at(hub: &Hub, target: &str) -> crate::harness::engine::NodeImages {
@@ -1832,6 +1862,20 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     }
     // A parent's reach off holds its children to its machine.
     let on = by.parent.as_ref().filter(|p| p.reach.as_deref() == Some("off")).map(target_of).or_else(|| ask.on.clone());
+    // In a pod of its own on kiln's Kubernetes engine (docs/agentic.md W10): its workspace held by its home, the runner
+    // whose machine holds its folder, which `on` names; placed there as a session that asks for no engine is.
+    let pod = ask.isolation.as_deref().map(str::trim) == Some(POD);
+    let ask = if pod {
+        if on.is_none() {
+            return Err(bad("a session in a pod names its home with `on`: the runner whose machine holds its folder, which holds its workspace"));
+        }
+        if hub.k8s.get().and_then(Option::as_ref).is_none() {
+            return Err((StatusCode::CONFLICT, "the server runs no Kubernetes engine (`[kubernetes]`): no agent runs in a pod".to_owned()));
+        }
+        Ask { isolation: None, ..ask.clone() }
+    } else {
+        ask.clone()
+    };
     // The Agentfile it names is checked before anything is placed for it.
     let image = match ask.image.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
         Some(asked) => Some(image_for(hub, &whose_agentfiles(by)?, kind, asked).await?),
@@ -2001,6 +2045,23 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         let spec = Spec { claim: claim.clone(), isolation: with_person(boundary(t), person.as_deref()), engine_version: decided_under(t), ..spec.clone() };
         // Under the caller's own ids where it named them, each placed batch its own in order.
         let ids = asked_ids.get(at..at.saturating_add(n)).unwrap_or_default();
+        // In a pod: each its pod, its workspace held by the runner it was placed on; it opens there as its pod's runner
+        // comes (`crate::k8s::agent::on_features`), so what's answered now is the session as it starts.
+        if pod {
+            match start_pods(hub, t, &spec, n, ids).await {
+                Ok(i) => infos.extend(i),
+                Err(e) => {
+                    let_go(hub, placed.get(at..).unwrap_or_default()).await;
+                    if infos.is_empty() {
+                        return Err((StatusCode::CONFLICT, format!("{e:#}")));
+                    }
+                    tracing::warn!(error = %format!("{e:#}"), "some of the agents asked for didn't start in their pods");
+                    break;
+                }
+            }
+            at += n;
+            continue;
+        }
         match hub.harness.open_as(hub, t, spec, n, ids).await {
             Ok(i) => infos.extend(i),
             Err(e) => {
@@ -2350,6 +2411,16 @@ mod tests {
             anyhow::ensure!(hub.harness.list().is_empty(), "nothing started");
             Ok(())
         })
+    }
+
+    /// W10: a session in a pod is answered as it starts, before its pod's runner opens it: under its id, its harness and
+    /// folder, its target its pod's runner, starting.
+    #[test]
+    fn w10_a_session_in_a_pod_is_answered_as_it_starts_its_target_its_pods_runner() {
+        let spec = Spec { kind: "claude".into(), cwd: Some("/src/kiln".into()), ..Spec::default() };
+        let i = pod_info("01a1f7", "kiln-agent-01a1f7", &spec);
+        assert_eq!((i.id.as_str(), i.kind.as_str(), i.name.as_str(), i.target.as_str(), i.cwd.as_str()), ("01a1f7", "claude", "claude", "agent:kiln-agent-01a1f7", "/src/kiln"));
+        assert_eq!(i.status, crate::harness::model::Status::Starting);
     }
 
     /// W9: a runner whose owner set `container` holds new conversations in containers of its image. Given one whose

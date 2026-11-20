@@ -488,6 +488,10 @@ pub struct Kubernetes {
     pub server_quic: Option<String>,
     /// PriorityClass for job pods (low, so CI never starves the control plane).
     pub priority_class: Option<String>,
+    /// The image agents' pods run (docs/agentic.md W10): each harness its agents use on its `PATH`. None: no agent runs
+    /// in a pod, and a start that asks for one is refused, saying so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents_image: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -886,6 +890,7 @@ impl Default for Kubernetes {
             server_url: None,
             server_quic: None,
             priority_class: None,
+            agents_image: None,
         }
     }
 }

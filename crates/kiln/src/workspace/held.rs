@@ -26,7 +26,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::Workspace;
-use super::slates::Made;
 
 /// What the server asks a home to hold ([`super::Ask::Hold`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +137,7 @@ pub async fn release(id: &str) -> anyhow::Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::slates::Made;
     use super::*;
 
     /// W10. Do: ask a hold as the server sends it, then keep one and look it up and let it go from the map, with no

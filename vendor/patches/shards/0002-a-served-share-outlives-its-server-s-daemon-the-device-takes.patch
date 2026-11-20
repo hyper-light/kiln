@@ -1,0 +1,1431 @@
+Subject: a served share outlives its server's daemon: the device takes slates' resync channel (Shards D288)
+Why: kiln goal 90: a Slates daemon restart must not end an agent microVM's share; Shards' branch agents/w-k90-microvm-resync-d288 (b9006561b) until Shards' coordinator merges it
+
+diff --git a/crates/api/src/image.rs b/crates/api/src/image.rs
+index 228917308347ec49652f4be7e2fab878fe9aba3a..3cf5e18c420f6cc6838f3b808ad67e90c1f87c5f 100644
+--- a/crates/api/src/image.rs
++++ b/crates/api/src/image.rs
+@@ -234,6 +234,10 @@ pub struct ServedShare {
+     pub exec: bool,
+     /// The members given it as they start (D277), as an [`ImageShare`]'s.
+     pub members: Option<PlugFor>,
++    /// Its server's resync channel (D288; slates' A-316), Unix's alone: the device's end of a
++    /// channel over which a successor of the server, should it die, hands the share a fresh
++    /// stream. Handed to the run host after the streams, held as a stream is.
++    pub resync: Option<ServedStream>,
+ }
+ 
+ /// The stream a [`ServedShare`]'s server answers on: on Unix a connected stream socket, on
+@@ -1514,6 +1518,7 @@ fn request(spec: &ImageSpec) -> Result<wire::Request, ImageRefusal> {
+             exec: s.exec,
+             members: share_to(&s.at, s.members.as_ref())?,
+             handle: None,
++            resync: s.resync.is_some(),
+         });
+     }
+     // The instant it becomes is nanoseconds since the Unix epoch in a u64, as `ready-by=`
+@@ -2161,6 +2166,7 @@ mod tests {
+             read_only,
+             exec,
+             members,
++            resync: None,
+         };
+         let mut s = spec();
+         s.served = vec![
+@@ -2181,6 +2187,7 @@ mod tests {
+                     exec: true,
+                     members: None,
+                     handle: None,
++                    resync: false,
+                 },
+                 wire::ServedAt {
+                     at: "/data".into(),
+@@ -2191,6 +2198,7 @@ mod tests {
+                         name: "codex".into(),
+                     }])),
+                     handle: None,
++                    resync: false,
+                 },
+             ]
+         );
+diff --git a/crates/api/src/image/pool.rs b/crates/api/src/image/pool.rs
+index 9deb3dfff5413aad051995ddee1aaecd2fea6f0a..c4570baf5dc88b5f2dc710f5accb854cd7ba5405 100644
+--- a/crates/api/src/image/pool.rs
++++ b/crates/api/src/image/pool.rs
+@@ -2200,6 +2200,7 @@ mod tests {
+                 exec: true,
+                 members: None,
+                 handle: None,
++                resync: false,
+             }],
+             ..request(1, None)
+         };
+diff --git a/crates/api/src/image/session.rs b/crates/api/src/image/session.rs
+index ff36f2b903f9f46c51504ad37a5c8bf3fc08b891..7e5e80e3ab89cc9060716d34c874f7035f3eab65 100644
+--- a/crates/api/src/image/session.rs
++++ b/crates/api/src/image/session.rs
+@@ -1033,13 +1033,22 @@ pub(crate) struct Host {
+ 
+ /// `served`'s streams sent on a run host's links socket `links` (D287): `SERVED_SHARES` messages
+ /// of `shards_ipc::MAX_FDS` descriptors at most and no payload, in order, as its host takes them
+-/// before its request.
++/// before its request; then the resync channels of those that have one (D288), in order, as
++/// `SERVED_RESYNCS` messages of as many at most.
+ #[cfg(unix)]
+ fn send_served(links: &std::os::unix::net::UnixStream, served: &[super::ServedShare]) -> io::Result<()> {
+     let fds: Vec<_> = served.iter().map(|s| s.stream.as_fd()).collect();
+     for batch in fds.chunks(shards_ipc::MAX_FDS) {
+         shards_ipc::send(links, shards_ipc::kind::SERVED_SHARES, &[], batch)?;
+     }
++    let resyncs: Vec<_> = served
++        .iter()
++        .filter_map(|s| s.resync.as_ref())
++        .map(|r| r.as_fd())
++        .collect();
++    for batch in resyncs.chunks(shards_ipc::MAX_FDS) {
++        shards_ipc::send(links, shards_ipc::kind::SERVED_RESYNCS, &[], batch)?;
++    }
+     Ok(())
+ }
+ 
+@@ -1339,6 +1348,12 @@ impl Begun {
+         }
+         #[cfg(windows)]
+         {
++            if served.iter().any(|s| s.resync.is_some()) {
++                return Err(ImageRefusal::Spec {
++                    what: "the served shares",
++                    why: "a resync channel, which Windows' shares take none of yet (D288)".into(),
++                });
++            }
+             let mut handed = request.clone();
+             for (at, share) in handed.served.iter_mut().zip(served) {
+                 let value = self.host.give(share.stream.as_fd()).map_err(os)?;
+@@ -6273,6 +6288,61 @@ mod tests {
+         assert_eq!(layer_files(&home), [others], "its run host's layer outlived it");
+     }
+ 
++    /// D288: the resync channels of a run's served shares that have one follow their streams on
++    /// its host's links socket, in the request's order of those. Do: three shares, the first and
++    /// third with a channel. Expect: one `SERVED_SHARES` of three, then one `SERVED_RESYNCS` of
++    /// two, each the very socket sent in its place.
++    #[cfg(unix)]
++    #[test]
++    fn a_served_shares_resync_channel_follows_the_streams() {
++        use std::io::{Read as _, Write as _};
++        use std::os::unix::net::UnixStream;
++        let (links, host) = UnixStream::pair().unwrap();
++        let pair = || UnixStream::pair().unwrap();
++        let streams = [pair(), pair(), pair()];
++        let channels = [pair(), pair()];
++        let mut handed = channels.iter();
++        let served: Vec<super::super::ServedShare> = streams
++            .iter()
++            .enumerate()
++            .map(|(i, (ours, _))| super::super::ServedShare {
++                stream: super::super::ServedStream::new(ours.try_clone().unwrap().into()),
++                at: format!("/s{i}"),
++                read_only: false,
++                exec: true,
++                members: None,
++                resync: (i != 1).then(|| {
++                    let (ours, _) = handed.next().unwrap();
++                    super::super::ServedStream::new(ours.try_clone().unwrap().into())
++                }),
++            })
++            .collect();
++        send_served(&links, &served).unwrap();
++        let first = shards_ipc::recv(&host).unwrap().unwrap();
++        assert_eq!(
++            (first.kind, first.fds.len()),
++            (shards_ipc::kind::SERVED_SHARES, 3)
++        );
++        let second = shards_ipc::recv(&host).unwrap().unwrap();
++        assert_eq!(
++            (second.kind, second.fds.len()),
++            (shards_ipc::kind::SERVED_RESYNCS, 2)
++        );
++        for (i, (_, peer)) in channels.iter().enumerate() {
++            (&*peer).write_all(&[u8::try_from(i).unwrap()]).unwrap();
++        }
++        let read: Vec<u8> = second
++            .fds
++            .into_iter()
++            .map(|fd| {
++                let mut byte = [0u8; 1];
++                UnixStream::from(fd).read_exact(&mut byte).unwrap();
++                byte[0]
++            })
++            .collect();
++        assert_eq!(read, [0, 1], "each channel in its share's order");
++    }
++
+     /// D287: a run's served shares' streams go on its host's links socket in their order,
+     /// `shards_ipc::MAX_FDS` a message at most and no payload, as its host takes them before
+     /// its request. Do: send one more than a message carries. Expect: two `SERVED_SHARES`
+@@ -6296,6 +6366,7 @@ mod tests {
+                 read_only: false,
+                 exec: true,
+                 members: None,
++                resync: None,
+             })
+             .collect();
+         send_served(&links, &served).unwrap();
+diff --git a/crates/api/src/image/wire.rs b/crates/api/src/image/wire.rs
+index 1aef5d40c0e5fc812539761d5b805ccf69bff4b5..3d3dcdb4892cac33013fd96d2b671ec042bcc78c 100644
+--- a/crates/api/src/image/wire.rs
++++ b/crates/api/src/image/wire.rs
+@@ -146,8 +146,12 @@ pub use shards_abi::run::nesting::Ready;
+ /// on its links socket before the request, `shards_ipc::kind::SERVED_SHARES`; on Windows
+ /// duplicated into its process, [`ServedAt::handle`]), put in a share slot of its microVM after
+ /// its own shares', so that a side that serves none refuses the run as it is asked, rather than
+-/// starting its members without the directory their orchestrator gave them.
+-pub const VERSION: u8 = 52;
++/// starting its members without the directory their orchestrator gave them; 53, a served
++/// share's resync channel ([`ServedAt::resync`], D288): on Unix its end comes on the links
++/// socket after the streams (`shards_ipc::kind::SERVED_RESYNCS`), and the share's device takes
++/// a fresh stream on it when its server dies, so that a side that knows no such channel
++/// refuses the run as it is asked, rather than its share ending with its server's daemon.
++pub const VERSION: u8 = 53;
+ 
+ /// The run host's links socket's descriptor on Unix (version 50, D285 slice 4): the first past
+ /// its standard streams, given it as it starts with [`LINKS_ARG`] on its command line, on which
+@@ -687,6 +691,10 @@ pub struct ServedAt {
+     /// request's order (`shards_ipc::kind::SERVED_SHARES`). Never part of a pool's exemplar
+     /// ([`Request::exemplar`]).
+     pub handle: Option<u64>,
++    /// Whether its server gives a resync channel beside its stream (D288; slates' A-316), whose
++    /// end comes on the links socket after the streams (`shards_ipc::kind::SERVED_RESYNCS`), in
++    /// the request's order of those that have one; Unix's alone. Appended in version 53.
++    pub resync: bool,
+ }
+ 
+ /// The run an orchestrator asks for.
+@@ -2767,6 +2775,8 @@ impl Request {
+                     w.u64(value);
+                 }
+             }
++            // Whether it has a resync channel, appended in version 53 (D288).
++            w.u8(u8::from(s.resync));
+         }
+         w.done()
+     }
+@@ -3009,8 +3019,9 @@ impl Request {
+             control.stdio = r.flag()?;
+         }
+         // Its shares another server serves, appended in version 52 (D287): each at least its
+-        // place's length, its two flags, its members' tag and its handle's flag.
+-        let n = r.count(4 + 1 + 1 + 1 + 1)?;
++        // place's length, its two flags, its members' tag, its handle's flag and, appended in
++        // version 53 (D288), its resync channel's.
++        let n = r.count(4 + 1 + 1 + 1 + 1 + 1)?;
+         let mut served = Vec::with_capacity(n);
+         for _ in 0..n {
+             let at = r.text()?;
+@@ -3018,12 +3029,14 @@ impl Request {
+             let exec = r.flag()?;
+             let members = r.share_to()?;
+             let handle = if r.flag()? { Some(r.u64()?) } else { None };
++            let resync = r.flag()?;
+             served.push(ServedAt {
+                 at,
+                 read_only,
+                 exec,
+                 members,
+                 handle,
++                resync,
+             });
+         }
+         r.end()?;
+@@ -6180,8 +6193,9 @@ mod tests {
+         );
+     }
+ 
+-    /// The run's shares another server serves (version 52, D287), the request's last field. Do:
+-    /// carry one with no handle (a Unix stream's), one with a handle's value (a Windows pipe's),
++    /// The run's shares another server serves (version 52, D287; its resync flag version 53's,
++    /// D288), the request's last field. Do: carry one with no handle and no resync channel, one
++    /// with a handle's value (a Windows pipe's) and a resync channel,
+     /// given to every member and to members named, read-only and not to be run from. Expect:
+     /// each reads back as written; its exemplar keeps each but its handle. Do: a handle's flag
+     /// of another value, a members' tag no version has, and four billion of them in a few
+@@ -6200,6 +6214,7 @@ mod tests {
+                 exec: true,
+                 members: Some(ShareTo::Members(vec![codex])),
+                 handle: None,
++                resync: false,
+             },
+             ServedAt {
+                 at: "/data".into(),
+@@ -6207,6 +6222,7 @@ mod tests {
+                 exec: false,
+                 members: Some(ShareTo::Every),
+                 handle: Some(0x0000_0000_0000_0a4c),
++                resync: true,
+             },
+         ];
+         let bytes = r.encode().unwrap();
+@@ -6228,9 +6244,9 @@ mod tests {
+                 .collect::<Vec<_>>(),
+             exemplar.served
+         );
+-        // The second's handle's flag, before its value, the request's last eight bytes.
++        // The second's resync flag (version 53, D288), the request's last byte.
+         let mut bad = bytes.clone();
+-        let at = bad.len() - 8 - 1;
++        let at = bad.len() - 1;
+         assert_eq!(bad[at], 1);
+         bad[at] = 2;
+         assert_eq!(
+@@ -6240,9 +6256,21 @@ mod tests {
+                 tag: 2
+             })
+         );
+-        // The second's members' tag, before its handle's flag and value.
++        // The second's handle's flag, before its value's eight bytes and its resync flag.
+         let mut bad = bytes.clone();
+-        let at = bad.len() - 8 - 1 - 1;
++        let at = bad.len() - 1 - 8 - 1;
++        assert_eq!(bad[at], 1);
++        bad[at] = 2;
++        assert_eq!(
++            Request::decode(&bad),
++            Err(WireError::Tag {
++                what: "a flag",
++                tag: 2
++            })
++        );
++        // The second's members' tag, before its handle's flag and value and its resync flag.
++        let mut bad = bytes.clone();
++        let at = bad.len() - 1 - 8 - 1 - 1;
+         assert_eq!(bad[at], 1);
+         bad[at] = 3;
+         assert_eq!(
+diff --git a/crates/ipc/src/lib.rs b/crates/ipc/src/lib.rs
+index e293de6756c2a2782d6c4ffbee89863647bb6fbc..41d619ce621090ee928cda7ec7bff548531100ed 100644
+--- a/crates/ipc/src/lib.rs
++++ b/crates/ipc/src/lib.rs
+@@ -537,6 +537,17 @@ pub mod kind {
+     /// before this did, numbers it 117: a run host of either build refuses the other's as a
+     /// message of another kind where its streams were due (`Cause::Request`).
+     pub const SERVED_SHARES: u8 = 118;
++    /// Orchestrator → run host, on its links socket (D288, Unix): the resync channels of the
++    /// run's shares another server serves that have one (`wire::ServedAt::resync`), in the
++    /// request's order, [`MAX_FDS`](super::MAX_FDS) a message at most and no payload, sent
++    /// after their streams' [`SERVED_SHARES`] and before the run's request. Not answered: its
++    /// sender holds its copies as it holds the streams'. 119, the first number no other kind
++    /// has.
++    pub const SERVED_RESYNCS: u8 = 119;
++    /// A run's share process → its VM process (D288, Unix): the resync channel of the share
++    /// in slot `u32` (little-endian, its payload), one descriptor, sent before the shares'
++    /// [`SHARE_ENDS`], which the VM's `TAKEN` answers for both.
++    pub const SHARE_RESYNC: u8 = 120;
+     /// Daemon → a running microVM's VM process: a run joins its network (D119). Its number
+     /// (a big-endian u64, which `EXEC_TAKEN` answers), with the VM's end of the joiner's
+     /// own connection to the daemon, on which the joiner's run goes as a warm VM's does
+diff --git a/crates/ipc/src/unix.rs b/crates/ipc/src/unix.rs
+index 950ac7b48efc27828014560893bd71a5d372e715..60bf175dae9c37ceb9a851e42994b9452d47497f 100644
+--- a/crates/ipc/src/unix.rs
++++ b/crates/ipc/src/unix.rs
+@@ -702,6 +702,24 @@ fn recv_until(sock: &UnixStream, deadline: Option<Instant>) -> io::Result<Option
+     Ok(Some(Message { kind, payload, fds }))
+ }
+ 
++/// Exactly `buf.len()` bytes, and the descriptors that came with them, waiting as long as
++/// that takes: a channel of fixed-length messages that are no [`Message`]s of this crate's
++/// framing (slates' resync channel, D288). `None` where the peer closed before any byte;
++/// `UnexpectedEof` where it closed partway through.
++pub fn recv_exact(sock: &UnixStream, buf: &mut [u8]) -> io::Result<Option<Vec<OwnedFd>>> {
++    let mut fds = Vec::new();
++    let got = recv_part(sock, buf, &mut fds, None)?;
++    if got == 0 {
++        return if fds.is_empty() {
++            Ok(None)
++        } else {
++            Err(io::ErrorKind::UnexpectedEof.into())
++        };
++    }
++    fill(sock, buf.get_mut(got..).unwrap_or_default(), &mut fds, None)?;
++    Ok(Some(fds))
++}
++
+ /// Reads exactly `buf.len()` more bytes of a message.
+ fn fill(
+     sock: &UnixStream,
+diff --git a/crates/shards/src/api_run.rs b/crates/shards/src/api_run.rs
+index 5de0e13fa8edb941330728618a6d08645fbbf3dd..3844ef261ab8abe04a01f0c6b370b4e00ef9040e 100644
+--- a/crates/shards/src/api_run.rs
++++ b/crates/shards/src/api_run.rs
+@@ -328,8 +328,8 @@ fn host(answers: &Answers) -> Result<(), No> {
+         return hosted::warm(answers, &request, input);
+     }
+     let ready_by = deadline(request.ready_by, SystemTime::now())?;
+-    let served = served_streams(&request)?;
+-    hosted::run(answers, &request, ready_by, input, served)
++    let (served, resyncs) = served_streams(&request)?;
++    hosted::run(answers, &request, ready_by, input, served, resyncs)
+ }
+ 
+ /// The streams of the run's shares another server serves (D287), one for each of `request`'s,
+@@ -338,12 +338,12 @@ fn host(answers: &Answers) -> Result<(), No> {
+ /// came, a message of another kind came first, or the request names a handle, which no Unix
+ /// stream has. Each is the VM's in its share slot as it is, its server answering it.
+ #[cfg(unix)]
+-fn served_streams(request: &wire::Request) -> Result<Vec<OwnedFd>, No> {
++fn served_streams(request: &wire::Request) -> Result<(Vec<OwnedFd>, Vec<OwnedFd>), No> {
+     let refused = |why: String| No(Cause::Request, why);
+     let want = request.served.len();
+     let mut streams: Vec<OwnedFd> = Vec::with_capacity(want);
+     if want == 0 {
+-        return Ok(streams);
++        return Ok((streams, Vec::new()));
+     }
+     if let Some(s) = request.served.iter().find(|s| s.handle.is_some()) {
+         return Err(refused(format!(
+@@ -390,7 +390,52 @@ fn served_streams(request: &wire::Request) -> Result<Vec<OwnedFd>, No> {
+             )));
+         }
+     }
+-    Ok(streams)
++    let resyncs = served_resyncs(request, links)?;
++    Ok((streams, resyncs))
++}
++
++/// The resync channels of the run's shares another server serves that have one (D288), in the
++/// request's order of those: those its orchestrator sent on this process's links socket after
++/// the streams (`kind::SERVED_RESYNCS`), each a socket; refused `Request` as their streams are.
++#[cfg(unix)]
++fn served_resyncs(request: &wire::Request, links: &Links) -> Result<Vec<OwnedFd>, No> {
++    let refused = |why: String| No(Cause::Request, why);
++    let want = request.served.iter().filter(|s| s.resync).count();
++    let mut resyncs: Vec<OwnedFd> = Vec::with_capacity(want);
++    while resyncs.len() < want {
++        let message = links.next().map_err(refused)?.ok_or_else(|| {
++            refused(format!(
++                "{} of its {want} served shares' resync channels came before its request",
++                resyncs.len()
++            ))
++        })?;
++        if message.kind != kind::SERVED_RESYNCS || message.fds.is_empty() {
++            return Err(refused(format!(
++                "message kind {} with {} descriptors before its request, where its served shares' resync channels were due",
++                message.kind,
++                message.fds.len()
++            )));
++        }
++        resyncs.extend(message.fds);
++    }
++    if resyncs.len() != want {
++        return Err(refused(format!(
++            "{} resync channels for its {want} served shares that have one",
++            resyncs.len()
++        )));
++    }
++    for channel in &resyncs {
++        use std::os::unix::fs::FileTypeExt as _;
++        let socket = channel
++            .try_clone()
++            .map(std::fs::File::from)
++            .and_then(|f| f.metadata())
++            .is_ok_and(|m| m.file_type().is_socket());
++        if !socket {
++            return Err(refused("a served share's resync channel is no socket".into()));
++        }
++    }
++    Ok(resyncs)
+ }
+ 
+ /// [`served_streams`] on Windows: each a pipe its orchestrator duplicated into this process for
+@@ -399,9 +444,15 @@ fn served_streams(request: &wire::Request) -> Result<Vec<OwnedFd>, No> {
+ /// standard handles, a pipe, no value twice) and owned from here on; refused `Request` where a
+ /// share names none.
+ #[cfg(windows)]
+-fn served_streams(request: &wire::Request) -> Result<Vec<OwnedFd>, No> {
++fn served_streams(request: &wire::Request) -> Result<(Vec<OwnedFd>, Vec<OwnedFd>), No> {
+     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+     let refused = |why: String| No(Cause::Request, why);
++    if let Some(s) = request.served.iter().find(|s| s.resync) {
++        return Err(refused(format!(
++            "{}: a served share's resync channel, which Windows' shares take none of yet (D288)",
++            s.at
++        )));
++    }
+     let mut streams: Vec<OwnedFd> = Vec::with_capacity(request.served.len());
+     let mut values: Vec<u64> = Vec::with_capacity(request.served.len());
+     for s in &request.served {
+@@ -419,7 +470,7 @@ fn served_streams(request: &wire::Request) -> Result<Vec<OwnedFd>, No> {
+         // checked a pipe of this process's above and named once: owned from here, closed once.
+         streams.push(unsafe { OwnedFd::from_raw_handle(pipe.as_raw_handle()) });
+     }
+-    Ok(streams)
++    Ok((streams, Vec::new()))
+ }
+ 
+ /// Why frame `kind`, come before its run's request, refuses the run: the channel is no run
+@@ -3362,6 +3413,9 @@ mod hosted {
+         /// Its sign-in grants, whose asks its host relays (D242, step 8).
+         signing: Vec<wire::SignInGrant>,
+         dirs: Vec<(OwnedFd, bool, OsString)>,
++        /// The resync channels of its shares another server serves that have one (D288), each
++        /// by its share's place in `dirs`.
++        resyncs: Vec<(usize, OwnedFd)>,
+         /// The bound each bounded volume's share among them is served with (D281).
+         bounds: Vec<crate::volumes::Bounded>,
+         /// The named volumes among them, held since they were opened (D281): its live state's
+@@ -3412,13 +3466,14 @@ mod hosted {
+         ready_by: Option<u64>,
+         input: super::Input,
+         served: Vec<OwnedFd>,
++        resyncs: Vec<OwnedFd>,
+     ) -> Result<(), No> {
+         let mut checking = Checking::begin();
+         let home = shards_ipc::home().map_err(no(Cause::Boot))?;
+         let (shaped, layering) = shape(request, &home, &mut checking)?;
+         let made = shaped.made.clone();
+-        let plan =
+-            plan(request, ready_by, shaped, served).inspect_err(|_| end(&home, None, &made, Vec::new()))?;
++        let plan = plan(request, ready_by, shaped, served, resyncs)
++            .inspect_err(|_| end(&home, None, &made, Vec::new()))?;
+         launch_and_serve(answers, input, &home, plan, checking, layering)
+     }
+ 
+@@ -3804,6 +3859,7 @@ mod hosted {
+         ready_by: Option<u64>,
+         shaped: Shaped,
+         served: Vec<OwnedFd>,
++        resyncs: Vec<OwnedFd>,
+     ) -> Result<Plan, No> {
+         let Shaped {
+             mut run,
+@@ -3855,8 +3911,18 @@ mod hosted {
+         // output, what it stages, its members' ends asked for, and its own command or
+         // `ATTEND`.
+         let (_, _, most) = crate::run::sizes(&run.resources, crate::build::host_memory());
+-        // Its shares another server serves (D287), in the slots after its own shares'.
++        // Its shares another server serves (D287), in the slots after its own shares', and the
++        // resync channels of those that have one (D288), each by its slot.
++        let first_served = opened.dirs.len();
+         served_slots(&mut opened, &request.served, served)?;
++        let resyncs: Vec<(usize, OwnedFd)> = request
++            .served
++            .iter()
++            .enumerate()
++            .filter(|(_, s)| s.resync)
++            .map(|(i, _)| first_served.saturating_add(i))
++            .zip(resyncs)
++            .collect();
+         // The shares it gives members as they start (D277), told in their entries.
+         let given = super::share_members(request, &members)?;
+         let volumes = agentfile
+@@ -3996,6 +4062,7 @@ mod hosted {
+             granted: request.credentials.iter().map(|g| g.reference.clone()).collect(),
+             signing: request.sign_ins.clone(),
+             dirs: opened.dirs,
++            resyncs,
+             bounds: opened.bounds,
+             volumes: opened.held,
+             made,
+@@ -4132,6 +4199,9 @@ mod hosted {
+     struct Launch<'a> {
+         prepared: &'a crate::run::Prepared,
+         dirs: &'a [(OwnedFd, bool, OsString)],
++        /// The resync channels of its served shares that have one (D288), by place in `dirs`.
++        #[cfg_attr(windows, allow(dead_code))]
++        resyncs: &'a [(usize, OwnedFd)],
+         bounds: &'a [crate::volumes::Bounded],
+         bridge: Option<&'a shards_net::bridge::Bridge>,
+         /// Whether its network process makes its run's credential grants (D242).
+@@ -4148,6 +4218,7 @@ mod hosted {
+             Launch {
+                 prepared: &self.prepared,
+                 dirs: &self.dirs,
++                resyncs: &self.resyncs,
+                 bounds: &self.bounds,
+                 bridge: self.bridge.as_ref(),
+                 credentials: self.credentials.is_some(),
+@@ -4163,6 +4234,7 @@ mod hosted {
+             Launch {
+                 prepared: &self.prepared,
+                 dirs: &self.opened.dirs,
++                resyncs: &[],
+                 bounds: &self.opened.bounds,
+                 bridge: self.bridge.as_ref(),
+                 credentials: self.credentials.is_some(),
+@@ -4361,7 +4433,7 @@ mod hosted {
+         let tags = run_tags(plan.dirs.len());
+         #[cfg(unix)]
+         let shares = (!plan.dirs.is_empty())
+-            .then(|| start_shares(home, plan.dirs, plan.bounds, Some(&tags)))
++            .then(|| start_shares(home, plan.dirs, plan.resyncs, plan.bounds, Some(&tags)))
+             .transpose()
+             .map_err(boot)?;
+         #[cfg(windows)]
+@@ -4630,6 +4702,7 @@ mod hosted {
+     fn start_shares(
+         home: &Path,
+         dirs: &[(OwnedFd, bool, OsString)],
++        resyncs: &[(usize, OwnedFd)],
+         bounds: &[crate::volumes::Bounded],
+         tags: Option<&[String]>,
+     ) -> Result<Shares, String> {
+@@ -4648,6 +4721,17 @@ mod hosted {
+             }
+             None => None,
+         };
++        // Its served shares' resync channels (D288), by their shares' places, on descriptors
++        // past its others.
++        let resynced: OsString = resyncs
++            .iter()
++            .map(|(at, _)| at.to_string())
++            .collect::<Vec<_>>()
++            .join(",")
++            .into();
++        if !resyncs.is_empty() {
++            args.extend([OsStr::new(crate::share::RESYNCS), resynced.as_os_str()]);
++        }
+         let bounded = crate::share::bound_args(bounds.iter().map(|b| (b.share, b)));
+         args.extend(bounded.iter().map(OsString::as_os_str));
+         for (_, read_only, only) in dirs {
+@@ -4665,6 +4749,12 @@ mod hosted {
+         if let Some((_, w)) = &notices {
+             fds.push((w.as_fd(), number(5usize.saturating_add(dirs.len()))?));
+         }
++        let past = 5usize
++            .saturating_add(dirs.len())
++            .saturating_add(usize::from(notices.is_some()));
++        for (k, (_, channel)) in resyncs.iter().enumerate() {
++            fds.push((channel.as_fd(), number(past.saturating_add(k))?));
++        }
+         let child = shards_ipc::spawn_in(&exe, &args, &fds, false, &[])
+             .map_err(|e| format!("starting the share process: {e}"))?;
+         Ok(Shares {
+@@ -7889,7 +7979,7 @@ mod hosted {
+         // No served share's stream (D287): its share process started before its run asked, so a
+         // run naming one is another microVM's than this one (its exemplar's check above), and
+         // one this host's exemplar names is refused by `served_slots` for its streams' want.
+-        let plan = match plan(&request, ready_by, shaped, Vec::new()) {
++        let plan = match plan(&request, ready_by, shaped, Vec::new(), Vec::new()) {
+             Ok(plan) => plan,
+             // Its shares' directories went with `shaped`, as `plan` failed.
+             Err(e) => {
+@@ -10177,7 +10267,8 @@ mod hosted {
+             .into_iter()
+             .collect();
+         #[cfg(unix)]
+-        let mut share = start_shares(live.home, &dirs, &bounds, Some(&tags)).map_err(|e| (R::Host, e))?;
++        let mut share =
++            start_shares(live.home, &dirs, &[], &bounds, Some(&tags)).map_err(|e| (R::Host, e))?;
+         #[cfg(windows)]
+         let mut share =
+             start_shares(live.home, &dirs, &bounds, live.job, Some(&tags)).map_err(|e| (R::Host, e))?;
+@@ -10473,6 +10564,7 @@ mod hosted {
+                 exec,
+                 members: None,
+                 handle: None,
++                resync: false,
+             };
+             let mut opened = own();
+             served_slots(
+@@ -14261,6 +14353,7 @@ mod tests {
+             exec: true,
+             members: Some(to),
+             handle: None,
++            resync: false,
+         };
+         let mut r = request(Vec::new());
+         r.shares = vec![wire::ShareAt {
+diff --git a/crates/shards/src/share.rs b/crates/shards/src/share.rs
+index 7d98cf621675dc17379637580877bc1ad654001e..2d394754d17b13ae2fa81eb0809076ebbe14e51b 100644
+--- a/crates/shards/src/share.rs
++++ b/crates/shards/src/share.rs
+@@ -97,6 +97,11 @@ fn take_durable(args: &mut Vec<OsString>) -> Result<(), String> {
+ /// stream; as records its guest's init takes as they are (`run::builtin::NOTICE`).
+ pub(crate) const NOTICES: &str = "--notices";
+ 
++/// The flag after [`NOTICES`] that names the shares whose server gave a resync channel (D288),
++/// by their places among the shares joined by `,`: each channel on a descriptor past the
++/// others, in the order named, which this process hands its VM as it is (`SHARE_RESYNC`).
++pub(crate) const RESYNCS: &str = "--resyncs";
++
+ /// The flag before a share process's shares that bounds one of them (D281), after
+ /// [`MOVED`] and [`NOTICES`]: its three arguments the share's place among them, the bytes its
+ /// files may take, and its volume's count file, which its server maps. One for each bounded
+@@ -174,7 +179,7 @@ fn bound(server: &Server, bytes: u64, count: &Path) -> Result<(), String> {
+ fn take_notices(args: &mut Vec<OsString>) -> Result<Option<Vec<Vec<u8>>>, String> {
+     let at = args
+         .iter()
+-        .take_while(|a| *a == MOVED || *a == NOTICES)
++        .take_while(|a| *a == MOVED || *a == NOTICES || *a == RESYNCS)
+         .position(|a| a == NOTICES);
+     let Some(at) = at else {
+         return Ok(None);
+@@ -188,6 +193,32 @@ fn take_notices(args: &mut Vec<OsString>) -> Result<Option<Vec<Vec<u8>>>, String
+     Ok(Some(tags.split(|&b| b == b',').map(<[u8]>::to_vec).collect()))
+ }
+ 
++/// The shares' places [`RESYNCS`] names, taken out with it: none where it is not there.
++#[cfg(unix)]
++fn take_resyncs(args: &mut Vec<OsString>) -> Result<Vec<u32>, String> {
++    let at = args
++        .iter()
++        .take_while(|a| *a == MOVED || *a == RESYNCS)
++        .position(|a| a == RESYNCS);
++    let Some(at) = at else {
++        return Ok(Vec::new());
++    };
++    args.remove(at);
++    if at >= args.len() {
++        return Err("share: --resyncs takes its shares' places".into());
++    }
++    let places = args.remove(at);
++    bytes_of(&places)?
++        .split(|&b| b == b',')
++        .map(|p| {
++            std::str::from_utf8(p)
++                .ok()
++                .and_then(|p| p.parse::<u32>().ok())
++                .ok_or_else(|| "share: --resyncs: a place that is no number".to_string())
++        })
++        .collect()
++}
++
+ /// Tells `out` what the host changes beneath each of `servers`' shares (D235), the k-th as
+ /// share `shares[k]`, its place among the process's shares, on threads
+ /// that last as long as the process, as its servers do once it serves them: their notices
+@@ -410,11 +441,29 @@ pub fn share(args: impl Iterator<Item = OsString>) -> ExitCode {
+         Ok(notices) => notices,
+         Err(e) => return failed(&e),
+     };
++    let resynced = match take_resyncs(&mut args) {
++        Ok(places) => places,
++        Err(e) => return failed(&e),
++    };
+     let moved = take_moved(&mut args);
+     let given = match given(&mut args) {
+         Ok(given) => given,
+         Err(e) => return failed(&e),
+     };
++    // Its served shares' resync channels (D288): past its notices' pipe, or where that would
++    // be, in the order named, each a socket the daemon left for this process alone.
++    let past = 5 + i32::try_from(given.len()).unwrap_or(i32::MAX) + i32::from(notices.is_some());
++    let mut resyncs: Vec<(u32, UnixStream)> = Vec::with_capacity(resynced.len());
++    for (k, place) in resynced.into_iter().enumerate() {
++        let at = past.saturating_add(i32::try_from(k).unwrap_or(i32::MAX));
++        if usize::try_from(place).map_or(true, |p| p >= given.len()) || !is(at, libc::S_IFSOCK) {
++            return failed(&format!(
++                "share: descriptor {at} is not share {place}'s resync channel"
++            ));
++        }
++        // SAFETY: a socket the daemon left for this process alone, checked above.
++        resyncs.push((place, unsafe { UnixStream::from_raw_fd(at) }));
++    }
+     // Where its notices go (D235): past the home's private directory.
+     let notices = match notices {
+         Some(tags) => {
+@@ -531,11 +580,23 @@ pub fn share(args: impl Iterator<Item = OsString>) -> ExitCode {
+             &kept
+         }
+     };
+-    // The VM's ends, kept until it says it has them all.
++    // Its served shares' resync channels first (D288), each with its share's slot, then the
++    // VM's ends, all kept until it says it has them.
++    for (place, channel) in &resyncs {
++        use std::os::fd::AsFd as _;
++        if let Err(e) = shards_ipc::send(
++            &vm,
++            shards_ipc::kind::SHARE_RESYNC,
++            &place.to_le_bytes(),
++            &[channel.as_fd()],
++        ) {
++            return failed(&format!("share: the VM's resync channels: {e}"));
++        }
++    }
+     if let Err(e) = hand_over(&vm, &theirs) {
+         return failed(&format!("share: the VM's connections: {e}"));
+     }
+-    drop((theirs, vm));
++    drop((theirs, vm, resyncs));
+     let mut status = ExitCode::SUCCESS;
+     std::thread::scope(|scope| {
+         let mut threads = Vec::new();
+@@ -760,6 +821,36 @@ fn joiner(server: &Server, link: &Link) {
+ mod tests {
+     use super::*;
+ 
++    /// D288: `--resyncs PLACES` after `--notices`, as the run host passes them, is taken with
++    /// its places, the shares' modes and names left; a place that is no number is refused.
++    #[cfg(unix)]
++    #[test]
++    fn its_resync_places_are_taken_after_its_notices() {
++        let args = |a: &[&str]| -> Vec<OsString> { a.iter().map(OsString::from).collect() };
++        let mut given = args(&[
++            "--notices",
++            "shards0,shards1",
++            "--resyncs",
++            "1",
++            "rw",
++            "",
++            "rw",
++            "",
++        ]);
++        assert!(take_notices(&mut given).unwrap().is_some());
++        assert_eq!(take_resyncs(&mut given).unwrap(), [1]);
++        assert_eq!(given, args(&["rw", "", "rw", ""]));
++        let mut given = args(&["--resyncs", "0,2", "ro", "f"]);
++        assert_eq!(take_resyncs(&mut given).unwrap(), [0, 2]);
++        let mut none = args(&["rw", "--resyncs"]);
++        assert_eq!(
++            take_resyncs(&mut none).unwrap(),
++            Vec::<u32>::new(),
++            "a share's name is no flag"
++        );
++        assert!(take_resyncs(&mut args(&["--resyncs", "x", "rw", ""])).is_err());
++    }
++
+     /// `--notices TAGS` and `--moved` are taken before the shares in either order, and a
+     /// share's mode and name never taken for them.
+     #[test]
+diff --git a/crates/shards/src/warm.rs b/crates/shards/src/warm.rs
+index 6b7927685bb276b976cc5411f1685068c271b482..5dc95f3a1a5cfe9925c834daa1cff1eeb34a0169 100644
+--- a/crates/shards/src/warm.rs
++++ b/crates/shards/src/warm.rs
+@@ -371,14 +371,28 @@ fn watch_windows(daemon: &UnixStream, slots: &[shards_vmm::devices::virtio::fs::
+ }
+ 
+ /// Takes a connection for each of `slots` from the run's share process, in order, and
+-/// says it has them (`kind::SHARE_ENDS`).
++/// says it has them (`kind::SHARE_ENDS`); and before them the resync channel of each served
++/// share whose server gave one, by its slot (`kind::SHARE_RESYNC`, D288).
+ #[cfg(unix)]
+ fn shared(link: &UnixStream, slots: &[shards_vmm::devices::virtio::fs::Share]) -> Result<(), String> {
+     let mut ends = Vec::with_capacity(slots.len());
++    let mut resyncs: Vec<(usize, UnixStream)> = Vec::new();
+     while ends.len() < slots.len() {
+         let m = shards_ipc::recv(link)
+             .map_err(|e| format!("the share process: {e}"))?
+             .ok_or("the share process ended first")?;
++        if m.kind == kind::SHARE_RESYNC {
++            let slot = <[u8; 4]>::try_from(m.payload.as_slice())
++                .ok()
++                .and_then(|b| usize::try_from(u32::from_le_bytes(b)).ok())
++                .filter(|&at| at < slots.len() && !resyncs.iter().any(|(s, _)| *s == at));
++            let mut fds = m.fds.into_iter();
++            match (slot, fds.next(), fds.next()) {
++                (Some(at), Some(channel), None) => resyncs.push((at, UnixStream::from(channel))),
++                _ => return Err("the share process sent a resync channel for no share of its own".into()),
++            }
++            continue;
++        }
+         if m.kind != kind::SHARE_ENDS {
+             return Err(format!("the share process said message kind {}", m.kind));
+         }
+@@ -397,6 +411,11 @@ fn shared(link: &UnixStream, slots: &[shards_vmm::devices::virtio::fs::Share]) -
+     for (slot, end) in slots.iter().zip(ends) {
+         slot.attach(end)?;
+     }
++    for (at, channel) in resyncs {
++        if let Some(slot) = slots.get(at) {
++            slot.resync_on(channel)?;
++        }
++    }
+     Ok(())
+ }
+ 
+@@ -2810,6 +2829,60 @@ fn open_lane(owner: &UnixStream, to: &'static ToGuest, number: [u8; 8], name: Ve
+ mod tests {
+     use super::*;
+ 
++    /// D288: a served share's resync channel, sent by the share process before the shares'
++    /// ends, reaches the slot it names, which reads its `Attached` at once. Do: a channel for
++    /// slot 1 of two, its `Attached` queued, then both ends. Expect: TAKEN, and the `Attached`
++    /// read off the channel. Do: a channel for slot 2 of two. Expect: refused.
++    #[cfg(unix)]
++    #[test]
++    fn a_served_shares_resync_channel_reaches_its_slot_and_no_other() {
++        use shards_vmm::devices::virtio::fs::Share;
++        use std::io::{Read as _, Write as _};
++        use std::os::fd::AsFd as _;
++        let mut attached = [0u8; 28];
++        attached[0] = 1;
++        attached[1] = 1;
++        attached[4] = 9;
++        let take = |slot: u32| {
++            let (vm, share_process) = UnixStream::pair().unwrap();
++            let slots = [Share::default(), Share::default()];
++            let (mut server, device) = UnixStream::pair().unwrap();
++            server.write_all(&attached).unwrap();
++            let device_copy = device.try_clone().unwrap();
++            shards_ipc::send(
++                &share_process,
++                kind::SHARE_RESYNC,
++                &slot.to_le_bytes(),
++                &[device.as_fd()],
++            )
++            .unwrap();
++            drop(device);
++            let ends = [UnixStream::pair().unwrap(), UnixStream::pair().unwrap()];
++            shards_ipc::send(
++                &share_process,
++                kind::SHARE_ENDS,
++                &[],
++                &[ends[0].0.as_fd(), ends[1].0.as_fd()],
++            )
++            .unwrap();
++            let taken = shared(&vm, &slots);
++            (taken, share_process, device_copy, server)
++        };
++        let (taken, share_process, device, _server) = take(1);
++        assert_eq!(taken, Ok(()));
++        let told = shards_ipc::recv(&share_process).unwrap().unwrap();
++        assert_eq!(told.kind, kind::TAKEN);
++        device.set_nonblocking(true).unwrap();
++        let mut left = [0u8; 1];
++        assert_eq!(
++            (&device).read(&mut left).map_err(|e| e.kind()),
++            Err(io::ErrorKind::WouldBlock),
++            "its slot read the channel's Attached"
++        );
++        let (taken, ..) = take(2);
++        assert!(taken.is_err(), "a channel for no slot of its own is refused");
++    }
++
+     /// Do write the `DONE` of a run that ended, of one whose init said why it failed with words
+     /// dockerd amends (`start_failed`: "not a directory"), and the code its microVM keeps.
+     /// Expect: the status alone; the status, then init's words as init said them, which the
+diff --git a/crates/vmm/src/devices/virtio/fs/mod.rs b/crates/vmm/src/devices/virtio/fs/mod.rs
+index 2bf5a68ed7a6251559f9bac27241cb2b37c45e52..7547a2ee56d66470802441e995de7b24a8dbfe35 100644
+--- a/crates/vmm/src/devices/virtio/fs/mod.rs
++++ b/crates/vmm/src/devices/virtio/fs/mod.rs
+@@ -19,6 +19,8 @@ pub mod notices;
+ #[cfg(windows)]
+ pub mod ntfs;
+ pub mod proto;
++#[cfg(unix)]
++pub mod resync;
+ pub mod server;
+ #[cfg(unix)]
+ pub mod window;
+@@ -84,6 +86,10 @@ pub struct Slot {
+     /// Which files its window maps, learned from what each way costs here (D189,
+     /// memory-09): made as it first learns.
+     crossover: std::sync::Mutex<Option<crossover::Crossover>>,
++    /// Its server's resync channel, where it gave one (D288): over it a successor of a
++    /// server that died hands the device a fresh stream.
++    #[cfg(unix)]
++    resync: std::sync::Mutex<Option<resync::Resync>>,
+ }
+ 
+ /// A share's slot, which the VM's owner fills.
+@@ -149,9 +155,60 @@ impl Slot {
+             window: std::sync::Mutex::new(None),
+             mappings: std::sync::Mutex::new(Vec::new()),
+             crossover: std::sync::Mutex::new(None),
++            #[cfg(unix)]
++            resync: std::sync::Mutex::new(None),
+         }
+     }
+ 
++    /// Takes `channel`, its server's resync channel (D288), its `Attached` read: from here
++    /// on a stream that fails is replaced by the one a successor hands over on it.
++    #[cfg(unix)]
++    pub fn resync_on(&self, channel: std::os::unix::net::UnixStream) -> Result<(), String> {
++        let taken = resync::Resync::attached(channel).map_err(|e| format!("its share's server: {e}"))?;
++        *self
++            .resync
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(taken);
++        Ok(())
++    }
++
++    /// The stream a successor of the server behind `conn` hands over, `conn` replaced by
++    /// it and every DAX mapping of the window asked for again on it (D288, slates' condition
++    /// 4b): Err `failed`, the old stream's error, where the share has no channel or its
++    /// channel gives no stream; the share then ends as before.
++    #[cfg(unix)]
++    fn resynced(&self, conn: &mut Option<Stream>, failed: io::Error) -> io::Result<()> {
++        let fresh = {
++            let channel = self
++                .resync
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner);
++            let Some(channel) = channel.as_ref() else {
++                return Err(failed);
++            };
++            match channel.fresh() {
++                Ok(fd) => Stream::from(fd),
++                Err(why) => {
++                    debug!("virtio-fs: its share's stream failed ({failed}) and {why}");
++                    return Err(failed);
++                }
++            }
++        };
++        let mut fresh = fresh;
++        if let Some(window) = self.window() {
++            for (moffset, m) in window.mappings() {
++                let again = descriptor_on(&mut fresh, m.node, m.writable, m.foffset, m.len)
++                    .and_then(|fd| window.map(fd, m.node, m.foffset, moffset, m.len, m.writable));
++                if again.is_err() {
++                    // Its file reached no more: zeros there, as a restore's (`attach`).
++                    let _ = window.map_zeros(m.node, m.foffset, moffset, m.len, m.writable);
++                }
++            }
++        }
++        *conn = Some(fresh);
++        Ok(())
++    }
++
+     /// What `f` learns or tells of which files the window maps ([`crossover`]).
+     fn crossover<T>(&self, f: impl FnOnce(&mut crossover::Crossover) -> T) -> T {
+         let mut x = self
+@@ -251,12 +308,18 @@ impl Slot {
+             .conn
+             .lock()
+             .unwrap_or_else(std::sync::PoisonError::into_inner);
+-        let conn = conn.as_mut().ok_or(io::ErrorKind::NotConnected)?;
+-        write_frame(conn, req)?;
+-        if !read_frame_into(conn, reply)? {
+-            return Err(io::ErrorKind::UnexpectedEof.into());
++        loop {
++            let asked = exchange(conn.as_mut().ok_or(io::ErrorKind::NotConnected)?, req, reply);
++            match asked {
++                Ok(took) => return Ok(took),
++                // Asked again whole, its unique unchanged, on its server's successor's stream
++                // (D288); a successor that dies too is followed by the next.
++                #[cfg(unix)]
++                Err(failed) => self.resynced(&mut conn, failed)?,
++                #[cfg(windows)]
++                Err(failed) => return Err(failed),
++            }
+         }
+-        Ok(!reply.is_empty())
+     }
+ 
+     /// Replaces a server reply its device cannot give the guest with EIO.
+@@ -428,6 +491,16 @@ fn release_reply(conn: &mut Stream, req: &[u8], reply: &[u8]) -> Result<(), Unre
+     done.and(released)
+ }
+ 
++/// `req` written on `conn` and its reply read into `reply`: false for a request that takes
++/// none.
++fn exchange(conn: &mut Stream, req: &[u8], reply: &mut Vec<u8>) -> io::Result<bool> {
++    write_frame(conn, req)?;
++    if !read_frame_into(conn, reply)? {
++        return Err(io::ErrorKind::UnexpectedEof.into());
++    }
++    Ok(!reply.is_empty())
++}
++
+ /// The descriptor of the file of node `node` of the server at the other end of `conn`,
+ /// for a DAX window's mapping of `len` bytes of it from `foffset` (D189), writable only if
+ /// `writable`: an errno where the server refuses it.
+@@ -2538,6 +2611,81 @@ mod tests {
+         second.join().unwrap();
+     }
+ 
++    /// A request whose server dies before answering it is asked again whole on the stream its
++    /// successor hands over on the share's resync channel, and answered there (D288); with no
++    /// channel, or a resync naming another attachment or token, the share ends as before.
++    #[test]
++    fn a_request_its_server_died_holding_is_asked_again_on_its_successors_stream() {
++        use super::resync::tests::{attached, channel, resync, send};
++        use std::os::fd::AsFd as _;
++        const TOKEN: [u8; 16] = [3; 16];
++        let request = {
++            let mut r = 56u32.to_le_bytes().to_vec();
++            r.extend_from_slice(&1u32.to_le_bytes());
++            r.extend_from_slice(&0xabcdu64.to_le_bytes());
++            r.resize(56, 0x11);
++            r
++        };
++        // The first server reads the request and dies; what the successor is sent decides.
++        let ask_after_death = |resynced: Option<[u8; 28]>, with_channel: bool| {
++            let (ours, theirs) = UnixStream::pair().unwrap();
++            let slot = Share::default();
++            slot.attach(ours).unwrap();
++            let (server_channel, device_channel) = channel();
++            if with_channel {
++                send(&server_channel, &attached(9, TOKEN), &[]);
++                slot.resync_on(device_channel).unwrap();
++            }
++            let dying = std::thread::spawn(move || {
++                let mut conn = theirs;
++                read_frame(&mut conn).unwrap().unwrap()
++            });
++            let asking = {
++                let (slot, request) = (slot.clone(), request.clone());
++                std::thread::spawn(move || slot.ask(&request))
++            };
++            let first = dying.join().unwrap();
++            let (fresh, mut successor) = UnixStream::pair().unwrap();
++            if let Some(message) = resynced {
++                send(&server_channel, &message, &[fresh.as_fd()]);
++            }
++            drop(fresh);
++            let answering = std::thread::spawn(move || {
++                let again = read_frame(&mut successor).ok().flatten();
++                if let Some(req) = &again {
++                    let mut out = 16u32.to_le_bytes().to_vec();
++                    out.extend_from_slice(&0i32.to_le_bytes());
++                    out.extend_from_slice(&req[8..16]);
++                    write_frame(&mut successor, &out).unwrap();
++                }
++                again
++            });
++            if resynced.is_none() || !with_channel {
++                drop(server_channel);
++            }
++            let answer = asking.join().unwrap();
++            drop(slot);
++            (first, answer, answering.join().unwrap())
++        };
++
++        let (first, answer, again) = ask_after_death(Some(resync(9, TOKEN)), true);
++        assert_eq!(first, request);
++        assert_eq!(
++            again.as_deref(),
++            Some(&request[..]),
++            "asked again whole, its unique unchanged"
++        );
++        let answer = answer.unwrap().unwrap();
++        assert_eq!(&answer[8..16], &0xabcdu64.to_le_bytes(), "the successor's answer");
++
++        let (_, answer, again) = ask_after_death(None, false);
++        assert!(answer.is_err(), "no channel: the share ends as before");
++        assert_eq!(again, None);
++        let (_, answer, again) = ask_after_death(Some(resync(8, TOKEN)), true);
++        assert!(answer.is_err(), "another attachment's resync is refused");
++        assert_eq!(again, None, "nothing asked on a stream it refused");
++    }
++
+     fn share(hold: mpsc::Receiver<()>, asked: mpsc::Sender<Vec<u8>>) -> (Share, std::thread::JoinHandle<()>) {
+         share_answering(hold, asked, 0)
+     }
+diff --git a/crates/vmm/src/devices/virtio/fs/resync.rs b/crates/vmm/src/devices/virtio/fs/resync.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..af14ffc66558dac466ef54806443108407555916
+--- /dev/null
++++ b/crates/vmm/src/devices/virtio/fs/resync.rs
+@@ -0,0 +1,323 @@
++//! A served share's resync channel (D288): how a share another server serves outlives that
++//! server's death, as slates' daemon offers it (slates §4.6, A-316 and A-339, its
++//! `slates_bridge_fuse::shards_resync`, whose parse is this one's reference). A share's stream
++//! is read whole by length, so one its server died partway through is never asked on again;
++//! a successor instead hands the device a fresh stream over a second channel made beside the
++//! stream, and the device asks its outstanding request again on it.
++//!
++//! The channel is a pair of Unix sockets that carry descriptors (sequenced packets on Linux,
++//! a stream on macOS), one way, the server's to the device's, and every message on it is
++//! [`MESSAGE_BYTES`] long, little-endian: kind, version, two zero bytes, the attachment
++//! (`u64`), its token (16 bytes). First comes `Attached`, with no descriptor, which tells the
++//! device the token; each `Resync` after it carries one descriptor, the device's end of a
++//! fresh stream. A device takes a `Resync` only where it parses, is the version it knows,
++//! carries exactly one descriptor and names the attachment and token `Attached` named, the
++//! token compared in time independent of where it differs; anything else, or the channel's
++//! end, ends the share as a share with no channel ends, typed ([`Ended`]). Windows', which
++//! names a handle rather than carrying one, is not taken here.
++
++use std::io;
++use std::os::fd::OwnedFd;
++use std::os::unix::net::UnixStream;
++
++/// Format: the bytes of each message, slates' `RESYNC_MESSAGE_BYTES`: kind (1), version (1),
++/// reserved (2), attachment (8), token (16).
++pub const MESSAGE_BYTES: usize = 28;
++/// Format: the version of the messages this device reads, slates' `RESYNC_VERSION`.
++const VERSION: u8 = 1;
++/// Format: slates' kind bytes, `Attached` and `Resync`.
++const ATTACHED: u8 = 1;
++const RESYNC: u8 = 2;
++/// Format: the bytes of an attachment's token, slates' `TOKEN_BYTES`.
++const TOKEN_BYTES: usize = 16;
++
++/// Why a share's channel gives it no fresh stream: its share ends, as one with no channel.
++#[derive(Debug, PartialEq, Eq)]
++pub enum Ended {
++    /// The server's end closed: no resync will ever come.
++    Closed,
++    /// The channel failed, in the OS's words.
++    Transport(io::ErrorKind),
++    /// A message that is not one of this version's.
++    Malformed,
++    /// A message of a kind not expected where it came: anything but `Attached` first, or
++    /// anything but `Resync` after.
++    Unexpected { kind: u8 },
++    /// A `Resync` with no descriptor, or more than one.
++    Descriptors { given: usize },
++    /// A `Resync` for another attachment, or with another token.
++    Foreign,
++}
++
++impl std::fmt::Display for Ended {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Ended::Closed => f.write_str("its server's resync channel closed"),
++            Ended::Transport(kind) => write!(f, "its resync channel: {kind}"),
++            Ended::Malformed => f.write_str("a malformed resync message"),
++            Ended::Unexpected { kind } => write!(f, "a resync message of kind {kind} out of turn"),
++            Ended::Descriptors { given } => write!(f, "a resync carrying {given} descriptors"),
++            Ended::Foreign => f.write_str("a resync for another attachment"),
++        }
++    }
++}
++
++/// One message: its kind, attachment and token.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++struct Message {
++    kind: u8,
++    attachment: u64,
++    token: [u8; TOKEN_BYTES],
++}
++
++/// `bytes` as a message, checked as slates' parse checks one: version, reserved bytes, then
++/// a kind it defines.
++fn parse(bytes: &[u8; MESSAGE_BYTES]) -> Result<Message, Ended> {
++    let [kind, version, r0, r1, rest @ ..] = *bytes;
++    if version != VERSION || r0 != 0 || r1 != 0 || !matches!(kind, ATTACHED | RESYNC) {
++        return Err(Ended::Malformed);
++    }
++    let (attachment, token) = rest.split_at(8);
++    let attachment = u64::from_le_bytes(attachment.try_into().map_err(|_| Ended::Malformed)?);
++    let token = token.try_into().map_err(|_| Ended::Malformed)?;
++    Ok(Message {
++        kind,
++        attachment,
++        token,
++    })
++}
++
++/// Whether `a` and `b` are the same token, in time independent of where they differ.
++fn same_token(a: &[u8; TOKEN_BYTES], b: &[u8; TOKEN_BYTES]) -> bool {
++    a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
++}
++
++/// A share's resync channel, its `Attached` taken.
++#[derive(Debug)]
++pub struct Resync {
++    channel: UnixStream,
++    attachment: u64,
++    token: [u8; TOKEN_BYTES],
++}
++
++impl Resync {
++    /// The channel `channel`, its first message read: the `Attached` its server queued
++    /// before handing the channel on.
++    pub fn attached(channel: UnixStream) -> Result<Resync, Ended> {
++        let (m, fds) = next(&channel)?;
++        if m.kind != ATTACHED {
++            return Err(Ended::Unexpected { kind: m.kind });
++        }
++        if !fds.is_empty() {
++            return Err(Ended::Descriptors { given: fds.len() });
++        }
++        Ok(Resync {
++            channel,
++            attachment: m.attachment,
++            token: m.token,
++        })
++    }
++
++    /// The fresh stream the next `Resync` hands over, waiting for it: what a share whose
++    /// stream failed asks, its server's successor sending it once it has kept the
++    /// attachment.
++    pub fn fresh(&self) -> Result<OwnedFd, Ended> {
++        let (m, fds) = next(&self.channel)?;
++        if m.kind != RESYNC {
++            return Err(Ended::Unexpected { kind: m.kind });
++        }
++        if m.attachment != self.attachment || !same_token(&m.token, &self.token) {
++            return Err(Ended::Foreign);
++        }
++        let given = fds.len();
++        match <[OwnedFd; 1]>::try_from(fds) {
++            Ok([fd]) => Ok(fd),
++            Err(_) => Err(Ended::Descriptors { given }),
++        }
++    }
++}
++
++/// The channel's next message and the descriptors it carried.
++fn next(channel: &UnixStream) -> Result<(Message, Vec<OwnedFd>), Ended> {
++    let mut bytes = [0u8; MESSAGE_BYTES];
++    match shards_ipc::recv_exact(channel, &mut bytes) {
++        Ok(Some(fds)) => Ok((parse(&bytes)?, fds)),
++        Ok(None) => Err(Ended::Closed),
++        Err(e) => Err(Ended::Transport(e.kind())),
++    }
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++
++    /// A message's bytes, as slates' `ResyncMessage::to_bytes` makes them.
++    pub(crate) fn message(kind: u8, attachment: u64, token: [u8; TOKEN_BYTES]) -> [u8; MESSAGE_BYTES] {
++        let mut b = [0u8; MESSAGE_BYTES];
++        b[0] = kind;
++        b[1] = VERSION;
++        b[4..12].copy_from_slice(&attachment.to_le_bytes());
++        b[12..].copy_from_slice(&token);
++        b
++    }
++
++    pub(crate) fn attached(attachment: u64, token: [u8; TOKEN_BYTES]) -> [u8; MESSAGE_BYTES] {
++        message(ATTACHED, attachment, token)
++    }
++
++    pub(crate) fn resync(attachment: u64, token: [u8; TOKEN_BYTES]) -> [u8; MESSAGE_BYTES] {
++        message(RESYNC, attachment, token)
++    }
++
++    /// The server's end and the device's, as slates makes them: sequenced packets on Linux,
++    /// a stream on macOS.
++    pub(crate) fn channel() -> (UnixStream, UnixStream) {
++        #[cfg(target_os = "linux")]
++        {
++            let mut fds = [0; 2];
++            // SAFETY: socketpair(2) into a two-int array; each end is owned once, below.
++            let r = unsafe {
++                libc::socketpair(
++                    libc::AF_UNIX,
++                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
++                    0,
++                    fds.as_mut_ptr(),
++                )
++            };
++            assert_eq!(r, 0, "socketpair");
++            use std::os::fd::FromRawFd as _;
++            // SAFETY: the two fresh descriptors socketpair(2) made, each owned once.
++            unsafe { (UnixStream::from_raw_fd(fds[0]), UnixStream::from_raw_fd(fds[1])) }
++        }
++        #[cfg(not(target_os = "linux"))]
++        UnixStream::pair().unwrap()
++    }
++
++    /// Sends `bytes` on the server's end, with `fds`.
++    pub(crate) fn send(server: &UnixStream, bytes: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) {
++        use std::os::fd::AsRawFd as _;
++        let raw: Vec<i32> = fds.iter().map(|f| f.as_raw_fd()).collect();
++        let space = if raw.is_empty() {
++            0
++        } else {
++            // SAFETY: CMSG_SPACE computes a size alone.
++            (unsafe { libc::CMSG_SPACE((raw.len() * 4) as u32) }) as usize
++        };
++        let mut control = vec![0u8; space];
++        let mut iov = libc::iovec {
++            iov_base: bytes.as_ptr() as *mut _,
++            iov_len: bytes.len(),
++        };
++        // SAFETY: a zeroed msghdr, then filled with the live buffers above.
++        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
++        msg.msg_iov = &mut iov;
++        msg.msg_iovlen = 1;
++        if !raw.is_empty() {
++            msg.msg_control = control.as_mut_ptr().cast();
++            msg.msg_controllen = space as _;
++            // SAFETY: the control buffer holds one header of `raw`'s descriptors.
++            unsafe {
++                let c = libc::CMSG_FIRSTHDR(&msg);
++                (*c).cmsg_level = libc::SOL_SOCKET;
++                (*c).cmsg_type = libc::SCM_RIGHTS;
++                (*c).cmsg_len = libc::CMSG_LEN((raw.len() * 4) as u32) as _;
++                std::ptr::copy_nonoverlapping(raw.as_ptr(), libc::CMSG_DATA(c).cast::<i32>(), raw.len());
++            }
++        }
++        // SAFETY: sendmsg(2) of the message built above.
++        let n = unsafe { libc::sendmsg(server.as_raw_fd(), &msg, 0) };
++        assert_eq!(n, bytes.len() as isize, "sendmsg");
++    }
++
++    const TOKEN: [u8; TOKEN_BYTES] = [7; TOKEN_BYTES];
++
++    #[test]
++    fn a_resync_naming_the_attachment_and_its_token_hands_over_its_stream() {
++        let (server, device) = channel();
++        send(&server, &attached(9, TOKEN), &[]);
++        let r = Resync::attached(device).unwrap();
++        let (fresh, _peer) = UnixStream::pair().unwrap();
++        use std::os::fd::AsFd as _;
++        send(&server, &resync(9, TOKEN), &[fresh.as_fd()]);
++        let got = r.fresh().unwrap();
++        assert!(same_inode(&got, &fresh), "the stream the successor handed over");
++    }
++
++    #[test]
++    fn anything_but_a_resync_of_its_own_ends_the_share() {
++        use std::os::fd::AsFd as _;
++        let (a, _pa) = UnixStream::pair().unwrap();
++        let (b, _pb) = UnixStream::pair().unwrap();
++        let mut other_token = TOKEN;
++        other_token[15] ^= 1;
++        let mut bad_version = resync(9, TOKEN);
++        bad_version[1] = 2;
++        let cases: Vec<(&str, [u8; MESSAGE_BYTES], Vec<std::os::fd::BorrowedFd<'_>>, Ended)> = vec![
++            (
++                "another attachment",
++                resync(8, TOKEN),
++                vec![a.as_fd()],
++                Ended::Foreign,
++            ),
++            (
++                "another token",
++                resync(9, other_token),
++                vec![a.as_fd()],
++                Ended::Foreign,
++            ),
++            (
++                "no descriptor",
++                resync(9, TOKEN),
++                vec![],
++                Ended::Descriptors { given: 0 },
++            ),
++            (
++                "two descriptors",
++                resync(9, TOKEN),
++                vec![a.as_fd(), b.as_fd()],
++                Ended::Descriptors { given: 2 },
++            ),
++            ("another version", bad_version, vec![a.as_fd()], Ended::Malformed),
++            (
++                "an Attached again",
++                attached(9, TOKEN),
++                vec![],
++                Ended::Unexpected { kind: ATTACHED },
++            ),
++        ];
++        for (what, bytes, fds, want) in cases {
++            let (server, device) = channel();
++            send(&server, &attached(9, TOKEN), &[]);
++            let r = Resync::attached(device).unwrap();
++            send(&server, &bytes, &fds);
++            assert_eq!(r.fresh().unwrap_err(), want, "{what}");
++        }
++        let (server, device) = channel();
++        send(&server, &attached(9, TOKEN), &[]);
++        let r = Resync::attached(device).unwrap();
++        drop(server);
++        assert_eq!(r.fresh().unwrap_err(), Ended::Closed, "its server's end closed");
++    }
++
++    #[test]
++    fn a_channel_must_say_attached_first() {
++        let (server, device) = channel();
++        send(&server, &resync(9, TOKEN), &[]);
++        assert_eq!(
++            Resync::attached(device).unwrap_err(),
++            Ended::Unexpected { kind: RESYNC }
++        );
++    }
++
++    fn same_inode(a: &OwnedFd, b: &impl std::os::fd::AsFd) -> bool {
++        use std::os::fd::AsRawFd as _;
++        // SAFETY: fstat(2) of two live descriptors into zeroed stat buffers.
++        unsafe {
++            let (mut x, mut y): (libc::stat, libc::stat) = (std::mem::zeroed(), std::mem::zeroed());
++            libc::fstat(a.as_raw_fd(), &mut x) == 0
++                && libc::fstat(b.as_fd().as_raw_fd(), &mut y) == 0
++                && x.st_ino == y.st_ino
++                && x.st_dev == y.st_dev
++        }
++    }
++}

@@ -44,6 +44,8 @@ pub const MAX_TLS_DAYS: i64 = 398;
 /// usage: the two marks that tell a front door, the server's entrance on a runner, from every other certificate this CA
 /// issues ([`answers_as_server`]). Both since the first front door (be7bce8e8, 2026-10-17).
 const FRONT_DOOR_ORGANIZATION: &str = "kiln front door";
+/// Format: the organization a Kubernetes node's `tlshd` certificate carries (docs/agentic.md W10), the mark of its role.
+pub const KUBERNETES_NODE_ORGANIZATION: &str = "kiln kubernetes node";
 
 pub struct Pki {
     dir: PathBuf,
@@ -542,6 +544,23 @@ impl Pki {
         params.serial_number = Some(random_serial());
         let signed = CertificateSigningRequestParams { params, public_key: csr.public_key }.signed_by(&self.issuer).context("sign the fleet node's CSR")?;
         Ok(signed.der().to_vec())
+    }
+
+    /// Sign a Kubernetes node's CSR (PEM) for its `tlshd` (docs/agentic.md W10): the client certificate the node's NFS
+    /// client presents as it mounts a pod's workspace from a home's Slates export over RPC-with-TLS, which takes a client
+    /// whose certificate chains to kiln's CA. For its key, made on the node, named `node` as its operator wrote it and
+    /// never the server's own name, clientAuth alone, its organization [`KUBERNETES_NODE_ORGANIZATION`], valid as a
+    /// machine's is, its serial its own. Its kind is recorded and its key refused on kiln's link, as every other
+    /// certificate kiln issues that isn't a runner's is (`crate::identities`). PEM.
+    pub fn sign_kubernetes_node(&self, csr_pem: &str, node: &str) -> anyhow::Result<String> {
+        let name = sanitize_name(node);
+        anyhow::ensure!(!name.is_empty(), "a node's name is a DNS name, and {node:?} isn't");
+        anyhow::ensure!(!reserved(&name), "{SERVER_NAME} is the server's own identity; a node can't be named so");
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parse the node's CSR")?;
+        let mut params = machine_params(name, LEAF_DAYS)?;
+        params.distinguished_name.push(DnType::OrganizationName, KUBERNETES_NODE_ORGANIZATION);
+        params.serial_number = Some(random_serial());
+        Ok(CertificateSigningRequestParams { params, public_key: csr.public_key }.signed_by(&self.issuer).context("sign the node's CSR")?.pem())
     }
 
     /// A runner's certificate in the runner's role (clientAuth alone, docs/agentic.md W10) for the key and the name of

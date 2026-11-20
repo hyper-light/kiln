@@ -97,7 +97,9 @@ fn let_go_of(root: &Path) -> Vec<PathBuf> {
     mounts_under(root).into_iter().map(|(p, _)| p).collect()
 }
 
-/// A FUSE file system's type (`fuse`, `fuseblk`, `fuse.<name>`).
+/// A FUSE file system's type (`fuse`, `fuseblk`, `fuse.<name>`). Where [`let_go_of`] is: Windows has no FUSE mounts to let
+/// go of, and the function unused there failed a Windows build under `-D warnings`.
+#[cfg(not(windows))]
 fn is_fuse(fs: &str) -> bool {
     fs == "fuse" || fs == "fuseblk" || fs.starts_with("fuse.")
 }

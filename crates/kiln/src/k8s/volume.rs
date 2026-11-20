@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use k8s_openapi::api::core::v1::{
-    NFSVolumeSource, ObjectReference, PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeSpec, PodSecurityContext,
-    Volume, VolumeMount, VolumeResourceRequirements,
+    Container, NFSVolumeSource, ObjectReference, PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeSpec, Pod,
+    PodSecurityContext, PodSpec, ResourceRequirements, Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -177,6 +177,101 @@ pub fn objects(name: &str, namespace: &str, agent: &str, export: &PodExport) -> 
     Ok(Objects { volume, claim, pod_volume, mount, security })
 }
 
+/// Format: the label an agent's pod carries (`app.kubernetes.io/name`), beside a job's `kiln-job`.
+pub const AGENT_POD: &str = "kiln-agent";
+
+/// Agent session `session`'s pod (docs/agentic.md W10), named `name` (a DNS label) in kiln's jobs namespace: its harness's
+/// image (`image`) running kiln's own runner for that one session (`kiln agent --ephemeral --session`, copied in by the
+/// init container a job's pod has, enrolling with the one-time `token` and connecting back to the server at its URLs, as
+/// a job's pod does), its workspace mounted at the folder's own path from the claim `objects` names, run as the folder's
+/// owner, as `objects` says; the server's default CPU and memory (memory its limit too); and no deadline, as an agent's
+/// session has none: it ends as its session does (the runner leaves, and its pod's container with it).
+pub fn agent_pod(cfg: &crate::config::Kubernetes, session: &str, name: &str, image: &str, token: &str, (server_url, server_quic): (&str, &str), objects: &Objects) -> Pod {
+    let env = vec![super::env_var("KILN_JOIN_TOKEN", token), super::env_var("KILN_SERVER", server_url), super::env_var("KILN_QUIC", server_quic), super::field_env("KILN_POD_UID", "metadata.uid")];
+    let q = |s: &str| Quantity(s.to_owned());
+    let resources = ResourceRequirements {
+        requests: Some(BTreeMap::from([("cpu".to_owned(), q(&cfg.default_cpu)), ("memory".to_owned(), q(&cfg.default_memory))])),
+        limits: Some(BTreeMap::from([("memory".to_owned(), q(&cfg.default_memory))])),
+        ..ResourceRequirements::default()
+    };
+    let labels = BTreeMap::from([("app.kubernetes.io/managed-by".to_owned(), "kiln".to_owned()), ("app.kubernetes.io/name".to_owned(), AGENT_POD.to_owned()), (AGENT_LABEL.to_owned(), session.to_owned())]);
+    Pod {
+        metadata: ObjectMeta { name: Some(name.to_owned()), namespace: Some(cfg.namespace.clone()), labels: Some(labels), ..ObjectMeta::default() },
+        spec: Some(PodSpec {
+            restart_policy: Some("Never".into()),
+            priority_class_name: cfg.priority_class.clone(),
+            service_account_name: Some(cfg.service_account.clone()),
+            automount_service_account_token: Some(false),
+            termination_grace_period_seconds: Some(20),
+            node_selector: (!cfg.node_selector.is_empty()).then(|| cfg.node_selector.clone()),
+            security_context: Some(objects.security.clone()),
+            init_containers: Some(vec![super::kiln_bin(cfg)]),
+            containers: vec![Container {
+                name: "agent".into(),
+                image: Some(image.to_owned()),
+                image_pull_policy: Some("IfNotPresent".into()),
+                command: Some(["/kiln-bin/kiln", "agent", "--ephemeral", "--session", session, "--name", name, "--work-dir", "/work", "--slots", "1"].map(str::to_owned).to_vec()),
+                env: Some(env),
+                resources: Some(resources),
+                volume_mounts: Some(vec![super::mount("kiln-bin", "/kiln-bin"), super::mount("work", "/work"), objects.mount.clone()]),
+                working_dir: Some(objects.mount.mount_path.clone()),
+                ..Container::default()
+            }],
+            volumes: Some(vec![super::empty_dir("kiln-bin"), super::empty_dir("work"), objects.pod_volume.clone()]),
+            ..PodSpec::default()
+        }),
+        ..Pod::default()
+    }
+}
+
+/// The cluster's calls a pod's workspace takes ([`make`], [`unmake`]): kiln's own client (`crate::kubeapi::KubeApi`), or
+/// a stand-in, so the order is kiln's and is tested.
+pub trait Cluster {
+    fn create_volume(&self, v: &PersistentVolume) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn create_claim(&self, c: &PersistentVolumeClaim) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn delete_claim(&self, name: &str) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+    fn delete_volume(&self, name: &str) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+}
+
+impl Cluster for crate::kubeapi::KubeApi {
+    async fn create_volume(&self, v: &PersistentVolume) -> anyhow::Result<()> {
+        self.create_persistent_volume(v).await
+    }
+    async fn create_claim(&self, c: &PersistentVolumeClaim) -> anyhow::Result<()> {
+        crate::kubeapi::KubeApi::create_claim(self, c).await
+    }
+    async fn delete_claim(&self, name: &str) -> anyhow::Result<()> {
+        crate::kubeapi::KubeApi::delete_claim(self, name).await
+    }
+    async fn delete_volume(&self, name: &str) -> anyhow::Result<()> {
+        self.delete_persistent_volume(name).await
+    }
+}
+
+/// Makes a pod's workspace in the cluster: the PersistentVolume first, reserved for its claim, then the claim, which binds
+/// it by name. A claim the cluster refuses takes its PersistentVolume back down: nothing of a refused workspace is left.
+pub async fn make(cluster: &impl Cluster, objects: &Objects) -> anyhow::Result<()> {
+    cluster.create_volume(&objects.volume).await?;
+    if let Err(e) = cluster.create_claim(&objects.claim).await {
+        if let Some(name) = objects.volume.metadata.name.as_deref()
+            && let Err(gone) = cluster.delete_volume(name).await
+        {
+            tracing::warn!(volume = name, error = %format!("{gone:#}"), "a refused pod workspace's PersistentVolume stayed");
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Takes a pod's workspace `name` down, once its pod is gone: the claim, then the PersistentVolume (kubelet keeps a
+/// claim's volume while a pod uses it). Each is asked, the PersistentVolume too where the claim wasn't taken down; one
+/// already gone is no error. The first that failed is said.
+pub async fn unmake(cluster: &impl Cluster, name: &str) -> anyhow::Result<()> {
+    let claim = cluster.delete_claim(name).await;
+    let volume = cluster.delete_volume(name).await;
+    claim.and(volume)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -225,6 +320,91 @@ mod tests {
         let read = objects("kiln-ws-a", "kiln-jobs", "01a1f7", &PodExport { read_only: true, ..export() })?;
         assert_eq!((read.mount.read_only, read.pod_volume.persistent_volume_claim.and_then(|c| c.read_only)), (Some(true), Some(true)));
         Ok(())
+    }
+
+    /// W10. Do: build agent session `01a1f7`'s pod over its workspace. Expect kiln's runner for that one session copied in
+    /// and run in the harness's image, enrolling with its token, the workspace mounted at the folder's own path from its
+    /// claim and worked in there, run as the folder's owner, and no deadline.
+    #[test]
+    fn w10_an_agents_pod_runs_kilns_runner_for_its_one_session_on_its_workspace() -> anyhow::Result<()> {
+        let cfg = crate::config::Kubernetes::default();
+        let built = objects("kiln-ws-a", "kiln-jobs", "01a1f7", &export())?;
+        let pod = serde_json::to_value(agent_pod(&cfg, "01a1f7", "kiln-ws-a", "ghcr.io/acme/agents:1", "t0ken", ("http://kiln:7070", "kiln:7071"), &built))?;
+        let spec = at(&pod, "spec");
+        let agent = spec.pointer("/containers/0").cloned().unwrap_or_default();
+        assert_eq!(at(&agent, "image"), json!("ghcr.io/acme/agents:1"));
+        assert_eq!(at(&agent, "command"), json!(["/kiln-bin/kiln", "agent", "--ephemeral", "--session", "01a1f7", "--name", "kiln-ws-a", "--work-dir", "/work", "--slots", "1"]));
+        assert_eq!(at(&agent, "workingDir"), json!("/Users/u/src/kiln"));
+        assert!(at(&agent, "volumeMounts").as_array().is_some_and(|m| m.contains(&json!({"name": "workspace", "mountPath": "/Users/u/src/kiln", "readOnly": false}))));
+        assert!(at(&agent, "env").as_array().is_some_and(|e| e.contains(&json!({"name": "KILN_JOIN_TOKEN", "value": "t0ken"}))));
+        assert_eq!(at(&spec, "securityContext"), json!({"runAsUser": 501, "runAsGroup": 20}));
+        assert!(at(&spec, "volumes").as_array().is_some_and(|v| v.contains(&json!({"name": "workspace", "persistentVolumeClaim": {"claimName": "kiln-ws-a", "readOnly": false}}))));
+        assert_eq!((at(&spec, "activeDeadlineSeconds"), at(&spec, "restartPolicy")), (serde_json::Value::Null, json!("Never")));
+        assert_eq!(pod.pointer("/metadata/labels/kiln.dev~1agent"), Some(&json!("01a1f7")));
+        Ok(())
+    }
+
+    /// The cluster as a stand-in takes it: each call said in order, and the claim's creation and deletion answering as
+    /// asked.
+    struct Stand {
+        said: std::sync::Mutex<Vec<String>>,
+        claim: Result<(), String>,
+        unclaim: Result<(), String>,
+    }
+
+    impl Stand {
+        fn new(claim: Result<(), String>, unclaim: Result<(), String>) -> Self {
+            Stand { said: std::sync::Mutex::new(Vec::new()), claim, unclaim }
+        }
+        fn say(&self, what: String) {
+            self.said.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(what);
+        }
+        fn said(&self) -> Vec<String> {
+            self.said.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        }
+    }
+
+    impl Cluster for Stand {
+        async fn create_volume(&self, v: &PersistentVolume) -> anyhow::Result<()> {
+            self.say(format!("create volume {}", v.metadata.name.clone().unwrap_or_default()));
+            Ok(())
+        }
+        async fn create_claim(&self, c: &PersistentVolumeClaim) -> anyhow::Result<()> {
+            self.say(format!("create claim {}", c.metadata.name.clone().unwrap_or_default()));
+            self.claim.clone().map_err(anyhow::Error::msg)
+        }
+        async fn delete_claim(&self, name: &str) -> anyhow::Result<()> {
+            self.say(format!("delete claim {name}"));
+            self.unclaim.clone().map_err(anyhow::Error::msg)
+        }
+        async fn delete_volume(&self, name: &str) -> anyhow::Result<()> {
+            self.say(format!("delete volume {name}"));
+            Ok(())
+        }
+    }
+
+    /// W10. Do: make a pod's workspace in a cluster that takes it, then in one that refuses its claim; take it down, then
+    /// take it down where the claim's deletion fails. Expect the PersistentVolume before the claim, and a refused claim's
+    /// PersistentVolume taken back down; the claim before the PersistentVolume as it goes, the PersistentVolume asked to
+    /// go even where the claim's deletion failed, that failure said.
+    #[test]
+    fn w10_a_pods_workspace_is_made_volume_then_claim_and_taken_down_claim_then_volume() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let built = objects("kiln-ws-a", "kiln-jobs", "01a1f7", &export())?;
+            let taken = Stand::new(Ok(()), Ok(()));
+            make(&taken, &built).await?;
+            assert_eq!(taken.said(), ["create volume kiln-ws-a", "create claim kiln-ws-a"]);
+            let refused = Stand::new(Err("exceeded quota".to_owned()), Ok(()));
+            assert!(make(&refused, &built).await.is_err_and(|e| e.to_string().contains("exceeded quota")));
+            assert_eq!(refused.said(), ["create volume kiln-ws-a", "create claim kiln-ws-a", "delete volume kiln-ws-a"]);
+            let down = Stand::new(Ok(()), Ok(()));
+            unmake(&down, "kiln-ws-a").await?;
+            assert_eq!(down.said(), ["delete claim kiln-ws-a", "delete volume kiln-ws-a"]);
+            let stuck = Stand::new(Ok(()), Err("forbidden".to_owned()));
+            assert!(unmake(&stuck, "kiln-ws-a").await.is_err_and(|e| e.to_string().contains("forbidden")));
+            assert_eq!(stuck.said(), ["delete claim kiln-ws-a", "delete volume kiln-ws-a"]);
+            Ok(())
+        })
     }
 
     /// W10. Do: build a pod's workspace over exports it can't be made from (no host, port 0, a relative path, a path a mount

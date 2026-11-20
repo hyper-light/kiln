@@ -1409,8 +1409,18 @@ pub async fn revoked_keys(store: &Store) -> anyhow::Result<Vec<(String, String)>
 /// issued since 2026-11-12, so each recorded as it was issued.
 pub const BOTH_SIDES_KINDS: [&str; 3] = ["holder", "keeper", "slates-node"];
 
-/// Why kiln's link refuses the key of a `kind` certificate for `subject` (one of [`BOTH_SIDES_KINDS`]).
+/// A Kubernetes node's `tlshd` certificate's kind (docs/agentic.md W10, `Pki::sign_kubernetes_node`): clientAuth alone, as
+/// a runner's is, so its key is refused on kiln's link by the kind kiln recorded as it issued it.
+pub const KUBERNETES_NODE: &str = "k8s-node";
+
+/// Every kind of certificate kiln's CA issues for a name whose key kiln's link refuses as never a runner's.
+pub const NOT_RUNNERS_KINDS: [&str; 4] = ["holder", "keeper", "slates-node", KUBERNETES_NODE];
+
+/// Why kiln's link refuses the key of a `kind` certificate for `subject` (one of [`NOT_RUNNERS_KINDS`]).
 pub fn not_a_runners(kind: &str, subject: &str) -> String {
+    if kind == KUBERNETES_NODE {
+        return format!("a Kubernetes node's key ({subject}): its tlshd mounts pods' workspaces with it, never a runner's on kiln's link (docs/agentic.md W10)");
+    }
     format!("a {kind}'s key ({subject}): it serves both sides of its own links, never a runner's on kiln's link (docs/agentic.md W10)")
 }
 
@@ -1418,7 +1428,7 @@ pub fn not_a_runners(kind: &str, subject: &str) -> String {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LinkRefusals {
     /// Keys (SPKI SHA-256, hex), each with its refusal: every revoked key ([`revoked_keys`]), and the key of every
-    /// certificate of the [`BOTH_SIDES_KINDS`] kiln issued.
+    /// certificate of the [`NOT_RUNNERS_KINDS`] kiln issued.
     pub keys: Vec<(String, String)>,
     /// Certificates (their serials, hex), each with its refusal: every certificate for a machine's name revoked by its
     /// serial, among them a runner's from before machines' certificates held their role once the runner took one in its
@@ -1431,10 +1441,10 @@ pub async fn link_refusals(store: &Store) -> anyhow::Result<LinkRefusals> {
     let mut keys = revoked_keys(store).await?;
     let (both_sides, serials) = store
         .call(|c| {
-            let kinds = BOTH_SIDES_KINDS.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let kinds = NOT_RUNNERS_KINDS.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
             let mut q = c.prepare(&format!("SELECT key_sha256, kind, subject FROM identities WHERE kind IN ({kinds}) ORDER BY issued_at"))?;
             let both_sides = q
-                .query_map(rusqlite::params_from_iter(BOTH_SIDES_KINDS.iter()), |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                .query_map(rusqlite::params_from_iter(NOT_RUNNERS_KINDS.iter()), |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
                 .collect::<Result<Vec<_>, _>>()?;
             // A W27 identity's subject is its kiln:// URI, and it carries no name the link takes: only machines' names.
             let mut q = c.prepare("SELECT serial, at, reason, by FROM revocations WHERE serial IS NOT NULL AND subject NOT LIKE 'kiln://%' ORDER BY at, id")?;
@@ -1547,7 +1557,7 @@ pub async fn runner_role_said(hub: &Hub, runner: &str, peer: PeerId, serial: &st
     }
 }
 
-/// Tells kiln's link to refuse the key of a certificate of one of the [`BOTH_SIDES_KINDS`] just issued (`der`, its `kind`,
+/// Tells kiln's link to refuse the key of a certificate of one of the [`NOT_RUNNERS_KINDS`] just issued (`der`, its `kind`,
 /// for `subject`), as it refuses those recorded before it started ([`link_refusals`]): never a runner's (docs/agentic.md W10).
 pub async fn refuse_on_link(hub: &Hub, kind: &str, subject: &str, der: &[u8]) {
     if let Some(key) = crate::pki::key_sha256(der) {
@@ -1649,6 +1659,35 @@ pub async fn cli(args: IdentitiesArgs, cfg: &crate::config::Config) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W10: a Kubernetes node's tlshd certificate is a client's alone, as a runner's is, so kiln's link would take it as a
+    /// runner but for the kind kiln recorded as it issued it. Do: issue one for a node, refuse one named as the server,
+    /// record the node's as the server does, and read what the link refuses. Expect a clientAuth-alone certificate naming
+    /// the node and carrying its role's organization, the server's name refused, and the node's key refused on the link in
+    /// its own words.
+    #[test]
+    fn w10_a_kubernetes_nodes_tlshd_certificate_is_never_a_runners_on_kilns_link() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let pki = crate::pki::Pki::open_scratch(dir.path())?;
+            let store = crate::store::Store::in_memory()?;
+            let key = rcgen::KeyPair::generate()?;
+            let csr = rcgen::CertificateParams::new(Vec::<String>::new())?.serialize_request(&key)?.pem()?;
+            let cert = pki.sign_kubernetes_node(&csr, "Kind-Worker")?;
+            let der = crate::pki::der_of(&cert)?;
+            assert_eq!(crate::pki::link_role(&der), crate::pki::LinkRole::Runner, "clientAuth alone, as a runner's");
+            let (_, parsed) = x509_parser::parse_x509_certificate(&der).map_err(|e| anyhow::anyhow!("{e}"))?;
+            assert!(parsed.subject().iter_organization().any(|o| o.as_str().is_ok_and(|o| o == crate::pki::KUBERNETES_NODE_ORGANIZATION)));
+            assert_eq!(crate::pki::cert_dns_name(&der).as_deref(), Some("kind-worker"));
+            assert!(pki.sign_kubernetes_node(&csr, "kiln-server").is_err(), "never the server's own name");
+            record(&store, KUBERNETES_NODE, "kind-worker", &cert).await?;
+            let refused = link_refusals(&store).await?;
+            let key_sha = crate::pki::key_sha256(&der).ok_or_else(|| anyhow::anyhow!("no key"))?;
+            let why = refused.keys.iter().find(|(k, _)| *k == key_sha).map(|(_, w)| w.clone()).unwrap_or_default();
+            assert!(why.contains("Kubernetes node") && why.contains("kind-worker"), "{why:?}");
+            Ok(())
+        })
+    }
 
     fn cert(pki: &crate::pki::Pki, name: &str) -> anyhow::Result<String> {
         let (csr, _key) = crate::pki::make_csr(name)?;

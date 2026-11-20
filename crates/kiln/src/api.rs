@@ -1039,6 +1039,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             Ok(srv::json(StatusCode::OK, &json!({ "unsigned": unsigned })))
         })
         .await,
+        (&Method::POST, ["api", "kubernetes", "node-certificates"]) => {
+            let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
+            boxed(|| kubernetes_node_certificate(&hub, req, &by)).await
+        }
         (&Method::POST, ["api", "identities", "revoke"]) => {
             let by = caller_of(&hub, req.headers()).await.map_or_else(|| "admin".to_owned(), |c| c.name);
             boxed(|| identity_revoke(&hub, req, &by)).await
@@ -4286,6 +4290,31 @@ struct RevokeReq {
     reason: String,
 }
 
+/// What a cluster's operator asks for a node's `tlshd` certificate (`POST /api/kubernetes/node-certificates`).
+#[derive(serde::Deserialize)]
+struct NodeCertificateAsk {
+    /// The node's name.
+    node: String,
+    /// A CSR (PEM) for a key made on the node, which never leaves it.
+    csr: String,
+}
+
+/// `POST /api/kubernetes/node-certificates` `{node, csr}` (docs/agentic.md W10): a Kubernetes node's client certificate
+/// for its `tlshd`, issued to the cluster's operator by someone who manages settings, with kiln's CA to trust
+/// (`x509.truststore`): recorded first (W27-R01), its key refused on kiln's link, and audited. The operator installs both
+/// on the node, its key `0600`, as `user_allow_other` is: never a privilege kiln holds.
+async fn kubernetes_node_certificate(hub: &Hub, req: Request, by: &str) -> R {
+    let ask: NodeCertificateAsk = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let cert = hub.pki.sign_kubernetes_node(&ask.csr, &ask.node).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let name = crate::pki::sanitize_name(&ask.node);
+    crate::identities::record(&hub.store, crate::identities::KUBERNETES_NODE, &name, &cert).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if let Ok(der) = crate::pki::der_of(&cert) {
+        crate::identities::refuse_on_link(hub, crate::identities::KUBERNETES_NODE, &name, &der).await;
+    }
+    hub.store.audit(by.to_owned(), "kubernetes.node_certificate".into(), name.clone()).await;
+    Ok(srv::json(StatusCode::OK, &json!({ "node": name, "certificate": cert, "ca": hub.pki.ca_pem })))
+}
+
 /// `POST /api/identities/revoke` `{serial | key | subject, reason}`: revoked from now on, refused
 /// at once by the TLS directory (W27-R01).
 async fn identity_revoke(hub: &Hub, req: Request, by: &str) -> R {
@@ -4441,8 +4470,10 @@ async fn enroll(hub: &Hub, req: Request) -> R {
     // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
     // executor's, whatever it asks to be.
     let pod = if persistent { None } else { hub.executor_tokens.update(|t| t.remove(&r.token)).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
+    // An agent's pod (docs/agentic.md W10): its runner is the pod's name, whatever it asks to be.
+    let agent_pod = if persistent || pod.is_some() { None } else { hub.agent_pods.enrolling(&r.token) };
     // A job pod's token, refused once its time is up (none is swept away for it: goal 9, plan 01a1a87b2cec step 5).
-    let ephemeral = pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some_and(|(_, exp)| exp > std::time::Instant::now()));
+    let ephemeral = pod.is_some() || agent_pod.is_some() || (!persistent && hub.ephemeral_tokens.update(|t| t.remove(&r.token)).is_some_and(|(_, exp)| exp > std::time::Instant::now()));
     let outpost = !persistent && !ephemeral && hub.outpost_invites.take(&r.token);
     if !persistent && !ephemeral && !outpost {
         crate::rt::sleep(Duration::from_millis(500)).await;
@@ -4453,7 +4484,7 @@ async fn enroll(hub: &Hub, req: Request) -> R {
             hub.pod_executors.update(|p| p.insert(pod_name.clone(), executor.clone()));
             pod_name.clone()
         }
-        None => crate::pki::sanitize_name(&r.name),
+        None => agent_pod.clone().unwrap_or_else(|| crate::pki::sanitize_name(&r.name)),
     };
     // A machine enrolling with the join token, or an outpost, is named as a joining one is: known
     // by its machine id when it sent one, shown by the name it asked for unless another machine

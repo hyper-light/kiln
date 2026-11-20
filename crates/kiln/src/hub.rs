@@ -731,6 +731,9 @@ pub struct Hub {
     pub executor_tokens: crate::rcu::Rcu<HashMap<String, (String, String, Instant)>>,
     /// The executor each executor pod's runner is, by the name it enrolled with.
     pub pod_executors: crate::rcu::Rcu<HashMap<String, String>>,
+    /// Agents' pods on the Kubernetes engine (docs/agentic.md W10): their runners' one-time tokens, and each pod's
+    /// session (`crate::k8s::agent`).
+    pub agent_pods: crate::k8s::agent::AgentPods,
     /// One-time outpost invites (`POST /api/outposts/invite`).
     pub outpost_invites: OutpostInvites,
     pub k8s: std::sync::OnceLock<Option<Arc<crate::k8s::K8s>>>,
@@ -991,6 +994,7 @@ impl Hub {
             ephemeral_tokens: Default::default(),
             executor_tokens: Default::default(),
             pod_executors: Default::default(),
+            agent_pods: Default::default(),
             outpost_invites: OutpostInvites::default(),
             k8s: std::sync::OnceLock::new(),
             gitops_kick: Notify::new(),
@@ -3749,6 +3753,8 @@ impl Hub {
                 self.instances.update(|i| i.set_features(peer, names.clone()));
                 // One that takes its engine is told what its owner set (`crate::harness::engine`).
                 crate::harness::engine::on_features(self, &agent, peer, &names).await;
+                // An agent pod's runner is given the session it was made for (docs/agentic.md W10).
+                crate::api::boxed(|| crate::k8s::agent::on_features(self, &agent)).await;
                 // One that takes a certificate in the runner's role, on a link made with one from before it, is reissued
                 // one (docs/agentic.md W10).
                 crate::api::boxed(|| crate::identities::on_features(self, &agent, peer, &names)).await;
