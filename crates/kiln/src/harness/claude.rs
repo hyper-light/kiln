@@ -1707,7 +1707,7 @@ impl Claude {
         prune_delivery(core);
         let (images, names) = super::model::attachment_summary(&attachments);
         core.note_sent(&id, &text);
-        core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some(super::core::origin_of(&id).into()), attachments: names, reply_to });
+        core.upsert(&id, None, Body::User { text, images, client_id: Some(id.clone()), origin: Some(core.origin_of(&id).into()), attachments: names, reply_to });
         core.touch_state();
         self.settle(core);
     }
@@ -2982,7 +2982,7 @@ impl Claude {
         let from = if was.as_deref() == Some("kiln") {
             "kiln"
         } else if ours {
-            super::core::origin_of(&id)
+            core.origin_of(&id)
         } else if human {
             "human"
         } else {

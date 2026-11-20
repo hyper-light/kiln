@@ -30,3 +30,12 @@ test("a peer's message steered into the agent's work stays part of that turn, un
   assert.equal(turns[0]!.prompt?.id, "u1");
   assert.deepEqual(turns[0]!.hidden, ["m1"]);
 });
+
+test("the brief an agent started this one with shows as no prompt, only the agent's work", () => {
+  const brief: HEvent = { id: "b1", seq: 0, at: 0, kind: "user", text: "Live handle audit: recover the reviewers…", client_id: "01a1e74bfirstprompt", origin: "agent" };
+  const turns = turnsOf([brief, tool("t1"), said("a1", "recovered")]);
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0]!.prompt, null);
+  assert.deepEqual(turns[0]!.hidden, ["b1"]);
+  assert.equal(turns[0]!.outcome?.text, "recovered");
+});
