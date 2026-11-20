@@ -591,17 +591,17 @@ through `kiln run --on` once this one holds.
 
 **The live move (goal 91, K4, K5; `tests/slates_fleet_live_move.rs`).** An agent of the stand-in (an ACP harness, whose
 conversation a move carries in words) works in its captured clone on one runner, is moved by `agents.move` to a second,
-and goes on there: its hand-off turn and its own turn work in the moved volume's mount, which holds both runners' work
-byte for byte; the old runner's mount is gone, its node refuses a write attachment by kind and reads nothing stale; the
-end takes the new mount down. `SLATES_FLEET_LIVE_MOVE=local` runs three runners on one Mac; `=<runner B>,<runner C>`
-(with `SLATES_FLEET_LIVE_MOVE_HOST`) runs the second and third on production runners through `kiln run --on`. By use
-(2026-11-19, one Mac, release): it found that no runner founded the fleet's groups and that a moved volume wasn't
-shared with its new runner (both fixed); Slates refuses most first asks `unplaced` (asked again every 30 s), and its
-MOUNT service answers a moved volume `NOENT` in four runs of five (Slates' to fix), so it passes only when Slates
-mounts the volume. Across three Macs (2026-11-20: this one, adas-mac-studio-2 and -3, LAN): the fleet forms, the agent
-works on the first and kiln moves it to the second, whose kiln then waits on Slates' adoption of the volume with no end
-in ten minutes; kiln's first mount of a workspace doesn't wait on Slates' `refused for now` (`LeaseUnconfirmed`) as its
-mount of a moved volume does, so the test starts the agent again on it.
+and goes on there: its next turn works in the moved volume's mount, which holds both runners' work byte for byte; the
+old runner's mount is gone, its node refuses a write attachment by kind and reads nothing stale; the end takes the new
+mount down. `SLATES_FLEET_LIVE_MOVE=local` runs three runners on one Mac; `=<runner B>,<runner C>` (with
+`SLATES_FLEET_LIVE_MOVE_HOST`) runs the second and third on production runners through `kiln run --on`. The runners
+start together (a listed runner joins once the server lists every node, A-734); a moved agent whose turn was over waits
+on its new runner for its next message, kiln's hand-off going with it. What it found by use, each fixed: no runner
+founded the fleet's groups; a moved volume wasn't shared with its new runner; and a moved captured clone wasn't found by
+its name on its new owner, so its mount was refused `NOENT` in four runs of five (Slates' A-756, carried as
+`vendor/patches/slates/0003` until kiln takes a Slates revision with it). Slates still refuses most first asks
+`unplaced` (asked again every 30 s), and kiln's first mount of a workspace doesn't wait on Slates' `refused for now`
+(`LeaseUnconfirmed` across a LAN), so the test starts the agent again on it.
 
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.
