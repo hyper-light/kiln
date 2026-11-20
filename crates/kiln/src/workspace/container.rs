@@ -28,9 +28,13 @@
 //! starts at the same place in it ([`Plan::workdir`], W3), so nothing is translated. Its identity follows the profile's
 //! rule: under rootless podman (`ContainerRootAsMountingUser`) the container runs as its root (`--user 0:0`, whatever the
 //! image's own user), the one id an unshared mount admits; through Docker Desktop's share (`HostUserThroughShare`) any id
-//! reaches the volume as the person, so the image's own user stands; a rootful Linux engine (`ContainerIdsAsHostIds`)
-//! needs the mount shared with other users, which kiln doesn't mount yet, and is refused before anything is asked
-//! ([`Refusal::NeedsSharedMount`]). Where the profile's share shows a hard link's other names stale once its first is
+//! reaches the volume as the person, so the image's own user stands; under a rootful Linux engine (`ContainerIdsAsHostIds`)
+//! the container's ids reach the volume as the host's own, so it runs as the user who mounted the workspace (`--user`, this
+//! runner's uid and gid), on a workspace mounted shared with the machine's other users (FUSE's `allow_other`, which the
+//! engine's daemon, root, needs to bind it: `super::slates::Made::shared`), and one not mounted so is refused before
+//! anything is asked ([`Refusal::NeedsSharedMount`]). A shared mount is the machine's operator's grant
+//! (`user_allow_other` in `/etc/fuse.conf`, which kiln reads and never writes), so a runner whose engine is rootful says
+//! it can run containers only where that grant is given ([`ContainerMissing::SharedMount`] otherwise). Where the profile's share shows a hard link's other names stale once its first is
 //! removed (Docker Desktop), git in the container writes its objects by rename (`core.createObject=rename`, through git's
 //! own `GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_0` and `GIT_CONFIG_VALUE_0`).
 
@@ -217,7 +221,7 @@ pub struct Plan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// The profile's container ids reach the volume as the host's own (a rootful Linux engine), which needs the workspace
-    /// mounted shared with other users: kiln doesn't mount one so yet.
+    /// mounted shared with the machine's other users, and this one isn't.
     NeedsSharedMount,
     /// Slates refused the bind, in its words.
     Bind(String),
@@ -235,7 +239,7 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NeedsSharedMount => f.write_str(
-                "this engine's containers reach the workspace as their own ids (a rootful Linux engine), which needs the workspace mounted shared with other users, as kiln doesn't mount it yet",
+                "this engine's containers reach the workspace as their own ids (a rootful Linux engine), which needs the workspace mounted shared with the machine's other users, and this one isn't",
             ),
             Self::Bind(why) => write!(f, "Slates refused to bind the workspace into the container: {why}"),
             Self::Unappliable(why) => write!(f, "{why}"),
@@ -248,14 +252,62 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
-/// The container options the profile's identity rule asks (see the module's notes), or the refusal of a profile kiln
-/// can't run a container under yet.
-fn identity_options(identity: IdentityRule) -> Result<Vec<String>, Refusal> {
+/// The container options the profile's identity rule asks (see the module's notes) over a workspace mounted `shared` or
+/// not, `mounting` the user who mounted it (`uid:gid`), or the refusal of a container kiln can't run so.
+fn identity_options(identity: IdentityRule, shared: bool, mounting: Option<String>) -> Result<Vec<String>, Refusal> {
     match identity {
         IdentityRule::ContainerRootAsMountingUser => Ok(vec!["--user".to_owned(), "0:0".to_owned()]),
         IdentityRule::HostUserThroughShare => Ok(Vec::new()),
-        IdentityRule::ContainerIdsAsHostIds => Err(Refusal::NeedsSharedMount),
+        IdentityRule::ContainerIdsAsHostIds => match mounting.filter(|_| shared) {
+            Some(user) => Ok(vec!["--user".to_owned(), user]),
+            None => Err(Refusal::NeedsSharedMount),
+        },
     }
+}
+
+/// Whether the profile's identity rule needs the workspace mounted shared with the machine's other users (a rootful Linux
+/// engine's: see the module's notes).
+pub fn needs_shared(identity: IdentityRule) -> bool {
+    identity == IdentityRule::ContainerIdsAsHostIds
+}
+
+/// The user who mounts this runner's workspaces, as an engine's `--user` names it: this process's uid and gid (W3 mounts
+/// as the runner).
+#[cfg(unix)]
+fn mounting_user() -> Option<String> {
+    Some(format!("{}:{}", nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw()))
+}
+
+#[cfg(not(unix))]
+fn mounting_user() -> Option<String> {
+    None
+}
+
+/// Whether this machine's operator lets a user's FUSE mount be shared with its other users: `user_allow_other` on a line
+/// of its own in `fuse_conf` (`/etc/fuse.conf`'s text), or kiln running as root, whose mounts need no grant.
+#[cfg(any(target_os = "linux", test))]
+fn shared_granted_by(fuse_conf: Option<&str>, root: bool) -> bool {
+    root || fuse_conf.is_some_and(|conf| conf.lines().any(|line| line.split('#').next().is_some_and(|l| l.trim() == "user_allow_other")))
+}
+
+/// [`shared_granted_by`] on this machine (Linux; read, never written). Elsewhere no shared mount is made.
+fn shared_granted() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        shared_granted_by(std::fs::read_to_string("/etc/fuse.conf").ok().as_deref(), nix::unistd::geteuid().is_root())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Whether a container session's workspace here is to be mounted shared ([`needs_shared`]): this machine's engine judged
+/// by Slates, its profile a rootful Linux engine's. One that can't be judged needs nothing shared (its start says why).
+pub async fn workspace_shared() -> bool {
+    crate::rt::blocking(|| crate::runner::docker::find().and_then(|program| slates_api::container_engine::engine_profile(&program).ok()).is_some_and(|judged| needs_shared(judged.tested.identity)))
+        .await
+        .unwrap_or(false)
 }
 
 /// The container options the profile's hard-link rule asks (see the module's notes).
@@ -373,7 +425,7 @@ pub async fn release(running: &Running, made: &Made) -> anyhow::Result<()> {
 /// [`start`] over `steps`.
 async fn start_with(steps: &impl Steps, made: &Made, plan: &Plan) -> Result<Running, Refusal> {
     // The profile first: one kiln can't run a container under is refused before anything is asked.
-    let identity = identity_options(plan.tested.identity)?;
+    let identity = identity_options(plan.tested.identity, made.shared, mounting_user())?;
     let bind = steps.bind(made).await.map_err(|e| Refusal::Bind(format!("{e:#}")))?;
     let started: Result<String, Refusal> = async {
         let applied = engine_mount(&bind.binding, Cli::of(plan.engine)).map_err(Refusal::Unappliable)?;
@@ -423,10 +475,13 @@ async fn end_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow:
 pub async fn facts(workspaces: Option<&Workspaces>, image: Option<&str>) -> ContainerFacts {
     let has_workspaces = workspaces.is_some_and(|w| w.available);
     let image = image.map(str::trim).filter(|i| !i.is_empty()).map(str::to_owned);
-    crate::rt::blocking(move || facts_of(has_workspaces, image, crate::runner::docker::find, |program| slates_api::container_engine::engine_profile(program)))
+    crate::rt::blocking(move || facts_of(has_workspaces, image, crate::runner::docker::find, |program| slates_api::container_engine::engine_profile(program), shared_granted))
         .await
         .unwrap_or_else(|e| ContainerFacts { why_not: Some(format!("the container engine couldn't be asked: {e:#}")), missing: Some(ContainerMissing::Engine), ..ContainerFacts::default() })
 }
+
+/// Why a rootful engine's containers can't run here: the operator's grant of shared mounts is missing.
+const NOT_GRANTED: &str = "this engine's containers reach the workspace as their own ids (a rootful Linux engine), which needs the workspace mounted shared with the machine's other users, and its operator hasn't let a user's mount be shared: `user_allow_other` in /etc/fuse.conf";
 
 /// The name a runner's facts give the engine a profile names.
 pub fn engine_word(engine: Engine) -> &'static str {
@@ -439,9 +494,9 @@ pub fn engine_word(engine: Engine) -> &'static str {
 
 /// [`facts`] over its two questions, in the order that asks least: the machine's workspaces first (a container binds its
 /// agent's volume), then the image declared for its agents' containers (`image`), then the engine (`find`: its command line, when its daemon answers), then Slates' judge of its profile
-/// (`profile`), then whether kiln runs a container under that profile's identity rule ([`identity_options`]). Nothing is
-/// asked past the first lack, which is named.
-fn facts_of(has_workspaces: bool, image: Option<String>, find: impl FnOnce() -> Option<String>, profile: impl FnOnce(&str) -> Result<EngineProfile, EngineFault>) -> ContainerFacts {
+/// (`profile`), then, where that profile's identity rule needs the workspace mounted shared ([`needs_shared`]), whether the
+/// machine's operator grants that (`granted`). Nothing is asked past the first lack, which is named.
+fn facts_of(has_workspaces: bool, image: Option<String>, find: impl FnOnce() -> Option<String>, profile: impl FnOnce(&str) -> Result<EngineProfile, EngineFault>, granted: impl FnOnce() -> bool) -> ContainerFacts {
     if !has_workspaces {
         return ContainerFacts { why_not: Some("this machine gives agents no workspaces of their own, which their containers bind".to_owned()), missing: Some(ContainerMissing::Workspaces), ..ContainerFacts::default() };
     }
@@ -474,10 +529,10 @@ fn facts_of(has_workspaces: bool, image: Option<String>, find: impl FnOnce() -> 
         image: Some(image),
         ..ContainerFacts::default()
     };
-    match identity_options(judged.tested.identity) {
-        Ok(_) => ContainerFacts { available: true, ..said },
-        Err(refused) => ContainerFacts { why_not: Some(refused.to_string()), missing: Some(ContainerMissing::SharedMount), ..said },
+    if needs_shared(judged.tested.identity) && !granted() {
+        return ContainerFacts { why_not: Some(NOT_GRANTED.to_owned()), missing: Some(ContainerMissing::SharedMount), ..said };
     }
+    ContainerFacts { available: true, ..said }
 }
 
 #[cfg(test)]
@@ -617,6 +672,37 @@ mod tests {
             assert_eq!(stand.args(), expected);
             Ok(())
         })
+    }
+
+    /// W9 (A-520's fifth piece: a rootful Linux engine). Do: start an agent's container through a rootful Docker Engine on a
+    /// workspace mounted shared. Expect it bound and run as the user who mounted the workspace (`--user` this process's uid
+    /// and gid), its ids being the host's own; a workspace not mounted shared was refused before anything was asked.
+    #[test]
+    fn w9_a_rootful_engine_runs_the_container_as_the_mounting_user_on_a_shared_workspace() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let stand = Stand::new();
+            let rootful = plan(Engine::DockerEngine, tested(IdentityRule::ContainerIdsAsHostIds, HardLinkRule::EveryNameServedAtOnce));
+            let shared = Made { shared: true, ..made() };
+            start_with(&stand, &shared, &rootful).await?;
+            let args = stand.args();
+            let user = mounting_user().ok_or_else(|| anyhow::anyhow!("no mounting user on this platform"))?;
+            assert!(args.windows(2).any(|w| w == ["--user".to_owned(), user.clone()]), "run as {user}: {args:?}");
+            assert_eq!(args.first().map(String::as_str), Some("run"));
+            assert!(needs_shared(IdentityRule::ContainerIdsAsHostIds) && !needs_shared(IdentityRule::HostUserThroughShare) && !needs_shared(IdentityRule::ContainerRootAsMountingUser));
+            Ok(())
+        })
+    }
+
+    /// W9. Do: read whether an operator grants shared mounts from `/etc/fuse.conf`'s texts. Expect only a line of its own
+    /// saying `user_allow_other` (a comment after it allowed) to grant it, and root to need no grant.
+    #[test]
+    fn w9_a_shared_mount_is_the_operators_grant_in_fuse_conf() {
+        assert!(shared_granted_by(Some("# mount_max = 1000\nuser_allow_other\n"), false));
+        assert!(shared_granted_by(Some("  user_allow_other  # for containers\n"), false));
+        assert!(!shared_granted_by(Some("#user_allow_other\n"), false), "a commented line grants nothing");
+        assert!(!shared_granted_by(Some("user_allow_other_not\n"), false));
+        assert!(!shared_granted_by(None, false), "no file grants nothing");
+        assert!(shared_granted_by(None, true), "root needs no grant");
     }
 
     /// W9 (Slates' A-520's third piece). Do: start an agent's container through rootless podman. Expect podman's own words
@@ -786,6 +872,7 @@ mod tests {
                 asked.set(asked.get() + 1);
                 Err(EngineFault::TooLarge)
             },
+            || false,
         );
         assert_eq!((none.available, none.missing, none.program, asked.get()), (false, Some(ContainerMissing::Workspaces), None, 0), "nothing is asked of a machine without workspaces");
         let no_image = facts_of(
@@ -799,16 +886,23 @@ mod tests {
                 asked.set(asked.get() + 1);
                 Err(EngineFault::TooLarge)
             },
+            || false,
         );
         assert_eq!((no_image.available, no_image.missing, asked.get()), (false, Some(ContainerMissing::Image), 0), "no engine is looked for where no image is declared");
         assert!(no_image.why_not.as_deref().is_some_and(|w| w.contains("container_image")), "{:?}", no_image.why_not);
-        let no_engine = facts_of(true, image(), || None, |_: &str| {
-            asked.set(asked.get() + 1);
-            Err(EngineFault::TooLarge)
-        });
+        let no_engine = facts_of(
+            true,
+            image(),
+            || None,
+            |_: &str| {
+                asked.set(asked.get() + 1);
+                Err(EngineFault::TooLarge)
+            },
+            || false,
+        );
         assert_eq!((no_engine.available, no_engine.missing, no_engine.image.as_deref(), asked.get()), (false, Some(ContainerMissing::Engine), Some(IMAGE), 0), "no profile is asked of an engine not found");
 
-        let refused = |fault: EngineFault| facts_of(true, image(), || Some(DOCKER.to_owned()), move |_: &str| Err(fault));
+        let refused = |fault: EngineFault| facts_of(true, image(), || Some(DOCKER.to_owned()), move |_: &str| Err(fault), || false);
         let by_runtime = refused(EngineFault::Refused(ProfileRefusal::RuntimeUnsupported { runtime: "nerdctl".to_owned() }));
         assert_eq!((by_runtime.available, by_runtime.missing, by_runtime.program.as_deref(), by_runtime.engine), (false, Some(ContainerMissing::Profile), Some(DOCKER), None));
         assert!(by_runtime.why_not.as_deref().is_some_and(|w| w.starts_with("Slates refused this machine's container engine: ")), "{:?}", by_runtime.why_not);
@@ -818,13 +912,24 @@ mod tests {
         let windows = refused(EngineFault::Unsupported { platform: "windows" });
         assert_eq!((windows.available, windows.missing), (false, Some(ContainerMissing::Platform)));
 
-        let with = |profile: EngineProfile| facts_of(true, image(), || Some(DOCKER.to_owned()), move |program: &str| {
-            assert_eq!(program, DOCKER, "Slates judges the engine found");
-            Ok(profile)
-        });
+        let granted = |profile: EngineProfile, granted: bool| {
+            facts_of(
+                true,
+                image(),
+                || Some(DOCKER.to_owned()),
+                move |program: &str| {
+                    assert_eq!(program, DOCKER, "Slates judges the engine found");
+                    Ok(profile)
+                },
+                move || granted,
+            )
+        };
+        let with = |profile: EngineProfile| granted(profile, false);
         let rootful = with(judged(Engine::DockerEngine, IdentityRule::ContainerIdsAsHostIds, HardLinkRule::EveryNameServedAtOnce));
         assert_eq!((rootful.available, rootful.missing, rootful.engine.as_deref()), (false, Some(ContainerMissing::SharedMount), Some("docker-engine")));
-        assert_eq!(rootful.why_not, Some(Refusal::NeedsSharedMount.to_string()));
+        assert!(rootful.why_not.as_deref().is_some_and(|w| w.contains("user_allow_other")), "{:?}", rootful.why_not);
+        let rootful = granted(judged(Engine::DockerEngine, IdentityRule::ContainerIdsAsHostIds, HardLinkRule::EveryNameServedAtOnce), true);
+        assert_eq!((rootful.available, rootful.missing, rootful.engine.as_deref()), (true, None, Some("docker-engine")), "a rootful engine where its operator grants shared mounts");
         let desktop = with(judged(Engine::DockerDesktop, IdentityRule::HostUserThroughShare, HardLinkRule::OtherNamesStaleAfterTheFirstIsRemoved));
         assert_eq!(
             desktop,

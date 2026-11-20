@@ -816,11 +816,18 @@ is the machine's). A harness signs in in its container by a secret its person's 
 2026-11-20, the person's decision: never an image's own): the person's own secret (`secrets.mine`), opened by the server
 for that session alone, is given to its harness as it starts (`Kind::in_container`), named on the engine's command line
 and valued only in that command line's own environment, gone with the container; a grant taken out of the environment, or
-the secret deleted, gives the next start none. Once a container and its bind have gone its workspace is let go of where its mount stays only as
+the secret deleted, gives the next start none. Built (2026-11-20, A-520's fifth piece, 5c): a rootful Linux engine (Slates'
+`ContainerIdsAsHostIds`, whose container ids reach the volume as the host's own): a container session's workspace is
+mounted shared with the machine's other users (Slates' `MountOptions::shared`, FUSE's `allow_other`, which the engine's
+daemon, root, needs to bind it; `Made::shared`, kept as its mount is made again), and its container runs as the user who
+mounted it (`--user`, the runner's uid and gid; the harness's `exec` takes the container's user); a workspace not mounted
+shared is still refused (`NeedsSharedMount`). A shared mount is the machine's operator's grant, `user_allow_other` in
+`/etc/fuse.conf`, which kiln reads and never writes: a runner whose engine is rootful says its agents can run in
+containers only where it's given (`ContainerMissing::SharedMount` otherwise, naming the grant). Once a container and its bind have gone its workspace is let go of where its mount stays only as
 it's busy (built 2026-11-20, `slates::remove_after_container`, measured live: Docker Desktop 29.3.1's VM holds the files a
 container touched past its life, so the mount's plain unmount is refused busy even with the container gone), its volume
-taken down after; any other refusal keeps its volume, as W3's do. Owed, in order, each a piece: a workspace mounted shared for a rootful
-Linux engine (until then refused, `NeedsSharedMount`); whether a bind keeps the mount's `nosuid` and `nodev` without
+taken down after; any other refusal keeps its volume, as W3's do. Owed, in order, each a
+piece: its live start on a rootful Linux engine (adacachy, once its operator grants `user_allow_other`); whether a bind keeps the mount's `nosuid` and `nodev` without
 the container's rules (a setuid file and a device node made through one container's bind, used through another's),
 measured; the `.nfs.*` names on a Mac; Windows' measurement and its route; and the goal's proof, a
 test that starts an agent in a container through kiln on Linux, macOS and Windows (a heavy run, main's).

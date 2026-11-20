@@ -284,7 +284,14 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
     // An isolated session's volume is served to its microVM by Slates itself, never mounted here (kiln goal
     // 01a1ec34599974448f6b7663ddb07001; `sandbox::isolated::served_project`): its harness works in the folder's own place
     // in its guest, and nothing of the volume is in this machine's mount table.
-    let made = if spec.isolation.is_some() { slates::make_unmounted(&name, &over).await? } else { slates::make(&name, &over).await? };
+    // A container session's under a rootful Linux engine is mounted shared with the machine's other users, which its
+    // engine's daemon needs to bind it and its container's ids reach it as (W9, `container::needs_shared`).
+    let made = if spec.isolation.is_some() {
+        slates::make_unmounted(&name, &over).await?
+    } else {
+        let shared = spec.container.is_some() && container::workspace_shared().await;
+        slates::make_as(&name, &over, shared).await?
+    };
     // Its landings follow how much its launcher let its agent do (the person's rule, 2026-11-18; W6), as kiln, the
     // launcher, sets the volume's write policy; no agent can raise it. Where kiln can't set one, Slates' unset policy
     // holds: its landings ask, and kiln's own `agents.land` judges each by the agent's granted mode.
