@@ -642,9 +642,13 @@ In order, each its own piece:
 6. **The runs, main's:** the `microvm::` drive on adacachy (KVM, now) and on jupiter (WHP, once 2, 3 and 5 are in),
    each through `kiln run` on a kiln carrying Shards packed for that host.
 
-Owed on every host alike: Slates hands a successor daemon's fresh stream to a device over its resync channel (A-316,
-A-339; Windows A-427), which `served::SlatesVolumes` drops (it hands Hex the stream alone, which is all D286 takes), so
-a Slates daemon's restart ends a microVM's share.
+A Slates daemon's restart no longer ends a microVM's share (kiln goal 90; built 2026-11-19 on macOS and Linux):
+Slates hands a successor daemon's fresh stream to a device over its resync channel (A-316, A-339), and
+`served::SlatesVolumes` now gives Hex that channel beside the stream (`Servers::stream_resyncing`, kiln's recorded Hex
+change 0003), which Hex hands Shards' image boot and Shards' device holds (Shards' D288, kiln's recorded Shards change
+0002 until Shards merges it): a failed stream is replaced by the successor's, each DAX mapping asked for again and the
+outstanding request asked again whole. Windows' channel (A-427) names a handle Shards' device takes none of yet, so
+there it is still let go. Owed: the drive with the daemon killed mid-run (main's).
 
 **W9 Containers (UI goal 88, kiln goal 01a1f124…; designed 2026-11-18, Slates' A-520).** An agent whose runner runs
 its sessions in containers works in an OCI container of its own on its Slates volume: the same volume W2 and W3 make (an

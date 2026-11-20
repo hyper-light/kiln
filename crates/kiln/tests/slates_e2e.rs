@@ -1619,4 +1619,74 @@ mod microvm {
         let dir = canonical(dir.path());
         drive(&Drive { f: &f, dir: &dir, instance: &instance, engine: Engine::MicroVm, image: Some(image.as_str()) })
     }
+
+    /// Kiln goal 90 (Shards' D288, Slates' A-316/A-339): an agent's share outlives its Slates daemon. Its microVM writes
+    /// a file in its volume; the instance's daemon is killed (its anchor's restarts it) and the agent's next turn writes
+    /// another there: done only where the share's device took the stream the successor handed it on the resync channel
+    /// kiln passed beside the share's stream, the share otherwise ended with the daemon (`WRITE_FAIL`). Unix: Windows'
+    /// channel names a handle Shards' device takes none of yet.
+    #[cfg(unix)]
+    #[test]
+    fn g90_an_agents_share_outlives_its_slates_daemon() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let instance = Instance::new(dir.path());
+        let env = runner_env(dir.path(), &instance)?;
+        let f = vm_e2e::up_own(dir.path(), "slatesrs", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
+        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f)? {
+            return Ok(());
+        }
+        let kept = vm_e2e::keep_stub(&f, "claude")?;
+        let dir = canonical(dir.path());
+        let project = Project::new(&dir.join("resync"))?;
+        let spec = json!({
+            "kind": "claude", "mode": Mode::Bypass.claude(), "cwd": project.dir, "prompt": "WRITE=before-death.txt do the task",
+            "workspace": {"kind": "volume"}, "isolation": {"kind": "microvm", "image": format!("agentfile:{}", kept.id)},
+        });
+        let id = vm_e2e::open(&f, &spec)?;
+        let mut pace = vm_e2e::Pace::default().reporting(landing_reports(&instance.name));
+        let fail = |e: String| anyhow::anyhow!("{e}\n{}\n{}", f.runner_log(), slates_log(&dir));
+        let (_, events) = pace.until(&f, &id, vm_e2e::Asked::Opening, "its first turn", |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
+        let lines = vm_e2e::said(&events);
+        anyhow::ensure!(lines.iter().any(|l| l == "WROTE before-death.txt"), "{}", fail(format!("its first write: {lines:?}")));
+        let killed = kill_daemon(&instance.name).map_err(|e| fail(format!("{e:#}")))?;
+        let successor = successor_of(&instance.name, killed).map_err(|e| fail(format!("{e:#}")))?;
+        eprintln!("KILLED: Slates daemon {killed} of instance {}; its successor is {successor}", instance.name);
+        let client = format!("after-{}", nonce());
+        vm_e2e::command(&f, &id, &json!({"type": "send", "id": client, "text": "WRITE=after-death.txt do the task", "mode": "queue"}))?;
+        let (_, events) = pace.until(&f, &id, vm_e2e::Asked::Message(&client), "its turn after its daemon's death", |_, e| vm_e2e::said_marker(&vm_e2e::said_after(e, &client), vm_e2e::STUB_DONE))?;
+        let lines = vm_e2e::said_after(&events, &client);
+        anyhow::ensure!(lines.iter().any(|l| l == "WROTE after-death.txt"), "{}", fail(format!("its share ended with its daemon: {lines:?}")));
+        eprintln!("PROVEN: session {id}: its share wrote on after its Slates daemon {killed} was killed, served by {successor}");
+        pace.stop(&f, &id)
+    }
+
+    /// Instance `name`'s daemon (`--instance NAME … daemon`, never its anchor), killed outright (SIGKILL): its pid.
+    #[cfg(unix)]
+    fn kill_daemon(name: &str) -> anyhow::Result<u32> {
+        let daemons = daemons_of(name)?;
+        let [pid] = daemons.as_slice() else { anyhow::bail!("instance {name} runs daemons {daemons:?}, not one") };
+        let killed = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status()?;
+        anyhow::ensure!(killed.success(), "kill -KILL {pid}: {killed}");
+        Ok(*pid)
+    }
+
+    /// The daemon instance `name`'s anchor starts after `killed`: waited for as long as an anchor's restart may take.
+    #[cfg(unix)]
+    fn successor_of(name: &str, killed: u32) -> anyhow::Result<u32> {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if let Some(pid) = daemons_of(name)?.into_iter().find(|&p| p != killed) {
+                return Ok(pid);
+            }
+            anyhow::ensure!(std::time::Instant::now() < until, "instance {name}'s anchor started no daemon after {killed} in 60 s");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    /// The pids of instance `name`'s daemons.
+    #[cfg(unix)]
+    fn daemons_of(name: &str) -> anyhow::Result<Vec<u32>> {
+        let procs = vm_e2e::host_processes()?;
+        Ok(of_instance(&procs, name).into_iter().filter(|p| p.argv.iter().any(|a| a == "daemon")).map(|p| p.pid).collect())
+    }
 }
