@@ -527,7 +527,21 @@ fn thread_stacks() {
     }
 }
 
+/// Says this binary is a lint build (build.rs, `KILN_SHARDS=lint`), which carries no Shards, and that it doesn't run.
+#[cfg(kiln_lint)]
+fn refuse_lint_build() -> bool {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "kiln: this is a lint build (KILN_SHARDS=lint), which carries no Shards: build kiln to run it");
+    true
+}
+
 pub fn main() -> ExitCode {
+    // A lint of a target whose Shards isn't built where the lint runs (build.rs, `KILN_SHARDS=lint`) carries no
+    // Shards: it checks kiln's code, and is never a kiln to run.
+    #[cfg(kiln_lint)]
+    if refuse_lint_build() {
+        return ExitCode::FAILURE;
+    }
     // The allocator's settings, before any other thread starts (goal 11, plan 01a1a87b2e56 step 4).
     kiln::os::alloc::init();
     thread_stacks();
