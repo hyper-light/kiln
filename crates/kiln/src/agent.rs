@@ -4074,6 +4074,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 server_leases = false;
                 server_features.clear();
                 sent_changes.state_pages = false;
+                sent_changes.cut.clear();
                 if let Some(s) = &sync {
                     s.connected(false);
                 }
@@ -5141,12 +5142,16 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                         server_features = names;
                         // Welcome precedes the named feature reply. Re-send through the existing
-                        // resumable stream so a quiet session's first oversized state is recovered too.
-                        if refresh {
+                        // resumable stream so a quiet session's first oversized state is recovered too:
+                        // those whose Open or state went cut or not at all (`SentChanges::cut`), and only
+                        // those. Each other's stream already carries it whole, and started again it would go
+                        // on from the server's copy a second time for every connection.
+                        let cut = std::mem::take(&mut sent_changes.cut);
+                        if refresh && !cut.is_empty() {
                             if let Some(h) = &harness {
-                                for info in h.list() {
-                                    if let Some(s) = h.get(&info.id) {
-                                        start_stream(&mut updates, &info.id, &s, server_kept.get(&info.id), &mut sent_changes);
+                                for id in &cut {
+                                    if let Some(s) = h.get(id) {
+                                        start_stream(&mut updates, id, &s, server_kept.get(id), &mut sent_changes);
                                     }
                                 }
                             }
@@ -6253,6 +6258,9 @@ pub async fn enroll_only(o: &Opts) -> anyhow::Result<()> {
 #[derive(Default)]
 struct SentChanges {
     state_pages: bool,
+    /// Sessions whose Open or state went, before the server said it takes bounded views (CP-T3.2), cut to fit
+    /// a frame or not at all: once it says so, their streams start again, the state in its bounded view.
+    cut: BTreeSet<String>,
     /// The server takes changesets as patches.
     patches: bool,
     sessions: HashMap<String, HashMap<crate::harness::model::FileKey, u64>>,
@@ -6396,7 +6404,11 @@ fn push_update(updates: &mut crate::wire::uplink::Updates, session: &str, u: &cr
             if matches!(u, Update::Open { .. }) {
                 sent.forget(session);
             }
-            legacy_harness_frames(session, u)
+            let (frames, whole) = legacy_frames(session, u);
+            if !whole {
+                sent.cut.insert(session.to_owned());
+            }
+            frames
         }
         Update::Changes { files } => sent.frames(session, files, picture),
         // Its server's copy starts its changeset over (an Open), or lets the session go.
@@ -6772,18 +6784,28 @@ fn harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String
 }
 
 fn legacy_harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec<String> {
-    use crate::harness::core::Update;
-    let Ok(json) = serde_json::to_string(u) else { return Vec::new() };
+    legacy_frames(session, u).0
+}
+
+/// [`legacy_harness_frames`], and whether `u` went whole, in one frame as it is.
+fn legacy_frames(session: &str, u: &crate::harness::core::Update) -> (Vec<String>, bool) {
+    let Ok(json) = serde_json::to_string(u) else { return (Vec::new(), false) };
     if json.len() <= HARNESS_FRAME {
-        return vec![json];
+        return (vec![json], true);
     }
+    (legacy_cut(session, u, json.len()), false)
+}
+
+/// [`legacy_harness_frames`] of an update whose JSON, `bytes` long, doesn't fit a frame whole.
+fn legacy_cut(session: &str, u: &crate::harness::core::Update, bytes: usize) -> Vec<String> {
+    use crate::harness::core::Update;
     // A changeset fits with its largest diffs left out; a patch of one goes in as many frames as
     // it takes. Neither is dropped: a changeset's page would go on showing what no longer is.
     if let Update::Changes { files } = u {
         let fitted = fit_changes(files);
         match &fitted {
-            Some(j) => tracing::debug!(session, bytes = json.len(), sent = j.len(), "agent session changeset too large whole: its largest diffs left out"),
-            None => tracing::warn!(session, bytes = json.len(), "agent session changeset too large to send, even as counts; dropped"),
+            Some(j) => tracing::debug!(session, bytes, sent = j.len(), "agent session changeset too large whole: its largest diffs left out"),
+            None => tracing::warn!(session, bytes, "agent session changeset too large to send, even as counts; dropped"),
         }
         return fitted.into_iter().collect();
     }
@@ -6801,7 +6823,7 @@ fn legacy_harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec
             .and_then(|v| serde_json::to_string(&v).ok());
         return match fitted {
             Some(j) if j.len() <= HARNESS_FRAME => {
-                tracing::debug!(session, bytes = json.len(), sent = j.len(), "agent session update cut to fit");
+                tracing::debug!(session, bytes, sent = j.len(), "agent session update cut to fit");
                 vec![j]
             }
             _ => match essentials(u, budget) {
@@ -6809,11 +6831,11 @@ fn legacy_harness_frames(session: &str, u: &crate::harness::core::Update) -> Vec
                 // shortens): what a viewer can't do without, rather than nothing. Dropped whole, the
                 // page went on without its state at all: no effort, a switch never shown done.
                 Some(j) if j.len() <= HARNESS_FRAME => {
-                    tracing::warn!(session, bytes = json.len(), sent = j.len(), "agent session update too large to send whole; sent what it can't do without");
+                    tracing::warn!(session, bytes, sent = j.len(), "agent session update too large to send whole; sent what it can't do without");
                     vec![j]
                 }
                 _ => {
-                    tracing::warn!(session, bytes = json.len(), "agent session update too large to send, even cut; dropped");
+                    tracing::warn!(session, bytes, "agent session update too large to send, even cut; dropped");
                     Vec::new()
                 }
             },
