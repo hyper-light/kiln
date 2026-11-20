@@ -2635,6 +2635,8 @@ fn named_ahead(meta: &mut super::model::Meta, kind: &Kind, model: Option<&str>) 
 fn begin(id: String, mut spec: Spec, kind: &'static Kind, mut core: Core, sink: Sink, on_change: Arc<dyn Fn() + Send + Sync>, files: Files, items: Option<Vec<serde_json::Value>>, adopt: Option<Adopt>) -> anyhow::Result<Arc<Session>> {
     let now = crate::util::now_ms();
     core.session_id.clone_from(&id);
+    // An agent's start's opening prompt is that agent's words: shown as theirs, not a person's.
+    core.agent_opening = spec.parent.as_ref().map(|_| opening_prompt_id(&id));
     core.state.max_subagents = core.state.max_subagents.or(spec.max_subagents);
     // Its grant, as kiln records it (`State::launched`): its spec's, which every mode set by command since has moved.
     core.state.launched = Some(spec.launched_level());

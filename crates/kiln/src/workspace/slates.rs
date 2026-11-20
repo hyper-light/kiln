@@ -623,6 +623,12 @@ pub struct Made {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(test, ts(skip))]
     pub base: Option<Base>,
+    /// Mounted shared with the machine's other users (Slates' `MountOptions::shared`: FUSE's `allow_other` on Linux), for
+    /// an agent's container under a rootful Linux engine, whose ids reach the volume as the host's own (W9,
+    /// `super::container`); mounted so again whenever its mount is made again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(test, ts(skip))]
+    pub shared: bool,
 }
 
 /// What a workspace's volume is a clone of (K5): its folder's captured base, an overlay of the folder whose whole tree
@@ -667,6 +673,12 @@ fn hex_bytes<const N: usize>(text: &str) -> Option<[u8; N]> {
 /// it's a clone of its folder's captured base, a plain volume Slates moves with its agent (K5, [`provision`]); elsewhere an
 /// overlay laid over the folder, which reads nothing of it until it's used.
 pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
+    make_as(name, over, false).await
+}
+
+/// [`make`], its mount shared with the machine's other users where `shared` (an agent's container under a rootful Linux
+/// engine, W9: [`Made::shared`]).
+pub async fn make_as(name: &str, over: &Path, shared: bool) -> anyhow::Result<Made> {
     ensure_up().await?;
     let (id, base) = provision(name, over, in_fleet().await).await?;
     let volume = slates_api::volume_id_text(id);
@@ -680,7 +692,7 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
         failed = e;
     }
     for point in points {
-        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone() };
+        let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone(), shared };
         // Mounted there anew, never taken as mounted already: a drive letter another start took meanwhile holds its
         // volume, not this one, and Slates refuses a second mount at it.
         match mount_typed(&m).await {
@@ -719,7 +731,7 @@ pub async fn make_unmounted(name: &str, over: &Path) -> anyhow::Result<Made> {
     ensure_up().await?;
     let spec = VolumeSpec::overlay(name, over, volume_max());
     let id = call_grouped("volume create", move |i| i.provision(&spec).map(|made| made.volume())).await?;
-    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None })
+    Ok(Made { volume: slates_api::volume_id_text(id), name: name.to_owned(), mount: String::new(), base: None, shared: false })
 }
 
 /// A workspace's volume `name` over folder `over`, unmounted (K5): with `captured`, a clone of the folder's captured base
@@ -1070,11 +1082,18 @@ async fn mount_typed(m: &Made) -> anyhow::Result<Result<(), slates_api::Error>> 
     super::place::ready(&dir)?;
     let volume = volume_id(&m.volume)?;
     let path = m.mount.clone();
-    if let Err(refused) = call("mount", move |i| Ok(i.mount(volume, &path, &slates_api::MountOptions::default()))).await? {
+    let options = mount_options(m);
+    if let Err(refused) = call("mount", move |i| Ok(i.mount(volume, &path, &options))).await? {
         return Ok(Err(refused));
     }
     anyhow::ensure!(is_mount(&dir), "Slates said it mounted {} at {}, but nothing is mounted there", m.name, m.mount);
     Ok(Ok(()))
+}
+
+/// The options workspace `m` is mounted with: shared with the machine's other users where it's to be (W9, [`Made::shared`]),
+/// else Slates' own defaults.
+fn mount_options(m: &Made) -> slates_api::MountOptions {
+    slates_api::MountOptions { shared: m.shared, ..slates_api::MountOptions::default() }
 }
 
 /// Whether a mount refused at a drive letter (`refused`, Slates' typed refusal) leaves the next free letter worth trying:
@@ -1196,6 +1215,31 @@ pub async fn remove(m: &Made) -> anyhow::Result<()> {
         release_base(base, volume_id(&m.volume)?).await;
     }
     Ok(())
+}
+
+/// Takes the workspace of an agent that ran in a container down (docs/agentic.md W9), once its container and its bind have
+/// gone: W3's [`remove`], and where its mount stays only because something still holds it ([`lets_go_after_container`]),
+/// that mount let go of (Slates' `mount::unmount_busy`: forced off on macOS, detached on Linux) and its volume taken down
+/// after it. What holds it then is the engine's own file sharing, not a person's process: a Mac's Docker Desktop holds
+/// every file a container touched open past the container's life (its VM's virtio-fs share of `/Users` over the NFS
+/// mount), so its plain unmount is refused busy, even once the container is gone (measured 2026-11-20, Docker Desktop
+/// 29.3.1, `workspace::container_live_tests`: held by `com.apple.Virtualization.VirtualMachine`).
+pub async fn remove_after_container(m: &Made) -> anyhow::Result<()> {
+    match remove(m).await {
+        Err(e) if lets_go_after_container(&e) => {
+            let path = m.mount.clone();
+            let let_go = crate::rt::blocking(move || slates_api::mount::unmount_busy(&path)).await?.map_err(|fault| anyhow::anyhow!("Slates' let-go of {}: {fault}", m.mount))?;
+            tracing::info!(mount = %m.mount, how = ?let_go, "an ended container's workspace, still held by its engine's file sharing, is let go of");
+            remove(m).await
+        }
+        done => done,
+    }
+}
+
+/// Whether a container's workspace whose [`remove`] failed with `e` is let go of ([`remove_after_container`]): its mount
+/// stays only as it's busy, held by what its engine shares; every other refusal keeps its volume, as W3's do.
+pub fn lets_go_after_container(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<MountStays>().is_some_and(|s| matches!(s.held, Held::Busy { .. }))
 }
 
 /// A workspace's volume kept because its mount is still in the kernel's table after kiln's one unmount: destroying the
@@ -2440,7 +2484,7 @@ mod tests {
     /// A captured clone's record, as a fleet runner makes one (K5).
     fn captured() -> Made {
         let base = Some(Base { volume: "00017f80ff10abcdef1234567890ffff".into(), snapshot: 7 });
-        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), base }
+        Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/another/machines/state/kiln/workspaces/kiln-a".into(), base, shared: false }
     }
 
     /// A-503 (kiln goal 95101ef32ffb8b099942fe076619c310): a captured clone that moved here with its agent is placed under
@@ -2493,7 +2537,7 @@ mod tests {
     fn k5_a_workspace_record_from_before_reads_and_writes_as_it_did() -> anyhow::Result<()> {
         let before = json!({"volume": "00017f80ff10abcdef123456789abcde", "name": "kiln-a", "mount": "/w/kiln-a"});
         let read: Made = serde_json::from_value(before.clone())?;
-        assert_eq!(read, Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), base: None });
+        assert_eq!(read, Made { volume: "00017f80ff10abcdef123456789abcde".into(), name: "kiln-a".into(), mount: "/w/kiln-a".into(), base: None, shared: false });
         assert_eq!(serde_json::to_value(&read)?, before);
         let clone = captured();
         let mut written = serde_json::to_value(&clone)?;
@@ -2523,6 +2567,19 @@ mod tests {
     /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (W6): a landing leaves out each path git ignores, once per directory
     /// git ignores whole, a rename's source (in either status column) no path of its own; and `.git`; the library's
     /// request carries every one of them.
+    /// W9: a container's workspace whose mount stays only as it's busy (its engine's file sharing holds it once the
+    /// container has gone: Docker Desktop's VM, measured 2026-11-20) is let go of; one the OS still lists after an unmount
+    /// that answered done, one whose unmount was refused, and any other failure keep their volume, as W3's do.
+    #[test]
+    fn w9_a_containers_busy_workspace_mount_is_let_go_of_and_no_other() {
+        let stays = |held: Held| anyhow::Error::new(MountStays { mount: "/w/kiln-a".to_owned(), held });
+        assert!(lets_go_after_container(&stays(Held::Busy { holders: Ok(vec!["20401 com.apple.Virtualization.VirtualMachine".to_owned()]) })));
+        assert!(lets_go_after_container(&stays(Held::Busy { holders: Ok(Vec::new()) })));
+        assert!(!lets_go_after_container(&stays(Held::StillListed)));
+        assert!(!lets_go_after_container(&stays(Held::Refused { refusal: "no".to_owned(), lsof: "nothing".to_owned() })));
+        assert!(!lets_go_after_container(&anyhow::anyhow!("Slates' volume destroy: refused")));
+    }
+
     #[test]
     fn w6_a_landing_leaves_out_what_git_ignores_and_git_itself() -> anyhow::Result<()> {
         let said = "!! target/\0 M src/a.rs\0R  new.rs\0old.rs\0!! src/gen.o\0?? src/n.rs\0 R moved.rs\0!! was.rs\0!! node_modules/\0";

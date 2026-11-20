@@ -1142,7 +1142,7 @@ impl Acp {
         if d != Delivery::Queued {
             core.note_sent(&m.id, &m.text);
         }
-        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(super::core::origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
+        core.upsert(&m.id, None, Body::User { text: m.text.clone(), images, client_id: Some(m.id.clone()), origin: Some(core.origin_of(&m.id).into()), attachments: names, reply_to: m.reply_to.clone() });
         core.touch_state();
     }
 
