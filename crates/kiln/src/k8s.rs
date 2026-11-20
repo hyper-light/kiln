@@ -267,8 +267,20 @@ impl K8s {
                 }
             }
             pending_since.retain(|n, _| seen.contains(n));
+            // Agents' pods (docs/agentic.md W10): each whose session ended, or that can't start, reaped with its claim,
+            // its PersistentVolume and its home's hold.
+            match list_agent_pods(&self.api).await {
+                Ok(pods) => self.reap_agents(&hub, &pods, &mut pending_since).await,
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "agents' pods weren't listed: reaped next time"),
+            }
         }
     }
+}
+
+/// kiln's agents' pods in its jobs namespace now (`k8s::volume::AGENT_POD`), by name.
+async fn list_agent_pods(api: &KubeApi) -> anyhow::Result<HashMap<String, Pod>> {
+    let pods = api.list_pods(&format!("{MANAGED},app.kubernetes.io/name={}", volume::AGENT_POD)).await?;
+    Ok(pods.into_iter().filter_map(|p| p.metadata.name.clone().map(|n| (n, p))).collect())
 }
 
 /// The toolchains' caches a job pod keeps under the cache claim (`[kubernetes] cache_pvc`), shared

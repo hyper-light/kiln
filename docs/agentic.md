@@ -911,7 +911,12 @@ part.
   its home by that id, never to the pod; and the start (built 2026-11-20, `K8s::start_agent`): the
   home asked to hold the workspace (a runner that names `workspace.hold`), the PersistentVolume and claim made from its
   export at the address `[slates_fleet.nodes]` lists for it, and the pod made in `[kubernetes] agents_image` with its
-  runner's one-time token; what it made taken down again where a later step fails, the home's hold let go; the home's part (built 2026-11-20:
+  runner's one-time token; what it made taken down again where a later step fails, the home's hold let go; and the reaper (built 2026-11-20, `K8s::reap_agents` in the job pods' reap loop,
+  `k8s::agent::agent_pod_ends`): a pod whose runner left (it leaves as its session ends), whose session ended, that is
+  gone from the cluster once its session opened, or that couldn't start for two minutes is deleted, then its claim and
+  PersistentVolume, then its home lets the workspace go, its export detached so its path reaches nothing; and the start's ask (built 2026-11-20): `agents.start` with `isolation:
+  "pod"` and `on` naming its home (refused without either, or where the server runs no `[kubernetes]`), placed there as
+  a session that asks for no engine is, answered as it starts under its id, its target its pod's runner; the home's part (built 2026-11-20:
   `workspace::held`, the `hold` and `release` asks of a runner that names `workspace.hold`: its volume made with no
   mount, its write policy from the agent's grant, exported to the folder's owner through `Instance::export`, the path,
   attachment, uid and gid answered, and every question about the pod's folder answered from the holding, as an isolated
