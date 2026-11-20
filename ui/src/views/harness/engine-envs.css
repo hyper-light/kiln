@@ -68,7 +68,7 @@
 }
 /* The form: a variable two rows (its name, where from and its moves; then what it takes). */
 .ev-form {
-  padding-top: 4px;
+  padding-top: 10px;
 }
 .ev-k {
   margin-top: 6px;
@@ -107,10 +107,9 @@
   border-top: 0;
   border-bottom: 0;
 }
-/* Each environment set apart by a clear rule and a gap; inside it, each section's head (Variables,
+/* Each environment set apart by a clear rule (no gap: a folded one is its line alone); inside it, each section's head (Variables,
    Sessions) between rules of its own. */
 [data-list="envs-tab"] > li.df-defrow {
-  margin-top: 18px;
   border-top: 1px solid #3a3c43;
 }
 [data-list="envs-tab"] li.ms-node.df-group {
@@ -181,6 +180,13 @@ input.ev-tag-in {
   text-align: left;
   cursor: text;
 }
+/* A name stays on one line, as it did before it could be edited; a long one is cut. */
+.ev-inline.df-defname {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .ev-inline.df-note {
   font-size: 13px;
   line-height: 19px;
@@ -223,4 +229,42 @@ input.ev-inline-in {
 }
 .ev-chev:focus-visible {
   outline: 1px solid #6b6e78;
+}
+
+/* The form's dropdowns: their arrow drawn inset from the right edge, as the left edge's padding. */
+.ev-form select.sb-in {
+  appearance: none;
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239a9ca4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-position: right 10px center;
+  background-repeat: no-repeat;
+  background-size: 12px;
+}
+
+/* A field in focus: its own border lit, as definitions' fields are (definition.css .ms-edit-in), not a
+   ring outside it that runs into what's beside it. */
+.ev-form .sb-in:focus,
+.ev-form .sb-in:focus-visible,
+input.ev-inline-in:focus,
+input.ev-tag-in:focus {
+  outline: none;
+  border-color: #bab0e3;
+}
+
+/* Its base and the + beside it, as far from the section's rule above as from the first variable
+   below: 10px each (the form's top; this row's foot and the space the first variable keeps over it). */
+.ev-baserow {
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 2px;
+}
+/* The + is smaller than the ✓ and × that save. */
+.fig-round.ev-add {
+  width: 24px;
+  height: 24px;
+}
+/* "New environment": as far from the rule above as from the one below. */
+[data-list="envs-tab"] > li.ev-new {
+  padding-top: 12px;
+  padding-bottom: 12px;
 }

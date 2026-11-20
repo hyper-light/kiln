@@ -58,9 +58,22 @@ test("a session on bare metal has the Engine tab: Environments and Agents, no Sa
   await expect(lines.first()).toContainText("release-tools");
   await expect(lines.first()).toContainText("this session");
   await expect(lines.first()).toContainText("Machine base · v3");
-  // Its variables a line each: a secret by its name, a value as it is, the machine's variable it takes.
-  const vars = list.getByRole("list", { name: "release-tools's variables" }).locator("li");
-  await expect(vars).toHaveText([/^GH_TOKEN\s*secret\s*GH_TOKEN$/, /^RUST_LOG\s*value\s*info$/, /^CARGO_HOME\s*machine\s*\$CARGO_HOME$/]);
+  // Opened, its variables are its fields: a secret by its name (never a value), a value as it is, the machine's variable it takes.
+  await list.getByRole("button", { name: "Expand release-tools" }).click();
+  const form = list.getByRole("listitem", { name: "release-tools's variables" });
+  for (const [i, name, from] of [
+    [1, "GH_TOKEN", "secret"],
+    [2, "RUST_LOG", "value"],
+    [3, "CARGO_HOME", "machine"],
+  ] as const) {
+    await expect(form.getByRole("textbox", { name: `Variable ${i}'s name` })).toHaveValue(name);
+    await expect(form.getByRole("combobox", { name: `Where variable ${i} comes from` })).toHaveValue(from);
+  }
+  await expect(form.getByRole("combobox", { name: "Variable 1's secret" })).toHaveValue("GH_TOKEN");
+  await expect(form.getByRole("textbox", { name: "Variable 2's value" })).toHaveValue("info");
+  // Nothing changed: nothing to save or discard.
+  await expect(form.getByRole("button", { name: "Save release-tools" })).toBeDisabled();
+  await expect(form.getByRole("button", { name: "Discard changes to release-tools" })).toBeDisabled();
   await expect(list.getByRole("list", { name: "Sessions running with release-tools" })).toContainText("Update the docs");
   // Sorted and found: most variables first after this session's; Secrets chosen, only those that give one.
   await body.getByRole("combobox", { name: "Sort environments" }).selectOption("vars");
@@ -95,16 +108,24 @@ test("one made, changed in place, applied to this session, refused deletion whil
   await expect(form).toHaveCount(0);
   const card = list.locator(":scope > li.df-defrow", { hasText: "e2e-env" });
   await expect(card).toContainText("Clean base · v1");
+  await list.getByRole("button", { name: "Expand e2e-env" }).click();
   const tree = list.getByRole("list", { name: "e2e-env: variables and sessions" });
-  await expect(tree.getByRole("list", { name: "e2e-env's variables" }).locator("li .ev-name")).toHaveText(["RUST_LOG", "GH_TOKEN", "CARGO_HOME"]);
+  const names = () => tree.getByRole("listitem", { name: "e2e-env's variables" }).getByRole("textbox", { name: /^Variable \d+'s name$/ });
+  await expect(names()).toHaveCount(3);
+  for (const [i, n] of ["RUST_LOG", "GH_TOKEN", "CARGO_HOME"].entries()) await expect(names().nth(i)).toHaveValue(n);
 
-  // Changed in place: its first variable taken out, saved as v2.
-  await card.getByRole("button", { name: "Edit e2e-env" }).click();
-  const edit = list.getByRole("listitem", { name: "Edit e2e-env" });
+  // Changed where it's shown: a change undone with ×, then one saved with ✓ as v2.
+  const edit = tree.getByRole("listitem", { name: "e2e-env's variables" });
+  await edit.getByRole("button", { name: "Remove variable 1" }).click();
+  await expect(names()).toHaveCount(2);
+  await edit.getByRole("button", { name: "Discard changes to e2e-env" }).click();
+  await expect(names()).toHaveCount(3);
   await edit.getByRole("button", { name: "Remove variable 1" }).click();
   await edit.getByRole("button", { name: "Save e2e-env" }).click();
   await expect(card).toContainText("Clean base · v2");
-  await expect(tree.getByRole("list", { name: "e2e-env's variables" }).locator("li .ev-name")).toHaveText(["GH_TOKEN", "CARGO_HOME"]);
+  await expect(names()).toHaveCount(2);
+  await expect(names().nth(0)).toHaveValue("GH_TOKEN");
+  await expect(names().nth(1)).toHaveValue("CARGO_HOME");
 
   // Chosen for this session from the dropdown, confirmed first: it restarts the session.
   const body = page.locator(".hx-inspector-body").filter({ visible: true }).first();
@@ -150,7 +171,8 @@ test("a card's head is edited in place: renamed, tagged and untagged, described;
   expect((await sent).postDataJSON()).toEqual({ version: 1, name: "ci-clean" });
   const renamed = list.locator(":scope > li.df-defrow", { hasText: "ci-clean" });
   await expect(renamed).toContainText("Clean base · v2");
-  // A tag added beside the name, then one taken away.
+  // A tag added under the name (its card opened), then one taken away.
+  await list.getByRole("button", { name: "Expand ci-clean" }).click();
   await list.getByRole("button", { name: "Add a tag to ci-clean" }).click();
   sent = patched();
   await list.getByRole("textbox", { name: "New tag for ci-clean" }).fill("nightly");
@@ -173,25 +195,26 @@ test("a card's head is edited in place: renamed, tagged and untagged, described;
   expect(said, said.join("\n")).toEqual([]);
 });
 
-test("each environment folds to its head and is kept folded; its pencil opens it", async ({ page }) => {
+test("each environment starts folded to its head, opens to its form, and is kept as it was left", async ({ page }) => {
   const said = errors(page);
   const { list } = await engine(page);
-  const toggle = list.getByRole("button", { name: "Collapse clean-ci" });
-  await expect(toggle).toHaveAttribute("aria-expanded", "true");
-  await expect(list.getByRole("list", { name: "clean-ci: variables and sessions" })).toBeVisible();
-  await toggle.click();
-  await expect(list.getByRole("button", { name: "Expand clean-ci" })).toHaveAttribute("aria-expanded", "false");
-  await expect(list.getByRole("list", { name: "clean-ci: variables and sessions" })).toHaveCount(0);
+  for (const n of ["release-tools", "clean-ci", "aws-agents"]) {
+    await expect(list.getByRole("button", { name: `Expand ${n}` })).toHaveAttribute("aria-expanded", "false");
+    await expect(list.getByRole("list", { name: `${n}: variables and sessions` })).toHaveCount(0);
+  }
   await expect(list.locator(":scope > li.df-defrow", { hasText: "clean-ci" })).toContainText("Clean base · v1");
+  await list.getByRole("button", { name: "Expand clean-ci" }).click();
+  await expect(list.getByRole("button", { name: "Collapse clean-ci" })).toHaveAttribute("aria-expanded", "true");
+  await expect(list.getByRole("list", { name: "clean-ci: variables and sessions" })).toBeVisible();
   // Kept as it was left.
   await page.reload();
   await tab(page, "Engine");
-  await expect(list.getByRole("button", { name: "Expand clean-ci" })).toBeVisible();
-  await expect(list.getByRole("list", { name: "clean-ci: variables and sessions" })).toHaveCount(0);
-  // The pencil opens it, to its form.
-  await list.getByRole("button", { name: "Edit clean-ci" }).click();
-  await expect(list.getByRole("button", { name: "Collapse clean-ci" })).toBeVisible();
-  await expect(list.getByRole("listitem", { name: "Edit clean-ci" })).toBeVisible();
+  await expect(list.getByRole("list", { name: "clean-ci: variables and sessions" })).toBeVisible();
+  await expect(list.getByRole("button", { name: "Expand aws-agents" })).toBeVisible();
+  // Opened, it's its form: no edit button to press first.
+  await list.getByRole("button", { name: "Expand aws-agents" }).click();
+  await expect(list.getByRole("listitem", { name: "aws-agents's variables" }).getByRole("textbox", { name: "Variable 1's name" })).toHaveValue("AWS_ACCESS_KEY_ID");
+  await expect(list.getByRole("button", { name: /^Edit / })).toHaveCount(0);
   expect(said, said.join("\n")).toEqual([]);
 });
 

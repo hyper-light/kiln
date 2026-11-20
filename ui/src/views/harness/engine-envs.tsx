@@ -7,7 +7,7 @@
  * A new one, or a change, is made in place on its card.
  */
 import * as React from "react";
-import { ArrowDown, ArrowUp, Check, ChevronRight, KeyRound, Pencil, Plus, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, ChevronRight, Plus, X } from "lucide-react";
 import { agentenvOf, agentenvsApi, agentenvsRes, machineVarsRes, relist, type Agentenv, type AgentenvFrom, type MachineVar } from "@/api/agentenvs";
 import type { AgentInfo } from "@/api/harness";
 import { mySecretsRes } from "@/api/secrets";
@@ -30,8 +30,6 @@ import {
   envFacets,
   envWords,
   facetsFor,
-  FROM_WORD,
-  givesOf,
   mineOf,
   moved,
   problemOf,
@@ -167,15 +165,15 @@ function Choose({ at, envs, mine }: { at: At; envs: readonly Agentenv[]; mine: A
 /* ------------------------------------------------ a card */
 
 function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly AgentInfo[]; here?: boolean }) {
-  // Each folds to its head, open as it starts and as the person last left it.
-  const [open, setOpen] = useFold(`engine-env.${e.id}`, true);
-  const [editing, setEditing] = React.useState(false);
+  // Each folds to its head: closed as it starts, then as the person last left it (its own key: what a
+  // build that opened them all at first kept doesn't open it).
+  const [open, setOpen] = useFold(`engine-env-open.${e.id}`, false);
   const [asking, setAsking] = React.useState(false);
   const [why, setWhy] = React.useState<string | null>(null);
   const sessions = e.sessions.map((id) => list.find((a) => a.id === id) ?? { id, name: id, target: "" });
   return (
     <>
-      {/* Its line: its name (this session's marked), its base and version, its pencil. */}
+      {/* Its line: its fold, its name (this session's marked), its base and version. */}
       <li className="ms-node df-defrow df-head" data-stand={e.sessions.length > 0 ? "working" : "done"} data-depth={0} data-env={e.id}>
         <span className="df-head-main">
           <button type="button" className="ev-chev" aria-expanded={open} aria-label={`${open ? "Collapse" : "Expand"} ${e.name}`} onClick={() => setOpen(!open)}>
@@ -189,105 +187,65 @@ function EnvCard({ e, at, list, here }: { e: Agentenv; at: At; list: readonly Ag
             {BASE_WORD[e.base]} base · v{e.version}
           </span>
         </span>
-        <span className="df-head-acts">
-          <button
-            type="button"
-            className="hx-icon"
-            aria-label={`Edit ${e.name}`}
-            aria-pressed={editing}
-            title="Edit"
-            onClick={() => {
-              setOpen(true);
-              setEditing(!editing);
-            }}
-          >
-            <Pencil size={14} />
-          </button>
-        </span>
       </li>
       {open && (
         <li className="ms-tree df-groups">
           <ul className="ms-tree-rows" aria-label={`${e.name}: variables and sessions`}>
-            {editing ? (
-              <EnvForm e={e} at={at} onDone={() => setEditing(false)} />
-            ) : (
-              <>
-                <li className="ms-node df-body ev-tagrow" data-depth={2}>
-                  <span className="ev-tags" role="list" aria-label={`${e.name}'s tags`}>
-                    {e.tags.map((t) => (
-                      <span role="listitem" key={t} className="ev-tag">
-                        {t}
-                        <button type="button" className="ev-tag-x" aria-label={`Remove tag ${t}`} onClick={() => change(e, { tags: e.tags.filter((x) => x !== t) }, setWhy)}>
-                          <X size={10} />
-                        </button>
-                      </span>
-                    ))}
-                    <AddTag name={e.name} onAdd={(t) => change(e, { tags: [...e.tags, t] }, setWhy)} />
-                  </span>
-                </li>
-                <li className="ms-node df-body ev-desc" data-depth={2}>
-                  <Inline
-                    value={e.description ?? ""}
-                    action={`Describe ${e.name}`}
-                    label={`${e.name}'s description`}
-                    placeholder="Add a description"
-                    className="df-note"
-                    onSave={(d) => change(e, { description: d || null }, setWhy)}
-                  />
-                </li>
-                <GroupHead label="Variables" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.vars.length}</span>} />
-                <li className="ms-node df-body" data-depth={2}>
-                  {e.vars.length === 0 ? (
-                    <span className="df-note">No variables.</span>
-                  ) : (
-                    <ul className="sb-rows ev-rows" aria-label={`${e.name}'s variables`}>
-                      {e.vars.map((v, i) => (
-                        <li key={`${i}:${v.name}`} className="sb-row ev-var" data-from={v.from}>
-                          <span className="ev-key">
-                            <span className="sb-mono sb-clip ev-name">{v.name}</span>
-                            <span className="sb-tags">
-                              <i>{FROM_WORD[v.from]}</i>
-                            </span>
-                          </span>
-                          <span className="sb-mono sb-clip ev-gives" title={v.from === "secret" ? `Secret ${v.secret ?? ""} (value hidden)` : givesOf(v)}>
-                            {v.from === "secret" && <KeyRound size={11} aria-hidden="true" />}
-                            {givesOf(v)}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </li>
-                <GroupHead label="Sessions" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.sessions.length}</span>} />
-                <li className="ms-node df-body" data-depth={2}>
-                  {sessions.length === 0 ? (
-                    <span className="df-note">No sessions.</span>
-                  ) : (
-                    <ul className="sb-rows ev-rows" aria-label={`Sessions running with ${e.name}`}>
-                      {sessions.map((s) => (
-                        <li key={s.id} className="sb-row ev-session">
-                          <Link to={`/agents/${s.id}`} className="ms-link sb-clip">
-                            {"kind" in s ? agentLabel(s) : s.name}
-                          </Link>
-                          <span className="sb-dim sb-clip">{s.id === at.agentId ? "this session" : s.target ? machineOf(s.target) : ""}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                  <span className="ev-acts">
-                    <Button size="xs" variant="ghost-danger" onClick={() => setAsking(true)}>
-                      Delete
-                    </Button>
-                  </span>
-                  {why && (
-                    <span className="sb-why" role="alert">
-                      {why}
+            <>
+              <li className="ms-node df-body ev-tagrow" data-depth={2}>
+                <span className="ev-tags" role="list" aria-label={`${e.name}'s tags`}>
+                  {e.tags.map((t) => (
+                    <span role="listitem" key={t} className="ev-tag">
+                      {t}
+                      <button type="button" className="ev-tag-x" aria-label={`Remove tag ${t}`} onClick={() => change(e, { tags: e.tags.filter((x) => x !== t) }, setWhy)}>
+                        <X size={10} />
+                      </button>
                     </span>
-                  )}
-                </li>
-                {asking && <DeleteAsk e={e} why={setWhy} onDone={() => setAsking(false)} />}
-              </>
-            )}
+                  ))}
+                  <AddTag name={e.name} onAdd={(t) => change(e, { tags: [...e.tags, t] }, setWhy)} />
+                </span>
+              </li>
+              <li className="ms-node df-body ev-desc" data-depth={2}>
+                <Inline
+                  value={e.description ?? ""}
+                  action={`Describe ${e.name}`}
+                  label={`${e.name}'s description`}
+                  placeholder="Add a description"
+                  className="df-note"
+                  onSave={(d) => change(e, { description: d || null }, setWhy)}
+                />
+              </li>
+              <GroupHead label="Variables" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.vars.length}</span>} />
+              <EnvForm key={`${e.id}:${e.version}`} e={e} at={at} />
+              <GroupHead label="Sessions" fixed open onOpen={() => {}} summary={<span className="df-head-v">{e.sessions.length}</span>} />
+              <li className="ms-node df-body" data-depth={2}>
+                {sessions.length === 0 ? (
+                  <span className="df-note">No sessions.</span>
+                ) : (
+                  <ul className="sb-rows ev-rows" aria-label={`Sessions running with ${e.name}`}>
+                    {sessions.map((s) => (
+                      <li key={s.id} className="sb-row ev-session">
+                        <Link to={`/agents/${s.id}`} className="ms-link sb-clip">
+                          {"kind" in s ? agentLabel(s) : s.name}
+                        </Link>
+                        <span className="sb-dim sb-clip">{s.id === at.agentId ? "this session" : s.target ? machineOf(s.target) : ""}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <span className="ev-acts">
+                  <Button size="xs" variant="ghost-danger" onClick={() => setAsking(true)}>
+                    Delete
+                  </Button>
+                </span>
+                {why && (
+                  <span className="sb-why" role="alert">
+                    {why}
+                  </span>
+                )}
+              </li>
+              {asking && <DeleteAsk e={e} why={setWhy} onDone={() => setAsking(false)} />}
+            </>
           </ul>
         </li>
       )}
@@ -418,10 +376,10 @@ function NewEnv({ at }: { at: At }) {
   if (!making)
     return (
       <li className="ms-node df-body ev-new" data-depth={0}>
-        <button type="button" className="df-add" onClick={() => setMaking(true)}>
-          <Plus size={13} aria-hidden="true" />
-          New environment
-        </button>
+        <Button size="xs" variant="secondary" aria-label="New environment" onClick={() => setMaking(true)}>
+          <Plus aria-hidden="true" />
+          New
+        </Button>
       </li>
     );
   return (
@@ -448,11 +406,13 @@ const FROMS: { value: AgentenvFrom; label: string }[] = [
  * `e` sends what changed on the version it was opened at: one saved since is refused, in the server's
  * words, and can be started over from.
  */
-function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }) {
+function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone?: () => void }) {
   const [d, setD] = React.useState<Draft>(() => draftOf(e));
   const [busy, setBusy] = React.useState(false);
   const [why, setWhy] = React.useState<string | null>(null);
   const problem = problemOf(d);
+  // An existing one's fields differ from what's kept: ✓ and × act.
+  const changed = !e || Object.keys(changeOf(e, d)).some((k) => k !== "version");
   const word = e ? "Save" : "Create";
   const setVar = (i: number, change: Partial<DraftVar>) => setD({ ...d, vars: d.vars.map((v, j) => (j === i ? { ...v, ...change } : v)) });
   const save = () => {
@@ -464,7 +424,7 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
         (saved) => {
           setData<Agentenv[]>(agentenvsRes.key, (l) => (l.some((x) => x.id === saved.id) ? l.map((x) => (x.id === saved.id ? saved : x)) : [saved, ...l]));
           relist();
-          onDone();
+          onDone?.();
         },
         (err: unknown) => {
           setWhy(errorMessage(err));
@@ -475,7 +435,7 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
   };
   const label = e ? e.name : "the new environment";
   return (
-    <li className="sb-form ev-form" aria-label={e ? `Edit ${e.name}` : "New environment"}>
+    <li className="sb-form ev-form" aria-label={e ? `${e.name}'s variables` : "New environment"}>
       {/* An existing one's name and description are edited in its header. */}
       {!e && (
         <>
@@ -487,7 +447,8 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
           </span>
         </>
       )}
-      <span className="sb-form-row">
+      {/* Its base, and a variable added beside it. */}
+      <span className="sb-form-row ev-baserow">
         <Segmented
           size="xs"
           label="Base"
@@ -498,8 +459,11 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
             { value: "clean", label: "Clean", title: "Start empty: only what the harness needs" },
           ]}
         />
+        <button type="button" className="fig-round ev-add" aria-label="Add a variable" title="Add a variable" onClick={() => setD({ ...d, vars: [...d.vars, blankVar()] })}>
+          <Plus size={12} aria-hidden="true" />
+        </button>
       </span>
-      <span className="sb-k ev-k">Variables</span>
+      {!e && <span className="sb-k ev-k">Variables</span>}
       {d.vars.map((v, i) => (
         <span key={v.key} className="ev-vrow" role="group" aria-label={`Variable ${i + 1}`}>
           <span className="sb-form-row">
@@ -556,12 +520,6 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
           </span>
         </span>
       ))}
-      <span className="sb-form-row">
-        <button type="button" className="df-add" onClick={() => setD({ ...d, vars: [...d.vars, blankVar()] })}>
-          <Plus size={13} aria-hidden="true" />
-          Add a variable
-        </button>
-      </span>
       {e && d.version !== undefined && e.version !== d.version && (
         <span className="sb-form-row">
           <span className="sb-dim">Changed elsewhere (now v{e.version}).</span>
@@ -571,10 +529,33 @@ function EnvForm({ e, at, onDone }: { e?: Agentenv; at: At; onDone: () => void }
         </span>
       )}
       <span className="sb-form-acts">
-        <button type="button" className="fig-round" data-size="sm" data-tone="accent" aria-label={`${word} ${label}`} title={word} disabled={busy} aria-busy={busy || undefined} onClick={save}>
+        <button
+          type="button"
+          className="fig-round"
+          data-size="sm"
+          data-tone="accent"
+          aria-label={`${word} ${label}`}
+          title={word}
+          disabled={busy || !changed}
+          aria-busy={busy || undefined}
+          onClick={save}
+        >
           <Check size={15} />
         </button>
-        <button type="button" className="fig-round" data-size="sm" data-tone="cancel" aria-label="Cancel" title="Cancel" onClick={onDone}>
+        <button
+          type="button"
+          className="fig-round"
+          data-size="sm"
+          data-tone="cancel"
+          aria-label={e ? `Discard changes to ${e.name}` : "Cancel"}
+          title={e ? "Discard changes" : "Cancel"}
+          disabled={!changed}
+          onClick={() => {
+            setWhy(null);
+            if (e) setD(draftOf(e));
+            else onDone?.();
+          }}
+        >
           <X size={15} />
         </button>
       </span>
