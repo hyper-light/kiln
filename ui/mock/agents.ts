@@ -2790,7 +2790,7 @@ export async function handleFamily(req: http.IncomingMessage, res: http.ServerRe
         excludes: ["/.git"],
         can_write: false,
         why_not:
-          "Slates on Linux can't take a person's go-ahead from kiln yet (Slates' GAP-A9-10): put the work up for review instead, or approve it with `slates grant` in the session that started Slates",
+          "it would also write 1 file git doesn't see changed into the folder: what git ignores (build output, dependencies) made since kiln read what git ignores in it, or a mode git keeps no part of: plan it again once the agent's build is done, or put the work up for review instead",
       });
     } else json(res, 200, { landed: { grant_required: false, outcome: { written: 2 } } });
   } else if (what === "change" && m === "POST") {

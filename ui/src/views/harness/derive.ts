@@ -270,9 +270,10 @@ function readTurns(events: HEvent[], at: number, parent: string | undefined, thr
         relayTo.set(t, [...(relayTo.get(t) ?? []), relayFor(e)]);
         continue;
       }
-      // Another agent's message, or kiln's news: steered into the agent's work, part of that turn;
+      // Another agent's message (its id says so, or its origin: the opening prompt of an agent
+      // another agent started), or kiln's news: steered into the agent's work, part of that turn;
       // after the agent answered, a turn of the agent's with no prompt shown.
-      if (isInternal(e.client_id)) {
+      if (isInternal(e.client_id) || e.origin === "agent") {
         const steered = cur !== null && !(before?.kind === "assistant" && !before.streaming);
         let t: Turn;
         if (steered) t = cur as unknown as Turn;

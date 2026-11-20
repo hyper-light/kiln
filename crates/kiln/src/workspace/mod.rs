@@ -37,6 +37,8 @@ mod bare_metal_tests;
 mod captured_tests;
 #[cfg(all(test, unix))]
 mod container_ab_tests;
+#[cfg(test)]
+mod container_live_tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -427,7 +429,9 @@ fn record_places(spec: &crate::harness::session::Spec) -> Option<(String, String
 /// (`slates::remove`).
 pub async fn release(spec: &crate::harness::session::Spec) {
     let Some(m) = spec.workspace.as_ref().and_then(|w| w.made.clone()) else { return };
-    if let Err(e) = slates::remove(&m).await {
+    // A container's workspace: what its engine's file sharing still holds once the container has gone is let go of (W9).
+    let removed = if spec.container.is_some() { slates::remove_after_container(&m).await } else { slates::remove(&m).await };
+    if let Err(e) = removed {
         tracing::warn!(volume = %m.volume, error = %format!("{e:#}"), "an ended agent's workspace stayed");
     }
 }

@@ -827,7 +827,10 @@ daemon, root, needs to bind it; `Made::shared`, kept as its mount is made again)
 mounted it (`--user`, the runner's uid and gid; the harness's `exec` takes the container's user); a workspace not mounted
 shared is still refused (`NeedsSharedMount`). A shared mount is the machine's operator's grant, `user_allow_other` in
 `/etc/fuse.conf`, which kiln reads and never writes: a runner whose engine is rootful says its agents can run in
-containers only where it's given (`ContainerMissing::SharedMount` otherwise, naming the grant). Owed, in order, each a
+containers only where it's given (`ContainerMissing::SharedMount` otherwise, naming the grant). Once a container and its bind have gone its workspace is let go of where its mount stays only as
+it's busy (built 2026-11-20, `slates::remove_after_container`, measured live: Docker Desktop 29.3.1's VM holds the files a
+container touched past its life, so the mount's plain unmount is refused busy even with the container gone), its volume
+taken down after; any other refusal keeps its volume, as W3's do. Owed, in order, each a
 piece: its live start on a rootful Linux engine (adacachy, once its operator grants `user_allow_other`); whether a bind keeps the mount's `nosuid` and `nodev` without
 the container's rules (a setuid file and a device node made through one container's bind, used through another's),
 measured; the `.nfs.*` names on a Mac; Windows' measurement and its route; and the goal's proof, a
