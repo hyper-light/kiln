@@ -572,8 +572,13 @@ pub fn check_turn(lines: &[String], probe: &str, mode: Mode) -> Result<(), Strin
 
 /// Whether kiln says runner `machine` gives agents workspaces of their own (`GET /api/harness/workspaces`'s answer
 /// `all`), and why not where it doesn't.
-pub fn workspaces_said(all: &Value, machine: &str) -> Result<(), String> {
+pub fn workspaces_said(all: &Value, machine: &str, engine: Engine) -> Result<(), String> {
     let entry = all.get(format!("agent:{machine}")).ok_or_else(|| format!("kiln says nothing of runner {machine}'s workspaces: {all}"))?;
+    // A microVM's volume is served to its guest, never mounted on the host: kiln says that one under `served` (W8 piece 4).
+    let entry = match engine {
+        Engine::BareMetal => entry,
+        Engine::MicroVm => entry.get("served").ok_or_else(|| format!("kiln says nothing of a volume served to runner {machine}'s microVMs: {entry}"))?,
+    };
     if entry.get("available") == Some(&Value::Bool(true)) {
         return Ok(());
     }
@@ -686,10 +691,10 @@ pub fn op(f: &vm_e2e::Fixture, name: &str, input: &Value) -> anyhow::Result<Valu
     Ok(serde_json::from_str(&body)?)
 }
 
-/// Whether the fixture's runner gives agents workspaces of their own: Ok(false) after saying why it skips; an error
-/// where [`REQUIRED`] requires them.
-pub fn workspaces_ready(f: &vm_e2e::Fixture) -> anyhow::Result<bool> {
-    match workspaces_said(&f.get("/api/harness/workspaces")?, &f.machine) {
+/// Whether the fixture's runner gives agents on `engine` workspaces of their own (mounted on its host, or served to
+/// their microVMs): Ok(false) after saying why it skips; an error where [`REQUIRED`] requires them.
+pub fn workspaces_ready(f: &vm_e2e::Fixture, engine: Engine) -> anyhow::Result<bool> {
+    match workspaces_said(&f.get("/api/harness/workspaces")?, &f.machine, engine) {
         Ok(()) => Ok(true),
         Err(why) => {
             let skip = format!("SKIP: runner {} gives agents no Slates volume of their own: {why}", f.machine);
@@ -1199,9 +1204,14 @@ mod checks {
     #[test]
     fn g266_kilns_word_on_a_runners_workspaces_says_why_not() {
         let all = json!({"local": {"available": false, "why_not": "this kiln keeps no workspaces"}, "agent:m1": {"available": true}, "agent:m2": {"available": false, "why_not": "Slates isn't installed on this machine"}});
-        assert_eq!(workspaces_said(&all, "m1"), Ok(()));
-        assert_eq!(workspaces_said(&all, "m2"), Err("Slates isn't installed on this machine".to_owned()));
-        assert!(workspaces_said(&all, "m3").is_err_and(|e| e.contains("nothing")));
+        assert_eq!(workspaces_said(&all, "m1", Engine::BareMetal), Ok(()));
+        assert_eq!(workspaces_said(&all, "m2", Engine::BareMetal), Err("Slates isn't installed on this machine".to_owned()));
+        assert!(workspaces_said(&all, "m3", Engine::BareMetal).is_err_and(|e| e.contains("nothing")));
+        // A microVM's volume is the one kiln says is served: a Windows host without WinFsp gives one, none mounted.
+        let whp = json!({"agent:whp": {"available": false, "why_not": "WinFsp isn't installed (winfsp.dev)", "served": {"available": true}}});
+        assert_eq!(workspaces_said(&whp, "whp", Engine::MicroVm), Ok(()));
+        assert_eq!(workspaces_said(&whp, "whp", Engine::BareMetal), Err("WinFsp isn't installed (winfsp.dev)".to_owned()));
+        assert!(workspaces_said(&all, "m1", Engine::MicroVm).is_err_and(|e| e.contains("served")));
     }
 
     #[test]
@@ -1563,7 +1573,7 @@ mod bare_metal {
         let dir = tempfile::tempdir()?;
         let instance = Instance::new(dir.path());
         let f = fixture(dir.path(), &instance)?;
-        if !workspaces_ready(&f)? {
+        if !workspaces_ready(&f, Engine::BareMetal)? {
             return Ok(());
         }
         let dir = canonical(dir.path());
@@ -1582,7 +1592,7 @@ mod bare_metal {
         let dir = tempfile::tempdir()?;
         let instance = Instance::new(dir.path());
         let f = fixture(dir.path(), &instance)?;
-        if !workspaces_ready(&f)? {
+        if !workspaces_ready(&f, Engine::BareMetal)? {
             return Ok(());
         }
         for mode in Mode::ALL {
@@ -1647,7 +1657,7 @@ mod microvm {
         let instance = Instance::new(dir.path());
         let env = runner_env(dir.path(), &instance)?;
         let f = vm_e2e::up_own(dir.path(), "slatesvm", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
-        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f)? {
+        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f, Engine::MicroVm)? {
             return Ok(());
         }
         let kept = vm_e2e::keep_stub(&f, "claude")?;
@@ -1668,7 +1678,7 @@ mod microvm {
         let instance = Instance::new(dir.path());
         let env = runner_env(dir.path(), &instance)?;
         let f = vm_e2e::up_own(dir.path(), "slatesrs", &env.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
-        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f)? {
+        if !vm_e2e::isolation_ready(&f)? || !workspaces_ready(&f, Engine::MicroVm)? {
             return Ok(());
         }
         let kept = vm_e2e::keep_stub(&f, "claude")?;

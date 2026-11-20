@@ -677,9 +677,11 @@ In order, each its own piece:
    handle Slates' daemon gave kiln's process for each box until that box's run ends and hands Hex a duplicate, so
    every DAX ask of the VM's is judged against a live holder (A-180); its end closes the kept handle, after which the
    attachment lasts while the VM's copy does.
-4. **Where a served volume is offered.** `/api/harness/workspaces` says per machine whether it gives a volume served
-   to a microVM beside whether it gives a mounted one, so the composer offers Own volume for an isolated agent on a
-   host without WinFsp, and the e2e microVM drive's readiness reads it.
+4. **Built (2026-11-20): where a served volume is offered.** `/api/harness/workspaces` says per machine whether it
+   gives a volume served to a microVM (`served`, judged as an isolated start is: `WorkspaceUse::Served`) beside whether
+   it gives a mounted one, and the e2e microVM drive's readiness reads it (on GitHub's windows-2025, which has no
+   WinFsp, it read the mounted one and failed). Owed: the composer offering Own volume for an isolated agent by it.
+   Test: `api`'s `w8_p4_a_runners_workspaces_say_a_served_volume_beside_a_mounted_one`.
 5. **Built (2026-11-20): the drive on Windows.** `tests/slates_e2e.rs`'s `microvm::` drive runs on Windows as on Unix
    (its resync drive, `g90_`, stays Unix's: Windows' channel names a handle Shards' device takes none of yet). Its
    looks at the host are its bare-metal sibling's (the host's processes through CIM's `Win32_Process`), and a session
