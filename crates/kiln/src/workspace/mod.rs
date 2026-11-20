@@ -35,6 +35,8 @@ pub mod slates_move;
 mod bare_metal_tests;
 #[cfg(test)]
 mod captured_tests;
+#[cfg(all(test, unix))]
+mod container_ab_tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

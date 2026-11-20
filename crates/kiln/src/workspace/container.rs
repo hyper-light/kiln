@@ -226,7 +226,7 @@ pub async fn release(running: &Running, made: &Made) -> anyhow::Result<()> {
 
 /// `said` with the export's capability path `path` shown without its token, a bearer secret (an engine's refusal of
 /// its volume names the volume's device, the path whole).
-fn without_token(said: &str, path: &str) -> String {
+pub(crate) fn without_token(said: &str, path: &str) -> String {
     match path.rsplit_once('.') {
         Some((named, token)) if !token.is_empty() => said.replace(path, &format!("{named}.<token>")),
         _ => said.to_owned(),
