@@ -216,8 +216,9 @@ the runner's own. The search path is the machine's as above unless the environme
 `clean` base takes nothing of its user's side, the shell `kiln spawn` took included: only what its
 environment names over what a harness needs.
 
-An agent another agent starts, and a branch, runs with its parent's environment unless its start
-names one. A runner keeps a session's environment in its memory alone: after the runner starts
+An agent another agent starts runs with its parent's stack (below) unless its start names one: those its parent
+was given by name, with those applied on their own matched again for it; a branch runs with its source's whole
+stack. A runner keeps a session's environment in its memory alone: after the runner starts
 again, hands its sessions to a newer process, or a session moves, the server sends it again.
 
 A session in a microVM takes an environment's `machine` and `value` variables into its harness's
@@ -269,8 +270,9 @@ where it's offered and applied on its own, not where it's forbidden.
 set the same variable, the one higher up wins; the base is the top one's. They're opened together
 as the harness starts (each its newest version, its secrets read again) into what the runner gets,
 one environment as before (`agentenv`, on the wire: no runner upgrade): its `id` the stack's ids,
-top first, joined by `+`, its `name` theirs joined by ` + `, its `version` 0, its variables the
-bottom one's first and the top one's last (a later one of a name wins). The Engine tab orders a
+top first, joined by `+`, its `name` theirs joined by ` + `, its `version` 0 (a stack of one: that
+one's id, name and version, as before), its variables the bottom one's first and the top one's last
+(a later one of a name wins). The Engine tab orders a
 session's stack by dragging a row or with its up and down buttons, and takes one out; a change
 starts the harness again on its conversation, as applying one does.
 
@@ -281,8 +283,11 @@ and the Engine tab says so). Those it joins go under the environments the sessio
 name, the one with more chips over one with fewer (more specific first), then by name. Turned off,
 or its scope changed so a session no longer matches, it leaves the stacks it joined on its own,
 not those it was put in by name. An environment with `secret` variables never joins a session in a
-microVM on its own (it's skipped there, never refusing the start); given by name it's refused, as
-above.
+microVM on its own (it's skipped there, never refusing the start, and one given a secret since leaves
+those it joined); given by name it's refused, as above. Applying (`agentenvs.apply`) names those a session is given
+by name, top first: those applied on their own that match it stay under them in their order (and
+any that match and aren't there join), one named among them is given by name from then on, at its
+place, and `[]` leaves those applied on their own alone over its machine's user's environment.
 
 **In a microVM, per agent.** A stack is a session's, and a session is one agent: in a microVM its
 variables go into that agent's harness member alone (`Elsewhere::env`), never the microVM's own
@@ -311,7 +316,7 @@ A runner says which variables its user has and where each is set, by name alone,
 | `agentenvs.update` | `PATCH /api/agentenvs/:id` | `{version, name?, description?, base?, vars?, tags?, scope?, auto?}` → `Agentenv`; 409 when `version` isn't its current one |
 | `agentenvs.delete` | `DELETE /api/agentenvs/:id` | → 204; 409 naming the sessions that run with it |
 | `agentenvs.machine` | `GET /api/agentenvs/machine?target=` | → `{vars: [{name, sources}]}` of that machine's user, by name; 502 while it's away |
-| `agentenvs.apply` | `PUT /api/harness/sessions/:id/agentenv` | `{agentenvs: id[], restart?: true}`, the session's whole stack, top first → `{agent, stack, restarted}`: `[]` puts it back on the machine's user's environment |
+| `agentenvs.apply` | `PUT /api/harness/sessions/:id/agentenv` | `{agentenvs: id[], restart?: true}`, those the session is given by name, top first, those applied on their own that match it under them (above) → `{agent, stack, restarted}`: `[]`, those applied on their own alone over the machine's user's environment |
 | `agentenvs.session` | `GET /api/harness/sessions/:id/agentenv` | → `{facts, stack, matching}`: what the session is as scopes see it (`{machine, os, arch, harness, agent?, model, permission, effort?}`), its stack (each `{id, name, version, auto}`: `auto` where it joined on its own), and the ids of the caller's environments whose scope matches it |
 | (start) | `agents.start`, `POST /api/harness/agents` | `agentenvs?: id[]`, the stack it starts with, top first; those applied on their own join under them |
 
