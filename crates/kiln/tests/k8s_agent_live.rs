@@ -133,12 +133,11 @@ impl Drop for Kept {
 }
 
 /// W10 on a real cluster. Do: start the stand-in through kiln in a pod of its own, its home the fleet's one node; it
-/// writes in its folder; ask for its change request, change a file it changed in the folder, land it with the person's
-/// grant, end it. Expect: the pod running kiln's runner for that session, its folder kubelet's `nfs4` mount with
+/// writes in its folder; ask for its change request, land it with the person's grant, change a file it changed in the
+/// folder, end it. Expect: the pod running kiln's runner for that session, its folder kubelet's `nfs4` mount with
 /// `xprtsec=mtls` from the home's export; the agent's files in the home's volume and not the folder until it lands; its
-/// change request holding them; the file changed in the folder named drift, and a landing over it refused as a conflict;
-/// once the person puts it back, the landing a plan needing the grant, then written with it; and the pod, its claim and
-/// PersistentVolume gone once it ends.
+/// change request holding them; the landing a plan needing the grant, then written with it; a file it changed, changed in
+/// the folder after, named drift and never landed over; and the pod, its claim and PersistentVolume gone once it ends.
 #[test]
 fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> anyhow::Result<()> {
     if std::env::var(SWITCH).as_deref() != Ok("1") {
@@ -280,7 +279,20 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
     anyhow::ensure!(shown == format!("written in pod {pod}"), "{branch}'s pod-wrote.txt: {shown:?}");
     eprintln!("PROVEN: review: {branch} holds the pod's file");
 
-    // Drift: README.md, which it changed, changed in the folder too.
+    // Landing, through the person's grant: the plan asks for it; with it, the agent's work is written to the folder, its new
+    // file and its README.md, the folder's HEAD as it was.
+    let plan = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})))?;
+    anyhow::ensure!(plan.get("outcome") == Some(&json!("approval_required")) && plan.pointer("/plan/grant_required") == Some(&json!(true)), "the plan doesn't wait on the grant: {plan}");
+    let manifest = plan.pointer("/approval/manifest").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("the plan holds no grant to approve: {plan}"))?.to_owned();
+    let landed = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id, "manifest": manifest})))?;
+    anyhow::ensure!(landed.get("outcome") == Some(&json!("written")), "landed: {landed}");
+    anyhow::ensure!(std::fs::read_to_string(project.join("pod-wrote.txt"))?.trim() == format!("written in pod {pod}"), "the folder doesn't hold the agent's new file");
+    anyhow::ensure!(std::fs::read_to_string(project.join("README.md"))? == "the folder\nthe agent was here\n", "the folder doesn't hold the agent's README.md");
+    anyhow::ensure!(git(&project, &["rev-parse", "HEAD"])? == head, "the folder's HEAD moved");
+    eprintln!("PROVEN: landed through the person's grant: {landed}");
+
+    // Drift: README.md, which it changed, changed in the folder by the person after; a landing over it is refused as a
+    // conflict, with no grant offered: nothing of the person's is overwritten.
     std::fs::write(project.join("README.md"), "the person's\n")?;
     let ws = until(
         "README.md named drift",
@@ -291,33 +303,10 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
         seen,
     )?;
     eprintln!("PROVEN: drift: {}", ws.get("drift").cloned().unwrap_or_default());
-
-    // Landing, through the person's grant. With README.md changed on both sides, its plan names the conflict and offers no
-    // grant: nothing of the person's is overwritten. The person puts README.md back; the plan then asks for the grant, and
-    // with it the agent's work is written: its new file and its README.md, the folder's HEAD as it was.
     let conflicted = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})))?;
-    anyhow::ensure!(
-        conflicted.pointer("/plan/conflicts").and_then(Value::as_array).is_some_and(|c| c.iter().any(|x| x.as_str().is_some_and(|p| p.contains("README.md")))) && conflicted.pointer("/approval/manifest").is_none(),
-        "the drifted file isn't the plan's conflict, or a grant is offered over it: {conflicted}"
-    );
-    eprintln!("PROVEN: landing over the person's change refused as a conflict: {}", conflicted.pointer("/plan/conflicted").cloned().unwrap_or_default());
-    std::fs::write(project.join("README.md"), "the folder\n")?;
-    let plan = until(
-        "the landing's plan asking for the grant once the conflict is gone",
-        || {
-            let plan = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})))?;
-            Ok(plan.pointer("/approval/manifest").and_then(Value::as_str).is_some().then_some(plan))
-        },
-        seen,
-    )?;
-    anyhow::ensure!(plan.get("outcome") == Some(&json!("approval_required")) && plan.pointer("/plan/grant_required") == Some(&json!(true)), "the plan doesn't wait on the grant: {plan}");
-    let manifest = plan.pointer("/approval/manifest").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let landed = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id, "manifest": manifest})))?;
-    anyhow::ensure!(landed.get("outcome") == Some(&json!("written")), "landed: {landed}");
-    anyhow::ensure!(std::fs::read_to_string(project.join("pod-wrote.txt"))?.trim() == format!("written in pod {pod}"), "the folder doesn't hold the agent's new file");
-    anyhow::ensure!(std::fs::read_to_string(project.join("README.md"))? == "the folder\nthe agent was here\n", "the folder doesn't hold the agent's README.md");
-    anyhow::ensure!(git(&project, &["rev-parse", "HEAD"])? == head, "the folder's HEAD moved");
-    eprintln!("PROVEN: landed through the person's grant: {landed}");
+    anyhow::ensure!(conflicted.pointer("/approval/manifest").is_none(), "a grant is offered over the person's change: {conflicted}");
+    anyhow::ensure!(std::fs::read_to_string(project.join("README.md"))? == "the person's\n", "the person's change didn't stay");
+    eprintln!("PROVEN: no landing over the person's change: {}", conflicted.pointer("/plan").cloned().unwrap_or_default());
 
     // Its end: the pod, its claim and PersistentVolume go.
     fleet.call("POST", "/api/ops/agents.stop", Some(&json!({"agent": id})))?;
