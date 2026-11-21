@@ -924,6 +924,14 @@ pub async fn tick(hub: &Arc<crate::hub::Hub>, all: &[Info], now: i64, driven: &[
     start_senders(hub, start);
 }
 
+/// When parents' news next comes due by the clock alone (G9 step 3: what wakes the goal driver for
+/// [`tick`]): a child that settled after work standing so for [`Told::settle`], or news waiting in a
+/// parent's queue whose look comes out otherwise by the clock ([`Kept::due`]). The rest (a child at
+/// work or settled, a parent's queue) is the agents' news; runs' news is told as it comes ([`ran`]).
+pub fn due() -> Option<i64> {
+    TOLD.lock().due_at()
+}
+
 /// Each of `all` by its id, the first of any id given twice (as a scan for it finds).
 fn by_id(all: &[Info]) -> HashMap<&str, &Info> {
     let mut by = HashMap::with_capacity(all.len());
@@ -934,6 +942,14 @@ fn by_id(all: &[Info]) -> HashMap<&str, &Info> {
 }
 
 impl Told {
+    /// [`due`].
+    fn due_at(&self) -> Option<i64> {
+        let settle = i64::try_from(self.settle.ms()).unwrap_or(i64::MAX);
+        let settling = self.seen.values().filter(|e| e.worked && e.told != e.key).map(|e| e.since.saturating_add(settle));
+        let heard = self.news.values().filter_map(|n| n.msg.as_ref().and_then(Kept::due));
+        settling.chain(heard).min()
+    }
+
     fn mark_news(&mut self, parent: &str) { self.news_dirty.insert(parent.to_owned()); }
 
     fn remove_news(&mut self, parent: &str) {
@@ -2499,6 +2515,24 @@ mod tests {
         assert!(run_line(&news, 0).len() <= LINE_SHARE);
         let line = run_line(&RunNews { tail: long, ..run_ended("k12") }, 0);
         assert!(line.len() <= LINE_SHARE && line.contains("line 399999\n```"), "the end of its output in what's left of the line");
+    }
+
+    /// G9 step 3: a child that settled after work comes due when it has stood settled for the
+    /// settle, its parent told then, and it holds no deadline after (the goal driver isn't woken for
+    /// it again).
+    #[test]
+    fn g9_s3_a_settled_child_comes_due_once() {
+        let mut t = Told::default();
+        let mut kid = Info { parent: Some("p1".into()), ..child("s1", Status::Running, 0, "") };
+        let now = 1_000_000;
+        let _ = t.due(std::slice::from_ref(&kid), now, &[]);
+        kid.status = Status::Idle;
+        kid.last_turn = Some(TurnEnd { at: now + 5_000, how: "done".into(), ..TurnEnd::default() });
+        assert!(t.due(std::slice::from_ref(&kid), now + 5_000, &[]).is_empty(), "it settles first");
+        let settle = i64::try_from(t.settle.ms()).unwrap_or(i64::MAX);
+        assert_eq!(t.due_at(), Some(now + 5_000 + settle));
+        assert_eq!(t.due(std::slice::from_ref(&kid), now + 5_000 + settle, &[]).len(), 1, "its parent is told");
+        assert_eq!(t.due_at(), None, "told: no deadline left");
     }
 
     /// T13: a child stands settled as long as a queued message takes to reach its harness, measured

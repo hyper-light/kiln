@@ -160,6 +160,12 @@ pub(super) fn may_hand(info: &Info, now: i64) -> bool {
     info.pause.is_none() && !matches!(info.status, Status::Disconnected | Status::Crashed) && !FAILED.lock().get(&info.id).is_some_and(|at| now - at < RETRY_MS)
 }
 
+/// When kiln next tries again to start subagents for an agent one couldn't be started for (G9 step
+/// 3: what wakes the goal driver for it): `RETRY_MS` after it failed, the soonest of them.
+pub(super) fn due() -> Option<i64> {
+    FAILED.lock().values().map(|at| at.saturating_add(RETRY_MS)).min()
+}
+
 /// The room `info` has for subagents now, as the stack's graph takes it (`lineage::room_of`: its
 /// Subagents setting, one pool whatever each does; none set, no limit; none ever as deep as agents
 /// may go).

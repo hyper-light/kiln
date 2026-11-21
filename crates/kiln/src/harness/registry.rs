@@ -2760,6 +2760,8 @@ impl Registry {
         let rx = hub.harness.local_rx.clone();
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.update(|k| k.insert("local".to_owned(), offered.clone()));
+        // The accounts to check follow the harnesses offered (`accounts::tick`, on the goal driver).
+        crate::goals::stir();
         if !RESTORED.swap(true, std::sync::atomic::Ordering::AcqRel) {
             // Files finished messages mention, kept as they come.
             crate::rt::spawn(Keeper::run(hub.clone()));
@@ -2992,6 +2994,7 @@ impl Registry {
     #[cfg(test)]
     pub fn set_kinds(&self, target: &str, kinds: Vec<KindInfo>) {
         self.kinds.update(|k| k.insert(target.to_owned(), kinds.clone()));
+        crate::goals::stir();
     }
 
     /// A session's meta as last reported (its harness's catalog: slash commands, models, modes).
@@ -3788,6 +3791,8 @@ impl Registry {
         }
         if let Some(plan) = proposed {
             self.proposed.update(|p| p.insert(id.to_owned(), plan.clone()));
+            // Kept as a plan by the goal driver (`plans::keep_proposed`).
+            crate::goals::stir();
         }
         if gone {
             // Copies swapped in only for what they had of it.
@@ -3914,6 +3919,7 @@ impl Registry {
             .await;
         let kinds = inv.kinds;
         self.kinds.update(|k| k.insert(format!("agent:{machine}"), kinds.clone()));
+        crate::goals::stir();
         // No process of it holds it now: the one it was held by is let go of.
         self.forget_holders(&lost.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
         if !lost.is_empty() {
@@ -4112,6 +4118,7 @@ impl Registry {
                 k.entry(now.target()).or_insert(v);
             }
         });
+        crate::goals::stir();
         if let Some(st) = &self.convo {
             st.put(moved.iter().map(|i| crate::convo::rows::Row::Machine { session: i.id.clone(), machine: to.to_owned() }).collect());
         }
@@ -4154,6 +4161,7 @@ impl Registry {
         // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
         let infos: Vec<Info> = self.sessions.on_each_session(move |_, m| *m.location == at, |s, id| s.get_mut(id).map(disconnected)).await;
         self.kinds.update(|k| k.remove(&format!("agent:{machine}")));
+        crate::goals::stir();
         for info in infos {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
