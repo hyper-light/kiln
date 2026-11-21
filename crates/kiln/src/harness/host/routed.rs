@@ -94,6 +94,23 @@ impl Host {
         }
     }
 
+    /// What still waited in session `id`'s journal where it was (a resume from the server's store:
+    /// `moving::Package::waiting`), down its lane behind its opening, each from its sender in the order it came: taken by
+    /// its inbox here as any routed message. How many its lane took.
+    pub(super) fn take_carried(&self, id: &str, waiting: Vec<crate::harness::moving::Waiting>) -> usize {
+        let Some(here) = self.get(id).map(|s| s.epoch()) else { return 0 };
+        let mut taken = 0usize;
+        for w in waiting {
+            let route = Route { status: w.status, ..Route::new("here", w.sender) };
+            if self.command_routed(id, w.command, Some(here), route) {
+                taken = taken.saturating_add(1);
+            } else {
+                tracing::warn!(target: "kiln.sends", event = "resume_waiting_lost", session = %id, "a message that waited where it was couldn't be taken here: its lane is full");
+            }
+        }
+        taken
+    }
+
     /// Message `c` routed to session `id` here, in its turn down its lane: taken into custody by the session's own
     /// inbox and answered, then handed to it now or, while its depth holds it back, kept waiting in its journal.
     pub(super) async fn take_routed(&self, id: &str, c: Command, epoch: Option<u64>, route: Route) {
@@ -649,6 +666,36 @@ mod tests {
             for id in &ids {
                 f.until_handed(id).await?;
             }
+            Ok(())
+        })
+    }
+
+    /// A session resumed here from the server's store (its machine gone) brings what still waited in its journal there:
+    /// each is taken by its inbox here, from its sender, and handed on as its admission allows.
+    #[test]
+    fn what_waited_where_a_resumed_session_was_is_taken_here() -> anyhow::Result<()> {
+        use crate::harness::moving::Waiting;
+        crate::rt::block_on(async {
+            let f = fixture().await?;
+            let taken = f.host.take_carried(&f.id, vec![Waiting { command: send("w1", "the agent's"), sender: "agent:a1".into(), status: None }, Waiting { command: send("w2", "a person's"), sender: "admin".into(), status: None }]);
+            anyhow::ensure!(taken == 2, "{taken}");
+            let mut answered = std::collections::BTreeMap::new();
+            crate::rt::timeout(crate::harness::registry::ANSWER_WAIT, async {
+                while answered.len() < 2 {
+                    let (source, update) = f.rx.recv().await?;
+                    if source == f.id
+                        && let Update::Inbox { said } = update
+                    {
+                        answered.insert(said.message.clone(), said.answer);
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("what waited wasn't answered here"))??;
+            anyhow::ensure!(answered.values().all(|a| a.as_ref().is_ok_and(|a| !a.repeat)), "{answered:?}");
+            f.until_handed("w1").await?;
+            f.until_handed("w2").await?;
             Ok(())
         })
     }

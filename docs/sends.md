@@ -102,15 +102,18 @@ ids it can't take in yet (a write failed) wait, and it refuses messages (`unavai
 they're in, each message trying them first. Its record keeps those waiting from the moment it's
 here, so a restart before they're in brings them again (an upgrade in place too, its harness still
 running), and they go with it if it moves on. A session resumed on another machine from the server's
-store (its own machine gone, and its inbox with it) brings the ids of the last 4,096 messages the
-server's copy of its timeline shows. A session that went on elsewhere and is restored on its old
-machine (a stale copy) takes nothing there. What a machine it left still holds of it, never seen to
-an end there (a message its harness was given), stays at the epoch it left at: a move carries its
-queue and its conversation, not that. Back on that machine at a higher epoch, it lets that go before
-anything is restored, as none of it can be restored at another epoch: restoring it refused all it
-was sent, for good (Slates, 2026-11-20: back on a Mac it had left, it took none of its person's
-messages or its 23 agents' there all night, each held in kiln). What came to an end there stays
-until the server acknowledges it, as each does.
+store (its own machine gone) brings what the server's copy of its inbox holds, fed there with its
+conversation (`crate::harness::inbox::carried_by`): the ids its inbox took, digests and all, beside
+those its timeline shows, its newest 4,096; and the messages still waiting in its journal there,
+each taken again where it goes, from its sender, in the order it came, before anything sent after
+(to a runner from before routing, the server holds them in its custody instead). A session that
+went on elsewhere and is restored on its old machine (a stale copy) takes nothing there. What a
+machine it left still holds of it, never seen to an end there (a message its harness was given),
+stays at the epoch it left at: a move carries its queue and its conversation, not that. Back on that
+machine at a higher epoch, it lets that go before anything is restored, as none of it can be
+restored at another epoch: restoring it refused all it was sent, for good (Slates, 2026-11-20: back
+on a Mac it had left, it took none of its person's messages or its 23 agents' there all night, each
+held in kiln). What came to an end there stays until the server acknowledges it, as each does.
 
 **A reset** (docs/agents.md, "Reset") ends all of a session's messages that never came to an end:
 what kiln holds for it and hasn't handed out is cancelled first, then its runner cancels what it was
@@ -571,6 +574,7 @@ host's.
   server's main store, which answers once kiln.db holds a write, before the disk does; its cluster
   group's log, flushed a moment later, keeps the rest (docs/p2p.md, "P1"). A power loss (not a
   restart) in that moment can take the last ones: a goal sent again then goes under a new id.
-- **CP-T3.7.** A session resumed from the server's store brings the ids its timeline there shows: a
-  message its gone machine took that never reached the server's copy is taken again if it's sent
-  again.
+- **CP-T3.7.** A session resumed from the server's store brings what the server's copy of its inbox
+  holds: what its gone machine took in the moment before its feed reached the server (the feed
+  behind, or the machine gone first) isn't there, so such a message is taken again if it's sent
+  again, and such a waiting one is lost with the machine.
