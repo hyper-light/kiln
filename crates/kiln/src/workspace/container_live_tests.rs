@@ -41,18 +41,13 @@ fn w9_live_an_agents_container_works_on_its_workspace_volume_through_its_export(
         eprintln!("skipped: no container engine answers here");
         return Ok(());
     };
-    let judged = match slates_api::container_engine::engine_profile(&engine) {
+    let judged = match slates_api::container_engine::export_engine(&engine) {
         Ok(judged) => judged,
         Err(fault) => {
             eprintln!("skipped: Slates refused this machine's engine ({engine}): {fault}");
             return Ok(());
         }
     };
-    // A rootless engine can't mount the workspace's export itself (`container::facts`).
-    if judged.profile.rootless {
-        eprintln!("skipped: {engine} runs rootless ({:?}, {}), and a rootless engine can't mount the workspace's export itself", judged.profile.engine, judged.profile.server_version);
-        return Ok(());
-    }
     let instance = format!("kilntestc{}", std::process::id());
     let o = super::slates::Override { instance, program: Some(program.into()), quick: true };
     anyhow::ensure!(super::slates::set_override(o), "another test pointed workspaces elsewhere");
@@ -66,7 +61,7 @@ fn w9_live_an_agents_container_works_on_its_workspace_volume_through_its_export(
     }
 }
 
-async fn run(engine: String, judged: slates_api::container_engine::EngineProfile, image: String) -> anyhow::Result<()> {
+async fn run(engine: String, judged: slates_api::container_engine::ExportEngine, image: String) -> anyhow::Result<()> {
     // Where this process keeps its workspaces, as a runner's state is (`slates::init`): under the person's home, inside
     // what a Mac's Docker Desktop shares with its VM (`/Users`), so the engine reaches the mount there.
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or_else(|| anyhow::anyhow!("no HOME"))?;
@@ -93,7 +88,7 @@ async fn run(engine: String, judged: slates_api::container_engine::EngineProfile
     gone
 }
 
-async fn drive(engine: &str, judged: slates_api::container_engine::EngineProfile, image: &str, made: &super::slates::Made) -> anyhow::Result<()> {
+async fn drive(engine: &str, judged: slates_api::container_engine::ExportEngine, image: &str, made: &super::slates::Made) -> anyhow::Result<()> {
     let sandbox = crate::sandbox::container::ContainerSandbox::new(engine.to_owned(), judged, made.clone());
     let launch = Launch {
         folder: Some(made.mount.clone()),

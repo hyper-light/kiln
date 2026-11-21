@@ -4,8 +4,8 @@
 //! copied ([`crate::workspace::container`]).
 //!
 //! **One workspace, one sandbox.** A [`ContainerSandbox`] serves the workspace it was made for (W3's [`Made`], mounted
-//! already) through the engine whose profile Slates judged before the workspace was made (`container_engine::
-//! engine_profile`): a launch runs in that workspace alone, its folder inside the workspace's mount, which the container
+//! already) through the engine Slates judged before the workspace was made (`container_engine::
+//! export_engine`, A-769): a launch runs in that workspace alone, its folder inside the workspace's mount, which the container
 //! sees at the same path, so nothing is translated.
 //!
 //! **A keeper, and the harness beside it.** The container runs an idle keeper (`tail -f /dev/null` as its entrypoint, the
@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use kiln_seams::sandbox::{Boundary, Holds, Launch, Link, Output, Refusal, Run, Sandbox, Signal};
-use slates_api::container_engine::EngineProfile;
+use slates_api::container_engine::ExportEngine;
 
 use super::ProcRun;
 use crate::workspace::container::{Plan, Running};
@@ -66,7 +66,7 @@ pub struct ContainerSandbox {
     /// The engine's command line, by its full path.
     program: String,
     /// Its profile, as Slates judged it.
-    judged: EngineProfile,
+    judged: ExportEngine,
     /// The workspace its runs work in, mounted already (W3).
     made: Made,
 }
@@ -74,7 +74,7 @@ pub struct ContainerSandbox {
 impl ContainerSandbox {
     /// The sandbox of workspace `made` through the engine `program` (its full path), whose profile Slates judged
     /// (`judged`).
-    pub fn new(program: String, judged: EngineProfile, made: Made) -> Self {
+    pub fn new(program: String, judged: ExportEngine, made: Made) -> Self {
         Self { program, judged, made }
     }
 }
@@ -87,7 +87,7 @@ fn inside(folder: &str, mount: &str) -> bool {
 
 /// The keeper container's plan for `launch` in workspace `made` through `program` under `judged`, named `name`, run as
 /// `user` (the uid and gid that own its folder), or why it's refused (see the module's notes).
-fn plan_of(launch: &Launch, program: &str, judged: &EngineProfile, made: &Made, name: String, user: (u32, u32)) -> Result<Plan, Refusal> {
+fn plan_of(launch: &Launch, program: &str, judged: &ExportEngine, made: &Made, name: String, user: (u32, u32)) -> Result<Plan, Refusal> {
     HOLDS.check(launch)?;
     let image = match &launch.boundary {
         Boundary::Container { image } => image.trim(),
@@ -279,9 +279,9 @@ pub async fn launch(kind: &crate::harness::kinds::Kind, spec: &crate::harness::s
         anyhow::anyhow!("an agent in a container works in a workspace volume of its own, mounted on its machine, and this one has none (a person chose its folder, or its machine makes no volumes)")
     })?;
     let launch = launch_of(kind, spec, image)?;
-    let (program, judged) = crate::rt::blocking(|| -> anyhow::Result<(String, EngineProfile)> {
+    let (program, judged) = crate::rt::blocking(|| -> anyhow::Result<(String, ExportEngine)> {
         let program = crate::runner::docker::find().ok_or_else(|| anyhow::anyhow!("no container engine answers here: neither docker nor podman, or its daemon is down"))?;
-        let judged = slates_api::container_engine::engine_profile(&program).map_err(|fault| anyhow::anyhow!("Slates refused this machine's container engine: {fault}"))?;
+        let judged = slates_api::container_engine::export_engine(&program).map_err(|fault| anyhow::anyhow!("Slates refused this machine's container engine: {fault}"))?;
         Ok((program, judged))
     })
     .await??;
@@ -293,7 +293,7 @@ pub async fn launch(kind: &crate::harness::kinds::Kind, spec: &crate::harness::s
 #[cfg(test)]
 mod tests {
     use kiln_seams::sandbox::{Limits, Share};
-    use slates_api::container_engine::{Endpoint, Engine, HardLinkRule, IdentityRule, RuntimeProfile, TestedProfile};
+    use slates_api::container_engine::{Endpoint, Engine, ExportProfile, MountsFrom, RuntimeProfile};
 
     use super::*;
 
@@ -307,8 +307,8 @@ mod tests {
     }
 
     /// Docker Desktop's profile, as Slates judges it.
-    fn judged() -> EngineProfile {
-        EngineProfile {
+    fn judged() -> ExportEngine {
+        ExportEngine {
             endpoint: "unix:///var/run/docker.sock".to_owned(),
             profile: RuntimeProfile {
                 endpoint: Endpoint::UnixSocket("/var/run/docker.sock".to_owned()),
@@ -319,7 +319,7 @@ mod tests {
                 user_namespace_remap: false,
                 selinux_labels: false,
             },
-            tested: TestedProfile { test: "T-4.13", description: "a stand-in's", identity: IdentityRule::HostUserThroughShare, hard_links: HardLinkRule::OtherNamesStaleAfterTheFirstIsRemoved },
+            tested: ExportProfile { test: "a stand-in's", description: "a stand-in's", mounts_from: MountsFrom::DesktopVm },
         }
     }
 

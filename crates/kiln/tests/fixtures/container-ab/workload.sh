@@ -8,6 +8,8 @@
 set -eu
 what=$1
 dir=$2
+# The bind and the export are two routes to one volume, and a run that failed left its folder: each run starts clean.
+rm -rf "$dir" 2>/dev/null || true
 mkdir -p "$dir"
 cd "$dir"
 export HOME=/tmp/ab-home npm_config_cache=/tmp/ab-npm GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null

@@ -160,14 +160,16 @@ impl Routes {
     /// The engine's run of `workload` in `image` on `route`: its seconds and digest, or why it didn't run.
     fn run(&self, route: Route, workload: &str, image: &str) -> Ran {
         let target = format!("{}/{WORK}", self.made.mount);
-        let mount = match route {
-            Route::Local => format!("type=tmpfs,target={},tmpfs-mode=1777", self.made.mount),
-            Route::Bind => self.bind.clone()?,
-            Route::Export => format!("type=volume,source={},target={},volume-nocopy", self.export.clone()?, self.made.mount),
+        // The control's tmpfs is executable (a built program runs from it) and anyone's to write; the others' mounts are
+        // the routes' own.
+        let (flag, mount) = match route {
+            Route::Local => ("--tmpfs", format!("{}:rw,exec,mode=1777", self.made.mount)),
+            Route::Bind => ("--mount", self.bind.clone()?),
+            Route::Export => ("--mount", format!("type=volume,source={},target={},volume-nocopy", self.export.clone()?, self.made.mount)),
         };
         let (uid, gid) = self.user;
         let args: Vec<String> = [
-            "run", "--rm", "--network", "none", "--user", &format!("{uid}:{gid}"), "--mount", &mount, "--mount", &format!("type=bind,source={},target=/in,readonly", self.input.display()),
+            "run", "--rm", "--network", "none", "--user", &format!("{uid}:{gid}"), flag, &mount, "--mount", &format!("type=bind,source={},target=/in,readonly", self.input.display()),
             "--entrypoint", "sh", image, "/in/workload.sh", workload, &target,
         ]
         .map(str::to_owned)
@@ -186,7 +188,7 @@ async fn run() -> anyhow::Result<()> {
     let program = crate::runner::docker::find().ok_or_else(|| anyhow::anyhow!("no container engine answers here"))?;
     let judged = crate::rt::blocking({
         let p = program.clone();
-        move || slates_api::container_engine::engine_profile(&p)
+        move || slates_api::container_engine::export_engine(&p)
     })
     .await?
     .map_err(|f| anyhow::anyhow!("Slates refused the engine: {f}"))?;
@@ -202,11 +204,15 @@ async fn run() -> anyhow::Result<()> {
     std::fs::write(over.join("README.md"), "the project\n")?;
     let made = super::slates::make(&format!("kiln-ab{}", std::process::id()), &over).await?;
     let r = ab(&program, judged.profile.engine, made.clone(), input).await;
-    if let Err(e) = super::slates::remove(&made).await {
-        eprintln!("AB: the workspace's take-down: {e:#}");
-    }
-    if let Some(pid) = super::slates::started_anchor() {
-        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+    // Taken down as a container's workspace is: Docker Desktop's VM holds what a bind touched past the container, so a
+    // mount that stays busy is let go of (`remove_after_container`). Its instance is stopped only once no mount stays.
+    match super::slates::remove_after_container(&made).await {
+        Ok(()) => {
+            if let Some(pid) = super::slates::started_anchor() {
+                let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+            }
+        }
+        Err(e) => eprintln!("AB: the workspace's take-down: {e:#} (its instance is left running beneath its mount)"),
     }
     r
 }

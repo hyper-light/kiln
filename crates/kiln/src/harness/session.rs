@@ -3179,7 +3179,7 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 /// still listed after the session read ended), and a session must never read ended while its container is still there
 /// (docs/agentic.md W9).
 fn ended_within(container: bool) -> Duration {
-    if container { Duration::from_secs(60) } else { Duration::from_secs(5) }
+    if container { crate::workspace::container::RELEASE_WITHIN * 2 } else { Duration::from_secs(5) }
 }
 /// Most of a run's output handed back.
 const RUN_OUTPUT_MAX: usize = 32 * 1024;
@@ -6540,13 +6540,12 @@ mod tests {
     use crate::util::Must as _;
 
     /// W9 (w-k90-containers' r49: a session read ended while its container was still listed). Do: compare how long a
-    /// container session waits for its run's exit with what its container's release may take at most (its engine
-    /// volume's removal tried `VOLUME_RM_TRIES` times, `VOLUME_RM_PAUSE_LIVE` apart, beside the container's own removal).
-    /// Expect the wait the longer by a margin, and a process's wait as before.
+    /// container session waits for its run's exit with its container's release's patience (`RELEASE_WITHIN`, the wait
+    /// for the engine's removal event). Expect room for that patience and as much again for the volume's removal and the
+    /// export's detach, and a process's wait as before.
     #[test]
     fn w9_a_container_session_waits_out_its_containers_release_before_it_reads_ended() {
-        let release = crate::workspace::container::VOLUME_RM_PAUSE_LIVE * crate::workspace::container::VOLUME_RM_TRIES;
-        assert!(ended_within(true) >= release * 4 + Duration::from_secs(20), "{:?} vs {release:?}", ended_within(true));
+        assert!(ended_within(true) >= crate::workspace::container::RELEASE_WITHIN * 2, "{:?}", ended_within(true));
         assert_eq!(ended_within(false), Duration::from_secs(5));
     }
 
