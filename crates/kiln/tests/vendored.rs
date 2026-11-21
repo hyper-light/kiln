@@ -180,8 +180,10 @@ fn paths_outside(text: &str, dir: &Path, root: &Path) -> anyhow::Result<Vec<Stri
     Ok(out)
 }
 
+/// kiln's Cargo.lock with `\n` line ends: a checkout on Windows can hand it over with `\r\n`, and the tests below
+/// plant packages by their text (windows-11-arm, GitHub run 44867288588: "quiver isn't in the lock as kiln's").
 fn kiln_lock() -> anyhow::Result<String> {
-    std::fs::read_to_string(root().join("Cargo.lock")).context("Cargo.lock")
+    Ok(std::fs::read_to_string(root().join("Cargo.lock")).context("Cargo.lock")?.replace("\r\n", "\n"))
 }
 
 #[test]
