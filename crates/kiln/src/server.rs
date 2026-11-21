@@ -668,7 +668,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             slots: cfg.local_agent.slots,
             work_dir: cfg.local_agent.work_dir.clone().unwrap_or_else(|| cfg.data("work")),
             state_dir: cfg.data("local-agent"),
-            server_data_dir: cfg.server.data_dir.clone(),
             join_token: None,
             ephemeral: false,
             dedicated_job: None,

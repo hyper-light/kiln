@@ -101,15 +101,11 @@ pub fn source_of<'s>(kind: &Kind, spec: &'s Spec) -> Result<Source<'s>, String> 
 /// which it sees there (its project, [`project_share`]: [`launch`] adds its harness's home), with
 /// its image's grants (which [`launch`] narrows to what its session uses: [`reach_of`]) and the
 /// microVM sized as its boundary sizes one (the person's sizes reach it through its placement: plan
-/// step 32). A project [`kept_out`] keeps out, `kiln`'s state among it, is refused before anything starts: its
-/// folder, or the one its workspace of its own lies over ([`given`]).
-pub fn launch_of(kind: &Kind, spec: &Spec, image: String, kiln: &[&Path]) -> anyhow::Result<Launch> {
+/// step 32). Its project is the folder it's started in, whatever that holds: agents that mount one path share its files
+/// (the person's decision, 2026-11-21), and kiln refuses none for what lies there.
+pub fn launch_of(kind: &Kind, spec: &Spec, image: String) -> anyhow::Result<Launch> {
     let cwd = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
     anyhow::ensure!(std::path::Path::new(&cwd).is_dir(), "{cwd} is not a directory on this machine");
-    let given = given(spec, Path::new(&cwd));
-    if let Some(why) = kept_out(&given, kiln) {
-        anyhow::bail!("an isolated agent can't work in {}: {why}", given.display());
-    }
     let run = kind.elsewhere(spec)?;
     let harness = kiln_seams::sandbox::Member(run.member.to_owned());
     // Its project: the folder itself, shared; or, where its workspace of its own is a Slates volume made for it with no
@@ -175,11 +171,7 @@ pub const SWAPPED: &str = "swapped";
 pub async fn launch(kind: &Kind, spec: &Spec, session: &str, vms: &Microvms, homes: Option<&std::path::Path>, host: Option<std::sync::Arc<crate::harness::host::Host>>, secrets: &[crate::secrets::mine::BuildSecret], swap_from: Option<crate::proc::Duplex>) -> anyhow::Result<crate::proc::Duplex> {
     use crate::harness::isolated::{env, host_tools};
     let source = source_of(kind, spec).map_err(anyhow::Error::msg)?;
-    // kiln's own state, which its project is, holds or lies in none of: where its microVMs are held, its people's volumes,
-    // and its server's data folder (kiln.db, its secrets and tokens), as its runner keeps it.
-    let server = host.as_ref().and_then(|h| h.server_data().map(Path::to_path_buf));
-    let kiln: Vec<&Path> = vms.state().into_iter().chain(homes).chain(server.as_deref()).collect();
-    let mut launch = launch_of(kind, spec, source.name(), &kiln)?;
+    let mut launch = launch_of(kind, spec, source.name())?;
     let folder = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
     let files = crate::rt::blocking(move || host_tools::tracked(Path::new(&folder))).await?;
     host_tools::check(files.iter().map(String::as_str))?;
@@ -564,76 +556,6 @@ pub fn served_project(spec: &Spec, cwd: &str, harness: &kiln_seams::sandbox::Mem
     });
     let served = kiln_seams::sandbox::Served { source: made.volume.clone(), at, writable: true, members: vec![harness.clone()] };
     Ok(Some((served, folder)))
-}
-
-/// Why folder `cwd` can't be an isolated agent's project, shared writable with its microVM, where it can't
-/// (CP-T4.1's AC-T4.1.5, as T4's `cp/t4-isolation` held it, 6134fd63b): the home of the user kiln runs as, or a
-/// folder holding it, every file of theirs among it (an agent started with no folder starts there); a folder that is,
-/// holds or lies in `~/.ssh` or one of `kiln`'s own (its state: its runner's keys and records, its microVMs' store,
-/// its people's volumes, its server's data folder with kiln.db, its secrets and tokens); or one holding another worktree
-/// of its repository, whose files are another agent's.
-/// Compared with their links resolved, where they resolve.
-pub fn kept_out(cwd: &Path, kiln: &[&Path]) -> Option<String> {
-    let cwd = canonical(cwd);
-    let home = canonical(&crate::os::home_dir());
-    if home.starts_with(&cwd) {
-        return Some("it is your home folder or holds it, and nothing else of your home goes in a microVM: give it a project's folder".to_owned());
-    }
-    let ssh = home.join(".ssh");
-    for kept in [ssh.as_path()].into_iter().chain(kiln.iter().copied()).map(canonical) {
-        if cwd.starts_with(&kept) {
-            return Some(format!("it is or lies in {}, which no isolated agent sees", kept.display()));
-        }
-        if kept.starts_with(&cwd) {
-            return Some(format!("it holds {}, which no isolated agent sees: give it a project's folder", kept.display()));
-        }
-    }
-    other_worktree(&cwd).map(|other| format!("it holds {}, another worktree of its repository, whose files are another agent's: start it in a worktree of its own", other.display()))
-}
-
-/// The folder of the machine whose files an isolated session working in `cwd` is given: `cwd`; or, where `cwd` lies in
-/// its workspace of its own (a Slates volume kiln made for it and mounted beneath its state, `crate::workspace::prepare`),
-/// the folder that workspace lies over, at the same place in it, whose files the volume holds.
-fn given(spec: &Spec, cwd: &Path) -> std::path::PathBuf {
-    // A workspace with no mount (one Slates serves its microVM, [`served_project`]) leaves its session in the folder itself.
-    let own = spec.workspace.as_ref().and_then(|w| Some((w.made.as_ref().filter(|m| !m.mount.is_empty())?.mount.as_str(), w.over.as_deref()?)));
-    let Some((mount, over)) = own else { return cwd.to_path_buf() };
-    let real = canonical(cwd);
-    match real.strip_prefix(canonical(Path::new(mount))) {
-        Ok(within) => Path::new(over).join(within),
-        Err(_) => cwd.to_path_buf(),
-    }
-}
-
-/// A worktree of `cwd`'s repository other than `cwd`, lying within it, where `cwd` holds its repository's git
-/// folder: each linked worktree's `.git` is named in `.git/worktrees/<id>/gitdir` (gitrepository-layout(5)),
-/// relative to that folder where git wrote it relative. None where `cwd` holds none, or it can't be read.
-fn other_worktree(cwd: &Path) -> Option<std::path::PathBuf> {
-    let linked = std::fs::read_dir(cwd.join(".git").join("worktrees")).ok()?;
-    linked.flatten().find_map(|entry| {
-        let said = std::fs::read_to_string(entry.path().join("gitdir")).ok()?;
-        let tree = canonical(entry.path().join(said.trim()).parent()?);
-        (tree != cwd && tree.starts_with(cwd)).then_some(tree)
-    })
-}
-
-/// `path` with its links resolved, where it can be: one not made yet (a person's volumes, made as their harness
-/// launches) as the folders it lies in resolve, then its own names.
-fn canonical(path: &Path) -> std::path::PathBuf {
-    let mut names = Vec::new();
-    let mut at = path;
-    loop {
-        if let Ok(real) = std::fs::canonicalize(at) {
-            return names.into_iter().rev().fold(real, |p, n| p.join(n));
-        }
-        match (at.parent(), at.file_name()) {
-            (Some(parent), Some(name)) => {
-                names.push(name);
-                at = parent;
-            }
-            _ => return path.to_path_buf(),
-        }
-    }
 }
 
 /// The folders of plugins `kind`'s harness loads for `session`, as the machine's launch gives them
@@ -1266,7 +1188,7 @@ mod tests {
         let cwd = dir.path().to_string_lossy().into_owned();
         let env = vec![("PATH".to_owned(), "/host/bin".to_owned()), ("LANG".to_owned(), "fr_FR.UTF-8".to_owned()), ("TZ".to_owned(), "Europe/Paris".to_owned()), ("KILN_REACH_SOCK".to_owned(), "/host/sock".to_owned())];
         let spec = |kind: &str| Spec { kind: kind.into(), cwd: Some(cwd.clone()), env: env.clone(), isolation: Some(microvm(None)), ..Spec::default() };
-        let codex = launch_of(kind("codex")?, &spec("codex"), "harness-codex@sha256:00".into(), &[])?;
+        let codex = launch_of(kind("codex")?, &spec("codex"), "harness-codex@sha256:00".into())?;
         assert_eq!((codex.program.as_str(), codex.args.as_slice()), ("codex", &[][..]), "its image's command runs it as kiln's adapter drives it");
         assert_eq!(codex.boundary, Boundary::MicroVm { image: "harness-codex@sha256:00".into() });
         // Its project, shared from this machine's folder to where its microVM sees it, which is its member's
@@ -1289,89 +1211,37 @@ mod tests {
         }
         assert_eq!(codex.env, vec![("LANG".to_owned(), "fr_FR.UTF-8".to_owned()), ("TZ".to_owned(), "Europe/Paris".to_owned())]);
         let resumed = Spec { resume: Some("conversation-1".into()), model: Some("claude-opus-5-5".into()), allow_bypass: false, ..spec("claude") };
-        let claude = launch_of(kind("claude")?, &resumed, "harness-claude@sha256:00".into(), &[])?;
+        let claude = launch_of(kind("claude")?, &resumed, "harness-claude@sha256:00".into())?;
         assert_eq!(claude.program, "claude");
         assert_eq!(claude.args, ["--model", "claude-opus-5-5", "--resume", "conversation-1"], "its session's own flags, past its image's");
         assert!(claude.env.contains(&("CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING".to_owned(), "1".to_owned())));
         assert!(!claude.env.iter().any(|(k, _)| k == "PATH" || k.starts_with("KILN_")), "no host variable, no kiln socket: {:?}", claude.env);
         // A folder this machine hasn't is refused before anything starts.
         let gone = Spec { cwd: Some(dir.path().join("gone").to_string_lossy().into_owned()), ..spec("codex") };
-        assert!(launch_of(kind("codex")?, &gone, "harness-codex@sha256:00".into(), &[]).is_err());
+        assert!(launch_of(kind("codex")?, &gone, "harness-codex@sha256:00".into()).is_err());
         Ok(())
     }
 
-    /// CP-T4.1's AC-T4.1.5, as T4's `cp/t4-isolation` held it (6134fd63b), carried to the launch through Hex (step 17):
-    /// no isolated agent works in its person's home or a folder holding it (where one started with no folder would), in
-    /// `~/.ssh`, or in a folder holding another worktree of its repository; a project's own folder and a worktree of its
-    /// own are its to work in. Each refused before anything starts.
+    /// The person's decision, 2026-11-21, over CP-T4.1's AC-T4.1.5 (which refused each): an isolated agent's project is
+    /// the folder it's started in, whatever that holds, and agents that mount one path share its files. A folder holding
+    /// another worktree of its repository and a folder of kiln's state, and the home an agent started with no folder
+    /// works in, are each its project, shared whole, writable, at its own path.
     #[test]
-    fn s17_t4_a_home_ssh_or_anothers_worktree_is_no_isolated_agents_project() -> anyhow::Result<()> {
-        let home = crate::os::home_dir();
-        let mut refused = vec![home.clone()];
-        refused.extend(home.parent().map(Path::to_path_buf));
-        refused.extend([home.join(".ssh")].into_iter().filter(|ssh| ssh.is_dir()));
-        for folder in &refused {
-            assert!(kept_out(folder, &[]).is_some(), "{} would be shared", folder.display());
+    fn an_isolated_agents_project_is_the_folder_it_is_started_in_whatever_it_holds() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let repo = dir.path().join("repo");
+        let (theirs, linked) = (repo.join(".claude").join("worktrees").join("w"), repo.join(".git").join("worktrees").join("w"));
+        for made in [&theirs, &linked, &repo.join("state").join("homes")] {
+            std::fs::create_dir_all(made)?;
         }
-        let repo = tempfile::tempdir()?;
-        assert_eq!(kept_out(repo.path(), &[]), None, "a project's own folder");
-        let inside = repo.path().join(".claude").join("worktrees").join("w");
-        let linked = repo.path().join(".git").join("worktrees").join("w");
-        std::fs::create_dir_all(&inside)?;
-        std::fs::create_dir_all(&linked)?;
-        std::fs::write(linked.join("gitdir"), format!("{}\n", inside.join(".git").display()))?;
-        let why = kept_out(repo.path(), &[]).unwrap_or_default();
-        assert!(why.contains("another worktree"), "{why}");
-        assert_eq!(kept_out(&inside, &[]), None, "a worktree of its own");
-        let spec = Spec { kind: "codex".into(), cwd: Some(repo.path().to_string_lossy().into_owned()), isolation: Some(microvm(None)), ..Spec::default() };
-        let refusal = launch_of(kind("codex")?, &spec, "harness-codex@sha256:00".into(), &[]).err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(refusal.contains("another worktree"), "refused before anything starts: {refusal}");
-        let homeless = Spec { cwd: None, ..spec };
-        assert!(launch_of(kind("codex")?, &homeless, "harness-codex@sha256:00".into(), &[]).is_err(), "one started with no folder works in its home");
-        Ok(())
-    }
-
-    /// CP-T4.1's AC-T4.1.5, as T4's `cp/t4-isolation` held it (6134fd63b), carried to the launch through Hex (step 17):
-    /// no isolated agent works in a folder that is, holds or lies in kiln's own state (where its microVMs are held, and
-    /// its people's volumes, made or not yet), each refused before anything starts; a project beside it is its to work
-    /// in. In a workspace of its own, mounted beneath kiln's state, the folder that workspace lies over is what's judged:
-    /// a project's taken, the home's refused. Another agent's workspace lies in kiln's state, and is refused.
-    #[test]
-    fn s17_t4_kilns_state_is_no_isolated_agents_project_nor_seen_through_its_workspace() -> anyhow::Result<()> {
-        let base = tempfile::tempdir()?;
-        let (state, project) = (base.path().join("state"), base.path().join("project"));
-        let volumes = state.join("homes").join("owner");
-        let (mine, theirs) = (state.join("workspaces").join("kiln-mine"), state.join("workspaces").join("kiln-theirs"));
-        for dir in [&project, &volumes, &mine, &theirs] {
-            std::fs::create_dir_all(dir)?;
+        std::fs::write(linked.join("gitdir"), format!("{}\n", theirs.join(".git").display()))?;
+        let at = |cwd: Option<&Path>| Spec { kind: "codex".into(), cwd: cwd.map(|c| c.to_string_lossy().into_owned()), isolation: Some(microvm(None)), ..Spec::default() };
+        for (what, spec) in [("a folder holding another worktree and kiln's state", at(Some(&repo))), ("no folder, its home", at(None))] {
+            let cwd = crate::harness::session::resolve_cwd(spec.cwd.as_deref());
+            let launched = launch_of(kind("codex")?, &spec, "harness-codex@sha256:00".into())?;
+            let project = project_share(&cwd).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(launched.shares == [project], "{what}: {:?}", launched.shares);
         }
-        let kiln = [state.as_path()];
-        assert_eq!(kept_out(&project, &kiln), None, "a project beside kiln's state");
-        for (folder, said) in [(state.as_path(), "lies in"), (volumes.as_path(), "lies in"), (base.path(), "holds")] {
-            let why = kept_out(folder, &kiln).unwrap_or_default();
-            assert!(why.contains(said), "{}: {why}", folder.display());
-        }
-        // A person's volumes kept apart from the rest of kiln's state (as a stand-in keeps them), not made yet.
-        let unmade = project.join("homes");
-        assert!(kept_out(&project, &[unmade.as_path()]).is_some_and(|why| why.contains("holds")), "a project holding where its person's volumes go");
-        let spec = |cwd: &Path| Spec { kind: "codex".into(), cwd: Some(cwd.to_string_lossy().into_owned()), isolation: Some(microvm(None)), ..Spec::default() };
-        let launched = |spec: &Spec| -> anyhow::Result<Launch> { launch_of(kind("codex")?, spec, "harness-codex@sha256:00".into(), &kiln) };
-        let refusal = |spec: &Spec| launched(spec).err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(refusal(&spec(base.path())).contains("holds"), "a folder holding kiln's state");
-        assert!(launched(&spec(project.as_path())).is_ok(), "a project beside kiln's state");
-        let in_workspace = |cwd: &Path, over: &Path| Spec {
-            workspace: Some(crate::workspace::Workspace {
-                kind: "volume".into(),
-                over: Some(over.to_string_lossy().into_owned()),
-                sub: String::new(),
-                made: Some(crate::workspace::slates::Made { mount: mine.to_string_lossy().into_owned(), ..Default::default() }),
-                ..Default::default()
-            }),
-            ..spec(cwd)
-        };
-        assert!(launched(&in_workspace(mine.as_path(), project.as_path())).is_ok(), "its own workspace over a project");
-        assert!(refusal(&in_workspace(mine.as_path(), crate::os::home_dir().as_path())).contains("home folder"), "its own workspace over the home");
-        assert!(refusal(&in_workspace(theirs.as_path(), project.as_path())).contains("lies in"), "another agent's workspace");
         Ok(())
     }
 
@@ -1396,7 +1266,7 @@ mod tests {
             ..Default::default()
         };
         let spec = Spec { kind: "codex".into(), cwd: Some(sub_s.clone()), isolation: Some(microvm(None)), workspace: Some(workspace("")), ..Spec::default() };
-        let launched = launch_of(kind("codex")?, &spec, "harness-codex@sha256:00".into(), &[])?;
+        let launched = launch_of(kind("codex")?, &spec, "harness-codex@sha256:00".into())?;
         let at = guest_path(&top_s).map_err(anyhow::Error::msg)?;
         let folder = format!("{at}/crates/kiln");
         assert!(launched.shares.is_empty(), "no folder of the machine's: {:?}", launched.shares);
@@ -1409,42 +1279,9 @@ mod tests {
         assert_eq!(harness_cwd(&spec), folder, "its harness told it works there");
         assert_eq!(launched.plug_roots, plug_root_of(&at).into_iter().collect::<Vec<_>>());
         let mounted = Spec { workspace: Some(workspace(&top_s)), ..spec.clone() };
-        let shared = launch_of(kind("codex")?, &mounted, "harness-codex@sha256:00".into(), &[])?;
+        let shared = launch_of(kind("codex")?, &mounted, "harness-codex@sha256:00".into())?;
         assert!(shared.served.is_empty(), "a mounted workspace is served nothing");
         assert_eq!(shared.shares.len(), 1, "its folder, shared from the machine");
-        Ok(())
-    }
-
-    /// CP-T4.1's AC-T4.1.5 (step 17): the kiln server's data folder (kiln.db, its secrets and tokens; on a machine that
-    /// runs both, the parent of its runner's default state) is kiln's state too, as its runner keeps it
-    /// (`Host::server_data`). No isolated agent works in a folder that is, holds or lies in it, refused before anything
-    /// starts; with its runner's state alone kept out, the server's folders beside that state were shared. Not made yet
-    /// (its server not started), it compares as made folders do, through the folders it lies in (macOS's `/var` is
-    /// `/private/var`), whichever way it and the project are named.
-    #[test]
-    fn s17_t4_the_kiln_servers_data_folder_is_no_isolated_agents_project() -> anyhow::Result<()> {
-        let base = tempfile::tempdir()?;
-        let (data, project) = (base.path().join("kiln"), base.path().join("project"));
-        let (runner, secrets) = (data.join("agent"), data.join("secrets"));
-        for dir in [&runner, &secrets, &project] {
-            std::fs::create_dir_all(dir)?;
-        }
-        assert_eq!(kept_out(&secrets, &[runner.as_path()]), None, "the server's secrets, its runner's state alone kept out");
-        let kiln = [runner.as_path(), data.as_path()];
-        assert_eq!(kept_out(&project, &kiln), None, "a project beside kiln's data");
-        for (folder, said) in [(data.as_path(), "lies in"), (secrets.as_path(), "lies in"), (base.path(), "holds")] {
-            let why = kept_out(folder, &[data.as_path()]).unwrap_or_default();
-            assert!(why.contains(said), "{}: {why}", folder.display());
-        }
-        let spec = Spec { kind: "codex".into(), cwd: Some(secrets.to_string_lossy().into_owned()), isolation: Some(microvm(None)), ..Spec::default() };
-        let refusal = launch_of(kind("codex")?, &spec, "harness-codex@sha256:00".into(), &kiln).err().map(|e| e.to_string()).unwrap_or_default();
-        assert!(refusal.contains("lies in"), "refused before anything starts: {refusal}");
-        let real = std::fs::canonicalize(base.path())?;
-        for (folder, unmade) in [(real.as_path(), base.path().join("unmade")), (base.path(), real.join("unmade"))] {
-            assert!(kept_out(folder, &[unmade.as_path()]).is_some_and(|why| why.contains("holds")), "{} holds {}", folder.display(), unmade.display());
-            let inside = folder.join("unmade").join("kiln.db");
-            assert!(kept_out(&inside, &[unmade.as_path()]).is_some_and(|why| why.contains("lies in")), "{} lies in {}", inside.display(), unmade.display());
-        }
         Ok(())
     }
 

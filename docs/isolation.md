@@ -152,20 +152,6 @@ What a session does to its harness maps onto the member:
 - **A machine without microVMs** refuses an isolated agent before anything starts
   (`sandbox::NO_MICROVM`), never running it as a process; its runner says so in its facts
   (`isolation.why_not`, and `virt.microvm` false), where placement (step 32) reads it.
-- **A project that would hand it the machine's own** (`sandbox::isolated::kept_out`; CP-T4.1's
-  AC-T4.1.5, as T4's `cp/t4-isolation` held it, 6134fd63b): the home of the user kiln runs as or a
-  folder holding it (where an agent started with no folder would work); a folder that is, holds or
-  lies in `~/.ssh` or kiln's own state (the folder its microVMs are held beneath, `Microvms::state`:
-  its runner's keys and records, its microVMs' store; its people's volumes, `Host::homes`; and the kiln
-  server's data folder, `Host::server_data`: kiln.db, its secrets and tokens, the server's own
-  `[server] data_dir` for its in-process runner and as the machine's kiln config names it for any
-  other runner, which on a machine that runs both holds that runner's default state); or one holding another
-  worktree of its repository, whose files are another agent's. A folder of kiln's not made yet (a
-  person's volumes, a server's data before it starts) is compared as made ones are, through the
-  folders it lies in (macOS's `/var` is `/private/var`). In a workspace of its
-  own (a Slates volume kiln mounts beneath its state) it's the folder the workspace lies over that's
-  judged, whose files the volume holds. Refused before anything starts, saying which; a project's own
-  folder, or a worktree of its own, is shared.
 - **A move to another machine** (`sandbox::isolated::NO_MOVE`): its microVM and what its harness keeps
   there are its machine's. Refused as it's asked, before anything of it stops, so its member goes on.
   A move to the machine's newer runner process (an in-place upgrade) isn't refused: there it starts
@@ -474,11 +460,10 @@ instead (`harness/session.rs:4953`). Hex delivers a member's own signal (`Runtim
   its harness's build, its tag), with a stand-in `shards`: a built-in built once and pinned by digest,
   found in the store without a build after, a changed Agentfile built again, starts at once waiting
   for one build, a refused build in Shards' words, nothing of a build left behind.
-- `cargo test -p kiln --lib sandbox::isolated::tests::s17_t4_`: a home, a folder holding it, `~/.ssh`, a
-  folder that is, holds or lies in kiln's state (its people's volumes too, made or not yet) and a folder
-  holding another worktree of its repository refused as a project, before anything starts; a project's
-  own folder and a worktree of its own taken; in a workspace of its own, the folder it lies over judged
-  (a project's taken, the home's refused), and another agent's workspace refused.
+- `cargo test -p kiln --lib sandbox::isolated::tests::an_isolated_agents_project_is_the_folder_it_is_started_in_whatever_it_holds`:
+  its project is the folder it's started in, whatever that holds (another worktree of its repository, kiln's state, the
+  home an agent started with no folder works in), shared whole: agents that mount one path share its files (the
+  person's decision, 2026-11-21, over CP-T4.1's AC-T4.1.5, which refused each).
 - `cargo test -p kiln --lib harness::lineage::tests::s17_`: a runner's own reason in a refusal; a
   person's own Agentfile read for them alone, at its latest version.
 - `cargo test -p kiln --lib harness::kinds::tests::s17_`: every launch beginning with its base, and each

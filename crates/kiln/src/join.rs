@@ -1106,7 +1106,6 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             slots: a.slots.unwrap_or_else(|| u32::try_from((cpus / 4).max(1)).unwrap_or(1)),
             work_dir: state_dir.join("work"),
             state_dir,
-            server_data_dir: crate::config::server_data_dir(&crate::config::default_config_path()),
             join_token: None,
             ephemeral: false,
             dedicated_job: None,

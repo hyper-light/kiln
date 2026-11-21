@@ -46,11 +46,6 @@ pub struct Opts {
     pub slots: u32,
     pub work_dir: PathBuf,
     pub state_dir: PathBuf,
-    /// The kiln server's data folder on this machine (`[server] data_dir`: kiln.db, its secrets and tokens; on a
-    /// machine that runs both, the parent of its runner's default state): the server's own for its in-process runner,
-    /// else as this machine's kiln config names it (`config::server_data_dir`). kiln's state, which no isolated agent's
-    /// project is, holds or lies in (`sandbox::isolated::kept_out`).
-    pub server_data_dir: PathBuf,
     pub join_token: Option<String>,
     pub ephemeral: bool,
     pub dedicated_job: Option<String>,
@@ -2552,7 +2547,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         let limits = crate::harness::host::Limits { per_machine: held.max_sessions };
         let h = harness_host(sink, &o.state_dir, &own_dir, limits);
-        h.keep_server_data(o.server_data_dir.clone());
         // A new build taking over takes no messages till it's promoted (`Host::hold`).
         if take_over_pending.is_some() {
             h.hold(true);
