@@ -11,7 +11,7 @@
 
 #![allow(unsafe_code)]
 
-use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::fd::RawFd;
@@ -29,10 +29,12 @@ pub(crate) const MAX_SEGMENTS: usize = 64;
 pub(crate) const SEGMENTED_BYTES: usize = 65_507;
 /// The control buffer of one message, in 8-byte words for `cmsghdr`'s alignment: room for one
 /// `UDP_SEGMENT` (a `u16`) or one `UDP_GRO` (an `int`) beside one `SCM_TIMESTAMPNS` (a
-/// `struct timespec`) and one `SO_RXQ_OVFL` (a `u32`): `CMSG_SPACE(4) + CMSG_SPACE(16) +
-/// CMSG_SPACE(4)`, 24 + 32 + 24 = 80 bytes on a 64-bit target (a 16-byte header) and less on a
-/// 32-bit one, ten words (`the_control_buffer_holds_every_message`).
-const CONTROL_WORDS: usize = 10;
+/// `struct timespec`), one `SO_RXQ_OVFL` (a `u32`) and the datagram's local address, an
+/// `IP_PKTINFO` (`struct in_pktinfo`, 12 bytes) or an `IPV6_PKTINFO` (`struct in6_pktinfo`, 20):
+/// `CMSG_SPACE(4) + CMSG_SPACE(16) + CMSG_SPACE(4) + CMSG_SPACE(20)`, 24 + 32 + 24 + 40 = 120
+/// bytes on a 64-bit target (a 16-byte header) and less on a 32-bit one, fifteen words
+/// (`the_control_buffer_holds_every_message`).
+const CONTROL_WORDS: usize = 15;
 
 type Control = [u64; CONTROL_WORDS];
 
@@ -100,6 +102,34 @@ pub(crate) fn enable_stamps(fd: RawFd) -> bool {
         )
     };
     status == 0
+}
+
+/// Asks the kernel to tell, with each datagram `fd` receives, the local address it was sent to
+/// (`IP_PKTINFO`, ip(7); `IPV6_RECVPKTINFO`, ipv6(7), on an IPv6 socket): an `IP_PKTINFO` or
+/// `IPV6_PKTINFO` control message. A socket bound to the unspecified address on a host with more
+/// than one address answers from the one it was reached at only if it knows it: the kernel's own
+/// choice is its route's source, which a peer that dialed another address does not accept (QUIC
+/// RFC 9000 §9: a server's address does not change). Whether the kernel agreed to either.
+pub(crate) fn enable_local_addresses(fd: RawFd) -> bool {
+    let on: libc::c_int = 1;
+    let mut agreed = false;
+    for (level, option) in [
+        (libc::IPPROTO_IP, libc::IP_PKTINFO),
+        (libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO),
+    ] {
+        // SAFETY: `on` is a live `c_int` and the length passed is its size; setsockopt only reads
+        // it. An IPv4 socket refuses the IPv6 option, which leaves it as it was.
+        agreed |= unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                option,
+                ptr::addr_of!(on).cast(),
+                socklen(size_of::<libc::c_int>()),
+            )
+        } == 0;
+    }
+    agreed
 }
 
 /// Format: `SK_MEMINFO_VARS` (`include/uapi/linux/sock_diag.h`), the words `SO_MEMINFO` fills on a
@@ -403,7 +433,7 @@ pub(crate) fn send(
             .map_or(ptr::null_mut(), <[libc::iovec]>::as_mut_ptr);
         message.msg_hdr.msg_iovlen = field(*count);
         if *count > 1 {
-            segment(&mut message.msg_hdr, control, slot.bytes.len());
+            write_controls(&mut message.msg_hdr, control, Some(slot.bytes.len()), None);
         }
         messages.push(message);
         first_iovec = first_iovec.saturating_add(*count);
@@ -443,9 +473,12 @@ pub(crate) fn segments_per_message(size: usize) -> usize {
 /// Sends `bytes` to `to` as one message straight from the caller's buffer, segmented into datagrams
 /// of `size` bytes (the last may be shorter) where it holds more than one, with one `sendmmsg` of
 /// one message; the caller keeps the message within [`segments_per_message`].
+/// `from`, when given, is the local address the message leaves from (an `IP_PKTINFO` or
+/// `IPV6_PKTINFO` control message): the one its peer reached this socket at.
 pub(crate) fn send_one(
     fd: RawFd,
     to: SocketAddr,
+    from: Option<IpAddr>,
     bytes: &[u8],
     size: usize,
     headers: &mut Headers,
@@ -477,9 +510,12 @@ pub(crate) fn send_one(
     message.msg_hdr.msg_namelen = name_length;
     message.msg_hdr.msg_iov = iovecs.as_mut_ptr();
     message.msg_hdr.msg_iovlen = field(1);
-    if size < bytes.len() {
-        segment(&mut message.msg_hdr, control, size);
-    }
+    write_controls(
+        &mut message.msg_hdr,
+        control,
+        (size < bytes.len()).then_some(size),
+        from,
+    );
     messages.push(message);
     let one: libc::c_uint = 1;
     // SAFETY: `messages` holds one initialised header whose name, iovec and control point into
@@ -508,36 +544,85 @@ pub(crate) fn send_one(
     }
 }
 
-/// Writes one `UDP_SEGMENT` control message of `size` into `control` and points `header` at it.
-fn segment(header: &mut libc::msghdr, control: &mut Control, size: usize) {
-    let Ok(size) = u16::try_from(size) else {
-        return;
-    };
+/// Writes the control messages of a send into `control` and points `header` at them: a
+/// `UDP_SEGMENT` of `segment` bytes where the message is segmented, and an `IP_PKTINFO` or
+/// `IPV6_PKTINFO` naming `from` as its source where it is given. None of either leaves the header
+/// without control. A message that would not fit is left out (the buffer holds both: the test
+/// `the_control_buffer_holds_every_message`).
+fn write_controls(
+    header: &mut libc::msghdr,
+    control: &mut Control,
+    segment: Option<usize>,
+    from: Option<IpAddr>,
+) {
+    let segment = segment.and_then(|size| u16::try_from(size).ok());
     // SAFETY: CMSG_SPACE only computes a length.
-    let space = unsafe { libc::CMSG_SPACE(socklen_u32(size_of::<u16>())) };
-    let Ok(space) = usize::try_from(space) else {
-        return;
+    let space = |bytes: usize| usize::try_from(unsafe { libc::CMSG_SPACE(socklen_u32(bytes)) }).unwrap_or(usize::MAX);
+    let source_bytes = match from {
+        Some(IpAddr::V4(_)) => size_of::<libc::in_pktinfo>(),
+        Some(IpAddr::V6(_)) => size_of::<libc::in6_pktinfo>(),
+        None => 0,
     };
-    if space > size_of::<Control>() {
+    let total = segment.map_or(0, |_| space(size_of::<u16>()))
+        .saturating_add(if from.is_some() { space(source_bytes) } else { 0 });
+    if total == 0 || total > size_of::<Control>() {
+        header.msg_control = ptr::null_mut();
+        header.msg_controllen = 0;
         return;
     }
+    *control = [0; CONTROL_WORDS];
     header.msg_control = control.as_mut_ptr().cast();
-    header.msg_controllen = field(space);
-    // SAFETY: the control buffer is `space` bytes or more and aligned for `cmsghdr`, so
-    // CMSG_FIRSTHDR returns a header inside it, and CMSG_DATA its data, with room for a `u16`.
+    header.msg_controllen = field(total);
+    // SAFETY: the control buffer is `total` bytes or more, zeroed and aligned for `cmsghdr`, and
+    // `msg_controllen` is `total`, the sum of the messages' spaces; CMSG_FIRSTHDR and CMSG_NXTHDR
+    // return headers inside it (a zeroed next header reads as one, its length set before it is
+    // used), and CMSG_DATA their data, with room for what each carries.
     unsafe {
-        let first = libc::CMSG_FIRSTHDR(header);
-        if first.is_null() {
-            header.msg_control = ptr::null_mut();
-            header.msg_controllen = 0;
-            return;
+        let mut at = libc::CMSG_FIRSTHDR(header);
+        if let Some(size) = segment {
+            let Some(first) = at.as_mut() else {
+                header.msg_control = ptr::null_mut();
+                header.msg_controllen = 0;
+                return;
+            };
+            first.cmsg_level = libc::SOL_UDP;
+            first.cmsg_type = libc::UDP_SEGMENT;
+            first.cmsg_len = libc::CMSG_LEN(socklen_u32(size_of::<u16>())).try_into().unwrap_or_default();
+            ptr::write_unaligned(libc::CMSG_DATA(at).cast::<u16>(), size);
+            at = libc::CMSG_NXTHDR(header, at);
         }
-        (*first).cmsg_level = libc::SOL_UDP;
-        (*first).cmsg_type = libc::UDP_SEGMENT;
-        (*first).cmsg_len = libc::CMSG_LEN(socklen_u32(size_of::<u16>()))
-            .try_into()
-            .unwrap_or_default();
-        ptr::write_unaligned(libc::CMSG_DATA(first).cast::<u16>(), size);
+        let Some(address) = from else { return };
+        let Some(next) = at.as_mut() else {
+            // No room for the source: the segmented message alone, as before.
+            header.msg_controllen = field(segment.map_or(0, |_| space(size_of::<u16>())));
+            if header.msg_controllen == 0 {
+                header.msg_control = ptr::null_mut();
+            }
+            return;
+        };
+        match address {
+            IpAddr::V4(v4) => {
+                next.cmsg_level = libc::IPPROTO_IP;
+                next.cmsg_type = libc::IP_PKTINFO;
+                next.cmsg_len = libc::CMSG_LEN(socklen_u32(size_of::<libc::in_pktinfo>())).try_into().unwrap_or_default();
+                let info = libc::in_pktinfo {
+                    ipi_ifindex: 0,
+                    ipi_spec_dst: libc::in_addr { s_addr: u32::from_ne_bytes(v4.octets()) },
+                    ipi_addr: libc::in_addr { s_addr: 0 },
+                };
+                ptr::write_unaligned(libc::CMSG_DATA(at).cast::<libc::in_pktinfo>(), info);
+            }
+            IpAddr::V6(v6) => {
+                next.cmsg_level = libc::IPPROTO_IPV6;
+                next.cmsg_type = libc::IPV6_PKTINFO;
+                next.cmsg_len = libc::CMSG_LEN(socklen_u32(size_of::<libc::in6_pktinfo>())).try_into().unwrap_or_default();
+                let info = libc::in6_pktinfo {
+                    ipi6_addr: libc::in6_addr { s6_addr: v6.octets() },
+                    ipi6_ifindex: 0,
+                };
+                ptr::write_unaligned(libc::CMSG_DATA(at).cast::<libc::in6_pktinfo>(), info);
+            }
+        }
     }
 }
 
@@ -560,6 +645,8 @@ pub(crate) struct Received {
     /// The datagrams the socket had dropped for want of room when this one was queued
     /// (`SO_RXQ_OVFL`), when the kernel attached the count: none until it is past zero.
     pub(crate) drops: Option<u32>,
+    /// The local address it was sent to (`IP_PKTINFO`, `IPV6_PKTINFO`), when the kernel told it.
+    pub(crate) to: Option<IpAddr>,
 }
 
 /// Receives up to one message into each of `buffers` with one `recvmmsg`, appending what arrived
@@ -636,7 +723,7 @@ pub(crate) fn receive(
         let Ok(length) = usize::try_from(message.msg_len) else {
             continue;
         };
-        let (segment, stamp, drops) = controls_of(&message.msg_hdr);
+        let Controls { segment, stamp, drops, to } = controls_of(&message.msg_hdr);
         out.push(Received {
             index,
             from,
@@ -644,6 +731,7 @@ pub(crate) fn receive(
             segment,
             stamp,
             drops,
+            to,
         });
     }
     Ok(received)
@@ -662,11 +750,23 @@ fn whole(bytes: usize) -> usize {
     usize::try_from(length).unwrap_or(usize::MAX)
 }
 
-/// The `UDP_GRO` segment size of a received message, if the kernel coalesced it, and its
-/// `SCM_TIMESTAMPNS` stamp in nanoseconds, if the kernel stamped it. A message whose `cmsg_len`
+/// What a received message's control messages told.
+#[derive(Clone, Copy, Debug, Default)]
+struct Controls {
+    /// Its `UDP_GRO` segment size, if the kernel coalesced it.
+    segment: Option<usize>,
+    /// Its `SCM_TIMESTAMPNS` stamp in nanoseconds, if the kernel stamped it.
+    stamp: Option<u64>,
+    /// The socket's `SO_RXQ_OVFL` drop count, if the kernel attached it.
+    drops: Option<u32>,
+    /// The local address it was sent to (`IP_PKTINFO`'s `ipi_addr`, `IPV6_PKTINFO`'s `ipi6_addr`).
+    to: Option<IpAddr>,
+}
+
+/// What a received message's control messages told ([`Controls`]). A message whose `cmsg_len`
 /// does not cover its data (a truncated control buffer) is not read.
-fn controls_of(header: &libc::msghdr) -> (Option<usize>, Option<u64>, Option<u32>) {
-    let (mut segment, mut stamp, mut drops) = (None, None, None);
+fn controls_of(header: &libc::msghdr) -> Controls {
+    let (mut segment, mut stamp, mut drops, mut to) = (None, None, None, None);
     // SAFETY: `header` was filled by recvmmsg, whose control buffer and length are its own;
     // CMSG_FIRSTHDR and CMSG_NXTHDR stay within `msg_controllen`; a `UDP_GRO` message's data is
     // an `int`, an `SCM_TIMESTAMPNS` message's a `timespec` and an `SO_RXQ_OVFL` message's a
@@ -692,19 +792,32 @@ fn controls_of(header: &libc::msghdr) -> (Option<usize>, Option<u64>, Option<u32
                 && length >= whole(size_of::<u32>())
             {
                 drops = Some(ptr::read_unaligned(libc::CMSG_DATA(at).cast::<u32>()));
+            } else if control.cmsg_level == libc::IPPROTO_IP
+                && control.cmsg_type == libc::IP_PKTINFO
+                && length >= whole(size_of::<libc::in_pktinfo>())
+            {
+                let info = ptr::read_unaligned(libc::CMSG_DATA(at).cast::<libc::in_pktinfo>());
+                to = Some(IpAddr::V4(Ipv4Addr::from(info.ipi_addr.s_addr.to_ne_bytes())));
+            } else if control.cmsg_level == libc::IPPROTO_IPV6
+                && control.cmsg_type == libc::IPV6_PKTINFO
+                && length >= whole(size_of::<libc::in6_pktinfo>())
+            {
+                let info = ptr::read_unaligned(libc::CMSG_DATA(at).cast::<libc::in6_pktinfo>());
+                to = Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)));
             }
             at = libc::CMSG_NXTHDR(header, at);
         }
     }
-    (segment, stamp, drops)
+    Controls { segment, stamp, drops, to }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The control buffer holds a `UDP_GRO` message beside an `SCM_TIMESTAMPNS` one and an
-    /// `SO_RXQ_OVFL` one.
+    /// The control buffer holds a `UDP_GRO` message beside an `SCM_TIMESTAMPNS` one, an
+    /// `SO_RXQ_OVFL` one and the larger of the local-address ones (`IPV6_PKTINFO`); and a send's
+    /// `UDP_SEGMENT` beside its source.
     #[test]
     fn the_control_buffer_holds_every_message() {
         // SAFETY: CMSG_SPACE only computes a length.
@@ -712,7 +825,14 @@ mod tests {
             libc::CMSG_SPACE(socklen_u32(size_of::<libc::c_int>()))
                 + libc::CMSG_SPACE(socklen_u32(size_of::<libc::timespec>()))
                 + libc::CMSG_SPACE(socklen_u32(size_of::<u32>()))
+                + libc::CMSG_SPACE(socklen_u32(size_of::<libc::in6_pktinfo>()))
         };
         assert!(usize::try_from(every).unwrap() <= size_of::<Control>());
+        // SAFETY: as above.
+        let send = unsafe {
+            libc::CMSG_SPACE(socklen_u32(size_of::<u16>()))
+                + libc::CMSG_SPACE(socklen_u32(size_of::<libc::in6_pktinfo>()))
+        };
+        assert!(usize::try_from(send).unwrap() <= size_of::<Control>());
     }
 }

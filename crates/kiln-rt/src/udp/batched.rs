@@ -27,7 +27,7 @@
 //! [`RECEIVE_BYTES`] on Linux, one elsewhere, reserved when the socket is made.
 
 use core::cell::Cell;
-use core::net::{Ipv4Addr, SocketAddr};
+use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[cfg(target_os = "linux")]
 use super::linux;
@@ -146,6 +146,11 @@ impl IoStats {
 pub struct Arrival {
     /// The address it came from.
     pub from: SocketAddr,
+    /// The local address it was sent to, where the kernel tells it (Linux's and macOS's
+    /// `IP_PKTINFO` and `IPV6_PKTINFO`): on a socket bound to the unspecified address, the one of
+    /// the host's addresses its sender reached. An answer goes back from it
+    /// ([`Batched::send_segments_from`]).
+    pub to: Option<IpAddr>,
     /// When it arrived, nanoseconds on the shard's clock: the kernel's receive stamp where there is one,
     /// else when it was read.
     pub at_ns: u64,
@@ -452,6 +457,8 @@ pub struct Batched {
     stats: IoStats,
     /// The latest arrival handed over: none after it arrived before it.
     latest_ns: u64,
+    /// Whether the kernel tells each datagram's local address ([`Arrival::to`]).
+    local_addresses: bool,
     #[cfg(target_os = "linux")]
     linux: Linux,
     #[cfg(target_os = "macos")]
@@ -500,11 +507,18 @@ fn shard_now() -> Result<u64, RtError> {
 /// The arrival handed over for a datagram from `from` read at `now_ns` with the kernel's `stamp_ns`, if
 /// any (both on the shard's clock): within the read's time and no earlier than `latest_ns`, which it
 /// advances.
-fn arrival(latest_ns: &mut u64, from: SocketAddr, stamp_ns: Option<u64>, now_ns: u64) -> Arrival {
+fn arrival(
+    latest_ns: &mut u64,
+    from: SocketAddr,
+    to: Option<IpAddr>,
+    stamp_ns: Option<u64>,
+    now_ns: u64,
+) -> Arrival {
     let at_ns = stamp_ns.unwrap_or(now_ns).min(now_ns).max(*latest_ns);
     *latest_ns = at_ns;
     Arrival {
         from,
+        to,
         at_ns,
         kernel: stamp_ns.is_some(),
         read_ns: now_ns.max(at_ns),
@@ -607,6 +621,14 @@ impl Batched {
             )
         )]
         let mut stats = IoStats::default();
+        // Whether the kernel tells each datagram's local address (Linux, macOS).
+        let local_addresses = match raw {
+            #[cfg(target_os = "linux")]
+            Some(fd) => linux::enable_local_addresses(fd),
+            #[cfg(target_os = "macos")]
+            Some(fd) => macos::enable_local_addresses(fd),
+            _ => false,
+        };
         #[cfg(target_os = "linux")]
         let (linux, buffer_count) = {
             if let Some(fd) = raw {
@@ -662,6 +684,7 @@ impl Batched {
             buffers,
             stats,
             latest_ns: 0,
+            local_addresses,
             #[cfg(target_os = "linux")]
             linux,
             #[cfg(target_os = "macos")]
@@ -837,6 +860,21 @@ impl Batched {
     /// message, or returns, or marks an astray report (once a datagram), or switches segmentation
     /// off (once), so it ends within three passes a datagram and two.
     pub fn send_segments(&mut self, to: SocketAddr, bytes: &[u8], segment: usize) -> usize {
+        self.send_segments_from(to, None, bytes, segment)
+    }
+
+    /// [`Batched::send_segments`] from the local address `source` where it is given: the one the
+    /// peer reached this socket at ([`Arrival::to`]), so a socket bound to the unspecified address
+    /// on a host with more than one answers from it, not from whichever its route names. Where the
+    /// kernel cannot be told (no `IP_PKTINFO`, the simulation fabric) the send goes as
+    /// [`Batched::send_segments`] would.
+    pub fn send_segments_from(
+        &mut self,
+        to: SocketAddr,
+        source: Option<IpAddr>,
+        bytes: &[u8],
+        segment: usize,
+    ) -> usize {
         let segment = segment.clamp(1, RECEIVE_BYTES);
         let total = bytes.len().div_ceil(segment);
         if total == 0 || (self.pending() && self.send() == Sent::Blocked) {
@@ -856,7 +894,7 @@ impl Batched {
             let Some(message) = bytes.get(from..to_byte) else {
                 break;
             };
-            match self.send_message(to, message, segment) {
+            match self.send_message(to, source, message, segment) {
                 SendStep::Took(_) => {
                     done = done.saturating_add(count);
                     self.stats.sent = self.stats.sent.saturating_add(as_u64(count));
@@ -891,12 +929,19 @@ impl Batched {
     /// One message of `bytes` to `to`, segmented into datagrams of `segment` bytes where it holds
     /// more than one.
     #[cfg(target_os = "linux")]
-    fn send_message(&mut self, to: SocketAddr, bytes: &[u8], segment: usize) -> SendStep {
+    fn send_message(
+        &mut self,
+        to: SocketAddr,
+        from: Option<IpAddr>,
+        bytes: &[u8],
+        segment: usize,
+    ) -> SendStep {
         let Inner::Real { socket } = &self.udp.inner else {
             return self.send_message_portable(to, bytes);
         };
         let fd = socket.raw_id();
-        match linux::send_one(fd, to, bytes, segment, &mut self.linux.send) {
+        let from = from.filter(|_| self.local_addresses);
+        match linux::send_one(fd, to, from, bytes, segment, &mut self.linux.send) {
             Ok(()) => SendStep::Took(1),
             Err(failed) => match failed.error.raw_os_error() {
                 Some(libc::EAGAIN | libc::EINTR) => SendStep::NotNow,
@@ -917,8 +962,40 @@ impl Batched {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn send_message(&mut self, to: SocketAddr, bytes: &[u8], _segment: usize) -> SendStep {
+    #[cfg(target_os = "macos")]
+    fn send_message(
+        &mut self,
+        to: SocketAddr,
+        from: Option<IpAddr>,
+        bytes: &[u8],
+        _segment: usize,
+    ) -> SendStep {
+        let (Inner::Real { socket }, Some(from)) = (&self.udp.inner, from.filter(|_| self.local_addresses)) else {
+            return self.send_message_portable(to, bytes);
+        };
+        match macos::send_from(socket.raw_id(), to, from, bytes) {
+            Ok(_) => SendStep::Took(1),
+            Err(error) => match error.raw_os_error() {
+                Some(libc::EAGAIN | libc::EINTR | libc::ENOBUFS) => SendStep::NotNow,
+                Some(
+                    libc::ECONNREFUSED | libc::ECONNRESET | libc::EHOSTUNREACH | libc::ENETUNREACH,
+                ) => {
+                    self.stats.astray = self.stats.astray.saturating_add(1);
+                    SendStep::Astray(1)
+                }
+                _ => SendStep::Refused(1),
+            },
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    fn send_message(
+        &mut self,
+        to: SocketAddr,
+        _from: Option<IpAddr>,
+        bytes: &[u8],
+        _segment: usize,
+    ) -> SendStep {
         self.send_message_portable(to, bytes)
     }
 
@@ -1213,7 +1290,7 @@ impl Batched {
                 .stamp
                 .zip(carry)
                 .and_then(|(stamp, carry)| carry.carry(stamp));
-            let arrived = arrival(latest_ns, taken.from, stamp, now_ns);
+            let arrived = arrival(latest_ns, taken.from, taken.to, stamp, now_ns);
             match taken.segment {
                 Some(size) => {
                     for datagram in bytes.chunks_mut(size) {
@@ -1239,9 +1316,14 @@ impl Batched {
         &mut self,
         deliver: &mut impl FnMut(Arrival, &mut [u8]),
     ) -> Result<ReceiveStep, RtError> {
-        let (Inner::Real { socket }, Some(mach)) = (&self.udp.inner, self.mach) else {
+        // recvmsg reads what the kernel tells: its stamp, the local address, or both.
+        let Inner::Real { socket } = &self.udp.inner else {
             return self.receive_portable(deliver);
         };
+        if self.mach.is_none() && !self.local_addresses {
+            return self.receive_portable(deliver);
+        }
+        let mach = self.mach;
         let fd = socket.raw_id();
         let Some(buffer) = self.buffers.first_mut() else {
             return Ok(ReceiveStep::Empty);
@@ -1256,12 +1338,13 @@ impl Batched {
         };
         // The stamps' clock first, then the shard's (as on Linux). The stamp is in the kernel's ticks
         // and the reading in the process's, which a translated process does not share (`macos`).
-        let ticks_now = mach.now_ticks();
+        let ticks_now = mach.map(|mach| mach.now_ticks());
         let now_ns = shard_now()?;
         let stamp = taken
             .stamp
-            .map(|ticks| now_ns.saturating_sub(mach.age_ns(ticks_now, ticks)));
-        let arrived = arrival(&mut self.latest_ns, taken.from, stamp, now_ns);
+            .zip(mach.zip(ticks_now))
+            .map(|(ticks, (mach, now))| now_ns.saturating_sub(mach.age_ns(now, ticks)));
+        let arrived = arrival(&mut self.latest_ns, taken.from, taken.to, stamp, now_ns);
         let Some(bytes) = buffer.get_mut(..taken.length) else {
             return Ok(ReceiveStep::Skipped);
         };
@@ -1294,7 +1377,7 @@ impl Batched {
             Outcome::Done((length, from)) => {
                 self.stats.receive_calls = self.stats.receive_calls.saturating_add(1);
                 let now_ns = shard_now()?;
-                let arrived = arrival(&mut self.latest_ns, from, None, now_ns);
+                let arrived = arrival(&mut self.latest_ns, from, None, None, now_ns);
                 let Some(bytes) = buffer.get_mut(..length) else {
                     return Ok(ReceiveStep::Skipped);
                 };

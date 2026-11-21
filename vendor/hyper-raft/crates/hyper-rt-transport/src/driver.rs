@@ -38,7 +38,7 @@
 //! (`docs/transport.md` §4aa).
 
 use std::future::{Future, poll_fn};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -99,6 +99,9 @@ const SEGMENTS_A_TRANSMIT: usize = 64;
 /// endpoint makes is sent past it.
 struct Held {
     to: SocketAddr,
+    /// The local address it leaves from: the one its peer reached the endpoint at
+    /// ([`Transmit::src_ip`](hyper_transport::Transmit), from [`Arrival::to`](hyper_rt::udp::Arrival)).
+    from: Option<IpAddr>,
     bytes: Vec<u8>,
     /// The bytes of it sent.
     done: usize,
@@ -1112,7 +1115,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
                     arrival.read_ns.saturating_sub(anchor_ns),
                 ))
                 .unwrap_or(anchor);
-            endpoint.handle_datagram(at, arrival.from, None, bytes);
+            // The address it reached: what an answer leaves from (a host with more than one).
+            endpoint.handle_datagram_to(at, arrival.from, arrival.to, None, bytes);
         })?;
         let consumed = match (stream_before, stream(endpoint)) {
             (Some(before), Some(after)) => after.saturating_sub(before),
@@ -1161,6 +1165,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             datagrams = datagrams.saturating_add(outgoing.len().div_ceil(segment));
             let held = Held {
                 to: transmit.destination,
+                from: transmit.src_ip,
                 bytes: outgoing,
                 done: 0,
                 segment,
@@ -1180,7 +1185,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
         let rest = held.bytes.get(held.done..).unwrap_or(&[]);
         let sent = self
             .socket_for(held.to)
-            .send_segments(held.to, rest, held.segment);
+            .send_segments_from(held.to, held.from, rest, held.segment);
         held.done = held
             .done
             .saturating_add(sent.saturating_mul(held.segment))

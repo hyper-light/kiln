@@ -29,7 +29,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::marker::PhantomData;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
@@ -1028,13 +1028,30 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         ecn: Option<EcnCodepoint>,
         bytes: &[u8],
     ) {
+        self.handle_datagram_to(now, from, None, ecn, bytes);
+    }
+
+    /// A datagram arrived from `from`, sent to this endpoint's local address `local_ip` where the
+    /// driver knows it (its socket's `IP_PKTINFO`). The connection it opens or belongs to answers
+    /// from that address ([`Transmit::src_ip`]): a server bound to the unspecified address on a host
+    /// with more than one address answers from the one its client dialed, which the client accepts
+    /// (RFC 9000 §9: a server's address does not change), where the kernel's own choice, its route's
+    /// source, may be another.
+    pub fn handle_datagram_to(
+        &mut self,
+        now: Instant,
+        from: SocketAddr,
+        local_ip: Option<IpAddr>,
+        ecn: Option<EcnCodepoint>,
+        bytes: &[u8],
+    ) {
         self.core.now = now;
         let datagram = self.receive.take(bytes, &mut self.core.budget);
         let mut buffer = std::mem::take(&mut self.scratch);
         buffer.clear();
         match self
             .quic
-            .handle(now, from, None, ecn, datagram, &mut buffer)
+            .handle(now, from, local_ip, ecn, datagram, &mut buffer)
         {
             Some(DatagramEvent::NewConnection(attempt)) => self.attempt(now, attempt, &mut buffer),
             Some(DatagramEvent::ConnectionEvent(handle, event)) => {

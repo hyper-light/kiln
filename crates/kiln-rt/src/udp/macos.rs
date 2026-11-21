@@ -22,7 +22,7 @@
 
 #![allow(unsafe_code)]
 
-use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::fd::RawFd;
@@ -36,8 +36,11 @@ use crate::machine::clock::{MachTicks, mach_ticks};
 const SCM_TIMESTAMP_MONOTONIC: libc::c_int = 0x04;
 
 /// The control buffer, in 8-byte words for `cmsghdr`'s alignment: `CMSG_SPACE(sizeof(uint64_t))`,
-/// 12 bytes of header rounded to 4-byte alignment and 8 of stamp, 20, in three words.
-const CONTROL_WORDS: usize = 3;
+/// 12 bytes of header rounded to 4-byte alignment and 8 of stamp, 20, beside the datagram's local
+/// address, the larger of `CMSG_SPACE(sizeof(struct in_pktinfo))` (24) and
+/// `CMSG_SPACE(sizeof(struct in6_pktinfo))` (32): 52 bytes, in seven words
+/// (`the_control_buffer_holds_every_message`).
+const CONTROL_WORDS: usize = 7;
 
 /// The stamps' clock, `mach_absolute_time`, and the kernel's ticks the stamps count.
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +120,8 @@ pub(crate) struct Received {
     pub(crate) from: SocketAddr,
     pub(crate) length: usize,
     pub(crate) stamp: Option<u64>,
+    /// The local address it was sent to (`IP_PKTINFO`, `IPV6_PKTINFO`), when the kernel told it.
+    pub(crate) to: Option<IpAddr>,
 }
 
 /// Receives one datagram into `buffer` without blocking (the socket is non-blocking). A datagram
@@ -152,10 +157,12 @@ pub(crate) fn receive(fd: RawFd, buffer: &mut [u8]) -> io::Result<Option<Receive
     let Some(from) = read_name(&name) else {
         return Ok(None);
     };
+    let (stamp, to) = controls_of(&message);
     Ok(Some(Received {
         from,
         length,
-        stamp: stamp_of(&message),
+        stamp,
+        to,
     }))
 }
 
@@ -184,29 +191,168 @@ fn read_name(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
     }
 }
 
-/// The `SCM_TIMESTAMP_MONOTONIC` stamp among the control messages recvmsg left in `message`;
-/// `None` when the kernel attached none or truncated it.
-fn stamp_of(message: &libc::msghdr) -> Option<u64> {
-    let whole = usize::try_from(
-        // SAFETY: `CMSG_LEN` is arithmetic on its argument and reads no memory.
-        unsafe { libc::CMSG_LEN(u32::try_from(size_of::<u64>()).unwrap_or(u32::MAX)) },
-    )
-    .ok()?;
+/// The `SCM_TIMESTAMP_MONOTONIC` stamp and the local address (`IP_PKTINFO`, `IPV6_PKTINFO`) among
+/// the control messages recvmsg left in `message`; each `None` when the kernel attached none or
+/// truncated it.
+fn controls_of(message: &libc::msghdr) -> (Option<u64>, Option<IpAddr>) {
+    // SAFETY: `CMSG_LEN` is arithmetic on its argument and reads no memory.
+    let whole = |bytes: usize| usize::try_from(unsafe { libc::CMSG_LEN(u32::try_from(bytes).unwrap_or(u32::MAX)) }).unwrap_or(usize::MAX);
+    let (mut stamp, mut to) = (None, None);
     // SAFETY: `message` was filled by recvmsg, whose control buffer and length are its own;
     // CMSG_FIRSTHDR and CMSG_NXTHDR return headers that lie whole within `msg_controllen`, or null
-    // (cmsg(3)), and a stamp message whose `cmsg_len` covers the stamp has it at CMSG_DATA, read
-    // unaligned.
+    // (cmsg(3)); a stamp message's data is a `uint64_t`, an `IP_PKTINFO`'s a `struct in_pktinfo`
+    // and an `IPV6_PKTINFO`'s a `struct in6_pktinfo`, each read unaligned at CMSG_DATA once its
+    // `cmsg_len` is checked to cover it.
     unsafe {
         let mut at = libc::CMSG_FIRSTHDR(message);
         while let Some(header) = at.as_ref() {
+            let length = usize::try_from(header.cmsg_len).unwrap_or(0);
             if header.cmsg_level == libc::SOL_SOCKET
                 && header.cmsg_type == SCM_TIMESTAMP_MONOTONIC
-                && usize::try_from(header.cmsg_len).is_ok_and(|length| length >= whole)
+                && length >= whole(size_of::<u64>())
             {
-                return Some(ptr::read_unaligned(libc::CMSG_DATA(at).cast::<u64>()));
+                stamp = Some(ptr::read_unaligned(libc::CMSG_DATA(at).cast::<u64>()));
+            } else if header.cmsg_level == libc::IPPROTO_IP
+                && header.cmsg_type == libc::IP_PKTINFO
+                && length >= whole(size_of::<libc::in_pktinfo>())
+            {
+                let info = ptr::read_unaligned(libc::CMSG_DATA(at).cast::<libc::in_pktinfo>());
+                to = Some(IpAddr::V4(Ipv4Addr::from(info.ipi_addr.s_addr.to_ne_bytes())));
+            } else if header.cmsg_level == libc::IPPROTO_IPV6
+                && header.cmsg_type == libc::IPV6_PKTINFO
+                && length >= whole(size_of::<libc::in6_pktinfo>())
+            {
+                let info = ptr::read_unaligned(libc::CMSG_DATA(at).cast::<libc::in6_pktinfo>());
+                to = Some(IpAddr::V6(Ipv6Addr::from(info.ipi6_addr.s6_addr)));
             }
             at = libc::CMSG_NXTHDR(message, at);
         }
     }
-    None
+    (stamp, to)
+}
+
+/// Asks the kernel to tell, with each datagram `fd` receives, the local address it was sent to
+/// (`IP_RECVPKTINFO`, which XNU names `IP_PKTINFO`; `IPV6_RECVPKTINFO` on an IPv6 socket), as
+/// Linux's `super::linux::enable_local_addresses` does. Whether it agreed to either.
+pub(crate) fn enable_local_addresses(fd: RawFd) -> bool {
+    let on: libc::c_int = 1;
+    let length = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap_or(0);
+    let mut agreed = false;
+    for (level, option) in [
+        (libc::IPPROTO_IP, libc::IP_PKTINFO),
+        (libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO),
+    ] {
+        // SAFETY: `on` is a live `c_int` and `length` its size; setsockopt only reads it. An IPv4
+        // socket refuses the IPv6 option, which leaves it as it was.
+        agreed |= unsafe { libc::setsockopt(fd, level, option, ptr::addr_of!(on).cast(), length) } == 0;
+    }
+    agreed
+}
+
+/// Sends `bytes` to `to` from the local address `from` (an `IP_PKTINFO` or `IPV6_PKTINFO` control
+/// message naming it the source), one datagram with `sendmsg(2)`, without blocking. Returns the
+/// bytes sent.
+pub(crate) fn send_from(fd: RawFd, to: SocketAddr, from: IpAddr, bytes: &[u8]) -> io::Result<usize> {
+    // SAFETY: `sockaddr_storage` is plain integers; all zeroes is a valid value.
+    let mut name: libc::sockaddr_storage = unsafe { zeroed() };
+    let name_length = write_name(to, &mut name);
+    let mut control = [0u64; CONTROL_WORDS];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
+    };
+    let (level, kind, data_bytes) = match from {
+        IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_PKTINFO, size_of::<libc::in_pktinfo>()),
+        IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO, size_of::<libc::in6_pktinfo>()),
+    };
+    let data_bytes = u32::try_from(data_bytes).unwrap_or(u32::MAX);
+    // SAFETY: CMSG_SPACE and CMSG_LEN only compute lengths.
+    let (space, cmsg_length) = unsafe { (libc::CMSG_SPACE(data_bytes), libc::CMSG_LEN(data_bytes)) };
+    if usize::try_from(space).unwrap_or(usize::MAX) > size_of::<[u64; CONTROL_WORDS]>() {
+        return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
+    }
+    // SAFETY: an all-zero `msghdr` is valid: null pointers with zero lengths.
+    let mut message: libc::msghdr = unsafe { zeroed() };
+    message.msg_name = ptr::addr_of_mut!(name).cast();
+    message.msg_namelen = name_length;
+    message.msg_iov = &raw mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = space;
+    // SAFETY: the control buffer is zeroed, aligned for `cmsghdr` and `space` bytes or more, and
+    // `msg_controllen` is `space`, so CMSG_FIRSTHDR returns a header inside it and CMSG_DATA its
+    // data, with room for the `in_pktinfo` or `in6_pktinfo` written there; sendmsg reads the name,
+    // the iovec over `bytes` and the control, all live for the call.
+    unsafe {
+        let Some(header) = libc::CMSG_FIRSTHDR(&raw const message).as_mut() else {
+            return Err(io::Error::from_raw_os_error(libc::ENOBUFS));
+        };
+        header.cmsg_level = level;
+        header.cmsg_type = kind;
+        header.cmsg_len = cmsg_length;
+        let data = libc::CMSG_DATA(header);
+        match from {
+            IpAddr::V4(v4) => ptr::write_unaligned(
+                data.cast::<libc::in_pktinfo>(),
+                libc::in_pktinfo {
+                    ipi_ifindex: 0,
+                    ipi_spec_dst: libc::in_addr { s_addr: u32::from_ne_bytes(v4.octets()) },
+                    ipi_addr: libc::in_addr { s_addr: 0 },
+                },
+            ),
+            IpAddr::V6(v6) => ptr::write_unaligned(
+                data.cast::<libc::in6_pktinfo>(),
+                libc::in6_pktinfo {
+                    ipi6_addr: libc::in6_addr { s6_addr: v6.octets() },
+                    ipi6_ifindex: 0,
+                },
+            ),
+        }
+        let sent = libc::sendmsg(fd, &raw const message, libc::MSG_DONTWAIT);
+        usize::try_from(sent).map_err(|_| io::Error::last_os_error())
+    }
+}
+
+/// Writes `address` into `storage`; returns its length.
+fn write_name(address: SocketAddr, storage: &mut libc::sockaddr_storage) -> libc::socklen_t {
+    let length = |bytes: usize| libc::socklen_t::try_from(bytes).unwrap_or(0);
+    match address {
+        SocketAddr::V4(v4) => {
+            // SAFETY: `sockaddr_storage` is large and aligned enough for `sockaddr_in`; the cast
+            // reference lives within the borrow.
+            let name = unsafe { &mut *ptr::from_mut(storage).cast::<libc::sockaddr_in>() };
+            name.sin_len = u8::try_from(size_of::<libc::sockaddr_in>()).unwrap_or(0);
+            name.sin_family = libc::sa_family_t::try_from(libc::AF_INET).unwrap_or(0);
+            name.sin_port = v4.port().to_be();
+            name.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(v4.ip().octets()) };
+            length(size_of::<libc::sockaddr_in>())
+        }
+        SocketAddr::V6(v6) => {
+            // SAFETY: as above, for `sockaddr_in6`.
+            let name = unsafe { &mut *ptr::from_mut(storage).cast::<libc::sockaddr_in6>() };
+            name.sin6_len = u8::try_from(size_of::<libc::sockaddr_in6>()).unwrap_or(0);
+            name.sin6_family = libc::sa_family_t::try_from(libc::AF_INET6).unwrap_or(0);
+            name.sin6_port = v6.port().to_be();
+            name.sin6_flowinfo = v6.flowinfo();
+            name.sin6_addr = libc::in6_addr { s6_addr: v6.ip().octets() };
+            name.sin6_scope_id = v6.scope_id();
+            length(size_of::<libc::sockaddr_in6>())
+        }
+    }
+}
+
+#[cfg(test)]
+mod local_address_tests {
+    use super::*;
+
+    /// The control buffer holds a stamp beside the larger of the local-address messages.
+    #[test]
+    fn the_control_buffer_holds_every_message() {
+        // SAFETY: CMSG_SPACE only computes a length.
+        let every = unsafe {
+            libc::CMSG_SPACE(u32::try_from(size_of::<u64>()).unwrap())
+                + libc::CMSG_SPACE(u32::try_from(size_of::<libc::in6_pktinfo>()).unwrap())
+        };
+        assert!(usize::try_from(every).unwrap() <= size_of::<[u64; CONTROL_WORDS]>());
+    }
 }
