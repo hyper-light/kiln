@@ -4230,7 +4230,6 @@ mod tests {
     /// or idle before its reminder is due) leave the store as they found it, every table's count.
     #[test]
     fn g9_s3_a_round_with_nothing_to_do_writes_nothing() -> anyhow::Result<()> {
-        use kiln_seams::Clock as _;
         use kiln_seams::clock::SimClock;
         use kiln_seams::harness::SimHarness;
         crate::rt::block_on(async {
