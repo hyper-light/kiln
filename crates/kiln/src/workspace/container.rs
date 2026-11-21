@@ -15,7 +15,7 @@
 //! machine's loopback as `host.docker.internal`. A rootless engine can't mount a file system itself, and is said so.
 //!
 //! **The order is this module's**, and its unit tests hold it over stand-ins (`Steps`). The engine's profile is judged
-//! first, by the caller, before the workspace is made (Slates' `container_engine::engine_profile`: a remote engine is
+//! first, by the caller, before the workspace is made (Slates' `container_engine::export_engine`, A-769: a remote engine is
 //! refused, since an export's address and identity are the machine's). Then the export, then the engine's volume over it,
 //! then the container on that volume. A start refused part way lets go of what it made, the volume, then the export. Its
 //! end goes in order: the container (its engine lets go of the files it held open), then the engine's volume (its mount
@@ -33,7 +33,7 @@
 use std::fmt;
 
 use kiln_ci::facts::{ContainerFacts, ContainerMissing, Workspaces};
-use slates_api::container_engine::{Engine, EngineFault, EngineProfile};
+use slates_api::container_engine::{Engine, EngineFault, ExportEngine};
 
 use super::slates::Made;
 
@@ -65,7 +65,7 @@ const LOOPBACK: &str = "127.0.0.1";
 pub struct Plan {
     /// The engine's command line, by its full path (as `crate::runner::docker::find` finds it).
     pub program: String,
-    /// The engine its profile names (Slates' `container_engine::engine_profile`).
+    /// The engine its profile names (Slates' `container_engine::export_engine`).
     pub engine: Engine,
     /// The container's name, and its engine volume's.
     pub name: String,
@@ -328,7 +328,7 @@ async fn end_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow:
 pub async fn facts(workspaces: Option<&Workspaces>, image: Option<&str>) -> ContainerFacts {
     let has_workspaces = workspaces.is_some_and(|w| w.available);
     let image = image.map(str::trim).filter(|i| !i.is_empty()).map(str::to_owned);
-    crate::rt::blocking(move || facts_of(has_workspaces, image, crate::runner::docker::find, slates_api::container_engine::engine_profile))
+    crate::rt::blocking(move || facts_of(has_workspaces, image, crate::runner::docker::find, slates_api::container_engine::export_engine))
         .await
         .unwrap_or_else(|e| ContainerFacts { why_not: Some(format!("the container engine couldn't be asked: {e:#}")), missing: Some(ContainerMissing::Engine), ..ContainerFacts::default() })
 }
@@ -342,14 +342,11 @@ pub fn engine_word(engine: Engine) -> &'static str {
     }
 }
 
-/// Format: why a rootless engine runs no agent's container (see the module's notes).
-const ROOTLESS: &str = "this machine's container engine runs rootless, and a rootless engine can't mount the workspace's NFS export itself";
-
 /// [`facts`] over its questions, in the order that asks least: the machine's workspaces first (a container works on its
 /// agent's volume), then the image declared for its agents' containers (`image`), then the engine (`find`: its command
 /// line, when its daemon answers), then Slates' judge of its profile (`profile`), then whether the engine mounts its own
 /// volumes (a rootless one can't). Nothing is asked past the first lack, which is named.
-fn facts_of(has_workspaces: bool, image: Option<String>, find: impl FnOnce() -> Option<String>, profile: impl FnOnce(&str) -> Result<EngineProfile, EngineFault>) -> ContainerFacts {
+fn facts_of(has_workspaces: bool, image: Option<String>, find: impl FnOnce() -> Option<String>, profile: impl FnOnce(&str) -> Result<ExportEngine, EngineFault>) -> ContainerFacts {
     if !has_workspaces {
         return ContainerFacts { why_not: Some("this machine gives agents no workspaces of their own, which their containers work on".to_owned()), missing: Some(ContainerMissing::Workspaces), ..ContainerFacts::default() };
     }
@@ -382,9 +379,6 @@ fn facts_of(has_workspaces: bool, image: Option<String>, find: impl FnOnce() -> 
         image: Some(image),
         ..ContainerFacts::default()
     };
-    if judged.profile.rootless {
-        return ContainerFacts { why_not: Some(ROOTLESS.to_owned()), missing: Some(ContainerMissing::Profile), ..said };
-    }
     ContainerFacts { available: true, ..said }
 }
 
@@ -617,21 +611,21 @@ mod tests {
         Ok(())
     }
 
-    /// A profile Slates judged: `engine` at Docker's socket, rootless or not.
-    fn judged(engine: Engine, rootless: bool) -> EngineProfile {
-        use slates_api::container_engine::{Endpoint, HardLinkRule, IdentityRule, RuntimeProfile, TestedProfile};
-        EngineProfile {
+    /// An engine Slates judged for the export route: `engine` at Docker's socket, mounting the export from `from`.
+    fn judged(engine: Engine, from: slates_api::container_engine::MountsFrom) -> ExportEngine {
+        use slates_api::container_engine::{Endpoint, ExportProfile, RuntimeProfile};
+        ExportEngine {
             endpoint: "unix:///var/run/docker.sock".to_owned(),
             profile: RuntimeProfile {
                 endpoint: Endpoint::UnixSocket("/var/run/docker.sock".to_owned()),
                 engine,
                 operating_system: "Docker Desktop".to_owned(),
                 server_version: "29.3.1".to_owned(),
-                rootless,
+                rootless: false,
                 user_namespace_remap: false,
                 selinux_labels: false,
             },
-            tested: TestedProfile { test: "T-4.13", description: "a stand-in's", identity: IdentityRule::HostUserThroughShare, hard_links: HardLinkRule::EveryNameServedAtOnce },
+            tested: ExportProfile { test: "a stand-in's", description: "a stand-in's", mounts_from: from },
         }
     }
 
@@ -642,7 +636,7 @@ mod tests {
     /// it; the refused untested profile still naming its engine; the rootless one said to mount nothing itself; only the
     /// last two available (the export route needs no mount shared with other users).
     #[test]
-    #[allow(clippy::result_large_err, reason = "the stand-ins answer as Slates' engine_profile does, with its EngineFault")]
+    #[allow(clippy::result_large_err, reason = "the stand-ins answer as Slates' export_engine does, with its EngineFault")]
     fn w9_a_runners_facts_say_whether_its_agents_can_run_in_containers_and_what_it_lacks() {
         use slates_api::container_engine::ProfileRefusal;
         let asked = std::cell::Cell::new(0_u32);
@@ -684,21 +678,20 @@ mod tests {
         let by_runtime = refused(EngineFault::Refused(ProfileRefusal::RuntimeUnsupported { runtime: "nerdctl".to_owned() }));
         assert_eq!((by_runtime.available, by_runtime.missing, by_runtime.program.as_deref(), by_runtime.engine), (false, Some(ContainerMissing::Profile), Some(DOCKER), None));
         assert!(by_runtime.why_not.as_deref().is_some_and(|w| w.starts_with("Slates refused this machine's container engine: ")), "{:?}", by_runtime.why_not);
-        let untested = judged(Engine::DockerEngine, false);
-        let by_profile = refused(EngineFault::Untested { endpoint: untested.endpoint.clone(), profile: Box::new(untested.profile), refusal: ProfileRefusal::UserNamespaceUntested });
+        let untested = judged(Engine::DockerEngine, slates_api::container_engine::MountsFrom::HostKernel);
+        let by_profile = refused(EngineFault::Untested { endpoint: untested.endpoint.clone(), profile: Box::new(untested.profile), refusal: ProfileRefusal::RootlessCannotMount });
         assert_eq!((by_profile.missing, by_profile.engine.as_deref(), by_profile.version.as_deref()), (Some(ContainerMissing::Profile), Some("docker-engine"), Some("29.3.1")));
+        assert!(by_profile.why_not.as_deref().is_some_and(|w| w.contains("RootlessCannotMount")), "{:?}", by_profile.why_not);
         let windows = refused(EngineFault::Unsupported { platform: "windows" });
         assert_eq!((windows.available, windows.missing), (false, Some(ContainerMissing::Platform)));
 
-        let with = |profile: EngineProfile| facts_of(true, image(), || Some(DOCKER.to_owned()), move |program: &str| {
+        let with = |profile: ExportEngine| facts_of(true, image(), || Some(DOCKER.to_owned()), move |program: &str| {
             assert_eq!(program, DOCKER, "Slates judges the engine found");
             Ok(profile)
         });
-        let rootless = with(judged(Engine::Podman, true));
-        assert_eq!((rootless.available, rootless.missing, rootless.engine.as_deref(), rootless.why_not.as_deref()), (false, Some(ContainerMissing::Profile), Some("podman"), Some(ROOTLESS)));
-        let rootful = with(judged(Engine::DockerEngine, false));
+        let rootful = with(judged(Engine::DockerEngine, slates_api::container_engine::MountsFrom::HostKernel));
         assert_eq!((rootful.available, rootful.missing, rootful.engine.as_deref()), (true, None, Some("docker-engine")));
-        let desktop = with(judged(Engine::DockerDesktop, false));
+        let desktop = with(judged(Engine::DockerDesktop, slates_api::container_engine::MountsFrom::DesktopVm));
         assert_eq!(
             desktop,
             ContainerFacts { available: true, program: Some(DOCKER.to_owned()), engine: Some("docker-desktop".to_owned()), endpoint: Some("unix:///var/run/docker.sock".to_owned()), version: Some("29.3.1".to_owned()), image: Some(IMAGE.to_owned()), why_not: None, missing: None }

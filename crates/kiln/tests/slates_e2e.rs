@@ -1881,10 +1881,10 @@ mod container {
     //!    volume ([`mounted_from`]), its capability never shown.
     //! 2. **On its volume, never a copy.** The harness works at the host mount's own path; its three edits are seen
     //!    through the host's own mount of the same volume before any landing, and the project's folder holds none of them.
-    //! 3. **Review, landing, drift (W3, W4, W6), unchanged.** Its change request holds exactly its changes; a person's
-    //!    landing (`agents.land`) writes them at once where its mode asks nothing and only on approval where it asks; a
-    //!    file the person changed on disk after the agent changed it is drift, and no landing writes over the person's
-    //!    bytes. A harness in a container has no kiln MCP (W9: its socket is the machine's), so the person lands here.
+    //! 3. **Review, landing, drift (W3, W4, W6), unchanged.** Its change request holds exactly its changes; the person's
+    //!    landing (`agents.land`) shows the plan, and writes it once the person approves its manifest, in either mode (a
+    //!    harness in a container has no kiln MCP to land with: W9, its socket is the machine's); a file the person
+    //!    changed on disk after the agent changed it is drift, and no landing writes over the person's bytes.
     //! 4. **Its end.** Ended, its container is gone and its volume's mount leaves the host's table.
     //!
     //! The image is built by the drive from a pinned Python base with the stand-in as `claude` on its `PATH`
@@ -1920,9 +1920,17 @@ mod container {
         std::fs::write(ctx.join("stub"), &stub)?;
         let links: String = kiln::harness::kinds::Kind::all().iter().map(|k| format!(" && ln -sf /usr/local/bin/kiln-stub /usr/local/bin/{}", k.program)).collect();
         std::fs::write(ctx.join("Dockerfile"), format!("FROM {BASE}\nCOPY stub /usr/local/bin/kiln-stub\nRUN chmod 0755 /usr/local/bin/kiln-stub{links}\n"))?;
-        let out = std::process::Command::new(docker).args(["build", "--quiet", "--tag", &tag]).arg(&ctx).output()?;
-        anyhow::ensure!(out.status.success(), "docker build {tag}: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        Ok(tag)
+        // Built again where the engine's builder lost its session under load (BuildKit's "no active session ... context
+        // deadline exceeded", adacachy 2026-11-20): a few tries, each one's words kept.
+        let mut said = Vec::new();
+        for _ in 0..3 {
+            let out = std::process::Command::new(docker).args(["build", "--quiet", "--tag", &tag]).arg(&ctx).output()?;
+            if out.status.success() {
+                return Ok(tag);
+            }
+            said.push(format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+        }
+        anyhow::bail!("docker build {tag}, 3 tries: {said:?}")
     }
 
     /// A server and runner of the drive's own under `dir`: [`runner_env`]'s, the engine's command line on its PATH, its
@@ -2053,16 +2061,12 @@ mod container {
         anyhow::ensure!(proposed == expected(&probe), "{what}: its change request {branch} holds {proposed:?}, not its harness's changes");
         anyhow::ensure!(tree(&project.path())? == before, "{what}: its change request wrote to the project's folder");
         eprintln!("PROVEN: {what}: its change request {branch} holds exactly its changes");
-        let landed = op("agents.land", &json!({"agent": id}))?;
-        match mode {
-            Mode::Bypass => written(&landed).map_err(fail)?,
-            Mode::Ask => {
-                let shown = approval_manifest(&landed).map_err(fail)?;
-                anyhow::ensure!(tree(&project.path())? == before, "{what}: showing a person the approval request wrote to the project's folder");
-                written(&op("agents.land", &json!({"agent": id, "manifest": shown}))?).map_err(fail)?;
-                eprintln!("PROVEN: {what}: its landing held for a person's approval of {shown}, then approved");
-            }
-        }
+        // The person lands it, in either mode (its harness has no kiln MCP to land with): a person reads the plan, then
+        // writes it by its manifest (`agents.land`), never at once.
+        let shown = approval_manifest(&op("agents.land", &json!({"agent": id}))?).map_err(fail)?;
+        anyhow::ensure!(tree(&project.path())? == before, "{what}: showing a person the plan wrote to the project's folder");
+        written(&op("agents.land", &json!({"agent": id, "manifest": shown}))?).map_err(fail)?;
+        eprintln!("PROVEN: {what}: the person was shown its plan {shown}, then wrote it");
         let after = tree(&project.path())?;
         anyhow::ensure!(changes(&before, &after) == expected(&probe), "{what}: its landing changed {:?}, not its harness's changes", changes(&before, &after));
         anyhow::ensure!(project.git_state()? == git_before, "{what}: its landing changed the project's git HEAD or index");
@@ -2079,8 +2083,8 @@ mod container {
         Ok(())
     }
 
-    /// The module's 1 to 4: two agents in containers, each on its own volume; the one whose mode asks nothing lands at
-    /// the person's word at once, the one whose mode asks only once the person approves.
+    /// The module's 1 to 4: two agents in containers, one in each mode, each on its own volume, each landed by the
+    /// person, who is shown its plan and approves it.
     #[test]
     fn a520_in_a_container_on_its_volume_an_agents_work_is_reviewed_and_landed_by_its_mode() -> anyhow::Result<()> {
         let Some(docker) = docker() else {

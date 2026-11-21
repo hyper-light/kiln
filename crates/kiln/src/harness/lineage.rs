@@ -1240,6 +1240,25 @@ pub fn engine_at(hub: &Hub, target: &str) -> Result<Engine, String> {
     hub.agents.load().get(machine).and_then(|a| a.facts.as_deref().and_then(crate::harness::engine::of)).ok_or_else(|| format!("{} hasn't said yet how it runs sessions", hub.shown(machine)))
 }
 
+/// The harnesses a new agent can start with on each machine (`GET /api/harness/kinds`, the start form's): each as its
+/// runner says it (`available`: installed on its host), and on a runner whose engine is `microvm`, every one kiln ships an
+/// Agentfile for besides (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, "Every kiln harness in Shards microVMs"): a start
+/// there runs in a microVM made from it, whatever its host has installed (a start naming no Agentfile takes kiln's for its
+/// harness, `crate::sandbox::isolated::source_of`, and an isolated one is never refused for its host's). Listed as installed
+/// alone, a Mac holding microVMs offered only Claude Code and Codex, the harnesses its host had.
+pub fn startable_kinds(hub: &Hub) -> std::collections::HashMap<String, Vec<super::kinds::KindInfo>> {
+    let mut all = hub.harness.kinds();
+    for (target, kinds) in &mut all {
+        if !matches!(engine_at(hub, target), Ok(Engine::Microvm)) {
+            continue;
+        }
+        for k in kinds.iter_mut().filter(|k| crate::agentfiles::builtin::ALL.iter().any(|b| b.harness == k.id)) {
+            k.available = true;
+        }
+    }
+    all
+}
+
 /// The container a new conversation on `target` is held in (docs/agentic.md W9): its runner's image where its engine is
 /// `container`, else none. A `container` runner that names no image (its facts say its agents can run in containers only
 /// with one) is refused, never run on its host unasked.
@@ -2921,6 +2940,53 @@ mod tests {
             anyhow::ensure!(!hub.harness.lacks("agent:new", "devin") && !hub.harness.lacks("agent:box", "devin") && hub.harness.lacks("agent:box", "codex"));
             hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
             anyhow::ensure!(!hub.harness.lacks("agent:studio", "devin"), "tests' sessions run no harness, whatever the machine has");
+            Ok(())
+        })
+    }
+
+    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d ("Every kiln harness in Shards microVMs"), as Macs holding microVMs ran it
+    /// on 2026-11-20: the start form offers, on a runner whose engine is `microvm`, every harness kiln ships an Agentfile for,
+    /// installed on its host or not, and on a runner running its sessions on its host, or one that hasn't said, only what
+    /// its host has.
+    #[test]
+    fn a_runner_holding_microvms_offers_every_harness_kiln_ships_an_agentfile_for() -> anyhow::Result<()> {
+        use kiln_ci::facts::RunnerFacts;
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let installed = ["claude", "codex"];
+            let offering = || {
+                super::super::kinds::offered()
+                    .into_iter()
+                    .map(|mut k| {
+                        k.available = installed.contains(&k.id.as_str());
+                        k
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let facts = |engine: Engine| RunnerFacts {
+                isolation: Some(kiln_ci::facts::Isolation { available: engine == Engine::Microvm, hypervisor: Some("Hypervisor.framework".into()), engine: Some(engine), ..kiln_ci::facts::Isolation::default() }),
+                virt: kiln_ci::facts::Virt { microvm: engine == Engine::Microvm, ..kiln_ci::facts::Virt::default() },
+                ..RunnerFacts::default()
+            };
+            for (name, facts) in [("mbp", Some(facts(Engine::Microvm))), ("studio", Some(facts(Engine::Host))), ("silent", None)] {
+                hub.put_agent(crate::hub::AgentLive { facts: facts.map(Box::new), ..crate::hub::tests::live_runner(name, "macos", "aarch64") });
+                hub.harness.set_kinds(&format!("agent:{name}"), offering());
+            }
+            hub.harness.set_kinds("local", offering());
+            let all = startable_kinds(&hub);
+            let offered = |target: &str| -> Vec<String> { all.get(target).into_iter().flatten().filter(|k| k.available).map(|k| k.id.clone()).collect() };
+            let shipped: Vec<&str> = crate::agentfiles::builtin::ALL.iter().map(|b| b.harness).collect();
+            for harness in ["codex", "antigravity", "pi", "devin", "cursor"] {
+                anyhow::ensure!(shipped.contains(&harness), "kiln ships no Agentfile for {harness}");
+            }
+            let microvm = offered("agent:mbp");
+            for harness in &shipped {
+                anyhow::ensure!(microvm.iter().any(|k| k == harness), "a runner holding microVMs didn't offer {harness}: {microvm:?}");
+            }
+            for target in ["agent:studio", "agent:silent", "local"] {
+                anyhow::ensure!(offered(target) == installed, "{target} offered {:?}, not what its host has", offered(target));
+            }
+            anyhow::ensure!(hub.harness.kinds().get("agent:mbp").is_some_and(|ks| ks.iter().filter(|k| k.available).count() == installed.len()), "what the runner said it has installed changed");
             Ok(())
         })
     }
