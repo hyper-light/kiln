@@ -826,6 +826,47 @@ fn runs_on(target: &str, bytes: &[u8]) -> bool {
     }
 }
 
+/// The least a kiln binary can be: a release is ~600 MB, a lab's build without its UI server or
+/// Shards still far more than this (`ci/release/build.sh`'s `KILN_MIN_BINARY` is the same floor).
+pub const MIN_BINARY: u64 = 8 << 20;
+
+/// Why the file at `path` isn't a whole kiln for this machine, read from its size and first bytes:
+/// at least [`MIN_BINARY`] bytes and this platform's executable header ([`runs_on`]).
+pub(crate) fn not_whole(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let size = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(e) => return Some(format!("{} can't be read: {e}", path.display())),
+    };
+    if size < MIN_BINARY {
+        return Some(format!("{} is {size} bytes, less than any kiln ({MIN_BINARY})", path.display()));
+    }
+    let mut head = [0u8; MAGIC];
+    if std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_err() || !runs_on(crate::api::TARGET, &head) {
+        return Some(format!("{} isn't a {} program", path.display(), crate::api::TARGET));
+    }
+    None
+}
+
+/// Whether the file at `path` is a whole kiln this machine can run, asked before anything takes it
+/// up (an upgrade's download, signed and about to be put in place; the binary a supervisor finds
+/// changed on disk): whole ([`not_whole`]), and its `--version` answers as kiln's. Why not, when it
+/// isn't. An empty build was installed on a Mac on 2026-11-21, and its runner never came back.
+pub async fn whole_kiln(path: &Path) -> Result<(), String> {
+    let p = path.to_path_buf();
+    if let Some(why) = crate::rt::blocking(move || not_whole(&p)).await.map_err(|e| format!("{e:#}"))? {
+        return Err(why);
+    }
+    let mut cmd = std::process::Command::new(path);
+    cmd.arg("--version").stdin(std::process::Stdio::null());
+    let out = crate::proc::output(cmd, Duration::from_secs(30)).await.map_err(|e| format!("{} --version didn't run: {e:#}", path.display()))?;
+    let said = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() || !said.trim_start().starts_with("kiln ") {
+        return Err(format!("{} --version didn't answer as kiln ({}): {}", path.display(), out.status, said.trim().chars().take(200).collect::<String>()));
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------ every platform in step
 
 /// How often the other platforms' binaries are checked against the server's commit.
@@ -2742,6 +2783,11 @@ pub async fn fetch_build(http: &crate::http::client::Client, server_url: &str, o
         if let Err(e) = crate::os::macsign::sign_as(&part, &exe, &build) {
             tracing::warn!(error = %format!("{e:#}"), "couldn't sign the new build: macOS may ask again before it reaches the server");
         }
+        // Whole and runnable as it'll be put in place, its signing done: never one that isn't.
+        if let Err(why) = whole_kiln(&part).await {
+            let _ = std::fs::remove_file(&part);
+            anyhow::bail!("the new build isn't a whole kiln, so it isn't taken up: {why}");
+        }
         std::fs::rename(&part, &exe).with_context(|| format!("keep {}", exe.display()))?;
         Ok((exe, build))
     }
@@ -2770,6 +2816,11 @@ async fn upgrade_here(http: &crate::http::client::Client, server_url: &str, orde
     let say = |line: String| up.say(AgentMsg::UpgradeLog { job: order.job.to_owned(), line });
     let (bin, log_path) = upgrade_files(own_dir);
     download_verified(http, server_url, order, &bin, up).await?;
+    // Whole and runnable before it installs itself over this runner: never one that isn't.
+    if let Err(why) = whole_kiln(&bin).await {
+        let _ = std::fs::remove_file(&bin);
+        anyhow::bail!("the new build isn't a whole kiln, so it isn't installed: {why}");
+    }
     say(format!("kiln install --agent --upgrade --service {service}"));
 
     // Its output goes to a file, not a pipe: a runner that takes the binary in place re-executes
@@ -2944,6 +2995,25 @@ pub async fn outpost_build() -> AgentMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty build was installed on a Mac (2026-11-21) and its runner never came back: nothing
+    /// takes up a kiln that isn't whole. Empty, or as long as one but not its platform's program,
+    /// it's refused; this test's own executable (a whole program of this platform, longer than any
+    /// floor) passes the reading of its size and header.
+    #[test]
+    fn an_empty_or_foreign_build_is_never_a_whole_kiln() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let empty = dir.path().join("kiln");
+        std::fs::write(&empty, b"")?;
+        anyhow::ensure!(not_whole(&empty).is_some_and(|why| why.contains("0 bytes")), "{:?}", not_whole(&empty));
+        let foreign = dir.path().join("zeros");
+        std::fs::write(&foreign, vec![0u8; usize::try_from(MIN_BINARY)?])?;
+        anyhow::ensure!(not_whole(&foreign).is_some_and(|why| why.contains("isn't a")), "{:?}", not_whole(&foreign));
+        anyhow::ensure!(not_whole(&dir.path().join("missing")).is_some());
+        let me = std::env::current_exe()?;
+        anyhow::ensure!(not_whole(&me).is_none(), "{:?}", not_whole(&me));
+        Ok(())
+    }
 
     /// An upgrade's progress never waits on a full uplink (adacachy's sat 40 minutes after its
     /// download, its build never started), and the upgrade under way is over once it ends, so the
