@@ -253,10 +253,29 @@ jobs:
       # runner out (the linux job).
       - name: Build kiln with vendor/slates
         run: cargo build -p kiln --locked
-      - name: kiln's Slates tests (library)
-        run: cargo test -p kiln --locked --lib -- workspace::slates
-      - name: kiln's Slates tests (vendored, slates_roles)
-        run: cargo test -p kiln --locked --test vendored --test slates_roles
+      - id: lib
+        name: kiln's Slates tests (library)
+        run: cargo test -p kiln --locked --lib -- workspace::slates 2>&1 | tee "$RUNNER_TEMP/lib.txt"
+      - id: roles
+        name: kiln's Slates tests (vendored, slates_roles)
+        run: cargo test -p kiln --locked --test vendored --test slates_roles 2>&1 | tee "$RUNNER_TEMP/roles.txt"
+      # A run's logs take a GitHub sign-in to read; its annotations don't (the `build` job's Report). Run
+      # 44841298533's windows-11-arm leg failed its integration tests with exit 101 and nothing else to read.
+      - name: Report
+        if: ${{ failure() }}
+        env:
+          OUTCOMES: lib=${{ steps.lib.outcome }} roles=${{ steps.roles.outcome }}
+        run: |
+          set +e +o pipefail
+          for said in $OUTCOMES; do
+            step=${said%%=*} outcome=${said#*=}
+            out="$RUNNER_TEMP/$step.txt"
+            if [ "$outcome" = success ] || [ ! -s "$out" ]; then continue; fi
+            # The failed tests' own output (cargo's `---- name stdout ----` sections) and the summary; else the end.
+            text=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | awk '/^---- / { f = 1 } /^(failures:|test result:|error)/ { f = 1 } f' | head -n 200)
+            [ -n "$text" ] || text=$(sed -e 's/\r$//' "$out" | tail -n 60)
+            echo "::error title=${{ matrix.os }} $step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
+          done
 
   # Goal 3 step 1 and goal 8 step 4, on Windows itself (the `build` job only builds there, and the
   # release's Windows binary is cross-built with zig): the compute pool's threads run below normal,
