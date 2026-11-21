@@ -367,6 +367,13 @@ pub enum AgentMsg {
     /// superseded (docs/agentic.md W10). Only to a server that named [`feature::RUNNER_ROLE`]. Appended last, after
     /// `Prebuilt`: postcard encodes variants by index.
     RunnerRole { serial: String },
+    /// A message routed to this runner ([`ServerMsg::HarnessSend`] whose JSON carries its `route`) for session
+    /// `session`, which it doesn't hold: it moved on, or was never here (docs/sends.md, "Routed to its session"; Ada,
+    /// 2026-11-20). Sent on, its route a hop further (`crate::harness::route::Route::onward`), in place of a
+    /// `no_session` refusal: the server sends it to where the session is now, whose inbox answers its sender. `epoch`
+    /// is the one it was sent for. Only for a message that came with a route, which only a server that named
+    /// [`feature::MAIL_ROUTE`] sends. Appended last, after `RunnerRole`: postcard encodes variants by index.
+    HarnessForward { session: String, epoch: u64, json: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -865,7 +872,15 @@ pub mod feature {
     /// exported to the folder's owner, and the questions about that session's folder answered from it. Only a runner that
     /// named it is asked to hold one.
     pub const WORKSPACE_HOLD: &str = "workspace.hold";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD];
+    /// Messages go to the runner their session is on, and are taken into custody there (docs/sends.md, "Routed to its
+    /// session"; Ada, 2026-11-20). A runner that names it takes a message routed to it (`route` beside the command in
+    /// [`super::ServerMsg::HarnessSend`]'s JSON: its target, its sender, its hops) into its session's own inbox at once,
+    /// and admits it there itself; one for a session it doesn't hold it sends on ([`super::AgentMsg::HarnessForward`]).
+    /// A server that names it sends such a runner a person's and an agent's message at once, with its route, and keeps
+    /// none of it: it holds one in its own custody (W20's) for a runner that didn't name it, or one that's away, and holds
+    /// kiln's own there still (docs/sends.md, "What's open").
+    pub const MAIL_ROUTE: &str = "mail-route";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD, MAIL_ROUTE];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -2158,8 +2173,9 @@ mod tests {
         // kiln plan 01a1dd2e… P4.5 an Agentfile's build ahead of its sessions, Prebuild (84), and where it is, Prebuilt (73);
         // kiln plan 01a1dd2e… P6.2 an agent's volumes on a runner, Volumes (85); docs/agents.md "Environments" a
         // runner's user's variables, UserEnv (86); docs/agentic.md W10 a runner's certificate reissued in its role and its
-        // word it took it, RunnerRole (87 and 74).
-        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (75, 88), "each table has every variant once");
+        // word it took it, RunnerRole (87 and 74); docs/sends.md "Routed to its session" a routed message a runner doesn't
+        // hold the session of, sent on, HarnessForward (75).
+        assert_eq!((crate::wire::agent_classes().len(), crate::wire::server_classes().len()), (76, 88), "each table has every variant once");
         assert!(CAP_UNREAD.is_power_of_two() && CAP_UNREAD == 1 << 41 && CAP_UNREAD & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH) == 0);
         assert!(CAP_WORKSPACE_COMMITS.is_power_of_two() && CAP_WORKSPACE_COMMITS == 1 << 42 && CAP_WORKSPACE_COMMITS & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD) == 0);
         assert!(CAP_WORKSPACE_COMPARE.is_power_of_two() && CAP_WORKSPACE_COMPARE == 1 << 43 && CAP_WORKSPACE_COMPARE & (CAP_WIRE | CAP_NET_DROPS | CAP_INBOX | CAP_HANDOVER | CAP_WORK | CAP_AGENT_LIMIT | CAP_IDENTITY | CAP_HEADROOM | CAP_CHANGES_PATCH | CAP_UNREAD | CAP_WORKSPACE_COMMITS) == 0);
@@ -2368,6 +2384,7 @@ mod tests {
             ("HarnessMailTransfer", AgentMsg::HarnessMailTransfer { json: "{}".into() }),
             ("Prebuilt", AgentMsg::Prebuilt { json: "{}".into() }),
             ("RunnerRole", AgentMsg::RunnerRole { serial: "00".into() }),
+            ("HarnessForward", AgentMsg::HarnessForward { session: "s1".into(), epoch: 1, json: "{}".into() }),
         ];
         let mut last = 63u8;
         for (name, m) in agent {

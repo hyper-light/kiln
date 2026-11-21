@@ -307,11 +307,22 @@ async fn send(cx: Cx, v: Value) -> Out {
     let owner = mail_owner(&cx).await;
     let sender = key_scope(&cx.caller);
     let provenance = relayed.map(|(relayed, seq, digest)| json!({"relayed": relayed, "seq": seq, "digest": digest}));
-    // Fault injection belongs after durable custody, at wire delivery. The ledger keeps these
-    // exact original words and their original proof, even when a test corrupts the transmission.
-    let receipt = cx.hub.harness.command_published(&cx.hub, &id, command, provenance, owner, sender, status).await.map_err(mail_failed)?;
+    // Routed to its session where its holder takes messages so (docs/sends.md, "Routed to its session"): the answer of
+    // its inbox there. Else into the server's custody, as before routing. Fault injection belongs after custody, at
+    // wire delivery: the ledger, or the route, carries these exact original words and their original proof, even when
+    // a test corrupts the transmission.
+    let sent = cx.hub.harness.command_sent(&cx.hub, &id, command, provenance, owner, sender, status).await;
+    let answer = match sent {
+        super::registry::Sent::Published(receipt) => publication_answer(&receipt),
+        super::registry::Sent::PublicationRefused(error) => Err(mail_failed(error)),
+        super::registry::Sent::Accepted(a) => Ok(super::registry::accepted(&message, &a)),
+        // On its way: its inbox's answer didn't come in time.
+        super::registry::Sent::Ok => Ok(json!({"sent": true, "message": message})),
+        super::registry::Sent::Refused(r) => Err(refused(&r)),
+        other => Err(other.failure().unwrap_or((StatusCode::CONFLICT, "its runner refused it".to_owned()))),
+    }?;
     wait::sent(&id, info.last_turn.as_ref().map(|t| t.at));
-    publication_answer(&receipt)
+    Ok(answer)
 }
 
 fn publication_answer(receipt: &super::mail::Receipt) -> Out {

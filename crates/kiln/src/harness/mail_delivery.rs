@@ -176,7 +176,7 @@ async fn drain_recipient(hub: &Arc<Hub>, recipient: &str) -> Result<(), Error> {
     {
         let mut after = 0;
         loop {
-            let page = mail::attempts(&hub.store, recipient.to_owned(), after, super::state_view::FRAME).await?;
+            let page = mail::attempts(&hub.store, recipient.to_owned(), Some(connection.clone()), after, super::state_view::FRAME).await?;
             for delivery in page.items {
                 if delivery.epoch != current.epoch { continue; }
                 let revision = delivery.token.revision;

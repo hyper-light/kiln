@@ -134,6 +134,14 @@ pub struct SearchFrom {
     pub rowid: i64,
 }
 
+/// A page of a family's inbox rows ([`Engine::inbox_scan`]): each `(key, value, number)`, and whether more follow.
+pub type InboxPage = (Vec<(Vec<u8>, Vec<u8>, u64)>, bool);
+
+/// What an engine that keeps no inbox says when asked for it.
+fn no_inbox() -> anyhow::Error {
+    anyhow::anyhow!("this conversation store keeps no inbox")
+}
+
 /// A row as a feed sends it: its number in the store it is from, and its session's epoch there.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Change {
@@ -231,7 +239,8 @@ pub trait Engine: Send + 'static {
     /// The rows written after number `from`, as they are now, oldest first, about `max_bytes`.
     /// `kept`: record lines as they are kept ([`RecordRow::kept`](super::rows::RecordRow::kept)),
     /// for a taker that takes them so; else as text.
-    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool) -> anyhow::Result<Changes>;
+    /// `inbox`: the sessions' inbox rows too ([`Row::Inbox`]), for a taker that takes them; else read past.
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes>;
     /// Take a batch of `peer`'s feed, which follows number `from` of it, in one transaction:
     /// numbered here as this store's own writes, a session's rows from its latest writer alone.
     /// `machine`: the machine of the feed, where the sessions it brings run (None: its rows say,
@@ -281,6 +290,32 @@ pub trait Engine: Send + 'static {
     /// Where its file stands, for its telemetry: cheap (the file's header, its log's size), as
     /// the writer looks every few seconds. `count`: its sessions counted too.
     fn look(&mut self, count: bool) -> anyhow::Result<Look>;
+    /// A row of a session's inbox and journal (`super::inbox`; migration 5): its value and the number of the write
+    /// that last wrote it. None: there's none, or it was deleted.
+    fn inbox_get(&mut self, family: &str, key: &[u8]) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
+        let _ = (family, key);
+        Err(no_inbox())
+    }
+    /// A family's rows of the inbox in key order: those starting with `prefix`, past `after`, at most `limit`, and
+    /// whether more follow.
+    fn inbox_scan(&mut self, family: &str, prefix: &[u8], after: Option<&[u8]>, limit: usize) -> anyhow::Result<InboxPage> {
+        let _ = (family, prefix, after, limit);
+        Err(no_inbox())
+    }
+    /// Inbox commits queued together (`(tx, sessions)`: `sessions[i]` whose write `i` is), in one transaction synced
+    /// past the drive's cache, in order: each its writes under a new number of its own, and that number; or the first of
+    /// its conditions that didn't hold (`Refusal::Conflict`), nothing of it written (those before and after it go on).
+    /// One with no writes commits nothing and answers the last number.
+    fn inbox_commit_batch(&mut self, batch: &[(&kiln_seams::records::Tx, &[String])]) -> anyhow::Result<Vec<Result<u64, kiln_seams::records::Refusal>>> {
+        let _ = batch;
+        Err(no_inbox())
+    }
+    /// The store's numbers go on from past `rev` at least: an inbox brought here from a file of its own keeps its
+    /// takes' numbers rising.
+    fn inbox_floor(&mut self, rev: u64) -> anyhow::Result<()> {
+        let _ = rev;
+        Err(no_inbox())
+    }
     /// Ready to be let go ([`Store::close`]): everything written goes into the file itself, its
     /// log emptied, for another process to open it next; a compaction under way stops, its copy
     /// gone (it would stay behind as the file moves).
@@ -372,9 +407,20 @@ fn read_on(mut reader: Box<dyn Read + Send>, rx: &mpsc::Receiver<ReadMsg>) {
     }
 }
 
+/// An inbox commit waiting for the writer ([`Store::inbox_commit`]): committed with those queued beside it.
+struct InboxJob {
+    tx: kiln_seams::records::Tx,
+    sessions: Vec<String>,
+    /// What its bytes are charged to: let go of once the writer is done with it.
+    owner: Option<Box<dyn Send + Sync>>,
+    reply: futures::channel::oneshot::Sender<anyhow::Result<Result<u64, kiln_seams::records::Refusal>>>,
+}
+
 enum Msg {
     /// Rows, and the bytes [`Queue`] counts them at.
     Rows(Vec<Row>, usize),
+    /// A commit to the sessions' inboxes: those that come together go in one transaction, one sync.
+    Inbox(Box<InboxJob>),
     /// Run on the engine, between commits (whatever was sent before it is committed first).
     Run(Job),
     /// Commit what was sent before, let go of the file ([`Engine::release`]) and stop.
@@ -671,6 +717,57 @@ impl Store {
         }
     }
 
+    /// [`Store::run`], awaited: the caller's shard is never held while the writer works (`READ_WAIT` at most).
+    async fn run_async<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+        let (rtx, rrx) = futures::channel::oneshot::channel();
+        self.tx
+            .send(Msg::Run(Box::new(move |e| {
+                let _ = rtx.send(f(e));
+            })))
+            .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
+        match crate::rt::timeout(READ_WAIT, rrx).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(anyhow::anyhow!("the conversation store has stopped")),
+            Err(_) => {
+                self.meter.timed_out();
+                Err(anyhow::anyhow!("the conversation store didn't answer in time"))
+            }
+        }
+    }
+
+    /// A row of a session's inbox and journal ([`Engine::inbox_get`]), read on the writer: what the inbox reads to
+    /// decide a commit must be every commit before it (`Consistency::Linearizable`), which a reader beside the writer
+    /// may not have seen yet.
+    pub async fn inbox_get(&self, family: String, key: Vec<u8>) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
+        self.run_async(move |e| e.inbox_get(&family, &key)).await
+    }
+
+    /// A family's inbox rows in key order ([`Engine::inbox_scan`]), read on the writer as [`Store::inbox_get`] is.
+    pub async fn inbox_scan(&self, family: String, prefix: Vec<u8>, after: Option<Vec<u8>>, limit: usize) -> anyhow::Result<InboxPage> {
+        self.run_async(move |e| e.inbox_scan(&family, &prefix, after.as_deref(), limit)).await
+    }
+
+    /// `tx` committed to the inbox on the writer, after what was sent before it ([`Engine::inbox_commit`]), synced past
+    /// the drive's cache before it's answered; `owner` (what the commit's bytes are charged to) let go of once the
+    /// writer is done with it. Its feed is told.
+    pub async fn inbox_commit(&self, tx: kiln_seams::records::Tx, sessions: Vec<String>, owner: Option<Box<dyn Send + Sync>>) -> anyhow::Result<Result<u64, kiln_seams::records::Refusal>> {
+        let (reply, answer) = futures::channel::oneshot::channel();
+        self.tx.send(Msg::Inbox(Box::new(InboxJob { tx, sessions, owner, reply }))).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
+        match crate::rt::timeout(READ_WAIT, answer).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(anyhow::anyhow!("the conversation store has stopped")),
+            Err(_) => {
+                self.meter.timed_out();
+                Err(anyhow::anyhow!("the conversation store didn't answer in time"))
+            }
+        }
+    }
+
+    /// The store's numbers go on from past `rev` at least ([`Engine::inbox_floor`]).
+    pub async fn inbox_floor(&self, rev: u64) -> anyhow::Result<()> {
+        self.run_async(move |e| e.inbox_floor(rev)).await
+    }
+
     /// Run `f` on the reader beside the writer, at the last commit ([`Read`]): never behind what was sent before it,
     /// for what asks for what's committed (an older page; plan 01a1cc09, step 2). A store with no reader
     /// (or whose reader stopped) runs it on the writer, after what was sent. Blocking, for `READ_WAIT` at most.
@@ -791,13 +888,13 @@ impl Store {
     /// The rows written after number `from`, about `max_bytes` of them, record lines as text.
     /// Blocking.
     pub fn changes(&self, from: u64, max_bytes: usize) -> anyhow::Result<Changes> {
-        self.changes_as(from, max_bytes, false)
+        self.changes_as(from, max_bytes, false, true)
     }
 
     /// [`Store::changes`], record lines as they are kept when `kept` ([`Engine::changes`]).
     /// Blocking.
-    pub fn changes_as(&self, from: u64, max_bytes: usize, kept: bool) -> anyhow::Result<Changes> {
-        self.run(move |e| e.changes(from, max_bytes, kept))
+    pub fn changes_as(&self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
+        self.run(move |e| e.changes(from, max_bytes, kept, inbox))
     }
 
     /// Take a batch of `peer`'s feed (it follows `from`; `machine` as for [`Engine::take`]).
@@ -951,6 +1048,40 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
             notify(watchers);
         }
     };
+    // The inbox commits that came in this pass, as one transaction (one sync for all of them), each answered.
+    let commit_inbox = |engine: &mut Box<dyn Engine>, jobs: &mut Vec<Box<InboxJob>>| {
+        if jobs.is_empty() {
+            return;
+        }
+        let taken = std::mem::take(jobs);
+        let done = {
+            let batch: Vec<(&kiln_seams::records::Tx, &[String])> = taken.iter().map(|j| (&j.tx, j.sessions.as_slice())).collect();
+            engine.inbox_commit_batch(&batch)
+        };
+        let wrote = matches!(&done, Ok(results) if results.iter().any(Result::is_ok));
+        match done {
+            Ok(results) => {
+                for (job, result) in taken.into_iter().zip(results) {
+                    let InboxJob { tx, owner, reply, .. } = *job;
+                    drop((tx, owner));
+                    let _ = reply.send(Ok(result));
+                }
+            }
+            Err(e) => {
+                let why = format!("{e:#}");
+                tracing::warn!(error = %why, commits = taken.len(), "conversation store: the sessions' inbox commits couldn't be written");
+                for job in taken {
+                    let InboxJob { tx, owner, reply, .. } = *job;
+                    drop((tx, owner));
+                    let _ = reply.send(Err(anyhow::anyhow!("{why}")));
+                }
+            }
+        }
+        if wrote {
+            notify(watchers);
+        }
+    };
+    let mut inbox: Vec<Box<InboxJob>> = Vec::new();
     loop {
         let idle = if squeezing || looking || compacting.is_some() { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY).min(LOOK_FILE) };
         // Nothing waits here between commits (each takes all there is), so the writer waits on its channel: the first of
@@ -974,12 +1105,15 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             #[cfg(test)]
                             queue.took_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
                         }
+                        Msg::Inbox(job) => inbox.push(job),
                         Msg::Run(f) => {
+                            commit_inbox(&mut engine, &mut inbox);
                             commit(&mut engine, &mut pending, &mut pending_bytes);
                             f(engine.as_mut());
                             meter.ran();
                         }
                         Msg::Close(reply) => {
+                            commit_inbox(&mut engine, &mut inbox);
                             commit(&mut engine, &mut pending, &mut pending_bytes);
                             // Its files closed before it says so, its reader's first: whoever moves them next finds them
                             // let go of.
@@ -997,6 +1131,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                     }
                     next = rx.try_recv().ok();
                 }
+                commit_inbox(&mut engine, &mut inbox);
                 commit(&mut engine, &mut pending, &mut pending_bytes);
             }
             // Nothing waits (each commit took all there was): the file's upkeep.
@@ -1167,6 +1302,15 @@ impl Held {
         *k = Keeping::Store(store);
     }
 
+    /// The store it keeps in now, if it has been given one and it wasn't taken away: what each session's inbox and
+    /// journal are kept in too (`super::inbox`).
+    pub fn current(&self) -> Option<Store> {
+        match &*self.keeping.lock().unwrap_or_else(PoisonError::into_inner) {
+            Keeping::Store(st) => Some(st.clone()),
+            Keeping::Waiting(_) | Keeping::Gone => None,
+        }
+    }
+
     /// The store, taken away: everything sent through the tee before is in it (each update is kept as it's sent), and what
     /// passes after goes nowhere. None: it had none.
     pub fn take(&self) -> Option<Store> {
@@ -1232,8 +1376,8 @@ impl Engine for SlowToLetGo {
     fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
         self.inner.search_some(q, from, rows, want)
     }
-    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool) -> anyhow::Result<Changes> {
-        self.inner.changes(from, max_bytes, kept)
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
+        self.inner.changes(from, max_bytes, kept, inbox)
     }
     fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took> {
         self.inner.take(peer, machine, from, batch)
@@ -1385,7 +1529,7 @@ mod tests {
         runner.send("a1", &update);
         runner.sync()?;
         anyhow::ensure!(runner.grown() == bytes, "a commit's rows: {} against {bytes}", runner.grown());
-        let batch = runner.changes_as(0, 1 << 20, false)?;
+        let batch = runner.changes_as(0, 1 << 20, false, true)?;
         let brought = batch_bytes(&batch);
         anyhow::ensure!(brought > 0, "a batch of what it committed");
         let took = server.take("runner", Some("box"), 0, batch.clone())?;
