@@ -12,7 +12,9 @@
 //!    checkout of kiln is needed anywhere: who builds is decided by the tools a machine has (cargo
 //!    and node, as its facts report them). A runner that has them builds the commit itself and
 //!    installs that build. A Mac hands its binary back, so the other Macs download it instead of
-//!    building; a Linux build links the machine's own C library, so it is that machine's alone.
+//!    building; a Windows machine builds in Git Bash and hands its binary back too (its C runtime
+//!    linked in), which it and the other Windows machines download; a Linux build links the
+//!    machine's own C library, so it is that machine's alone.
 //! 3. A Mac that can't build kiln itself (one without developer tools) gets its build over the
 //!    wire: another Mac with the tools builds the commit natively, else a Linux machine cross-builds
 //!    it (`ci/release/build.sh`: zig, against the macOS stubs). The binary comes back to the server
@@ -65,6 +67,9 @@ const CANT_BUILD_MARK: &str = "KILN-CANT-BUILD";
 
 /// The tools a machine builds kiln with natively, as its facts name them (npm comes with node).
 const NATIVE_TOOLS: [&str; 2] = ["cargo", "node"];
+/// The tools a Windows machine builds kiln with natively: its build script runs in Git Bash, which
+/// comes with git (as `.kiln/release.yaml`'s Shards for Windows does).
+const WINDOWS_TOOLS: [&str; 3] = ["cargo", "node", "git"];
 /// The tools a Linux machine cross-builds kiln for a Mac with: `ci/release/build.sh` fetches its
 /// own zig with python3.
 const CROSS_TOOLS: [&str; 3] = ["cargo", "node", "python3"];
@@ -583,10 +588,21 @@ pub fn platform_job(target: &str) -> &'static str {
 }
 
 /// Whether a build for `target` serves every machine of that platform, so it's kept here and can be
-/// made on another machine: a Mac's does (natively on a Mac, or cross-built on Linux); a Linux
+/// made on another machine: a Mac's does (natively on a Mac, or cross-built on Linux), and so does a
+/// Windows machine's (natively on Windows, its C runtime linked in: [`build_script`]); a Linux
 /// machine's links its own C library, so it is that machine's alone.
 fn shared(target: &str) -> bool {
-    target.ends_with("-apple-darwin")
+    target.ends_with("-apple-darwin") || on_windows(target)
+}
+
+/// Whether `target` is a Windows machine's.
+fn on_windows(target: &str) -> bool {
+    target.contains("-windows-")
+}
+
+/// The tools a machine whose builds are for `target` builds kiln with natively.
+fn native_tools(target: &str) -> &'static [&'static str] {
+    if on_windows(target) { &WINDOWS_TOOLS } else { &NATIVE_TOOLS }
 }
 
 /// Which of `need` aren't among `tools` (a machine's facts: name → version).
@@ -600,18 +616,20 @@ fn cant_build(hub: &Hub, machine: &str) -> Option<String> {
 }
 
 /// Whether `r` builds kiln itself: it has the tools to (its facts say so; no checkout of kiln is
-/// needed: the source comes from the server); else why not.
+/// needed: the source comes from the server); else why not. Whatever its platform, kiln has a build
+/// for: a Windows machine too (the person's word, 2026-11-21: only Linux and macOS was a limit of
+/// kiln's own making).
 pub(crate) fn builds_itself(hub: &Hub, r: &RunnerInfo) -> Result<(), String> {
-    if r.os != "linux" && r.os != "macos" {
-        return Err("kiln builds itself only on Linux and macOS".to_owned());
-    }
+    let Some(target) = r.target.as_deref() else {
+        return Err(format!("kiln has no build for {} on {}", r.os, r.arch));
+    };
     if !r.terminal {
         return Err("terminals are turned off on it, and a build runs in one".to_owned());
     }
     if let Some(why) = cant_build(hub, &r.name) {
         return Err(why);
     }
-    let missing = hub.agents.load().get(&r.name).and_then(|a| a.facts.as_ref().map(|f| lacks(&f.tools, &NATIVE_TOOLS)));
+    let missing = hub.agents.load().get(&r.name).and_then(|a| a.facts.as_ref().map(|f| lacks(&f.tools, native_tools(target))));
     match missing {
         Some(m) if m.is_empty() => Ok(()),
         Some(m) => Err(format!("it has no {} to build kiln with", m.join(" or "))),
@@ -636,7 +654,8 @@ struct Candidate {
 
 /// Of `candidates`, the one to build kiln for `target`, and whether it cross-builds: a machine of
 /// that platform with the tools builds natively; a Linux machine with the tools cross-builds a
-/// Mac's (`ci/release/build.sh`). One `within` the target use first (`[ci.scheduler] target_use`,
+/// Mac's (`ci/release/build.sh`), never a Windows machine's (the Shards it carries is built on
+/// Windows: crates/kiln/build.rs). One `within` the target use first (`[ci.scheduler] target_use`,
 /// how full placement fills a machine, derived for each unless set; one that hasn't sampled counts
 /// as within it), then natively before cross-built, then the emptiest, then by name: a Mac past it
 /// gives way to a Linux machine within it.
@@ -644,9 +663,9 @@ fn pick(target: &str, candidates: &[Candidate], within: impl Fn(&Candidate) -> b
     candidates
         .iter()
         .filter_map(|c| {
-            if c.target.as_deref() == Some(target) && lacks(&c.tools, &NATIVE_TOOLS).is_empty() {
+            if c.target.as_deref() == Some(target) && lacks(&c.tools, native_tools(target)).is_empty() {
                 Some((c, false))
-            } else if shared(target) && c.os == "linux" && lacks(&c.tools, &CROSS_TOOLS).is_empty() {
+            } else if target.ends_with("-apple-darwin") && c.os == "linux" && lacks(&c.tools, &CROSS_TOOLS).is_empty() {
                 Some((c, true))
             } else {
                 None
@@ -1020,6 +1039,7 @@ pub fn build_script(sc: &Script<'_>) -> String {
     let fail = crate::updates::FAIL_MARK;
     let hidden = crate::updates::HIDDEN_MARK;
     let (job, token, commit, target) = (sc.job, sc.token, sc.commit, sc.target);
+    let windows = on_windows(target);
     let s = short(commit);
     let bases = sc.bases.join(" ");
     let (tools, what) = if sc.cross { ("cargo npm tar curl rustup python3", "ci/release/build.sh") } else { ("cargo npm tar curl", "cargo") };
@@ -1057,15 +1077,21 @@ echo "cross-building kiln {s} for {target} with $(cargo --version 2>/dev/null): 
             format!("$dir/dist-{job}/kiln-{target}"),
         )
     } else {
+        // A Windows machine's build links its C runtime in, so it runs on every Windows machine
+        // (`shared`), whatever runtime each has installed.
+        let crt = if windows { format!(r#"CARGO_TARGET_{}_RUSTFLAGS="-C target-feature=+crt-static" "#, target.to_ascii_uppercase().replace('-', "_")) } else { String::new() };
         (
             format!(
                 r#"echo "building kiln {s} with $($cargo --version 2>/dev/null)"
-{{ MACOSX_DEPLOYMENT_TARGET=11.0 KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" nice -n 10 $cargo build --release --locked -p kiln; echo "$?" >"$dir/rc-{job}"; }} 2>&1 | tee "$log""#
+{{ {crt}MACOSX_DEPLOYMENT_TARGET=11.0 KILN_COMMIT={commit} CARGO_TARGET_DIR="$dir/target" nice -n 10 $cargo build --release --locked -p kiln; echo "$?" >"$dir/rc-{job}"; }} 2>&1 | tee "$log""#
             ),
-            "$dir/target/release/kiln".to_owned(),
+            format!("$dir/target/release/kiln{}", if windows { ".exe" } else { "" }),
         )
     };
-    let post = format!(r#"curl -fsS -X POST -H "Authorization: Bearer {token}" -H "Content-Type: application/octet-stream" --data-binary @"$bin" "$base/api/updates/jobs/{job}/binary?sha256=$sum" >/dev/null"#);
+    // In Git Bash a path is a Windows program's (curl's) only as an argument of its own: `-T` names
+    // the binary so, where `@<path>` would reach curl unconverted.
+    let body = if windows { r#"-T "$bin""# } else { r#"--data-binary @"$bin""# };
+    let post = format!(r#"curl -fsS -X POST -H "Authorization: Bearer {token}" -H "Content-Type: application/octet-stream" {body} "$base/api/updates/jobs/{job}/binary?sha256=$sum" >/dev/null"#);
     let hand_back = match (sc.keep, sc.install) {
         (true, Some(_)) => format!(
             r#"if {post}; then
@@ -1165,7 +1191,9 @@ echo "{BUILT_MARK} $sum"
 
 /// Start upgrading `r` to `commit` by a build of it (`by`: who asked, for the audit log): `b`
 /// makes it from the server's source, on `r` itself, which installs it; or on another machine,
-/// which hands the binary back to the server for `r` to download, in the same job. Nothing either
+/// which hands the binary back to the server for `r` to download, in the same job. A Windows
+/// machine's own build goes back to the server too, and its runner takes it as it takes any
+/// upgrade, by download, rather than from a script in the build's terminal. Nothing either
 /// machine runs is stopped.
 pub async fn build(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, b: &Builder, by: &str) -> anyhow::Result<Job> {
     let target = r.target.clone().ok_or_else(|| anyhow::anyhow!("kiln has no build for {} on {}", r.os, r.arch))?;
@@ -1192,8 +1220,9 @@ pub async fn build(hub: &Arc<Hub>, r: &RunnerInfo, commit: &str, b: &Builder, by
         );
     }
     let inst8 = crate::updates::instance8(r);
-    let script = build_script(&Script { job: &id, bases: &bases, token: &token(hub, &id), commit, target: &target, cross: b.cross, keep, install: b.itself.then_some(inst8.as_str()) });
-    let (h, machine, runner) = (Arc::clone(hub), b.machine.clone(), (!b.itself).then(|| r.name.clone()));
+    let by_download = !b.itself || on_windows(&target);
+    let script = build_script(&Script { job: &id, bases: &bases, token: &token(hub, &id), commit, target: &target, cross: b.cross, keep, install: (!by_download).then_some(inst8.as_str()) });
+    let (h, machine, runner) = (Arc::clone(hub), b.machine.clone(), by_download.then(|| r.name.clone()));
     crate::rt::spawn(async move { run_build(&h, &id, &machine, &script, runner.as_deref()).await });
     Ok(job)
 }
@@ -1258,10 +1287,31 @@ async fn await_build(hub: &Arc<Hub>, id: &str, machine: &str, target: &str, comm
 /// output, its wait's end, and the fleet's changes (a longer wait chosen meanwhile, the new runner
 /// reporting in), never on a tick (goal 9: it looked again each minute, and each second for the
 /// report).
+/// The command a build's terminal runs `script` (free of single quotes) with: `sh -c`; on Windows,
+/// whose terminals run PowerShell, Git Bash beside git (as `.kiln/release.yaml` finds it: a bare
+/// `bash` may be WSL's), the script handed over in base64, which no quoting between PowerShell and
+/// bash changes. Its last words keep the terminal among kiln's own (`crate::termsess`).
+fn in_terminal(script: &str, windows: bool) -> String {
+    use base64::Engine as _;
+    if !windows {
+        return format!("sh -c '{script}'");
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(script);
+    let job = script.lines().next().and_then(|l| l.strip_prefix(crate::updates::HIDDEN_MARK)).unwrap_or_default();
+    format!(
+        "$g = Split-Path (Get-Command git -ErrorAction Stop).Source; \
+$b = @('..\\bin\\bash.exe', '..\\usr\\bin\\bash.exe', '..\\..\\bin\\bash.exe') | ForEach-Object {{ Join-Path $g $_ }} | Where-Object {{ Test-Path $_ }} | Select-Object -First 1; \
+if (-not $b) {{ Write-Output '{CANT_BUILD_MARK} there is no Git Bash beside git, so this machine cannot build kiln'; exit 10 }}; \
+& $b -c 'f=$(mktemp) && echo {encoded} | base64 -d >$f && bash $f; rc=$?; rm -f $f; exit $rc'; exit $LASTEXITCODE {}{job}",
+        crate::updates::HIDDEN_MARK
+    )
+}
+
 async fn run_build(hub: &Arc<Hub>, id: &str, machine: &str, script: &str, then: Option<&str>) {
     use crate::termsess::Frame;
     let u = &hub.updates;
-    let session = crate::termsess::open_agent(hub, machine.to_owned(), Some(format!("sh -c '{script}'")), 200, 50);
+    let windows = hub.agents.load().get(machine).is_some_and(|a| a.os == "windows");
+    let session = crate::termsess::open_agent(hub, machine.to_owned(), Some(in_terminal(script, windows)), 200, 50);
     let mut att = session.attach();
     let mut screen = crate::updates::Screen::default();
     let (mut ok_marked, mut cant) = (false, None::<String>);
@@ -1417,7 +1467,8 @@ mod tests {
         let linux = script("x86_64-unknown-linux-gnu", false, false, Some("01a14794"));
         let for_another = script("aarch64-apple-darwin", false, true, None);
         let cross = script("aarch64-apple-darwin", true, true, None);
-        for s in [&mac, &linux, &for_another, &cross] {
+        let windows = script("x86_64-pc-windows-msvc", false, true, None);
+        for s in [&mac, &linux, &for_another, &cross, &windows] {
             // It goes inside `sh -c '…'`: no single quotes, no backslashes.
             assert!(!s.contains('\'') && !s.contains('\\'), "{s}");
             assert!(s.starts_with(crate::updates::HIDDEN_MARK));
@@ -1436,6 +1487,41 @@ mod tests {
         assert!(cross.contains("ci/release/build.sh aarch64-apple-darwin") && cross.contains("KILN_DIST=\"$dir/dist-job1\""));
         assert!(cross.contains("bin=\"$dir/dist-job1/kiln-aarch64-apple-darwin\"") && cross.contains("export RUSTUP_TOOLCHAIN=stable"));
         assert!(cross.contains("for t in cargo npm tar curl rustup python3") && !cross.contains("xcode-select"));
+        // A Windows machine's build links its C runtime in, and goes back to the server for its
+        // runner to download: no script installs it.
+        assert!(windows.contains("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=\"-C target-feature=+crt-static\" MACOSX_DEPLOYMENT_TARGET"), "{windows}");
+        assert!(windows.contains("bin=\"$dir/target/release/kiln.exe\"") && windows.contains("-T \"$bin\"") && !windows.contains("--data-binary"), "{windows}");
+        assert!(windows.contains("|| fail \"could not hand the binary to the server\"") && !windows.contains("install --agent") && !windows.contains("svc="), "{windows}");
+        assert!(!mac.contains("crt-static") && !linux.contains("kiln.exe"));
+    }
+
+    /// The person's word, 2026-11-21: kiln builds itself on Windows too. Its terminal runs PowerShell,
+    /// which runs the script in Git Bash: handed over in base64 inside the one argument bash takes,
+    /// with no quote of its own for PowerShell to pass on wrong, the terminal kept among kiln's own.
+    #[test]
+    fn a_windows_build_runs_its_script_in_git_bash() -> anyhow::Result<()> {
+        use base64::Engine as _;
+        let s = script("x86_64-pc-windows-msvc", false, true, None);
+        assert_eq!(in_terminal(&s, false), format!("sh -c '{s}'"));
+        let c = in_terminal(&s, true);
+        assert!(c.starts_with("$g = Split-Path (Get-Command git -ErrorAction Stop).Source;") && c.contains("'..\\usr\\bin\\bash.exe'"), "{c}");
+        assert!(c.ends_with(&format!("{}job1", crate::updates::HIDDEN_MARK)), "{c}");
+        assert!(c.contains(&format!("Write-Output '{CANT_BUILD_MARK} there is no Git Bash beside git")), "{c}");
+        let arg = c.split_once("& $b -c '").and_then(|(_, rest)| rest.split_once('\'')).map(|(arg, _)| arg).ok_or_else(|| anyhow::anyhow!("no argument for bash: {c}"))?;
+        assert!(!arg.contains('"'), "{arg}");
+        let encoded = arg.split_whitespace().max_by_key(|w| w.len()).ok_or_else(|| anyhow::anyhow!("no script in {arg}"))?;
+        assert_eq!(String::from_utf8(base64::engine::general_purpose::STANDARD.decode(encoded)?)?, s);
+        Ok(())
+    }
+
+    /// The Windows machine's script parses as the shell's whole, as Git Bash runs it.
+    #[cfg(unix)]
+    #[test]
+    fn a_windows_machines_build_script_parses() -> anyhow::Result<()> {
+        let s = script("x86_64-pc-windows-msvc", false, true, None);
+        let out = std::process::Command::new("/bin/sh").arg("-n").arg("-c").arg(&s).output()?;
+        anyhow::ensure!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        Ok(())
     }
 
     /// The script under sh: with no checkout of kiln anywhere it goes on to the tools, then to
@@ -1490,6 +1576,18 @@ mod tests {
         let no_python = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node"], 0.3);
         assert_eq!(pick(mac, &[studio.clone(), no_python], limit), None, "cross-building needs python3 for zig");
         assert_eq!(pick("x86_64-pc-windows-msvc", &[linux, studio], limit), None, "only a Mac's build is cross-built for it");
+    }
+
+    /// A Windows machine's build is made on Windows, by one with cargo, node and git (its script runs
+    /// in Git Bash), never cross-built on Linux: the Shards it carries is built on Windows.
+    #[test]
+    fn a_windows_build_is_made_on_windows() {
+        let (windows, within) = ("x86_64-pc-windows-msvc", |_: &Candidate| true);
+        let jupiter = candidate("jupiter", "windows", windows, &["cargo", "node", "git", "go"], 0.5);
+        let linux = candidate("linux", "linux", "x86_64-unknown-linux-gnu", &["cargo", "node", "python3"], 0.1);
+        assert_eq!(pick(windows, &[linux.clone(), jupiter], within), Some(("jupiter".to_owned(), false)));
+        let no_git = candidate("jupiter", "windows", windows, &["cargo", "node"], 0.5);
+        assert_eq!(pick(windows, &[linux, no_git], within), None, "no Git Bash to run its script, and Linux doesn't cross-build it");
     }
 
     fn live(name: &str, os: &str, arch: &str, tools: &[&str]) -> crate::hub::AgentLive {
@@ -1602,6 +1700,31 @@ mod tests {
             }
             hub.put_agent(live("box", "linux", "x86_64", &["git"]));
             assert!(matches!(plan(&hub, &runner(&hub, "box").await?, &t).await, Plan::Wait(_)), "a Linux build is its machine's own: never made elsewhere");
+            Ok(())
+        })
+    }
+
+    /// The person's word, 2026-11-21: kiln builds itself on Windows too. A Windows machine with cargo,
+    /// node and git builds its own; another without them gets that build over the wire (it links its
+    /// C runtime in, so it serves them all); without git, nothing runs the build's script.
+    #[test]
+    fn a_windows_machine_builds_kiln_too() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = fleet().await?;
+            hub.put_agent(live("jupiter", "windows", "x86_64", &["cargo", "node", "git", "go"]));
+            hub.put_agent(live("surface", "windows", "x86_64", &["git"]));
+            let t = newest();
+            assert_eq!(built_by(&plan(&hub, &runner(&hub, "jupiter").await?, &t).await), Some(("jupiter".to_owned(), true, false)));
+            assert_eq!(built_by(&plan(&hub, &runner(&hub, "surface").await?, &t).await), Some(("jupiter".to_owned(), false, false)));
+            hub.change_agent("jupiter", |j| {
+                if let Some(f) = j.facts.as_mut() {
+                    f.tools.remove("git");
+                }
+            });
+            match plan(&hub, &runner(&hub, "jupiter").await?, &t).await {
+                Plan::Wait(why) => anyhow::ensure!(why.contains("it has no git to build kiln with"), "{why}"),
+                other => anyhow::bail!("without git: {other:?}"),
+            }
             Ok(())
         })
     }

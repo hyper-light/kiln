@@ -67,7 +67,10 @@ A runner with no binary of the server's commit yet doesn't wait on another machi
 while its own platform's job is building, and otherwise the commit is built from the server's
 source right away. No checkout of kiln is needed anywhere. A machine with the tools (cargo and
 node, as its runner reports them) builds the commit itself; a Mac's build is kept, so the other
-Macs download it. A Mac without them (no developer tools) gets its build over the wire: a Mac
+Macs download it. A Windows machine builds it too, with git besides: its build runs in Git Bash,
+found beside git, and links its C runtime in, so its binary is kept for every Windows machine and
+its own runner takes it by download, as it takes any upgrade. A Windows machine's build is made
+on Windows alone (the Shards kiln carries for it is built there). A Mac without them (no developer tools) gets its build over the wire: a Mac
 that has them builds the commit natively, else a Linux machine cross-builds it
 (`ci/release/build.sh`: zig, against the macOS stubs). The binary comes back to the server, and the
 Mac downloads it in the same upgrade. One build of a commit serves every Mac: while one is under
