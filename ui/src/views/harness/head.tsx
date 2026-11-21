@@ -319,7 +319,6 @@ export function AgentHeader({
         )}
       </div>
       {refusals && refused && flag && <RefusedList id={refusalsId} refused={refused} />}
-      {actions.resetAsk}
       {switchTarget ? (
         <React.Suspense fallback={<RunSettings {...line} />}>
           <RunSettingsElsewhere {...line} target={switchTarget} own={info?.kind} />
