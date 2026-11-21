@@ -23,7 +23,7 @@
 //!   KILN_K8S_LIVE=1 KUBECONFIG=... KILN_K8S_HOST=192.168.58.1 KILN_K8S_NODES=k90-close,k90-close-m02 \
 //!   KILN_K8S_IMAGE=k90-close-agent:live cargo test -p kiln --test k8s_agent_live -- --nocapture
 
-#![cfg(target_os = "linux")]
+#![cfg(unix)]
 
 mod common;
 mod vm_e2e;
@@ -133,11 +133,12 @@ impl Drop for Kept {
 }
 
 /// W10 on a real cluster. Do: start the stand-in through kiln in a pod of its own, its home the fleet's one node; it
-/// writes in its folder; ask for its change request, change a file it changed in the folder, land it with the person's
-/// grant, end it. Expect: the pod running kiln's runner for that session, its folder kubelet's `nfs4` mount with
-/// `xprtsec=mtls` from the home's export; the agent's files in the home's volume and not the folder until it lands; its
-/// change request holding them; the file changed in the folder named drift; the landing a plan needing the grant, then
-/// written with it, the drifted file left; and the pod, its claim and PersistentVolume gone once it ends.
+/// writes in its folder; ask for its change request; change a file it changed in the folder; ask to land it; end it. Then
+/// start a second on the folder put back, land it with the person's grant, end it. Expect: each pod running kiln's runner
+/// for its session, its folder kubelet's `nfs4` mount with `xprtsec=mtls` from the home's export; the agent's files in the
+/// home's volume and not the folder until it lands; its change request holding them; the file changed in the folder named
+/// drift and never landed over; the second's landing a plan needing the grant, then written with it; and each pod, its
+/// claim and PersistentVolume gone once its agent ends.
 #[test]
 fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> anyhow::Result<()> {
     if std::env::var(SWITCH).as_deref() != Ok("1") {
@@ -195,25 +196,10 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
 
     // The agent, in a pod of its own, its home the node.
     let spec = json!({"kind": "claude", "on": machine, "cwd": project, "prompt": PROMPT, "isolation": "pod"});
-    let started = until(
-        "agents.start with isolation pod answered",
-        || {
-            let (code, body) = fleet.request("POST", "/api/ops/agents.start", Some(&spec))?;
-            let text = String::from_utf8_lossy(&body).into_owned();
-            if (200..300).contains(&code) {
-                return Ok(Some(serde_json::from_str::<Value>(&text)?));
-            }
-            anyhow::ensure!(code == 409 && text.contains("try again"), "POST /api/ops/agents.start: {code} {text}");
-            Ok(None)
-        },
-        logs,
-    )?;
-    let id = started.pointer("/agents/0/id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no session in {started}"))?.to_owned();
-    let pod = kiln::k8s::agent::pod_name(&id);
+    let (id, pod) = start_in_pod(&fleet, &spec, &ns, &root)?;
     kept.pod.replace(Some(pod.clone()));
     let agent = |fleet: &common::Fleet| fleet.call("POST", "/api/ops/agents.get", Some(&json!({"agent": id})));
     let seen = || format!("{}\n{}", pod_story(&ns, &pod), fleet_logs(&root));
-    until("the agent's pod running", || Ok((kubectl(&ns, &["get", "pod", &pod, "-o", "jsonpath={.status.phase}"])? == "Running").then_some(())), seen)?;
 
     // The pod's folder is kubelet's NFS mount of the home's export, over RPC-with-TLS.
     let mounts = kubectl(&ns, &["exec", &pod, "-c", "agent", "--", "cat", "/proc/mounts"])?;
@@ -247,13 +233,24 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
     }
 
     // The agent wrote, in its pod, into its home's volume; the folder is as it was.
+    let last_plan = std::cell::RefCell::new(String::new());
     let wrote = until(
-        "the agent's file in its volume, by its landing's plan",
+        "the agent's files in its volume, by its landing's plan (one created, one replaced)",
         || {
-            let plan = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})))?;
-            Ok(plan.to_string().contains("pod-wrote.txt").then_some(plan))
+            let plan = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})));
+            last_plan.replace(match &plan {
+                Ok(p) => p.to_string(),
+                Err(e) => format!("{e:#}"),
+            });
+            let plan = plan?;
+            // A plan says what it would do by action, counted (the file it creates and the one it replaces).
+            let count = |action: &str| plan.pointer("/plan/summary/by_action").and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("action").and_then(Value::as_str) == Some(action))).and_then(|x| x.get("count")).and_then(Value::as_u64).unwrap_or(0);
+            Ok((count("create") >= 1 && count("replace") >= 1).then_some(plan))
         },
-        || format!("{}\n{}", agent(&fleet).map(|a| a.to_string()).unwrap_or_default(), seen()),
+        || {
+            let ws = fleet.call("POST", "/api/ops/agents.workspace", Some(&json!({"agent": id}))).map(|w| w.to_string()).unwrap_or_else(|e| format!("{e:#}"));
+            format!("its last plan: {}\nits workspace: {ws}\n{}\n{}", last_plan.borrow(), agent(&fleet).map(|a| a.to_string()).unwrap_or_default(), seen())
+        },
     )?;
     let in_pod = kubectl(&ns, &["exec", &pod, "-c", "agent", "--", "cat", &format!("{folder}/pod-wrote.txt")])?;
     anyhow::ensure!(in_pod.trim() == format!("written in pod {pod}"), "the pod reads {in_pod:?} back");
@@ -268,7 +265,8 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
     anyhow::ensure!(shown == format!("written in pod {pod}"), "{branch}'s pod-wrote.txt: {shown:?}");
     eprintln!("PROVEN: review: {branch} holds the pod's file");
 
-    // Drift: README.md, which it changed, changed in the folder too.
+    // Drift: README.md, which it changed, changed in the folder by the person meanwhile; its landing over that is refused as
+    // a conflict, with no grant offered: nothing of the person's is overwritten.
     std::fs::write(project.join("README.md"), "the person's\n")?;
     let ws = until(
         "README.md named drift",
@@ -279,32 +277,79 @@ fn w10_an_agent_in_a_pod_works_in_its_homes_volume_through_kubelets_mount() -> a
         seen,
     )?;
     eprintln!("PROVEN: drift: {}", ws.get("drift").cloned().unwrap_or_default());
-
-    // Landing, through the person's grant: the plan asks for it; with it, written, the drifted file left as the person made it.
-    let plan = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})))?;
-    let manifest = plan.pointer("/approval/manifest").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("the plan holds no grant to approve: {plan}"))?.to_owned();
-    let landed = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id, "manifest": manifest})))?;
-    anyhow::ensure!(landed.get("outcome") == Some(&json!("written")), "landed: {landed}");
-    anyhow::ensure!(std::fs::read_to_string(project.join("pod-wrote.txt"))?.trim() == format!("written in pod {pod}"), "the folder doesn't hold the landing");
-    anyhow::ensure!(std::fs::read_to_string(project.join("README.md"))? == "the person's\n", "the landing overwrote the drifted file");
-    anyhow::ensure!(git(&project, &["rev-parse", "HEAD"])? == head, "the folder's HEAD moved");
-    eprintln!("PROVEN: landed through the person's grant: {landed}");
+    let conflicted = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": id})))?;
+    anyhow::ensure!(conflicted.pointer("/approval/manifest").is_none(), "a grant is offered over the person's change: {conflicted}");
+    anyhow::ensure!(std::fs::read_to_string(project.join("README.md"))? == "the person's\n", "the person's change didn't stay");
+    eprintln!("PROVEN: no landing over the person's change: {}", conflicted.pointer("/plan/conflicted").cloned().unwrap_or_default());
 
     // Its end: the pod, its claim and PersistentVolume go.
     fleet.call("POST", "/api/ops/agents.stop", Some(&json!({"agent": id})))?;
+    reaped(&ns, &pod, &root)?;
+
+    // A second agent, on the folder as its last commit has it (the person put README.md back): its plan asks for the
+    // person's grant, and with it its work is written to the folder, its new file and its README.md, HEAD as it was.
+    git(&project, &["checkout", "--", "README.md"])?;
+    let (second, pod2) = start_in_pod(&fleet, &spec, &ns, &root)?;
+    kept.pod.replace(Some(pod2.clone()));
+    let seen2 = || format!("{}\n{}", pod_story(&ns, &pod2), fleet_logs(&root));
+    let plan = until(
+        "the second agent's files in its volume, its plan asking for the grant",
+        || {
+            let plan = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": second})))?;
+            let count = |action: &str| plan.pointer("/plan/summary/by_action").and_then(Value::as_array).and_then(|a| a.iter().find(|x| x.get("action").and_then(Value::as_str) == Some(action))).and_then(|x| x.get("count")).and_then(Value::as_u64).unwrap_or(0);
+            Ok((count("create") >= 1 && count("replace") >= 1 && plan.pointer("/approval/manifest").is_some()).then_some(plan))
+        },
+        seen2,
+    )?;
+    anyhow::ensure!(plan.get("outcome") == Some(&json!("approval_required")) && plan.pointer("/plan/grant_required") == Some(&json!(true)), "the plan doesn't wait on the grant: {plan}");
+    let manifest = plan.pointer("/approval/manifest").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let landed = fleet.call("POST", "/api/ops/agents.land", Some(&json!({"agent": second, "manifest": manifest})))?;
+    anyhow::ensure!(landed.get("outcome") == Some(&json!("written")), "landed: {landed}");
+    anyhow::ensure!(std::fs::read_to_string(project.join("pod-wrote.txt"))?.trim() == format!("written in pod {pod2}"), "the folder doesn't hold the agent's new file");
+    anyhow::ensure!(std::fs::read_to_string(project.join("README.md"))? == "the folder\nthe agent was here\n", "the folder doesn't hold the agent's README.md");
+    anyhow::ensure!(git(&project, &["rev-parse", "HEAD"])? == head, "the folder's HEAD moved");
+    eprintln!("PROVEN: landed through the person's grant: {landed}");
+    fleet.call("POST", "/api/ops/agents.stop", Some(&json!({"agent": second})))?;
+    reaped(&ns, &pod2, &root)?;
+    fleet.stop_gently();
+    Ok(())
+}
+
+/// Starts `spec`'s agent through kiln in a pod of its own (asked again while its home hasn't yet said what it has), and
+/// waits for its pod to run: its session's id and its pod's name.
+fn start_in_pod(fleet: &common::Fleet, spec: &Value, ns: &str, root: &Path) -> anyhow::Result<(String, String)> {
+    let started = until(
+        "agents.start with isolation pod answered",
+        || {
+            let (code, body) = fleet.request("POST", "/api/ops/agents.start", Some(spec))?;
+            let text = String::from_utf8_lossy(&body).into_owned();
+            if (200..300).contains(&code) {
+                return Ok(Some(serde_json::from_str::<Value>(&text)?));
+            }
+            anyhow::ensure!(code == 409 && text.contains("try again"), "POST /api/ops/agents.start: {code} {text}");
+            Ok(None)
+        },
+        || fleet_logs(root),
+    )?;
+    let id = started.pointer("/agents/0/id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no session in {started}"))?.to_owned();
+    let pod = kiln::k8s::agent::pod_name(&id);
+    until("the agent's pod running", || Ok((kubectl(ns, &["get", "pod", &pod, "-o", "jsonpath={.status.phase}"])? == "Running").then_some(())), || format!("{}\n{}", pod_story(ns, &pod), fleet_logs(root)))?;
+    Ok((id, pod))
+}
+
+/// Waits until pod `pod`, its claim and its PersistentVolume are gone: kiln's reaper took them down as its session ended.
+fn reaped(ns: &str, pod: &str, root: &Path) -> anyhow::Result<()> {
     until(
         "the pod, its claim and PersistentVolume gone",
         || {
             let left = [("pod", false), ("pvc", false), ("pv", true)].iter().filter(|(kind, cluster)| {
-                let got = if *cluster { run("kubectl", &["get", kind, &pod, "--ignore-not-found", "-o", "name"], None) } else { kubectl(&ns, &["get", kind, &pod, "--ignore-not-found", "-o", "name"]) };
+                let got = if *cluster { run("kubectl", &["get", kind, pod, "--ignore-not-found", "-o", "name"], None) } else { kubectl(ns, &["get", kind, pod, "--ignore-not-found", "-o", "name"]) };
                 got.map_or(true, |o| !o.trim().is_empty())
             });
             Ok((left.count() == 0).then_some(()))
         },
-        seen,
-    )?;
-    fleet.stop_gently();
-    Ok(())
+        || format!("{}\n{}", pod_story(ns, pod), fleet_logs(root)),
+    )
 }
 
 /// The pod's description and its agent's log, for a failure.
