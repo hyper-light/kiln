@@ -744,7 +744,9 @@ mod tests {
             ..Default::default()
         };
         assert!(follow_to(&mut spec, made("v1", now)));
-        assert_eq!(spec.cwd.as_deref(), Some("/home/b/.kiln/state/workspaces/kiln-x/src"));
+        // Its folder is joined to the new mount as this host joins paths (`\` on Windows).
+        let joined = Path::new(now).join("src").to_string_lossy().into_owned();
+        assert_eq!(spec.cwd.as_deref(), Some(joined.as_str()));
         let env: std::collections::HashMap<&str, &str> = spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         assert_eq!(env.get("VIRTUAL_ENV"), Some(&"/home/b/.kiln/state/workspaces/kiln-x/.venv"), "{env:?}");
         assert_eq!(env.get("CARGO_TARGET_DIR"), Some(&"/home/b/.kiln/state/workspaces/kiln-x/target"), "{env:?}");
@@ -761,7 +763,9 @@ mod tests {
             workspace: Some(Workspace { sub: sub.into(), ..volume_at("v1", mount, "/Users/person/project") }),
             ..Default::default()
         };
-        assert_eq!(record_places(&spec("src", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a/src".to_owned(), "/Users/person/project/src".to_owned())));
+        // The person's folder is joined as this host joins paths (`\` on Windows).
+        let person_src = Path::new("/Users/person/project").join("src").to_string_lossy().into_owned();
+        assert_eq!(record_places(&spec("src", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a/src".to_owned(), person_src)));
         assert_eq!(record_places(&spec("", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a".to_owned(), "/Users/person/project".to_owned())));
         assert_eq!(record_places(&spec("src", "")), None, "no mount: an isolated agent's, kept in its microVM's volume");
         assert_eq!(record_places(&crate::harness::session::Spec::default()), None);
