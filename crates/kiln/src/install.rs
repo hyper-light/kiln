@@ -716,7 +716,9 @@ fn systemd_unit(i: &Install<'_>, env: &str, exec: &str, systemd: Option<u32>, pl
         "[Unit]\nDescription=kiln {unit} (self-supervising CI/CD job server)\nAfter=network-online.target\nWants=network-online.target\n\n\
          [Service]\nType=simple\n{env}ExecStart={exec}\n\
          # kiln supervises and restarts its own server; this only covers the supervisor itself.\n\
-         Restart=always\nRestartSec=5\nKillMode=mixed\nTimeoutStopSec=30\nLimitNOFILE=1048576\n\
+         # Stopping it stops the supervisor alone: it stops its child and kills what's left of the unit but Slates' anchor,\n\
+         # which holds every workspace volume in its memory and outlives a restart.\n\
+         Restart=always\nRestartSec=5\nKillMode=process\nTimeoutStopSec=30\nLimitNOFILE=1048576\n\
          # The legs and agents it starts run each in a cgroup of its own under it, below kiln's own processes (docs/priority.md).\n\
          Delegate=yes\n{subgroup}{server}\n\
          [Install]\nWantedBy={target}\n"
@@ -2188,6 +2190,8 @@ mod tests {
         let i = Install { system: true, unit: "kiln-agent", bin: Path::new("/usr/local/bin/kiln"), args: &agent, config: Path::new("/etc/kiln/kiln.toml"), state_dir: Path::new("/var/lib/kiln"), env: None, ask: false };
         let runner = systemd_unit(&i, "", "/usr/local/bin/kiln supervise -- agent", Some(262), Place::NONE);
         anyhow::ensure!(runner.contains("\nDelegate=yes\nDelegateSubgroup=kiln\n"), "{runner}");
+        // Stopping it stops the supervisor alone, which sweeps the unit but Slates' anchor (`os::supervise::sweep_unit`).
+        anyhow::ensure!(runner.contains("\nKillMode=process\n") && !runner.contains("KillMode=mixed"), "{runner}");
         anyhow::ensure!(!runner.contains("Slice=") && !runner.contains("CPUWeight") && !runner.contains("ProcessType"), "{runner}");
         // kiln's upgrades still read what it runs.
         anyhow::ensure!(crate::upgrade::parse_unit(&runner, "kiln-agent", true).is_some_and(|e| e.args == ["agent"]), "{runner}");

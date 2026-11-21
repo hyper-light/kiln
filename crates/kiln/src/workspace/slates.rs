@@ -922,10 +922,22 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     if m.mount.is_empty() {
         return Ok(());
     }
+    // Its machine's instance answering first, started where it isn't (its machine started again since the volume was
+    // made): a mount asked of no daemon is refused, and the agent with it.
+    ensure_up().await?;
     if mounted_as_made(m).await? {
         return Ok(());
     }
     mount_at(m).await
+}
+
+/// Whether workspace `m`'s volume is gone from its machine's instance (Slates answers it missing): a volume lives in its
+/// anchor's memory, so one made before its machine (or the anchor) started again went with it, and what it held too.
+pub async fn gone(m: &Made) -> anyhow::Result<bool> {
+    ensure_up().await?;
+    let id = volume_id(&m.volume)?;
+    let answer = call("status", move |i| Ok(i.status(id).map(|_| ()))).await?;
+    Ok(matches!(answer, Err(slates_api::Error::NotFound(slates_api::Missing::Volume(_)))))
 }
 
 /// Workspace `m` as this machine places it ([`placed_under`] its place for workspaces): a workspace that arrived here

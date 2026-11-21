@@ -266,7 +266,18 @@ fn rehomed_path(path: &str, over: &str, top: &str) -> Option<String> {
 /// mounted again if its mount went away. Nothing for an agent that works in its folder itself.
 pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyhow::Result<()> {
     let Some(w) = spec.workspace.clone().filter(|w| w.kind == "volume") else { return Ok(()) };
-    if let Some(m) = &w.made {
+    if let Some(m) = w.made.as_ref().filter(|_| w.owner.is_none())
+        && slates::gone(m).await?
+    {
+        // Its volume went with its machine's Slates instance (the machine started again: a volume lives in its anchor's
+        // memory), and what it changed there with it. It starts again in a new one over its folder as it is now, said
+        // in the log, rather than refused at every start from now on.
+        tracing::warn!(session = %id, volume = %m.volume, "an agent's workspace volume is gone with its machine's Slates instance: it starts in a new one over its folder");
+        if let Some(over) = w.over.as_deref().filter(|_| !m.mount.is_empty()) {
+            spec.env = rehomed(&spec.env, &place::top(&m.mount).to_string_lossy(), over);
+            spec.cwd = Some(if w.sub.is_empty() { over.to_owned() } else { Path::new(over).join(&w.sub).to_string_lossy().into_owned() });
+        }
+    } else if let Some(m) = &w.made {
         slates::mounted(m).await?;
         // Its environment on that mount too, as its folder is (one started in a person's shell inside another agent's
         // volume, or one started again): nothing of it left naming the folder the volume is laid over.
