@@ -94,7 +94,13 @@ here, so a restart before they're in brings them again (an upgrade in place too,
 running), and they go with it if it moves on. A session resumed on another machine from the server's
 store (its own machine gone, and its inbox with it) brings the ids of the last 4,096 messages the
 server's copy of its timeline shows. A session that went on elsewhere and is restored on its old
-machine (a stale copy) takes nothing there.
+machine (a stale copy) takes nothing there. What a machine it left still holds of it, never seen to
+an end there (a message its harness was given), stays at the epoch it left at: a move carries its
+queue and its conversation, not that. Back on that machine at a higher epoch, it lets that go before
+anything is restored, as none of it can be restored at another epoch: restoring it refused all it
+was sent, for good (Slates, 2026-11-20: back on a Mac it had left, it took none of its person's
+messages or its 23 agents' there all night, each held in kiln). What came to an end there stays
+until the server acknowledges it, as each does.
 
 **Blue/green.** A session handed to the new build of its runner (another runner process of the same
 machine, at the same epoch) brings its inbox's newest ids the same way, and refuses messages while
@@ -138,7 +144,14 @@ message for one Claude Code never got and gave it again; Claude Code said it bac
 kiln held it in flight for good: the agent read as working, its queue never went, its usage limit's
 pause could never go on, and a move waited for a turn that wasn't under way (Quiver, 2026-11-13:
 three messages held so for ten hours, and "Go on now" from its usage limit said it was moving and
-never went).
+never went). A move asked while no turn is under way, with only messages in flight that Claude
+Code never started, doesn't wait either, "now" or not: it asks Claude Code what it holds (an
+interrupt, which cuts nothing then), and what it never started leaves the session, which comes to
+rest and goes. Slates, 2026-11-20: resumed at its stop point on an account at 100% of its five-hour
+window, it was written kiln's "Continue where you left off", which Claude Code 2.1.327 never took
+(the message is in none of its transcript's lines); kiln's usage-limit move came 26 s later and
+waited for the turn to end, and the session took no message for 2.5 minutes, until its person's own
+message stopped it.
 
 **One runner a machine.** A session an older runner process hands to its machine's newest
 (docs/releases.md, "One runner a machine") goes as a move does: it takes no messages as it's handed

@@ -4308,11 +4308,14 @@ struct Move {
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
-/// `now`: the turn under way isn't waited for (the caller interrupts it). None: an isolated agent
-/// doesn't go to another machine (its microVM and what its harness keeps there are this one's, kiln
-/// plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), refused before anything of it stops, saying so.
+/// `now`: the turn under way isn't waited for (the caller interrupts it). `unstarted`: no turn is
+/// under way, only messages its harness never started, which nothing ends (`Adapter::unstarted_only`):
+/// there's no turn to wait for (the caller asks the harness what it holds, and they leave the
+/// session). None: an isolated agent doesn't go to another machine (its microVM and what its
+/// harness keeps there are this one's, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), refused
+/// before anything of it stops, saying so.
 #[allow(clippy::too_many_arguments)]
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool, slates: Option<crate::workspace::slates_move::VolumeMove>) -> Option<Move> {
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, unstarted: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool, slates: Option<crate::workspace::slates_move::VolumeMove>) -> Option<Move> {
     // Its spec before its core: never the one lock inside the other.
     let isolated = s.spec.lock().isolation.is_some();
     let mut core = s.core.lock();
@@ -4322,7 +4325,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
         return None;
     }
     core.hold = true;
-    let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
+    let busy = !unstarted && !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
     let picks_up = now && busy;
     let into = kind.map(|k| format!(", to go on in {}", k.name)).unwrap_or_default();
     let text = if local {
@@ -5681,9 +5684,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 }
                             }
                             Command::MoveTo { to, cwd, note, now, kind: into, model, local, native, slates } => {
-                                if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
+                                // No turn under way, only what its harness never started: nothing
+                                // would end the wait (Slates, 2026-11-20: 2.5 minutes, until its
+                                // person's message stopped it).
+                                let unstarted = adapter.unstarted_only(&s.core.lock());
+                                if let Some(mv) = move_wanted(&s, to, cwd, note, now, unstarted, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
                                     // Not waiting for the turn: it stops here, and goes on there.
-                                    if mv.picks_up {
+                                    // Or none is under way: asked what it holds, its harness
+                                    // answers, and what it never started leaves the session.
+                                    if mv.picks_up || unstarted {
                                         adapter.command(&mut s.core.lock(), Command::Interrupt);
                                     }
                                     moving = Some(mv);
@@ -6350,7 +6359,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     // Another runner: it goes there, now.
                     Command::MoveTo { to, cwd, note, now, kind: into, model, local, native, slates } => {
-                        if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
+                        if let Some(mv) = move_wanted(&s, to, cwd, note, now, false, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
                             moving = Some(mv);
                             break;
                         }

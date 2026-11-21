@@ -2404,7 +2404,15 @@ impl Host {
         }
         let mut after = None;
         let _ = input.controller.lock().restoring();
-        let reconciled = self.reconcile_legacy_mail(s, &input, LegacyReconciliation::Journal).await.is_ok();
+        // What an earlier stay on this machine left in its journal, at an epoch it has since left
+        // (it went on elsewhere and came back), goes first: none of it can be restored at this one,
+        // and one restored refused its admission for good (CP-T3.2, W20; Slates, 2026-11-20).
+        let epoch = input.controller.lock().capacity().epoch;
+        let left_behind = input.inbox.let_go_left_behind(&s.id, epoch).await;
+        if let Err(e) = &left_behind {
+            tracing::warn!(target: "kiln.sends", event = "left_behind_failed", session = %s.id, error = %e, "what an earlier stay left in a session's journal couldn't be let go of: it takes no messages until it can");
+        }
+        let reconciled = left_behind.is_ok() && self.reconcile_legacy_mail(s, &input, LegacyReconciliation::Journal).await.is_ok();
         if !reconciled { let _ = input.controller.lock().unavailable(); }
         loop {
             if !reconciled { break; }
@@ -5562,6 +5570,39 @@ while True:
         })
     }
 
+    /// CP-T3.2. Slates, 2026-11-20: paused at its stop point on an account at 100% of its five-hour
+    /// window, resumed by its person, it was written kiln's "Continue where you left off", which
+    /// Claude Code (2.1.327) never took: its transcript ends at the pause's interrupt, the message in
+    /// none of its lines. kiln's usage-limit move came 26 s later, not "now", and waited for the
+    /// turn to end: there was none, and the session took no message for 2.5 minutes, until its
+    /// person's own message interrupted it. A move asked while no turn is under way doesn't wait on
+    /// what Claude Code never started: it asks Claude Code what it holds (an interrupt, which cuts
+    /// nothing), the messages nothing would end leave the session, and its move goes at once.
+    #[cfg(unix)]
+    #[test]
+    fn cp_t3_2_an_agent_held_as_working_by_a_message_nothing_ends_moves_when_told_to_after_its_turn() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (program, _heard) = stand_in(dir.path())?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("unstarted".into()), spec)?;
+            let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
+            until_it("the stand-in's start", 300, || s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()).await?;
+            assert!(host.command("unstarted", message("m1", "hello")));
+            until_it("m1's turn, over", 60, || s.core.lock().state.status == Status::Idle && s.core.lock().state.harness_session.is_some()).await?;
+            assert!(host.command("unstarted", message("m2", "one it says nothing of")));
+            until_it("m2 written, and the session held as working", 60, || s.core.lock().state.delivery.get("m2") == Some(&super::super::model::Delivery::Sent) && s.core.lock().state.status == Status::Running).await?;
+            assert!(host.command("unstarted", Command::MoveTo { to: "elsewhere".into(), cwd, note: None, now: false, kind: None, model: None, local: false, native: false, slates: None }));
+            until_it("its move, tried without a turn to wait for", 60, || said("Couldn't move to elsewhere")).await?;
+            assert!(!s.core.lock().hold, "it goes on here: nothing waits on the move");
+            assert!(host.close("unstarted"));
+            Ok(())
+        })
+    }
+
     /// Kiln's Agentfile for Claude Code, as an isolated session started with none named is made from.
     fn claude_image() -> anyhow::Result<crate::sandbox::image::Source<'static>> {
         let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for Claude Code"))?;
@@ -6554,6 +6595,38 @@ while True:
             let said = take_message(Some(&inbox), "s1", Some(&left), message("m2", "x"), Some(3), 2).await;
             assert!(matches!(said.map(|s| s.answer), Some(Err(inbox::Refusal::Moved { epoch: 3, .. }))));
             assert!(left.1.lock().is_empty());
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2, W20: a session moved back to a machine it left takes messages there. Its journal
+    /// there still held a message its harness was given and never seen to an end before it left, at
+    /// the epoch it left at; arriving at a higher one, its admission restored that, was refused (a
+    /// lease is its own epoch's) and took nothing it was sent, for good: Slates, 2026-11-20, back on
+    /// the Mac it had left at epoch 4, said it takes no messages at epochs 6 and 8, its person's
+    /// "Continue" and 23 agents' mail held in kiln.
+    #[test]
+    fn cp_t3_2_a_session_moved_back_to_a_machine_it_left_takes_messages() -> anyhow::Result<()> {
+        use crate::harness::admission::{Lease, Stage};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let inbox = host.inbox.clone().ok_or_else(|| anyhow::anyhow!("the host has no inbox"))?;
+            // Its stay here at epoch 4: its person's message handed to its harness, then it went on elsewhere.
+            inbox.open("back", 4).await?;
+            let lease = Lease { message: "given".into(), peer: "admin".into(), epoch: 4, bytes: 10, stage: Stage::ProviderFlight, token: Some(crate::harness::mail::Token { revision: 7, generation: 1 }), handoff: None };
+            inbox.accept_pending("back", "given", &inbox::digest("x", &[]), Some(4), 1, &inbox::Pending::new(lease, message("given", "x"))).await?;
+            inbox.fence("back", 4).await?;
+            // Back at 6, as a move brings it: its state at 5 there, at 6 here.
+            let seed = session::Seed { events: Vec::new(), state: super::super::model::State { epoch: 5, ..Default::default() }, items: None, from: "elsewhere".into(), from_cwd: dir.path().to_string_lossy().into_owned(), picks_up: false, note: None, restored: false, synced: None, local: false };
+            let s = host.open_seeded(Some("back".into()), no_harness(dir.path()), Some(seed), None, Vec::new(), false, true)?;
+            // Its lane's first word (it's here: its inbox opened, its journal replayed) done.
+            host.settled("back").await;
+            let admission = s.core.lock().state.admission.clone().ok_or_else(|| anyhow::anyhow!("it said nothing of what it takes"))?;
+            assert_eq!(admission.epoch, 6);
+            assert!(admission.target > 0, "it takes messages at the epoch it's back at: {admission:?}");
+            assert!(inbox.pending("back", "given").await?.is_none(), "what its stay before left here went");
             Ok(())
         })
     }
