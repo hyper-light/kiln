@@ -262,8 +262,10 @@ fn rehomed_path(path: &str, over: &str, top: &str) -> Option<String> {
 /// Makes the workspace `spec` asks for (on the machine its agent `id` works on), before its
 /// harness starts: a volume laid over its folder's repository, mounted, and the agent's folder in
 /// it; for an isolated session, the volume with no mount, which Slates serves its microVM itself
-/// (its folder stays the folder's own path); or, for one made already (the runner started again),
-/// mounted again if its mount went away. Nothing for an agent that works in its folder itself.
+/// (its folder stays the folder's own path); or, for one made already, mounted again if its mount
+/// went away (the runner started again, a restart, a volume that moved here), or made anew where its
+/// volume is gone. Nothing for an agent that works in its folder itself. Every start of a harness,
+/// its first and every one after, readies its workspace here and nowhere else.
 pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyhow::Result<()> {
     let Some(w) = spec.workspace.clone().filter(|w| w.kind == "volume") else { return Ok(()) };
     if let Some(m) = w.made.as_ref().filter(|_| w.owner.is_none())
@@ -333,7 +335,7 @@ pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyh
 /// mount re-placed under this machine's own place for workspaces where it named another machine's, and its folder and
 /// environment there ([`follow_to`]: the mount's top, with the agent's place beneath it). Its work is written back here as
 /// on the runner it came from (Slates judges a moved captured clone against its capture, its A-503). Whether it has a
-/// workspace volume to mount here as it starts ([`mounted_for`]), so its folder is never taken for one this machine lacks.
+/// workspace volume to mount here as it starts ([`prepare`]), so its folder is never taken for one this machine lacks.
 pub fn arrived_here(spec: &mut crate::harness::session::Spec) -> bool {
     let Some(m) = spec.workspace.as_ref().filter(|w| w.kind == "volume").and_then(|w| w.made.clone()).filter(|m| !m.mount.is_empty()) else { return false };
     match slates::placed_here(&m) {
@@ -362,16 +364,6 @@ fn follow_to(spec: &mut crate::harness::session::Spec, arrived: slates::Made) ->
         spec.cwd = Some(here.to_string_lossy().into_owned());
     }
     true
-}
-
-/// A session's workspace volume mounted where it says before its harness starts in it (`harness::session`): one that
-/// arrived with a move (its new owner may answer a moment after the move, so Slates' pauses are waited out), or one a
-/// refused move let go of and took back. Nothing for any other workspace.
-pub async fn mounted_for(spec: &crate::harness::session::Spec) -> anyhow::Result<()> {
-    match spec.workspace.as_ref().filter(|w| w.kind == "volume").and_then(|w| w.made.as_ref()) {
-        Some(m) => slates::mounted_patiently(m).await,
-        None => Ok(()),
-    }
 }
 
 /// The folder a workspace for `cwd` is laid over, and `cwd`'s place beneath it (a workspace's `sub`): its repository's
