@@ -298,6 +298,7 @@ async fn release_with(steps: &impl Steps, running: &Running, made: &Made) -> any
                 tracing::debug!(volume = %running.volume, tried, error = %format!("{e:#}"), "an ended container's engine volume wasn't removed yet");
                 stayed = Some(e);
                 if tried < VOLUME_RM_TRIES {
+                    #[allow(clippy::disallowed_methods)] // (c) the container engine sends no notification when it lets go of its volume: asked again
                     crate::rt::sleep(VOLUME_RM_PAUSE).await;
                 }
             }
