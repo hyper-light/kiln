@@ -2537,7 +2537,12 @@ where
                             Err(crate::memory::lanes::RecvError::Overflowed(_)) => changed = true,
                             Err(crate::memory::lanes::RecvError::Closed) => return false,
                         }
-                        ev = events.try_recv().ok().map(Ok);
+                        ev = match events.try_recv() {
+                            Ok(text) => Some(Ok(text)),
+                            Err(crate::memory::lanes::TryRecvError::Empty) => None,
+                            Err(crate::memory::lanes::TryRecvError::Overflowed(n)) => Some(Err(crate::memory::lanes::RecvError::Overflowed(n))),
+                            Err(crate::memory::lanes::TryRecvError::Closed) => Some(Err(crate::memory::lanes::RecvError::Closed)),
+                        };
                     }
                     if changed {
                         return true;
