@@ -346,7 +346,7 @@ impl Agy {
             Command::Control { id, value } => {
                 super::goback::control(core, &id, value.as_ref());
             }
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } | Command::Reset { .. } => {}
             // One of its subagents, held at its calls through kiln's hook.
             Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),
             Command::Perms { perms, task: Some(task) } => self.set_task_perms(core, &task, perms),

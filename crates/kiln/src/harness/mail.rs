@@ -608,6 +608,45 @@ fn transition_on(c: &mut Connection, token: Token, epoch: Option<u64>, next: Dis
     Ok(Receipt { id, revision: token.revision, generation: token.generation, disposition: next, repeat: current == next })
 }
 
+/// The newest communication's revision to `recipient` (0: none): where a reset draws its line (docs/agents.md, "Reset"),
+/// those after it are sent after the reset and go to the fresh harness.
+pub async fn newest(store: &Store, recipient: String) -> Result<u64, Error> {
+    store.read(move |c| Ok(newest_on(c, &recipient))).await.map_err(store_error)?
+}
+
+fn newest_on(c: &Connection, recipient: &str) -> Result<u64, Error> {
+    let newest: i64 = c.query_row("SELECT COALESCE(MAX(revision),0) FROM agent_mail WHERE recipient=?1", [recipient], |r| r.get(0)).map_err(sql_error)?;
+    unsigned(newest)
+}
+
+/// Every communication to `recipient` up to revision `upto` that kiln still holds for it and that never came to an end,
+/// ended cancelled (a reset, docs/agents.md "Reset", for whoever asked: `CancelReason::User`): those `waiting`, frozen
+/// or not, none of which is handed out after this; and, with `handed`, those handed out (`dispatched`, `admitted`),
+/// which its runner let go of as it reset (it says each of its own the same, which kiln takes as a repeat). Each one's
+/// original stays in the ledger, as every terminal one's does. Their receipts, in revision order, each with its sender.
+pub async fn cancel_for(store: &Store, recipient: String, upto: u64, handed: bool) -> Result<Vec<(Receipt, String)>, Error> {
+    store.call(move |c| Ok(cancel_for_on(c, &recipient, upto, handed))).await.map_err(store_error)?
+}
+
+fn cancel_for_on(c: &mut Connection, recipient: &str, upto: u64, handed: bool) -> Result<Vec<(Receipt, String)>, Error> {
+    let terminal = serde_json::to_string(&super::admission::Disposition::Cancelled { reason: super::admission::CancelReason::User }).map_err(|e| Error::Unavailable { reason: e.to_string() })?;
+    let states = if handed { "('waiting','dispatched','admitted')" } else { "('waiting')" };
+    let tx = c.savepoint().map_err(sql_error)?;
+    let mut cancelled = Vec::new();
+    {
+        let mut q = tx.prepare(&format!("SELECT id,revision,generation,disposition,sender FROM agent_mail WHERE recipient=?1 AND revision<=?2 AND disposition IN {states} ORDER BY revision")).map_err(sql_error)?;
+        let mut rows = q.query(params![recipient, number(upto)?]).map_err(sql_error)?;
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            let (id, revision, generation, _): (String, i64, i64, String) = row_receipt(row).map_err(sql_error)?;
+            let sender: String = row.get(4).map_err(sql_error)?;
+            cancelled.push((from_receipt((id, revision, generation, Disposition::Cancelled.name().to_owned()), false)?, sender));
+        }
+    }
+    tx.execute(&format!("UPDATE agent_mail SET disposition='cancelled',terminal=COALESCE(terminal,?3) WHERE recipient=?1 AND revision<=?2 AND disposition IN {states}"), params![recipient, number(upto)?, terminal]).map_err(sql_error)?;
+    tx.commit().map_err(sql_error)?;
+    Ok(cancelled)
+}
+
 pub async fn history(store: &Store, owner: String, sender: String, recipient: String, status: Option<StatusKey>, after: u64, budget: usize) -> Result<Page<Publication>, Error> {
     store.read(move |c| Ok(history_on(c, &owner, &sender, &recipient, status.as_ref(), after, budget))).await.map_err(store_error)?
 }
@@ -998,6 +1037,34 @@ mod tests {
         let b = put(&mut c, &message("two", Some("build"), "after consumed"))?;
         assert!(claim_on(&mut c, b.revision, 9, 4096)?.is_some());
         assert!(matches!(transition_on(&mut c, first.token, Some(8), Disposition::Consumed, None), Err(Error::Stale { .. })));
+        Ok(())
+    }
+
+    /// docs/agents.md, "Reset": a reset cancels what kiln holds for an agent up to its line, those waiting first and
+    /// those handed out once its runner let them go; one sent after the line, and one seen to an end, stay as they are,
+    /// and the runner's own word for one it let go of is a repeat.
+    #[test]
+    fn a_reset_cancels_what_is_held_up_to_its_line_and_nothing_after() -> anyhow::Result<()> {
+        let mut c = db()?;
+        publish_on(&mut c, &message("waiting", None, "held"), u64::MAX)?;
+        let handed = publish_on(&mut c, &message("handed", None, "handed out"), u64::MAX)?;
+        let consumed = publish_on(&mut c, &message("consumed", None, "seen to an end"), u64::MAX)?;
+        let handed_out = claim_on(&mut c, handed.revision, 3, 4096)?.ok_or_else(|| anyhow::anyhow!("missing claim"))?;
+        let done = claim_on(&mut c, consumed.revision, 3, 4096)?.ok_or_else(|| anyhow::anyhow!("missing claim"))?;
+        transition_on(&mut c, done.token, Some(3), Disposition::Consumed, None)?;
+        let line = newest_on(&c, "recipient")?;
+        publish_on(&mut c, &message("after", None, "sent after the reset"), u64::MAX)?;
+        let first: Vec<String> = cancel_for_on(&mut c, "recipient", line, false)?.into_iter().map(|(r, sender)| format!("{}:{sender}", r.id)).collect();
+        assert_eq!(first, ["waiting:sender"], "those waiting first");
+        let second: Vec<String> = cancel_for_on(&mut c, "recipient", line, true)?.into_iter().map(|(r, _)| r.id).collect();
+        assert_eq!(second, ["handed"], "then those handed out");
+        let states: std::collections::BTreeMap<String, Disposition> = all(&c)?.items.into_iter().map(|p| (p.receipt.id, p.receipt.disposition)).collect();
+        assert_eq!(states.get("waiting"), Some(&Disposition::Cancelled));
+        assert_eq!(states.get("handed"), Some(&Disposition::Cancelled));
+        assert_eq!(states.get("consumed"), Some(&Disposition::Consumed), "one seen to an end keeps its end");
+        assert_eq!(states.get("after"), Some(&Disposition::Waiting), "one sent after the line goes to the fresh harness");
+        let terminal = serde_json::to_string(&crate::harness::admission::Disposition::Cancelled { reason: crate::harness::admission::CancelReason::User })?;
+        assert!(transition_on(&mut c, handed_out.token, Some(3), Disposition::Cancelled, Some(&terminal))?.repeat, "its runner's own word is a repeat");
         Ok(())
     }
 

@@ -33,8 +33,8 @@ pub fn command_kind(command: &Command) -> Option<&'static str> {
         | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::AutoResume { .. }
         | Command::McpEnable { .. } | Command::McpReconnect { .. } | Command::McpAuth { .. } | Command::McpAdd { .. }
         | Command::McpRemove { .. } | Command::RemoveTask { .. } | Command::OwnEdits { .. } | Command::Override { .. }
-        // A person applied an environment to it (the server sends it for them).
-        | Command::Agentenv { .. } => Some("command"),
+        // A person applied an environment to it (the server sends it for them), or reset it (or an agent of theirs did).
+        | Command::Agentenv { .. } | Command::Reset { .. } => Some("command"),
         // Reads and refreshes.
         Command::Snapshot | Command::McpRefresh | Command::Suggest { .. } | Command::SkillView { .. } | Command::SkillsReload => None,
         // kiln's own: a move's progress, a hand-over's word, another session's usage limit.

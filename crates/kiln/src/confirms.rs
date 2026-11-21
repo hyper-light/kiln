@@ -106,8 +106,9 @@ async fn target_of(cx: &Cx, name: &str, input: &Value) -> Target {
 const DEFS_UNCHANGED: &[&str] = &["agentdefs.check", "agentdefs.run"];
 
 /// Operations on another agent that its own rules already hold an agent to: a message (steered or
-/// queued from it, `lineage::may_message`) and a question about its code.
-const TO_PEERS: &[&str] = &["agents.send", "agents.about"];
+/// queued from it, `lineage::may_message`), a question about its code, and a reset of one that's stuck
+/// (`lineage::may_reset`: any agent working for the same person resets any other at once, Ada, 2026-11-21).
+const TO_PEERS: &[&str] = &["agents.send", "agents.about", "agents.reset"];
 
 /// What needs its person's click, of an agent's call of op `name` (`destructive` as the registry has
 /// it) with `input`, and what its target is now (its version, for the confirmation to hold to); none

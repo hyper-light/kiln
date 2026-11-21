@@ -1431,6 +1431,33 @@ html[data-window="short"] .hx-main:has(.ch :is(input, textarea, select):focus) >
   border-top: 1px solid #1d1f23;
   animation: ag-usage-in 0.12s ease-out;
 }
+/* An agent's reset, asked under its page's head (actions.tsx ResetAsk; docs/agents.md, "Reset"): static, the head's own rule above it. */
+.ag-reset {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 720px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #1d1f23;
+}
+.ag-reset-q {
+  margin: 0;
+  color: var(--color-secondary);
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.ag-reset-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.ag-reset-why {
+  flex: 1 1 220px;
+  min-width: 0;
+}
 .ag-refused-counts {
   margin: 0;
   color: var(--color-secondary);
