@@ -1,6 +1,7 @@
-//! The goal driver's model (CP-T6.1): kiln's goal driver (its own round of the stacks every tick,
-//! adopting, resuming and stepping them, as `Driver::drive` runs it) as a task of the server's
-//! node under kiln-sim's seeded scheduler,
+//! The goal driver's model (CP-T6.1, and T-T1.5.1 for G9 step 3): kiln's goal driver (its round
+//! of the stacks whenever its feed, its agents' news or a deadline wakes it, adopting, resuming
+//! and stepping them, as `Driver::follow` runs it) as a task of the server's node under kiln-sim's
+//! seeded scheduler,
 //! its time a simulated clock, its stacks in a test build's inline store (each call a wait a crash
 //! can come at), its agents on kiln-seams' `SimHarness`.
 //!
@@ -9,13 +10,18 @@
 //! meets it, stops short with it still set, gives up, or pauses it. The nemesis, until it stops:
 //! the server crashing at any wait of the driver's and coming back on its store; agents' machines
 //! going away; harnesses starting again and losing their goal; usage limits pausing agents;
-//! people clearing an agent's goal. After it, agents meet what they're sent.
+//! people clearing an agent's goal; people adding goals to a stack, and agents saying their goal is
+//! met themselves (`goals_done`), each a write to the store with nothing else to tell the driver
+//! (its feed must). After it, agents meet what they're sent.
 //!
 //! The checker: never two goals under way in a stack; a goal goes under way only when every goal
 //! before it ended, and an ended goal never comes back; nothing goes to an agent paused for a
 //! limit; a goal isn't sent again within 30 s of the last time unless something cut the agent off
-//! from it (the server's crash, the agent's restart, its machine away); and, once the nemesis has
-//! stopped, every stack runs to its end, each goal met (or skipped, cleared by a person).
+//! from it (the server's crash, the agent's restart, its machine away): no duplicate reminder; an
+//! agent free with its stack's goal open is sent it within the longest reminder gap
+//! (`REMIND_MAX_MS`) of the last send, of what last freed it, and of the server's start: no lost
+//! reminder (T-T1.5.1: both exactly 0); and, once the nemesis has stopped, every stack runs to its
+//! end, each goal met (or skipped, cleared by a person).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -29,7 +35,7 @@ use kiln_sim::{Queue, Rng, Trace, World};
 use rusqlite::params;
 use serde_json::{Value, json};
 
-use super::{Driver, REMIND_MS, touch};
+use super::{Driver, REMIND_MAX_MS, REMIND_MS, StoreFeed, touch};
 use crate::harness::model::{Command, Objective, Pause, Status};
 use crate::harness::session::Info;
 use crate::rt::Shutdown;
@@ -63,6 +69,8 @@ enum Ev {
     Clear(usize),
     ServerCrash,
     ServerUp,
+    /// A person adds a goal to the agent's stack.
+    Edit(usize),
 }
 
 struct Agent {
@@ -83,6 +91,11 @@ struct Agent {
     cut_at: Option<Duration>,
     /// Since when it's paused for a usage limit.
     paused: Option<Duration>,
+    /// Its machine is away.
+    away: bool,
+    /// When it was last freed: its turn ended, its harness restarted, its machine came back, its
+    /// pause ended, its goal cleared.
+    freed_at: Duration,
 }
 
 /// What a run counted.
@@ -98,8 +111,16 @@ pub struct Counts {
     pub clears: u64,
     pub stops_short: u64,
     pub polls: u64,
-    /// Server crashes at a wait of the driver's, mid-tick.
+    /// Server crashes at a wait of the driver's, mid-round.
     pub crashes_mid: u64,
+    /// Goals people added to stacks under way (T-T1.5.1).
+    pub edits: u64,
+    /// Goals their agents said met through the stack (`goals_done`), not their harness (T-T1.5.1).
+    pub verdicts: u64,
+    /// Goals sent again too soon (T-T1.5.1: exactly 0).
+    pub duplicates: u64,
+    /// Agents left free with their goal open past the longest reminder gap (T-T1.5.1: exactly 0).
+    pub lost: u64,
 }
 
 impl Counts {
@@ -115,6 +136,10 @@ impl Counts {
         self.stops_short += o.stops_short;
         self.polls += o.polls;
         self.crashes_mid += o.crashes_mid;
+        self.edits += o.edits;
+        self.verdicts += o.verdicts;
+        self.duplicates += o.duplicates;
+        self.lost += o.lost;
     }
 }
 
@@ -127,6 +152,8 @@ struct Sim {
     queue: Queue<Ev>,
     store: Store,
     port: SimHarness<Info, Command>,
+    /// The agents' news, as the hub's session events tell the driver: told at each change of theirs.
+    news: Arc<crate::rt::Notify>,
     shutdown: Shutdown,
     agents: Vec<Agent>,
     until: Duration,
@@ -142,20 +169,18 @@ struct Sim {
     counts: Counts,
 }
 
-/// The driver's loop, as `Driver::drive` runs it: its own round of the stacks every tick (what
-/// it does then for agents no stack drives, `keep`, is the process's, shared with other tests: the
-/// model's agents have it off). Its own lock for each change: `CHANGING` is the process's too.
-async fn driver(store: Store, clock: SimClock, port: SimHarness<Info, Command>, shutdown: Shutdown) {
+/// The driver's loop, as `Driver::drive` runs it: a round of the stacks whenever the store's feed,
+/// the agents' news or a deadline wakes it (what it does for agents no stack drives, `keep`, is the
+/// process's, shared with other tests: left out, and the model's agents have it off). Its own lock
+/// for each change: `CHANGING` is the process's too. A server that comes back starts on a new feed,
+/// as a restarted server does, with a round of every stack.
+async fn driver(store: Store, clock: SimClock, port: SimHarness<Info, Command>, news: Arc<crate::rt::Notify>, shutdown: Shutdown) {
     // Its own counters and no planner, as the driver's tests have (the process's are shared).
     let metrics = crate::metrics::AgentMetrics::default();
     let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
     let changing = crate::turn::Gate::one();
-    loop {
-        if !d.tick().await {
-            return;
-        }
-        d.round(&changing).await;
-    }
+    let feed = StoreFeed::new(&store);
+    let _ = d.follow(&changing, &feed, Some(&news), false).await;
 }
 
 fn catalog(kind: Kind) -> Value {
@@ -211,7 +236,7 @@ impl Sim {
                 Ok(())
             }))
             .map_err(|e| format!("{e:#}"))?;
-            agents.push(Agent { id, kind, heard: 0, on: None, turn: 0, cleared: Vec::new(), goals, sent: Vec::new(), cut_at: None, paused: None });
+            agents.push(Agent { id, kind, heard: 0, on: None, turn: 0, cleared: Vec::new(), goals, sent: Vec::new(), cut_at: None, paused: None, away: false, freed_at: Duration::ZERO });
         }
         let meddle = rng.range(0, 300);
         let crash_mid = rng.range(0, 8);
@@ -223,6 +248,7 @@ impl Sim {
             queue: Queue::new(),
             store,
             port,
+            news: Arc::new(crate::rt::Notify::new()),
             shutdown: Shutdown::new(),
             until,
             end: until.saturating_add(SETTLE),
@@ -278,12 +304,16 @@ impl Sim {
                 let t = at(&mut self.rng);
                 self.queue.push(t, Ev::Clear(i));
             }
+            for _ in 0..self.rng.range(0, 3) {
+                let t = at(&mut self.rng);
+                self.queue.push(t, Ev::Edit(i));
+            }
         }
     }
 
     fn server_up(&mut self) -> Result<(), String> {
         let sp = self.world.spawner(self.server).ok_or("no server node")?;
-        spawn(sp.as_ref(), driver(self.store.clone(), self.clock.clone(), self.port.clone(), self.shutdown.clone())).map_err(|e| format!("{e}"))?;
+        spawn(sp.as_ref(), driver(self.store.clone(), self.clock.clone(), self.port.clone(), Arc::clone(&self.news), self.shutdown.clone())).map_err(|e| format!("{e}"))?;
         self.up = true;
         Ok(())
     }
@@ -320,6 +350,7 @@ impl Sim {
                     let gap = now.saturating_sub(*last_at);
                     let cut = a.cut_at.is_some_and(|c| c >= *last_at) || self.crashed_at.is_some_and(|c| c >= *last_at);
                     if gap < Duration::from_millis(u64::try_from(REMIND_MS).unwrap_or(30_000)) && !cut {
+                        self.counts.duplicates += 1;
                         return Err(format!("{:?}: {} was sent {goal} again {gap:?} after the last time", now, a.id));
                     }
                 }
@@ -341,11 +372,19 @@ impl Sim {
             if let Some(a) = self.agents.get_mut(i) {
                 a.heard = self.port.heard(&a.id).len();
             }
+            self.news.notify();
         }
         Ok(())
     }
 
+    /// An event, and the agents' news of it told (the store's writes tell the driver themselves).
     fn act(&mut self, ev: Ev) -> Result<(), String> {
+        let out = self.act_on(ev);
+        self.news.notify();
+        out
+    }
+
+    fn act_on(&mut self, ev: Ev) -> Result<(), String> {
         let now = self.now();
         let now_ms = self.unix_ms();
         let faulty = now < self.until;
@@ -356,6 +395,7 @@ impl Sim {
                     return Ok(());
                 }
                 let Some(goal) = a.on.take() else { return Ok(()) };
+                a.freed_at = now;
                 // After the nemesis, every goal is met.
                 let roll = if faulty { self.rng.below(100) } else { 0 };
                 let (kind, id) = (a.kind, a.id.clone());
@@ -363,6 +403,25 @@ impl Sim {
                     self.counts.met += 1;
                 } else {
                     self.counts.stops_short += 1;
+                }
+                // Now and then the agent says so through its stack (`goals_done`): the goal ends met
+                // in the store, its harness's goal cleared, and nothing else tells the driver.
+                if roll < 60 && self.rng.chance(300) {
+                    self.counts.verdicts += 1;
+                    let (a, g) = (id.clone(), goal.clone());
+                    futures::executor::block_on(self.store.call(move |c| {
+                        c.execute("UPDATE goal_items SET status = 'met', reason = 'said met', ended_at = ?3 WHERE agent = ?1 AND text = ?2 AND status = 'active'", params![a, g, now_ms])?;
+                        touch(c, &a, None, None, now_ms)
+                    }))
+                    .map_err(|e| format!("{e:#}"))?;
+                    self.port.update(&id, |info| {
+                        info.status = Status::Idle;
+                        info.last_activity = now_ms;
+                        info.summary = "It's done.".into();
+                        info.objective = None;
+                    });
+                    self.trace.note(|| format!("{now:?} {id} says {goal} met through its stack"));
+                    return Ok(());
                 }
                 self.port.update(&id, |info| {
                     info.status = Status::Idle;
@@ -386,8 +445,9 @@ impl Sim {
                 if !faulty {
                     return Ok(());
                 }
-                if let Some(a) = self.agents.get(i) {
+                if let Some(a) = self.agents.get_mut(i) {
                     self.port.away(&a.id, true);
+                    a.away = true;
                 }
                 self.update(i, |info| info.status = Status::Disconnected);
                 self.counts.aways += 1;
@@ -399,6 +459,8 @@ impl Sim {
                 if let Some(a) = self.agents.get_mut(i) {
                     self.port.away(&a.id, false);
                     a.cut_at = Some(now);
+                    a.away = false;
+                    a.freed_at = now;
                 }
                 self.update(i, |info| info.status = if working { Status::Running } else { Status::Idle });
             }
@@ -411,6 +473,7 @@ impl Sim {
                     a.turn = a.turn.saturating_add(1);
                     a.on = None;
                     a.cut_at = Some(now);
+                    a.freed_at = now;
                 }
                 self.update(i, |info| {
                     info.status = Status::Idle;
@@ -440,6 +503,7 @@ impl Sim {
                 if let Some(a) = self.agents.get_mut(i) {
                     a.paused = None;
                     a.cut_at = Some(now);
+                    a.freed_at = now;
                 }
                 self.update(i, |info| info.pause = None);
             }
@@ -461,6 +525,7 @@ impl Sim {
                     a.cleared.push(text);
                     a.turn = a.turn.saturating_add(1);
                     a.on = None;
+                    a.freed_at = now;
                     self.update(i, |info| info.status = Status::Idle);
                     self.counts.clears += 1;
                 }
@@ -480,6 +545,25 @@ impl Sim {
                     self.server_up()?;
                     self.crashed_at = Some(now);
                 }
+            }
+            Ev::Edit(i) => {
+                // A person adds a goal at the end of the stack (`goals_add`): a stack that was done
+                // runs again. A write to the store, nothing more: the driver hears it on its feed.
+                let Some(a) = self.agents.get_mut(i) else { return Ok(()) };
+                let k = a.goals.len();
+                let text = format!("goal {k} of agent {i}, added");
+                a.goals.push(text.clone());
+                let agent = a.id.clone();
+                self.counts.edits += 1;
+                self.counts.goals += 1;
+                futures::executor::block_on(self.store.call(move |c| {
+                    let pos: i64 = c.query_row("SELECT COALESCE(MAX(pos), -1) + 1 FROM goal_items WHERE agent = ?1", params![agent], |r| r.get(0))?;
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES (?1, ?2, ?3, ?4, 'pending')", params![format!("{agent}-g{k}"), agent, pos, text])?;
+                    let done: bool = c.query_row("SELECT state = 'done' FROM goal_stacks WHERE agent = ?1", params![agent], |r| r.get(0))?;
+                    touch(c, &agent, done.then_some("running"), None, now_ms)
+                }))
+                .map_err(|e| format!("{e:#}"))?;
+                self.trace.note(|| format!("{now:?} a goal added to agent {i}'s stack"));
             }
         }
         Ok(())
@@ -541,6 +625,31 @@ impl Sim {
         Ok(all_done)
     }
 
+    /// No lost reminder (T-T1.5.1): an agent free (not at work, not paused, its machine there) whose
+    /// stack runs with a goal open is sent a goal within the longest reminder gap of the last send,
+    /// of what last freed it, and of the server's start, while the server is up.
+    fn check_lost(&mut self) -> Result<(), String> {
+        if !self.up {
+            return Ok(());
+        }
+        let now = self.now();
+        let longest = Duration::from_millis(u64::try_from(REMIND_MAX_MS).unwrap_or(u64::MAX));
+        let stacks = self.stacks()?;
+        for a in &self.agents {
+            let open = stacks.get(&a.id).is_some_and(|(state, items)| state == "running" && items.iter().any(|(_, st)| st == "pending" || st == "active"));
+            if !open || a.on.is_some() || a.paused.is_some() || a.away {
+                continue;
+            }
+            let sent = a.sent.last().map_or(Duration::ZERO, |(t, _)| *t);
+            let since = sent.max(a.freed_at).max(self.crashed_at.unwrap_or(Duration::ZERO));
+            if now.saturating_sub(since) > longest {
+                self.counts.lost += 1;
+                return Err(format!("{now:?}: {} was left free with its goal open since {since:?}, past the longest reminder gap: a lost reminder ({:?})", a.id, stacks.get(&a.id)));
+            }
+        }
+        Ok(())
+    }
+
     fn run(&mut self) -> Result<(), String> {
         let mut ended = BTreeMap::new();
         for _ in 0..STEPS_MAX {
@@ -562,7 +671,8 @@ impl Sim {
                 }
                 continue;
             }
-            // Nothing ready: the driver waits for its next tick.
+            // Nothing ready: the driver waits for what it follows.
+            self.check_lost()?;
             if self.check_stacks(&mut ended)? && self.now() >= self.until {
                 break;
             }
@@ -626,9 +736,11 @@ mod tests {
 
     use super::*;
 
-    /// CP-T6.1, AC-T6.1.1: the goal driver's model over the seed budget: stacks run in order, one
-    /// goal at a time, nothing to a paused agent, no goal sent again too soon, and every stack runs
-    /// to its end once the nemesis stops; and every fault happened.
+    /// CP-T6.1, AC-T6.1.1, and T-T1.5.1 (G9 step 3: the driver on the feed): the goal driver's
+    /// model over the seed budget (`KILN_SIM_SEEDS=10000` for T-T1.5.1's): stacks run in order, one
+    /// goal at a time, nothing to a paused agent, duplicate and lost reminders exactly 0, people's
+    /// edits and agents' verdicts through the store reaching the driver, and every stack runs to its
+    /// end once the nemesis stops; and every fault happened.
     #[test]
     fn goal_stacks_run_in_order_to_their_end_under_the_nemesis() -> Result<(), String> {
         let mut all = Counts::default();
@@ -641,9 +753,12 @@ mod tests {
         eprintln!("{}\n  counted: {all:?}", report.line());
         report.into_result()?;
         if seeds::replay().is_none() {
-            let none = [("server crashes", all.server_crashes), ("crashes at a wait of the driver's", all.crashes_mid), ("restarts", all.restarts), ("machines away", all.aways), ("pauses", all.pauses), ("goals stopped short", all.stops_short), ("goals met", all.met)];
+            let none = [("server crashes", all.server_crashes), ("crashes at a wait of the driver's", all.crashes_mid), ("restarts", all.restarts), ("machines away", all.aways), ("pauses", all.pauses), ("goals stopped short", all.stops_short), ("goals met", all.met), ("goals added", all.edits), ("goals said met through the stack", all.verdicts)];
             if let Some((what, _)) = none.iter().find(|(_, n)| *n == 0) {
                 return Err(format!("no {what} over the budget: the model didn't test what it says"));
+            }
+            if all.duplicates != 0 || all.lost != 0 {
+                return Err(format!("duplicate reminders {}, lost {}: both must be 0", all.duplicates, all.lost));
             }
         }
         Ok(())
