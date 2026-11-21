@@ -2895,13 +2895,15 @@ where
 /// stack as the goal under way,
 /// so kiln keeps it like the others; one the stack had under way goes back to the front of what's
 /// next. The stack runs.
-async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<()> {
-    let Some(o) = set_goal(info) else { return Ok(()) };
-    // Gone since the round looked (ended, its stack forgotten: [`forget_with`]): its goal makes it no
-    // stack again.
-    if d.port.agent(&info.id).is_none() {
+async fn adopt<P: HarnessPort<Agent = Info>>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<()> {
+    if set_goal(info).is_none() {
         return Ok(());
     }
+    // Gone since the round looked (ended, its stack forgotten: [`forget_with`]): its goal makes it no
+    // stack again. There, its goal as it is now, not as the round saw it: the stack may have ended
+    // it since, and its harness let it go.
+    let Some(info) = d.port.agent(&info.id) else { return Ok(()) };
+    let Some(o) = set_goal(&info) else { return Ok(()) };
     let Ok(text) = clean(&o.text) else { return Ok(()) };
     let (agent, how, at, now, gave_up) = (info.id.clone(), how(d.port, &info.id), o.at, d.clock.unix_ms(), o.status == "unmet");
     d.store
@@ -2909,6 +2911,17 @@ async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result
             // One you cleared or skipped is being cleared in the agent: it doesn't come back.
             let dropped: i64 = c.query_row("SELECT dropped_at FROM goal_stacks WHERE agent = ?1", params![agent], |r| r.get(0)).optional()?.unwrap_or(0);
             if at <= dropped {
+                return Ok(());
+            }
+            // One the stack ended (said met through it, met, skipped) at or after the agent's goal
+            // was set: what the agent still has is the goal the stack sent it, not one set anew, and
+            // it doesn't come back (T-T1.5.1: an ended goal never does). Set in the agent again
+            // after that, it joins.
+            if c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM goal_items WHERE agent = ?1 AND text = ?2 AND status NOT IN ('pending', 'active') AND ended_at >= ?3)",
+                params![agent, text, at],
+                |r| r.get::<_, bool>(0),
+            )? {
                 return Ok(());
             }
             // Its harness giving up on a goal the stack knows, one it still had set: one the stack has
