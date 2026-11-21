@@ -759,10 +759,6 @@ pub struct Host {
     /// (`crate::sandbox::isolated::reach_of`): as its maker keeps them ([`Host::keep_homes`]), none
     /// till then.
     homes: std::sync::OnceLock<PathBuf>,
-    /// The kiln server's data folder on this machine (kiln.db, its secrets and tokens), kiln's state, which no
-    /// isolated agent's project is, holds or lies in (`crate::sandbox::isolated::kept_out`): as its runner keeps
-    /// it ([`Host::keep_server_data`]), none till then.
-    server_data: std::sync::OnceLock<PathBuf>,
 }
 
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
@@ -1060,7 +1056,6 @@ impl Host {
             handovers,
             microvm: Mutex::new(crate::sandbox::microvm()),
             homes: std::sync::OnceLock::new(),
-            server_data: std::sync::OnceLock::new(),
         });
         shares.follow_input(&host);
         host
@@ -1075,17 +1070,6 @@ impl Host {
     /// Where this machine keeps its persons' harness homes (`<state>/homes`), if it keeps any.
     pub fn homes(&self) -> Option<&std::path::Path> {
         self.homes.get().map(PathBuf::as_path)
-    }
-
-    /// Keeps `dir` as the kiln server's data folder on this machine (`agent::Opts::server_data_dir`): the first it's
-    /// given.
-    pub fn keep_server_data(&self, dir: PathBuf) {
-        let _ = self.server_data.set(dir);
-    }
-
-    /// The kiln server's data folder on this machine, if its runner kept it ([`Host::keep_server_data`]).
-    pub fn server_data(&self) -> Option<&std::path::Path> {
-        self.server_data.get().map(PathBuf::as_path)
     }
 
     /// Where this machine holds isolated agents' harnesses (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
@@ -5599,7 +5583,7 @@ while True:
         use kiln_seams::sandbox::Boundary;
         crate::rt::block_on(async move {
             let dir = tempfile::tempdir()?;
-            // kiln's state (its microVMs' store, its people's volumes) apart from its project, which may hold none of it (CP-T4.1's AC-T4.1.5).
+            // kiln's state (its microVMs' store, its people's volumes), in a folder of its own.
             let state = tempfile::tempdir()?;
             let (program, heard) = stand_in(dir.path())?;
             let (tx, _rx) = async_channel::unbounded();
@@ -5740,7 +5724,7 @@ while True:
     fn p1_3_a_session_through_hex_interrupted_mid_turn_goes_on_and_its_stop_ends_its_member_then_its_box() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let dir = tempfile::tempdir()?;
-            // kiln's state apart from its project, which may hold none of it (CP-T4.1's AC-T4.1.5).
+            // kiln's state, in a folder of its own.
             let state = tempfile::tempdir()?;
             let (program, heard) = stand_in(dir.path())?;
             let (tx, _rx) = async_channel::unbounded();

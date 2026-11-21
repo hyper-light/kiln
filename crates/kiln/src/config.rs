@@ -802,13 +802,6 @@ pub fn default_config_path() -> PathBuf {
     crate::os::config_home().join("kiln").join("kiln.toml")
 }
 
-/// The kiln server's data folder on this machine as its config at `path` names it, read as the server reads it
-/// ([`Config::load`]: `[server] data_dir`, `$KILN_DATA_DIR` over it); where that config can't be read, where a server
-/// keeps it by default ([`default_data_dir`]).
-pub fn server_data_dir(path: &Path) -> PathBuf {
-    Config::load(path).map_or_else(|_| default_data_dir(), |c| c.server.data_dir)
-}
-
 impl Default for Server {
     fn default() -> Self {
         let host = hostname();
