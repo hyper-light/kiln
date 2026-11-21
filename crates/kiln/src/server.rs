@@ -184,6 +184,19 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // What admissions and restarts taught before this start, and the restart it ends, learned as runners are answered
     // from here on (docs/resilience.md R5).
     hub.take_admission(began.elapsed()).await;
+    // The run-lease broker over kiln's credential store (plan step 33, Shards' D242), opened before any runner is heard,
+    // whether or not the server runs a runner of its own: every runner's microVMs are leased their credentials and
+    // sign-ins from it over their links (`crate::secrets::lessor::answer`), and a runner is told the server answers them
+    // only once it's open (`Hub::features`). Opened only with the server's own runner, a server with `[local_agent]` off
+    // (production's) named it and refused every one, "its server's run-lease broker isn't open". A broker that doesn't
+    // open leases no machine's microVMs anything: their harnesses sign in themselves.
+    let lessors = match crate::secrets::lessor::open(&hub).await {
+        Ok(lessors) => Some(lessors),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "the run-lease broker didn't open: no machine's microVMs are leased credentials, and their harnesses sign in themselves");
+            None
+        }
+    };
     // Runners are heard from here on, and charged their grace from now (`crate::comeback`). Until its agent sessions are
     // listed (`Registry::run_local`, below), and the runners connected before it are back or past their grace, an
     // attach to a session it has no copy of yet waits for it (`crate::harness::returning`; docs/wire.md, "Restarts"):
@@ -644,15 +657,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         let creds = (pki.ca_der.clone(), pki.issue_local(&name)?);
         let http_port = cfg.server.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p).to_owned();
-        // Its microVMs' credentials leased from the run-lease broker over kiln's credential store (plan step 33, Shards'
-        // D242). A broker that doesn't open leaves it none: a launch granting a credential is then refused, typed.
-        let leasing = match crate::secrets::lessor::open(&hub).await {
-            Ok(lessors) => Some(crate::sandbox::Leasing(Arc::new(lessors))),
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "the run-lease broker didn't open: this machine's microVMs hold no credentials");
-                None
-            }
-        };
+        // Its microVMs' credentials leased from the server's run-lease broker in its process (opened above). A broker that
+        // didn't open leaves it none: a launch granting a credential is then refused, typed.
+        let leasing = lessors.map(|lessors| crate::sandbox::Leasing(Arc::new(lessors)));
         let opts = crate::agent::Opts {
             server_url: format!("http://127.0.0.1:{http_port}"),
             quic: Some(format!("127.0.0.1:{}", quic_bind.port())),

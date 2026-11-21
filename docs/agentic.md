@@ -804,7 +804,16 @@ of the machine changed, and a rootless one says why not. Once a container is gon
 mount stays only as it's busy (`slates::remove_after_container`, measured live with the bind: Docker Desktop's VM held
 the files a container touched past its life). Its proof by use: `slates_e2e`'s `container::` drives (CONTAINER_E2E=1),
 an agent in a container through kiln, its writes reviewed, landed by its mode, and its drift kept; and W9's A/B
-(`workspace::container_ab_tests`). Owed, in order, each a piece: Windows' run; whether the engine's mount keeps
+(`workspace::container_ab_tests`). By use on adacachy (2026-11-20, rootful Docker Engine 29.9.0, nothing of the machine
+changed; kiln 209e19dc6, run r3): both drives passed, an agent in each mode reviewed, landed by its person and its drift
+kept, its container and engine volume gone at its end. The A/B there (run r5, a release kiln, 5 interleaved rounds, every
+run's seconds shown): the export made what the container's own tmpfs made, byte for byte, in every round of git's clone,
+`gc` and `fsck` (export 0.116, 0.148, 0.180, 0.182, 0.205 s; control 0.045 to 0.068 s), a release `cargo build` (export
+0.406, 0.409, 0.530, 1.126, 2.073 s; control 0.274 to 1.482 s), an offline `npm install` (export 0.362, 0.374, 0.416,
+0.592, 0.608 s; control 0.280 to 0.939 s) and a run of hard links, renames and a delete while open (export 0.511, 0.520,
+0.544, 0.613, 0.651 s; control 0.218 to 0.728 s, no `.nfs` name left); the bind ran in none of the 20, Docker refusing
+it (`stat ...: permission denied`: the engine, root, never sees a FUSE mount made without `allow_other`), which is the
+machine change it needs. Owed, in order, each a piece: Windows' run; whether the engine's mount keeps
 `nosuid` and `nodev` without the container's rules, measured.
 
 **W10 Kubernetes (kiln goal 28e73c34's part 01a1f1249c5e75b5bbf0c92c84385109, designed 2026-11-19).** An agent on
