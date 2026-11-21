@@ -395,7 +395,9 @@ jobs:
             out="$RUNNER_TEMP/$step.txt"
             if [ ! -s "$out" ]; then continue; fi
             plain=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Blocking|Downloaded|Downloading|Updating|Locking) ')
-            summary=$(printf '%s\n' "$plain" | grep -E '^(test result:|test .* \.\.\. (ok|FAILED|ignored)$|SKIP:|PROVEN:)' | tail -n 60)
+            # What failed first (an annotation keeps its first 4096 characters): each failed test, its panic or error
+            # lines, and the result line; then what passed and was proven.
+            summary=$( { printf '%s\n' "$plain" | grep -E '^test result:|FAILED$|^---- |panicked at|^Error: |^Caused by:|^ +[0-9]+: [^ ]' | grep -v -E '^ +[0-9]+: (std|core|alloc|tokio|futures|hyper_rt)::' | head -n 60; printf '%s\n' "$plain" | grep -E '^(SKIP:|PROVEN:)|\.\.\. ok$' | tail -n 40; } )
             text=$(printf '%s\n' "$plain" | tail -n 150)
             if ! printf '%s\n' "$plain" | grep -q -E '^running [0-9]+ tests?$'; then
               first=$(printf '%s\n' "$plain" | sed -n '/^error/,$p' | head -n 150)

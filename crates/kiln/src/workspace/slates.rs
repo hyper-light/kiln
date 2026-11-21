@@ -689,25 +689,34 @@ pub async fn make(name: &str, over: &Path) -> anyhow::Result<Made> {
     if let Err(e) = held {
         failed = e;
     }
-    for point in points {
+    'points: for point in points {
         let m = Made { volume: volume.clone(), name: name.to_owned(), mount: point.to_string_lossy().into_owned(), base: base.clone() };
         // Mounted there anew, never taken as mounted already: a drive letter another start took meanwhile holds its
         // volume, not this one, and Slates refuses a second mount at it.
-        match mount_typed(&m).await {
+        let mut answer = mount_typed(&m).await;
+        // Refused for now: asked again at the same point after Slates' pause, as a moved volume's mount is
+        // ([`after_refusal`]; w-fed-move's finding 4: a first mount across a LAN met `LeaseUnconfirmed` and gave up).
+        while let Ok(Err(refused)) = &answer
+            && let AfterRefusal::Again(pause) = after_refusal(refused, super::place::taken(&point))
+        {
+            pause_for_move(pause).await;
+            answer = mount_typed(&m).await;
+        }
+        match answer {
             Ok(Ok(())) => return Ok(m),
             // Refused as another volume's letter, or taken meanwhile: the next one; any other refusal ends the search.
             Ok(Err(refused)) => {
-                let next = another_letter_may_serve(&refused, super::place::taken(&point));
+                let next = after_refusal(&refused, super::place::taken(&point)) == AfterRefusal::NextPoint;
                 failed = anyhow::anyhow!("Slates' mount: {refused}");
                 if !next {
-                    break;
+                    break 'points;
                 }
             }
             // Taken meanwhile (a drive letter another start mounted first): the next one.
             Err(e) if super::place::taken(&point) => failed = e,
             Err(e) => {
                 failed = e;
-                break;
+                break 'points;
             }
         }
     }
@@ -948,8 +957,10 @@ pub async fn mounted_patiently(m: &Made) -> anyhow::Result<()> {
     loop {
         match mount_typed(m).await? {
             Ok(()) => return Ok(()),
-            Err(slates_api::Error::Retry { pause_ns, .. }) => pause_for_move(Duration::from_nanos(pause_ns)).await,
-            Err(refused) => anyhow::bail!("Slates' mount: {refused}"),
+            Err(refused) => match after_refusal(&refused, false) {
+                AfterRefusal::Again(pause) => pause_for_move(pause).await,
+                AfterRefusal::NextPoint | AfterRefusal::Refused => anyhow::bail!("Slates' mount: {refused}"),
+            },
         }
     }
 }
@@ -1098,6 +1109,28 @@ fn another_letter_may_serve(refused: &slates_api::Error, taken_now: bool) -> boo
     taken_now || matches!(refused, slates_api::Error::Host(slates_api::HostFault::Target(slates_api::TargetRefusal::DriveLetterTaken)))
 }
 
+/// What a workspace's mount does after Slates answered `refused` at a point (`taken_now`: a drive holds the point now):
+/// every mount alike, a workspace's first ([`make`]) and a moved volume's ([`mounted_patiently`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AfterRefusal {
+    /// Refused for now (`Error::Retry`: a lease not yet confirmed across the LAN, `LeaseUnconfirmed`, or a moved volume
+    /// its new owner hasn't adopted): asked again at the same point after the pause Slates derived, which Slates bounds.
+    Again(Duration),
+    /// Another drive letter may serve ([`another_letter_may_serve`]).
+    NextPoint,
+    /// No point serves: the refusal stands.
+    Refused,
+}
+
+/// The [`AfterRefusal`] of `refused`, at a point a drive holds now or not (`taken_now`).
+fn after_refusal(refused: &slates_api::Error, taken_now: bool) -> AfterRefusal {
+    match refused {
+        slates_api::Error::Retry { pause_ns, .. } => AfterRefusal::Again(Duration::from_nanos(*pause_ns)),
+        refused if another_letter_may_serve(refused, taken_now) => AfterRefusal::NextPoint,
+        _ => AfterRefusal::Refused,
+    }
+}
+
 /// Takes workspace `m`'s mount away ([`unmount_typed`]), its refusal in Slates' words.
 async fn unmount(m: &Made) -> anyhow::Result<()> {
     unmount_typed(m).await?.map_err(|refused| anyhow::anyhow!("Slates' unmount: {refused}"))
@@ -1198,7 +1231,7 @@ async fn holders(_mount: &str) -> Result<Vec<String>, String> {
 /// destroyed once the mount has gone, and kept, refused by kind ([`MountStays`]), while it stays: never destroyed
 /// beneath a live mount.
 pub async fn remove(m: &Made) -> anyhow::Result<()> {
-    take_down(&Live { made: m }, &m.mount).await?;
+    take_down(&Live { made: m, patient_until: std::time::Instant::now() + BUSY_PATIENCE }, &m.mount).await?;
     if !m.mount.is_empty() {
         super::place::clear(Path::new(&m.mount));
     }
@@ -1320,12 +1353,23 @@ trait TakeDown {
     /// Slates' answer, its refusal kept typed (`Ok(Err(refused))`), apart from a failure to ask it at all.
     async fn unmount(&self) -> anyhow::Result<Result<(), slates_api::Error>>;
     async fn holders(&self) -> Result<Vec<String>, String>;
+    /// Until what holds a busy mount (`held`) has ended, as the OS tells it, within the take-down's patience: false once
+    /// the patience has run out, or where nothing names a process whose end can be waited on.
+    async fn released(&self, held: &Held) -> bool;
     async fn destroy(&self) -> anyhow::Result<()>;
 }
 
-/// [`TakeDown`] for workspace `made` on this machine.
+/// How long a workspace's take-down waits for what holds its mount busy to end ([`take_down`]): once kiln's own
+/// processes in it have ended, what holds it is another's, which may be kiln's own short work in it still (a `git`
+/// of a review or a drift read in a moved workspace: w-fed-move, 2026-11-20) or a person's shell, which never ends of
+/// itself. Long enough for the first, ordinary git operations over a workspace volume; past it, the mount is refused
+/// busy by kind (`MountStays`), so a person ends what holds it, never left up unsaid.
+const BUSY_PATIENCE: Duration = Duration::from_secs(120);
+
+/// [`TakeDown`] for workspace `made` on this machine, waiting on what holds its mount busy until `patient_until`.
 struct Live<'a> {
     made: &'a Made,
+    patient_until: std::time::Instant,
 }
 
 impl TakeDown for Live<'_> {
@@ -1342,6 +1386,18 @@ impl TakeDown for Live<'_> {
         holders(&self.made.mount).await
     }
 
+    /// Each process `lsof` names holding the mount waited on to its end, as the OS tells it (`os::watch::exited`), never
+    /// a clock's look, within the patience left (`rt::timeout`, the wait's own deadline).
+    async fn released(&self, held: &Held) -> bool {
+        let Held::Busy { holders: Ok(holders) } = held else { return false };
+        let pids: Vec<u32> = holders.iter().filter_map(|h| h.split_whitespace().next()?.parse().ok()).collect();
+        let left = self.patient_until.saturating_duration_since(std::time::Instant::now());
+        if pids.is_empty() || left.is_zero() {
+            return false;
+        }
+        matches!(crate::rt::timeout(left, crate::os::watch::exited(&pids)).await, Ok(Ok(())))
+    }
+
     async fn destroy(&self) -> anyhow::Result<()> {
         let volume = volume_id(&self.made.volume)?;
         call("volume destroy", move |i| i.destroy(volume)).await
@@ -1349,7 +1405,8 @@ impl TakeDown for Live<'_> {
 }
 
 /// Takes a workspace with mount point `mount` down by `steps`: unmounted, asked once (what held it, the processes kiln
-/// started in it, has ended: [`remove`]), then its volume destroyed, only once the kernel's mount table no longer holds
+/// started in it, has ended: [`remove`]) and again only after what holds it busy then has ended, as the OS tells it,
+/// within [`BUSY_PATIENCE`] (w-fed-move's finding 1), then its volume destroyed, only once the kernel's mount table no longer holds
 /// the point; an unmount that answers done is believed only when the table agrees. A mount that stays keeps its volume,
 /// refused by kind, as Slates types the unmount's answer ([`MountStays`], [`Held`]), and logged: a volume destroyed
 /// beneath a live mount leaves the mount with nothing behind it (the macOS bare-metal drive, f3f618f2, kiln 68eda5b1,
@@ -1358,8 +1415,8 @@ impl TakeDown for Live<'_> {
 async fn take_down(steps: &impl TakeDown, mount: &str) -> anyhow::Result<()> {
     if !mount.is_empty() {
         if steps.mounted().await {
-            let asked = steps.unmount().await;
-            if steps.mounted().await {
+            let mut asked = steps.unmount().await;
+            while steps.mounted().await {
                 let held = match asked {
                     // Done by Slates' word while kiln's own read of the table still lists it, or Slates' own read
                     // after an unmount that answered done (contract 42): the OS's unmount and its table disagree.
@@ -1369,6 +1426,12 @@ async fn take_down(steps: &impl TakeDown, mount: &str) -> anyhow::Result<()> {
                     Ok(Err(refused)) => held_by(format!("Slates' unmount: {refused}"), steps.holders().await),
                     Err(unasked) => held_by(format!("{unasked:#}"), steps.holders().await),
                 };
+                // Busy: asked again once what holds it has ended, within the take-down's patience (w-fed-move's finding 1).
+                if matches!(held, Held::Busy { .. }) && steps.released(&held).await {
+                    tracing::info!(mount, ?held, "an ended agent's workspace was busy until what held it ended: asked again");
+                    asked = steps.unmount().await;
+                    continue;
+                }
                 let stays = MountStays { mount: mount.to_owned(), held };
                 tracing::warn!(%stays, "an ended agent's workspace stays mounted once its processes have ended: its volume is kept");
                 return Err(stays.into());
@@ -2031,6 +2094,9 @@ mod tests {
             async fn holders(&self) -> Result<Vec<String>, String> {
                 self.holders.clone()
             }
+            async fn released(&self, _held: &Held) -> bool {
+                false
+            }
             async fn destroy(&self) -> anyhow::Result<()> {
                 self.destroyed.fetch_add(1, Relaxed);
                 Ok(())
@@ -2081,6 +2147,85 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(lsof_holders("p4242\nczsh\nf5\np4243\ncvim\n"), ["4242 zsh", "4243 vim"], "lsof's -F pc fields, each process once");
         Ok(())
+    }
+
+    /// w-fed-move's finding 4 (kiln goal 91's live move, 2026-11-20): a workspace's first mount waits on Slates'
+    /// "refused for now" as a moved volume's mount does: across a LAN a new volume's first mount met `LeaseUnconfirmed`
+    /// (`Error::Retry`) and gave up, where the moved volume's waited. Do: judge a refusal for now, a letter another
+    /// volume holds, and a volume gone. Expect: asked again at the same point after Slates' own pause; the next letter;
+    /// refused.
+    #[test]
+    fn fed_move_a_first_mount_refused_for_now_is_asked_again_after_slates_pause() {
+        let retry = slates_api::Error::Retry { cause: slates_api::RetryCause::LeaseUnconfirmed { version: 3 }, pause_ns: 250_000_000 };
+        assert_eq!(after_refusal(&retry, false), AfterRefusal::Again(Duration::from_millis(250)), "refused for now: asked again after Slates' pause");
+        assert_eq!(after_refusal(&retry, true), AfterRefusal::Again(Duration::from_millis(250)), "refused for now, whatever holds the point");
+        let letter = slates_api::Error::Host(slates_api::HostFault::Target(slates_api::TargetRefusal::DriveLetterTaken));
+        assert_eq!(after_refusal(&letter, false), AfterRefusal::NextPoint);
+        let gone = slates_api::Error::NotFound(slates_api::Missing::Volume(slates_api::VolumeId { bytes: [7; 16] }));
+        assert_eq!(after_refusal(&gone, false), AfterRefusal::Refused);
+        assert_eq!(after_refusal(&gone, true), AfterRefusal::NextPoint, "a point another start took meanwhile: the next one");
+    }
+
+    /// w-fed-move's finding 1 (kiln goal 91's live move, 2026-11-20): after a move, `agents.stop` left the new runner's
+    /// mount up: its one unmount met it busy, held by a `git` of kiln's own work in the moved workspace, which ended
+    /// minutes later. A busy mount is asked again once what holds it has ended, as the OS tells it, within the take-down's
+    /// patience; one still held when the patience runs out keeps its volume, refused by kind (`MountStays`, busy), never
+    /// left up unsaid. Do: hold the mount busy for one unmount, its holder then ending. Expect: asked twice, its volume
+    /// destroyed. Do: hold it busy past the patience. Expect: refused busy, naming the holder, nothing destroyed. A mount
+    /// refused other than busy is asked once, as before (`w3_a_volume_is_never_destroyed_while_its_mount_is_in_the_table`).
+    #[test]
+    fn fed_move_a_mount_held_busy_briefly_is_asked_again_once_its_holder_ends() -> anyhow::Result<()> {
+        use slates_api::MountFault;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+        const POINT: &str = "/state/workspaces/kiln-m";
+        struct HeldBusy {
+            mounted: AtomicBool,
+            /// How many unmounts it is busy for before it goes.
+            busy_for: u32,
+            /// How many of its holders' ends are told before the patience runs out.
+            ends_told: u32,
+            unmounts: AtomicU32,
+            waits: AtomicU32,
+            destroyed: AtomicU32,
+        }
+        impl TakeDown for HeldBusy {
+            async fn mounted(&self) -> bool {
+                self.mounted.load(Relaxed)
+            }
+            async fn unmount(&self) -> anyhow::Result<Result<(), slates_api::Error>> {
+                if self.unmounts.fetch_add(1, Relaxed) < self.busy_for {
+                    let holders = slates_api::MountHolders { pids: vec![88916], unreadable: 0, unread: None };
+                    return Ok(Err(slates_api::Error::Mount(MountFault::Busy { path: POINT.to_owned(), holders })));
+                }
+                self.mounted.store(false, Relaxed);
+                Ok(Ok(()))
+            }
+            async fn holders(&self) -> Result<Vec<String>, String> {
+                Ok(vec!["88916 git".to_owned()])
+            }
+            async fn released(&self, held: &Held) -> bool {
+                assert!(matches!(held, Held::Busy { .. }), "waited on a mount that isn't busy: {held:?}");
+                self.waits.fetch_add(1, Relaxed) < self.ends_told
+            }
+            async fn destroy(&self) -> anyhow::Result<()> {
+                self.destroyed.fetch_add(1, Relaxed);
+                Ok(())
+            }
+        }
+        fn held(busy_for: u32, ends_told: u32) -> HeldBusy {
+            HeldBusy { mounted: AtomicBool::new(true), busy_for, ends_told, unmounts: AtomicU32::new(0), waits: AtomicU32::new(0), destroyed: AtomicU32::new(0) }
+        }
+        crate::rt::block_on(async {
+            let briefly = held(1, 1);
+            take_down(&briefly, POINT).await?;
+            anyhow::ensure!((briefly.unmounts.load(Relaxed), briefly.destroyed.load(Relaxed)) == (2, 1), "asked again once its holder ended, then destroyed: {} unmounts, {} destroys", briefly.unmounts.load(Relaxed), briefly.destroyed.load(Relaxed));
+            let outlasting = held(u32::MAX, 2);
+            let kept = take_down(&outlasting, POINT).await;
+            let stays = kept.as_ref().err().and_then(|e| e.downcast_ref::<MountStays>()).cloned();
+            anyhow::ensure!(stays == Some(MountStays { mount: POINT.into(), held: Held::Busy { holders: Ok(vec!["88916 git".to_owned()]) } }), "refused busy by kind: {kept:?}");
+            anyhow::ensure!(outlasting.unmounts.load(Relaxed) == 3 && outlasting.destroyed.load(Relaxed) == 0, "asked after each told end, nothing destroyed");
+            Ok(())
+        })
     }
 
     /// W3 (kiln goal 01a1ec34599974448aed2672bafaf9a2; UI goal 89): the workspace mounts a Slates instance that is gone

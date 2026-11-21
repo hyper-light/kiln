@@ -1798,8 +1798,9 @@ A conversation the composer doesn't list goes on in a new agent that names it: `
 Not yet: kiln shows no report of the link it holds into an isolated agent's microVM (`runs.control`: each end's
 negotiated suite, and the link's lanes), because Hex, which holds the microVMs, reports none yet. The signals that
 stop a harness and kiln's MCP ride that link all the same. And on a Windows machine, a harness that runs as a
-process there gets kiln's MCP only where that machine's kiln is the server, and only Claude Code; in a microVM
-there, every harness but Pi gets it, as on every machine.
+process there gets kiln's MCP from its runner over the loopback, by its session's own token (`reach::loopback`,
+2026-11-20), or where that machine's kiln is the server from the server, and only Claude Code; in a microVM there,
+every harness but Pi gets it, as on every machine.
 
 ## Live overrides: ports, egress, networks and volumes
 
