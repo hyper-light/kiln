@@ -278,8 +278,11 @@ starts the harness again on its conversation, as applying one does.
 
 **Applied on its own** (`auto`). An environment with `auto` on joins the stack of each of its
 owner's sessions its scope matches: as one starts, and, when its scope or `auto` changes, each of
-their sessions running (without starting its harness again: it takes it as its harness next starts,
-and the Engine tab says so). Those it joins go under the environments the session was given by
+their sessions running (its harness starting again on it once nothing is under way, its conversation
+going on, as applying one does). A change to what an environment gives (its variables or its base)
+reaches each running session it's in, given by name or on its own, the same way: a running agent
+takes every change to its environments (the person's decision, 2026-11-21; taken only as its harness
+next started, a change never reached an agent that ran on). Those it joins go under the environments the session was given by
 name, the one with more chips over one with fewer (more specific first), then by name. Turned off,
 or its scope changed so a session no longer matches, it leaves the stacks it joined on its own,
 not those it was put in by name. An environment with `secret` variables never joins a session in a
