@@ -26,6 +26,8 @@
 
 mod graph;
 pub mod keep;
+#[cfg(all(test, unix))]
+mod latency;
 pub mod ops;
 #[cfg(test)]
 mod sim;
