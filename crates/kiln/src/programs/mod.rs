@@ -483,6 +483,8 @@ async fn kv_json<T: for<'de> Deserialize<'de> + Default>(store: &crate::store::S
 
 async fn kv_save<T: Serialize>(store: &crate::store::Store, key: String, v: &T) -> anyhow::Result<()> {
     store.kv_set(key, serde_json::to_string(v)?).await?;
+    // What the goal driver holds programs' workers to (`enforce`, usage pauses lifting) follows.
+    crate::goals::stir();
     Ok(())
 }
 

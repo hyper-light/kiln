@@ -753,6 +753,9 @@ run out, and two lines can't take the same one by accident as they could a bit.
   it routed there on to where the session is now. A runner that didn't name it, or one that's away,
   gets messages from the server's custody (W20's), as before; so does kiln's own (docs/sends.md,
   "What's open").
+  `harness.reset`: the runner resets its agents (`Command::Reset`, docs/agents.md "Reset"): what each has
+  pending ends, its intake opens again and its harness starts again fresh; a runner that didn't name it is
+  asked to reset none.
 
 ## Registry
 
@@ -1149,6 +1152,7 @@ travels in `HarnessCmd`.
 | `Branch` | command, refused while away | A person's branch of a session, or of one of its harness's subagents: a new session on its machine from the conversation so far, beside it or of its own. They branch again if it didn't go. | New. A runner from before it can't read it, and says so. |
 | `RemoveTask` | command, refused while away | A person's Remove of one of a session's harness subagents that ended: it leaves the session's tasks for good. They remove it again if it didn't go. | New: a session whose features have `remove_task` takes it. |
 | `Override` | command, refused while away | A person's change of a live override of a session, in place: a port, an egress grant, a network or a volume (kiln plan 01a1dd2e…, P6b.4). Its session takes it as its own record, then its microVM and its harness, each as it can, and keeps it for its harness's every start. They make it again if it didn't apply. | New. A runner from before it can't read it, and says so. |
+| `Reset` | command, refused while away | A session reset (`{by, why}`: who asked as kiln says it, and their words; docs/agents.md, "Reset"): what it has pending ends (each message it was sent and never finished cancelled, its queue, approvals and tasks; a pause, a hold, a move or switch waiting), its intake opens again, and its harness is killed and started again fresh on the same conversation. kiln's server's alone (`agents.reset`, which first cancels what kiln holds for it): one from a client is refused. | New: to runners that named `harness.reset`. |
 
 ## Updates of a session: `Update`
 

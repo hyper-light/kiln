@@ -6,6 +6,8 @@
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -116,6 +118,74 @@ pub fn spawn_detached(cmd: &mut Command) -> std::io::Result<Child> {
 
 /// A supervised child on Unix is stopped by signals, which `main` already handles.
 pub fn watch_supervisor(_shutdown: crate::rt::Shutdown) {}
+
+/// What's left of this supervisor's systemd unit once its child has stopped, killed, but for Slates' processes (kiln's
+/// own executable in Slates' role, `crate::workspace::slates::ROLE_ARG`): kiln's units stop with `KillMode=process`
+/// (`crate::install`), so the anchor, which holds every workspace volume in its memory, outlives a stop or restart of
+/// its unit, and nothing else of the unit does (its legs, agents and their processes), as `KillMode=mixed` had it. Only
+/// on Linux and under systemd (`INVOCATION_ID`); elsewhere the service manager kills by process group or job, which
+/// the anchor already leaves (`spawn_detached`). How many processes it killed.
+#[cfg(target_os = "linux")]
+pub fn sweep_unit() -> usize {
+    if std::env::var_os("INVOCATION_ID").is_none() {
+        return 0;
+    }
+    let Some(root) = std::fs::read_to_string("/proc/self/cgroup").ok().as_deref().and_then(unit_cgroup) else { return 0 };
+    let me = std::process::id();
+    let mut killed = 0usize;
+    // Again while it finds any: one forked meanwhile is in the next look.
+    for _ in 0..3 {
+        let mut pids = Vec::new();
+        cgroup_procs(&Path::new("/sys/fs/cgroup").join(root.trim_start_matches('/')), &mut pids);
+        let left: Vec<u32> = pids.into_iter().filter(|&p| p != me && !is_slates(p)).collect();
+        if left.is_empty() {
+            break;
+        }
+        for p in left {
+            if let Ok(raw) = i32::try_from(p)
+                && kill(Pid::from_raw(raw), Signal::SIGKILL).is_ok()
+            {
+                killed = killed.saturating_add(1);
+            }
+        }
+    }
+    killed
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sweep_unit() -> usize {
+    0
+}
+
+/// The cgroup of the systemd unit `cgroup` (`/proc/self/cgroup`'s v2 line) lies in: its path to its last `.service`
+/// (a user's unit lies under `user@<uid>.service`; kiln's own processes in the unit's leaf, `DelegateSubgroup=`).
+#[cfg(target_os = "linux")]
+fn unit_cgroup(cgroup: &str) -> Option<String> {
+    let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let parts: Vec<&str> = path.split('/').collect();
+    let last = parts.iter().rposition(|p| p.ends_with(".service"))?;
+    Some(parts.get(..=last)?.join("/"))
+}
+
+/// Every process in cgroup `dir` and below it.
+#[cfg(target_os = "linux")]
+fn cgroup_procs(dir: &Path, out: &mut Vec<u32>) {
+    if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+        out.extend(procs.lines().filter_map(|l| l.trim().parse::<u32>().ok()));
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            cgroup_procs(&e.path(), out);
+        }
+    }
+}
+
+/// Whether process `pid` is one of Slates' (kiln's executable in Slates' role: its anchor or a daemon).
+#[cfg(target_os = "linux")]
+fn is_slates(pid: u32) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c.split(|&b| b == 0).any(|arg| arg == crate::workspace::slates::ROLE_ARG.as_bytes()))
+}
 
 /// `kiln uninstall` on Unix leaves running supervisors to the boot manager that started them
 /// (`systemctl disable --now`, `launchctl bootout`); nothing to find here.
@@ -555,5 +625,17 @@ mod tests {
         assert_eq!(m.trim(), "master");
         assert_eq!(s.trim(), "session");
         Ok(())
+    }
+
+    /// A unit stopped with `KillMode=process` is swept by its supervisor (`sweep_unit`): the unit's cgroup is the one
+    /// to its last `.service`, a system unit's and a user's alike (a user's lies under `user@<uid>.service` too), with
+    /// kiln's own processes in its leaf. Outside a unit, nothing is swept.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stopping_unit_sweeps_its_own_cgroup() {
+        assert_eq!(super::unit_cgroup("0::/kiln.slice/kiln-server.service\n").as_deref(), Some("/kiln.slice/kiln-server.service"));
+        let user = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/kiln-agent-01a14794.service/kiln-agents-1247\n";
+        assert_eq!(super::unit_cgroup(user).as_deref(), Some("/user.slice/user-1000.slice/user@1000.service/app.slice/kiln-agent-01a14794.service"));
+        assert_eq!(super::unit_cgroup("0::/user.slice/user-1000.slice/session-2.scope\n"), None);
     }
 }

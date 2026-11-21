@@ -1083,6 +1083,32 @@ async fn session_restart(cx: Cx, v: Value) -> Out {
     Ok(json!({"agent": info.id, "how": how, "engine": engine(&info)}))
 }
 
+/// An agent reset (`agents.reset`; docs/agents.md, "Reset"; Ada, 2026-11-21: "clear all pending messages, actions, etc.,
+/// kill and then restart the agent in a fresh harness", from its page's menu, the API and kiln's MCP, "such that agents
+/// can reset stuck agents"): by a caller that may reset it (`lineage::may_reset`: whoever may steer it, and any agent
+/// working for the same person, without a click). Its timeline says who reset it: the agent that asked, by name, or the
+/// person. A session whose machine is away is refused, as one whose runner predates resets is ([`Registry::reset`]).
+async fn reset(cx: Cx, v: Value) -> Out {
+    let info = known(&cx, &agent_of(&v)?)?;
+    lineage::may_reset(&cx.hub, &cx.caller, &info.id).await?;
+    match info.status {
+        Status::Disconnected => return Err((StatusCode::BAD_GATEWAY, format!("{}'s machine isn't connected right now", info.name))),
+        // Its harness is gone with nothing of it running there to reset: it comes back fresh by a resume.
+        Status::Crashed => return Err((StatusCode::CONFLICT, format!("{} crashed, so nothing of it runs to reset: resume it (agents.resume, or Restart on its page), and reset it then if it's still stuck", info.name))),
+        Status::Starting | Status::Idle | Status::Running | Status::Waiting | Status::Exited => {}
+    }
+    let why = v.get("why").and_then(Value::as_str).map(str::trim).filter(|w| !w.is_empty()).map(str::to_owned);
+    let by = match cx.caller.agent.as_deref() {
+        Some(me) => match cx.hub.harness.info(me) {
+            Some(asker) => format!("agent {} ({})", asker.name, lineage::short(me)),
+            None => format!("agent {}", lineage::short(me)),
+        },
+        None => cx.caller.name.clone(),
+    };
+    let cancelled = cx.hub.harness.reset(&cx.hub, &info.id, by, why).await.map_err(|e| (StatusCode::CONFLICT, e))?;
+    Ok(json!({"agent": info.id, "reset": true, "cancelled": cancelled, "engine": engine(&info)}))
+}
+
 /// Agent `agent` ended for good and taken off kiln's lists (the Agents page's Remove: kiln plan
 /// 01a1dd2e8618733a87f2793aab1322a8 P5.6, S1): its goals forgotten and its copy let go, audited as whoever
 /// asked. One whose machine keeps it (its archive or restore under way) is refused until that's done.
@@ -1341,6 +1367,15 @@ pub fn list_ops() -> Vec<Op> {
             input: Input::of::<input::AgentsInterrupt>(),
             route: |v| Ok((Method::POST, path(&["api", "harness", "sessions", &agent_of(v)?, "restart"]))),
             run: |cx, v| Box::pin(session_restart(cx, v)),
+        },
+        Op {
+            name: "agents.reset",
+            summary: "Reset an agent that's stuck: yours, or any other agent working for the same person you do, at once (docs/agents.md, \"Reset\"). Everything it had pending ends: each message to it that kiln holds, or that it was handed and never finished, is cancelled and its sender told so; its queue, approvals and tasks; a pause, a hold, or a move or switch waiting. Its message intake opens again, and its harness is killed and started again fresh on the same conversation, which goes on (its goals, plan and settings stay). Its timeline says who reset it, and `why` when given. Answers how many of the messages kiln held for it were cancelled (`cancelled`). One whose machine is away, or whose runner predates resets, is refused, nothing done.",
+            read_only: false,
+            destructive: true,
+            input: Input::of::<input::AgentsReset>(),
+            route: |v| Ok((Method::POST, path(&["api", "harness", "agents", &agent_of(v)?, "reset"]))),
+            run: |cx, v| Box::pin(reset(cx, v)),
         },
         Op {
             name: "agents.control",
@@ -1818,6 +1853,15 @@ pub mod input {
     pub struct AgentsRestart {
         /// The agent's id (as agents.list gives it).
         pub agent: String,
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct AgentsReset {
+        /// The agent's id (as agents.list gives it).
+        pub agent: String,
+        /// Why it's reset, in your words: said in its timeline beside who reset it.
+        pub why: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

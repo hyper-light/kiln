@@ -53,7 +53,7 @@ fn goes_on(info: &Info) -> bool {
     !info.wait_at_limit
 }
 
-/// Every few seconds (`goals::run`): the paused sessions that go on elsewhere ([`goes_on`]) look
+/// At each look of the goal driver's (`goals::run`; woken by a pause, an arrival, or [`due`]): the paused sessions that go on elsewhere ([`goes_on`]) look
 /// for a machine to go on on, once a pause, then again now and then.
 pub fn tick(hub: &Arc<Hub>, all: &[Info], now: i64) {
     // The paused sessions that go on, looked up in a set, not scanned for each one tried (goal 9, plan 01a1a87b2cec
@@ -87,6 +87,25 @@ pub fn tick(hub: &Arc<Hub>, all: &[Info], now: i64) {
         let (hub, info, since) = (Arc::clone(hub), info.clone(), p.since);
         crate::rt::spawn(async move { go(&hub, &info, since, &said).await });
     }
+}
+
+/// When a paused session next looks for somewhere to go on, by what was last done for it (G9
+/// step 3: what wakes the goal driver for [`tick`]): settled where it went, its move waited out, or
+/// its next look when nowhere could take it. A new pause, or its arrival, is its own news.
+pub fn due() -> Option<i64> {
+    due_in(&TRIED.lock())
+}
+
+/// [`due`] over `tried`.
+fn due_in(tried: &HashMap<String, Tried>) -> Option<i64> {
+    tried
+        .values()
+        .map(|t| match t {
+            Tried { to: Some(_), arrived: Some(at), .. } => at.saturating_add(SETTLE_MS),
+            Tried { to: Some(_), at, .. } => at.saturating_add(MOVE_FOR_MS),
+            Tried { at, .. } => at.saturating_add(AGAIN_MS),
+        })
+        .min()
 }
 
 async fn go(hub: &Arc<Hub>, info: &Info, since: i64, said: &str) {
@@ -246,6 +265,22 @@ mod tests {
 
     fn best(options: Vec<Choice>) -> Option<String> {
         rank(options).map(|c| c.name)
+    }
+
+    /// G9 step 3: each paused session's next look comes due from what was last done for it, the
+    /// soonest of them waking the goal driver: nowhere to go (look again), a move under way (wait it
+    /// out), arrived (settle there).
+    #[test]
+    fn g9_s3_a_paused_session_s_next_look_is_its_own_deadline() {
+        let tried = |at: i64, to: Option<&str>, arrived: Option<i64>| Tried { since: 1, at, to: to.map(str::to_owned), arrived, why: String::new() };
+        let mut all = HashMap::new();
+        assert_eq!(due_in(&all), None);
+        all.insert("a".to_owned(), tried(1_000, None, None));
+        assert_eq!(due_in(&all), Some(1_000 + AGAIN_MS));
+        all.insert("b".to_owned(), tried(500, Some("m"), None));
+        assert_eq!(due_in(&all), Some((1_000 + AGAIN_MS).min(500 + MOVE_FOR_MS)));
+        all.insert("c".to_owned(), tried(0, Some("m"), Some(2_000)));
+        assert_eq!(due_in(&all), Some((1_000 + AGAIN_MS).min(2_000 + SETTLE_MS)));
     }
 
     #[test]

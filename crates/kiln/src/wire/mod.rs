@@ -396,6 +396,7 @@ classes! {
         Command::Branch { .. } => REFUSED,
         Command::RemoveTask { .. } => REFUSED,
         Command::Override { .. } => REFUSED,
+        Command::Reset { .. } => REFUSED,
     }
 }
 

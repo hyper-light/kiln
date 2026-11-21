@@ -336,6 +336,24 @@ pub async fn flow(hub: &Arc<Hub>, recipient: &str, source: Location, event: Flow
     Ok(())
 }
 
+/// What a reset cancelled of what kiln held for `recipient` (docs/agents.md, "Reset"), said as each one's end is said:
+/// to its sender's open pages (its publication on the recipient's feed, beside the recipient's capacity as it stands),
+/// to the plan program it belongs to, to the agent that sent it, and to the sender's waiting asks.
+pub async fn cancelled(hub: &Arc<Hub>, recipient: &str, receipts: Vec<(Receipt, String)>) {
+    for (receipt, sender) in receipts {
+        let projection = mail::Projection { publication: receipt.clone(), mail_scope: mail::scope(&sender) };
+        if let Err(e) = crate::programs::mail_progress(hub, recipient, &projection.publication, &projection.mail_scope).await {
+            tracing::warn!(target: "kiln.sends", session = %recipient, message = %receipt.id, error = %e, "a plan program wasn't told its message was cancelled by a reset");
+        }
+        super::told::mail_progress(hub, recipient, &projection.publication, &projection.mail_scope);
+        let capacity = hub.harness.info(recipient).and_then(|i| i.admission);
+        if let (Some(source), Some(capacity)) = (hub.harness.location(recipient), capacity) {
+            let _ = hub.harness.mail_event(hub, recipient, source, FlowEvent::Capacity { capacity }, Some(projection)).await;
+        }
+        hub.harness.mail_receipt(recipient, receipt);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

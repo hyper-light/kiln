@@ -3358,6 +3358,8 @@ impl Hub {
             tracing::warn!(agent = name, reason, "agent disconnected");
         }
         let lost_at = Instant::now();
+        // Its runs hold their agents back no more (`harness::told`, on the goal driver).
+        crate::goals::stir();
         let Some((away, snapshot)) = self.change_agent(name, |a| {
             a.connected = false;
             a.lost_at = Some(lost_at);

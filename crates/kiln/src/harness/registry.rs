@@ -2815,6 +2815,8 @@ impl Registry {
         let rx = hub.harness.local_rx.clone();
         let offered = crate::rt::blocking(super::kinds::offered).await.unwrap_or_default();
         hub.harness.kinds.update(|k| k.insert("local".to_owned(), offered.clone()));
+        // The accounts to check follow the harnesses offered (`accounts::tick`, on the goal driver).
+        crate::goals::stir();
         if !RESTORED.swap(true, std::sync::atomic::Ordering::AcqRel) {
             // Files finished messages mention, kept as they come.
             crate::rt::spawn(Keeper::run(hub.clone()));
@@ -3047,6 +3049,7 @@ impl Registry {
     #[cfg(test)]
     pub fn set_kinds(&self, target: &str, kinds: Vec<KindInfo>) {
         self.kinds.update(|k| k.insert(target.to_owned(), kinds.clone()));
+        crate::goals::stir();
     }
 
     /// A session's meta as last reported (its harness's catalog: slash commands, models, modes).
@@ -3843,6 +3846,8 @@ impl Registry {
         }
         if let Some(plan) = proposed {
             self.proposed.update(|p| p.insert(id.to_owned(), plan.clone()));
+            // Kept as a plan by the goal driver (`plans::keep_proposed`).
+            crate::goals::stir();
         }
         if gone {
             // Copies swapped in only for what they had of it.
@@ -3969,6 +3974,7 @@ impl Registry {
             .await;
         let kinds = inv.kinds;
         self.kinds.update(|k| k.insert(format!("agent:{machine}"), kinds.clone()));
+        crate::goals::stir();
         // No process of it holds it now: the one it was held by is let go of.
         self.forget_holders(&lost.iter().map(|i| i.id.clone()).collect::<Vec<_>>());
         if !lost.is_empty() {
@@ -4167,6 +4173,7 @@ impl Registry {
                 k.entry(now.target()).or_insert(v);
             }
         });
+        crate::goals::stir();
         if let Some(st) = &self.convo {
             st.put(moved.iter().map(|i| crate::convo::rows::Row::Machine { session: i.id.clone(), machine: to.to_owned() }).collect());
         }
@@ -4209,6 +4216,7 @@ impl Registry {
         // A session at a time, as its owner's turns take them (goal 9, plan 01a1a87b2cec step 3: `Copies::on_each_session`).
         let infos: Vec<Info> = self.sessions.on_each_session(move |_, m| *m.location == at, |s, id| s.get_mut(id).map(disconnected)).await;
         self.kinds.update(|k| k.remove(&format!("agent:{machine}")));
+        crate::goals::stir();
         for info in infos {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
@@ -5433,6 +5441,51 @@ impl Registry {
         }
     }
 
+    /// Session `id` reset (`agents.reset`; docs/agents.md, "Reset"; Ada, 2026-11-21). What kiln holds for it and hasn't
+    /// handed out is cancelled first, so none of it reaches the fresh harness. Then its runner resets it
+    /// (`Command::Reset`): what it had pending ends there, each message it was handed cancelled to its sender, and its
+    /// harness starts again fresh on its conversation. Then what kiln handed out before the reset ends too, as its
+    /// runner let it go. Each sender is told its message was cancelled. A machine that's away, or whose runner predates
+    /// resets (no `harness.reset`), is refused, nothing done. How many messages kiln held that ended.
+    pub async fn reset(&self, hub: &Arc<Hub>, id: &str, by: String, why: Option<String>) -> Result<usize, String> {
+        let Some(loc) = self.location(id) else { return Err(format!("kiln doesn't run agent {id}")) };
+        if let Location::Machine(machine) = &loc {
+            let inst = hub.instances.load();
+            let holder = inst.owner(&crate::instances::Owned::Agent(id.to_owned())).or_else(|| inst.newest(machine));
+            let resets = holder.and_then(|p| inst.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::RESET));
+            if !resets {
+                return Err(format!("{}'s runner can't reset agents yet: it resets once it's upgraded (it names harness.reset)", hub.shown(machine)));
+            }
+        }
+        let line = super::mail::newest(&hub.store, id.to_owned()).await.map_err(|e| format!("what kiln holds for it couldn't be read: {e}"))?;
+        let held = super::mail::cancel_for(&hub.store, id.to_owned(), line, false).await.map_err(|e| format!("what kiln holds for it couldn't be cancelled: {e}"))?;
+        let mut ended = held.len();
+        super::mail_delivery::cancelled(hub, id, held).await;
+        // Its harness starts again with its environment opened again, given to it first, as a stop by force's does.
+        if let Err(why) = self.agentenv_again(hub, id).await {
+            tracing::warn!(target: "kiln.agentenvs", session = %id, %why, "a session reset goes on with the environment it had: its own couldn't be opened again");
+        }
+        let c = Command::Reset { by: Some(by), why };
+        let sent = match loc {
+            Location::Local => {
+                if self.local.command_at(id, c, Some(self.epoch_of(id))) { Sent::Taken } else { Sent::NoSession }
+            }
+            Location::Machine(machine) => {
+                let json = serde_json::to_string(&c).map_err(|e| format!("its reset couldn't be written: {e}"))?;
+                let p = hub.command_start(&machine, &ServerMsg::HarnessCmd { session: id.to_owned(), json }).await;
+                Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await)
+            }
+        };
+        if let Some((_, why)) = sent.failure() {
+            return Err(format!("its runner didn't take the reset: {why}"));
+        }
+        let handed = super::mail::cancel_for(&hub.store, id.to_owned(), line, true).await.map_err(|e| format!("it was reset, but what kiln had handed it couldn't be cancelled: {e}"))?;
+        ended = ended.saturating_add(handed.len());
+        super::mail_delivery::cancelled(hub, id, handed).await;
+        hub.harness.mail_delivery.changed();
+        Ok(ended)
+    }
+
     /// [`Registry::dispatch`], to session `id` alone.
     async fn dispatch_one(&self, hub: &Hub, id: &str, c: Command) -> Pending {
         self.dispatch_relayed(hub, id, c, None).await
@@ -5452,6 +5505,11 @@ impl Registry {
                 code: crate::wire::channel::Refusal::Refused,
                 why: "a session's environment is kiln's to give it: apply one with agentenvs.apply (PUT /api/harness/sessions/:id/agentenv)".into(),
             });
+        }
+        // A reset is kiln's to do (docs/agents.md, "Reset"): `agents.reset` ends what kiln holds for the session first,
+        // then sends it by [`Registry::reset`]. One sent as a command is refused, from whichever client.
+        if matches!(&c, Command::Reset { .. }) {
+            return Pending::Now(Sent::Rejected { code: crate::wire::channel::Refusal::Refused, why: "a reset is kiln's to do: use agents.reset (POST /api/harness/agents/:id/reset)".into() });
         }
         // A harness started again starts with its environment opened again, its newest version and its secrets read
         // again (docs/agents.md, "Where they apply"): given to it first, on its own command stream, then the restart

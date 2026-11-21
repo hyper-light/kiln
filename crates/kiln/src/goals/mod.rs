@@ -32,7 +32,6 @@ mod sim;
 mod subagents;
 
 use std::collections::{HashMap, HashSet};
-use std::pin::pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -64,8 +63,139 @@ pub const MET_LINE: &str = "GOAL MET";
 const OWN_CLEAR_MS: i64 = 60_000;
 /// Why a stack you paused is paused.
 const PAUSED_BY_YOU: &str = "Paused by you: the agent isn't held to its goal (its own goal is cleared) until you resume.";
-/// How often the driver looks at every stack.
-pub const TICK: Duration = Duration::from_millis(1500);
+/// Told when something the riders on the driver's loop act on changed outside the stacks' tables
+/// and the agents' sessions (G9 step 3): a machine's harnesses (accounts), a runner gone (its runs
+/// hold their agents back no more), a plan a session proposed, a program's assignments or settings
+/// ([`stir`]). What they act on in the stacks and the sessions is the feed's and the agents' news.
+static STIR: LazyLock<crate::rt::Notify> = LazyLock::new(crate::rt::Notify::new);
+
+/// Wakes the goal driver for its riders ([`STIR`]): something they act on changed.
+pub fn stir() {
+    STIR.notify();
+}
+
+/// The writes that change what the goal driver does, as a feed it waits on (G9 step 3, T1.5): a
+/// position that moves with each committed write to the stacks (goal edits, verdicts, stack
+/// controls, adoptions, sends), their plan runs and steps. Nothing is lost or heard twice: the
+/// driver takes where the feed stands before it reads the stacks and waits past that, so a write
+/// after its read wakes it and one before is in what it read; the stacks' rows (`reminded_at`,
+/// `status`) say what was done, so a wake after a restart redoes nothing. kiln's SQLite store is
+/// the feed now ([`StoreFeed`]); Records' change feed (kiln-seams `Records::wait`, a family's
+/// revision past one) has the same shape, for the stacks once they move onto Records.
+pub trait Feed: Send + Sync {
+    /// Where the feed stands now.
+    fn at(&self) -> u64;
+    /// Once the feed has moved past `at`: where it stands then.
+    fn after(&self, at: u64) -> futures::future::BoxFuture<'_, u64>;
+}
+
+/// The tables whose writes change what the goal driver does: its stacks, their plan runs and steps,
+/// and plans' tags (which plans are programs and their tracks: `programs::enforce`, its rider).
+const FED: &[&str] = &["goal_stacks", "goal_items", "plan_runs", "plan_run_steps", "plan_tags"];
+
+/// [`Feed`] on kiln's store: its count of committed writes to [`FED`]'s tables (`store::Changes`).
+pub struct StoreFeed<'a> {
+    store: &'a crate::store::Store,
+    told: Arc<crate::rt::Notify>,
+}
+
+impl<'a> StoreFeed<'a> {
+    pub fn new(store: &'a crate::store::Store) -> Self {
+        Self { store, told: store.changes().watch(FED) }
+    }
+}
+
+impl Feed for StoreFeed<'_> {
+    fn at(&self) -> u64 {
+        self.store.changes().of(FED)
+    }
+
+    fn after(&self, at: u64) -> futures::future::BoxFuture<'_, u64> {
+        Box::pin(async move {
+            loop {
+                let now = self.at();
+                if now != at {
+                    return now;
+                }
+                self.told.notified().await;
+            }
+        })
+    }
+}
+
+/// What the goal driver and its riders act on of an agent, as one number: its status, pause,
+/// approvals, queue (and what of it its harness was handed), tasks, parent and goal; its turn's end
+/// (keep-going, parents told), where it is (sessions elsewhere), its usage and its threshold
+/// (programs' rules, usage pauses lifting), what it was told to do at a limit. Its info's other
+/// changes (its output, its activity) aren't news to it.
+fn news_of(i: &Info) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(&i.status).hash(&mut h);
+    i.pause.as_ref().map(|p| p.since).hash(&mut h);
+    i.approvals.len().hash(&mut h);
+    i.queued.hash(&mut h);
+    for q in &i.queue {
+        q.id.hash(&mut h);
+    }
+    i.queue_partial.hash(&mut h);
+    for g in &i.said {
+        g.id.hash(&mut h);
+    }
+    i.tasks_running.hash(&mut h);
+    i.parent.hash(&mut h);
+    i.target.hash(&mut h);
+    i.last_turn.as_ref().map(|t| t.at).hash(&mut h);
+    (i.keep_off, i.wait_at_limit, i.pause_at).hash(&mut h);
+    crate::programs::weekly(&i.limits).map(|u| u.pct.to_bits()).hash(&mut h);
+    if let Some(o) = &i.objective {
+        o.status.hash(&mut h);
+        o.text.hash(&mut h);
+        o.at.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Whether session event `text` is news to the goal driver: an agent's info changed in what it acts
+/// on ([`news_of`], against `seen`, what it last saw of each), or a session closed.
+fn heard_news(hub: &Hub, text: &str, seen: &mut HashMap<String, u64>) -> bool {
+    if crate::wire::events::kind_of(text) != Some("harness") {
+        return true;
+    }
+    let id = text.strip_prefix(r#"{"type":"harness","info":{"id":""#).and_then(|r| r.get(..r.find('"')?)).filter(|id| !id.contains('\\'));
+    let Some(id) = id else {
+        // Its id not at its front: every agent looked at.
+        let mut changed = false;
+        for i in hub.harness.list_shared() {
+            let n = news_of(&i);
+            changed |= seen.insert(i.id.clone(), n) != Some(n);
+        }
+        return changed;
+    };
+    let Some(info) = hub.harness.info_shared(id) else { return seen.remove(id).is_some() };
+    let n = news_of(&info);
+    if seen.get(id) == Some(&n) {
+        return false;
+    }
+    seen.insert(id.to_owned(), n);
+    true
+}
+
+/// `soonest`, or `t` if it's sooner and after `now`.
+fn sooner(soonest: Option<i64>, t: i64, now: i64) -> Option<i64> {
+    if t <= now {
+        return soonest;
+    }
+    Some(soonest.map_or(t, |s| s.min(t)))
+}
+
+/// What woke the goal driver.
+enum Woke {
+    /// Something it acts on changed, or a deadline came: a round.
+    Change,
+    /// The agents' news ended (the hub is going).
+    Closed,
+}
 
 /// One change to the stacks at a time, yours (start, skip, an edit …) or the server's own steps: a
 /// goal goes to its agent once, and what's decided is decided on the stack as it is. In the order they came, with no lock (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal).
@@ -702,6 +832,13 @@ where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
     resay_on(port, None, now).await;
+}
+
+/// When the stacks' words kept to say again next change by the clock alone ([`Kept::due`]): one not
+/// yet seen in its agent's queue taken as gone, or one gone from it whose handing wasn't heard of
+/// taken as lost. The rest change only as their agents' queues do (the agents' news).
+fn said_due() -> Option<i64> {
+    SAID.lock().values().filter_map(|w| w.msg.due()).min()
 }
 
 /// [`resay`], each agent with a word kept found by its id through `hub` where the driver has one (it's the port then):
@@ -2265,6 +2402,15 @@ fn gap(reminders: i64) -> i64 {
     REMIND_MS.saturating_mul(1_i64 << doublings).min(REMIND_MAX_MS)
 }
 
+/// When the goal under way is due to be sent again (T-T1.5.1: no duplicate reminder): the first
+/// whole millisecond surely past its [`gap`] since it was last sent. `reminded_at` is the send's
+/// time rounded down to the millisecond (unix ms, the grain goals' times are kept in), so the send
+/// itself came up to a millisecond after it: `reminded_at + gap` can fall short of the gap, one
+/// millisecond past it never does. Rounded up, never down.
+fn reminder_due(reminded_at: i64, reminders: i64) -> i64 {
+    reminded_at.saturating_add(gap(reminders)).saturating_add(1)
+}
+
 /// Clears the stack's goal in the agent's harness, where it has goals of its own: the one under
 /// way, or one it stopped pursuing while still set (Claude Code's after its checks gave up), so
 /// the agent doesn't go on chasing it. Said at `now`, as the stack's word (`say`).
@@ -2311,98 +2457,183 @@ impl<P> Driver<'_, P>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
-    /// Every [`TICK`] by its clock, until it's shut down: a round of the stacks (`round`), then the
-    /// agents no stack drives kept going.
+    /// Until it's shut down: a round of the stacks (`round`) whenever something it acts on changed,
+    /// then the agents no stack drives kept going (`tend`). It doesn't look on a timer (G9 step 3,
+    /// T1.5): it waits on the feed of the writes that change what it does ([`Feed`]: goal edits,
+    /// verdicts, stack controls, plan runs), on the agents' news (an agent's turn ended, its goal
+    /// set or cleared, its pause, approvals or queue changed: [`news_of`]), and on its deadlines
+    /// ([`Driver::deadline`]: a stack paused for a while, a reminder's gap), each as a deadline. Its
+    /// riders (keep-going, parents told, sessions elsewhere, accounts, programs' rules, plans' steps
+    /// on subagents, usage pauses lifting, words said again) go with each round, woken by the same
+    /// and by their own deadlines, each from its own state, and by [`stir`] for what they act on
+    /// outside the stacks and the sessions: no pace is picked for any of them.
     pub async fn drive(&self) -> anyhow::Result<()> {
-        let mut ticks: u64 = 0;
+        let feed = StoreFeed::new(self.store);
+        self.follow(&CHANGING, &feed, None, true).await
+    }
+
+    /// [`Driver::drive`]'s loop, its changes one at a time under `changing`, its writes heard on
+    /// `feed`, its agents' news on `news` without a hub (kiln-sim's model and the driver's tests; with
+    /// one, the hub's session events). `tend`: the agents no stack drives are tended after each round
+    /// (kiln-sim's model leaves them out: what they keep is the process's, shared with other tests).
+    pub(crate) async fn follow(&self, changing: &crate::turn::Gate, feed: &dyn Feed, news: Option<&crate::rt::Notify>, tend: bool) -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        // The agents' news through the hub: each session's info as it changes (`Hub::harness_events`).
+        let mut sessions = match self.hub {
+            Some(hub) => match hub.harness_events.subscribe(crate::hub::EVENTS.div_ceil(hub.harness_events.lanes())) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(error = %e, "the goal driver can't hear agent sessions: its stacks move on as they're written and at their deadlines");
+                    None
+                }
+            },
+            None => None,
+        };
+        let mut seen: HashMap<String, u64> = HashMap::new();
         loop {
-            if !self.tick().await {
+            if self.shutdown.is_cancelled() {
                 return Ok(());
             }
-            ticks = ticks.wrapping_add(1);
-            let (running, waiting) = crate::rt::labeled(&ROUND, self.round(&CHANGING)).await;
-            // The agents no goal stack drives: kept going when they stop part-way (`keep`), but
-            // for those `keep_going` leaves alone.
-            let now = self.clock.unix_ms();
-            let all = self.agents_now().await;
-            let held = paused_for_usage(self.store).await;
-            let quiet: Vec<String> = all.iter().filter(|i| i.pause.is_some() || held.contains(&i.id)).map(|i| i.id.clone()).collect();
-            // Driven too: the subagents kiln started for plans' steps, which it follows itself
-            // (`subagents`): not kept going, and no news of them for the agent they work for.
-            let mut running = running;
-            if let Some(hub) = self.planner {
-                running.extend(subagents::held(hub).await);
+            // Where the feed stands before the round reads the stacks: a write after this is heard.
+            let at = feed.at();
+            // When the round began: a deadline after it wasn't due in what the round and its riders
+            // looked at, so it wakes them (at once, if it passed meanwhile); one before it, they saw.
+            let began = self.clock.unix_ms();
+            // What the round sees of each agent: news is what differs from it.
+            seen.clear();
+            for i in self.agents_shared() {
+                seen.insert(i.id.clone(), news_of(&i));
             }
-            // What follows, up to the settings' read, was one poll but where keep-going sends: its
-            // turn on the shard is given up between the agents kept going and between the looks
-            // after them, and each agent's children are found among those gathered once (goal 9,
-            // plan 01a1a87b2cec step 3). Its turns end their polls, whether or not other work wants the
-            // shard (`rt::Turns::end`): let go on unasked, the driver's polls ran 0.2 to 0.4 ms on
-            // the CPU in rt9's rounds.
-            let mut turns = crate::rt::Turns::new();
-            crate::rt::labeled(&KEEP_GOING, async {
-                let children = children_of(&all);
-                for info in keep_going(&all, &running, &waiting, &quiet) {
-                    // An archived agent is kept going by no one (attention plan 01a199e1b177752e84dad5dc990e6a15).
-                    if let Some(hub) = self.hub
-                        && crate::harness::attention::is_archived(hub, &info.id).await.unwrap_or(true)
-                    {
-                        continue;
-                    }
-                    // Agents it started at work, or runs it left in the background going: work it has
-                    // going, as its background tasks are (`harness::told`).
-                    let going = children_working(&children, &info.id) || crate::harness::told::runs_awaited(info);
-                    keep::tick(self.port, info, now, going).await;
-                    turns.end().await;
+            let (running, waiting) = crate::rt::labeled(&ROUND, self.round(changing)).await;
+            // The riders go with each round: what wakes the round (the feed, the agents' news, its
+            // deadlines and theirs, a stir) is what they act on; none has a pace of its own.
+            if tend {
+                self.tend(running, waiting).await;
+            }
+            let deadline = self.deadline(began, tend).await;
+            let now = self.clock.unix_ms();
+            let sleep_ms = |ms: i64| self.clock.sleep(Duration::from_millis(u64::try_from(ms.max(0)).unwrap_or(0)));
+            let due = async {
+                match deadline {
+                    Some(t) => sleep_ms(t.saturating_sub(now)).await,
+                    None => std::future::pending::<()>().await,
                 }
-                keep::retain(all.iter().map(|i| i.id.as_str()));
-            })
-            .await;
-            if let Some(hub) = self.hub {
-                // Programs' workers held to their usage thresholds, and settings' notices delivered
-                // (docs/programs.md), every 15 s.
-                if ticks.is_multiple_of(10) {
-                    crate::programs::enforce(hub).await;
+            };
+            let stirred = async {
+                if tend {
+                    STIR.notified().await;
+                } else {
+                    std::future::pending::<()>().await;
                 }
-                turns.end().await;
-                // Parents told of their children that settled, so none has to wait for them (one
-                // that's quiet once it goes on).
-                crate::rt::labeled(&TOLD, crate::harness::told::tick(hub, &all, now, &running, &quiet)).await;
-                turns.end().await;
-                // The paused ones that go on on another machine at a limit (`harness::elsewhere`).
-                hyper_rt::futures::label(&ELSEWHERE);
-                crate::harness::elsewhere::tick(hub, &all, now);
-                // Machines' accounts checked where never checked, or their harnesses changed: what
-                // placing an agent reads (`accounts::known`).
-                crate::accounts::tick(hub);
-                // The infos copied for this tick let go of where they were made (`listed`): each a score
-                // of blocks, every session's freed on the driver's shard each tick (goal 9, plan
-                // 01a1a87b2cec step 3).
-                let_go(all).await;
-                crate::rt::labeled(&TAIL, async {
-                    // Subagents given the rest of their agent's settings once their harness lists them.
-                    crate::harness::lineage::settle_settings(hub).await;
-                    // What agents' goals wait on a person for, on their info: Mission Control's Needs
-                    // you, and a card wherever you are in kiln (said at once too, as each change makes
-                    // it: `say_held`).
-                    {
-                        let _one = CHANGING.turn().await;
-                        say_held(hub).await;
-                    }
-                    // The plans agents proposed (plan mode) since the last look, kept as kiln's plans:
-                    // one an agent, a version each time it proposes another.
-                    for (agent, words) in hub.harness.take_proposed() {
-                        if let Err(e) = crate::plans::keep_proposed(hub, &agent, &words).await {
-                            tracing::warn!(%agent, error = %format!("{e:#}"), "keeping a proposed plan");
+            };
+            let told = async {
+                match news {
+                    Some(n) => n.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let heard = async {
+                let (Some(hub), Some(events)) = (self.hub, sessions.as_mut()) else { return std::future::pending::<bool>().await };
+                loop {
+                    let first = events.recv().await;
+                    let mut changed = false;
+                    let mut ev = Some(first);
+                    // What came meanwhile, taken at once: a burst of news is one look.
+                    while let Some(e) = ev.take() {
+                        match e {
+                            Ok(text) => changed |= heard_news(hub, &text, &mut seen),
+                            // Some lost: looked at again.
+                            Err(crate::memory::lanes::RecvError::Overflowed(_)) => changed = true,
+                            Err(crate::memory::lanes::RecvError::Closed) => return false,
                         }
+                        ev = match events.try_recv() {
+                            Ok(text) => Some(Ok(text)),
+                            Err(crate::memory::lanes::TryRecvError::Empty) => None,
+                            Err(crate::memory::lanes::TryRecvError::Overflowed(n)) => Some(Err(crate::memory::lanes::RecvError::Overflowed(n))),
+                            Err(crate::memory::lanes::TryRecvError::Closed) => Some(Err(crate::memory::lanes::RecvError::Closed)),
+                        };
                     }
-                })
-                .await;
+                    if changed {
+                        return true;
+                    }
+                }
+            };
+            let woke = futures::select_biased! {
+                () = self.shutdown.cancelled().fuse() => return Ok(()),
+                _ = feed.after(at).fuse() => Woke::Change,
+                () = told.fuse() => Woke::Change,
+                open = heard.fuse() => if open { Woke::Change } else { Woke::Closed },
+                () = due.fuse() => Woke::Change,
+                () = stirred.fuse() => Woke::Change,
+            };
+            if matches!(woke, Woke::Closed) {
+                sessions = None;
             }
         }
     }
 
-    /// One round of the stacks, as each [`TICK`] has: goals set in agents adopted, stacks paused
+    /// The agents no stack drives, kept going when they stop part-way (`keep`), and with a hub what
+    /// else rides on the driver's loop: parents told, sessions elsewhere, accounts, settings,
+    /// holds and proposals. `running` and `waiting`: the stacks running and paused for a while.
+    async fn tend(&self, running: Vec<String>, waiting: Vec<String>) {
+        let now = self.clock.unix_ms();
+        let all = self.agents_now().await;
+        let held = paused_for_usage(self.store).await;
+        let quiet: Vec<String> = all.iter().filter(|i| i.pause.is_some() || held.contains(&i.id)).map(|i| i.id.clone()).collect();
+        // Driven too: the subagents kiln started for plans' steps, which it follows itself
+        // (`subagents`): not kept going, and no news of them for the agent they work for.
+        let mut running = running;
+        if let Some(hub) = self.planner {
+            running.extend(subagents::held(hub).await);
+        }
+        // Its turn on the shard is given up between the agents kept going and between the looks
+        // after them, and each agent's children are found among those gathered once (goal 9, plan
+        // 01a1a87b2cec step 3).
+        let mut turns = crate::rt::Turns::new();
+        crate::rt::labeled(&KEEP_GOING, async {
+            let children = children_of(&all);
+            for info in keep_going(&all, &running, &waiting, &quiet) {
+                // An archived agent is kept going by no one (attention plan 01a199e1b177752e84dad5dc990e6a15).
+                if let Some(hub) = self.hub
+                    && crate::harness::attention::is_archived(hub, &info.id).await.unwrap_or(true)
+                {
+                    continue;
+                }
+                let going = children_working(&children, &info.id) || crate::harness::told::runs_awaited(info);
+                keep::tick(self.port, info, now, going).await;
+                turns.end().await;
+            }
+            keep::retain(all.iter().map(|i| i.id.as_str()));
+        })
+        .await;
+        if let Some(hub) = self.hub {
+            // Programs' workers held to their usage thresholds, and settings' notices delivered
+            // (docs/programs.md): at each change to their usage, their stacks or their programs.
+            crate::programs::enforce(hub).await;
+            turns.end().await;
+            crate::rt::labeled(&TOLD, crate::harness::told::tick(hub, &all, now, &running, &quiet)).await;
+            turns.end().await;
+            hyper_rt::futures::label(&ELSEWHERE);
+            crate::harness::elsewhere::tick(hub, &all, now);
+            crate::accounts::tick(hub);
+            let_go(all).await;
+            crate::rt::labeled(&TAIL, async {
+                crate::harness::lineage::settle_settings(hub).await;
+                {
+                    let _one = CHANGING.turn().await;
+                    say_held(hub).await;
+                }
+                for (agent, words) in hub.harness.take_proposed() {
+                    if let Err(e) = crate::plans::keep_proposed(hub, &agent, &words).await {
+                        tracing::warn!(%agent, error = %format!("{e:#}"), "keeping a proposed plan");
+                    }
+                }
+            })
+            .await;
+        }
+    }
+
+    /// One round of the stacks, as each change the driver hears brings ([`Driver::follow`]): goals set in agents adopted, stacks paused
     /// for a while whose time is up running again, each running stack stepped, plans' steps side
     /// by side followed and handed out to subagents (`subagents`, with a planner), stacks paused for
     /// usage going on once their limit lifts (`resume_lifted`), and what an edit may not have got
@@ -2485,14 +2716,62 @@ where
         (running, waiting)
     }
 
-    /// Waits one [`TICK`] by its clock: false when it's shut down first.
-    async fn tick(&self) -> bool {
-        if self.shutdown.is_cancelled() {
-            return false;
+    /// When the stacks next need the driver though nothing changes, after `now` (when its round
+    /// began; G9 step 3): the
+    /// soonest of a stack's pause for a while running out (`resume_at`) and the goal under way's
+    /// reminder coming due ([`gap`] after it was last sent). What else holds a reminder back (the
+    /// agent at work, waiting on you, a queue, its tasks) is news when it ends. A failed read is
+    /// looked at again after the first reminder's gap, the soonest any reminder comes. With
+    /// `riders`, theirs too, each from its own state: the stacks' words that may not have reached
+    /// their agents ([`said_due`]; process-wide, so kiln-sim's model, which runs beside other tests,
+    /// leaves them out with the rest), an agent's turn end settling (keep-going), a child settling or news waiting to be heard (parents told), a paused session's
+    /// next look elsewhere, a plan step's subagent that failed to start trying again, a subagent's
+    /// settings still to be given let go.
+    async fn deadline(&self, now: i64, riders: bool) -> Option<i64> {
+        let mut soonest = self.stacks_deadline(now).await;
+        let mut add = |t: Option<i64>| {
+            if let Some(t) = t {
+                soonest = sooner(soonest, t, now);
+            }
+        };
+        if riders {
+            add(said_due());
+            add(keep::due());
+            add(crate::harness::told::due());
+            add(crate::harness::elsewhere::due());
+            add(subagents::due());
+            if let Some(hub) = self.hub {
+                add(crate::harness::lineage::settings_due(hub).await);
+            }
         }
-        let cancelled = pin!(self.shutdown.cancelled());
-        let slept = self.clock.sleep(TICK);
-        matches!(futures::future::select(cancelled, slept).await, futures::future::Either::Right(_))
+        soonest
+    }
+
+    /// [`Driver::deadline`]'s part from the stacks' own rows.
+    async fn stacks_deadline(&self, now: i64) -> Option<i64> {
+        let read = self
+            .store
+            .read(move |c| {
+                let mut soonest = None;
+                let mut st = c.prepare("SELECT resume_at FROM goal_stacks WHERE state = 'paused' AND resume_at > 0")?;
+                for t in st.query_map([], |r| r.get::<_, i64>(0))? {
+                    soonest = sooner(soonest, t?, now);
+                }
+                let mut st = c.prepare("SELECT i.reminded_at, i.reminders FROM goal_items i JOIN goal_stacks s ON s.agent = i.agent WHERE s.state = 'running' AND i.status = 'active' AND i.reminded_at > 0")?;
+                for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
+                    let (at, n) = r?;
+                    soonest = sooner(soonest, reminder_due(at, n), now);
+                }
+                Ok(soonest)
+            })
+            .await;
+        match read {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "the goal stacks' deadlines weren't read: looked at again after a reminder's gap");
+                Some(now.saturating_add(gap(0)))
+            }
+        }
     }
 
     /// Every agent the port knows now, as `HarnessPort::agents` lists them. Through the hub (the
@@ -2616,13 +2895,15 @@ where
 /// stack as the goal under way,
 /// so kiln keeps it like the others; one the stack had under way goes back to the front of what's
 /// next. The stack runs.
-async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<()> {
-    let Some(o) = set_goal(info) else { return Ok(()) };
-    // Gone since the round looked (ended, its stack forgotten: [`forget_with`]): its goal makes it no
-    // stack again.
-    if d.port.agent(&info.id).is_none() {
+async fn adopt<P: HarnessPort<Agent = Info>>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<()> {
+    if set_goal(info).is_none() {
         return Ok(());
     }
+    // Gone since the round looked (ended, its stack forgotten: [`forget_with`]): its goal makes it no
+    // stack again. There, its goal as it is now, not as the round saw it: the stack may have ended
+    // it since, and its harness let it go.
+    let Some(info) = d.port.agent(&info.id) else { return Ok(()) };
+    let Some(o) = set_goal(&info) else { return Ok(()) };
     let Ok(text) = clean(&o.text) else { return Ok(()) };
     let (agent, how, at, now, gave_up) = (info.id.clone(), how(d.port, &info.id), o.at, d.clock.unix_ms(), o.status == "unmet");
     d.store
@@ -2630,6 +2911,17 @@ async fn adopt<P: HarnessPort>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result
             // One you cleared or skipped is being cleared in the agent: it doesn't come back.
             let dropped: i64 = c.query_row("SELECT dropped_at FROM goal_stacks WHERE agent = ?1", params![agent], |r| r.get(0)).optional()?.unwrap_or(0);
             if at <= dropped {
+                return Ok(());
+            }
+            // One the stack ended (said met through it, met, skipped) at or after the agent's goal
+            // was set: what the agent still has is the goal the stack sent it, not one set anew, and
+            // it doesn't come back (T-T1.5.1: an ended goal never does). Set in the agent again
+            // after that, it joins.
+            if c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM goal_items WHERE agent = ?1 AND text = ?2 AND status NOT IN ('pending', 'active') AND ended_at >= ?3)",
+                params![agent, text, at],
+                |r| r.get::<_, bool>(0),
+            )? {
                 return Ok(());
             }
             // Its harness giving up on a goal the stack knows, one it still had set: one the stack has
@@ -3097,8 +3389,8 @@ fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: 
         if !fresh && item.how.as_deref() == Some("goal") && info.tasks_running > 0 {
             return Next::Wait;
         }
-        // Since it was last sent (never, for a fresh one: at once).
-        if now.saturating_sub(item.reminded_at) < gap(item.reminders) {
+        // Since it was last sent (never, for a fresh one: at once), surely past its gap.
+        if now < reminder_due(item.reminded_at, item.reminders) {
             return Next::Wait;
         }
         let how = item.how.clone().unwrap_or_else(|| "message".into());
@@ -3498,6 +3790,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The least time the driver's tests move its clock by: what's due at a time goes at it, not before.
+    const STEP: Duration = Duration::from_millis(1);
     use super::*;
     use crate::harness::model::{Objective, ToolKind};
     use crate::harness::session::ApprovalBrief;
@@ -3518,8 +3812,9 @@ mod tests {
         Objective { text: "tests  pass".into(), status: status.into(), reason: Some("why".into()), at }
     }
 
-    /// Past the first pause after the goal was sent.
-    const LATER: i64 = 1_000 + REMIND_MS;
+    /// Past the first pause after the goal was sent: the first millisecond surely past it
+    /// ([`reminder_due`]).
+    const LATER: i64 = 1_000 + REMIND_MS + 1;
 
     /// The id of a message a command sends, if it sends one.
     fn sent_id(c: &Command) -> Option<String> {
@@ -3861,15 +4156,15 @@ mod tests {
         thrice.reminders = 3;
         thrice.reminded_at = 10_000;
         let s = stack(vec![thrice]);
-        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS - 1, false, false), Next::Wait));
-        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS, false, false), Next::Remind { worked: false, .. }));
+        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS, false, false), Next::Wait));
+        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS + 1, false, false), Next::Remind { worked: false, .. }));
         // It worked on it a good while since it was last sent: real work.
         let mut worked = item("active", Some("goal"));
         worked.reminded_at = 10_000;
         worked.busy_at = 11_000;
         let mut after = info(Status::Idle, None);
         after.last_activity = 11_000 + WORKED_MS;
-        assert!(matches!(decide(&stack(vec![worked]), Some(&after), 10_000 + REMIND_MS, false, false), Next::Remind { worked: true, .. }));
+        assert!(matches!(decide(&stack(vec![worked]), Some(&after), 10_000 + REMIND_MS + 1, false, false), Next::Remind { worked: true, .. }));
     }
 
     /// CP-M2's counters move (a non-vacuity check; docs/agents.md, "Metrics"): a goal's first send
@@ -3907,8 +4202,8 @@ mod tests {
             // The first goal goes to the agent, idle: a start.
             step(&driver, id, false).await?;
             assert_eq!(counts(), (1, 0, 0, 0));
-            // It stops short of it: 30 s on, the goal goes again.
-            clock.advance(std::time::Duration::from_secs(30));
+            // It stops short of it: the first millisecond past 30 s on, the goal goes again.
+            clock.advance(std::time::Duration::from_millis(30_001));
             step(&driver, id, false).await?;
             assert_eq!(counts(), (1, 1, 0, 0));
             // Its harness says it's met: it ended, met; the second one starts.
@@ -3925,6 +4220,82 @@ mod tests {
             assert_eq!(counts(), (2, 1, 1, 1));
             // What was counted is what the agent was sent: two goals and a reminder.
             assert_eq!(port.heard(id).len(), 3);
+            Ok(())
+        })
+    }
+
+    /// G9 step 3, T1.5: the goal driver's feed moves with writes to the tables that change what it
+    /// does and no other's, on the store as production opens it (through the cluster group): kiln's
+    /// other writes don't run its round. (Past the group, `[cluster] group = false`, every committed
+    /// write moves every table's count: rounds there run on every write, each finding nothing new.)
+    #[test]
+    fn g9_s3_the_feed_moves_for_the_goal_tables_writes_alone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::Store::open_grouped(&dir.path().join("kiln.db"), &dir.path().join("cluster"))?;
+        crate::rt::block_on(async move {
+            let feed = StoreFeed::new(&store);
+            let at = feed.at();
+            for k in ["a", "b", "c"] {
+                store.kv_set(k.into(), "1".into()).await?;
+            }
+            store.call(|c| Ok(c.execute("INSERT INTO plans (id, title, body, created_at, updated_at) VALUES ('p1', 'a plan', '', 0, 0)", [])?)).await?;
+            anyhow::ensure!(feed.at() == at, "the feed moved for writes to other tables");
+            store.call(|c| Ok(c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES ('g1', 'a1', 0, 'a goal')", [])?)).await?;
+            let moved = feed.at();
+            anyhow::ensure!(moved != at, "a goal's write didn't move the feed");
+            anyhow::ensure!(feed.after(at).await == moved, "a wait from before it isn't over at it");
+            Ok(())
+        })
+    }
+
+    /// G9 step 3, T1.5: a round with nothing to do writes nothing, so it doesn't wake itself: the
+    /// round that sends a goal moves the feed once, and the rounds after it (the agent at work on it,
+    /// or idle before its reminder is due) leave the store as they found it, every table's count.
+    #[test]
+    fn g9_s3_a_round_with_nothing_to_do_writes_nothing() -> anyhow::Result<()> {
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let clock = SimClock::new();
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let shutdown = crate::rt::Shutdown::new();
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let id = "goals-quiet-round";
+            anyhow::ensure!(port.open(id, Info { id: id.into(), status: Status::Idle, ..Info::default() }), "not opened");
+            port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
+            store
+                .call(move |c| {
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES ('g1', ?1, 0, 'the first goal')", params![id])?;
+                    touch(c, id, Some("running"), None, 0)
+                })
+                .await?;
+            let gate = crate::turn::Gate::one();
+            let feed = StoreFeed::new(&store);
+            // Every table's count: in memory, any committed write moves it; through the group, the
+            // tables' own.
+            let all = || store.changes().of(&["goal_stacks", "goal_items", "plan_runs", "plan_run_steps", "plan_tags", "kv"]);
+            let (at, before) = (feed.at(), all());
+            driver.round(&gate).await;
+            anyhow::ensure!(port.heard(id).len() == 1 && feed.at() != at, "the round didn't send the goal: {:?}", port.heard(id));
+            // Idle before the reminder's due: nothing to do.
+            let (at, before_quiet) = (feed.at(), all());
+            anyhow::ensure!(before_quiet != before, "sending wrote nothing");
+            driver.round(&gate).await;
+            anyhow::ensure!(feed.at() == at && all() == before_quiet, "an idle round wrote");
+            // It goes to work on it: the round after notes when (`busy_at`, what tells real work from
+            // a reminder that brought none), news, so one write.
+            anyhow::ensure!(port.update(id, |i| i.status = Status::Running), "not updated");
+            driver.round(&gate).await;
+            let busy_at = stack_of(&store, id).await?.items.first().map_or(0, |i| i.busy_at);
+            anyhow::ensure!(busy_at > 0 && feed.at() != at, "the round didn't note the agent at work: busy_at {busy_at}");
+            // Still at work on it, past the reminder's gap: nothing to do.
+            let (at, before_busy) = (feed.at(), all());
+            clock.advance(Duration::from_millis(u64::try_from(reminder_due(0, 0)).unwrap_or(u64::MAX)));
+            driver.round(&gate).await;
+            driver.round(&gate).await;
+            anyhow::ensure!(feed.at() == at && all() == before_busy && port.heard(id).len() == 1, "a round with the agent at work wrote or sent");
             Ok(())
         })
     }
@@ -4028,16 +4399,19 @@ mod tests {
             let sent = || port.heard(id).iter().map(|d| d.at_ms).collect::<Vec<i64>>();
             let test = async {
                 clock.sleeping_since(0, 1).await;
-                // A tick: the goal set in the agent joins its stack, as the goal under way.
-                clock.advance_and_settle(TICK).await;
+                // The goal set in the agent joins its stack at once, as the goal under way.
                 let joined = stack_of(&store, id).await?;
                 anyhow::ensure!(joined.items.first().is_some_and(|i| i.status == "active" && i.how.as_deref() == Some("goal")), "the goal didn't join the stack: {joined:?}");
                 let mut last = clock.unix_ms();
                 let mut gaps = Vec::new();
                 for secs in [30, 60, 120, 240, 480, 900, 900] {
-                    clock.advance_and_settle(Duration::from_secs(secs).saturating_sub(TICK)).await;
-                    anyhow::ensure!(sent().len() == gaps.len(), "a reminder went a tick before {secs} s: {:?}", sent());
-                    clock.advance_and_settle(TICK).await;
+                    // The gap itself: nothing is due, so nothing wakes the driver (no news, no write;
+                    // a settle would wait for a sleep it has no cause to start). A reminder sent
+                    // there would show as one a millisecond before its time, below.
+                    clock.advance(Duration::from_secs(secs));
+                    anyhow::ensure!(sent().len() == gaps.len(), "a reminder went at {secs} s, not past it: {:?}", sent());
+                    // The first millisecond past it: the reminder goes, and the driver sleeps again.
+                    clock.advance_and_settle(STEP).await;
                     let at = sent().last().copied().unwrap_or_default();
                     anyhow::ensure!(sent().len() == gaps.len() + 1 && at == clock.unix_ms(), "no reminder at {secs} s: {:?}", sent());
                     gaps.push(at - last);
@@ -4049,7 +4423,8 @@ mod tests {
             };
             let (driven, gaps) = futures::join!(driver.drive(), test);
             driven?;
-            assert_eq!(gaps?, [30_000, 60_000, 120_000, 240_000, 480_000, 900_000, 900_000]);
+            // Each the first millisecond surely past its gap (`reminder_due`).
+            assert_eq!(gaps?, [30_001, 60_001, 120_001, 240_001, 480_001, 900_001, 900_001]);
             // Each was the goal again, as its harness takes it.
             let again = format!("/goal {goal}");
             assert!(port.heard(id).iter().all(|d| matches!(&d.command, Command::Send { text, .. } if *text == again)), "{:?}", port.heard(id));
@@ -4742,14 +5117,17 @@ mod tests {
             let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             let test = async {
                 clock.sleeping_since(0, 1).await;
-                clock.advance_and_settle(Duration::from_secs(60).saturating_sub(TICK)).await;
+                // A millisecond short: nothing is due, so nothing wakes the driver (a settle would wait
+                // for a sleep it has no cause to start). A resume there would show in its goal's
+                // send a millisecond early, below.
+                clock.advance(Duration::from_secs(60).saturating_sub(STEP));
                 let s = stack_of(&store, id).await?;
-                anyhow::ensure!(s.state == "paused" && port.heard(id).is_empty(), "resumed a tick early: {s:?}");
-                clock.advance_and_settle(TICK).await;
+                anyhow::ensure!(s.state == "paused" && port.heard(id).is_empty(), "resumed a millisecond early: {s:?}");
+                clock.advance_and_settle(STEP).await;
                 let s = stack_of(&store, id).await?;
                 anyhow::ensure!(s.state == "running" && s.resume_at == 0 && s.reason.is_none(), "{s:?}");
                 let heard = port.heard(id);
-                anyhow::ensure!(matches!(heard.as_slice(), [d] if matches!(&d.command, Command::Send { text, .. } if text == "/goal deploy is green")), "{heard:?}");
+                anyhow::ensure!(matches!(heard.as_slice(), [d] if d.at_ms == until && matches!(&d.command, Command::Send { text, .. } if text == "/goal deploy is green")), "{heard:?}");
                 // The message that took it is noted, to withdraw if the goal ends before the agent takes it.
                 let sent = heard.first().and_then(|d| sent_id(&d.command));
                 anyhow::ensure!(sent.is_some() && s.items.first().is_some_and(|i| i.sent_id == sent), "{:?} {sent:?}", s.items.first().map(|i| &i.sent_id));
@@ -4792,27 +5170,35 @@ mod tests {
                 .await?;
             let metrics = crate::metrics::AgentMetrics::default();
             let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
+            // The agent's news, as the hub's session events tell it.
+            let news = crate::rt::Notify::new();
+            let feed = StoreFeed::new(&store);
             let test = async {
+                // Its rounds done, the driver sleeps until its reminder's due.
                 clock.sleeping_since(0, 1).await;
-                clock.advance_and_settle(TICK).await;
                 let s = stack_of(&store, id).await?;
                 let w: Vec<String> = s.items.iter().map(|i| format!("{}:{}", i.status, i.text)).collect();
                 anyhow::ensure!(w == ["met:tests pass", "active:docs build"], "{w:?}");
                 // Set in the agent anew (`/goal tests pass` again): it joins, as the goal under way.
                 port.update(id, |i| i.objective = Some(Objective { text: "tests pass".into(), status: "active".into(), reason: None, at: later + 20_000 }));
-                clock.advance_and_settle(TICK).await;
+                // The news wakes the driver; its round done, it sleeps again.
+                let since = clock.registrations();
+                news.notify();
+                clock.sleeping_since(since, 1).await;
                 let s = stack_of(&store, id).await?;
                 anyhow::ensure!(s.items.iter().any(|i| i.status == "active" && i.text == "tests pass"), "{s:?}");
                 // Its harness giving up on the goal that went back among the others (split, moved): it stays where it is.
                 port.update(id, |i| i.objective = Some(Objective { text: "docs build".into(), status: "unmet".into(), reason: None, at: later + 40_000 }));
-                clock.advance_and_settle(TICK).await;
+                let since = clock.registrations();
+                news.notify();
+                clock.sleeping_since(since, 1).await;
                 let s = stack_of(&store, id).await?;
                 let w: Vec<String> = s.items.iter().filter(|i| i.status != "met").map(|i| format!("{}:{}", i.status, i.text)).collect();
                 anyhow::ensure!(w.first().map(String::as_str) == Some("active:tests pass") && w.contains(&"pending:docs build".to_owned()), "{w:?}");
                 shutdown.cancel();
                 Ok(())
             };
-            let (driven, tested) = futures::join!(driver.drive(), test);
+            let (driven, tested) = futures::join!(driver.follow(&CHANGING, &feed, Some(&news), true), test);
             driven?;
             tested
         })
