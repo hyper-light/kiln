@@ -12,6 +12,7 @@ pub mod history;
 pub mod keep;
 pub mod keeper;
 pub mod local;
+pub mod loopback;
 /// kiln's MCP for the agents on a runner: `kiln reach mcp` over the runner's reach socket (Unix),
 /// and an isolated session's over its lane, in the runner's own process (every platform).
 pub mod mcp;
