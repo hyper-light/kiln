@@ -6574,6 +6574,38 @@ while True:
         })
     }
 
+    /// CP-T3.2, W20: a session moved back to a machine it left takes messages there. Its journal
+    /// there still held a message its harness was given and never seen to an end before it left, at
+    /// the epoch it left at; arriving at a higher one, its admission restored that, was refused (a
+    /// lease is its own epoch's) and took nothing it was sent, for good: Slates, 2026-11-20, back on
+    /// the Mac it had left at epoch 4, said it takes no messages at epochs 6 and 8, its person's
+    /// "Continue" and 23 agents' mail held in kiln.
+    #[test]
+    fn cp_t3_2_a_session_moved_back_to_a_machine_it_left_takes_messages() -> anyhow::Result<()> {
+        use crate::harness::admission::{Lease, Stage};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let inbox = host.inbox.clone().ok_or_else(|| anyhow::anyhow!("the host has no inbox"))?;
+            // Its stay here at epoch 4: its person's message handed to its harness, then it went on elsewhere.
+            inbox.open("back", 4).await?;
+            let lease = Lease { message: "given".into(), peer: "admin".into(), epoch: 4, bytes: 10, stage: Stage::ProviderFlight, token: Some(crate::harness::mail::Token { revision: 7, generation: 1 }), handoff: None };
+            inbox.accept_pending("back", "given", &inbox::digest("x", &[]), Some(4), 1, &inbox::Pending::new(lease, message("given", "x"))).await?;
+            inbox.fence("back", 4).await?;
+            // Back at 6, as a move brings it: its state at 5 there, at 6 here.
+            let seed = session::Seed { events: Vec::new(), state: super::super::model::State { epoch: 5, ..Default::default() }, items: None, from: "elsewhere".into(), from_cwd: dir.path().to_string_lossy().into_owned(), picks_up: false, note: None, restored: false, synced: None, local: false };
+            let s = host.open_seeded(Some("back".into()), no_harness(dir.path()), Some(seed), None, Vec::new(), false, true)?;
+            // Its lane's first word (it's here: its inbox opened, its journal replayed) done.
+            host.settled("back").await;
+            let admission = s.core.lock().state.admission.clone().ok_or_else(|| anyhow::anyhow!("it said nothing of what it takes"))?;
+            assert_eq!(admission.epoch, 6);
+            assert!(admission.target > 0, "it takes messages at the epoch it's back at: {admission:?}");
+            assert!(inbox.pending("back", "given").await?.is_none(), "what its stay before left here went");
+            Ok(())
+        })
+    }
+
     /// CP-T3.2: handing sessions over ends even when their lanes wait on a sink nobody drains: it
     /// waits for them [`SETTLE_WAIT`] at most. The runner's loop polls the hand-over beside the sink
     /// it drains (`agent.rs`, `HarnessApplied::Native`), so there its lanes settle and it goes on;
