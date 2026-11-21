@@ -6399,7 +6399,7 @@ fn workspaces_answer(mounted: &Result<(), crate::harness::lineage::NoWorkspace>,
 }
 
 fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
-    let all = hub.harness.kinds();
+    let all = crate::harness::lineage::startable_kinds(hub);
     match q.get("target") {
         Some(t) => srv::json(StatusCode::OK, &all.get(t).cloned().unwrap_or_default()),
         None if q.get("shared").is_some_and(|shared| shared == "1") => srv::json(StatusCode::OK, &shared_kinds(&all)),
