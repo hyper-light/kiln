@@ -42,11 +42,13 @@ use super::slates::Made;
 const NFS_VERSION: &str = "4.2";
 /// How many times an engine volume's removal is tried before its release says it stayed: an engine may still count a
 /// container it just removed as the volume's user for a moment (Docker Desktop 29.3.1, w-k90-containers' r8).
-const VOLUME_RM_TRIES: u32 = 10;
-/// How long between an engine volume's removal's tries ([`VOLUME_RM_TRIES`]).
+pub(crate) const VOLUME_RM_TRIES: u32 = 10;
+/// How long between an engine volume's removal's tries ([`VOLUME_RM_TRIES`]) on a machine.
+pub(crate) const VOLUME_RM_PAUSE_LIVE: std::time::Duration = std::time::Duration::from_millis(500);
+/// The pause taken: [`VOLUME_RM_PAUSE_LIVE`]'s, but none to speak of between a stand-in's tries.
 #[cfg(not(test))]
-const VOLUME_RM_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
-/// See above: no pause between a stand-in's tries.
+const VOLUME_RM_PAUSE: std::time::Duration = VOLUME_RM_PAUSE_LIVE;
+/// See above.
 #[cfg(test)]
 const VOLUME_RM_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 /// Format: the container option that holds `nosuid`: no process of the container gains a privilege by an exec.

@@ -726,7 +726,8 @@ run out, and two lines can't take the same one by accident as they could a bit.
   two runners that name it, and refuses the move by kind otherwise (an older runner would hand the
   session over without its volume).
   `agentenv`: the runner runs sessions with the environments the server resolves for them
-  (`Spec::agentenv`, `Command::Agentenv`; docs/agents.md, "Environments"), and says which variables
+  (`Spec::agentenv`, `Command::Agentenv`; docs/agents.md, "Environments"; a session's stack resolved as
+  one, so a runner knows nothing of stacks), and says which variables
   its user has, by name and where each is set, as the server asks (`ServerMsg::UserEnv`); a runner
   that didn't name it is sent none: a start with an environment there is refused, saying so.
   `sessions.volumes.exec`: the runner holds a volume given to a running microVM session with its
@@ -1106,7 +1107,7 @@ travels in `HarnessCmd`.
 | `Control` | command, refused while away | A control's value, or an action. | Fire-and-forget. |
 | `StopTask` | command, refused while away | Stops one task now. | Fire-and-forget. |
 | `Restart` | command, refused while away | Starts the harness again now. | Fire-and-forget. |
-| `Agentenv` | command, refused while away | A session's environment replaced (`{agentenv, restart}`: `harness::agentenv::Resolved` or none, its secrets' values opened), then its harness started again unless `restart` is false. kiln's server's alone: one from a client is refused. | New: to runners that named `agentenv`. |
+| `Agentenv` | command, refused while away | A session's environment replaced (`{agentenv, restart}`: `harness::agentenv::Resolved` or none, its secrets' values opened; a stack resolved as one, its `id` the stack's ids joined by `+`), then its harness started again unless `restart` is false. kiln's server's alone: one from a client is refused. | New: to runners that named `agentenv`. |
 | `Suggest` | ask | Answered by a `Reply` to its client. | As its class says. |
 | `Snapshot` | ask | The whole session, for a server that lost track of it. A resume by revision replaces it. | Asked for by a server that restarted. |
 | `StateRead` | ask | A bounded page or range of deferred session detail, at its field revision. | Reply to the requesting client; stale reads are refused. |

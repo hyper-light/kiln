@@ -166,7 +166,7 @@ async fn start_one(hub: &Arc<Hub>, id: &str, to: &str, now: bool, kind: Option<S
     }
     // Its environment goes on with it, opened again there (docs/agents.md, "Where they apply"): never to a runner
     // that runs none, where it would go on without it.
-    if crate::agentenvs::linked(hub, id).is_some() && !crate::agentenvs::resolve::speaks(hub, &to) {
+    if crate::agentenvs::stacked(hub, id) && !crate::agentenvs::resolve::speaks(hub, &to) {
         return Err(format!("it runs with an environment, and {}'s kiln runs no session with one: upgrade it (System → Updates)", hub.shown(&to)));
     }
     if local {

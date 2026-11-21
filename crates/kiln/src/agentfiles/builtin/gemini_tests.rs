@@ -293,9 +293,12 @@ fn osi_problems(h: &Value) -> Vec<String> {
 fn launched(kind: &Kind) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let cwd = tempfile::tempdir()?;
     let spec = Spec { kind: kind.id.to_owned(), program: Some("/nowhere/agent".to_owned()), cwd: Some(cwd.path().to_string_lossy().into_owned()), ..Spec::default() };
-    let p = kind.launch(&spec, "session")?;
+    // Over no user environment: what the machine's user has is every launch's, not the kind's own,
+    // and differs from machine to machine (and as another session reads it again, `agentenv::said`).
+    let p = kind.launch_over(&spec, "session", &[])?;
     let args = p.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-    let own = |k: &OsStr| k == OsStr::new("PATH") || k.to_string_lossy().starts_with("KILN_");
+    // Every launch's too: the PATH it was found on, kiln's own, and `PWD`, where it starts.
+    let own = |k: &OsStr| k == OsStr::new("PATH") || k == OsStr::new("PWD") || k.to_string_lossy().starts_with("KILN_");
     let env = p.get_envs().filter(|(k, _)| !own(k)).filter_map(|(k, v)| Some(format!("{}={}", k.to_string_lossy(), v?.to_string_lossy()))).collect();
     Ok((args, env))
 }

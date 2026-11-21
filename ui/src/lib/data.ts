@@ -9,7 +9,8 @@
 import { create } from "zustand";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import { harnessApi, listed, type AgentInfo } from "@/api/harness";
+import { listAgents, listed } from "@/api/agents-list";
+import type { AgentInfo } from "@/api/wire";
 import type { Agent, AiSession, HostSample, LeanAgent, MetricsHistory, Overview, Repo, Run, ServerEvent, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
 import { loaded, preload, recent, useSuspenseResource, type ResourceOptions, type ResourceFetcher } from "./resource";
 
@@ -220,7 +221,7 @@ export const harnessSessionsRes: Res<AgentInfo[]> = {
     const kept = recent<AgentInfo[]>("harness/agents", 5_000);
     return kept
       ? Promise.resolve(kept)
-      : harnessApi.list(signal).catch((error: unknown) => {
+      : listAgents(signal).catch((error: unknown) => {
           if (signal.aborted) throw error;
           return [];
         });

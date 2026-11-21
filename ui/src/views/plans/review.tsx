@@ -43,6 +43,8 @@ import { criterionSentence, planSteps, stepMarkdown, testSentence } from "./step
 import "../research/research.css";
 import "./review.css";
 
+export { useReviewWaits } from "./review-waits";
+
 /** Of a list this long, this many show; the rest on asking. */
 const FEW = 3;
 
@@ -73,15 +75,6 @@ export function ReviewHere({ agent, store, send }: { agent: string; store: Sessi
       </Frame>
     );
   return <Receipt agent={agent} name={name} />;
-}
-
-/** What waits on your review of `store`'s agent's plans, if anything (its Plan tab says so): a plan it proposed, or one its goals wait on. */
-export function useReviewWaits(store: SessionStore): "proposed" | "goal" | null {
-  const held = Boolean(useRes(harnessSessionsRes).data.find((a) => a.id === store.id)?.held?.plan);
-  const asked = useSession(store, (s) => s.state?.approvals);
-  const done = useRequestsAnswered();
-  if (asked && stillAsked(asked, done).some((a) => a.tool === "plan" && !a.agent && Boolean(a.plan))) return "proposed";
-  return held ? "goal" : null;
 }
 
 function Frame({ children }: { children: React.ReactNode }) {

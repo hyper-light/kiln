@@ -60,13 +60,16 @@ fn g1_s1_a_held_shard_shows_its_own_delay_and_slow_polls_alone() -> anyhow::Resu
     anyhow::ensure!(over(1, 0.25) >= over_before.get(1).copied().unwrap_or(0) + HOLDS, "shard 1's delay histogram didn't take its holds: {} over 0.25 s", over(1, 0.25));
     anyhow::ensure!(held.slow.total() >= b1.slow.total() + HOLDS, "shard 1's slow polls went {:?} to {:?}", b1.slow, held.slow);
     anyhow::ensure!(held.longest_poll >= HELD.mul_f64(0.9), "shard 1's longest poll: {:?}", held.longest_poll);
-    // The others': flat. A stray poll the host held may count, never the holds.
+    // The others': flat. None of their tasks' own slow polls (`task`, `blocking`: a hold is one that waits inside a
+    // call) rose, and no poll of theirs came near a hold. Those the host held, preempting their thread (`host`), or that
+    // the OS can't tell (`unknown`: off the CPU with no window open) are the machine's, as many as its load makes: on
+    // adacachy at load 76, two of shard 0's in one run (2026-11-20).
     for i in [0, 2] {
         let (a, b) = (after.get(i).ok_or_else(|| anyhow::anyhow!("no shard {i}"))?, before.get(i).ok_or_else(|| anyhow::anyhow!("no shard {i}"))?);
         anyhow::ensure!(a.most_late < HELD / 2, "shard {i}'s probe was {:?} late", a.most_late);
         anyhow::ensure!(over(i, 0.25) == over_before.get(i).copied().unwrap_or(0), "shard {i}'s delay histogram moved over 0.25 s");
         anyhow::ensure!(a.longest_poll < HELD / 2, "shard {i}'s longest poll: {:?}", a.longest_poll);
-        anyhow::ensure!(a.slow.total() <= b.slow.total() + 1, "shard {i}'s slow polls went {:?} to {:?}", b.slow, a.slow);
+        anyhow::ensure!((a.slow.task, a.slow.blocking) == (b.slow.task, b.slow.blocking), "shard {i}'s own slow polls went {:?} to {:?}", b.slow, a.slow);
     }
 
     // On /metrics, every series for every shard (busy where the OS keeps a thread's CPU time).

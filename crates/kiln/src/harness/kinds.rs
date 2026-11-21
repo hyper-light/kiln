@@ -120,8 +120,13 @@ impl Kind {
     }
 
     /// The process to start for session `session` of `spec` (cwd, environment and arguments).
-    #[cfg_attr(not(unix), allow(unused_variables))]
     pub fn launch(&self, spec: &Spec, session: &str) -> anyhow::Result<Process> {
+        self.launch_over(spec, session, &super::agentenv::said())
+    }
+
+    /// [`Kind::launch`], with `user` the machine's user's environment.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    pub(crate) fn launch_over(&self, spec: &Spec, session: &str, user: &[(String, String)]) -> anyhow::Result<Process> {
         if self.protocol == Protocol::Terminal {
             anyhow::bail!("{} has no structured mode; run it in a terminal ({})", self.name, self.program);
         }
@@ -135,7 +140,7 @@ impl Kind {
             anyhow::bail!("{cwd} is not a directory on this machine");
         }
         p.current_dir(&cwd);
-        set_env(&mut p, spec);
+        set_env_over(&mut p, spec, user);
         // `PWD` names where it starts, as a shell sets it for what it runs (POSIX `cd`), whatever environment it was
         // handed: a person's shell's names their own folder, as it was when that shell started, where an agent on a
         // volume starts at the mount (docs/agentic.md W2).

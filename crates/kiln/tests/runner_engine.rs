@@ -1,11 +1,13 @@
 //! A runner's engine (kiln plan 01a1dd2e…, P2.3 and P2.4; docs/isolation.md, "A runner's engine"), end
-//! to end through kiln's API, MCP and code mode: a server, and a runner of this build, which carries no
-//! Shards and so can't hold agents in microVMs. It says `host` and why, and `microvm` is refused, saying
+//! to end through kiln's API, MCP and code mode: a server, and a runner of this build. Every kiln carries
+//! Shards (docs/shards.md), so a runner holds agents in microVMs wherever Shards' check of its host passes;
+//! the first test's runner can't, its state folder holding a file where kiln writes the Shards it carries
+//! out, so it holds none whatever its host. It says `host` and why, and `microvm` is refused, saying
 //! why, on every surface. Its owner sets `host` and takes it away, and the runner keeps what was set for
-//! its restarts. A session that asks nothing starts on its host, with no microVM. One that needs a microVM
-//! is refused, the engine named (P2.4 AC2). The runner side of `microvm` (a runner that holds microVMs
-//! defaulting to it, a switch to `host`, placement between two runners) needs a kiln carrying Shards:
-//! `vm_harnesses`' `engine::` tests.
+//! its restarts. On a runner whose owner set `host`, a session that asks nothing starts on its host, with
+//! no microVM. One that needs a microVM is refused, the engine named (P2.4 AC2). The runner side of
+//! `microvm` (a runner that holds microVMs defaulting to it, a switch to `host`, placement between two
+//! runners) boots real microVMs: `vm_harnesses`' `engine::` tests.
 //!
 //! `cargo test -p kiln --test runner_engine`
 
@@ -81,13 +83,17 @@ fn put(s: &Server, name: &str, body: Value) -> anyhow::Result<(u16, Value)> {
 /// the runners API and its engine's own view, its isolation facts beside it; `microvm` is refused on it,
 /// saying why, through REST, MCP and code mode, and leaves it as it was; its owner sets `host` (kept on
 /// the runner for its restarts) and takes it away. What isn't an engine is refused, saying why; a runner
-/// the server doesn't know has none.
+/// the server doesn't know has none. Its microVMs can't be held: a file stands where kiln writes the Shards
+/// it carries out (`<state>/shards`, `kiln::shards::write_out`), on any host, so its engine is what it can
+/// do, as it would be on a host whose hypervisor Shards can't use.
 #[test]
 fn p2_3_a_runner_without_microvms_runs_host_says_why_and_cant_be_set_to_microvm() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let s = common::start(dir.path(), &Options::default())?;
+    std::fs::create_dir_all(dir.path().join("box-state"))?;
+    std::fs::write(dir.path().join("box-state/shards"), "not a folder")?;
     let (runner, log) = agents::runner_with(dir.path(), s.port, "box", None, TALK, &[])?;
-    agents::connected(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
+    agents::connected_as_is(s.port, &s.admin, "box", &log, Duration::from_secs(120))?;
     let kept = dir.path().join("box-state/runner-engine.json");
 
     // AC2: `host`, from what it can do, and why: its own facts' why. AC4: its isolation facts with it.
@@ -159,11 +165,11 @@ fn session_until(s: &Server, id: &str, what: &str, log: &Path, holds: impl Fn(&V
     until(what, log, || Ok(call(s, "GET", &format!("/api/harness/sessions/{id}"), None)?.1), holds)
 }
 
-/// P2.3's second test on a `host` runner, and P2.4's second: a new session that asks nothing starts on
-/// the runner's host with no microVM, by the console's route and by `agents.start` alike, and counts
-/// among those on its engine; one that needs a microVM is refused with words naming the engine, by
-/// `agents.start` (placed by need, every runner here `host`) and by a start naming the runner; one
-/// asked as a process (`isolation` "none") starts there.
+/// P2.3's second test on a `host` runner (its owner set it, `agents::connected`), and P2.4's second: a new
+/// session that asks nothing starts on the runner's host with no microVM, by the console's route and by
+/// `agents.start` alike, and counts among those on its engine; one that needs a microVM is refused with words
+/// naming the engine, by `agents.start` (placed by need, every runner here `host`) and by a start naming the
+/// runner; one asked as a process (`isolation` "none") starts there.
 #[test]
 fn p2_3_a_new_session_takes_its_runners_engine_and_p2_4_a_microvm_one_is_refused_on_host_runners() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

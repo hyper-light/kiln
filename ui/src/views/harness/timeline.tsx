@@ -30,7 +30,7 @@ import { labelOf, useLabels, withLabels } from "@/lib/data";
 import { Link, useNavigate } from "@/lib/router";
 import { useNow } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
-import { AccountCard, saysSignedOut } from "./account-card";
+import { saysSignedOut } from "./signed-out";
 import {
   changesetOf,
   diffStats,
@@ -52,7 +52,7 @@ import {
   type Turn,
   type TurnsMemo,
 } from "./derive";
-import { ApprovalCard, type Decide } from "./approval";
+import type { Decide } from "./approval";
 import { DiffStat, FileDiffView } from "./diff";
 import { MsgMenu, type MenuGroup, type MenuRow } from "./msgmenu";
 import { startFrom } from "./new-agent-draft";
@@ -69,9 +69,10 @@ import { LiveView } from "./live";
 import { liveOf } from "./live-of";
 import { SavePlan, todosAsPlan } from "@/views/plans/save";
 import { researchCall } from "@/api/research";
-import { ResearchCard } from "@/views/research/research";
-import { DefinitionCard, defCall } from "./definitions";
+import { defCall } from "./definition-parts";
 import { Loadable } from "@/components/ui/loading";
+import { RowsHold } from "@/components/ui/hold";
+import { Skeleton } from "@/components/ui/misc";
 import { copyText } from "@/views/terminal/clipboard";
 import { Beam, Condense, formatThought, LoadingMark, Optic, PrismLabel, ThinkingBody, ThinkingHead, ThinkingLabel, type BeamStatus } from "./signals";
 import { latestThought, thinkingStarted, thoughtIsLive, thoughtShown, type ThoughtItem } from "./thinking";
@@ -88,6 +89,13 @@ import { SessionEvents, useSessionEvent } from "./session-event";
 import { pageInGap, revealRow, rowWindow, survivingPosition, type RowPosition, type WindowPart } from "./row-window";
 import { useRowPins } from "./row-pins";
 import { RestoringPlace } from "./restoring-place";
+
+// Cards a conversation shows only for some calls and notices: loaded as one shows, not with the page (goal 8).
+const AccountCard = React.lazy(() => import("./account-card").then((m) => ({ default: m.AccountCard })));
+const ResearchCard = React.lazy(() => import("@/views/research/research").then((m) => ({ default: m.ResearchCard })));
+const DefinitionCard = React.lazy(() => import("./definitions").then((m) => ({ default: m.DefinitionCard })));
+// What it asks of you (choices, plans, diffs to allow): loaded as it asks.
+const ApprovalCard = React.lazy(() => import("./approval").then((m) => ({ default: m.ApprovalCard })));
 
 /** Tool calls the agent is asking you about right now (the rest of the pending ones wait their turn). */
 const Asking = React.createContext<ReadonlySet<string>>(new Set());
@@ -373,7 +381,11 @@ function ToolBody({ calls, lastResearch }: { calls: ToolEvent[]; lastResearch?: 
               <span className="hx-dim hx-trunc">{c.title}</span>
             </div>
             {r?.id ? (
-              (lastResearch ? lastResearch.has(c.id) : lastOf.get(r.id) === i) && <ResearchCard id={r.id} />
+              (lastResearch ? lastResearch.has(c.id) : lastOf.get(r.id) === i) && (
+                <Loadable label="its research" fallback={<RowsHold rows={1} rowHeight={56} />}>
+                  <ResearchCard id={r.id} />
+                </Loadable>
+              )
             ) : defCall(c) ? (
               <Loadable label="Loading the agent" fallback={null}>
                 <DefinitionCard id={defCall(c)!} at={c.ended ?? c.started} />
@@ -648,7 +660,9 @@ function Notice({ e, repeats }: { e: Extract<HEvent, { kind: "notice" }>; repeat
       </div>
       {signIn?.notice === e.id && (
         <div className="ac-under">
-          <AccountCard compact intent="login" target={signIn.target} kind={signIn.kind} />
+          <React.Suspense fallback={null}>
+            <AccountCard compact intent="login" target={signIn.target} kind={signIn.kind} />
+          </React.Suspense>
         </div>
       )}
     </>
@@ -2245,9 +2259,11 @@ export const Timeline = React.memo(function Timeline({
                 {tail && mine.map((m) => <Sending key={m.id} m={m} live={live} onResend={resend} onDiscard={store.discard} />)}
                 {tail && hasAsks && onDecide && (
                   <div ref={asksRef} className="hx-asks">
-                    {pending.map((a) => (
-                      <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} onReviewPlan={parent ? undefined : onReviewPlan} />
-                    ))}
+                    <Loadable label="Loading what it asks" fallback={<Skeleton className="h-16" />}>
+                      {pending.map((a) => (
+                        <ApprovalCard key={a.id} a={a} cwd={cwd} onDecide={onDecide} agentName={agentName} kind={agentLabel} agentId={agent} onReviewPlan={parent ? undefined : onReviewPlan} />
+                      ))}
+                    </Loadable>
                   </div>
                 )}
                 {tail && footer}

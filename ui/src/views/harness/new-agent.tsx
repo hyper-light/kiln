@@ -14,7 +14,7 @@
 import * as React from "react";
 import "./harness.css";
 import "./console.css";
-import { ArrowUp, Check, ChevronDown, CircleAlert, Paperclip } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, ChevronDown, CircleAlert, Paperclip, X } from "lucide-react";
 import { agentenvChoicesRes, type Agentenv } from "@/api/agentenvs";
 import { api } from "@/api/client";
 import { clientId, harnessApi, sessionStore, type AgentInfo, type KindInfo, type PastSession, type WorkspacesAvailable } from "@/api/harness";
@@ -29,6 +29,7 @@ import { sendingProps } from "@/lib/action";
 import { useSuspenseResource } from "@/lib/resource";
 import { useRouter } from "@tanstack/react-router";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
+import { factsOf, moved, scopeMatches } from "./agentenv-scope";
 import { agentfileChoicesRes, choicesFor, chosenFor, projectOf, resumedImage, whyNoMicrovm, withChoice, type AgentfileChoice } from "@/views/agentfiles/choose";
 import { atOf, doingOf, findAgents } from "./broadcast";
 import { ComposeField } from "./compose-field";
@@ -128,8 +129,8 @@ function useChoices() {
   const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "volume");
   /** The Agentfile each harness's microVM is made from, per project (views/agentfiles/choose.ts); none kept: a process on its machine. */
   const [agentfiles, setAgentfiles] = useLocalStorage<Record<string, string>>("kiln.agents.agentfiles", {});
-  /** The environment it runs with, kept as the Agentfile is (docs/agents.md, "Environments"); none: its machine's user's. */
-  const [agentenv, setAgentenv] = useLocalStorage("kiln.agents.agentenv", "");
+  /** The environments it runs with, top first, kept as the Agentfile is (docs/agents.md, "Environments"); none: its machine's user's. The one kept before stacks starts it. */
+  const [agentenvs, setAgentenvs] = useLocalStorage<string[]>("kiln.agents.agentenvs", [readLocal("kiln.agents.agentenv", "")].filter(Boolean));
   const [dirs, setDirs] = useLocalStorage<Record<string, string[]>>("kiln.agents.recentDirs", {});
   const [picked, setPicked] = React.useState<string | null>(null);
   /** The folder typed or browsed to, on the machine it was for. */
@@ -184,8 +185,8 @@ function useChoices() {
     setWorkspace,
     agentfiles,
     setAgentfiles,
-    agentenv,
-    setAgentenv,
+    agentenvs,
+    setAgentenvs,
     dirs,
     setDirs,
     picked,
@@ -293,11 +294,14 @@ function useAgentfile(c: Choices, s: Setup) {
   return { choices, project, chosen, why: chosen && s.target ? whyNoMicrovm(s.target, s.machines, s.machine) : null };
 }
 
-/** The environment it runs with, as kept, while it's still one of the person's; else none (its machine's user's). */
-function useAgentenv(c: Choices): { envs: Agentenv[]; chosen: Agentenv | null } {
+/** The environments it runs with, top first, as kept, those still the person's (none: its machine's user's); and all of theirs. */
+function useAgentenvs(c: Choices): { envs: Agentenv[]; chosen: Agentenv[] } {
   const envs = useRes(agentenvChoicesRes).data;
-  return { envs, chosen: envs.find((e) => e.id === c.agentenv) ?? null };
+  return { envs, chosen: c.agentenvs.flatMap((id) => envs.find((e) => e.id === id) ?? []) };
 }
+
+/** A stack's names, top first. */
+const namesOf = (envs: Agentenv[]) => envs.map((e) => e.name).join(" + ");
 
 /** Above the box: the agent page's own line, for the agent to be. */
 function HowLine({ c }: { c: Choices }) {
@@ -347,10 +351,10 @@ function HowLine({ c }: { c: Choices }) {
 }
 
 /** Start. `sending`: several are starting from here: it says so, and a press waits (a second would start more). */
-function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (s: Setup, agentfile: AgentfileChoice | null, agentenv: Agentenv | null) => void }) {
+function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (s: Setup, agentfile: AgentfileChoice | null, agentenvs: Agentenv[]) => void }) {
   const s = useSetup(c);
   const { chosen } = useAgentfile(c, s);
-  const env = useAgentenv(c).chosen;
+  const env = useAgentenvs(c).chosen;
   const label = c.count > 1 ? `Start ${c.count}` : "Start";
   return (
     <button
@@ -362,7 +366,7 @@ function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (
       onClick={() => {
         if (!sending) run(s, chosen, env);
       }}
-      aria-label={`${label}: ${s.kindName} on ${s.machine}${chosen ? `, in a microVM from ${chosen.name}` : ""}${env ? `, with ${env.name}` : ""}`}
+      aria-label={`${label}: ${s.kindName} on ${s.machine}${chosen ? `, in a microVM from ${chosen.name}` : ""}${env.length ? `, with ${namesOf(env)}` : ""}`}
     >
       <ArrowUp size={15} />
       <span>{label}</span>
@@ -429,21 +433,44 @@ function AgentfileRow({ c, s }: { c: Choices; s: Setup }) {
 }
 
 /**
- * The environment it runs with (docs/agents.md, "Environments"): its machine's user's, or one of the
- * person's, kept for the next start as the Agentfile is. They're made and changed in an agent's
- * Engine tab.
+ * The environments it runs with (docs/agents.md, "Environments", "Scopes, stacks, and applied on its
+ * own"): its machine's user's, or a stack of the person's, top first, moved up and down and taken out,
+ * kept for the next start as the Agentfile is. Those offered are those whose scope matches the session
+ * to be (its machine, harness, model, permissions and effort, as chosen here). They're made and
+ * changed in an agent's Engine tab.
  */
-function AgentenvRow({ c }: { c: Choices }) {
-  const { envs, chosen } = useAgentenv(c);
+function AgentenvRow({ c, s }: { c: Choices; s: Setup }) {
+  const { envs, chosen } = useAgentenvs(c);
+  const facts = factsOf({ target: s.target, machines: s.machines, harness: s.kind, model: s.model.shown, mode: s.mode, effort: s.effort });
+  const offered = envs.filter((e) => !chosen.includes(e) && scopeMatches(e.scope, facts));
+  const set = (next: Agentenv[]) => c.setAgentenvs(next.map((e) => e.id));
   return (
-    <div className="mc-opt">
+    <div className="mc-opt mc-opt-envs">
       <span className="mc-opt-key">Environment</span>
       <div className="mc-opt-val">
+        {chosen.length > 0 && (
+          <ol className="mc-envs" aria-label="The environments it runs with">
+            {chosen.map((e, i) => (
+              <li key={e.id}>
+                <span>{e.name}</span>
+                <button type="button" className="ms-go" aria-label={`Move ${e.name} up`} title="Up" disabled={i === 0} onClick={() => set(moved(chosen, i, -1))}>
+                  <ArrowUp size={14} />
+                </button>
+                <button type="button" className="ms-go" aria-label={`Move ${e.name} down`} title="Down" disabled={i === chosen.length - 1} onClick={() => set(moved(chosen, i, 1))}>
+                  <ArrowDown size={14} />
+                </button>
+                <button type="button" className="ms-go" aria-label={`Take ${e.name} out`} title="Take out" onClick={() => set(chosen.filter((x) => x !== e))}>
+                  <X size={14} />
+                </button>
+              </li>
+            ))}
+          </ol>
+        )}
         <Pick
-          label="The environment it runs with"
-          value={chosen?.id ?? ""}
-          onChange={c.setAgentenv}
-          options={[{ value: "", label: "Machine environment (default)" }, ...envs.map((e) => ({ value: e.id, label: `${e.name} v${e.version}`, group: "Yours" }))]}
+          label={chosen.length ? "Add an environment" : "The environment it runs with"}
+          value=""
+          onChange={(id) => id && c.setAgentenvs([...chosen.map((e) => e.id), id])}
+          options={[{ value: "", label: chosen.length ? "Add" : "Machine environment (default)" }, ...offered.map((e) => ({ value: e.id, label: `${e.name} v${e.version}`, group: "Yours" }))]}
         />
       </div>
     </div>
@@ -554,7 +581,7 @@ function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past
         </div>
       </div>
       <AgentfileRow c={c} s={s} />
-      <AgentenvRow c={c} />
+      <AgentenvRow c={c} s={s} />
       <div className="mc-opt">
         <span className="mc-opt-key">Commands</span>
         <div className="mc-opt-val">
@@ -663,13 +690,13 @@ function Under({
 }) {
   const s = useSetup(c);
   const { chosen } = useAgentfile(c, s);
-  const env = useAgentenv(c).chosen;
+  const env = useAgentenvs(c).chosen;
   // What More options holds that isn't as it starts out, said while it's closed.
   const summary = [
     c.name.trim() && `“${c.name.trim()}”`,
     s.volume && "Own volume",
     chosen && `microVM: ${chosen.name}`,
-    env && `Environment: ${env.name}`,
+    env.length > 0 && `Environment: ${namesOf(env)}`,
     c.reach && (c.reach === "off" ? "Only its machine" : `Prefers ${labelOf(c.reach)}`),
   ]
     .filter(Boolean)
@@ -865,7 +892,7 @@ export function NewAgent({
 
   // Start doesn't wait for the server (starting.ts): the agents are listed starting at once, under
   // ids made here, and one opens at once.
-  const run = async (s: Setup, agentfile: AgentfileChoice | null, agentenv: Agentenv | null) => {
+  const run = async (s: Setup, agentfile: AgentfileChoice | null, agentenvs: Agentenv[]) => {
     if (!s.target) return;
     const body = text.trim();
     // Files go with the first message (those still uploading too: Start doesn't wait for them), so
@@ -886,7 +913,7 @@ export function NewAgent({
       volume: s.volume,
       folder: s.folder,
       agentfile: agentfile?.image,
-      agentenv: agentenv?.id,
+      agentenvs: agentenvs.map((e) => e.id),
     });
     const ids = Array.from({ length: c.count }, () => clientId());
     // One agent: its files are kept for it, and its page sends them once it can take them (and
