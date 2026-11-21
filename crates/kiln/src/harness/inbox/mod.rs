@@ -659,6 +659,52 @@ impl Inbox {
         Ok(Some((row.key, pending)))
     }
 
+    /// Session `session`'s communications from an epoch before `epoch` that never came to an end
+    /// here, let go of: an earlier stay's, left in this journal when it went on on another machine
+    /// (CP-T3.2, W20). A move between machines carries its queue and its conversation, not this
+    /// journal (docs/sends.md, "Moves"): what was still to come of each went with it. And a lease
+    /// is its own epoch's, so none of them can be restored at `epoch`: one restored refused the
+    /// session's admission, which then took nothing it was sent, for good (Slates, 2026-11-20: back
+    /// on the Mac it had left at epoch 4 with four messages its harness was given there, it took no
+    /// message at epoch 6 nor at epoch 8, each held in kiln). A terminal one stays until the server
+    /// acknowledges it, as every terminal one does. How many went.
+    pub async fn let_go_left_behind(&self, session: &str, epoch: u64) -> Result<usize, Refusal> {
+        check_session(session)?;
+        let mut gone = 0usize;
+        let mut after: Option<Vec<u8>> = None;
+        let mut conflicts = 0usize;
+        loop {
+            let page = self.records.scan(PENDING, Scan { prefix: session_prefix(session), after: after.clone(), limit: PAGE, at: Consistency::Linearizable }).await.map_err(|e| unavailable(session, &e.to_string()))?;
+            let last = page.rows.last().map(|row| row.key.clone());
+            let mut tx = Tx::default();
+            for row in page.rows {
+                let pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+                if pending.disposition.is_some() || pending.lease.epoch >= epoch {
+                    continue;
+                }
+                // Each as it was read: one written since is read again.
+                tx.conds.push(Cond::At { family: PENDING.into(), key: row.key.clone(), rev: row.rev });
+                tx.writes.push(Write::Delete { family: PENDING.into(), key: row.key });
+            }
+            let n = tx.writes.len();
+            if n > 0 {
+                match self.records.commit(tx).await {
+                    Ok(_) => gone = gone.saturating_add(n),
+                    // Written since it was read (its server's acknowledgement, say): the page again.
+                    Err(records::Refusal::Conflict { .. }) if conflicts < RETRIES => {
+                        conflicts = conflicts.saturating_add(1);
+                        continue;
+                    }
+                    Err(e) => return Err(unavailable(session, &e.to_string())),
+                }
+            }
+            if !page.more {
+                return Ok(gone);
+            }
+            after = last;
+        }
+    }
+
     /// Persist the exact terminal cause before publishing its receipt. Failure leaves the
     /// original body and lease pending, rather than releasing credit on uncertain persistence.
     pub async fn dispose_pending(&self, session: &str, message: &str, epoch: u64, disposition: super::admission::Disposition) -> Result<Option<Pending>, Refusal> {
@@ -1120,6 +1166,37 @@ mod tests {
         assert!(block(i.pending("s1", "m"))?.is_some());
         assert!(block(i.acknowledge_pending("s1", "m", 0, &Token { revision: 1, generation: 1 }, Some(&Disposition::Consumed { boundary: Consumption::ProviderAccepted })))?);
         assert!(block(i.pending("s1", "m"))?.is_none());
+        Ok(())
+    }
+
+    /// CP-T3.2, W20: back on a machine it left, a session's journal there lets go of what its
+    /// earlier stay left unfinished at the epoch it left at, and of nothing else: what came to an
+    /// end waits for its server's acknowledgement, and what it takes now stays.
+    #[test]
+    fn cp_t3_2_what_an_earlier_stay_left_unfinished_goes_and_nothing_else() -> Result<(), Refusal> {
+        use crate::harness::admission::{Consumption, Disposition, Stage};
+        let at_epoch = |message: &str, epoch: u64| {
+            let mut pending = pending_message(message, message);
+            pending.lease.epoch = epoch;
+            pending.lease.stage = Stage::ProviderFlight;
+            pending
+        };
+        let i = inbox();
+        // Its first stay, at epoch 4: one handed to its harness and never seen to an end, one consumed.
+        block(i.open("s1", 4))?;
+        for message in ["in-flight", "consumed"] {
+            block(i.accept_pending("s1", message, &digest(message, &[]), Some(4), 10, &at_epoch(message, 4)))?;
+        }
+        block(i.dispose_pending("s1", "consumed", 4, Disposition::Consumed { boundary: Consumption::ProviderAccepted }))?;
+        // It went on elsewhere at 5, and is back at 6, taking one there.
+        block(i.fence("s1", 4))?;
+        assert_eq!(block(i.open("s1", 6))?, 6);
+        block(i.accept_pending("s1", "now", &digest("now", &[]), Some(6), 20, &at_epoch("now", 6)))?;
+        assert_eq!(block(i.let_go_left_behind("s1", 6))?, 1);
+        assert!(block(i.pending("s1", "in-flight"))?.is_none(), "what the earlier stay left unfinished goes");
+        assert!(block(i.pending("s1", "consumed"))?.is_some_and(|p| p.disposition.is_some()), "a terminal one waits for its acknowledgement");
+        assert!(block(i.pending("s1", "now"))?.is_some_and(|p| p.lease.epoch == 6), "what it takes at its epoch stays");
+        assert_eq!(block(i.let_go_left_behind("s1", 6))?, 0, "once gone, nothing more goes");
         Ok(())
     }
 
