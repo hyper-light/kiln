@@ -2508,12 +2508,25 @@ for line in sys.stdin:
                     }
                     () = committed.notified().fuse() => break,
                     () = async move { match still { Some(s) => s.await, None => std::future::pending().await } }.fuse() => {
-                        // Its turn ended in the window: it owes kiln nothing now, and what's awaited is kiln's
-                        // move (the registry's relay of that end, say), which the wait follows by liveness
-                        // alone. Refused for its CPU time, a turn ended 41 ms in whose end the relay hadn't
-                        // yet carried (goals::ops' keyed-control test, a full parallel run on adacachy,
-                        // 2026-11-20).
+                        // Its turn ended in the window: it owes kiln nothing now, and what's awaited is
+                        // kiln's move (the registry's relay of that end), which the wait follows by
+                        // liveness alone. Refused for its CPU time, a turn ended 41 ms in whose end the
+                        // relay hadn't yet carried (goals::ops' keyed-control test, a full parallel run on
+                        // adacachy, 2026-11-20).
                         if !owes() {
+                            continue;
+                        }
+                        // Its process waits in a read of its input ([`reads_its_input`]): kiln's records
+                        // hold its turn as under way, but what's awaited is kiln's move (the turn's message,
+                        // queued and not yet in the pipe; or the answer it wrote, unread in kiln's end of
+                        // its stdout pipe), so its window starts again, as for a source whose time moved.
+                        // Refused for its CPU time: a turn kiln held as under way (its session Running, the
+                        // registry's view still Idle, its last end the turn's before) with its source still
+                        // a whole window of 67 ms (the keyed-control test), and the reviewed plan's run
+                        // (goals::stack_tests), Running and Idle, at windows of 9 to 153 ms (targeted
+                        // parallel runs on adacachy, 2026-11-20).
+                        if hub.harness.local.get(id).and_then(|s| *s.pid.lock()).is_some_and(reads_its_input) {
+                            waits.heard(ms());
                             continue;
                         }
                         let now = cpu();
@@ -2555,6 +2568,33 @@ for line in sys.stdin:
     #[cfg(not(target_os = "linux"))]
     fn at_work(pid: u32) -> Option<(u64, bool)> {
         crate::os::metrics::cpu_us_of(&[pid]).map(|us| (us, false))
+    }
+
+    /// Whether source process `pid` waits in a read of its standard input, where a harness kiln drives over its stdio
+    /// waits for kiln's next message (Linux's `/proc/<pid>/task/*/syscall`: the call a blocked thread is in, and its
+    /// first argument). Elsewhere, never said.
+    ///
+    /// Asked of the source's process because nothing kiln keeps says it. That read blocks only while the source's stdin
+    /// pipe is empty, so it says both that everything kiln wrote has reached it and that it waits on kiln's next word.
+    /// Kiln's own records say neither: a message is under way in the session's state from the moment the adapter
+    /// queues it, and its handover (its durable `ProviderFlight` stage, the stdin queue, the writer task's write) is
+    /// recorded nowhere a wait reads; and an answer the source wrote that kiln's reader hasn't yet read (its task
+    /// starved on a loaded machine, as the window's refusals were) is held in the kernel's pipe buffer, which only
+    /// the kernel can say is there. Harnesses that wait on their input in `epoll` or `select` (Claude Code's node)
+    /// are never said to read it, and their windows are refused by their CPU time as before.
+    #[cfg(target_os = "linux")]
+    fn reads_its_input(pid: u32) -> bool {
+        let read = nix::libc::SYS_read.to_string();
+        std::fs::read_dir(format!("/proc/{pid}/task")).into_iter().flatten().flatten().any(|task| {
+            let call = std::fs::read_to_string(task.path().join("syscall")).unwrap_or_default();
+            let mut words = call.split_whitespace();
+            words.next() == Some(read.as_str()) && words.next() == Some("0x0")
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reads_its_input(_: u32) -> bool {
+        false
     }
 
     pub(crate) async fn source_ready(hub: &Hub, id: &str) -> anyhow::Result<()> {
