@@ -490,6 +490,16 @@ pub async fn may_steer(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Re
     }
 }
 
+/// Whether `caller` may reset agent `id` (`agents.reset`; docs/agents.md, "Reset"): whoever may steer it, and an agent any
+/// other agent that works for the same person (Ada, 2026-11-21: "agents can reset stuck agents", any of hers, no click).
+pub async fn may_reset(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> Result<(), Refused> {
+    match (access(hub, caller, id).await, caller.agent.as_deref()) {
+        (Access::Act, _) | (Access::See, Some(_)) => Ok(()),
+        (_, Some(me)) => Err((StatusCode::FORBIDDEN, format!("an agent resets only agents that work for the same person it does: {} isn't one of {}'s person's", short(id), short(me)))),
+        (_, None) => Err(unseen()),
+    }
+}
+
 /// How an agent may send agent `id` a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reach {

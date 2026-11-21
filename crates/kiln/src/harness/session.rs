@@ -2185,6 +2185,89 @@ fn unset_machine_vars(s: &Session, env: &super::agentenv::Resolved, user: &[(Str
     s.core.lock().upsert(&format!("agentenv-unset:{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text });
 }
 
+/// Its session reset (`Command::Reset`; docs/agents.md, "Reset"; Ada, 2026-11-21: "clear all pending messages, actions,
+/// etc., kill and then restart the agent in a fresh harness"), once its harness is down, so no callback of the process
+/// it ran races what ends here, and after that process's end gave kiln's queue back what its adapter held. Everything
+/// it had pending ends: kiln's queue and its subagents' queues; every communication its journal holds that never came to
+/// an end at its epoch, cancelled, each one's sender told so (what an earlier stay here left goes too); a hold, a pause
+/// and the input it had yet to flush. Its admission takes messages again (`Controller::reset`), and its timeline says
+/// who reset it and why, what ended, and, where its journal couldn't be written, that it takes none until it can. Its
+/// conversation, goals, plan and settings stay. How many messages ended.
+async fn reset_session(s: &Session, by: Option<&str>, why: Option<&str>, harness: &str) -> usize {
+    use super::admission::{CancelReason, Disposition, FlowEvent};
+    let (mut ended, input, epoch, frozen) = {
+        let mut core = s.core.lock();
+        let mut ended: std::collections::BTreeSet<String> = core.state.queue.drain(..).map(|q| q.id).collect();
+        for t in &mut core.state.tasks {
+            ended.extend(t.queue.drain(..).map(|q| q.id));
+        }
+        core.hold = false;
+        core.limit_ask = None;
+        core.state.switching = None;
+        core.state.pause = None;
+        let frozen = core.state.frozen.take().is_some();
+        core.input_stages.clear();
+        core.input_retained.clear();
+        core.input_receipts.clear();
+        core.input_legacy_flights.clear();
+        core.drop_unfinished(true);
+        core.touch_state();
+        (ended, core.input.clone(), core.state.epoch, frozen)
+    };
+    if frozen {
+        let _ = crate::headroom::pause(&s.id, false);
+    }
+    let mut failed = None;
+    let mut events = Vec::new();
+    if let Some(input) = &input {
+        let cancelled = Disposition::Cancelled { reason: CancelReason::User };
+        let journal = match input.inbox.let_go_left_behind(&s.id, epoch).await {
+            Ok(_) => input.inbox.end_pending(&s.id, epoch, &cancelled).await,
+            Err(e) => Err(e),
+        };
+        match journal {
+            Ok(disposed) => {
+                let mut c = input.controller.lock();
+                for d in &disposed {
+                    let _ = c.finish(&d.lease.message, d.disposition.clone(), input.now_ns(), false);
+                }
+                if let Err(e) = c.reset() {
+                    failed = Some(format!("{e:?}"));
+                }
+                let capacity = c.capacity();
+                for d in disposed {
+                    if let Some(token) = d.lease.token {
+                        events.push(FlowEvent::Disposed { token, epoch: d.lease.epoch, disposition: d.disposition, capacity: capacity.clone() });
+                    }
+                    ended.insert(d.lease.message);
+                }
+                events.push(FlowEvent::Capacity { capacity });
+            }
+            Err(e) => failed = Some(e.to_string()),
+        }
+    }
+    let mut core = s.core.lock();
+    if let Some(input) = &input {
+        core.state.admission = Some(input.controller.lock().capacity());
+    }
+    for event in events {
+        core.out.push(Update::MailFlow { event: Box::new(event) });
+    }
+    let who = by.map(str::trim).filter(|b| !b.is_empty()).unwrap_or("kiln");
+    let because = why.map(str::trim).filter(|w| !w.is_empty()).map(|w| format!(" ({w})")).unwrap_or_default();
+    let messages = match ended.len() {
+        0 => "nothing it was sent was pending".to_owned(),
+        1 => "the 1 message pending for it cancelled".to_owned(),
+        n => format!("the {n} messages pending for it cancelled"),
+    };
+    let intake = failed.as_deref().map(|why| format!("; its intake couldn't be opened again ({why}): it takes no messages until it can")).unwrap_or_default();
+    let text = format!("Reset by {who}{because}: {messages}, its tasks stopped and its queue emptied; {harness} starts again fresh, the conversation going on{intake}");
+    let level = if failed.is_some() { Level::Warn } else { Level::Info };
+    core.upsert(&format!("reset-{}", Core::now()), None, Body::Notice { level, text });
+    core.touch_state();
+    ended.len()
+}
+
 /// Stop what it left running that kiln took back over: one (its task id), or all of them.
 async fn stop_left(s: &Arc<Session>, task: Option<&str>) {
     let pid: Option<u32> = task.and_then(|t| t.strip_prefix(super::survivors::LEFT)).and_then(|p| p.parse().ok());
@@ -5556,6 +5639,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 let mut ending = false;
                 // Stopped by force (`Command::ForceStop`): it starts again now, whatever is under way.
                 let mut forcing = false;
+                // Reset (`Command::Reset`): stopped by force, and once its harness is down what it had pending ends
+                // (`reset_session`), who asked and their words said in its timeline.
+                let mut resetting: Option<(Option<String>, Option<String>)> = None;
                 // Where this machine keeps what's an agent's own: whose each file it changes is.
                 let roots = std::sync::Arc::new(super::whose::Roots::of(&spec));
                 // The agent-control link it's driven over, said once it's made.
@@ -5673,6 +5759,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 s.turn_open.store(false, std::sync::atomic::Ordering::Relaxed);
                                 let text = format!("Stopped by force: {} starts again, the conversation going on; what it was running stopped with it", kind.name);
                                 s.core.lock().upsert(&format!("force-stop:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
+                                forcing = true;
+                            }
+                            // Reset (docs/agents.md, "Reset"): what it runs ends with its harness, now, and what it had
+                            // pending once that's down; it starts again at once, the turn under way not taken up again.
+                            Command::Reset { by, why } => {
+                                s.turn_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                                s.stop_owned_reach(None);
+                                stop_left(&s, None).await;
+                                resetting = Some((by, why));
                                 forcing = true;
                             }
                             Command::Snapshot => {
@@ -6214,6 +6309,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         let mut core = s.core.lock();
                         adapter.exited(&mut core, None, None);
                     }
+                    // Reset: its harness is down, and what its adapter held is back in kiln's queue, so now what it
+                    // had pending ends; and with it a move, a switch or a setting's start again that waited.
+                    if let Some((by, why)) = resetting.take() {
+                        reset_session(&s, by.as_deref(), why.as_deref(), kind.name).await;
+                        moving = None;
+                        switching = None;
+                        reloading = false;
+                        swap_now = false;
+                        in_place = false;
+                        carry.retain(|c| !is_message(c));
+                        for_room.retain(|c| !is_message(c));
+                        flush(&s, &sink, None).await;
+                        on_change();
+                    }
                     first = false;
                     continue;
                 }
@@ -6335,7 +6444,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             };
             // A start asked for: kiln's own, its wait over, or a person's (a restart, a message),
             // which the restart rule reads apart ([`Ran::again`]).
-            if let Ev::Ctl(Some(Ctl::Cmd(c))) = &ev && matches!(**c, Command::Restart | Command::Send { task: None, .. } | Command::SkillRun { .. }) {
+            if let Ev::Ctl(Some(Ctl::Cmd(c))) = &ev && matches!(**c, Command::Restart | Command::Reset { .. } | Command::Send { task: None, .. } | Command::SkillRun { .. }) {
                 ours = woke;
             }
             match ev {
@@ -6350,6 +6459,27 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         at_state(&mut s.core.lock(), client, &revision, *command, |core, command| adapter.command(core, command));
                     }
                     Command::Restart => {
+                        if s.core.lock().has_room() {
+                            break;
+                        }
+                        start_asked = true;
+                    }
+                    // Reset (docs/agents.md, "Reset") while its harness is down: what it had pending ends now, and its
+                    // harness starts again fresh, now where there's room, else once there is.
+                    Command::Reset { by, why } => {
+                        s.turn_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                        s.stop_owned_reach(None);
+                        stop_left(&s, None).await;
+                        reset_session(&s, by.as_deref(), why.as_deref(), kind.name).await;
+                        moving = None;
+                        switching = None;
+                        reloading = false;
+                        swap_now = false;
+                        in_place = false;
+                        carry.retain(|c| !is_message(c));
+                        for_room.retain(|c| !is_message(c));
+                        flush(&s, &sink, None).await;
+                        on_change();
                         if s.core.lock().has_room() {
                             break;
                         }

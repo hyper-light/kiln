@@ -574,7 +574,7 @@ function Head({
       mode: state?.mode || info?.mode || "",
       model: state?.model || info?.model || "",
     },
-    { onGone: () => navigate("/agents") },
+    { onGone: () => navigate("/agents"), reset: true },
   );
   return (
     <>

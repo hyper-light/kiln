@@ -485,6 +485,7 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                     stop_child(&mut c.exited, &mut c.control).await;
                 }
                 stop_child(&mut exited, &mut control).await;
+                sweep();
                 return Ok(());
             }
             Exit::Upgrade => {
@@ -534,7 +535,10 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                     futures::select_biased! {
                         sig = signals.next().fuse() => match sig {
                             Some(crate::rt::SIGHUP) => {}
-                            _ => return Ok(()),
+                            _ => {
+                                sweep();
+                                return Ok(());
+                            }
                         },
                         () = pause => break,
                     }
@@ -542,6 +546,15 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
         }
+    }
+}
+
+/// The supervisor's unit let go of as it stops, its child stopped: what's left of it killed but Slates' anchor and
+/// daemons, which outlive it with every workspace volume they hold ([`crate::os::supervise::sweep_unit`]).
+fn sweep() {
+    let killed = crate::os::supervise::sweep_unit();
+    if killed > 0 {
+        tracing::info!(killed, "processes left in the unit as it stops, killed: Slates' anchor goes on with its workspaces");
     }
 }
 
