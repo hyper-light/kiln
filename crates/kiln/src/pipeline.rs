@@ -694,11 +694,16 @@ jobs:
       - run: cargo bench
 "#;
 
-    /// kiln's own `.kiln/*.yaml` read both ways: as v1 pipelines and in the CI engine's kiln
-    /// dialect, so neither grows a key the other refuses.
+    /// kiln's own `.kiln/*.yaml` read both ways while v1 reads them: as v1 pipelines and in the CI
+    /// engine's kiln dialect, so neither grows a key the other refuses. Once `.kiln/config.yaml`
+    /// moves them to the engine (`kiln_workflows: on`, W29-R16 stage 3), v1 stands aside and they
+    /// are the engine's alone, read in its dialect only: release.yaml's `kiln/upload@v1` and
+    /// `kiln/download@v1` steps (kiln plan 01a1cd8e…, step 16) are the engine's, and v1 has none.
     #[test]
     fn kilns_own_workflows_read_both_ways() -> anyhow::Result<()> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln");
+        let settings: crate::ci::repo_config::RepoConfig = serde_yaml::from_str(&std::fs::read_to_string(dir.join("config.yaml"))?)?;
+        let v1 = settings.kiln_workflows() != Some(true);
         let mut read = 0;
         for e in std::fs::read_dir(&dir)?.filter_map(Result::ok) {
             let path = e.path();
@@ -711,7 +716,9 @@ jobs:
             if !text.lines().any(|l| l.starts_with("jobs:")) {
                 continue;
             }
-            parse(&text).map_err(|e| anyhow::anyhow!("{name} as v1: {e}"))?;
+            if v1 {
+                parse(&text).map_err(|e| anyhow::anyhow!("{name} as v1: {e}"))?;
+            }
             let (wf, diags) = kiln_ci::wf::parse_workflow(&format!(".kiln/{name}"), &text, kiln_ci::expr::Dialect::Kiln);
             let errors: Vec<String> = diags.iter().filter(|d| d.is_error()).map(|d| format!("{d:?}")).collect();
             anyhow::ensure!(wf.is_some() && errors.is_empty(), "{name} in the kiln dialect: {errors:?}");
