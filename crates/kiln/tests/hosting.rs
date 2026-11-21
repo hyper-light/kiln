@@ -545,6 +545,14 @@ fn w14_ac02_strategies() -> anyhow::Result<()> {
     until(30, "D7 lands", || Ok((text(&api(&s, &dev, "GET", "/api/diffs/D7")?, "state") != "landed").then(|| "not yet".to_owned())))?;
     let refs = must(git(&home, &work, &["ls-remote", &url(&dev), "refs/heads/main"]), "ls-remote")?;
     assert!(refs.starts_with(&c7), "the trunk is the commit itself: {refs} vs {c7}");
+    // The trunk's move replays its open changes onto it (W26-R16), D6 among them, each as the round that replays them
+    // finds them open: D8 comes once that round has run, so it stays on its old trunk (submitted before it ran, D8 would
+    // be replayed onto D7 too, and ff-only could land it).
+    until(30, "D6 replayed onto D7", || {
+        let d6 = api(&s, &dev, "GET", "/api/diffs/D6")?;
+        let last = d6.get("versions").and_then(Value::as_array).and_then(|v| v.last()).cloned().unwrap_or_default();
+        Ok((!(text(&last, "why") == "replayed" && text(&last, "parent") == c7)).then(|| d6.to_string()))
+    })?;
     // D8 on an old trunk: ff-only can't.
     must(git(&home, &work, &["checkout", "-q", "-B", "old", &trunk0]), "checkout")?;
     commit(&home, &work, "g.txt", "g\n", "eight: g", "I8888888888888888888888888888888888888888")?;
