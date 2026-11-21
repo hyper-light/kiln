@@ -1,5 +1,5 @@
 Subject: vfs: a base file's descriptor lives only while a handle holds it open, and a recovery reopens only the base root (slates A-832 942d4a37e, A-833 6e3dec78d)
-Why: Every Slates daemon kept one file descriptor per base file it ever read and never closed it: kiln's daemon on adacachy reached 1,048,575 of 1,048,576 and refused every open, so kiln's up() failed and the anchor exited 4; this MacBook's held 4,574. Its restart then reopened ~192,000 recorded base directories in one step and the liveness watchdog killed it a second in, every time. Both are fixed on Slates main (A-832, A-833); this carries them until the next re-vendor, which drops this change as upstream's own.
+Why: Every Slates daemon kept one file descriptor per base file it ever read and never closed it: kiln's daemon on adacachy reached 1,048,575 of 1,048,576 and refused every open, so kiln's up() failed and the anchor exited 4; this MacBook's held 4,574. Its restart then reopened ~192,000 recorded base directories in one step and the liveness watchdog killed it a second in, every time. Both are fixed on Slates main (A-832, A-833), with their tests; this carries them until the next re-vendor, which drops this change as upstream's own.
 
 diff --git a/crates/vfs/src/base.rs b/crates/vfs/src/base.rs
 index 59d5f3518598fd7b6907282fbb0c81afa9327524..aa36b330b05295fd7ef2c4bfdb325fd9f6bc7ad7 100644
@@ -485,3 +485,187 @@ index 519d55bd63b4d06de45652c92a423e9be97ebed2..8dc0a5078993396cd63be239897e14ab
        }
      }
    }
+diff --git a/crates/vfs/tests/base.rs b/crates/vfs/tests/base.rs
+index 14a8ab4df55a27f2646da853826762a2a6054532..9c9b12937ec044135497b8d7fffafc59eb57e98f 100644
+--- a/crates/vfs/tests/base.rs
++++ b/crates/vfs/tests/base.rs
+@@ -545,8 +545,8 @@ fn worked_example() -> (SimHost, Store, Volume, slates_vfs::ids::InodeNo) {
+   );
+   assert_eq!(
+     host.open_handles(),
+-    3,
+-    "the root, src, and the file's descriptor"
++    2,
++    "the root and src: a read no handle holds open keeps no descriptor"
+   );
+   let lib = vol
+     .with_host(&mut host)
+@@ -590,11 +590,11 @@ fn the_overlay_worked_example_copies_up_with_a_witness_equal_to_the_disk() {
+   assert_eq!(diverged[0].kind, Divergence::Witnessed);
+ }
+ 
+-/// A reclaimed base file's descriptor is closed (2026-10-07). Do: read `/src/main.rs` through the overlay (its
+-/// descriptor is held, so the host holds the root, `src` and the file open), unlink it through the overlay (no
+-/// reference holds it, so it is reclaimed at once), then drain the host's hints. Expect: the host holds the two
+-/// directories and nothing else. Before, the reclaim took the descriptor out of the plane's table and dropped it
+-/// without closing it: on a real disk, a file descriptor leaked per unlinked base file.
++/// A reclaimed base file's descriptor is closed (2026-10-07). Do: read `/src/main.rs` through the overlay (no handle
++/// holds it open, so its descriptor is closed when the read's borrow ends: the host holds the root and `src`), unlink it
++/// through the overlay (no reference holds it, so it is reclaimed at once), then drain the host's hints. Expect: the
++/// host holds the two directories and nothing else. Before 2026-10-07, the reclaim took the descriptor out of the
++/// plane's table and dropped it without closing it: on a real disk, a file descriptor leaked per unlinked base file.
+ #[test]
+ fn an_unlinked_base_files_descriptor_is_closed() {
+   let mut host = SimHost::new();
+@@ -609,8 +609,8 @@ fn an_unlinked_base_files_descriptor_is_closed() {
+   );
+   assert_eq!(
+     host.open_handles(),
+-    3,
+-    "the root, src, and the file's descriptor"
++    2,
++    "the root and src: a read no handle holds open keeps no descriptor"
+   );
+   let src = match vol
+     .with_host(&mut host)
+@@ -633,6 +633,88 @@ fn an_unlinked_base_files_descriptor_is_closed() {
+   );
+ }
+ 
++/// Reading base files holds no descriptor once the reads are done (2026-11-21). Do: read 500 base files in 5
++/// directories through the overlay, as a tool walking a tree does, with no handle open on any of them. Expect: the host
++/// holds the root and the 5 directories open and nothing else, and every file read back its bytes. Before, every base
++/// file ever read kept a descriptor until the daemon ended: kiln's daemon on adacachy reached 1,048,575 of its
++/// 1,048,576 descriptors and every later open failed `EMFILE`.
++#[test]
++fn reading_base_files_keeps_no_descriptor_after_the_reads() {
++  let mut host = SimHost::new();
++  populate(&mut host, 5, 500);
++  host.advance_ns(2);
++  let mut store = store();
++  let mut vol = overlay(&mut host, &mut store);
++  for f in 0..500 {
++    let path = format!("/d{}/f{f}", f % 5);
++    assert_eq!(
++      read_all(&mut vol, &mut host, &mut store, &path).unwrap(),
++      format!("file {f}").as_bytes(),
++      "{path}"
++    );
++  }
++  assert_eq!(
++    host.open_handles(),
++    6,
++    "the root and the 5 directories; no file read through the overlay kept its descriptor"
++  );
++}
++
++/// An open base file keeps its descriptor until its last close, and serves the file it opened meanwhile (A-151, POSIX)
++/// (2026-11-21). Do: open `/src/main.rs` as a mount's `OPEN` does (reference, `open_base`, then `open_for`), run another
++/// verb, replace the disk's file with other bytes, read through the open, then close it and run one more verb. Expect:
++/// the descriptor is held while the file is open (root, `src` and the file), the read returns the bytes opened, and
++/// after the close the host holds the two directories alone.
++#[test]
++fn an_open_base_file_keeps_its_descriptor_until_its_last_close() {
++  use slates_vfs::ids::RefOwner;
++  let owner = RefOwner::Attachment(1);
++  let mut host = SimHost::new();
++  host.mkdir("/src");
++  host.replace_file("/src/main.rs", b"fn main() {}");
++  host.advance_ns(2);
++  let mut store = store();
++  let mut vol = overlay(&mut host, &mut store);
++  let no = vol
++    .with_host(&mut host)
++    .resolve(&mut store, "/src/main.rs")
++    .unwrap()
++    .inode;
++  vol.reference_for(&store, no, owner).unwrap();
++  vol.with_host(&mut host).open_base(&mut store, no).unwrap();
++  vol.open_for(no, owner);
++  vol
++    .with_host(&mut host)
++    .resolve(&mut store, "/src")
++    .unwrap();
++  assert_eq!(
++    host.open_handles(),
++    3,
++    "root, src and the open file's descriptor"
++  );
++  host.replace_file("/src/main.rs", b"replaced by an outsider");
++  let mut bytes = vec![0u8; 12];
++  let n = vol
++    .with_host(&mut host)
++    .read(&mut store, no, 0, &mut bytes)
++    .unwrap();
++  assert_eq!(
++    &bytes[..n],
++    b"fn main() {}",
++    "the open serves the file it opened"
++  );
++  vol.close_for(no, owner);
++  vol
++    .with_host(&mut host)
++    .resolve(&mut store, "/src")
++    .unwrap();
++  assert_eq!(
++    host.open_handles(),
++    2,
++    "root and src: the last close closed the descriptor"
++  );
++}
++
+ /// A drift re-check the host refuses is reported, never passed (2026-10-07). Do: in the worked example, arm the host
+ /// to refuse opening the witnessed `/src/lib.rs` (an I/O error) and ask for the status; then clear the fault and ask
+ /// again. Expect: the first status lists `/src/lib.rs` as unverified with the host's refusal and no drift; the
+diff --git a/crates/vfs/tests/base_identity.rs b/crates/vfs/tests/base_identity.rs
+index bd990f8b0b04c5f7afb00d1f6e72389a8aab5cfd..efeedd98a5819ecf8757e768e056a87c9b86517e 100644
+--- a/crates/vfs/tests/base_identity.rs
++++ b/crates/vfs/tests/base_identity.rs
+@@ -428,3 +428,47 @@ fn without_birth_times_a_reused_number_is_still_a_new_entry_after_a_takeover() {
+     b"the second save"
+   );
+ }
++
++/// A recovery reopens only the base root; every other directory the image recorded is reacquired at its first use
++/// (A-833, 2026-11-21). Do: list 200 base directories through the overlay, one file in each, publish, and let a successor
++/// recover the image; count the host's open handles; then read one file in a recorded directory and remove another
++/// recorded directory on the disk and look inside it. Expect: one open handle (the root) after the recovery, whatever the
++/// directory count; the file reads its bytes; the removed directory's entry is refused `BaseUnavailable`. Before, a
++/// recovery reopened every recorded directory in one step: kiln's daemon on adacachy recorded about 192,000, overran the
++/// liveness window and was killed a second into every restart.
++#[test]
++fn a_recovery_reopens_only_the_root_and_reacquires_each_directory_at_its_first_use() {
++  let mut host = SimHost::new();
++  for d in 0..200 {
++    host.mkdir(&format!("/d{d}"));
++    host.replace_file(&format!("/d{d}/f"), format!("file {d}").as_bytes());
++  }
++  host.advance_ns(STEP_NS);
++  let mut store = common::store();
++  let mut vol = overlay(&mut host, &mut store);
++  for d in 0..200 {
++    lookup(&mut vol, &mut host, &mut store, &format!("/d{d}/f"));
++  }
++  let image = published(&mut vol, &store, &mut host);
++  let (mut after, mut recovered) = taken_over(&store, &image, &mut host);
++  assert_eq!(
++    host.open_handles(),
++    1,
++    "the root alone: no recorded directory is reopened by the recovery"
++  );
++  let file = lookup(&mut recovered, &mut host, &mut after, "/d7/f");
++  assert_eq!(
++    read_no(&mut recovered, &mut host, &mut after, file).unwrap(),
++    b"file 7"
++  );
++  host.remove("/d9/f");
++  host.remove("/d9");
++  host.advance_ns(STEP_NS);
++  assert!(
++    matches!(
++      recovered.with_host(&mut host).resolve(&mut after, "/d9/f"),
++      Err(VfsError::BaseUnavailable(_) | VfsError::NotFound)
++    ),
++    "a recorded directory gone from the disk is refused, never served"
++  );
++}
