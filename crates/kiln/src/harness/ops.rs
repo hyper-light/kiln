@@ -2139,7 +2139,7 @@ pub(crate) mod end_to_end {
 
     const NOWHERE: &str = "/nonexistent/kiln-agents-test";
 
-    fn run(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
+    pub(crate) fn run(f: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(crate::rt::block_on(f));
@@ -2151,7 +2151,7 @@ pub(crate) mod end_to_end {
         }
     }
 
-    async fn hub_with(f: impl FnOnce(&mut crate::config::Config)) -> anyhow::Result<Arc<Hub>> {
+    pub(crate) async fn hub_with(f: impl FnOnce(&mut crate::config::Config)) -> anyhow::Result<Arc<Hub>> {
         let hub = crate::hub::tests::scratch_hub_with(|c| {
             c.terminal.enabled = true;
             f(c);
