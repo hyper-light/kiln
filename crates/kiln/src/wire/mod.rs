@@ -243,6 +243,7 @@ classes! {
         AgentMsg::HarnessMailTransfer { .. } => REFUSED,
         AgentMsg::Prebuilt { .. } => Class::State,
         AgentMsg::RunnerRole { .. } => Class::Handshake,
+        AgentMsg::HarnessForward { .. } => Class::Answer,
     }
 }
 

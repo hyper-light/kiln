@@ -1844,6 +1844,36 @@ pub struct Session {
     agentenv: Mutex<Option<super::agentenv::Resolved>>,
 }
 
+#[cfg(test)]
+impl Session {
+    /// A session no task runs, at `epoch` (tests elsewhere in the harness): what it's told waits in its command channel,
+    /// whose receiving end the caller holds (dropped, the channel closes), so what it was handed stays handed.
+    pub(crate) fn idle_for_tests(id: &str, epoch: u64) -> (Self, Box<dyn std::any::Any + Send>) {
+        let (ctl, rx) = crate::memory::queue::unbounded::<Ctl>(&crate::memory::owners::CHANNELS);
+        let s = Session {
+            id: id.into(),
+            spec: Mutex::new(Spec::default()),
+            created_at: 0,
+            core: Mutex::new(Core::new()),
+            info: Mutex::new(Info::default()),
+            ctl,
+            pid: Mutex::new(None),
+            turn_open: std::sync::atomic::AtomicBool::new(false),
+            ran: Mutex::new((None, Vec::new())),
+            left: Mutex::new(Vec::new()),
+            moving: Mutex::new(false),
+            prompted: std::sync::atomic::AtomicBool::new(false),
+            carried: Mutex::new(None),
+            ended: std::sync::atomic::AtomicBool::new(false),
+            ended_changed: crate::rt::Changed::new(),
+            owned_reach: Mutex::new(std::collections::HashMap::new()),
+            agentenv: Mutex::new(None),
+        };
+        s.core.lock().state.epoch = epoch;
+        (s, Box::new(rx))
+    }
+}
+
 impl Session {
     pub(crate) async fn promotion_changed(&self) -> Result<(), String> { self.ctl.send(Ctl::Promotion).await.map_err(|_| "the legacy session owner stopped before its persisted transition could progress".to_owned()) }
     pub(super) fn input_changed(&self) { let _ = self.ctl.try_send(Ctl::OwnedChanged); }

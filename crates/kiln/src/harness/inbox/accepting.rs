@@ -25,16 +25,22 @@ pub(super) struct PendingWrite<'a> {
     digest: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     accepted_seq: Option<records::Rev>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a crate::harness::mail::StatusKey>,
 }
 
 fn empty_writes(writes: &&[String]) -> bool { writes.is_empty() }
 
 impl<'a> PendingWrite<'a> {
     pub(super) fn original(lease: &'a Lease, command: &'a Command, body_bytes: usize) -> Self {
-        Self { lease, command: Some(command), opaque_writes: &[], origin: Origin::Accepted, current: None, body_bytes: Some(body_bytes), disposition: None, accepted_at: 0, digest: "", accepted_seq: None }
+        Self { lease, command: Some(command), opaque_writes: &[], origin: Origin::Accepted, current: None, body_bytes: Some(body_bytes), disposition: None, accepted_at: 0, digest: "", accepted_seq: None, status: None }
+    }
+    /// A message routed to its session here: kept as routed, with its status key where it's a replaceable status.
+    pub(super) fn routed(lease: &'a Lease, command: &'a Command, body_bytes: usize, status: Option<&'a crate::harness::mail::StatusKey>) -> Self {
+        Self { origin: Origin::Routed, status, ..Self::original(lease, command, body_bytes) }
     }
     pub(super) fn borrowed(pending: &'a Pending) -> Self {
-        Self { lease: &pending.lease, command: pending.command.as_ref(), opaque_writes: &pending.opaque_writes, origin: pending.origin, current: pending.current.as_ref(), body_bytes: pending.body_bytes, disposition: pending.disposition.as_ref(), accepted_at: pending.accepted_at, digest: &pending.digest, accepted_seq: pending.accepted_seq }
+        Self { lease: &pending.lease, command: pending.command.as_ref(), opaque_writes: &pending.opaque_writes, origin: pending.origin, current: pending.current.as_ref(), body_bytes: pending.body_bytes, disposition: pending.disposition.as_ref(), accepted_at: pending.accepted_at, digest: &pending.digest, accepted_seq: pending.accepted_seq, status: pending.status.as_ref() }
     }
     fn receipt(self, at: i64, digest: &'a str) -> Self { Self { accepted_at: at, digest, ..self } }
 }

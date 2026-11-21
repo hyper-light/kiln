@@ -29,6 +29,10 @@ use super::model::{Body, Command, QueueItem, Status};
 use super::session::{self, Info, Session, Sink, Spec};
 
 pub(crate) mod transfer;
+mod routed;
+
+/// Most routed messages a session's lane takes in one burst (docs/sends.md, "A burst in one commit").
+pub const ROUTED_BURST_MAX: usize = routed::BURST_MAX;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -734,6 +738,10 @@ pub struct Host {
     /// Its sessions' inboxes (CP-T3.2): none without their records (`KILN_INBOX` off, or they
     /// couldn't be opened), and messages then go on as they come, unchecked.
     inbox: Option<Arc<Inbox>>,
+    /// What waits in each session's own journal here to be handed to it ([`routed::Waiting`]).
+    waiting: Mutex<HashMap<String, routed::Waiting>>,
+    /// What the server last said it holds for each session in its own custody ([`routed::ServerMail`]).
+    server_mail: Mutex<routed::ServerMail>,
     /// Each session's lane: what it's told, in order, a command at a time; and what says it's done. Each a
     /// lock-free queue (goal 5, plan 01a1a59c2aae, its top goal): an async-channel's wait took
     /// event-listener's `Mutex`, the runner's loop sending each command on its shard and the lane's task
@@ -803,6 +811,12 @@ enum Lane {
     Fence { epoch: u64, handover: bool },
     /// It ended for good: its inbox goes.
     Forget,
+    /// A message routed to it (docs/sends.md, "Routed to its session"), sent for `epoch`, with its route: taken into
+    /// custody by its own inbox, and handed to it as its admission allows ([`Host::take_routed`]).
+    Routed { c: Box<Command>, epoch: Option<u64>, at: std::time::Instant, route: Box<super::route::Route> },
+    /// Its room changed while messages wait in its own journal here: those it has room for now are handed to it
+    /// ([`Host::admit_waiting`]).
+    Admit,
 }
 
 /// Largest file a message can carry.
@@ -1007,6 +1021,16 @@ impl Host {
         Self::build(sink, file, limits, clock, records, metrics, crate::memory::room::server())
     }
 
+    /// A host whose sessions' inboxes and journals are kept in its machine's conversation store (`store`: the runner's,
+    /// held for its sessions' updates, or the server's own), beside their conversations and fed with them
+    /// ([`crate::convo::inbox`]; Ada, 2026-11-20). Its records file from before, beside its record of its sessions, is
+    /// brought into the store once. None: as [`Host::counting_into`] (the store is off here).
+    pub fn keeping_in(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, store: Option<crate::convo::inbox::Source>) -> Arc<Self> {
+        let Some(store) = store else { return Self::counting_into(sink, file, limits, clock, crate::metrics::agents()) };
+        let records = inbox_records(file.as_ref().and_then(|f| f.parent()), store);
+        Self::build(sink, file, limits, clock, records, crate::metrics::agents(), crate::memory::room::server())
+    }
+
     /// A host whose sessions' inboxes keep their records in `records` (none: no inboxes).
     pub fn with_records(sink: impl Into<Sink>, file: Option<PathBuf>, limits: Limits, clock: Arc<dyn Clock>, records: Option<Arc<dyn kiln_seams::Records>>) -> Arc<Self> {
         Self::build(sink, file, limits, clock, records, crate::metrics::agents(), crate::memory::room::server())
@@ -1054,6 +1078,8 @@ impl Host {
             metrics,
             changed: crate::rt::Changed::new(),
             inbox: records.map(|r| Arc::new(Inbox::new(r, inbox::Limits::default()))),
+            waiting: Mutex::new(HashMap::new()),
+            server_mail: Mutex::new(HashMap::new()),
             lanes: Mutex::new(HashMap::new()),
             ending: Mutex::new(HashMap::new()),
             held: AtomicBool::new(false),
@@ -2104,9 +2130,39 @@ impl Host {
             if let Some(before) = before {
                 let _ = before.recv().await;
             }
-            while let Ok(item) = rx.recv().await {
+            let mut next: Option<Lane> = None;
+            loop {
+                let item = match next.take() {
+                    Some(item) => item,
+                    None => match rx.recv().await {
+                        Ok(item) => item,
+                        Err(_) => break,
+                    },
+                };
                 let Some(h) = me.upgrade() else { return };
-                h.step(&id, item).await;
+                match item {
+                    // Routed messages waiting one behind another go on together: the session's own store syncs their
+                    // takes in one commit ([`Host::take_routed_burst`]). A replaceable status goes alone, in its turn.
+                    Lane::Routed { c, epoch, at, route } if route.status.is_none() => {
+                        crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
+                        let mut burst = vec![(*c, epoch, *route)];
+                        while burst.len() < routed::BURST_MAX {
+                            match rx.try_recv() {
+                                Ok(Lane::Routed { c, epoch, at, route }) if route.status.is_none() => {
+                                    crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
+                                    burst.push((*c, epoch, *route));
+                                }
+                                Ok(other) => {
+                                    next = Some(other);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        h.take_routed_burst(&id, burst).await;
+                    }
+                    item => h.step(&id, item).await,
+                }
             }
             drop(done);
             if let Some(h) = me.upgrade() {
@@ -2188,6 +2244,11 @@ impl Host {
                 self.take(id, *c, epoch).await
             }
             Lane::Unread { message, epoch, why } => self.unread(id, message, epoch, &why).await,
+            Lane::Routed { c, epoch, at, route } => {
+                crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
+                self.take_routed(id, *c, epoch, *route).await;
+            }
+            Lane::Admit => self.admit_waiting(id).await,
             Lane::Mark(done) => {
                 let _ = done.send(());
             }
@@ -2201,6 +2262,10 @@ impl Host {
             }
             // Only for a session not here (again) by now.
             Lane::Fence { epoch, handover } => {
+                if self.get(id).is_none() {
+                    // What waited in its journal here went with it, its journal's transfer carrying it.
+                    self.forget_waiting(id);
+                }
                 if let Some(inbox) = &self.inbox
                     && self.get(id).is_none()
                 {
@@ -2212,6 +2277,9 @@ impl Host {
                 }
             }
             Lane::Forget => {
+                if self.get(id).is_none() {
+                    self.forget_waiting(id);
+                }
                 if let Some(inbox) = &self.inbox
                     && self.get(id).is_none()
                     && let Err(e) = inbox.forget(id).await
@@ -2238,12 +2306,12 @@ impl Host {
                 if let Some(s) = self.get(id) {
                     let input = s.core.lock().input.clone();
                     if let Some(input) = input {
+                        if input.controller.lock().capacity().epoch != epoch { return; }
+                        // The server's custody (W20), beside what waits in the session's own journal here.
+                        self.server_mail.lock().insert(id.to_owned(), (peers, demand));
+                        if !self.set_demand(id, &input) { return; }
                         let capacity = {
                             let mut c = input.controller.lock();
-                            if c.capacity().epoch != epoch { return; }
-                            let peers_changed = c.peers(&peers).unwrap_or(false);
-                            let demand_changed = c.demand(&demand).unwrap_or(false);
-                            if !peers_changed && !demand_changed { return; }
                             c.advertised_ready(input.now_ns());
                             c.capacity()
                         };
@@ -2431,6 +2499,11 @@ impl Host {
                 Err(_) => { let _ = input.controller.lock().unavailable(); break; }
             };
             after = Some(key);
+            // Routed to it here and still waiting in its journal: it holds no lease, and is handed on in its turn.
+            if pending.waiting_here() {
+                self.add_waiting(&s.id, routed::Waiter { message: pending.lease.message.clone(), sender: pending.lease.peer.clone(), seq: pending.seq().unwrap_or(0), status: pending.status.clone() });
+                continue;
+            }
             let newly_restored = input.controller.lock().lease(&pending.lease.message).is_none_or(|lease| lease.stage == super::admission::Stage::Carried);
             if pending.disposition.is_none() && input.controller.lock().restore(pending.lease.clone()).is_err() {
                 let _ = input.controller.lock().unavailable();
@@ -2441,6 +2514,11 @@ impl Host {
                 if let Some(command) = pending.current_command() && !already_queued && s.command(command.clone()) { let _ = input.controller.lock().stage(&pending.lease.message, super::admission::Stage::InCtl); }
             }
             self.publish_pending(&s.id, &input, pending);
+        }
+        // What waits in its own journal here is handed on in its turn, from now on as its room changes.
+        if self.waiting.lock().get(&s.id).is_some_and(|w| !w.queue.is_empty()) {
+            self.set_demand(&s.id, &input);
+            self.watch_room(&s.id, &input);
         }
         let capacity = { let mut c = input.controller.lock(); c.advertised_ready(input.now_ns()); c.capacity() };
         s.mail_flow(super::admission::FlowEvent::Capacity { capacity });
@@ -3571,11 +3649,19 @@ impl Host {
 
 }
 
-/// The records a host's sessions' inboxes keep, in its folder `dir`: none when `KILN_INBOX` is off,
-/// or they can't be opened (said, and messages then go on unchecked).
-fn open_records(dir: &std::path::Path) -> Option<Arc<dyn kiln_seams::Records>> {
-    if std::env::var("KILN_INBOX").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no")) {
+/// Whether `KILN_INBOX` turns sessions' inboxes off here (said once as it's read).
+fn inbox_off() -> bool {
+    let off = std::env::var("KILN_INBOX").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"));
+    if off {
         tracing::info!(target: "kiln.sends", event = "inbox_off", "sessions' inboxes are off (KILN_INBOX): messages aren't checked for repeats");
+    }
+    off
+}
+
+/// The records a host's sessions' inboxes keep in its folder `dir`, where it keeps no conversation store: none when
+/// `KILN_INBOX` is off, or they can't be opened (said, and messages then go on unchecked).
+fn open_records(dir: &std::path::Path) -> Option<Arc<dyn kiln_seams::Records>> {
+    if inbox_off() {
         return None;
     }
     let path = dir.join(crate::records::FILE);
@@ -3586,6 +3672,25 @@ fn open_records(dir: &std::path::Path) -> Option<Arc<dyn kiln_seams::Records>> {
             None
         }
     }
+}
+
+/// Each session's inbox and journal in the machine's conversation store (`store`, [`crate::convo::inbox`]): none when
+/// `KILN_INBOX` is off. The host's records file from before in `dir` is brought into the store the first time it's asked
+/// anything; one that can't be opened is said, and the inbox goes on without its rows (their messages, sent again, are
+/// taken again).
+fn inbox_records(dir: Option<&std::path::Path>, store: crate::convo::inbox::Source) -> Option<Arc<dyn kiln_seams::Records>> {
+    if inbox_off() {
+        return None;
+    }
+    let path = dir.map(|d| d.join(crate::records::FILE)).filter(|p| p.exists());
+    let legacy = path.and_then(|path| match crate::records::open(&path) {
+        Ok(r) => Some((r, path)),
+        Err(e) => {
+            tracing::warn!(target: "kiln.sends", event = "inbox_legacy_unreadable", file = %path.display(), error = %format!("{e:#}"), "the inbox's file from before couldn't be opened: its rows aren't brought into the conversation store");
+            None
+        }
+    });
+    Some(Arc::new(crate::convo::inbox::InboxRecords::new(store, inbox::FAMILIES, legacy)))
 }
 
 /// A message's id and digest ([`inbox::digest`]): what a session's inbox takes once. None for a

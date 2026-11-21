@@ -30,7 +30,8 @@ use crate::store::Store;
 
 pub mod turso;
 
-/// A host's records file, in its folder (beside its conversation store).
+/// A host's records file, in its folder (beside its conversation store): its sessions' inboxes, where the host keeps no
+/// conversation store; else brought into it once (`crate::convo::inbox`).
 pub const FILE: &str = "records.db";
 
 /// The records kept at `path`, in the store kiln keeps a host's records in: Turso's, until

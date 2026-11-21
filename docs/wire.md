@@ -743,6 +743,15 @@ run out, and two lines can't take the same one by accident as they could a bit.
   W10): its volume made with no mount over the folder there and exported to the folder's owner, the
   export's path, attachment, uid and gid answered, and questions about that session's folder answered
   from it; a runner that didn't name it is asked to hold none.
+  `mail-route`: messages go to the runner their session is on, and are taken into custody there
+  (docs/sends.md, "Routed to its session"; Ada, 2026-11-20). The server sends a runner that names it
+  a person's and an agent's message at once, `route` beside the command in `HarnessSend`'s JSON (the
+  runner it's for, its sender, its hops), and keeps none of it: the session's own inbox there takes it
+  and answers, and the runner admits it to the session itself. A runner that gets one for a session it
+  doesn't hold sends it on, a hop further (`AgentMsg::HarnessForward`), and the server sends the words
+  it routed there on to where the session is now. A runner that didn't name it, or one that's away,
+  gets messages from the server's custody (W20's), as before; so does kiln's own (docs/sends.md,
+  "What's open").
 
 ## Registry
 
@@ -789,6 +798,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `AgentMsg` | 72 | `HarnessMailTransfer` | | this line: exact journal transfer phase, to a server that named `mail-transfer` |
 | `AgentMsg` | 73 | `Prebuilt` | | main (kiln plan 01a1dd2e…, P4.5): where a build of an Agentfile asked ahead of its sessions is, JSON, to a server that named `agentfiles.prebuild` |
 | `AgentMsg` | 74 | `RunnerRole` | | this line (docs/agentic.md W10): the runner took the certificate reissued in its role (its serial), to a server that named `runner-role` |
+| `AgentMsg` | 75 | `HarnessForward` | | this line (docs/sends.md, "Routed to its session"): a message routed to the runner for a session it doesn't hold, sent on a hop further, its JSON as it came with its route a hop on; only for a message that came with a route |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
@@ -986,6 +996,7 @@ Four edges are left, and the lab steers clear of each:
 | `HarnessMailTransfer` | command, refused while away | Offer, readiness, adoption or abort for one exact fenced journal manifest. | Current authenticated custodian and expected destination only; durable phase acknowledges it. |
 | `Prebuilt` | state | Where a build of an Agentfile the server asked ahead of its sessions is (`agentfiles::prebuild::Said`, JSON: `{agentfile, version, harness, how}`, `how` `{state: "building"}`, `{state: "done", image}` with its image pinned by its digest, or `{state: "failed", why}` in Shards' words or kiln's): building as it begins, done or failed as it ends. The server moves the row of the version it names forward only (queued, building, then done or failed). | New: to a server that named `agentfiles.prebuild`, answering its `Prebuild`. |
 | `RunnerRole` | handshake | The runner took the certificate the server reissued it in the runner's role (`serial`, hex): it keeps it where it reads its certificate as it starts and presents it from its link's next connection on, so the server records the one it connected with superseded and refuses it from then on (docs/agentic.md W10). | New: to a server that named `runner-role`, answering its `RunnerRole`. |
+| `HarnessForward` | answer | A message the server routed to the runner (`HarnessSend` with its `route`) for a session it doesn't hold: it moved on, or was never there (docs/sends.md, "Routed to its session"). In place of a `no_session` refusal, its JSON as it came with its route a hop further; the server sends the words it routed there (never what the runner says they were) on to where the session is now, whose inbox answers the sender. A forward of a message the server didn't route to that runner, or whose answer it no longer waits for, is let go of. | New: only for a message that came with a route, which only a server that named `mail-route` sends. |
 
 ## Server to runner: `ServerMsg`
 
