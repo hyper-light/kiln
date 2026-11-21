@@ -251,8 +251,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # One at a time: kiln's crate compiled twice at once (the library, and the library as its tests) ran a 16 GB
       # runner out (the linux job).
-      - name: Build kiln with vendor/slates
-        run: cargo build -p kiln --locked
+      - id: build
+        name: Build kiln with vendor/slates
+        run: cargo build -p kiln --locked 2>&1 | tee "$RUNNER_TEMP/build.txt"
       - id: lib
         name: kiln's Slates tests (library)
         run: cargo test -p kiln --locked --lib -- workspace::slates 2>&1 | tee "$RUNNER_TEMP/lib.txt"
@@ -264,7 +265,7 @@ jobs:
       - name: Report
         if: ${{ failure() }}
         env:
-          OUTCOMES: lib=${{ steps.lib.outcome }} roles=${{ steps.roles.outcome }}
+          OUTCOMES: build=${{ steps.build.outcome }} lib=${{ steps.lib.outcome }} roles=${{ steps.roles.outcome }}
         run: |
           set +e +o pipefail
           for said in $OUTCOMES; do
