@@ -11,8 +11,14 @@ use sha2::Digest as _;
 use super::{Inbox, Pending, Refusal, check_session, message_key, session_prefix, unavailable};
 use crate::harness::mail::TransferManifest;
 
-const TRANSFERS: &str = "inbox-transfers";
-const TRANSFER_ROWS: &str = "inbox-transfer-pending";
+pub(super) const TRANSFERS: &str = "inbox-transfers";
+pub(super) const TRANSFER_ROWS: &str = "inbox-transfer-pending";
+
+/// The session a staged row's key names: its manifest's, as [`prefix`] writes it first.
+pub(super) fn session_of_row(key: &[u8]) -> Option<&[u8]> {
+    let len = usize::try_from(u64::from_le_bytes(key.get(..8)?.try_into().ok()?)).ok()?;
+    key.get(8..8usize.checked_add(len)?)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

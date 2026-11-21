@@ -60,6 +60,23 @@ const HEADS: &str = "inbox-heads";
 const MESSAGES: &str = "inbox";
 const PENDING: &str = "inbox-pending";
 
+/// How each session's inbox is kept in its runner's conversation store ([`crate::convo::inbox::InboxRecords`]): whose
+/// each key is, and every family an inbox keeps.
+pub(crate) const FAMILIES: crate::convo::inbox::Families = crate::convo::inbox::Families {
+    whose: session_of,
+    all: &[HEADS, MESSAGES, PENDING, transfer::TRANSFERS, transfer::TRANSFER_ROWS],
+};
+
+/// The session a key of one of an inbox's families names: its id's bytes.
+fn session_of<'k>(family: &str, key: &'k [u8]) -> Option<&'k [u8]> {
+    match family {
+        HEADS | transfer::TRANSFERS => Some(key),
+        MESSAGES | PENDING => key.split(|b| *b == b'/').next(),
+        transfer::TRANSFER_ROWS => transfer::session_of_row(key),
+        _ => None,
+    }
+}
+
 /// Replayable custody is separate from the bounded deduplication history. A terminal record is
 /// retained until the server durably acknowledges its disposition, including across restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,11 +103,18 @@ pub struct Pending {
     digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     accepted_seq: Option<Rev>,
+    /// A routed message's status key, where it's an explicitly replaceable status (news): a newer one from the same
+    /// sender under the same key replaces it while it still waits here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<super::mail::StatusKey>,
 }
 
+/// Where a journal row's original came from. `Routed`: routed to its session here (docs/sends.md, "Routed to its
+/// session"), taken into custody by its own inbox with no server holding it, so its row goes once its message ends
+/// (no acknowledgement comes for it). Appended last: a build from before reads no row that has it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Origin { #[default] Accepted, LegacyRetained, LegacyOpaque }
+pub enum Origin { #[default] Accepted, LegacyRetained, LegacyOpaque, Routed }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Current { pub revision: u64, pub command: super::model::Command }
@@ -98,11 +122,15 @@ pub struct Current { pub revision: u64, pub command: super::model::Command }
 impl Pending {
     pub fn new(lease: super::admission::Lease, command: super::model::Command) -> Self {
         let body_bytes = super::admission::command_bytes(&command).ok();
-        Self { lease, command: Some(command), opaque_writes: Vec::new(), origin: Origin::Accepted, current: None, body_bytes, disposition: None, accepted_at: 0, digest: String::new(), accepted_seq: None }
+        Self { lease, command: Some(command), opaque_writes: Vec::new(), origin: Origin::Accepted, current: None, body_bytes, disposition: None, accepted_at: 0, digest: String::new(), accepted_seq: None, status: None }
     }
     pub fn legacy(lease: super::admission::Lease, command: super::model::Command) -> Self { Self { origin: Origin::LegacyRetained, ..Self::new(lease, command) } }
-    pub fn opaque(lease: super::admission::Lease, opaque_writes: Vec<String>) -> Self { Self { lease, command: None, opaque_writes, origin: Origin::LegacyOpaque, current: None, body_bytes: None, disposition: None, accepted_at: 0, digest: String::new(), accepted_seq: None } }
+    pub fn opaque(lease: super::admission::Lease, opaque_writes: Vec<String>) -> Self { Self { lease, command: None, opaque_writes, origin: Origin::LegacyOpaque, current: None, body_bytes: None, disposition: None, accepted_at: 0, digest: String::new(), accepted_seq: None, status: None } }
     pub fn current_command(&self) -> Option<&super::model::Command> { self.current.as_ref().map(|current| &current.command).or(self.command.as_ref()) }
+    /// The revision its take committed at in its session's store: where it stands among the messages taken there.
+    pub fn seq(&self) -> Option<Rev> { self.accepted_seq }
+    /// Routed to its session here and still waiting in its journal to be handed to it.
+    pub fn waiting_here(&self) -> bool { self.origin == Origin::Routed && self.lease.stage == super::admission::Stage::Waiting && self.disposition.is_none() }
 }
 
 pub struct Disposed {
@@ -460,6 +488,29 @@ impl Inbox {
         self.accept_inner(session, message, digest, Some(epoch), at, Some(accepting::PendingWrite::original(lease, command, body_bytes)), Some(budget)).await
     }
 
+    /// [`Inbox::accept_input`] for a message routed to its session here (docs/sends.md, "Routed to its session"): its
+    /// original kept in the session's own journal as routed, no server holding it, at `lease`'s stage (`Waiting`: the
+    /// depth held it back, and it's handed to the session once there's room), with its status key where it's a
+    /// replaceable status. Taken once: a retry is its repeat, as any message's.
+    #[allow(clippy::too_many_arguments, reason = "the routed take binds the session, the message and its identity, the epoch it was sent for, its lease, its original and its status together")]
+    pub async fn accept_routed(&self, session: &str, message: &str, digest: &str, epoch: u64, at: i64, lease: &super::admission::Lease, command: &super::model::Command, body_bytes: usize, status: Option<&super::mail::StatusKey>, budget: &super::admission::Input) -> Result<Answer, Refusal> {
+        self.accept_inner(session, message, digest, Some(epoch), at, Some(accepting::PendingWrite::routed(lease, command, body_bytes, status)), Some(budget)).await
+    }
+
+    /// A routed message still waiting in session `session`'s journal (`epoch`), taken out of it: a newer status from
+    /// its sender under the same key replaced it (W20 coalescing), so it's never handed to the session. Its id stays
+    /// taken: a retry of it is its repeat. Whether it was waiting there.
+    pub async fn supersede_waiting(&self, session: &str, message: &str, epoch: u64) -> Result<bool, Refusal> {
+        check_session(session)?;
+        check_message(message)?;
+        let key = message_key(session, message);
+        let Some(row) = self.records.get(PENDING, &key, Consistency::Linearizable).await.map_err(|e| unavailable(session, &e.to_string()))? else { return Ok(false) };
+        let pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+        if !pending.waiting_here() || pending.lease.epoch != epoch { return Ok(false); }
+        self.records.commit(Tx { conds: vec![Cond::At { family: PENDING.into(), key: key.clone(), rev: row.rev }], writes: vec![Write::Delete { family: PENDING.into(), key }] }).await.map_err(|e| unavailable(session, &e.to_string()))?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)] // Common legacy/durable acceptance path preserves independently validated protocol fields.
     async fn accept_inner(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64, pending: Option<accepting::PendingWrite<'_>>, budget: Option<&super::admission::Input>) -> Result<Answer, Refusal> {
         let storage_failed = |refusal: Refusal| {
@@ -655,7 +706,9 @@ impl Inbox {
         check_session(session)?;
         let page = self.records.scan(PENDING, Scan { prefix: session_prefix(session), after, limit: 1, at: Consistency::Linearizable }).await.map_err(|e| unavailable(session, &e.to_string()))?;
         let Some(row) = page.rows.into_iter().next() else { return Ok(None) };
-        let pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+        let mut pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+        // Where its take stands among the session's: the row's own revision until a later write kept it.
+        pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
         Ok(Some((row.key, pending)))
     }
 
@@ -717,7 +770,9 @@ impl Inbox {
         if pending.disposition.is_none() {
             pending.disposition = Some(disposition);
             pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
-            self.records.commit(Tx { conds: vec![Cond::At { family: PENDING.into(), key: key.clone(), rev: row.rev }], writes: vec![Write::Put { family: PENDING.into(), key, value: json(session, &pending)? }] }).await.map_err(|e| unavailable(session, &e.to_string()))?;
+            // A routed message's row goes as it ends: no server holds its custody to acknowledge its end.
+            let write = if pending.origin == Origin::Routed { Write::Delete { family: PENDING.into(), key: key.clone() } } else { Write::Put { family: PENDING.into(), key: key.clone(), value: json(session, &pending)? } };
+            self.records.commit(Tx { conds: vec![Cond::At { family: PENDING.into(), key, rev: row.rev }], writes: vec![write] }).await.map_err(|e| unavailable(session, &e.to_string()))?;
         }
         Ok(Some(pending))
     }
@@ -742,7 +797,12 @@ impl Inbox {
                 pending.disposition = Some(disposition.clone());
                 pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
                 tx.conds.push(Cond::At { family: PENDING.into(), key: key.clone(), rev: row.rev });
-                tx.writes.push(Write::Put { family: PENDING.into(), key, value: json(session, &pending)? });
+                // A routed message's row goes as it ends: no server holds its custody to acknowledge its end.
+                if pending.origin == Origin::Routed {
+                    tx.writes.push(Write::Delete { family: PENDING.into(), key });
+                } else {
+                    tx.writes.push(Write::Put { family: PENDING.into(), key, value: json(session, &pending)? });
+                }
             }
             let actual = pending.disposition.ok_or_else(|| unavailable(session, "its handoff disposition could not be retained"))?;
             disposed.push(Disposed { lease: pending.lease, disposition: actual });
@@ -1592,6 +1652,8 @@ mod tests {
             format!("still knows, its newest {} too)", count(super::super::host::HANDOVERS_MAX as u64)),
             format!("reads at most {} of a session's ids at once", count(READ)),
             format!("a stack keeps its newest {} asked under a key", crate::goals::ASKED_MAX),
+            format!("sent on at most {} times", crate::harness::route::HOPS_MAX),
+            format!("(at most {} at once, none of them a replaceable status)", super::super::host::ROUTED_BURST_MAX),
         ];
         // As read, however its lines are wrapped.
         let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");

@@ -1762,9 +1762,10 @@ fn gone_here(session: &str, moved: &std::collections::HashSet<crate::instances::
 /// one: `upgrade::own_dir`, which an upgrade replaces), and its people's volumes beneath kiln's state
 /// (`state_dir`), which outlives every instance; those an instance kept in its own folder first moved
 /// there, each said (`isolated::home::adopt`).
-fn harness_host(sink: impl Into<crate::harness::session::Sink>, state_dir: &std::path::Path, own_dir: &std::path::Path, limits: crate::harness::host::Limits) -> Arc<crate::harness::host::Host> {
+fn harness_host(sink: impl Into<crate::harness::session::Sink>, state_dir: &std::path::Path, own_dir: &std::path::Path, limits: crate::harness::host::Limits, store: Option<crate::convo::store::Held>) -> Arc<crate::harness::host::Host> {
     use crate::harness::isolated::home::{self, Adopted};
-    let h = crate::harness::host::Host::new(sink, Some(own_dir.join("harness.json")), limits);
+    // Its sessions' inboxes and journals in its conversation store, beside their conversations (Ada, 2026-11-20).
+    let h = crate::harness::host::Host::keeping_in(sink, Some(own_dir.join("harness.json")), limits, crate::rt::clock(), store.map(crate::convo::inbox::Source::Held));
     for a in home::adopt(state_dir) {
         match a {
             Adopted::Moved { from, to } => tracing::info!(from = %from.display(), to = %to.display(), "a person's harness home kept by an earlier instance, moved beneath kiln's state"),
@@ -2546,7 +2547,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             tracing::info!(max_sessions = held.max_sessions, from = ?held.from, "agent sessions: this machine has at most this many at work at once");
         }
         let limits = crate::harness::host::Limits { per_machine: held.max_sessions };
-        let h = harness_host(sink, &o.state_dir, &own_dir, limits);
+        let h = harness_host(sink, &o.state_dir, &own_dir, limits, convo_held.clone());
         // A new build taking over takes no messages till it's promoted (`Host::hold`).
         if take_over_pending.is_some() {
             h.hold(true);
@@ -7282,13 +7283,13 @@ mod tests {
         crate::rt::block_on(async move {
             let state = tempfile::tempdir()?;
             let (tx, _rx) = async_channel::unbounded();
-            let a = harness_host(tx, state.path(), &crate::upgrade::instance_dir(state.path(), "a"), Limits::default());
+            let a = harness_host(tx, state.path(), &crate::upgrade::instance_dir(state.path(), "a"), Limits::default(), None);
             let volume = a.homes().ok_or_else(|| anyhow::anyhow!("instance a keeps no volumes"))?.join("owner").join("claude");
             std::fs::create_dir_all(&volume)?;
             std::fs::write(volume.join("history.jsonl"), "kept\n")?;
             drop(a);
             let (tx, _rx) = async_channel::unbounded();
-            let b = harness_host(tx, state.path(), &crate::upgrade::instance_dir(state.path(), "b"), Limits::default());
+            let b = harness_host(tx, state.path(), &crate::upgrade::instance_dir(state.path(), "b"), Limits::default(), None);
             let homes = b.homes().ok_or_else(|| anyhow::anyhow!("instance b keeps no volumes"))?;
             let found = std::fs::read_to_string(homes.join("owner").join("claude").join("history.jsonl"));
             anyhow::ensure!(found.as_deref().ok() == Some("kept\n"), "instance b keeps volumes at {}, and doesn't find instance a's: {found:?}", homes.display());
@@ -7298,7 +7299,7 @@ mod tests {
             std::fs::create_dir_all(&older)?;
             std::fs::write(older.join("config.yaml"), "GOOSE_PROVIDER: anthropic\n")?;
             let (tx, _rx) = async_channel::unbounded();
-            let c = harness_host(tx, state.path(), &crate::upgrade::instance_dir(state.path(), "c"), Limits::default());
+            let c = harness_host(tx, state.path(), &crate::upgrade::instance_dir(state.path(), "c"), Limits::default(), None);
             let homes = c.homes().ok_or_else(|| anyhow::anyhow!("instance c keeps no volumes"))?;
             anyhow::ensure!(std::fs::read_to_string(homes.join("user-u1").join("goose").join("config.yaml")).is_ok(), "an older instance's volume wasn't adopted into {}", homes.display());
             anyhow::ensure!(!older.exists(), "{} was copied, not moved", older.display());

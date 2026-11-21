@@ -1104,7 +1104,10 @@ impl Carries for AgentMsg {
             // A build's word is read by `crate::agentfiles::prebuild`, which keeps what it can (P4.5).
             | AgentMsg::Prebuilt { .. }
             // A certificate taken up in the runner's role says its serial alone (docs/agentic.md W10).
-            | AgentMsg::RunnerRole { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::RunnerRole { .. }
+            // A message routed to a session the runner doesn't hold, sent on: the registry reads its command and route
+            // (`crate::harness::registry::Registry::forward`), and sends on only what it routed there itself.
+            | AgentMsg::HarnessForward { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
