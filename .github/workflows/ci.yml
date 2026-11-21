@@ -234,15 +234,20 @@ jobs:
           (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      # GitHub's Linux images leave ~14 GB free on /, less than kiln's target takes: in run 44807509237 both Linux
-      # lanes lost their runner ~23 min into the build (exit 143). The image's unused SDKs make room; the VM is
-      # GitHub's and thrown away after the job.
-      - name: Room on disk (Linux)
+      # GitHub's Linux images leave ~14 GB free on / and 16 GB of memory. With room on disk made (run 44841298533)
+      # ubuntu-24.04-arm's build was still ended ~22 min in with exit 143, as in 44807509237: systemd-oomd ends
+      # the whole job's cgroup under memory pressure (kiln's crate takes 7 GiB and more beside its dependencies).
+      # So on Linux: oomd stopped, 16 GiB of swap, two rustc at a time. The VM is GitHub's, thrown away after.
+      - name: Room on disk and in memory (Linux)
         if: ${{ runner.os == 'Linux' }}
         run: |
-          df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          sudo systemctl stop systemd-oomd.service systemd-oomd.socket || true
+          sudo swapoff -a || true
+          sudo fallocate -l 16G /swapfile-ci && sudo chmod 600 /swapfile-ci && sudo mkswap /swapfile-ci && sudo swapon /swapfile-ci
+          echo CARGO_BUILD_JOBS=2 >> "$GITHUB_ENV"
           df -h /
+          free -g
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # One at a time: kiln's crate compiled twice at once (the library, and the library as its tests) ran a 16 GB
       # runner out (the linux job).
