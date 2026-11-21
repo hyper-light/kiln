@@ -2707,10 +2707,10 @@ where
     /// soonest of a stack's pause for a while running out (`resume_at`) and the goal under way's
     /// reminder coming due ([`gap`] after it was last sent). What else holds a reminder back (the
     /// agent at work, waiting on you, a queue, its tasks) is news when it ends. A failed read is
-    /// looked at again after the first reminder's gap, the soonest any reminder comes. The stacks'
-    /// words that may not have reached their agents come due as their own state says ([`said_due`]);
-    /// with `riders`, so do theirs, each from its own state: an agent's turn end settling
-    /// (keep-going), a child settling or news waiting to be heard (parents told), a paused session's
+    /// looked at again after the first reminder's gap, the soonest any reminder comes. With
+    /// `riders`, theirs too, each from its own state: the stacks' words that may not have reached
+    /// their agents ([`said_due`]; process-wide, so kiln-sim's model, which runs beside other tests,
+    /// leaves them out with the rest), an agent's turn end settling (keep-going), a child settling or news waiting to be heard (parents told), a paused session's
     /// next look elsewhere, a plan step's subagent that failed to start trying again.
     async fn deadline(&self, now: i64, riders: bool) -> Option<i64> {
         let mut soonest = self.stacks_deadline(now).await;
@@ -2719,8 +2719,8 @@ where
                 soonest = sooner(soonest, t, now);
             }
         };
-        add(said_due());
         if riders {
+            add(said_due());
             add(keep::due());
             add(crate::harness::told::due());
             add(crate::harness::elsewhere::due());
