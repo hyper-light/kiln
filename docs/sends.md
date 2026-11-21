@@ -138,7 +138,14 @@ message for one Claude Code never got and gave it again; Claude Code said it bac
 kiln held it in flight for good: the agent read as working, its queue never went, its usage limit's
 pause could never go on, and a move waited for a turn that wasn't under way (Quiver, 2026-11-13:
 three messages held so for ten hours, and "Go on now" from its usage limit said it was moving and
-never went).
+never went). A move asked while no turn is under way, with only messages in flight that Claude
+Code never started, doesn't wait either, "now" or not: it asks Claude Code what it holds (an
+interrupt, which cuts nothing then), and what it never started leaves the session, which comes to
+rest and goes. Slates, 2026-11-20: resumed at its stop point on an account at 100% of its five-hour
+window, it was written kiln's "Continue where you left off", which Claude Code 2.1.327 never took
+(the message is in none of its transcript's lines); kiln's usage-limit move came 26 s later and
+waited for the turn to end, and the session took no message for 2.5 minutes, until its person's own
+message stopped it.
 
 **One runner a machine.** A session an older runner process hands to its machine's newest
 (docs/releases.md, "One runner a machine") goes as a move does: it takes no messages as it's handed

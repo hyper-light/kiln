@@ -1060,6 +1060,15 @@ impl Adapter {
         }
     }
 
+    /// Busy only with messages its harness never started, no turn under way: a move doesn't wait
+    /// on them (`session::move_wanted`). Claude Code's alone says what it started of each.
+    pub fn unstarted_only(&self, core: &Core) -> bool {
+        match self {
+            Self::Claude(a) => a.unstarted_only(core),
+            Self::Codex(_) | Self::Acp(_) | Self::Agy(_) | Self::Pi(_) => false,
+        }
+    }
+
     /// A pause ended (it reset, or a person resumed it): the turn it cut off goes on, then kiln's
     /// queue.
     pub fn go_on(&mut self, core: &mut Core, p: super::model::Pause) {

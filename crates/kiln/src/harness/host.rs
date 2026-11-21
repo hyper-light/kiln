@@ -5578,6 +5578,39 @@ while True:
         })
     }
 
+    /// CP-T3.2. Slates, 2026-11-20: paused at its stop point on an account at 100% of its five-hour
+    /// window, resumed by its person, it was written kiln's "Continue where you left off", which
+    /// Claude Code (2.1.327) never took: its transcript ends at the pause's interrupt, the message in
+    /// none of its lines. kiln's usage-limit move came 26 s later, not "now", and waited for the
+    /// turn to end: there was none, and the session took no message for 2.5 minutes, until its
+    /// person's own message interrupted it. A move asked while no turn is under way doesn't wait on
+    /// what Claude Code never started: it asks Claude Code what it holds (an interrupt, which cuts
+    /// nothing), the messages nothing would end leave the session, and its move goes at once.
+    #[cfg(unix)]
+    #[test]
+    fn cp_t3_2_an_agent_held_as_working_by_a_message_nothing_ends_moves_when_told_to_after_its_turn() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (program, _heard) = stand_in(dir.path())?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let cwd = dir.path().to_string_lossy().into_owned();
+            let spec = Spec { kind: "claude".into(), cwd: Some(cwd.clone()), program: Some(program.to_string_lossy().into_owned()), ..Spec::default() };
+            let s = host.open(Some("unstarted".into()), spec)?;
+            let said = |words: &str| s.core.lock().events().any(|e| matches!(&e.body, super::super::model::Body::Notice { text, .. } if text.contains(words)));
+            until_it("the stand-in's start", 300, || s.pid.lock().is_some() && !s.core.lock().meta.features.is_empty()).await?;
+            assert!(host.command("unstarted", message("m1", "hello")));
+            until_it("m1's turn, over", 60, || s.core.lock().state.status == Status::Idle && s.core.lock().state.harness_session.is_some()).await?;
+            assert!(host.command("unstarted", message("m2", "one it says nothing of")));
+            until_it("m2 written, and the session held as working", 60, || s.core.lock().state.delivery.get("m2") == Some(&super::super::model::Delivery::Sent) && s.core.lock().state.status == Status::Running).await?;
+            assert!(host.command("unstarted", Command::MoveTo { to: "elsewhere".into(), cwd, note: None, now: false, kind: None, model: None, local: false, native: false, slates: None }));
+            until_it("its move, tried without a turn to wait for", 60, || said("Couldn't move to elsewhere")).await?;
+            assert!(!s.core.lock().hold, "it goes on here: nothing waits on the move");
+            assert!(host.close("unstarted"));
+            Ok(())
+        })
+    }
+
     /// Kiln's Agentfile for Claude Code, as an isolated session started with none named is made from.
     fn claude_image() -> anyhow::Result<crate::sandbox::image::Source<'static>> {
         let claude = crate::agentfiles::builtin::ALL.iter().find(|b| b.harness == "claude").ok_or_else(|| anyhow::anyhow!("kiln ships no Agentfile for Claude Code"))?;
