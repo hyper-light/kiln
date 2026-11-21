@@ -2711,7 +2711,8 @@ where
     /// `riders`, theirs too, each from its own state: the stacks' words that may not have reached
     /// their agents ([`said_due`]; process-wide, so kiln-sim's model, which runs beside other tests,
     /// leaves them out with the rest), an agent's turn end settling (keep-going), a child settling or news waiting to be heard (parents told), a paused session's
-    /// next look elsewhere, a plan step's subagent that failed to start trying again.
+    /// next look elsewhere, a plan step's subagent that failed to start trying again, a subagent's
+    /// settings still to be given let go.
     async fn deadline(&self, now: i64, riders: bool) -> Option<i64> {
         let mut soonest = self.stacks_deadline(now).await;
         let mut add = |t: Option<i64>| {
@@ -2725,6 +2726,9 @@ where
             add(crate::harness::told::due());
             add(crate::harness::elsewhere::due());
             add(subagents::due());
+            if let Some(hub) = self.hub {
+                add(crate::harness::lineage::settings_due(hub).await);
+            }
         }
         soonest
     }

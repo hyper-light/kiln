@@ -1784,6 +1784,8 @@ pub async fn start_subagent(hub: &Hub, by: &Starter, ask: Ask) -> Result<Info, R
         if info.kind == parent.kind && !controls.is_empty() {
             let pending = json!({"controls": controls, "at": crate::util::now_ms()});
             let _ = hub.store.kv_set(format!("{LIKE}{}", info.id), pending.to_string()).await;
+            // Given at the goal driver's next look, once its harness lists them.
+            crate::goals::stir();
         }
     }
     Ok(info)
@@ -1807,6 +1809,18 @@ fn settings_of(meta: Option<&Value>, state: &super::model::State) -> serde_json:
         })
     };
     state.control_values.iter().filter(|(id, v)| !v.is_null() && !NOT_SETTINGS.contains(&id.as_str()) && setting(id)).map(|(id, v)| (id.clone(), v.clone())).collect()
+}
+
+/// When the soonest of the settings subagents are still to be given is let go ([`LIKE_FOR_MS`] after
+/// it was kept; G9 step 3: what wakes the goal driver for [`settle_settings`]). A subagent's harness
+/// listing its controls comes with its start, its own news.
+pub async fn settings_due(hub: &Hub) -> Option<i64> {
+    let pending = hub.store.kv_prefix(LIKE.to_owned()).await.ok()?;
+    pending
+        .iter()
+        .filter_map(|(_, v)| serde_json::from_str::<Value>(v).ok()?.get("at").and_then(Value::as_i64))
+        .map(|at| at.saturating_add(LIKE_FOR_MS).saturating_add(1))
+        .min()
 }
 
 /// Gives each subagent kiln started the settings of its parent's it's still to be given (its
