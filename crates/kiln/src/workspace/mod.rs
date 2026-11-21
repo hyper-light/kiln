@@ -736,18 +736,20 @@ mod tests {
     /// new one, and the rest stays as it was.
     #[test]
     fn w7_a_moved_agents_folder_and_environment_follow_its_volume_to_its_new_mount() {
-        let (was, now) = ("/Users/a/.kiln/state/workspaces/kiln-x", "/home/b/.kiln/state/workspaces/kiln-x");
+        // Absolute paths as this host spells them: a path with no drive isn't absolute on Windows.
+        let (was, now, over) = if cfg!(windows) { ("C:\\kiln\\workspaces\\kiln-x", "D:\\kiln\\workspaces\\kiln-x", "C:\\Users\\a\\project") } else { ("/Users/a/.kiln/state/workspaces/kiln-x", "/home/b/.kiln/state/workspaces/kiln-x", "/Users/a/project") };
+        let at = |root: &str, name: &str| Path::new(root).join(name).to_string_lossy().into_owned();
         let mut spec = crate::harness::session::Spec {
-            cwd: Some(format!("{was}/src")),
-            env: vec![("VIRTUAL_ENV".to_owned(), format!("{was}/.venv")), ("CARGO_TARGET_DIR".to_owned(), format!("{was}/target")), ("EDITOR".to_owned(), "vi".to_owned())],
-            workspace: Some(Workspace { sub: "src".into(), ..volume_at("v1", was, "/Users/a/project") }),
+            cwd: Some(at(was, "src")),
+            env: vec![("VIRTUAL_ENV".to_owned(), at(was, ".venv")), ("CARGO_TARGET_DIR".to_owned(), at(was, "target")), ("EDITOR".to_owned(), "vi".to_owned())],
+            workspace: Some(Workspace { sub: "src".into(), ..volume_at("v1", was, over) }),
             ..Default::default()
         };
         assert!(follow_to(&mut spec, made("v1", now)));
-        assert_eq!(spec.cwd.as_deref(), Some("/home/b/.kiln/state/workspaces/kiln-x/src"));
+        assert_eq!(spec.cwd, Some(at(now, "src")));
         let env: std::collections::HashMap<&str, &str> = spec.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        assert_eq!(env.get("VIRTUAL_ENV"), Some(&"/home/b/.kiln/state/workspaces/kiln-x/.venv"), "{env:?}");
-        assert_eq!(env.get("CARGO_TARGET_DIR"), Some(&"/home/b/.kiln/state/workspaces/kiln-x/target"), "{env:?}");
+        assert_eq!(env.get("VIRTUAL_ENV").copied(), Some(at(now, ".venv").as_str()), "{env:?}");
+        assert_eq!(env.get("CARGO_TARGET_DIR").copied(), Some(at(now, "target").as_str()), "{env:?}");
         assert_eq!(env.get("EDITOR"), Some(&"vi"));
         assert_eq!(spec.workspace.and_then(|w| w.made).map(|m| m.mount), Some(now.to_owned()));
     }
@@ -761,7 +763,9 @@ mod tests {
             workspace: Some(Workspace { sub: sub.into(), ..volume_at("v1", mount, "/Users/person/project") }),
             ..Default::default()
         };
-        assert_eq!(record_places(&spec("src", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a/src".to_owned(), "/Users/person/project/src".to_owned())));
+        // The person's folder is joined as this host joins paths (`\` on Windows).
+        let person_src = Path::new("/Users/person/project").join("src").to_string_lossy().into_owned();
+        assert_eq!(record_places(&spec("src", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a/src".to_owned(), person_src)));
         assert_eq!(record_places(&spec("", "/state/workspaces/kiln-a")), Some(("/state/workspaces/kiln-a".to_owned(), "/Users/person/project".to_owned())));
         assert_eq!(record_places(&spec("src", "")), None, "no mount: an isolated agent's, kept in its microVM's volume");
         assert_eq!(record_places(&crate::harness::session::Spec::default()), None);

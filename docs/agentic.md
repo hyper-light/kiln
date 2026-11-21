@@ -921,7 +921,7 @@ part.
   may only `get` them now), and PersistentVolumes to create, get and delete, which belong to no namespace (a
   ClusterRole). Nothing else: no CSI driver, no privileged container, no `hostPath`, no mount propagation, no
   StorageClass.
-- **Proof, and the order it's built in.** The proof (owed, main's run): KIND on a Linux machine whose kernel has
+- **Proof, and the order it's built in.** The proof (its volume check run below; the engine's rework a task of its own): KIND on a Linux machine whose kernel has
   `CONFIG_TLS` (Docker Desktop's has none, as Slates measured on 2026-10-01), through kiln: an agent on the Kubernetes
   engine edits in its pod; its change request shows the edit; a file a person changed in the folder meanwhile shows as
   drift; its landing writes the folder only under its grant; and a pod deleted mid-session leaves no attachment, claim
@@ -953,7 +953,19 @@ part.
   `workspace::held`, the `hold` and `release` asks of a runner that names `workspace.hold`: its volume made with no
   mount, its write policy from the agent's grant, exported to the folder's owner through `Instance::export`, the path,
   attachment, uid and gid answered, and every question about the pod's folder answered from the holding, as an isolated
-  session's are, never of a folder the server names; let go, the export detached, then the volume ended); the engine and the workspace's home; the end and its reaper; the node certificate's issue; the proof.
+  session's are, never of a folder the server names; let go, the export detached, then the volume ended); the engine and the workspace's home; the end and its reaper; the node certificate's issue; the proof. Slates volumes attach to Kubernetes pods, checked on a real cluster (2026-11-20, `k8s_agent_live`,
+  `KILN_K8S_LIVE=1`, run at bec9fdf5f93; adacachy has no KIND, so a minikube cluster of the test's own, its nodes kicbase
+  with `tlshd` built from ktls-utils 0.11, the host's `tls` module loaded, the server and its home in a container on the
+  cluster's own network since the host's firewall drops that network's traffic to the host): the home a fleet of one, each
+  node's `tlshd` certificate issued through kiln for a key made on the node, `agents.start` `isolation: "pod"` answered,
+  and the pod's folder kubelet's `nfs4` mount of the home's Slates export with `xprtsec=mtls` (`vers=4.2,nosuid,nodev`);
+  the stand-in harness in the pod wrote its files into the volume, not the folder; its change request's branch held the
+  pod's file; a file it changed, changed in the folder meanwhile, was shown as drift, and a landing over it refused by
+  kind (`ModifyModify`; a later run also landed through the person's grant). Found by that use, each fixed with its test:
+  `agents.start`'s input knew no `pod` (`AgentsStartIsolation::Pod`), and a pod session's landing, drift and change
+  request were refused or empty, judged by the workspace the session names, where its home holds it by its id
+  (`AgentPods::holds`, `k8s::agent::held_at_home`). That check is all goal 90 asks of Kubernetes (Ada, 2026-11-20): kiln's
+  Kubernetes engine itself needs a rework of its own, a separate task.
 
 ## C: From changes to landed
 

@@ -1,6 +1,6 @@
 /** Runners' engines and their microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2.3, P3.2). */
 import type { Res } from "@/lib/data";
-import { request } from "./client";
+import { ApiError, request } from "./client";
 import type { ContainerFacts, IsolationFacts, LiveAccess, LiveChange, LiveMember, LivePortKey, LiveProtocol, RunnerEngine } from "./wire";
 
 const enc = encodeURIComponent;
@@ -236,7 +236,12 @@ export const grantsRes = (id: string): Res<SessionGrants> => ({
 
 const ses = (id: string, rest = "") => `/api/microvm/sessions/${enc(id)}${rest}`;
 export const sandboxApi = {
-  all: (signal?: AbortSignal) => request<Record<string, SandboxBrief>>("GET", "/api/microvm/sessions", undefined, { signal }),
+  /** A server that keeps no sandbox list (404) has none to show: every page that reads it still loads. */
+  all: (signal?: AbortSignal) =>
+    request<Record<string, SandboxBrief>>("GET", "/api/microvm/sessions", undefined, { signal }).catch((e: unknown) => {
+      if (e instanceof ApiError && e.status === 404) return {};
+      throw e;
+    }),
   get: (id: string, signal?: AbortSignal) => request<SandboxDetail>("GET", ses(id), undefined, { signal }),
   act: (id: string, act: "pause" | "resume" | "restart" | "stop", body: { version?: number } = {}) => request<SandboxDetail>("POST", ses(id, `/${act}`), body),
   swap: (id: string, name: string, source: string, pin: string) => request<SandboxDetail>("POST", ses(id, `/components/${enc(name)}`), { source, pin }),

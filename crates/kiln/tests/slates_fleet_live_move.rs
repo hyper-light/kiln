@@ -692,7 +692,7 @@ impl Lab {
         let began = Instant::now();
         loop {
             let log = self.log(n);
-            let joined = log.lines().filter(|l| l.contains("joins kiln's Slates fleet")).filter_map(|l| checks::nodes_heard(l)).last();
+            let joined = log.lines().filter(|l| l.contains("joins kiln's Slates fleet")).filter_map(checks::nodes_heard).next_back();
             if let Some(heard) = joined {
                 anyhow::ensure!(heard >= self.nodes.len(), "{} joined having heard {heard} node(s) of {}", n.name, self.nodes.len());
                 eprintln!("PROVEN: {} joined kiln's Slates fleet hearing {heard} node(s) ({:?})", n.name, began.elapsed());
