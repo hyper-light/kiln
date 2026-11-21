@@ -9,6 +9,9 @@
 //!   child works in it, and goes with the child.
 //! - Review: a change request from a volume holds what changed there.
 //! - Drift: a file the agent changed, changed on disk after, is drift.
+//! - A dead mount (Linux): its instance's daemon killed, the anchor keeps the volume but the agent's FUSE mount is left
+//!   dead (`ENOTCONN`); started again, the agent's workspace is mounted again at its own point through
+//!   `workspace::prepare` before anything reads its folder, never refused as "not a directory" (2026-11-21, adacachy).
 //! - Landing, as each agent's mode lets it (the person's rule, 2026-11-18): the plan leaves out what git ignores and
 //!   git's own directory; an agent whose mode asks reads its plan and its writing waits on its person's click, then the
 //!   person writes it; one whose mode edits unasked writes its own at once; each into the folder, its repository's
@@ -294,6 +297,45 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
     anyhow::ensure!(std::fs::read_to_string(Path::new(&child.cwd).join("after.rs"))? == "after\n", "the child still works in it");
     anyhow::ensure!(hub.harness.close(hub, &child.id).await, "the child didn't end");
     anyhow::ensure!(until(GONE_WITHIN, || !mounted(&parent_made.mount)).await, "the volume stayed after its last agent ended");
+    #[cfg(target_os = "linux")]
+    dead_mount(hub, started, &cx, &src, &missing).await?;
     Ok(())
 }
 
+/// The instance's daemon this test's anchor runs now: the anchor's child (Linux's `/proc/<pid>/task/<pid>/children`).
+#[cfg(target_os = "linux")]
+fn daemon_of(anchor: u32) -> Option<u32> {
+    let children = std::fs::read_to_string(format!("/proc/{anchor}/task/{anchor}/children")).ok()?;
+    children.split_whitespace().next()?.parse().ok()
+}
+
+/// Whether a look at `point` says its mount is dead (its daemon gone: `ENOTCONN`).
+#[cfg(target_os = "linux")]
+fn dead(point: &str) -> bool {
+    std::fs::metadata(point).is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected)
+}
+
+/// A dead mount, then a start again (2026-11-21, adacachy: two agents refused "<cwd> is not a directory on this machine"
+/// after their daemon died): do start an agent on a volume, kill the daemon this test's anchor runs (the anchor starts
+/// another, which recovers the volume, while the agent's mount stays dead), then restart the agent; expect its mount
+/// dead before, and after the restart its own volume mounted again at the same point, its folder there as before.
+#[cfg(target_os = "linux")]
+async fn dead_mount(hub: &Arc<Hub>, started: &mut Started, cx: &Cx, src: &Path, missing: &str) -> anyhow::Result<()> {
+    let fail = |(c, m): crate::ops::Fail| anyhow::anyhow!("{c}: {m}");
+    let volume = Some(super::Workspace { kind: "volume".into(), ..Default::default() });
+    let info = started.open(Spec { kind: "claude".into(), cwd: Some(src.to_string_lossy().into_owned()), name: Some("A dead mount".into()), program: Some(missing.to_owned()), workspace: volume, ..Spec::default() }).await?;
+    let made = made_of(&info)?;
+    anyhow::ensure!(mounted(&made.mount), "nothing mounted at {}", made.mount);
+    let anchor = super::slates::started_anchor().ok_or_else(|| anyhow::anyhow!("the test started no anchor of its own"))?;
+    let daemon = daemon_of(anchor).ok_or_else(|| anyhow::anyhow!("anchor {anchor} runs no daemon"))?;
+    let killed = Command::new("kill").args(["-KILL", &daemon.to_string()]).status()?;
+    anyhow::ensure!(killed.success(), "kill -KILL {daemon}: {killed}");
+    anyhow::ensure!(until(GONE_WITHIN, || dead(&made.mount)).await, "{} isn't dead after its daemon {daemon} was killed", made.mount);
+    call(cx.clone(), "agents.restart", json!({"agent": info.id})).await.map_err(fail)?;
+    anyhow::ensure!(until(GONE_WITHIN, || mounted(&made.mount)).await, "{} wasn't mounted again as the agent started again", made.mount);
+    let now = hub.harness.info(&info.id).ok_or_else(|| anyhow::anyhow!("no agent {}", info.id))?;
+    let again = made_of(&now)?;
+    anyhow::ensure!(again.mount == made.mount && now.cwd == info.cwd, "it works in {} on {}, not {} on {}", now.cwd, again.mount, info.cwd, made.mount);
+    anyhow::ensure!(again.volume == made.volume, "its volume, which the anchor kept, is {} now, not {}", again.volume, made.volume);
+    Ok(())
+}
