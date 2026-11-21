@@ -85,6 +85,25 @@ fn inside(folder: &str, mount: &str) -> bool {
     folder.is_absolute() && !folder.components().any(|c| matches!(c, Component::ParentDir)) && folder.starts_with(mount)
 }
 
+/// Whom an agent's container runs as, the one identity its workspace's export serves (A-115): the uid and gid that own
+/// its folder on Unix.
+#[cfg(unix)]
+fn container_user(mount: &str) -> anyhow::Result<(u32, u32)> {
+    crate::workspace::held::owner(std::path::Path::new(mount))
+}
+
+/// Format: whom an agent's container runs as on Windows, where a folder has no Unix owner: an ordinary user of the
+/// container's, the export bound to it alone, every other id a stranger to Slates (A-115), root's too.
+#[cfg(not(unix))]
+const WINDOWS_CONTAINER_USER: (u32, u32) = (1000, 1000);
+
+/// Whom an agent's container runs as on Windows ([`WINDOWS_CONTAINER_USER`]).
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps, reason = "Unix's reads its folder's owner, which can fail")]
+fn container_user(_mount: &str) -> anyhow::Result<(u32, u32)> {
+    Ok(WINDOWS_CONTAINER_USER)
+}
+
 /// The keeper container's plan for `launch` in workspace `made` through `program` under `judged`, named `name`, run as
 /// `user` (the uid and gid that own its folder), or why it's refused (see the module's notes).
 fn plan_of(launch: &Launch, program: &str, judged: &ExportEngine, made: &Made, name: String, user: (u32, u32)) -> Result<Plan, Refusal> {
@@ -116,7 +135,7 @@ fn plan_of(launch: &Launch, program: &str, judged: &ExportEngine, made: &Made, n
         image: image.to_owned(),
         entrypoint: Some(KEEPER.to_owned()),
         command: KEEPER_ARGS.map(str::to_owned).to_vec(),
-        workdir: folder.clone(),
+        workdir: crate::workspace::container::seen_at(folder).map_err(|_| Refusal::Invalid { what: "its folder", why: format!("{folder} is on no drive its container can see") })?,
         user,
     })
 }
@@ -219,7 +238,7 @@ impl Sandbox for ContainerSandbox {
     fn launch<'a>(&'a self, launch: Launch) -> BoxFuture<'a, Result<Box<dyn Run>, Refusal>> {
         Box::pin(async move {
             let name = format!("{}-{}", self.made.name, crate::util::now_ms());
-            let user = crate::workspace::held::owner(std::path::Path::new(&self.made.mount)).map_err(|e| Refusal::Failed(format!("its folder's owner couldn't be read: {e:#}")))?;
+            let user = container_user(&self.made.mount).map_err(|e| Refusal::Failed(format!("its folder's owner couldn't be read: {e:#}")))?;
             let plan = plan_of(&launch, &self.program, &self.judged, &self.made, name, user)?;
             let running = crate::workspace::container::start(&self.made, &plan).await.map_err(|refused| Refusal::Failed(refused.to_string()))?;
             let mut cmd = std::process::Command::new(&self.program);

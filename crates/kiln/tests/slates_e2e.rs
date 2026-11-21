@@ -1868,7 +1868,7 @@ mod microvm {
 // engine itself mounts from Slates' NFS export of it, never a copy. Skipped in the runner's own words where its facts say
 // its agents can't run in containers.
 // =================================================================================================
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod container {
     //! A-520's fifth piece, by use: a runner whose owner set its engine to `container` runs each agent's harness in a
     //! container of the image its administrator declared (`[agent] container_image`), on the agent's Slates volume,
@@ -1938,12 +1938,11 @@ mod container {
     /// run in containers. None, said why, where they can't (a failure under [`REQUIRED`]).
     fn fixture(dir: &Path, instance: &Instance, docker: &Path, image: &str) -> anyhow::Result<Option<vm_e2e::Fixture>> {
         let mut env = runner_env(dir, instance)?;
-        let engine_bin = dir.join("engine-bin");
-        std::fs::create_dir_all(&engine_bin)?;
-        std::os::unix::fs::symlink(docker, engine_bin.join("docker"))?;
+        let engine_bin = engine_bin(dir, docker)?;
+        let sep = if cfg!(windows) { ';' } else { ':' };
         for (k, v) in &mut env {
             if *k == "PATH" {
-                *v = format!("{v}:{}", engine_bin.display());
+                *v = format!("{v}{sep}{}", engine_bin.display());
             }
         }
         let config = dir.join("runner.toml");
@@ -1971,6 +1970,28 @@ mod container {
         let machine = f.machine.clone();
         vm_e2e::set_engine(&f, &machine, "container")?;
         Ok(Some(f))
+    }
+
+    /// A folder holding the engine's command line alone, for the runner's PATH: a link to it on Unix; on Windows, where
+    /// a link needs a privilege, the folder it is in (Docker Desktop's `resources\bin`).
+    #[cfg(unix)]
+    fn engine_bin(dir: &Path, docker: &Path) -> anyhow::Result<PathBuf> {
+        let at = dir.join("engine-bin");
+        std::fs::create_dir_all(&at)?;
+        std::os::unix::fs::symlink(docker, at.join("docker"))?;
+        Ok(at)
+    }
+
+    /// See the Unix one.
+    #[cfg(windows)]
+    fn engine_bin(_dir: &Path, docker: &Path) -> anyhow::Result<PathBuf> {
+        docker.parent().map(Path::to_path_buf).ok_or_else(|| anyhow::anyhow!("{} is in no folder", docker.display()))
+    }
+
+    /// Where the agent's container sees `host`, a path of this machine's: its own on Unix, as WSL names it on Windows
+    /// (`C:\src` at `/mnt/c/src`; `kiln::workspace::container::seen_at`).
+    fn seen(host: &str) -> anyhow::Result<String> {
+        kiln::workspace::container::seen_at(host).map_err(|e| anyhow::anyhow!("{host}: {e}"))
     }
 
     /// What runner `machine`'s facts say of its containers (`facts.containers`), or null.
@@ -2041,12 +2062,13 @@ mod container {
         let at = mount_point(&mount);
         anyhow::ensure!(slates_mounted_at(&at)?, "{what}: nothing of Slates' is mounted at {} ({:?})", at.display(), host_mounts()?);
         let said_cwd = vm_e2e::cwd_said(&lines).ok_or_else(|| fail(format!("its harness never said its folder: {lines:?}")))?;
-        anyhow::ensure!(Path::new(&said_cwd).starts_with(&mount), "{what}: its harness works in {said_cwd}, outside its volume's mount {mount}");
+        let inside = seen(&mount)?;
+        anyhow::ensure!(said_cwd == inside || said_cwd.starts_with(&format!("{inside}/")), "{what}: its harness works in {said_cwd}, outside its volume's mount {mount} (in its container {inside})");
         let kernel = vm_e2e::where_said(&lines).map(|w| w.kernel).ok_or_else(|| fail(format!("its harness never said where it ran: {lines:?}")))?;
-        if cfg!(target_os = "macos") {
-            anyhow::ensure!(kernel == "Linux", "{what}: its harness ran on {kernel}, the Mac's own kernel, not in a container");
+        if cfg!(any(target_os = "macos", windows)) {
+            anyhow::ensure!(kernel == "Linux", "{what}: its harness ran on {kernel}, the machine's own kernel, not in a container");
         }
-        let mounted = mounted_from(docker, &mount)?;
+        let mounted = mounted_from(docker, &inside)?;
         let [(container, engine_volume, kind, export, writable)] = mounted.as_slice() else { return Err(fail(format!("the engine runs {} containers on a volume at {mount}, not one: {mounted:?}", mounted.len()))) };
         let named = format!("/{}@", made.name);
         anyhow::ensure!(kind == "nfs" && export.starts_with(&named) && *writable, "{what}: container {container} runs on engine volume {engine_volume} ({kind}, {export}, writable: {writable}), not an NFS export of its volume {} for writing", made.name);
@@ -2074,7 +2096,7 @@ mod container {
         // 4: its end.
         pace.stop(f, &id)?;
         mount_gone(&at).map_err(|e| fail(format!("{e:#}")))?;
-        let left = mounted_from(docker, &mount)?;
+        let left = mounted_from(docker, &inside)?;
         anyhow::ensure!(left.is_empty(), "{what}: its containers outlived it: {left:?}");
         let volumes = std::process::Command::new(docker).args(["volume", "ls", "--quiet"]).output()?;
         let kept: Vec<String> = String::from_utf8_lossy(&volumes.stdout).lines().filter(|v| v.starts_with(&made.name)).map(str::to_owned).collect();
@@ -2131,7 +2153,7 @@ mod container {
                 .map_err(|e| anyhow::anyhow!("{mode:?}: {e:#}\n--- the runner ---\n{}\n{}", f.runner_log(), slates_log(&dir)))?;
             let lines = vm_e2e::said(&events);
             anyhow::ensure!(lines.iter().any(|l| *l == format!("APPENDED {}", APPENDED.0)), "{mode:?}: {lines:?}");
-            anyhow::ensure!(vm_e2e::where_said(&lines).is_some_and(|w| !cfg!(target_os = "macos") || w.kernel == "Linux"), "{mode:?}: not in a container: {lines:?}");
+            anyhow::ensure!(vm_e2e::where_said(&lines).is_some_and(|w| !cfg!(target_os = "macos") || w.kernel == "Linux") && vm_e2e::where_said(&lines).is_some_and(|w| !cfg!(windows) || w.kernel == "Linux"), "{mode:?}: not in a container: {lines:?}");
             let persons = b"the person's\n".to_vec();
             std::fs::write(project.path().join(APPENDED.0), &persons)?;
             let ws = op(&f, "agents.workspace", &json!({"agent": id}))?;

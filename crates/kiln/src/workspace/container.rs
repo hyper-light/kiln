@@ -75,7 +75,8 @@ pub struct Plan {
     pub entrypoint: Option<String>,
     /// The command it runs: the harness's, or an idle keeper's that the harness is run beside (`sandbox::container`).
     pub command: Vec<String>,
-    /// The harness's folder: the same place in the workspace inside the container as on the machine (W3).
+    /// The harness's folder: the same place in the workspace inside the container as on the machine (W3), as the
+    /// container names it ([`seen_at`]).
     pub workdir: String,
     /// Whom it runs as and the export serves: the uid and gid that own the agent's folder.
     pub user: (u32, u32),
@@ -133,7 +134,14 @@ fn volume_args(plan: &Plan, port: u16, path: &str) -> Result<Vec<String>, Refusa
     Ok(["volume", "create", "--driver", "local", "--opt", "type=nfs", "--opt", &format!("o={options}"), "--opt", &format!("device=:{path}"), &plan.name].map(str::to_owned).to_vec())
 }
 
-/// The engine's arguments for `plan`'s container on its volume, mounted at `mount` (the machine's own mount point).
+/// Where an agent's container sees `host`, a path of this machine's in its workspace: at its own path on Unix, and
+/// where WSL names it on Windows (`C:\\src\\app` at `/mnt/c/src/app`), Docker Desktop's VM being WSL 2's there, as a
+/// microVM sees a Windows folder (`sandbox::isolated::guest_path`); refused for a path on no drive.
+pub fn seen_at(host: &str) -> Result<String, Refusal> {
+    crate::sandbox::isolated::guest_path(host).map_err(|_| Refusal::Path)
+}
+
+/// The engine's arguments for `plan`'s container on its volume, mounted at `mount` (the mount point as it sees it).
 fn run_args(plan: &Plan, mount: &str) -> Result<Vec<String>, Refusal> {
     if !carried(mount) {
         return Err(Refusal::Path);
@@ -250,7 +258,8 @@ async fn start_with(steps: &impl Steps, made: &Made, plan: &Plan) -> Result<Runn
     let started: Result<String, Refusal> = async {
         let port = port.ok_or(Refusal::NoNfs)?;
         let volume = volume_args(plan, port, &exported.path)?;
-        let run = run_args(plan, &made.mount)?;
+        // The container's own path for the mount: the machine's on Unix, as WSL names it on Windows (`/mnt/c/…`).
+        let run = run_args(plan, &seen_at(&made.mount)?)?;
         steps.engine(&plan.program, &volume).await.map_err(|e| Refusal::Volume(without_token(&format!("{e:#}"), &exported.path)))?;
         match steps.engine(&plan.program, &run).await {
             Ok(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(id),
