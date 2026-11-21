@@ -284,15 +284,23 @@ async fn set_diff_state(hub: &Hub, ids: &[String], state: State) -> anyhow::Resu
 /// Diffs the queue gives back to Review (docs/ci.md W28-R104, R107): each that was landing in the
 /// state its reviews give it now.
 async fn to_review(hub: &Hub, ids: &[String]) -> anyhow::Result<()> {
+    for (id, now) in review_states(hub, ids).await? {
+        set_diff_state(hub, std::slice::from_ref(&id), now).await?;
+    }
+    Ok(())
+}
+
+/// The state each of `ids` that's landing has from its reviews now, as [`to_review`] gives it back.
+async fn review_states(hub: &Hub, ids: &[String]) -> anyhow::Result<Vec<(String, State)>> {
+    let mut out = Vec::new();
     for id in ids {
         let Some(d) = diffs::find(hub, id).await? else { continue };
         if d.state != State::Landing.as_str() {
             continue;
         }
-        let now = super::review::state_now(hub, &d).await.unwrap_or(State::Accepted);
-        set_diff_state(hub, std::slice::from_ref(id), now).await?;
+        out.push((id.clone(), super::review::state_now(hub, &d).await.unwrap_or(State::Accepted)));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// An entry's diffs, bottom first (those gone left out).
@@ -468,10 +476,17 @@ async fn return_to_review(hub: &Arc<Hub>, e: &Entry, files: &[String]) -> anyhow
     // One that was in the queue leaves it: W19-R06's `land.ejected`, recorded with its return
     // (crate::events).
     let ejected = matches!(e.state.as_str(), "queued" | "testing").then(|| e.diffs.clone());
+    // Its diffs are Review's again in the same transaction as the entry says it's returned: whoever reads
+    // one reads the other so (W28-R107, "not ejected").
+    let states = if ejected.is_some() { review_states(hub, &e.diffs).await? } else { Vec::new() };
     hub.store
         .call(move |c| {
             let tx = crate::store::tx(c)?;
-            tx.prepare_cached("UPDATE land_queue SET state = 'returned', hold = NULL, reason = ?2, conflicts = ?3, batch = NULL, base = NULL, candidate = NULL, checks = NULL, commits = NULL, updated_at = ?4 WHERE id = ?1")?.execute(params![id, why, list, crate::util::now_unix()])?;
+            let now = crate::util::now_unix();
+            tx.prepare_cached("UPDATE land_queue SET state = 'returned', hold = NULL, reason = ?2, conflicts = ?3, batch = NULL, base = NULL, candidate = NULL, checks = NULL, commits = NULL, updated_at = ?4 WHERE id = ?1")?.execute(params![id, why, list, now])?;
+            for (d, state) in &states {
+                tx.prepare_cached("UPDATE diffs SET state = ?2, updated_at = ?3 WHERE id = ?1 AND state = ?4")?.execute(params![d, state.as_str(), now, State::Landing.as_str()])?;
+            }
             if let Some(diffs) = ejected {
                 crate::events::record(&tx, "land.ejected", &serde_json::json!({ "diffs": diffs, "reason": why }))?;
             }
@@ -480,7 +495,6 @@ async fn return_to_review(hub: &Arc<Hub>, e: &Entry, files: &[String]) -> anyhow
         })
         .await?;
     if matches!(e.state.as_str(), "queued" | "testing") {
-        to_review(hub, &e.diffs).await?;
         queue_event(hub, &e.diffs, "dequeued", Some("INVALID_MERGE_COMMIT"), "kiln").await;
     }
     // Its diffs climb the conflict ladder (W26-R17): once Review's gate clears the resolution a person
