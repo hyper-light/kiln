@@ -1696,7 +1696,10 @@ mod tests {
 
     /// Goal 9, plan 01a1a87b2cec step 5: who enrolled a machine is read on the store's read connections, not in the
     /// writer's turn: answered while the writer is held by another call, with what the last enrollment committed, and
-    /// `admin` for a machine never enrolled.
+    /// `admin` for a machine never enrolled. The writer is held by a call that goes on only once both reads have
+    /// answered, so they answer while it holds the writer, or not at all (a read in the writer's turn would wait on it
+    /// as it waits on the read, and the test would never end): no clock says which, as a loaded machine's reads take
+    /// what time they take (1.35 s in one full parallel run on adacachy, 2026-11-20).
     #[test]
     fn g9_s5_who_enrolled_a_machine_is_read_beside_the_writer() -> anyhow::Result<()> {
         crate::rt::block_on(async {
@@ -1704,21 +1707,24 @@ mod tests {
             let store = Store::open(&dir.path().join("kiln.db"))?;
             enrolled(&store, "box", "user:sam").await?;
             enrolled(&store, "box", "user:ada").await?;
-            let hold = store.call(|_| {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                Ok(())
+            let (taken, holding) = futures::channel::oneshot::channel::<()>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let hold = store.call(move |_| {
+                let _ = taken.send(());
+                released.recv().map_err(|_| anyhow::anyhow!("the reads ended without letting the writer go"))
             });
-            let ask = async {
-                // The writer has taken the held call by now.
-                crate::rt::sleep(std::time::Duration::from_millis(200)).await;
-                let began = std::time::Instant::now();
-                let (by, never) = (enrolled_by(&store, "box").await, enrolled_by(&store, "never").await);
-                (by, never, began.elapsed())
+            let reader = &store;
+            let ask = async move {
+                // The writer holds the call from here until the reads have answered.
+                holding.await.map_err(|_| anyhow::anyhow!("the writer never took the held call"))?;
+                let answered = (enrolled_by(reader, "box").await, enrolled_by(reader, "never").await);
+                let _ = release.send(());
+                anyhow::Ok(answered)
             };
-            let (held, (by, never, took)) = futures::join!(hold, ask);
+            let (held, asked) = futures::join!(hold, ask);
             held?;
+            let (by, never) = asked?;
             anyhow::ensure!(by? == "ada" && never? == "admin", "the last enrollment's, and admin for none");
-            anyhow::ensure!(took < std::time::Duration::from_secs(1), "read in {took:?}, behind the writer's 2 s call");
             Ok(())
         })
     }

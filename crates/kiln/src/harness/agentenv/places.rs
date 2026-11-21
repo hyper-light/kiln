@@ -138,15 +138,22 @@ pub fn launchd_value(out: &str) -> Option<String> {
     (!v.is_empty()).then(|| v.to_owned())
 }
 
+/// What the systemd user manager sets from the user record (systemd.exec(5)): [`systemd_environment`] leaves it out.
+const SYSTEMD_ACCOUNT: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL"];
+
 /// `systemctl --user show-environment`: "the environment block that is passed to all processes the
 /// manager spawns" (`environment.d` and `systemctl --user set-environment` among it), one
 /// `VARIABLE=value` a line, a value with whitespace or characters special to the shell written
 /// `VARIABLE=$'value'`, dollar-single-quote escaped (systemctl(1), `show-environment`).
+/// Of it, what a user sets alone: not `HOME`, `USER`, `LOGNAME` or `SHELL`, which the manager sets for itself
+/// from the user record (systemd.exec(5), "Environment Variables in Spawned Processes"), as a runner's own
+/// process has them already from where it was started. Taken over the runner's, they'd name another home than
+/// the one its process was given (a test's runner, whose sessions then wrote into its machine's real home).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn systemd_environment(text: &str) -> Vec<(String, Option<String>)> {
     text.lines()
         .filter_map(|line| line.split_once('='))
-        .filter(|(k, _)| super::valid_name(k))
+        .filter(|(k, _)| super::valid_name(k) && !SYSTEMD_ACCOUNT.contains(k))
         .map(|(k, v)| (k.to_owned(), Some(v.strip_prefix("$'").and_then(|q| q.strip_suffix('\'')).map_or_else(|| v.to_owned(), unescape_dollar_single))))
         .collect()
 }
@@ -432,13 +439,15 @@ mod tests {
 
     #[test]
     fn systemds_environment_block_is_read_with_its_dollar_single_quotes() {
-        let text = "HOME=/home/u\nLANG=C.UTF-8\nMULTI=$'a b\\nc\\'d\\\\e\\x41\\101'\nODD=$'\\q'\nbad-name=x\n";
+        let text = "HOME=/home/u\nUSER=u\nLOGNAME=u\nSHELL=/usr/bin/fish\nLANG=C.UTF-8\nMULTI=$'a b\\nc\\'d\\\\e\\x41\\101'\nODD=$'\\q'\nbad-name=x\n";
         let got = systemd_environment(text);
         let v = |k: &str| got.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.clone());
-        assert_eq!(v("HOME").as_deref(), Some("/home/u"));
+        // The manager's own, from the user record, aren't the user's settings: the runner's process has them.
+        assert_eq!((v("HOME"), v("USER"), v("LOGNAME"), v("SHELL")), (None, None, None, None));
+        assert_eq!(v("LANG").as_deref(), Some("C.UTF-8"));
         assert_eq!(v("MULTI").as_deref(), Some("a b\nc'd\\eAA"));
         assert_eq!(v("ODD").as_deref(), Some("\\q"));
-        assert_eq!(got.len(), 4, "{:?}", got.iter().map(|(k, _)| k).collect::<Vec<_>>());
+        assert_eq!(got.len(), 3, "{:?}", got.iter().map(|(k, _)| k).collect::<Vec<_>>());
     }
 
     /// pam_env's `/etc/environment` (Ubuntu's PATH line among them).

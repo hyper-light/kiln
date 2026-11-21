@@ -295,6 +295,32 @@ mod tests {
     /// records by their kind and when it took them. No epoch raised, so older builds still open
     /// the database (they never name the column).
     #[test]
+    fn agentenv_stacks_carry_each_sessions_environment_over_as_its_top() -> anyhow::Result<()> {
+        // Environments' stacks (docs/agents.md, "Scopes, stacks, and applied on its own"): the one environment each
+        // session ran with becomes its stack's top, given by name; every environment unscoped and not applied on its
+        // own; agentenv_sessions kept for a kiln from before; no epoch raised.
+        const MINE: &str = "20261119-1200_agentenv_stacks";
+        let mut c = Connection::open_in_memory()?;
+        c.execute_batch(crate::store::SCHEMA)?;
+        let (before, after): (Vec<(&str, &str)>, Vec<(&str, &str)>) = MIGRATIONS.iter().copied().partition(|(n, _)| *n < MINE);
+        apply_list(&mut c, &before)?;
+        assert!(after.first().is_some_and(|(n, _)| *n == MINE), "{MINE} is shipped");
+        c.execute("INSERT INTO agentenvs (id, owner, name, base, vars, created_at, updated_at) VALUES ('e1', 'user:u', 'work', 'user', '[]', 1, 1)", [])?;
+        c.execute("INSERT INTO agentenv_sessions (session, agentenv_id, applied_at, applied_by) VALUES ('s1', 'e1', 5, 'user:u'), ('s2', 'e1', 6, 'kiln')", [])?;
+        apply_list(&mut c, &after)?;
+        assert!(apply_list(&mut c, MIGRATIONS)?.0.is_empty(), "applying again changes nothing");
+        let rows: Vec<(String, i64, String, bool, i64, String)> =
+            c.prepare("SELECT session, position, agentenv_id, auto, applied_at, applied_by FROM agentenv_stacks ORDER BY session")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?.collect::<Result<_, _>>()?;
+        assert_eq!(rows, [("s1".to_owned(), 0, "e1".to_owned(), false, 5, "user:u".to_owned()), ("s2".to_owned(), 0, "e1".to_owned(), false, 6, "kiln".to_owned())]);
+        let env: (String, bool) = c.query_row("SELECT scope, auto FROM agentenvs WHERE id = 'e1'", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        assert_eq!(env, ("[]".to_owned(), false));
+        let kept: i64 = c.query_row("SELECT COUNT(*) FROM agentenv_sessions", [], |r| r.get(0))?;
+        assert_eq!(kept, 2, "kept for a kiln from before");
+        assert_eq!(read_min_reader(&c)?, 0, "no epoch raised: older builds still open it");
+        Ok(())
+    }
+
+    #[test]
     fn w27_r08_relays_column() -> anyhow::Result<()> {
         const MINE: &str = "20261101-0200_w27_relays";
         let mut c = Connection::open_in_memory()?;

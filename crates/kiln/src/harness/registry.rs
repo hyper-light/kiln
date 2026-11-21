@@ -5133,7 +5133,7 @@ impl Registry {
     /// keeps that it runs with one: why not, where it can't be (a secret its owner deleted, a `secret` variable added
     /// since for a session in a microVM, its runner away).
     async fn agentenv_again(&self, hub: &Hub, id: &str) -> Result<(), String> {
-        if crate::agentenvs::linked(hub, id).is_none() {
+        if !crate::agentenvs::stacked(hub, id) {
             return Ok(());
         }
         let microvm = self.info(id).is_some_and(|i| i.isolation.is_some());
@@ -5338,7 +5338,7 @@ impl Registry {
         super::lineage::kept_agentfile(hub, pkg.spec.isolation.as_ref(), person.as_deref()).await?.into_spec(&mut pkg.spec);
         // Its environment, where kiln keeps that it runs with one, opened again for its harness's start there
         // (docs/agents.md, "Where they apply"): refused, staying where it is, where that runner runs none.
-        if crate::agentenvs::linked(hub, id).is_some() && !crate::agentenvs::resolve::speaks(hub, to) {
+        if crate::agentenvs::stacked(hub, id) && !crate::agentenvs::resolve::speaks(hub, to) {
             return Err(format!("it runs with an environment, and {}'s kiln runs no session with one: upgrade it (System → Updates)", hub.shown(to)));
         }
         pkg.spec.agentenv = crate::agentenvs::resolve::again(hub, id, pkg.spec.isolation.is_some(), "resumed from kiln's copy").await.map_err(|e| e.said())?;
@@ -5405,7 +5405,7 @@ impl Registry {
         let mut spec = s.resume_spec();
         // Its environment, where kiln keeps that it runs with one, opened again for its harness's start there
         // (docs/agents.md, "Where they apply").
-        if crate::agentenvs::linked(hub, id).is_some() && !crate::agentenvs::resolve::speaks(hub, to) {
+        if crate::agentenvs::stacked(hub, id) && !crate::agentenvs::resolve::speaks(hub, to) {
             return Err(format!("it runs with an environment, and {}'s kiln runs no session with one: upgrade it (System → Updates)", hub.shown(to)));
         }
         spec.agentenv = crate::agentenvs::resolve::again(hub, id, spec.isolation.is_some(), "moved from the kiln server").await.map_err(|e| e.said())?;

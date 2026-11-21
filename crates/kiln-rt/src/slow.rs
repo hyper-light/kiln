@@ -233,12 +233,21 @@ impl SlowTable {
 /// `crate::shard_loop::THREAD_CPU_FOR_SLOW_POLLS`), and its own time beside its task clock's (Linux,
 /// `crate::shard_loop::OWN_CPU_FOR_SLOW_POLLS`), the shard reads it only for tasks spawned at one of these, from the poll
 /// after their site's first slow one, so a site whose polls never held their shard that long costs none. The shard's
-/// own, one writer and no reader: open addressing over twice [`ENTRIES`] places, taken as the first site is learned, and
-/// no more sites than [`ENTRIES`] (the slow table's bound).
-#[derive(Debug, Default)]
+/// own, one writer and no reader: open addressing over twice [`ENTRIES`] places, made with the shard as its slow
+/// table's entries are, and no more sites than [`ENTRIES`] (the slow table's bound). Made as the first site was
+/// learned, the places were a poll's allocation: whichever poll first held its shard past [`SLOW_POLL_NS`], which a
+/// loaded host makes of any poll (2,048 bytes and their pages in a warm service's measured window,
+/// `tests/service_resources.rs`, 102 of 300 runs on a 32-core host at load 75, 2026-11-20).
+#[derive(Debug)]
 pub(crate) struct CpuSites {
     places: Box<[Option<&'static Location<'static>>]>,
     learned: usize,
+}
+
+impl Default for CpuSites {
+    fn default() -> Self {
+        Self { places: (0..ENTRIES.saturating_mul(2)).map(|_| None).collect(), learned: 0 }
+    }
 }
 
 impl CpuSites {
@@ -253,9 +262,6 @@ impl CpuSites {
     pub(crate) fn learn(&mut self, site: &'static Location<'static>) -> bool {
         if self.learned >= ENTRIES {
             return false;
-        }
-        if self.places.is_empty() {
-            self.places = (0..ENTRIES.saturating_mul(2)).map(|_| None).collect();
         }
         let Some(place) = self.place_of(site).and_then(|place| self.places.get_mut(place)) else {
             return false;

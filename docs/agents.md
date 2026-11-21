@@ -191,6 +191,8 @@ kiln plan 01a1cd8e862e7169a074db3d5fa33f3d decision 6).
 | `base` | `user`: the machine's user's environment (above), its variables over it; `clean`: only what the harness needs to run (its home, user, shell, search path, temporary folder, locale and time zone; on Windows also `SystemRoot`, `SystemDrive`, `ComSpec`, `PATHEXT`, `windir`, `APPDATA`, `LOCALAPPDATA`, `USERPROFILE`, `ProgramData`, `ProgramFiles`), its variables over that |
 | `vars` | in order, each `{name, from, of?, value?, secret?}`; a later one of a name wins |
 | `tags` | its owner's own labels for it, in order: each trimmed, once (case aside); found by the Engine tab's filter |
+| `scope` | where it's offered and applied (below, "Scopes, stacks, and applied on its own"): chips `{key, value}`, in order; none, everywhere |
+| `auto` | applied on its own to the owner's sessions its scope matches (below); off by default |
 | `version`, `created_at`, `updated_at` | its version goes up with each change; a session says the version it started with |
 
 A variable's `name` is a portable one (`[A-Za-z_][A-Za-z0-9_]*`; on Windows, names differ by more
@@ -214,8 +216,9 @@ the runner's own. The search path is the machine's as above unless the environme
 `clean` base takes nothing of its user's side, the shell `kiln spawn` took included: only what its
 environment names over what a harness needs.
 
-An agent another agent starts, and a branch, runs with its parent's environment unless its start
-names one. A runner keeps a session's environment in its memory alone: after the runner starts
+An agent another agent starts runs with its parent's stack (below) unless its start names one: those its parent
+was given by name, with those applied on their own matched again for it; a branch runs with its source's whole
+stack. A runner keeps a session's environment in its memory alone: after the runner starts
 again, hands its sessions to a newer process, or a session moves, the server sends it again.
 
 A session in a microVM takes an environment's `machine` and `value` variables into its harness's
@@ -231,6 +234,66 @@ crash or a runner's restart, moved. An environment applied to a running session 
 again at once, or once the turn under way ends, unless it is told to wait for its next start (`restart: false`). An environment some
 session runs with can't be deleted: the refusal names those sessions.
 
+### Scopes, stacks, and applied on its own
+
+Decided by the user (2026-11-19): an environment is scoped to where it applies, a session runs with
+a stack of them, and one may apply itself to the sessions its scope matches.
+
+**A scope** is chips, each `{key, value}`:
+
+| `key` | matches a session whose | `value` |
+|---|---|---|
+| `machine` | runner's machine (`local`: the server) | the machine's id |
+| `os` | machine's system | `linux`, `macos`, `windows` |
+| `arch` | machine's architecture, as OCI names it | `amd64`, `arm64` |
+| `harness` | harness | its id (`claude`, `codex`, …) |
+| `agent` | agent definition it started from (`agentdefs`) | the definition's id (`kiln:<name>` for kiln's own) |
+| `model` | model | the model as the session names it |
+| `permission` | harness's permission mode | `<harness>:<mode>` (`claude:plan`): a mode is its harness's own |
+| `effort` | harness's effort | `<harness>:<effort>` (`codex:high`) |
+
+Chips of one key are any of them; chips of different keys are all of them: `harness: claude,
+harness: codex, os: linux` is a Claude Code or Codex session on Linux. `permission` and `effort`
+chips name their harness, so `permission: claude:plan` matches Claude Code sessions in plan mode
+and no other harness's; with `agent` chips beside them they're that agent's. No chips: every
+session, on every connected runner (the default). A session is matched by what it is as it starts,
+and again whenever the environment's scope or `auto` changes: a session whose model or mode changes
+as it runs isn't matched again until then.
+
+The same chips find environments: the Engine tab's filter takes them (and starts from the
+session's own: its machine, system, architecture, harness, agent, model, permission and effort),
+and the environments it offers a session, there and in the composer, are those whose scope matches
+it. One whose scope doesn't match can still be applied by name (`agentenvs.apply`): a scope says
+where it's offered and applied on its own, not where it's forbidden.
+
+**A stack.** A session runs with any number of environments, in order, the top one first. Where two
+set the same variable, the one higher up wins; the base is the top one's. They're opened together
+as the harness starts (each its newest version, its secrets read again) into what the runner gets,
+one environment as before (`agentenv`, on the wire: no runner upgrade): its `id` the stack's ids,
+top first, joined by `+`, its `name` theirs joined by ` + `, its `version` 0 (a stack of one: that
+one's id, name and version, as before), its variables the bottom one's first and the top one's last
+(a later one of a name wins). The Engine tab orders a
+session's stack by dragging a row or with its up and down buttons, and takes one out; a change
+starts the harness again on its conversation, as applying one does.
+
+**Applied on its own** (`auto`). An environment with `auto` on joins the stack of each of its
+owner's sessions its scope matches: as one starts, and, when its scope or `auto` changes, each of
+their sessions running (without starting its harness again: it takes it as its harness next starts,
+and the Engine tab says so). Those it joins go under the environments the session was given by
+name, the one with more chips over one with fewer (more specific first), then by name. Turned off,
+or its scope changed so a session no longer matches, it leaves the stacks it joined on its own,
+not those it was put in by name. An environment with `secret` variables never joins a session in a
+microVM on its own (it's skipped there, never refusing the start, and one given a secret since leaves
+those it joined); given by name it's refused, as above. Applying (`agentenvs.apply`) names those a session is given
+by name, top first: those applied on their own that match it stay under them in their order (and
+any that match and aren't there join), one named among them is given by name from then on, at its
+place, and `[]` leaves those applied on their own alone over its machine's user's environment.
+
+**In a microVM, per agent.** A stack is a session's, and a session is one agent: in a microVM its
+variables go into that agent's harness member alone (`Elsewhere::env`), never the microVM's own
+environment or another member's, so agents sharing a microVM see only their own. `agent` and
+`harness` chips scope an environment to some of a microVM's agents and not others.
+
 ### What a machine's user has
 
 A runner says which variables its user has and where each is set, by name alone, never a value
@@ -239,7 +302,7 @@ A runner says which variables its user has and where each is set, by name alone,
 | System | Where it looks | `sources` |
 |---|---|---|
 | macOS | the login shell (`$SHELL -l -i`, above); launchd's user domain (`launchctl getenv`, for the names `launchctl` reports set) | `login_shell`, `launchd` |
-| Linux | the login shell; the systemd user manager, where one answers (`systemctl --user show-environment`: `environment.d`, `systemctl --user set-environment`); PAM's `pam_env`, where a PAM stack loads it (`/etc/security/pam_env.conf`, `/etc/environment`, each from `/usr/etc` where `/etc` has none; `~/.pam_environment` where a stack sets `user_readenv=1`) | `login_shell`, `systemd_user`, `pam` |
+| Linux | the login shell; the systemd user manager, where one answers (`systemctl --user show-environment`: `environment.d`, `systemctl --user set-environment`; not the `HOME`, `USER`, `LOGNAME` and `SHELL` it sets for itself from the user record, systemd.exec(5), which the runner's process has from where it started); PAM's `pam_env`, where a PAM stack loads it (`/etc/security/pam_env.conf`, `/etc/environment`, each from `/usr/etc` where `/etc` has none; `~/.pam_environment` where a stack sets `user_readenv=1`) | `login_shell`, `systemd_user`, `pam` |
 | Windows | the user's and the system's environment in the registry (`HKCU\Environment`, `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`), `REG_EXPAND_SZ` expanded as Windows does | `user_registry`, `system_registry` |
 | every | the runner's own process | `runner` |
 
@@ -249,14 +312,15 @@ A runner says which variables its user has and where each is set, by name alone,
 |---|---|---|
 | `agentenvs.list` | `GET /api/agentenvs` | → `{agentenvs: Agentenv[]}`, its caller's, by name, each with `sessions` (the ids of those running with it) |
 | `agentenvs.get` | `GET /api/agentenvs/:id` | → `Agentenv`; 404 when it isn't the caller's |
-| `agentenvs.create` | `POST /api/agentenvs` | `{name, description?, base, vars}` → `Agentenv`; 409 when the name is taken; 400 naming a bad variable or a secret the caller hasn't |
-| `agentenvs.update` | `PATCH /api/agentenvs/:id` | `{version, name?, description?, base?, vars?}` → `Agentenv`; 409 when `version` isn't its current one |
+| `agentenvs.create` | `POST /api/agentenvs` | `{name, description?, base, vars, tags?, scope?, auto?}` → `Agentenv`; 409 when the name is taken; 400 naming a bad variable or a secret the caller hasn't |
+| `agentenvs.update` | `PATCH /api/agentenvs/:id` | `{version, name?, description?, base?, vars?, tags?, scope?, auto?}` → `Agentenv`; 409 when `version` isn't its current one |
 | `agentenvs.delete` | `DELETE /api/agentenvs/:id` | → 204; 409 naming the sessions that run with it |
 | `agentenvs.machine` | `GET /api/agentenvs/machine?target=` | → `{vars: [{name, sources}]}` of that machine's user, by name; 502 while it's away |
-| `agentenvs.apply` | `PUT /api/harness/sessions/:id/agentenv` | `{agentenv: id \| null, restart?: true}` → `{agent, agentenv, restarted}`: `null` puts it back on the machine's user's environment |
-| (start) | `agents.start`, `POST /api/harness/agents` | `agentenv?: id`, the environment it starts with |
+| `agentenvs.apply` | `PUT /api/harness/sessions/:id/agentenv` | `{agentenvs: id[], restart?: true}`, those the session is given by name, top first, those applied on their own that match it under them (above) → `{agent, stack, restarted}`: `[]`, those applied on their own alone over the machine's user's environment |
+| `agentenvs.session` | `GET /api/harness/sessions/:id/agentenv` | → `{facts, stack, matching}`: what the session is as scopes see it (`{machine, os, arch, harness, agent?, model, permission, effort?}`), its stack (each `{id, name, version, auto}`: `auto` where it joined on its own), and the ids of the caller's environments whose scope matches it |
+| (start) | `agents.start`, `POST /api/harness/agents` | `agentenvs?: id[]`, the stack it starts with, top first; those applied on their own join under them |
 
-`AgentInfo` says `agentenv?: {id, name, version}` of each session. Each change is an `agentenv`
+`AgentInfo` says `agentenv?: {id, name, version}` of each session: its stack as the runner holds it (above). Each change is an `agentenv`
 event (`{type, agentenv, deleted?}`) on `/api/events`. A refusal is typed (`agentenv_unknown`,
 `agentenv_name_taken`, `agentenv_stale`, `agentenv_in_use`, `agentenv_secret_missing`,
 `agentenv_secret_in_microvm`, `agentenv_bad_var`), its text the UI's to show.
@@ -273,7 +337,11 @@ variables with `ServerMsg::UserEnv`, answered as `Answer`.
 Every agent's Engine tab has its Environments, beside its Agents (and its Sandboxes, in a
 microVM): a section that folds, found by a filter with facets (Base, What it uses: machine
 variables, values, secrets; Where: this session's, others', none) and sorted (newest, oldest, name,
-most variables, most sessions), a card each, this session's first and marked. A card is its name,
+most variables, most sessions), a card each, this session's first and marked. Its scope chips (its
+own row, apart from its tags) filter the cards, starting from the session's own; the session's
+stack is listed above them, top first, reordered by dragging or with up and down, each one taken
+out with ×, and a card's Apply puts it on top. A card's scope is edited as chips too, beside its
+`auto` switch ("Apply on its own"). A card is its name,
 base and version, its variables a line each (name, where it comes from, a value shown or a secret's
 name, never a secret's value), and the sessions running with it; it's changed in place, and applied
 to this session from there, the card saying the session starts again on its conversation. A new
