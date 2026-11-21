@@ -599,10 +599,12 @@ mount down. `SLATES_FLEET_LIVE_MOVE=local` runs three runners on one Mac; `=<run
 start together (a listed runner joins once the server lists every node, A-734); a moved agent whose turn was over waits
 on its new runner for its next message, kiln's hand-off going with it. What it found by use, each fixed: no runner
 founded the fleet's groups; a moved volume wasn't shared with its new runner; and a moved captured clone wasn't found by
-its name on its new owner, so its mount was refused `NOENT` in four runs of five (Slates' A-756, carried as
-`vendor/patches/slates/0004` until kiln takes a Slates revision with it). Slates still refuses most first asks
-`unplaced` (asked again every 30 s), and kiln's first mount of a workspace doesn't wait on Slates' `refused for now`
-(`LeaseUnconfirmed` across a LAN), so the test starts the agent again on it.
+its name on its new owner, so its mount was refused `NOENT` in four runs of five (Slates' A-756, in the Slates kiln
+takes); and a move's first asks were refused `unplaced` while its head was carried and placed off its owner (Slates'
+A-784, carried as `vendor/patches/slates/0002` until kiln takes a Slates revision with it: a move prepares unfrozen and
+freezes only once ready; release, one Mac, the first ask reported at 24.6 s, the live move 49.5 s against 112 s). kiln's
+first mount of a workspace doesn't wait on Slates' `refused for now` (`LeaseUnconfirmed` across a LAN), so the test starts
+the agent again on it.
 
 **W8 Shards.** An isolated session (`isolation: {"kind": "microvm"}`) runs its harness in a Shards
 microVM built from an image (an Agentfile, W21-R01; docs/isolation.md), its network what kiln allows.
