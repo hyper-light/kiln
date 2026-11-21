@@ -861,9 +861,9 @@ pub struct Hub {
     pub flight: crate::ci::services::memo::Flights,
     /// What wakes the relay of kiln's events from their outbox to the bus (`crate::events`).
     pub relay: crate::events::Relay,
-    /// The run-lease broker's lessors, once the server opened them for its own runner (`crate::secrets::lessor::open`):
-    /// the one broker every runner's microVMs lease from, others' over their links (`crate::secrets::lessor::answer`),
-    /// so a sign-in is refreshed one at a time across every run (Shards' D242).
+    /// The run-lease broker's lessors, once the server opened them as it started (`crate::secrets::lessor::open`), its
+    /// own runner or none: the one broker every runner's microVMs lease from, others' over their links
+    /// (`crate::secrets::lessor::answer`), so a sign-in is refreshed one at a time across every run (Shards' D242).
     pub lessors: std::sync::OnceLock<crate::secrets::lessor::Lessors>,
 }
 
@@ -1415,6 +1415,14 @@ impl Hub {
     pub fn shown(&self, name: &str) -> String {
         let live = self.agents.load().get(name).and_then(|a| a.label.clone());
         live.or_else(|| self.labels.load().get(name).cloned()).unwrap_or_else(|| name.to_owned())
+    }
+
+    /// The features the server names to a runner (docs/wire.md, "Named features"): every one it speaks, but
+    /// `secrets.leases` only while its run-lease broker is open ([`Hub::lessors`]): a runner told it grants its
+    /// microVMs' harnesses their sign-ins from it, which none could have from a broker that isn't open (plan step 33).
+    pub fn features(&self) -> Vec<String> {
+        let leases = self.lessors.get().is_some();
+        proto::feature::ALL.iter().filter(|name| leases || **name != proto::feature::LEASES).map(|name| (*name).to_owned()).collect()
     }
 
     /// The machine a runner that names itself `name` is (docs/machines.md, "One record a machine"):
@@ -3744,7 +3752,7 @@ impl Hub {
                 // One that speaks named features is told the server's (docs/wire.md, "Named
                 // features"); it says its own.
                 if caps & proto::CAP_FEATURES != 0 {
-                    self.send_peer(peer, &ServerMsg::Features { names: proto::feature::all() }).await;
+                    self.send_peer(peer, &ServerMsg::Features { names: self.features() }).await;
                 }
             }
             // The features it speaks by name: each says them all, superseding the last.

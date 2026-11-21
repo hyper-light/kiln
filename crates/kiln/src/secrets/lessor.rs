@@ -1373,6 +1373,44 @@ mod tests {
         Ok(())
     }
 
+    /// Plan step 33 (D242), as production runs it (2026-11-20, `[local_agent]` off): the server names `secrets.leases` to
+    /// its runners only while its broker is open ([`crate::hub::Hub::features`]), and once it is (as it starts, its own
+    /// runner or none: `crate::server`), its runner's isolated agent's sign-in is captured and leased. Named with no
+    /// broker open, every runner's microVMs were granted sign-ins it refused, "its server's run-lease broker isn't open",
+    /// and Claude Code in each said "Not logged in".
+    #[test]
+    fn s33_a_server_names_leases_only_while_its_broker_is_open() -> anyhow::Result<()> {
+        use crate::harness::core::Update;
+        use crate::harness::registry::Location;
+        use crate::harness::session::{Info, Isolation};
+        let Some((u, broker, _)) = stores()?.into_iter().next() else { anyhow::bail!("no store to lease from") };
+        let clock: Arc<dyn Clock> = Arc::new(u.clock.clone());
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            hub.put_agent(crate::hub::tests::live_runner("r1", "macos", "aarch64"));
+            let isolation = Isolation { kind: Isolation::MICROVM.into(), image: None, person: Some("owner".into()), cpus: None, memory: None, disk: None };
+            let info = Info { id: "claude-vm".into(), kind: "claude".into(), isolation: Some(isolation), ..Info::default() };
+            hub.harness.ingest(&Location::Machine("r1".into()), "claude-vm", Update::Open { info: Box::new(info), since: None }).await;
+            let capture = || Ask::Capture { sign_in: "claude/owner".into(), access: Carried::new(Value::new(b"at-owner".to_vec())), refresh: None, expires_in: None, scope: None };
+            let names = |hub: &crate::hub::Hub| hub.features().iter().any(|n| n == crate::proto::feature::LEASES);
+
+            anyhow::ensure!(!names(&hub), "it named {} with no broker open", crate::proto::feature::LEASES);
+            let shut = asked_of(&hub, "r1", capture()).await?;
+            anyhow::ensure!(matches!(shut, Answer::Refused { said: Said::Unavailable { .. } }), "with no broker open: {shut:?}");
+
+            hub.lessors.set(Lessors::new(broker, clock)).map_err(|_| anyhow::anyhow!("its lessors were open already"))?;
+            anyhow::ensure!(names(&hub), "it didn't name {} with its broker open", crate::proto::feature::LEASES);
+            let others = hub.features().into_iter().filter(|n| n != crate::proto::feature::LEASES).count();
+            anyhow::ensure!(others + 1 == crate::proto::feature::ALL.len(), "it named {others} other features of {}", crate::proto::feature::ALL.len() - 1);
+            let Answer::Captured { captured } = asked_of(&hub, "r1", capture()).await? else { anyhow::bail!("r1's isolated agent's sign-in wasn't captured") };
+            anyhow::ensure!(captured.access == "sign-ins/claude/owner/access", "{captured:?}");
+            let leased = asked_of(&hub, "r1", Ask::Lease { identity: "a1".repeat(32), reference: captured.access }).await?;
+            let Answer::Leased { value, .. } = leased else { anyhow::bail!("r1's isolated agent's sign-in wasn't leased: {leased:?}") };
+            anyhow::ensure!(value.0.expose() == b"at-owner", "another value was leased");
+            anyhow::Ok(())
+        })
+    }
+
     /// Plan step 33 (D242): a runner other than the server's own leases through its link. Its run's lessor ([`Remote`])
     /// puts each ask to its server through its reach node (`Handle::lessor`) as a `lessor` question, its tokens hex
     /// there alone, and the server's answer comes back as the broker gave it: a capture's placeholders, its access token
