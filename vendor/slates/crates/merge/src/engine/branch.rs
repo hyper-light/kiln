@@ -8,7 +8,16 @@
 //! head identity to `v` by the same keys (the identity is a set hash, `crate::identity`: an entry out, an entry in). The
 //! new green's histories, last-change indexes and change index start empty: by the engine's one history rule every key
 //! has held its value since version 0. It answers every read as a green seeded from a copy of the other's state at `v`
-//! does ([`Green::with_origin`], the copying reference its tests hold it to).
+//! does ([`Green::with_origin`], the copying reference its tests hold it to). A copy the other made after `v` (A-586) is
+//! taken away first, its tree cut from the new green's maps in O(its destination's length) and its entry out of the
+//! identity, with the entry it gave each key that changed after it back in. Every key the change index names is read at
+//! `v` as the green's readers read it, the copies above it counted, and set back where that differs from what the new
+//! green holds once the cuts are made: a key of a cut tree that held a value at `v` is set back whatever the head holds
+//! (A-626; until then a key equal at both ends was left cut, which a replace that gives a tree back meets, and a key read
+//! at `v` from its own history alone, before a copy at or before `v` that gave it its value, was set to the older
+//! value). A copy made at or before `v` is part of the
+//! state the new green starts from: its keys hold their values since version 0 there, and its entry stays in the
+//! identity's sum, which a recount of the new green's own state does not reproduce (its records stay with the other).
 //!
 //! **What it costs.** Let `E` be the change index's entries in `(v, head]`, `c` the paths they name, `L` the longest
 //! such path in bytes, `n` the keys a history map holds and `B` the bytes of the changed files at `v` and at the head.
@@ -37,8 +46,8 @@ use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
 use super::{
-  Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, dir_entry, file_entry, history_at,
-  link_entry, mode_entry, present_at, relink, special_entry, xattr_entry,
+  Green, IDENTITY_TAG_HARDLINK, IDENTITY_TAG_SYMLINK, IdentityKey, dir_entry, file_entry,
+  link_entry, mode_entry, relink, special_entry, xattr_entry,
 };
 use crate::dims::{Arenas, GreenRelease};
 use crate::identity::{Entry, SetHash};
@@ -54,6 +63,9 @@ enum Revert {
   Symlink(String, Option<String>),
   Hardlink(String, Option<String>),
   Xattr(String, String, Option<Vec<u8>>),
+  /// A copy's tree taken away, made after the version (A-586): applied before every other revert, so the keys set back
+  /// beneath it land where it stood.
+  Cut(String),
 }
 
 /// Why a lineage refused a call.
@@ -81,15 +93,25 @@ pub enum LineageRefused {
   Busy,
 }
 
-/// The value a branch sets a key back to, when it differs from the head's: `history`'s entry at `version` against
-/// `now`. A key with no history never changed, so it is never set back.
-fn changed_since<T: Clone + PartialEq>(
-  history: Option<&Vec<(u64, Option<T>)>>,
-  now: Option<&T>,
-  version: u64,
+/// Whether one dimension's key at a path has a history of its own, with the key it names there
+/// ([`Green::keys_with_history`]).
+type HasHistory = (bool, fn(String) -> IdentityKey);
+
+/// What a branch does to one key (module docs): its value at the version (`then`, read as the green's readers read it)
+/// against the head's (`now`); the identity's entry exchanged when they differ, and the key set back when `then`
+/// differs from what the branch holds once its cuts are made, nothing for a key in a tree a cut took away (`cut`). The
+/// value to set back, when one is owed.
+fn set_back<T: PartialEq>(
+  identity: &mut SetHash,
+  (then, now): (Option<T>, Option<&T>),
+  cut: bool,
+  entry: impl Fn(&T) -> Entry,
 ) -> Option<Option<T>> {
-  let then = history_at(history?, version);
-  (then.as_ref() != now).then_some(then)
+  if then.as_ref() != now {
+    exchange(identity, now.map(&entry), then.as_ref().map(&entry));
+  }
+  let held = now.filter(|_| !cut);
+  (then.as_ref() != held).then_some(then)
 }
 
 /// Moves `identity` from an entry to another: the head's out, the version's in (either absent).
@@ -181,25 +203,106 @@ impl Green {
     Ok((branch, reverted))
   }
 
-  /// Every key whose value at `version` differs from the head's, as the revert that sets it back, read from the
-  /// histories of the paths the change index names in `(version, head]`; `identity` (this green's at its head) is moved
-  /// to `version` by the same keys.
+  /// `identity`, this green's sum at its head, moved to `version` as a branch at `version` moves it ([`Green::reverts`]):
+  /// what a checkpoint at `version` carries (A-626 part 3, `copy_checkpoint`).
+  pub(super) fn identity_moved_to(&self, version: u64, identity: &mut SetHash) {
+    self.reverts(version, identity);
+  }
+
+  /// Every key whose value at `version` differs from what the new green holds once its cuts are made (the head's, or
+  /// nothing in a cut tree), as the revert that sets it back, read for the paths the change index names in
+  /// `(version, head]`; `identity` (this green's at its head) is moved to `version` by the keys whose value differs
+  /// from the head's.
   fn reverts(&self, version: u64, identity: &mut SetHash) -> Vec<Revert> {
-    let mut reverts = Vec::new();
-    for path in self.changed_between(version, self.head()) {
-      self.file_reverts(&path, version, identity, &mut reverts);
-      self.node_reverts(&path, version, identity, &mut reverts);
-      self.link_reverts(&path, version, identity, &mut reverts);
-      self.xattr_reverts(&path, version, identity, &mut reverts);
+    let changed = self.changed_between(version, self.head());
+    let mut reverts = self.copy_reverts(&changed, version, identity);
+    for path in &changed {
+      // A copy made after the version takes its whole tree away, keys equal at both ends among them (A-626).
+      let cut = !self.copies_above_after(path, version).is_empty();
+      self.file_reverts(path, (version, cut), identity, &mut reverts);
+      self.node_reverts(path, (version, cut), identity, &mut reverts);
+      self.link_reverts(path, (version, cut), identity, &mut reverts);
+      self.xattr_reverts(path, (version, cut), identity, &mut reverts);
+      self.copied_reverts(path, version, identity);
     }
     reverts
   }
 
-  /// [`Green::reverts`] of `path`'s bytes.
+  /// [`Green::reverts`] of the copies made after `version` (A-586), first: each one's tree cut and its entry taken out
+  /// of `identity`, which then no longer stands for the tree's entries. The change index names each copy's destination at
+  /// its version, so this costs the paths it names.
+  fn copy_reverts(&self, changed: &[String], version: u64, identity: &mut SetHash) -> Vec<Revert> {
+    let mut reverts = Vec::new();
+    for dst in changed {
+      let entries = self.copy_entries_after(dst, version);
+      if entries.is_empty() {
+        continue;
+      }
+      for entry in &entries {
+        identity.remove(entry);
+      }
+      reverts.push(Revert::Cut(dst.clone()));
+    }
+    reverts
+  }
+
+  /// [`Green::reverts`] of the entries copies made after `version` gave `path`'s keys (A-586): put back into `identity`
+  /// for every key there with a history of its own, since that key's exchange takes out its head entry (or, equal at
+  /// both ends, leaves its entry at `version` standing), and the copy's entry, taken out, stood for the one it gave. A
+  /// key with no history at a path a copy after `version` covers held nothing then and holds the copy's value now, so it
+  /// moves nothing. Until A-626 only keys with a change after `version` were counted, which missed a copy's own
+  /// destination when its history ended before the copy (removed, then copied over).
+  fn copied_reverts(&self, path: &str, version: u64, identity: &mut SetHash) {
+    if self.copies_above_after(path, version).is_empty() {
+      return;
+    }
+    for key in self.keys_with_history(path) {
+      for entry in self.copied_entries(&key, version) {
+        identity.add(&entry);
+      }
+    }
+  }
+
+  /// `path`'s keys, in every dimension, that have a history of their own.
+  fn keys_with_history(&self, path: &str) -> Vec<IdentityKey> {
+    let recorded: &[HasHistory] = &[
+      (self.content_history.contains_key(path), IdentityKey::File),
+      (
+        self.special_history.contains_key(path),
+        IdentityKey::Special,
+      ),
+      (self.dir_history.contains_key(path), IdentityKey::Dir),
+      (self.mode_history.contains_key(path), IdentityKey::Mode),
+      (
+        self.symlink_history.contains_key(path),
+        IdentityKey::Symlink,
+      ),
+      (
+        self.hardlink_history.contains_key(path),
+        IdentityKey::Hardlink,
+      ),
+    ];
+    let mut keys: Vec<IdentityKey> = recorded
+      .iter()
+      .filter(|(held, _)| *held)
+      .map(|(_, key)| key(path.to_owned()))
+      .collect();
+    let from = (path.to_owned(), String::new());
+    keys.extend(
+      self
+        .xattr_history
+        .range(from..)
+        .take_while(|((at, _), _)| at == path)
+        .map(|((_, name), _)| IdentityKey::Xattr(path.to_owned(), name.clone())),
+    );
+    keys
+  }
+
+  /// [`Green::reverts`] of `path`'s bytes. `cut`: a copy made after `version` took `path`'s tree away.
   fn file_reverts(
     &self,
     path: &str,
-    version: u64,
+    (version, cut): (u64, bool),
     identity: &mut SetHash,
     reverts: &mut Vec<Revert>,
   ) {
@@ -214,6 +317,8 @@ impl Green {
         now.map(|bytes| file_entry(path, bytes)),
         then.as_deref().map(|bytes| file_entry(path, bytes)),
       );
+    }
+    if then.as_deref() != now.filter(|_| !cut) {
       reverts.push(Revert::File(path.to_owned(), then.map(Cow::into_owned)));
     }
   }
@@ -222,41 +327,34 @@ impl Green {
   fn node_reverts(
     &self,
     path: &str,
-    version: u64,
+    (version, cut): (u64, bool),
     identity: &mut SetHash,
     reverts: &mut Vec<Revert>,
   ) {
-    let now = self.specials.get(path);
-    if let Some(then) = changed_since(self.special_history.get(path), now, version) {
-      exchange(
-        identity,
-        now.map(|node| special_entry(path, node)),
-        then.as_ref().map(|node| special_entry(path, node)),
-      );
-      reverts.push(Revert::Special(path.to_owned(), then));
+    if self.special_history.contains_key(path) {
+      let pair = (self.special_at(path, version), self.specials.get(path));
+      if let Some(then) = set_back(identity, pair, cut, |node| special_entry(path, node)) {
+        reverts.push(Revert::Special(path.to_owned(), then));
+      }
     }
-    let present = self.dirs.contains_key(path);
-    if let Some(then) = self
-      .dir_history
-      .get(path)
-      .map(|history| present_at(history, version))
-      .filter(|then| *then != present)
-    {
-      exchange(
-        identity,
-        present.then(|| dir_entry(path)),
-        then.then(|| dir_entry(path)),
-      );
-      reverts.push(Revert::Dir(path.to_owned(), then));
+    if self.dir_history.contains_key(path) {
+      let (then, now) = (self.dir_at(path, version), self.dirs.contains_key(path));
+      if then != now {
+        exchange(
+          identity,
+          now.then(|| dir_entry(path)),
+          then.then(|| dir_entry(path)),
+        );
+      }
+      if then != (now && !cut) {
+        reverts.push(Revert::Dir(path.to_owned(), then));
+      }
     }
-    let now = self.modes.get(path);
-    if let Some(then) = changed_since(self.mode_history.get(path), now, version) {
-      exchange(
-        identity,
-        now.map(|mode| mode_entry(path, *mode)),
-        then.map(|mode| mode_entry(path, mode)),
-      );
-      reverts.push(Revert::Mode(path.to_owned(), then));
+    if self.mode_history.contains_key(path) {
+      let pair = (self.mode_at(path, version), self.modes.get(path));
+      if let Some(then) = set_back(identity, pair, cut, |mode| mode_entry(path, *mode)) {
+        reverts.push(Revert::Mode(path.to_owned(), then));
+      }
     }
   }
 
@@ -264,31 +362,23 @@ impl Green {
   fn link_reverts(
     &self,
     path: &str,
-    version: u64,
+    (version, cut): (u64, bool),
     identity: &mut SetHash,
     reverts: &mut Vec<Revert>,
   ) {
-    let now = self.symlinks.get(path);
-    if let Some(then) = changed_since(self.symlink_history.get(path), now, version) {
-      exchange(
-        identity,
-        now.map(|target| link_entry(IDENTITY_TAG_SYMLINK, path, target)),
-        then
-          .as_deref()
-          .map(|target| link_entry(IDENTITY_TAG_SYMLINK, path, target)),
-      );
-      reverts.push(Revert::Symlink(path.to_owned(), then));
+    let symlink = |target: &String| link_entry(IDENTITY_TAG_SYMLINK, path, target);
+    if self.symlink_history.contains_key(path) {
+      let pair = (self.symlink_at(path, version), self.symlinks.get(path));
+      if let Some(then) = set_back(identity, pair, cut, symlink) {
+        reverts.push(Revert::Symlink(path.to_owned(), then));
+      }
     }
-    let now = self.hardlinks.get(path);
-    if let Some(then) = changed_since(self.hardlink_history.get(path), now, version) {
-      exchange(
-        identity,
-        now.map(|target| link_entry(IDENTITY_TAG_HARDLINK, path, target)),
-        then
-          .as_deref()
-          .map(|target| link_entry(IDENTITY_TAG_HARDLINK, path, target)),
-      );
-      reverts.push(Revert::Hardlink(path.to_owned(), then));
+    let hardlink = |target: &String| link_entry(IDENTITY_TAG_HARDLINK, path, target);
+    if self.hardlink_history.contains_key(path) {
+      let pair = (self.hardlink_at(path, version), self.hardlinks.get(path));
+      if let Some(then) = set_back(identity, pair, cut, hardlink) {
+        reverts.push(Revert::Hardlink(path.to_owned(), then));
+      }
     }
   }
 
@@ -296,23 +386,22 @@ impl Green {
   fn xattr_reverts(
     &self,
     path: &str,
-    version: u64,
+    (version, cut): (u64, bool),
     identity: &mut SetHash,
     reverts: &mut Vec<Revert>,
   ) {
     let from = (path.to_owned(), String::new());
-    for ((_, name), history) in self
+    for ((_, name), _) in self
       .xattr_history
       .range(from..)
       .take_while(|((at, _), _)| at == path)
     {
-      let now = self.xattrs.get(path, name);
-      if let Some(then) = changed_since(Some(history), now, version) {
-        exchange(
-          identity,
-          now.map(|value| xattr_entry(path, name, value)),
-          then.as_deref().map(|value| xattr_entry(path, name, value)),
-        );
+      let pair = (
+        self.xattr_at(path, name, version),
+        self.xattrs.get(path, name),
+      );
+      let entry = |value: &Vec<u8>| xattr_entry(path, name, value);
+      if let Some(then) = set_back(identity, pair, cut, entry) {
         reverts.push(Revert::Xattr(path.to_owned(), name.clone(), then));
       }
     }
@@ -362,6 +451,16 @@ impl Green {
       Revert::Xattr(path, name, None) => {
         self.xattrs.remove(&path, &name);
       }
+      Revert::Cut(dst) => {
+        // The reverse map of hard links holds nothing a copy brought: a copy's source holds no link (A-586).
+        self.content.cut_tree(&dst);
+        self.specials.cut_tree(&dst);
+        self.dirs.cut_tree(&dst);
+        self.modes.cut_tree(&dst);
+        self.symlinks.cut_tree(&dst);
+        self.hardlinks.cut_tree(&dst);
+        self.xattrs.cut_tree(&dst);
+      }
     }
   }
 }
@@ -401,12 +500,14 @@ pub struct Lineage {
 #[derive(Debug, Default)]
 pub struct Release {
   maps: GreenRelease,
+  /// The green's content history chunks, whose files' blocks it holds (A-728), given back a chunk a step.
+  history: crate::history::Chunks,
 }
 
 impl Release {
   /// Whether every hold has been given back.
   pub fn is_done(&self) -> bool {
-    self.maps.is_done()
+    self.history.is_released() && self.maps.is_done()
   }
 }
 
@@ -561,21 +662,26 @@ impl Lineage {
     }
     let mut green = self.unseat(handle)?;
     let maps = green.releasing();
+    let history = std::mem::take(&mut green.chunks);
     if let Some(place) = self.seats.get_mut(handle.seat) {
       place.generation = place.generation.saturating_add(1);
     }
     self.free.push(handle.seat);
-    Ok(Release { maps })
+    Ok(Release { maps, history })
   }
 
-  /// One step of `release`: one node's hold given back, the node freed, and its file's block let go, when no other
+  /// One step of `release`: one chunk of its content history given back, its file's block let go when nothing else
+  /// holds it (A-728), or else one node's hold given back, the node freed, and its file's block let go, when no other
   /// member names it. False once every hold is back; refused `Busy` while a member is out, since the arenas are then in
   /// its engine.
   pub fn release_step(&mut self, release: &mut Release) -> Result<bool, LineageRefused> {
     if self.out.is_some() {
       return Err(LineageRefused::Busy);
     }
-    Ok(self.arenas.release_step(&mut release.maps))
+    Ok(
+      release.history.release_step(&mut self.arenas.blocks)
+        || self.arenas.release_step(&mut release.maps),
+    )
   }
 
   /// The members seated.

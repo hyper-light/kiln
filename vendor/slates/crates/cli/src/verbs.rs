@@ -6,7 +6,8 @@ use slates_api::{Instance, Issuer};
 use slates_client::{
   AttachRequest, AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport,
   Digest, Established, GrantScope, GrantSummary, GreenBase, Intent, Landing, Principal, Rebased,
-  Rights, Scope, SnapshotId, StatusReport, Submitted, TelemetryReport, VolumeId, VolumeSummary,
+  RepositorySpec, Rights, Scope, SnapshotId, StatusReport, Submitted, TelemetryReport, VolumeId,
+  VolumeSummary,
 };
 use slates_ipc::delivery::{Delivery, Output};
 use slates_ipc::rendezvous::ENV_ENDPOINT;
@@ -351,6 +352,38 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       request.json,
     );
   }
+  // The version-control credentials (A-625 part 3) prove the human's authority as `enroll` does.
+  if let Verb::CredentialKey {
+    line,
+    principal,
+    expires_s,
+  } = &request.verb
+  {
+    return emit_credential_key(
+      Instance::from_client(&request.instance, client),
+      line,
+      (principal.as_ref(), *expires_s),
+      request.json,
+    );
+  }
+  if let Verb::CredentialToken {
+    principal,
+    expires_s,
+  } = &request.verb
+  {
+    return emit_credential_token(
+      Instance::from_client(&request.instance, client),
+      (principal.as_ref(), *expires_s),
+      request.json,
+    );
+  }
+  if let Verb::CredentialRevoke { id } = &request.verb {
+    return emit_credential_revoke(
+      Instance::from_client(&request.instance, client),
+      *id,
+      request.json,
+    );
+  }
   // `export` and `mount` attach for the host mount — the access-list-checked `attach` returns the mount capability the
   // loopback edge authorizes every request's file handle against (§4.13; AUD-01: a supplied uid and loopback
   // reachability are not authority, the capability is). `export` prints the capability's path for a mount elsewhere;
@@ -499,7 +532,7 @@ fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> R
     port: bound,
     bearer,
     tick_ns: config.runtime.timer_tick_ns,
-    keep_alive_ns: slates_mcp::http::listen_keep_alive_ns(slates_api::deadlines().reply_ns),
+    keep_alive_ns: listen_keep_alive_ns(slates_server::daemon::LIVENESS_BUDGET_NS),
     connections: config.clients_per_shard,
   };
   slates_machine::log_line!(
@@ -706,6 +739,26 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
       delete_len,
       bytes,
     } => merge_edit(client, *work, path, *at, *delete_len, bytes, json)?,
+    Verb::Copy {
+      work,
+      from,
+      to,
+      version,
+      replace,
+    } => {
+      let op = slates_ipc::protocol::WorkOp::Copy {
+        from: from.clone(),
+        to: to.clone(),
+        version: *version,
+        replace: *replace,
+      };
+      client.declare(*work, op)?;
+      if json {
+        slates_machine::out_line!("{}", serde_json::json!({ "declared": true }));
+      } else {
+        slates_machine::out_line!("declared");
+      }
+    }
     Verb::Submit { work, evidence } => {
       let outcome = client.submit_with_evidence(*work, evidence)?;
       if json {
@@ -867,6 +920,143 @@ fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(),
   } else {
     slates_machine::out_line!("id: {}", volume_id_text(id));
     slates_machine::out_line!("path: (none until a bridge exists)");
+  }
+  Ok(())
+}
+
+/// `repository create` (§4.17.1; A-685): the repository's name and its root green's id (the green its default branch
+/// is bound to), as text lines or a JSON `{ "repository", "id" }`. A refusal (a name taken: `AlreadyExists`) is the
+/// client's error, exit 1, as every verb's is.
+fn emit_repository_created(
+  client: &mut Client,
+  spec: &RepositorySpec,
+  json: bool,
+) -> Result<(), ClientError> {
+  let root = client.create_repository(spec)?;
+  if json {
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "repository": spec.name, "id": volume_id_text(root) })
+    );
+  } else {
+    slates_machine::out_line!("repository: {}", spec.name);
+    slates_machine::out_line!("id: {}", volume_id_text(root));
+  }
+  Ok(())
+}
+
+/// `repository import` (A-710): what the import took, as text (`name: value` lines) or one JSON object, its fields
+/// the reply's.
+fn emit_repository_imported(
+  client: &mut Client,
+  repository: &str,
+  path: &str,
+  json: bool,
+) -> Result<(), ClientError> {
+  let fields = match client.import_repository(repository, path)? {
+    slates_client::Imported::Mercurial {
+      changesets,
+      manifests,
+      file_logs,
+      file_revisions,
+      markers,
+    } => serde_json::json!({
+      "repository": repository,
+      "changesets": changesets,
+      "manifests": manifests,
+      "file_logs": file_logs,
+      "file_revisions": file_revisions,
+      "markers": markers,
+    }),
+    slates_client::Imported::Dump {
+      revisions,
+      youngest,
+    } => serde_json::json!({
+      "repository": repository,
+      "revisions": revisions,
+      "youngest": youngest,
+    }),
+  };
+  if json {
+    slates_machine::out_line!("{fields}");
+  } else if let Some(fields) = fields.as_object() {
+    for (name, value) in fields {
+      match value.as_str() {
+        Some(text) => slates_machine::out_line!("{name}: {text}"),
+        None => slates_machine::out_line!("{name}: {value}"),
+      }
+    }
+  }
+  Ok(())
+}
+
+/// A branch verb's answer (A-575): the repository, the branch and its green where it has one, as text (`name: value`
+/// lines) or one JSON object.
+fn emit_branch(repository: &str, name: &str, green: Option<VolumeId>, json: bool) {
+  let id = green.map(volume_id_text);
+  if json {
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "repository": repository, "branch": name, "id": id })
+    );
+  } else {
+    slates_machine::out_line!("repository: {repository}");
+    slates_machine::out_line!("branch: {name}");
+    if let Some(id) = id {
+      slates_machine::out_line!("id: {id}");
+    }
+  }
+}
+
+/// `repository policy` (A-622): the policy read, each named point's hooks replaced by the ones given for it (an empty
+/// program clearing it), every other part kept, then set from the version read; the version it is at now, and its hooks,
+/// as text (`name: value` lines) or one JSON object.
+fn emit_repository_policy(
+  client: &mut Client,
+  repository: &str,
+  given: &[(slates_ipc::protocol::HookPointName, String, String)],
+  json: bool,
+) -> Result<(), ClientError> {
+  let mut policy = client.describe_repository_policy(repository)?;
+  let named: Vec<(slates_ipc::protocol::HookPointName, &str)> = given
+    .iter()
+    .map(|(point, name, _)| (*point, name.as_str()))
+    .collect();
+  policy.hooks.retain(|hook| {
+    !named
+      .iter()
+      .any(|(point, name)| hook.point == *point && hook.name == *name)
+  });
+  policy.hooks.extend(
+    given
+      .iter()
+      .filter(|(_, _, program)| !program.is_empty())
+      .map(|(point, name, program)| slates_ipc::protocol::HookConfig {
+        point: *point,
+        name: name.clone(),
+        program: program.clone(),
+      }),
+  );
+  client.set_repository_policy(repository, &policy)?;
+  let version = policy.version.saturating_add(1);
+  let hooks: Vec<String> = policy
+    .hooks
+    .iter()
+    .map(|hook| format!("{}={}", hook.name, hook.program))
+    .collect();
+  if json {
+    let fields = serde_json::json!({
+      "repository": repository,
+      "version": version,
+      "hooks": hooks,
+    });
+    slates_machine::out_line!("{fields}");
+  } else {
+    slates_machine::out_line!("repository: {repository}");
+    slates_machine::out_line!("version: {version}");
+    for hook in &hooks {
+      slates_machine::out_line!("hook: {hook}");
+    }
   }
   Ok(())
 }
@@ -1229,6 +1419,19 @@ fn emit_captured(client: &mut Client, volume: VolumeId, json: bool) -> Result<()
   Ok(())
 }
 
+/// `log` (A-773): the session log, as text lines or one JSON object (`crate::log_view`).
+fn emit_log(client: &mut Client, json: bool) -> Result<(), ClientError> {
+  let log = client.session_log()?;
+  if json {
+    slates_machine::out_line!("{}", crate::log_view::json(&log));
+  } else {
+    for line in crate::log_view::text_lines(&log) {
+      slates_machine::out_line!("{line}");
+    }
+  }
+  Ok(())
+}
+
 /// `grants`: every grant, one per text line or a JSON array of [`grant_json`] objects (the shape a
 /// script iterates, matching `volume list`'s array of objects).
 fn emit_grants(client: &mut Client, json: bool) -> Result<(), ClientError> {
@@ -1427,6 +1630,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::ChangedSince { .. }
     | Verb::Work { .. }
     | Verb::Edit { .. }
+    | Verb::Copy { .. }
     | Verb::Submit { .. }
     | Verb::Rebase { .. }
     | Verb::Advance { .. }
@@ -1514,6 +1718,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       json,
     ),
     Verb::Grants => emit_grants(client, json)?,
+    Verb::Log => emit_log(client, json)?,
     Verb::Audit { since } => emit_audit(client, *since, json)?,
     Verb::Share {
       volume,
@@ -1535,13 +1740,44 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       );
     }
     Verb::Move { volume, to } => emit_moved(client, *volume, *to, json)?,
+    Verb::RepositoryCreate { spec } => emit_repository_created(client, spec, json)?,
+    Verb::RepositoryImport { repository, path } => {
+      emit_repository_imported(client, repository, path, json)?;
+    }
+    Verb::RepositoryPolicy { repository, hooks } => {
+      emit_repository_policy(client, repository, hooks, json)?;
+    }
+    Verb::BranchCreate {
+      repository,
+      name,
+      from,
+      version,
+    } => {
+      let green = client.create_branch(repository, (name, from, *version))?;
+      emit_branch(repository, name, Some(green), json);
+    }
+    Verb::BranchBind {
+      repository,
+      name,
+      green,
+    } => {
+      client.bind_branch(repository, name, *green)?;
+      emit_branch(repository, name, Some(*green), json);
+    }
+    Verb::BranchRetire { repository, name } => {
+      client.retire_branch(repository, name)?;
+      emit_branch(repository, name, None, json);
+    }
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }
     | Verb::RecoveryPlan { .. }
     | Verb::Recover { .. }
     | Verb::Grant { .. }
     | Verb::Enroll { .. }
-    | Verb::Revoke { .. } => {}
+    | Verb::Revoke { .. }
+    | Verb::CredentialKey { .. }
+    | Verb::CredentialToken { .. }
+    | Verb::CredentialRevoke { .. } => {}
   }
   Ok(())
 }
@@ -1601,12 +1837,23 @@ fn emit_share(
   rights: Rights,
   json: bool,
 ) -> Result<(), ClientError> {
-  // A principal with no host named is this daemon's own host's (A-237).
+  let principal = wire_principal(client, principal)?;
+  client.share(volume, principal, rights)?;
+  emit_ok("shared", json);
+  Ok(())
+}
+
+/// The principal `principal` names, as the wire names it: a host not named is this daemon's own (A-237), and a
+/// `consumer:N` without an account is under this process's.
+fn wire_principal(
+  client: &mut Client,
+  principal: &SharePrincipal,
+) -> Result<Principal, ClientError> {
   let here = match principal {
     SharePrincipal::Uid { host: Some(_), .. } | SharePrincipal::Consumer { host: Some(_), .. } => 0,
     _ => client.daemon_status()?.anchor,
   };
-  let principal = match principal {
+  Ok(match principal {
     SharePrincipal::Uid { uid, host } => Principal::Uid {
       host: host.unwrap_or(here),
       uid: *uid,
@@ -1620,9 +1867,105 @@ fn emit_share(
       account: account.unwrap_or_else(current_account),
       consumer: *consumer,
     },
+  })
+}
+
+/// The principal a credential proves and when it stops proving it (A-625 part 3): the principal named, else this
+/// process's own account on this daemon's host; `expires_s` seconds from now on the wall clock, if given.
+fn credential_terms(
+  instance: &mut Instance,
+  (principal, expires_s): (Option<&SharePrincipal>, Option<u64>),
+) -> Result<(Principal, Option<u64>), Failure> {
+  let own = SharePrincipal::Uid {
+    uid: current_account(),
+    host: None,
   };
-  client.share(volume, principal, rights)?;
-  emit_ok("shared", json);
+  let name = instance.name().to_owned();
+  let principal = wire_principal(instance.client(), principal.unwrap_or(&own))
+    .map_err(|error| failure_of(error, &name))?;
+  let expires_ns = expires_s.map(expiry_after).transpose()?;
+  Ok((principal, expires_ns))
+}
+
+/// The wall-clock instant `seconds` from now, in nanoseconds since the Unix epoch: when a credential enrolled now for
+/// that long stops proving its principal.
+fn expiry_after(seconds: u64) -> Result<u64, Failure> {
+  std::time::SystemTime::now()
+    .checked_add(std::time::Duration::from_secs(seconds))
+    .and_then(|instant| instant.duration_since(std::time::UNIX_EPOCH).ok())
+    .and_then(|since| u64::try_from(since.as_nanos()).ok())
+    .ok_or_else(|| Failure::Refused(format!("--expires {seconds} is past what the clock names")))
+}
+
+/// When a credential stops proving its principal, as the CLI prints it.
+fn expiry_text(expires_ns: Option<u64>) -> String {
+  expires_ns.map_or_else(
+    || "never".to_owned(),
+    |expires_ns| format!("{expires_ns} ns after the Unix epoch"),
+  )
+}
+
+/// `credential key LINE`: the human surface enrolls an SSH public key for a principal (§4.13, A-625 part 3), proving
+/// issuer authority as `enroll` does; the key's id is its fingerprint as `ssh-keygen -l` prints it.
+fn emit_credential_key(
+  mut instance: Instance,
+  line: &str,
+  terms: (Option<&SharePrincipal>, Option<u64>),
+  json: bool,
+) -> Result<(), Failure> {
+  let blob = slates_server::credentials::key_blob_of_line(line)
+    .map_err(|refusal| Failure::Refused(format!("credential key: {refusal}")))?;
+  let (principal, expires_ns) = credential_terms(&mut instance, terms)?;
+  let fingerprint = slates_server::credentials::key_fingerprint(&blob);
+  let name = instance.name().to_owned();
+  issuer()?
+    .enroll_ssh_key(&mut instance, principal, blob, expires_ns)
+    .map_err(|e| failure_of_api(e, &name))?;
+  if json {
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "id": fingerprint, "expires_ns": expires_ns })
+    );
+  } else {
+    slates_machine::out_line!("key: {fingerprint}");
+    slates_machine::out_line!("expires: {}", expiry_text(expires_ns));
+  }
+  Ok(())
+}
+
+/// `credential token`: the issuer mints an HTTP token for a principal and enrolls it by its hash (§4.13, A-625 part 3).
+/// The token is shown once, here; the daemon holds its hash alone, so it can never show it again.
+fn emit_credential_token(
+  mut instance: Instance,
+  terms: (Option<&SharePrincipal>, Option<u64>),
+  json: bool,
+) -> Result<(), Failure> {
+  let (principal, expires_ns) = credential_terms(&mut instance, terms)?;
+  let name = instance.name().to_owned();
+  let (token, id) = issuer()?
+    .enroll_token(&mut instance, principal, expires_ns)
+    .map_err(|e| failure_of_api(e, &name))?;
+  if json {
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "token": token, "id": hex32(&id), "expires_ns": expires_ns })
+    );
+  } else {
+    slates_machine::out_line!("token: {token}");
+    slates_machine::out_line!("id: {}", hex32(&id));
+    slates_machine::out_line!("expires: {}", expiry_text(expires_ns));
+  }
+  Ok(())
+}
+
+/// `credential revoke ID`: the human surface revokes a version-control credential (§4.13, A-625 part 3); a later login
+/// or request presenting it is refused.
+fn emit_credential_revoke(mut instance: Instance, id: [u8; 32], json: bool) -> Result<(), Failure> {
+  let name = instance.name().to_owned();
+  issuer()?
+    .revoke_credential(&mut instance, id)
+    .map_err(|e| failure_of_api(e, &name))?;
+  emit_ok("revoked", json);
   Ok(())
 }
 
@@ -2653,6 +2996,24 @@ fn takeover_text(report: &slates_client::TakeoverReport) -> String {
 /// Format: nanoseconds in a millisecond, for a status line printed in milliseconds.
 const NANOS_PER_MILLISECOND: u64 = 1_000_000;
 
+/// The daemon's memory by kind (§4.14), read in its own process with nothing suspended: what to read instead of
+/// suspending the daemon with `vmmap` or `heap`, which past the anchor's window gets it killed (A-232).
+fn memory_lines(report: &DaemonReport, out: &mut String) {
+  for kind in &report.memory {
+    out.push_str(&format!(
+      "memory: {} mappings={} reserved_bytes={} resident_bytes={} modified_bytes={} measured={}\n",
+      kind.kind,
+      kind.mappings,
+      kind.reserved_bytes,
+      kind.resident_bytes,
+      kind
+        .modified_bytes
+        .map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string()),
+      kind.measured
+    ));
+  }
+}
+
 /// The daemon's status: the daemon's lines, its place in the fleet (a laptop: `f` 0, itself the one
 /// member, no peers probed), then one block per shard with its health signals and its telemetry drain.
 fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> String {
@@ -2688,6 +3049,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   out.push_str(&format!("anchor: {}\n", report.anchor));
   // Whether the anchor has judged this daemon recovered (A-311): until then its exit counts toward a crash loop.
   out.push_str(&format!("recovered: {}\n", report.recovered));
+  memory_lines(report, &mut out);
   let root: String = report
     .seal
     .root_id
@@ -2940,7 +3302,6 @@ mod harness_tests {
   )]
 
   use std::ffi::{OsStr, OsString};
-  use std::time::{Duration, Instant};
 
   use slates_client::{
     Client, ClientError, CreateSpec, Deadlines, NamePolicy, Refusal, SizeClass, VolumeId,
@@ -2953,8 +3314,6 @@ mod harness_tests {
 
   /// Format: the environment variable that turns this test binary into the workload the core spawns.
   const WORKLOAD_ROLE: &str = "SLATES_CLI_TEST_WORKLOAD";
-  /// Shape: how long a client retries the rendezvous while the daemon starts.
-  const START_WAIT: Duration = Duration::from_secs(5);
   /// Shape: shards per test daemon: two, so the consumer's record and the attesting channel differ.
   const TEST_SHARDS: u16 = 2;
 
@@ -2985,19 +3344,11 @@ mod harness_tests {
     slates_api::deadlines()
   }
 
-  fn connect_retrying(instance: &str) -> Client {
-    let started = Instant::now();
-    loop {
-      match Client::connect(instance, deadlines()) {
-        Ok(client) => return client,
-        Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-          if started.elapsed() < START_WAIT =>
-        {
-          std::hint::spin_loop();
-        }
-        Err(e) => panic!("{e}"),
-      }
-    }
+  /// One claim on the in-process daemon `Daemon::start` returned: its rendezvous is made before it returns, and a
+  /// claim waits while its holder lives (A-468). Until 2026-11-20 a refused claim was retried, spinning, within a
+  /// `START_WAIT` of 5 s.
+  fn connect_once(instance: &str) -> Client {
+    Client::connect(instance, deadlines()).unwrap()
   }
 
   fn unhex32(text: &str) -> [u8; 32] {
@@ -3121,7 +3472,7 @@ mod harness_tests {
       .expect("the fixture explicitly creates its local consensus group");
     let issuer =
       slates_api::Issuer::from_handoff(&daemon.segment().handoff_env().unwrap()).unwrap();
-    let mut human = slates_api::Instance::from_client(&instance, connect_retrying(&instance));
+    let mut human = slates_api::Instance::from_client(&instance, connect_once(&instance));
 
     let (consumer, capability, volume) = run_once((&mut human, &issuer), &instance, false);
     assert!(
@@ -3131,7 +3482,7 @@ mod harness_tests {
       ),
       "the workload's volume is the consumer's, not the account's"
     );
-    let mut later = connect_retrying(&instance);
+    let mut later = connect_once(&instance);
     assert!(
       matches!(
         later.attest(consumer, &capability),
@@ -3150,6 +3501,16 @@ mod harness_tests {
   }
 }
 
+/// Derived: the period the MCP edge's quiet listen stream sends its keep-alive comment at
+/// (`slates_mcp::http::HttpEdge::keep_alive_ns`): the heartbeat's rule over the liveness budget `liveness_budget_ns`
+/// (`slates_server::daemon::heartbeat_of`, `W / ELECTION_MARGIN`), the rule the anchor's beat follows, so a beat lands
+/// inside each liveness window and a client whose patience is that window sees the edge alive within it (R3, goal 88's
+/// class C; main's ruling, 2026-11-20). Not learned from the stream's ends: a client's close cannot tell an idle
+/// timeout from a cancellation. Until 2026-11-20 half the client's reply deadline, a fixed 500 ms no budget moved.
+fn listen_keep_alive_ns(liveness_budget_ns: u64) -> u64 {
+  slates_server::daemon::heartbeat_of(liveness_budget_ns).max(1)
+}
+
 #[cfg(test)]
 mod tests {
   use super::{chokepoint_value, digest_json, failure_of_api, signal_value};
@@ -3160,6 +3521,34 @@ mod tests {
   /// exited 1 printing `denied: NoAuthority(NoHandoff)`). Do: map a missing issuer authority and a revoked consumer's
   /// denial to the command's failure. Expect the first the command's own (exit 4) naming the anchor's surface it needs,
   /// as `docs/cli.md` says, and the second the daemon's refusal (exit 1).
+  /// R3, goal 88's class C (main's ruling, 2026-11-20): the MCP edge's quiet listen stream beats inside each liveness
+  /// window by the anchor's beat's own rule, so it follows the budget. Do: take the keep-alive at the daemon's liveness
+  /// budget and at twice it. Expect each the heartbeat's rule over that budget: the shipped heartbeat at the shipped
+  /// budget, twice it at twice the budget, and the window holding more than one beat. Before, it was half the client's
+  /// reply deadline, a fixed 500 ms that no budget moved.
+  #[test]
+  fn the_mcp_listens_keep_alive_beats_by_the_heartbeats_rule_over_the_liveness_budget() {
+    let budget = slates_server::daemon::LIVENESS_BUDGET_NS;
+    assert_eq!(
+      super::listen_keep_alive_ns(budget),
+      slates_server::daemon::HEARTBEAT_NS,
+      "at the shipped budget, the daemon's heartbeat"
+    );
+    assert_eq!(
+      super::listen_keep_alive_ns(2 * budget),
+      slates_server::daemon::heartbeat_of(2 * budget),
+      "it follows the budget"
+    );
+    assert_eq!(
+      super::listen_keep_alive_ns(2 * budget),
+      2 * super::listen_keep_alive_ns(budget)
+    );
+    assert!(
+      super::listen_keep_alive_ns(budget) < budget / 2,
+      "more than one beat lands inside each window"
+    );
+  }
+
   #[test]
   fn a_missing_issuer_authority_fails_the_command_and_a_denial_is_a_refusal() {
     let missing = failure_of_api(

@@ -6,6 +6,8 @@
 
 use slates_wire::Wire;
 
+use crate::register::{ObjectId, RegisterClass};
+
 /// A volume id: 128 random bits whose high half names the creator host (§4.8 "Lookup").
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct VolumeId {
@@ -189,6 +191,84 @@ pub struct ConsumerRecord {
   pub write: Option<WritePolicy>,
   /// How many times the consumer's write policy was set (A-285), as a volume's `write_version`. Appended.
   pub write_version: u64,
+}
+
+/// git's author and committer of the commits the server makes for a principal (§4.17.1 "A push is a work" item 4;
+/// A-664): the name and the email exactly as git writes them. The server holds them to git's own rules before it records
+/// them (`slates_git::derived::Identity`: no byte git would strip from either end or drop from inside, a name not
+/// empty), so every commit made of them carries these bytes.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GitIdentity {
+  /// The name.
+  pub name: String,
+  /// The email: may be empty, which git writes `<>`.
+  pub email: String,
+}
+
+/// A principal's identities in the tools whose objects the server makes for it (§4.13 "a principal's record"; §4.17.1
+/// "A push is a work" item 4; §4.17.3 decision 7; A-664): git's author and committer, and Mercurial's user. Set whole by
+/// the principal's owner on the control channel, never on the principal's own channel, as the version after the one
+/// its setter read, so a setting made from a stale read changes nothing (`Op::IdentitiesSet`). Kept on the partition
+/// that holds the principal's record, keyed by the principal's key.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRecord {
+  /// The principal.
+  pub principal: Principal,
+  /// git's author and committer; `None` when the principal has none, so a submit of its to a git repository's green is
+  /// refused `IdentityRequired`.
+  pub git: Option<GitIdentity>,
+  /// Mercurial's user, `Name <address>` (§4.17.3 decision 7); `None` when it has none.
+  pub mercurial: Option<String>,
+  /// How many times they were set: the first setting's is 1.
+  pub version: u64,
+}
+
+/// What a version-control credential is (§4.13, §4.17.2 "Access"; A-625 part 3): an SSH user key or an HTTP token.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum CredentialKind {
+  /// An SSH user key (RFC 4252 §7): its public key blob as a client sends it, and its algorithm's name, the blob's
+  /// first string (`ssh-ed25519`, `ssh-rsa`, ...), so a later algorithm joins with no change of record.
+  SshKey {
+    /// The key's algorithm, as its blob names it.
+    algorithm: String,
+    /// The public key blob (RFC 4253 §6.6).
+    blob: Vec<u8>,
+  },
+  /// A token: Basic's password or a bearer token over HTTP (RFC 7617, RFC 6750), and CRAM-MD5's secret over `svn://`
+  /// (RFC 2195; A-692). Held as its SHA-256, the record's id, and its CRAM-MD5 keyed contexts, so the token itself is
+  /// never kept.
+  HttpToken {
+    /// HMAC-MD5's keyed contexts of the token (RFC 2104 §4, RFC 2195 §4; A-692), made when it was enrolled: MD5's
+    /// state after the token's outer pad block, then after its inner pad block, each four words low-order byte first
+    /// (Dovecot's CRAM-MD5 scheme's layout, `slates_svn::handshake::CramContexts`). They answer `svn://`'s CRAM-MD5
+    /// as the token does and do not give the token back: an HTTP request, which presents the token, cannot be made
+    /// from them.
+    cram_md5_contexts: [u8; 32],
+  },
+}
+
+/// A version-control credential a human enrolled for a principal (§4.13: through the CLI's control verbs, never MCP or
+/// an SDK; A-625 part 3). Named by the SHA-256 of what a client presents (an SSH key's blob, OpenSSH's fingerprint; an
+/// HTTP token's bytes), so an edge finds it by one lookup on the partition its id routes to, and a token's bytes are
+/// never held. A record never changes once made: enrolled whole, revoked whole.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct CredentialRecord {
+  /// The SHA-256 of what a client presents.
+  pub id: [u8; 32],
+  /// The principal it proves.
+  pub principal: Principal,
+  /// What it is.
+  pub kind: CredentialKind,
+  /// When it stops proving its principal, on the wall clock in nanoseconds since the Unix epoch; none when it never
+  /// does.
+  pub expires_ns: Option<u64>,
+}
+
+impl CredentialRecord {
+  /// Whether it still proves its principal at wall-clock instant `now_ns`: it has no expiry, or its expiry is later.
+  pub fn live_at(&self, now_ns: u64) -> bool {
+    self.expires_ns.is_none_or(|expires_ns| now_ns < expires_ns)
+  }
 }
 
 /// Rights on a volume (§4.13).
@@ -923,6 +1003,10 @@ pub enum LandingState {
   Refused,
   /// Stopped mid-way; every entry old or new.
   Aborted,
+  /// Withdrawn before any grant: a newer presentation of the same volume into the same target replaced it, so an
+  /// older state never lands over a newer one (A-779, main's ruling 2026-11-20). Never granted; nothing expires it on a
+  /// clock. Appended.
+  Superseded,
 }
 
 /// A landing record.
@@ -946,6 +1030,8 @@ pub struct LandingRecord {
   pub written: u32,
   /// Entries in conflict.
   pub conflicts: u32,
+  /// The newer presentation that superseded it, once `Superseded` (A-779). Appended.
+  pub superseded_by: Option<u64>,
 }
 
 /// What the audit log records (§4.14, §4.15).
@@ -1208,6 +1294,9 @@ pub struct PendingCreationRecord {
   pub client: u32,
   /// The completion key's sequence.
   pub sequence: u32,
+  /// The green the work is being made over: on a holder node, whose green another node owns, what a restart releases
+  /// the work's admission at (A-697 part e2).
+  pub green: VolumeId,
 }
 
 /// A work's submit that went to its green's owner and whose answer the work has not yet settled (A-247): kept on the
@@ -1381,7 +1470,26 @@ impl VolumeId {
   pub fn partition(&self) -> u16 {
     id_partition(&self.bytes)
   }
+
+  /// The counter the id was minted at (bytes 10-15, big-endian): the partition's minting counter when the volume was
+  /// made (A-694; `Db::volume_counter_at`).
+  pub fn counter(&self) -> u64 {
+    let mut counter = [0u8; size_of::<u64>()];
+    if let (Some(low), Some(minted)) = (
+      counter.get_mut(ID_COUNTER_PAD..),
+      self.bytes.get(ID_COUNTER_BYTES),
+    ) {
+      low.copy_from_slice(minted);
+    }
+    u64::from_be_bytes(counter)
+  }
 }
+
+/// Format: where a volume id's counter lies: its last six bytes, after the host's eight and the partition's two.
+const ID_COUNTER_BYTES: std::ops::Range<usize> = 10..16;
+
+/// Format: the bytes of a `u64` the counter's six leave above them: two.
+const ID_COUNTER_PAD: usize = size_of::<u64>() - (ID_COUNTER_BYTES.end - ID_COUNTER_BYTES.start);
 
 /// A repository (§4.17.1 "The repository and its greens"; A-515): a name a tool's clients reach, its tool and object
 /// format, its default branch, and its owner. Its namespace, each branch name bound to the green whose versions are the
@@ -1402,6 +1510,257 @@ pub struct RepositoryRecord {
   pub default_branch: Option<String>,
   /// Who created it, and holds every right on it until a policy says otherwise (§4.13).
   pub owner: Principal,
+  /// Its policy (A-622): empty at creation, then set whole by `Op::RepositoryPolicySet`. Appended.
+  pub policy: RepositoryPolicy,
+  /// Its index's cut (A-724 piece 9, §4.17.5 "A giant repository's metadata across partitions"): the leading bits of an
+  /// object's id that name the range its index row is held in (`slates_vcs::cut`), each range on the partition
+  /// rendezvous ranks first for the repository's family and the range. Zero at creation, the whole index on the owner;
+  /// moved a bit at a time by `Op::RepositoryIndexCut`. Appended.
+  pub index_bits: u8,
+}
+
+/// A repository's policy (§4.17.1 "Policy: protected branches, access and hooks"; A-597's matcher, A-622's record): its
+/// rules by name pattern and its hooks, set whole by its owner (`Op::RepositoryPolicySet`) and carried by its record,
+/// so a partition's snapshot carries it and a replay sets it again. Empty at creation: no rule and no hook, so the
+/// repository's own rule decides everything (its owner holds every right, A-575) and no hook runs. Bounded by the
+/// partition's merge byte budget, which its rules', hooks', hooks-env sections' and trusted signers' encoded bytes are
+/// charged to, and by one log record, since it is set whole.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryPolicy {
+  /// How many times it has been set: a setting names the version after the one its setter read, so one made from a
+  /// stale read is refused and changes nothing.
+  pub version: u64,
+  /// The rules, in the order given, which git's precedence (the last covering rule) and Subversion's at one depth (the
+  /// rule defined last) read.
+  pub rules: Vec<PolicyRule>,
+  /// The hooks, in the order given: the hooks of one point run in that order.
+  pub hooks: Vec<HookConfig>,
+  /// A Subversion repository's hooks-env (A-648), its sections in the order given: what each of its hooks' environment
+  /// is. Empty for git and Mercurial, whose hooks inherit the server's environment. Appended.
+  pub hooks_env: Vec<HooksEnvSection>,
+  /// The keys trusted to sign the repository's commits (A-644), each an SSH public key in wire form, in the order set:
+  /// a commit a rule requires signed verifies under one of them (A-321's verifier, under git's namespace). Kept only as
+  /// the server's verb accepted them, and only for a git repository. Appended.
+  pub signers: Vec<Vec<u8>>,
+}
+
+/// What a policy rule's pattern names (§4.17.1; A-597): the names its repository's tool has, each in its tool's form.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyNames {
+  /// git refs, by `git for-each-ref`'s pattern: a ref, a prefix ending at a slash, or a glob.
+  Refs,
+  /// Mercurial named branches, by name or `*`.
+  Branches,
+  /// Mercurial bookmarks, by name or `*`.
+  Bookmarks,
+  /// Mercurial topics, by name or `*`.
+  Topics,
+  /// Subversion paths: `/path`, or `:glob:/path` with wildcards.
+  Paths,
+}
+
+impl PolicyNames {
+  /// Whether a repository serving `tool` has these names.
+  pub fn of(self, tool: VcsTool) -> bool {
+    matches!(
+      (tool, self),
+      (VcsTool::Git, Self::Refs)
+        | (
+          VcsTool::Mercurial,
+          Self::Branches | Self::Bookmarks | Self::Topics
+        )
+        | (VcsTool::Subversion, Self::Paths)
+    )
+  }
+}
+
+/// A right a policy rule decides (§4.17.1 "Policy"; A-644's requirements).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyRight {
+  /// Read the branch.
+  Read,
+  /// Submit a work to it.
+  Submit,
+  /// Move it to a head that does not descend from its current one.
+  Rewrite,
+  /// Delete it.
+  Delete,
+  /// Bring it a merge commit, one of more than one parent, among the commits a change brings (A-644). A requirement: a
+  /// rule denying it keeps the name's history linear, a later one allowing it exempts whom it names, and where no rule
+  /// speaks nothing is required. git's alone. Appended.
+  MergeCommit,
+  /// Bring it a commit that no key of the policy's `signers` signed (A-644). A requirement as `MergeCommit` is: a rule
+  /// denying it requires signed commits. git's alone. Appended.
+  UnsignedCommit,
+}
+
+impl PolicyRight {
+  /// Whether a repository serving `tool` has this right: the requirements are git's alone, the one tool whose push
+  /// path judges them (§4.17.2 "Protected branches").
+  pub fn of(self, tool: VcsTool) -> bool {
+    match self {
+      Self::Read | Self::Submit | Self::Rewrite | Self::Delete => true,
+      Self::MergeCommit | Self::UnsignedCommit => tool == VcsTool::Git,
+    }
+  }
+}
+
+/// Whether a policy rule allows its right or denies it.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyEffect {
+  /// It allows the right.
+  Allow,
+  /// It denies the right.
+  Deny,
+}
+
+/// One entry of the principals a policy rule speaks to.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PolicyEntry {
+  /// This principal.
+  Is {
+    /// The principal.
+    principal: Principal,
+  },
+  /// Every principal but this one (acl's `!user`, authz's `~user`).
+  IsNot {
+    /// The principal excepted.
+    principal: Principal,
+  },
+}
+
+/// The principals a policy rule speaks to.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PolicyWho {
+  /// Every principal.
+  Anyone,
+  /// Each principal one of the entries names.
+  AnyOf {
+    /// The entries.
+    entries: Vec<PolicyEntry>,
+  },
+}
+
+/// One policy rule (§4.17.1 "Policy"; A-597): on the names `pattern` covers, `effect` for `right` to the principals
+/// `who` names.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRule {
+  /// What the pattern names: the repository's tool's names.
+  pub names: PolicyNames,
+  /// The pattern, in its tool's form: not empty, holding no NUL, and for Subversion a path from the root.
+  pub pattern: String,
+  /// The right it decides.
+  pub right: PolicyRight,
+  /// Whether it allows or denies.
+  pub effect: PolicyEffect,
+  /// Whom it speaks to.
+  pub who: PolicyWho,
+}
+
+/// A hook point (§4.17.1; A-597's points), each its tool's.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HookPointName {
+  /// git's `pre-receive`.
+  GitPreReceive,
+  /// git's `update`.
+  GitUpdate,
+  /// git's `post-receive`.
+  GitPostReceive,
+  /// Mercurial's `pretxnchangegroup`.
+  HgPretxnchangegroup,
+  /// Mercurial's `changegroup`.
+  HgChangegroup,
+  /// Subversion's `pre-commit`.
+  SvnPreCommit,
+  /// Subversion's `pre-revprop-change`.
+  SvnPreRevpropChange,
+  /// Subversion's `post-commit`.
+  SvnPostCommit,
+  /// Subversion's `start-commit` (A-648). Appended.
+  SvnStartCommit,
+  /// Subversion's `post-revprop-change` (A-648). Appended.
+  SvnPostRevpropChange,
+  /// Subversion's `pre-lock` (A-648). Appended.
+  SvnPreLock,
+  /// Subversion's `post-lock` (A-648). Appended.
+  SvnPostLock,
+  /// Subversion's `pre-unlock` (A-648). Appended.
+  SvnPreUnlock,
+  /// Subversion's `post-unlock` (A-648). Appended.
+  SvnPostUnlock,
+}
+
+impl HookPointName {
+  /// The tool whose point it is.
+  pub fn tool(self) -> VcsTool {
+    match self {
+      Self::GitPreReceive | Self::GitUpdate | Self::GitPostReceive => VcsTool::Git,
+      Self::HgPretxnchangegroup | Self::HgChangegroup => VcsTool::Mercurial,
+      Self::SvnPreCommit
+      | Self::SvnPreRevpropChange
+      | Self::SvnPostCommit
+      | Self::SvnStartCommit
+      | Self::SvnPostRevpropChange
+      | Self::SvnPreLock
+      | Self::SvnPostLock
+      | Self::SvnPreUnlock
+      | Self::SvnPostUnlock => VcsTool::Subversion,
+    }
+  }
+
+  /// Its name in its tool.
+  pub fn name(self) -> &'static str {
+    match self {
+      Self::GitPreReceive => "pre-receive",
+      Self::GitUpdate => "update",
+      Self::GitPostReceive => "post-receive",
+      Self::HgPretxnchangegroup => "pretxnchangegroup",
+      Self::HgChangegroup => "changegroup",
+      Self::SvnPreCommit => "pre-commit",
+      Self::SvnPreRevpropChange => "pre-revprop-change",
+      Self::SvnPostCommit => "post-commit",
+      Self::SvnStartCommit => "start-commit",
+      Self::SvnPostRevpropChange => "post-revprop-change",
+      Self::SvnPreLock => "pre-lock",
+      Self::SvnPostLock => "post-lock",
+      Self::SvnPreUnlock => "pre-unlock",
+      Self::SvnPostUnlock => "post-unlock",
+    }
+  }
+}
+
+/// One configured hook (§4.17.1: "a program the repository's owner configured").
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HookConfig {
+  /// The point it runs at.
+  pub point: HookPointName,
+  /// Its name: at a Mercurial point, the point's name alone or with a `.suffix` (`pretxnchangegroup.acl`), one hook a
+  /// name; git and Subversion keep one hook a point, named for its point.
+  pub name: String,
+  /// The program it runs: an absolute path on the host that runs the repository's hooks, holding no NUL.
+  pub program: String,
+}
+
+/// A variable of a Subversion repository's hooks-env (A-648): one `NAME = value` line of a section of the file
+/// `svnserve.conf`'s `hooks-env` names.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HooksEnvVariable {
+  /// Its name: not empty, holding no `=` and no NUL, so that it is one variable of a hook's environment.
+  pub name: String,
+  /// Its value, holding no NUL, since a hook's environment is C strings.
+  pub value: Vec<u8>,
+}
+
+/// A section of a Subversion repository's hooks-env (A-648; `run_hook_cmd`, `hooks.c`): the variables the hook named as
+/// the section runs with, or, in the section named `default`, those of every hook with no section of its own. A hook
+/// gets its section alone and never the server's environment; a section named twice is one, and one with no variables
+/// is none, as Subversion's configuration reads the file.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HooksEnvSection {
+  /// Its name, a hook's or `default`: not empty, holding no NUL.
+  pub name: String,
+  /// Its variables, in the order given; a variable set twice keeps its last value.
+  pub variables: Vec<HooksEnvVariable>,
 }
 
 /// How a green joined its repository's lineage (§4.17.1 item 4, A-575): a repository's greens share the nodes of their
@@ -1444,4 +1803,469 @@ pub struct BranchRecord {
   pub name: String,
   /// The green.
   pub green: VolumeId,
+}
+
+/// A review comment on a request (§4.17.1 "Works over works", shared piece 6; A-596): anchored to a path, the whole lines
+/// a byte range covers, and the version of the request it stands on (the version of the green whose versions are the
+/// request's updates). It moves forward with the request by the engine's position mapping
+/// (`slates_merge::engine::Green::reanchor`), its lines unchanged; once a change meets them it is outdated where it last
+/// stood, never moved again (`crate::review`).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ReviewCommentRecord {
+  /// The repository whose request it is on.
+  pub repository: RepositoryId,
+  /// The request: the volume whose versions are the request's updates.
+  pub request: VolumeId,
+  /// Its number among the request's comments, from one.
+  pub id: u64,
+  /// Who wrote it.
+  pub author: Principal,
+  /// The path it is on, as the request names it.
+  pub path: String,
+  /// The first byte of its lines in the version it stands on.
+  pub start: u64,
+  /// The bytes its lines cover there, through the last one's newline (or the text's end).
+  pub len: u64,
+  /// The version it stands on: the one it was written on, or the one it was last moved to.
+  pub version: u64,
+  /// The version whose change outdated it, once one has: it stands where it last stood (`start` and `len` at
+  /// `version`) and never moves again.
+  pub outdated_at: Option<u64>,
+  /// What it says.
+  pub body: String,
+}
+
+/// An approval of a request (§4.17.1, shared piece 6; A-596): bound to the version of the request its approver saw, and
+/// stale once a later change meets what the repository's policy says an approval covers (`crate::review`). A standing
+/// approval is the evidence a policy counts.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ReviewApprovalRecord {
+  /// The repository whose request it is on.
+  pub repository: RepositoryId,
+  /// The request: the volume whose versions are the request's updates.
+  pub request: VolumeId,
+  /// Who approved.
+  pub approver: Principal,
+  /// The version of the request it saw.
+  pub version: u64,
+  /// The version whose change made it stale, once one has.
+  pub stale_at: Option<u64>,
+}
+
+/// A check an entry makes (§4.17.1 shared piece 2; A-603, A-642): read before any of the entry's own changes and in the
+/// step that commits it, against each log's own position, so it holds at exactly the positions the entry appends at. A
+/// check that does not hold refuses the whole entry.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryCheck {
+  /// A green is at `version`: a head the client saw that the entry does not move is unchanged (Mercurial's
+  /// `check:heads` and `unbundle`'s `heads`, §4.17.3 decision 6).
+  Head {
+    /// The green.
+    green: VolumeId,
+    /// The version it must be at.
+    version: u64,
+  },
+  /// The names starting with `prefix` bind exactly `bound`, in name order: no name under it was added, retired or bound
+  /// to another green. Where a range of names holds the heads, this with a `Head` check for each green it lists says
+  /// every head is unchanged.
+  Names {
+    /// The prefix; empty for every name of the repository.
+    prefix: String,
+    /// Every name under it and the green it binds, in name order.
+    bound: Vec<NameBinding>,
+  },
+  /// One of the repository's own state logs is at `position` (A-642): nothing changed it since the push read it.
+  Log {
+    /// The log.
+    log: StateLog,
+    /// The position it must be at.
+    position: u64,
+  },
+}
+
+/// The repository's own state's logs (A-642): each moved by its own changes, at its own positions, never by a counter
+/// every push passes. A green's log is its chain of versions.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StateLog {
+  /// The namespace: names bound and retired, the default, and greens joining the lineage.
+  Names,
+  /// Mercurial's phase roots.
+  Phases,
+  /// Mercurial's obsolescence markers.
+  Markers,
+  /// Git LFS's locks.
+  Locks,
+}
+
+/// One of a repository's logs (A-642): a green's chain, or one of the repository's own state's.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogName {
+  /// A green's log: its chain of versions, positions its versions.
+  Green {
+    /// The green.
+    green: VolumeId,
+  },
+  /// One of a repository's state logs.
+  State {
+    /// The repository.
+    repository: RepositoryId,
+    /// The log.
+    log: StateLog,
+  },
+}
+
+impl LogName {
+  /// The register that holds this log in the fleet (A-636 part 2a; §4.8 "Data model"): a green's log is the green's
+  /// own register, its chain of versions; a state log is its repository's register of the log's class
+  /// ([`RegisterClass::State`]), placed and taken over as the repository is, so a repository's state moves as one, as
+  /// a volume's catalog moves with its volume. No two logs of one repository share a register, so a holder of several
+  /// tells each log's records and promises apart by it.
+  pub fn register(&self) -> ObjectId {
+    match self {
+      LogName::Green { green } => ObjectId(green.bytes),
+      LogName::State { repository, log } => {
+        ObjectId(repository.bytes).in_class(RegisterClass::State(*log))
+      }
+    }
+  }
+}
+
+/// What one record moved of one log (A-642): from the position it found the log at to the one it left it at.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogSpan {
+  /// The log.
+  pub log: LogName,
+  /// The position the record found it at: its predecessor.
+  pub from: u64,
+  /// The position it left it at.
+  pub to: u64,
+}
+
+/// An atomic record (A-642): one entry that moved two logs or more, a green's among them, committed whole or not at all.
+/// Each position it took on each log points to it, and a holder applies it only once every log it moves is at the
+/// position it moved it from (its join); a cut of positions holds all of it or none of it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AtomicRecord {
+  /// What it moved of each log, in log order.
+  pub spans: Vec<LogSpan>,
+}
+
+/// A position of a green's log (A-642): a version of the green.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GreenPosition {
+  /// The green.
+  pub green: VolumeId,
+  /// The version.
+  pub version: u64,
+}
+
+/// An atomic record as a partition snapshot carries it (A-642): the record and the positions of greens' logs that point
+/// to it still, those its greens' checkpoints and destroys have not folded.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AtomicHeld {
+  /// The record.
+  pub record: AtomicRecord,
+  /// The positions pointing to it.
+  pub pointers: Vec<GreenPosition>,
+}
+
+/// Where a holder's logs stand against an atomic record (A-642).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Join {
+  /// Some log it moves has not reached its predecessor yet: the holder waits.
+  Waiting,
+  /// Every log it moves is at its predecessor: the holder applies it now.
+  Ready,
+  /// Every log it moves holds it already.
+  Applied,
+  /// Its logs disagree, some holding it and some not: a holder never comes to this, so it is refused loudly.
+  Diverged,
+}
+
+impl AtomicRecord {
+  /// Where logs at the positions `at` gives stand against the record (A-642's join).
+  pub fn join(&self, at: impl Fn(&LogName) -> u64) -> Join {
+    let (mut before, mut ready, mut held) = (false, false, false);
+    for span in &self.spans {
+      let position = at(&span.log);
+      if position >= span.to {
+        held = true;
+      } else if position == span.from {
+        ready = true;
+      } else if position < span.from {
+        before = true;
+      } else {
+        // Inside a span of several positions: part of the record held on this log.
+        return Join::Diverged;
+      }
+    }
+    match (before, ready, held) {
+      (false, false, true) => Join::Applied,
+      (_, _, true) => Join::Diverged,
+      (true, _, false) => Join::Waiting,
+      (false, _, false) => Join::Ready,
+    }
+  }
+
+  /// Whether a cut, the logs it names at the positions `at` gives (`None` for a log it does not name), holds part of the
+  /// record and not the rest: a log inside a span, or one log past its span beside another before its own.
+  pub fn split_by(&self, at: impl Fn(&LogName) -> Option<u64>) -> bool {
+    spans_split_by(&self.spans, at)
+  }
+}
+
+/// Whether a cut, the logs it names at the positions `at` gives (`None` for a log it does not name), holds part of a
+/// record's spans and not the rest (A-642): [`AtomicRecord::split_by`]'s rule, which the fleet's replicas judge every
+/// record's spans by (A-636), a record of one log's included.
+pub fn spans_split_by(spans: &[LogSpan], at: impl Fn(&LogName) -> Option<u64>) -> bool {
+  let mut side = None;
+  for span in spans {
+    let Some(position) = at(&span.log) else {
+      continue;
+    };
+    let held = if position >= span.to {
+      true
+    } else if position <= span.from {
+      false
+    } else {
+      return true;
+    };
+    match side {
+      None => side = Some(held),
+      Some(seen) if seen != held => return true,
+      Some(_) => {}
+    }
+  }
+  false
+}
+
+/// A Git LFS lock as a repository's lock log holds it (A-642): the locked path and the lock's record, its bytes the LFS
+/// server's (id, owner, time).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LockRecord {
+  /// The locked path.
+  pub path: String,
+  /// The lock.
+  pub lock: Vec<u8>,
+}
+
+/// A name and the green it binds, as a [`RepositoryCheck::Names`] lists them (A-603).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NameBinding {
+  /// The name.
+  pub name: String,
+  /// The green it binds.
+  pub green: VolumeId,
+}
+
+/// A green's next version as an entry of its repository's register commits it (A-603): the bytes are the green's chain
+/// entry, the merge crate's encoding, held opaquely as `Op::GreenAdvanced` holds them, so a recovery replays them into
+/// the green as it replays every other version.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GreenVersion {
+  /// The green: a member of the entry's repository.
+  pub green: VolumeId,
+  /// The version: the one after the green's head, or after its version earlier in the same entry.
+  pub version: u64,
+  /// The chain entry.
+  pub entry: Vec<u8>,
+}
+
+/// A change of a repository's namespace as an entry of its register carries it (§4.17.1 item 3, A-603): creating a
+/// branch, deleting one and moving the default are entries of the register, so two clients creating one name race on
+/// one append and one of them is refused.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum NameChange {
+  /// `name` binds `green`, a member of the repository that no name binds, under a name the repository does not hold.
+  Bind {
+    /// The name.
+    name: String,
+    /// The green.
+    green: VolumeId,
+  },
+  /// `name` leaves the namespace; its green stays a member, so binding the name to it again restores the branch.
+  Retire {
+    /// The name.
+    name: String,
+  },
+  /// The default branch becomes `branch`, bound or not yet (an unborn default), or none.
+  Default {
+    /// The branch's name.
+    branch: Option<String>,
+  },
+}
+
+/// A change of a repository's own state, carried beside its greens' versions and namespace changes (§4.17.1 shared
+/// piece 2; §4.17.3 decisions 3 and 4; A-603): moved in the same step as the push that moves it, or alone. Each is made
+/// against the state at the entry's position and refused if that state is not the one it was made against, so a replay
+/// applies exactly what the owner judged.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum StateChange {
+  /// `node` becomes a root of phase `phase` (Mercurial's phase roots, kept as Mercurial keeps them): refused when it is
+  /// one already.
+  PhaseRootAdded {
+    /// The phase, as the tool numbers it.
+    phase: u8,
+    /// The node.
+    node: Vec<u8>,
+  },
+  /// `node` stops being a root of phase `phase`: refused when it is not one.
+  PhaseRootRemoved {
+    /// The phase.
+    phase: u8,
+    /// The node.
+    node: Vec<u8>,
+  },
+  /// An obsolescence marker, in its encoded form, kept for good in the order the register received it (Mercurial keeps
+  /// every marker it receives): refused when the repository holds it already.
+  MarkerAdded {
+    /// The marker's bytes.
+    marker: Vec<u8>,
+  },
+  /// `path` is locked by `lock` (Git LFS's locks, A-642): refused when the path is locked already.
+  LockTaken {
+    /// The path.
+    path: String,
+    /// The lock's record.
+    lock: Vec<u8>,
+  },
+  /// `path`'s lock `lock` is released: refused unless the path is locked by exactly that lock.
+  LockReleased {
+    /// The path.
+    path: String,
+    /// The lock released.
+    lock: Vec<u8>,
+  },
+}
+
+/// One entry of a repository's logs (§4.17.1 item 2, shared piece 2; A-603 rebuilt by A-642): what one step commits of
+/// a repository, all of it or none. Each green it moves keeps its own log, and the entry appends to it only while the
+/// green is at the position the push read; the repository's own state moves in logs of its own; there is no position
+/// of the whole repository. Its checks are read first; then its members join, its greens' versions are committed, its
+/// names change and its state moves, each item judged against what the items before it left, so git's atomic push
+/// ("Either all refs are updated or none") and a Mercurial push that adds changesets, moves bookmarks, phases and
+/// markers are each one durable step. An entry that moves two logs or more, a green's among them, is an atomic record.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryEntry {
+  /// The repository.
+  pub repository: RepositoryId,
+  /// What must hold before the entry's own changes, each against its log's position.
+  pub checks: Vec<RepositoryCheck>,
+  /// Greens joining the repository's lineage, in order.
+  pub joined: Vec<MemberRecord>,
+  /// The greens' versions the entry commits, in order: each appended only while its green is at the position before
+  /// it, the position the push read.
+  pub versions: Vec<GreenVersion>,
+  /// The namespace's changes, in order.
+  pub names: Vec<NameChange>,
+  /// The repository's own state's changes, in order.
+  pub state: Vec<StateChange>,
+  /// The objects the push brought to the repository's tool store (§4.17.1 "Durability and residency"; A-662): the
+  /// content identities of the objects its quarantine sealed and the repository did not hold, in the order they were
+  /// admitted, with their bytes and the moves the store committed them with, encoded by the repository's tool and
+  /// opaque here. The register holds them as a version's chain entry holds its work's post-state, for as long as the
+  /// repository lives, so a recovery replays them through the store's own admission and commit. Empty when the entry
+  /// brought none.
+  pub objects: Vec<u8>,
+}
+
+/// A phase root of a repository (§4.17.3 decision 3, A-603): `node` is a root of phase `phase`.
+#[derive(Wire, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PhaseRoot {
+  /// The phase, as the tool numbers it.
+  pub phase: u8,
+  /// The node.
+  pub node: Vec<u8>,
+}
+
+/// A repository's own state as a partition snapshot carries it (A-603, A-642): each state log's position and what it
+/// holds. The markers log's position is the markers it holds.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct RegisterRecord {
+  /// The repository.
+  pub repository: RepositoryId,
+  /// The names log's position.
+  pub names_position: u64,
+  /// The phases log's position.
+  pub phases_position: u64,
+  /// The locks log's position.
+  pub locks_position: u64,
+  /// The phase roots, in (phase, node) order.
+  pub phase_roots: Vec<PhaseRoot>,
+  /// The obsolescence markers, in the order the log received them.
+  pub markers: Vec<Vec<u8>>,
+  /// The locks, in path order.
+  pub locks: Vec<LockRecord>,
+  /// Each entry's objects (`RepositoryEntry::objects`, A-662), in the order the register received them.
+  pub objects: Vec<Vec<u8>>,
+}
+
+/// One change a state log's record carries (A-636 part 2b), in the order its operation made it: each took one position
+/// of its log, so a holder or a successor that applies a record's changes in order to the log at the record's `from`
+/// leaves it at the record's `to` (`crate::repository::Repositories` applies them by these rules).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum LoggedChange {
+  /// A green joined the repository's lineage (the names log).
+  Joined {
+    /// The member.
+    member: MemberRecord,
+  },
+  /// The namespace changed (the names log): a name bound or retired, or the default moved.
+  Named {
+    /// The change.
+    change: NameChange,
+  },
+  /// A green left the namespace and the lineage, destroyed (the names log): the name that bound it goes, and so does
+  /// its membership.
+  Left {
+    /// The green.
+    green: VolumeId,
+  },
+  /// The repository's own state changed (the phases, markers or locks log).
+  Changed {
+    /// The change.
+    change: StateChange,
+  },
+  /// A push's record (the names log; A-724 piece 8c, the takeover test's fix): the objects an entry brought, as its
+  /// register keeps them (`RepositoryEntry::objects`), so they ride the replicated log to the repository's candidates
+  /// and a successor replays them, never only the owner's own partition. Appended.
+  Objects {
+    /// The record's bytes.
+    record: Vec<u8>,
+  },
+}
+
+/// One record of one of a repository's state logs as the fleet holds it (§4.17.1 shared piece 2, the fleet half; A-636
+/// part 2b): what one operation moved of the log, from the position it found the log at to the one it left it at, with
+/// that operation's changes of the log in order. Its log's register holds it at position `to` (`LogName::register`),
+/// one register a log, so each log ships to its holders on its own. An operation that moves several logs makes one
+/// record on each, all carrying the operation's identity and every span it moved, its greens' included, so a takeover
+/// can keep or drop the operation whole (A-642: a cut holds all of a record or none of it; A-636 part 1's rule).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct StateLogRecord {
+  /// The repository.
+  pub repository: RepositoryId,
+  /// The log.
+  pub log: StateLog,
+  /// The position the operation found the log at: its predecessor, the record before it ending there.
+  pub from: u64,
+  /// The position it left the log at: where the log's register holds it.
+  pub to: u64,
+  /// The operation's identity: BLAKE3 over its spans and its own encoding, so two operations that moved the same
+  /// positions alike are told apart by what they did, and every record of one operation names it alike.
+  pub identity: [u8; 32],
+  /// Every span the operation moved, in log order: each log's, this one's and its greens' included.
+  pub spans: Vec<LogSpan>,
+  /// The operation's changes of this log, in order: `to - from` of them.
+  pub changes: Vec<LoggedChange>,
+}
+
+impl StateLogRecord {
+  /// The log this record is of.
+  pub fn log_name(&self) -> LogName {
+    LogName::State {
+      repository: self.repository,
+      log: self.log,
+    }
+  }
 }

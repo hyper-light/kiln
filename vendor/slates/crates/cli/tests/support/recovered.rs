@@ -8,7 +8,7 @@
 //! for a new daemon to answer, and a kill that came a moment after a start was restarted at once whatever its timing.
 
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Format: the status JSON's key for the answering daemon's pid (`slates_mcp::daemon_json`).
 const PID_KEY: &str = "\"pid\":";
@@ -16,21 +16,22 @@ const PID_KEY: &str = "\"pid\":";
 const RECOVERED_KEY: &str = "\"recovered\":";
 
 /// The pid of a daemon of `instance` that the anchor has judged recovered and that `wanted` accepts, asked of
-/// `slates status --json` every `poll` for at most `wait`; the test fails naming what it last saw once `wait` passes.
-pub(crate) fn await_recovered(
+/// `slates status --json` every `poll` while `judged`'s process tree lives and gains CPU (`support/process_wait.rs`),
+/// failed once it is gone, stalled or past its CPU budget. A loaded box starves an anchor's restart past any wall bound
+/// while it keeps running (goal 88's sweep, 2026-11-20); the wall form, `await_recovered`, went with its last caller.
+pub(crate) fn await_recovered_while_alive(
   instance: &str,
   wanted: &dyn Fn(u32) -> bool,
   poll: Duration,
-  wait: Duration,
+  judged: &mut super::process_wait::Judged,
 ) -> u32 {
-  let started = Instant::now();
   loop {
     let output = Command::new(env!("CARGO_BIN_EXE_slates"))
       .args(["--instance", instance, "status", "--json"])
       .output()
       .unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
-    let last = if output.status.success() {
+    if output.status.success() {
       let pid = after(&text, PID_KEY).and_then(|rest| {
         rest
           .split(|c: char| !c.is_ascii_digit())
@@ -42,14 +43,10 @@ pub(crate) fn await_recovered(
       if let Some(pid) = pid.filter(|pid| recovered && wanted(*pid)) {
         return pid;
       }
-      format!("pid {pid:?}, recovered {recovered}")
-    } else {
-      format!("status exited {:?}", output.status.code())
-    };
-    assert!(
-      started.elapsed() < wait,
-      "no daemon of {instance} the test wanted was judged recovered within {wait:?} (last: {last})"
-    );
+    }
+    judged.look(&format!(
+      "a daemon of {instance} the test wanted judged recovered"
+    ));
     // The test paces its asks; shipped code parks on its driver (D-9).
     #[allow(clippy::disallowed_methods)]
     std::thread::sleep(poll);

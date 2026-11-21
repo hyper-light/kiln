@@ -51,8 +51,8 @@ use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::{ClusterError, CommitBudget, broadcast, commit_record};
 use slates_db::register::{
   Accepted, Acceptor, Authority, HostEpoch, HostId, HostPrepare, HostPromise, LedgerPrepare,
-  LedgerPromise, Lineage, ObjectId, Placement, Record, RegionalConfiguration, RegisterError,
-  encode_refusal,
+  LedgerPromise, Lineage, ObjectId, Placement, Record, RegionalConfiguration, RegisterClass,
+  RegisterError, encode_refusal,
 };
 use slates_db::takeover::{
   CountingRule, Heard, LedgerAnswered, Readiness, answer_by_name, answer_ledger, copy_falls_to,
@@ -233,6 +233,31 @@ const TAKEOVER_RECOVERED_PAST_TOLERANCE: &str = "fleet.takeover.recovered_past_t
 /// The status count under which a successor records an object it adopted and placed under itself.
 /// Format: a refusal name in the daemon's status report.
 const TAKEOVER_ADOPTED: &str = "fleet.takeover.adopted";
+
+/// Counter: a repository's state log's register adopted by this successor (A-636 part 2b): owned and placed here, never
+/// taken for a volume's head; the repository's state rebuilt from its logs is part 2c's.
+/// Format: a counter name in the daemon's status report.
+pub(crate) const TAKEOVER_STATE_LOG_ADOPTED: &str = "fleet.takeover.state_log_adopted";
+
+/// Counter: a repository's own register adopted by this successor, its record kept for the repository's rebuild from
+/// it and its state logs (A-636 part 2c-1; the rebuild is part 2c-2). Format: a counter name in the daemon's status
+/// report.
+pub(crate) const TAKEOVER_REPOSITORY_ADOPTED: &str = "fleet.takeover.repository_adopted";
+
+/// Counter: a repository taken over recorded whole by its successor from its adopted record and the parts of its state
+/// logs it kept, its store made from the log (A-636 part 2c-2). Format: a counter name in the daemon's status report.
+pub(crate) const TAKEOVER_REPOSITORY_REBUILT: &str = "fleet.takeover.repository_rebuilt";
+
+/// Counter: an operation of a repository taken over that its successor dropped because some log it moved did not hold
+/// it whole (A-636 part 1's rule, part 2c-2): never committed whole, so no holder applied it. Format: a counter name in
+/// the daemon's status report.
+pub(crate) const TAKEOVER_REPOSITORY_OPERATION_DROPPED: &str =
+  "fleet.takeover.repository_operation_dropped";
+
+/// Counter: a repository taken over whose record and kept parts its shard's database refused (A-636 part 2c-2): the
+/// refusal logged, the repository not rebuilt here, never attempted again. Zero in every correct use. Format: a counter
+/// name in the daemon's status report.
+pub(crate) const TAKEOVER_REPOSITORY_UNREBUILT: &str = "fleet.takeover.repository_unrebuilt";
 
 /// Counter: a takeover round started over, under a newer configuration or above a fence a holder reported
 /// ([`begin_round`]); the objects it adopted stay adopted, and their copies do not raise its epoch (A-353).
@@ -1816,8 +1841,8 @@ async fn give_up_dropped(departed: HostId, learned: Vec<ObjectId>, local: HostId
 /// Records each of `objects` unrecovered on its owner shard, `RecoveryCause::TakeoverIncomplete { waited_on }`, so every
 /// verb on it answers `NotRecovered`: the give-up a takeover round makes by name ([`give_up_unpromised`],
 /// [`give_up_dropped`]). A catalog register has no verbs of its own (its volume waits for it in its materialization and
-/// is given up there, naming `catalog`), and an object whose partition no shard here serves has nowhere to be recorded:
-/// each is settled unrecorded. Returns every object settled, each with whether its owner shard recorded it. Each owner
+/// is given up there, naming `catalog`), nor has a repository's state log (A-636 part 2b), and an object whose
+/// partition no shard here serves has nowhere to be recorded: each is settled unrecorded ([`given_up_shard`]). Returns every object settled, each with whether its owner shard recorded it. Each owner
 /// shard is waited for in its own time (A-435), since the give-up is one attempt: a shard alive and busy records its
 /// objects, and only one that stopped, or ran a window of CPU without answering, settles none of them. It was waited a
 /// period on the wall, and a busy owner shard left its objects answering as volumes no member serves for good. Bounded
@@ -1826,16 +1851,12 @@ async fn record_given_up(objects: &[ObjectId], waited_on: &'static str) -> Vec<(
   let Some(origin) = state::with_state(|s| s.shard) else {
     return Vec::new();
   };
-  // Each object's owner shard, `None` for a catalog register (nothing to record) or a partition with no shard here.
+  // Each object's owner shard, `None` for a register with no verbs of its own (nothing to record) or a partition with no
+  // shard here.
   let mut by_shard: BTreeMap<u16, Vec<ObjectId>> = BTreeMap::new();
   let mut settled: Vec<(ObjectId, bool)> = Vec::new();
   for object in objects {
-    let target = (!object.is_catalog())
-      .then(|| {
-        let partition = crate::verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
-        state::with_state(|s| s.shards.get(usize::from(partition)).copied()).flatten()
-      })
-      .flatten();
+    let target = state::with_state(|s| given_up_shard(s, *object)).flatten();
     match target {
       Some(shard) => by_shard.entry(shard).or_default().push(*object),
       None => settled.push((*object, false)),
@@ -1872,6 +1893,17 @@ async fn record_given_up(objects: &[ObjectId], waited_on: &'static str) -> Vec<(
 
 /// Claims every recorded object of `settled` ([`record_given_up`]) as this node's in every shard's routing, so a read
 /// from another node meets its `NotRecovered` answer here.
+/// The shard here that records `object` given up: its id's partition's owner shard (A-435). `None` for a register with no
+/// verbs of its own, which its object's give-up stands for (a catalog, given up with its volume; a repository's state
+/// log, A-636 part 2b, whose id is no volume's), and for a partition no shard here serves.
+fn given_up_shard(state: &ShardState, object: ObjectId) -> Option<u16> {
+  if object.class() != RegisterClass::Own {
+    return None;
+  }
+  let partition = crate::verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+  state.shards.get(usize::from(partition)).copied()
+}
+
 fn claim_given_up(state: &mut ShardState, settled: &[(ObjectId, bool)], local: HostId) {
   for (object, _) in settled.iter().filter(|(_, claimed)| *claimed) {
     track_owner_on_every_shard(state, *object, local);
@@ -2395,7 +2427,9 @@ async fn commit_ledger_positions(
 
 /// Records `object` adopted by this node: tracked as its own, its placement kept at the adoption's sequence
 /// and epoch, its lease-gate record dropped, the round's learned reports for it dropped, and its content — a
-/// volume's manifest or a green's chain — queued to be served on the shard its id routes to.
+/// volume's manifest or a green's chain — queued to be served on the shard its id routes to. What it is adopted as is
+/// read from its id's register class first (A-636 part 2b): a catalog, a repository's state log (counted; its
+/// repository's state is rebuilt from its logs by part 2c), or the object's own register, whose value says which.
 fn record_adoption(
   state: &mut ShardState,
   departed: HostId,
@@ -2429,25 +2463,51 @@ fn record_adoption(
     }
     take.adopted.insert(object);
   }
-  if object.is_catalog() {
-    // A volume's catalog register: its successor rebuilds the volume under it (AUD-29-17) — unless the
-    // volume's own register was adopted as a tombstone (AUD-29-43): a destroyed volume is not rebuilt. A work's catalog
-    // is the route a resend of its submits takes (A-255), which the route keeper ends once nothing can use it (A-288).
-    if let Some(catalog) = crate::catalog::CatalogValue::from_record_bytes(&record.value)
-      && !state
-        .pending_tombstones
-        .contains_key(&object.placement_key())
-    {
-      let route = catalog.work_of.is_some();
-      state
-        .pending_catalogs
-        .insert(object.placement_key(), (record.sequence, catalog));
-      if route {
-        crate::work_route::nudge(state);
-      }
-    }
-  } else if let Some(tombstone) = crate::tombstone::TombstoneValue::from_record_bytes(&record.value)
+  // Dispatched by the register's class, read from its id before any value is decoded (A-636 part 2b): a state log's
+  // record is never taken for its repository's head, whatever its bytes.
+  match object.class() {
+    RegisterClass::Catalog => adopt_catalog(state, object, record),
+    RegisterClass::State(_) => state.count(TAKEOVER_STATE_LOG_ADOPTED, 1),
+    RegisterClass::Own => adopt_own(
+      state,
+      (departed, object, record),
+      registers_short,
+      reported_adopted,
+    ),
+  }
+  let count = state.refusals.entry(TAKEOVER_ADOPTED).or_insert(0);
+  *count = count.saturating_add(1);
+}
+
+/// A volume's catalog register adopted: its successor rebuilds the volume under it (AUD-29-17) — unless the volume's own
+/// register was adopted as a tombstone (AUD-29-43): a destroyed volume is not rebuilt. A work's catalog is the route a
+/// resend of its submits takes (A-255), which the route keeper ends once nothing can use it (A-288).
+fn adopt_catalog(state: &mut ShardState, object: ObjectId, record: &Record) {
+  if let Some(catalog) = crate::catalog::CatalogValue::from_record_bytes(&record.value)
+    && !state
+      .pending_tombstones
+      .contains_key(&object.placement_key())
   {
+    let route = catalog.work_of.is_some();
+    state
+      .pending_catalogs
+      .insert(object.placement_key(), (record.sequence, catalog));
+    if route {
+      crate::work_route::nudge(state);
+    }
+  }
+}
+
+/// An object's own register adopted, by its value's class: a destroyed volume's tombstone, a volume's head (its
+/// materialization queued from where its departed owner placed it), a repository's record (kept for its rebuild, A-636
+/// part 2c-1), or a green's merge record (its rebuild queued).
+fn adopt_own(
+  state: &mut ShardState,
+  (departed, object, record): (HostId, ObjectId, &Record),
+  registers_short: Option<slates_db::catalog::RecoveryShortfall>,
+  reported_adopted: Vec<HostId>,
+) {
+  if let Some(tombstone) = crate::tombstone::TombstoneValue::from_record_bytes(&record.value) {
     // A destroyed volume (AUD-29-43): the successor owes its tombstone from the adopted stage on, and never
     // materializes it.
     state.pending_catalogs.remove(&object);
@@ -2470,6 +2530,13 @@ fn record_adoption(
     let mut pending = crate::state::PendingVolume::adopted(head, Some(departed), cohort_hosts);
     pending.registers_short = registers_short;
     state.pending_materializations.insert(object, pending);
+  } else if let Some(repository) = crate::catalog::repository_of(&record.value) {
+    // A repository's record (A-636 part 2c-1): kept for its rebuild from it and its state logs (part 2c-2), never
+    // queued as a volume or a green.
+    state
+      .pending_repositories
+      .insert(object, (record.sequence, repository));
+    state.count(TAKEOVER_REPOSITORY_ADOPTED, 1);
   } else {
     match crate::merge_service::MergeRecordValue::decode_record(&record.value) {
       // A green: its newest merge record was adopted; the owned green is rebuilt from this node's accepted chain
@@ -2489,8 +2556,117 @@ fn record_adoption(
       }
     }
   }
-  let count = state.refusals.entry(TAKEOVER_ADOPTED).or_insert(0);
-  *count = count.saturating_add(1);
+}
+
+/// A repository this node took over, ready to be rebuilt (A-636 part 2c-2): its id, its adopted record and every part
+/// of its four state logs this node holds, read from the logs' registers' acceptors here.
+pub(crate) type ReadyRepository = (
+  ObjectId,
+  slates_db::catalog::RepositoryRecord,
+  Vec<slates_db::catalog::StateLogRecord>,
+);
+
+/// The repositories this node adopted whose rebuild can run (A-636 part 2c-2): each whose record was adopted
+/// ([`adopt_own`]) and no register of whose family any takeover round still learns, its state logs' and its greens'
+/// alike, and none of whose greens still waits to be materialized, so every log it keeps is adopted and every green's
+/// head is the adopted one. Each with the parts its state logs' registers hold here, in each log's order.
+pub(crate) fn repositories_ready(state: &ShardState) -> Vec<ReadyRepository> {
+  state
+    .pending_repositories
+    .iter()
+    .filter(|(object, _)| {
+      let family = object.line_key();
+      let learning = state.host_takeovers.values().any(|take| {
+        take
+          .learned
+          .keys()
+          .any(|learned| learned.line_key() == family)
+      });
+      let materializing = state
+        .pending_green_materializations
+        .keys()
+        .any(|green| green.line_key() == family);
+      !learning && !materializing
+    })
+    .map(|(object, (_, record))| (*object, record.clone(), held_parts(state, record.id)))
+    .collect()
+}
+
+/// Every part of `repository`'s four state logs this node's acceptors hold, by log and then position.
+fn held_parts(
+  state: &ShardState,
+  repository: slates_db::catalog::RepositoryId,
+) -> Vec<slates_db::catalog::StateLogRecord> {
+  use slates_db::catalog::{LogName, StateLog};
+  [
+    StateLog::Names,
+    StateLog::Phases,
+    StateLog::Markers,
+    StateLog::Locks,
+  ]
+  .into_iter()
+  .flat_map(|log| {
+    let register = LogName::State { repository, log }.register();
+    state
+      .holder_records
+      .get(&register)
+      .map(|acceptor| {
+        acceptor
+          .values(register)
+          .filter_map(crate::state_log::record_of)
+          .collect::<Vec<_>>()
+      })
+      .unwrap_or_default()
+  })
+  .collect()
+}
+
+/// Rebuilds a repository taken over on the shard its id routes to (A-636 part 2c-2): keeps the parts of its state logs
+/// held whole by A-636 part 1's rule, each green's log judged by its head here ([`slates_db::repository::whole_parts`]),
+/// records it whole from its adopted record and those parts (`Op::RepositoryRebuilt`), and makes its store from the
+/// log and each member green's map from its adopted head a step a turn ([`crate::vcs_store::rebuild`]), as a rebuild
+/// does. Whether it stands here now: recorded, or recorded
+/// already; `false` once the database refused it, logged and counted ([`TAKEOVER_REPOSITORY_UNREBUILT`]).
+pub(crate) fn rebuild_repository(
+  state: &mut ShardState,
+  record: slates_db::catalog::RepositoryRecord,
+  parts: Vec<slates_db::catalog::StateLogRecord>,
+) -> bool {
+  if state
+    .db
+    .partition()
+    .repositories()
+    .repository(record.id)
+    .is_some_and(|held| *held == record)
+  {
+    return true;
+  }
+  let partition = state.db.partition();
+  let (parts, dropped) =
+    slates_db::repository::whole_parts(parts, |green| partition.green_head(green));
+  let op = slates_db::op::Op::RepositoryRebuilt {
+    record: record.clone(),
+    parts,
+  };
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  if let Err(error) = state.db.mutate(&mut state.segment, &op, now) {
+    slates_machine::log_line!(
+      "slates-server: partition {}: a repository taken over was not rebuilt: {error:?}",
+      state.partition
+    );
+    state.count(TAKEOVER_REPOSITORY_UNREBUILT, 1);
+    return false;
+  }
+  state.count(
+    TAKEOVER_REPOSITORY_OPERATION_DROPPED,
+    u64::try_from(dropped.len()).unwrap_or(u64::MAX),
+  );
+  // Its store made from the log a step a turn, lent to nothing until it is whole, then each green's map made again in
+  // slices (A-732 and its git and Subversion sibling): a large repository's adoption held in one step would spin the
+  // successor's shard past the watchdog, the crash loop on another path.
+  crate::vcs_store::rebuild(state, record.id);
+  state.count(TAKEOVER_REPOSITORY_REBUILT, 1);
+  true
 }
 
 /// Whether this node's share of `departed`'s takeover is done: every member of the recovery neighbourhoods it
@@ -3424,5 +3600,179 @@ mod tests {
     );
     assert_eq!(owner, Some(local), "claimed by the round's node");
     assert_eq!((given_up, dropped), (2, 2), "both registers counted");
+  }
+
+  /// A state log's record at `register`, from 0 to 2, as a part of one operation.
+  fn names_part(repository: ObjectId) -> Vec<u8> {
+    let repository = slates_db::catalog::RepositoryId {
+      bytes: repository.0,
+    };
+    let log = slates_db::catalog::LogName::State {
+      repository,
+      log: slates_db::catalog::StateLog::Names,
+    };
+    crate::state_log::value_of(&slates_db::catalog::StateLogRecord {
+      repository,
+      log: slates_db::catalog::StateLog::Names,
+      from: 0,
+      to: 2,
+      identity: [2; 32],
+      spans: vec![slates_db::catalog::LogSpan {
+        log,
+        from: 0,
+        to: 2,
+      }],
+      changes: Vec::new(),
+    })
+  }
+
+  /// A-636 part 2b (A-636 part 2a's dispatch sites). Do: on a successor's shard, adopt a departed owner's repository's
+  /// names log's register, once with a value that decodes as a volume's head and once with a state log's record; then
+  /// the repository's own id with that head. Expect: the state log adopted as its class each time and counted, nothing
+  /// queued to be materialized or rebuilt for it (no volume, green, catalog or tombstone) and no merge record refused;
+  /// the repository's own id, a head, queued as a volume. Before, the register's class was read only for a catalog, so
+  /// a state log whose value read as a head was queued to be materialized as a volume of its own.
+  #[test]
+  fn a_state_logs_register_is_adopted_as_its_class_never_as_its_repositorys_head() {
+    crate::daemon::audit_on_shard(|state| {
+      let (departed, local) = (HostId(7), state.fleet.host());
+      let repository = ObjectId::new(departed, 3);
+      let names = repository.in_class(RegisterClass::State(slates_db::catalog::StateLog::Names));
+      let head = sealed(&[1], 3).to_record_bytes();
+      let record = |object: ObjectId, value: Vec<u8>| Record {
+        owner: local,
+        object,
+        sequence: 2,
+        epoch: HostEpoch(2),
+        generation: 0,
+        value,
+      };
+      for value in [head.clone(), names_part(repository)] {
+        record_adoption(
+          state,
+          departed,
+          names,
+          &record(names, value),
+          Placement::of(&[local]),
+          local,
+        );
+      }
+      assert!(!state.pending_materializations.contains_key(&names));
+      assert!(!state.pending_green_materializations.contains_key(&names));
+      assert!(!state.pending_tombstones.contains_key(&names));
+      assert!(state.pending_catalogs.is_empty());
+      assert_eq!(
+        state.refusals.get(TAKEOVER_STATE_LOG_ADOPTED).copied(),
+        Some(2)
+      );
+      record_adoption(
+        state,
+        departed,
+        repository,
+        &record(repository, head),
+        Placement::of(&[local]),
+        local,
+      );
+      assert!(state.pending_materializations.contains_key(&repository));
+    });
+  }
+
+  /// A-636 part 2c-1. Do: on a successor's shard, adopt a departed owner's repository's own register holding its record,
+  /// at sequence 5; then adopt another object's own register whose value is a repository's record cut short, and one
+  /// whose value is a record behind a state log's class byte. Expect: the repository kept as a pending repository with
+  /// the sequence and the record adopted, counted once; nothing queued to be materialized or rebuilt for it (no volume,
+  /// green or tombstone); the cut-short and misclassed values kept as no repository.
+  #[test]
+  fn a_repositorys_record_is_adopted_as_its_own_never_as_a_volume_or_a_green() {
+    crate::daemon::audit_on_shard(|state| {
+      let (departed, local) = (HostId(7), state.fleet.host());
+      let repository = ObjectId::family(departed, 0, 9, 9).unwrap();
+      let held = slates_db::catalog::RepositoryRecord {
+        index_bits: 0,
+        id: slates_db::catalog::RepositoryId {
+          bytes: repository.0,
+        },
+        name: "linux".to_owned(),
+        tool: slates_db::catalog::VcsTool::Git,
+        format: slates_db::catalog::ObjectFormat::Sha1,
+        default_branch: Some("main".to_owned()),
+        owner: slates_db::catalog::Principal::Certificate { hash: [7; 32] },
+        policy: slates_db::catalog::RepositoryPolicy::default(),
+      };
+      let value = crate::catalog::repository_value(&held);
+      let record = |object: ObjectId, value: Vec<u8>| Record {
+        owner: local,
+        object,
+        sequence: 5,
+        epoch: HostEpoch(2),
+        generation: 0,
+        value,
+      };
+      record_adoption(
+        state,
+        departed,
+        repository,
+        &record(repository, value.clone()),
+        Placement::of(&[local]),
+        local,
+      );
+      assert_eq!(
+        state.pending_repositories.get(&repository),
+        Some(&(5, held.clone()))
+      );
+      assert!(!state.pending_materializations.contains_key(&repository));
+      assert!(
+        !state
+          .pending_green_materializations
+          .contains_key(&repository)
+      );
+      assert!(!state.pending_tombstones.contains_key(&repository));
+      let short = value.get(..value.len().saturating_sub(1)).unwrap().to_vec();
+      let mut misclassed = value;
+      misclassed[0] = crate::catalog::STATE_LOG_CLASS;
+      for (serial, value) in [(10, short), (11, misclassed)] {
+        let other = ObjectId::family(departed, 0, 9, serial).unwrap();
+        record_adoption(
+          state,
+          departed,
+          other,
+          &record(other, value),
+          Placement::of(&[local]),
+          local,
+        );
+        assert!(!state.pending_repositories.contains_key(&other), "{serial}");
+      }
+      assert_eq!(
+        state.refusals.get(TAKEOVER_REPOSITORY_ADOPTED).copied(),
+        Some(1)
+      );
+    });
+  }
+
+  /// A-636 part 2b (A-636 part 2a's dispatch sites). Do: on a shard serving partition 0, ask which shard records each of
+  /// a repository's registers given up by name: its own id, its catalog and each of its four state logs. Expect: its own
+  /// id recorded on the shard serving its partition; its catalog and its state logs nowhere, each settled unrecorded,
+  /// since none is a volume with verbs of its own. Before, every register but a catalog was recorded as an unrecovered
+  /// volume under its own id, so a state log's id answered `NotRecovered` as a volume no one had.
+  #[test]
+  fn a_given_up_state_log_is_settled_unrecorded_as_a_catalog_is() {
+    crate::daemon::audit_on_shard(|state| {
+      let mut bytes = [0u8; 16];
+      bytes[15] = 5;
+      let repository = ObjectId(bytes);
+      let shard = state.shards.first().copied();
+      assert!(shard.is_some());
+      assert_eq!(given_up_shard(state, repository), shard);
+      assert_eq!(given_up_shard(state, repository.catalog()), None);
+      for log in [
+        slates_db::catalog::StateLog::Names,
+        slates_db::catalog::StateLog::Phases,
+        slates_db::catalog::StateLog::Markers,
+        slates_db::catalog::StateLog::Locks,
+      ] {
+        let register = repository.in_class(RegisterClass::State(log));
+        assert_eq!(given_up_shard(state, register), None, "{log:?}");
+      }
+    });
   }
 }

@@ -7,6 +7,7 @@ use std::time::Duration;
 use slates_anchor::{AnchorSegment, RegionKind};
 use slates_machine::facts::Facts;
 use slates_machine::{MachineProfile, ProfileOptions};
+use slates_server::config::{VcsHttpConfig, VcsSshConfig};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 use super::parent::ParentWatch;
@@ -181,6 +182,7 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
   // A fleet node (§2.6 boot step 6): the shared manifest gives the membership the placement authority is
   // built over and the transport the membership loop drives; a laptop passes neither and runs the same
   // placement path, degenerate (R8).
+  let mut edge_identity = None;
   let transport = match &options.fleet {
     Some(selection) => {
       let plan = super::fleet::load(selection)?;
@@ -193,6 +195,8 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
         plan.membership.quorum.f
       );
       config = config.with_fleet(plan.membership);
+      // The node's own identity, which the version-control edge presents when one is asked for below.
+      edge_identity = Some(plan.edge_identity);
       // The serve sockets are bound here, before the daemon starts: an address in use refuses the start
       // by name instead of leaving a daemon that can never be probed.
       Some(
@@ -204,6 +208,27 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
     }
     None => None,
   };
+  // The version-control servers' shared HTTP edge, when the operator asked for one (`--vcs-http`; §4.17.2 "Transports"
+  // item 1, A-625 part 3): a fleet node's presents the node's own identity over HTTPS; a daemon that is no fleet node
+  // serves cleartext, on a loopback address alone, which the flag's reading held it to (`super::vcs_address`).
+  config.vcs_http = options.vcs_http.map(|address| VcsHttpConfig {
+    address,
+    identity: edge_identity.clone(),
+  });
+  // The SSH edge, when asked for (`--vcs-ssh`; §4.17.2 "Transports" item 2, A-684): a fleet node's presents the node's
+  // own key from the same identity; any other daemon serves with the key its anchor made at its start and published in
+  // the segment, or, run alone, one it makes for its own life.
+  config.vcs_ssh = options.vcs_ssh.map(|address| VcsSshConfig {
+    address,
+    identity: edge_identity,
+  });
+  let edge = config
+    .vcs_http
+    .as_ref()
+    .map(|edge| (edge.address, edge.identity.is_some()));
+  // The svn:// listener, when the operator asked for one (`--vcs-svn`; §4.17.4 piece 7, A-656 part 2): cleartext as
+  // ra_svn is, on a loopback address alone for a daemon that is no fleet node, which the flag's reading held it to.
+  config.vcs_svn = options.vcs_svn;
   for line in &config.derivations {
     slates_machine::log_line!("slates daemon: {line}");
   }
@@ -215,6 +240,39 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
     supervision.mark_serving(slates_vfs::clock::Clock::monotonic_ns(
       &mut slates_vfs::clock::HostClock::new(),
     ));
+  }
+  // Where the edge serves, before the line that says the daemon serves, so whoever reads the one has read the other (a
+  // port 0 asked for is the system's pick). An edge asked for that did not start was logged with its reason by the
+  // daemon, which serves everything else.
+  if let Some((address, https)) = edge
+    && let Some(port) = daemon.vcs_http_port()
+  {
+    slates_machine::log_line!(
+      "slates daemon: the version-control HTTP edge serves {} on {}:{port}",
+      if https { "HTTPS" } else { "cleartext" },
+      address.ip()
+    );
+  }
+  // The SSH edge's address and its host key's fingerprint, as `ssh` shows a key it has not seen ("ED25519 key fingerprint
+  // is SHA256:..."), so a person compares the two before trusting the key (A-684); before the serving line, as above.
+  if let Some(address) = options.vcs_ssh
+    && let Some(edge) = daemon.vcs_ssh()
+  {
+    slates_machine::log_line!(
+      "slates daemon: the version-control SSH edge serves on {}:{} with the ED25519 host key {}",
+      address.ip(),
+      edge.port,
+      edge.fingerprint
+    );
+  }
+  // Where the svn:// listener serves, before the serving line too; one asked for that did not start was logged.
+  if let Some(address) = options.vcs_svn
+    && let Some(port) = daemon.vcs_svn_port()
+  {
+    slates_machine::log_line!(
+      "slates daemon: the svn:// listener serves on {}:{port}",
+      address.ip()
+    );
   }
   slates_machine::log_line!(
     "slates daemon: instance {} serving on {} shards{}",
@@ -236,12 +294,8 @@ pub(crate) fn serve(started: Started) -> Result<(), Failure> {
   // The process thread waits for a reason to stop without polling: the control shard's heartbeat asks the anchor's
   // stop request and these two at its own cadence and wakes this thread once one holds.
   let watch = parent;
-  let waited = daemon.wait_for_stop(move || signal::stop_requested() || !watch.anchor_alive());
-  if let Err(refusal) = waited {
-    slates_machine::log_line!(
-      "slates daemon: the stop watch could not be installed ({refusal}); stopping"
-    );
-  } else if signal::stop_requested() || daemon.stop_requested() {
+  daemon.wait_for_stop(move || signal::stop_requested() || !watch.anchor_alive());
+  if signal::stop_requested() || daemon.stop_requested() {
     // A planned stop: hand off any consensus leadership first, so the groups pay a handoff rather than the
     // election timeout a leader loss waits out (bounded; the anchor holds the daemon to its declaration).
     match daemon.drain_leadership() {
@@ -252,11 +306,36 @@ pub(crate) fn serve(started: Started) -> Result<(), Failure> {
     }
   } else if !parent.anchor_alive() {
     slates_machine::log_line!("slates daemon: the anchor is gone; leaving");
+    release_the_anchors_objects();
   } else {
     slates_machine::log_line!("slates daemon: the control shard's watch ended; stopping");
   }
   daemon.stop();
   Ok(())
+}
+
+/// Removes the names of the anchor's segment and content object once the anchor is gone (`slates_mem::unlink_handoff`):
+/// on macOS an object outlives every holder while its name exists, so a `SIGKILL`ed anchor left both in the kernel with
+/// every page the daemon had written (21 GB of the big Studio after four killed anchors, 2026-11-20). Done before the
+/// stop, so a daemon killed while it stops has already let them go; its own mappings keep the bytes until it exits.
+fn release_the_anchors_objects() {
+  for variable in [
+    slates_anchor::segment::ENV_HANDOFF,
+    slates_anchor::segment::ENV_CONTENT,
+  ] {
+    let Ok(value) = std::env::var(variable) else {
+      continue;
+    };
+    let handoff = match value.parse::<i32>() {
+      Ok(descriptor) => slates_mem::Handoff::Descriptor(descriptor),
+      Err(_) => slates_mem::Handoff::Name(value),
+    };
+    if let Err(refusal) = slates_mem::unlink_handoff(&handoff) {
+      slates_machine::log_line!(
+        "slates daemon: the anchor's {variable} was not released: {refusal}"
+      );
+    }
+  }
 }
 
 #[cfg(test)]

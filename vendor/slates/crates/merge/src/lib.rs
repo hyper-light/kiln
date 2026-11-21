@@ -36,19 +36,28 @@ pub mod checkpoint;
 pub mod derive;
 mod dims;
 pub mod engine;
+pub mod held;
 mod history;
 mod identity;
 pub mod increment;
 pub mod map;
+pub mod named;
 pub mod ops_doc;
 pub mod origin;
+pub mod pace;
 pub mod ptrie;
+pub mod push;
 pub mod range;
+pub mod refine;
+pub mod review;
 pub mod splice;
 pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};
-pub use engine::{ConflictWindow, Green, Increment, Outcome};
+pub use engine::{
+  ComputeRefused, Computed, ConflictWindow, Green, HeadMoved, Increment, Judged, Judgment, Outcome,
+  PositionRefused, ReanchorRefused, Reanchored,
+};
 pub use increment::{Base, DeriveError, VolumeOp, compose_volume};
 pub use map::{Mapped, map_range};
 pub use ops_doc::{Op, OpKind, OpsDoc, PathTable};

@@ -82,6 +82,25 @@ pub enum Principal {
   },
 }
 
+/// A version-control credential, as `EnrollCredential` gives it (§4.13, §4.17.2 "Access"; A-625 part 3).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum CredentialMaterial {
+  /// An SSH user key: its public key blob (RFC 4253 §6.6), the bytes a `.pub` line carries base64-encoded.
+  SshKey {
+    /// The blob.
+    blob: Vec<u8>,
+  },
+  /// A token, Basic's password or a bearer token over HTTP and CRAM-MD5's secret over `svn://` (A-692), by its SHA-256
+  /// and its CRAM-MD5 keyed contexts, which the issuer derives from it: the token stays with the human the issuer showed
+  /// it to, so it never crosses a channel.
+  HttpToken {
+    /// The token's SHA-256.
+    id: [u8; 32],
+    /// HMAC-MD5's keyed contexts of the token, in Dovecot's layout (`slates_db::catalog::CredentialKind::HttpToken`).
+    cram_md5_contexts: [u8; 32],
+  },
+}
+
 /// Rights on a volume (§4.13 "Access lists"), as a `share` grants them.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Rights {
@@ -345,6 +364,9 @@ pub enum RequestBody {
     work: VolumeId,
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// Declare a namespace or metadata operation on a work volume (§4.16): the counterpart to `Edit`'s
   /// content splice, for links, directories, modes and extended attributes.
@@ -928,6 +950,9 @@ pub enum RequestBody {
     insert: EditBytes,
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// A presented landing's entries, a page at a time (§4.15 step 2: the confirmation surface shows "the full entry list
   /// on demand"): the landing a `GrantRequired` reply named, its entries' encodings from `from` (the start, then each
@@ -987,6 +1012,9 @@ pub enum RequestBody {
     evidence: Vec<[u8; 32]>,
     /// The signature a `SubmitSigned` carried, kept through the hold and judged for the approval request (A-321).
     signature: Option<Vec<u8>>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// An `EditSubmit` whose caller's own policy asks (A-285): the edit applies, and the submit is held as
   /// `SubmitHeld`'s is. Appended.
@@ -1003,6 +1031,9 @@ pub enum RequestBody {
     insert: EditBytes,
     /// The evidence references (opaque to slates), possibly none.
     evidence: Vec<[u8; 32]>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// Submits a work whose merge an ask policy held for approval (A-285): the launcher's or the harness's approval of
   /// exactly the increment `identity` names (the identity a `MergeApprovalRequired` reply carried), proven by the keyed
@@ -1021,6 +1052,9 @@ pub enum RequestBody {
     /// The signature over the merge's statement, when the merge is signed work (A-321): the approval carries it again,
     /// since the held submit kept nothing. Its reply is then `SubmittedSigned`.
     signature: Option<Vec<u8>>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// A `Submit` carrying a signature over its merge's statement (signed work, A-321; `slates_server::signed_work::
   /// merge_statement`, signed under the namespace `slates-work`): judged under the work's and the green's trusted
@@ -1034,6 +1068,9 @@ pub enum RequestBody {
     evidence: Vec<[u8; 32]>,
     /// The SSH signature blob (the armour's base64, decoded).
     signature: Vec<u8>,
+    /// What the commit the server makes of the work carries (A-664): the message the client gives, and the identities
+    /// its channel fills in. Appended.
+    authorship: Authorship,
   },
   /// Sets a volume's trusted signers (signed work, A-321): the public keys, in SSH wire form, whose signatures over the
   /// volume's work verify; the whole set, so a key is removed by setting the set without it. The launcher's act, proven
@@ -1191,6 +1228,327 @@ pub enum RequestBody {
     /// The branch's name.
     name: String,
   },
+  /// Set repository `repository`'s policy whole (§4.17.1 "Policy"; A-622): its rules by name pattern, its hooks, a
+  /// Subversion repository's hooks-env (A-648) and a git repository's keys trusted to sign its commits (A-644),
+  /// replacing what it held, made from `read`, the policy version its setter read (0 for a repository never given one).
+  /// Its owner's verb. Answered `Acknowledged`, the policy then at version `read + 1`; refused `PolicyChanged` with the
+  /// version now when the policy has moved since `read`, `Database` naming the first rule, hook or hooks-env section its
+  /// repository cannot hold, and `BadRequest` for a signer that is no key slates verifies with or signers for a
+  /// repository that is not git's. Appended.
+  SetRepositoryPolicy {
+    /// The repository.
+    repository: String,
+    /// The policy version the setter read.
+    read: u64,
+    /// The rules, in order: git's precedence and Subversion's at one depth read the order.
+    rules: Vec<PolicyRule>,
+    /// The hooks, in order: one point's hooks run in that order.
+    hooks: Vec<HookConfig>,
+    /// A Subversion repository's hooks-env, its sections in order (A-648): each hook's environment is its own section,
+    /// else the `default` one, else nothing. Empty for git and Mercurial. Appended.
+    hooks_env: Vec<HooksEnvSection>,
+    /// The keys trusted to sign the repository's commits (A-644), each an SSH public key in wire form
+    /// (`ssh-ed25519` or `sk-ssh-ed25519@openssh.com`, A-321): a commit a rule requires signed verifies under one of
+    /// them. A git repository's alone. Appended.
+    signers: Vec<Vec<u8>>,
+  },
+  /// Enroll a version-control credential for `principal` (§4.13: the human surface, proving issuer authority as an
+  /// enrollment does; §4.17.2 "Access"; A-625 part 3): an SSH user key by its blob, or a token by its SHA-256 and its
+  /// CRAM-MD5 keyed contexts (A-692), so the token itself never crosses a channel. It proves `principal` to the HTTP and
+  /// SSH edges, and a token to `svn://`'s CRAM-MD5, until `expires_ns` on the wall clock (nanoseconds since the Unix
+  /// epoch) when one is given. Served on the partition the credential's id routes
+  /// to. Answered `CredentialEnrolled` with the id; refused `Forbidden` on a consumer's channel, `GrantIssuerUnverified`
+  /// when the proof does not verify, `AlreadyExists` for an id held, `BadRequest` for a key blob that names no
+  /// algorithm, and `TableAtCapacity` past the partition's table bytes. Appended.
+  EnrollCredential {
+    /// The principal it proves.
+    principal: Principal,
+    /// The credential.
+    material: CredentialMaterial,
+    /// When it stops proving `principal` (wall clock, nanoseconds since the Unix epoch); none for never.
+    expires_ns: Option<u64>,
+    /// The proof of issuer authority: `BLAKE3_keyed(issuer_secret, "slates.credential-enroll" ‖ the wire encodings
+    /// of principal, material and expires_ns, in that order)`.
+    proof: [u8; 32],
+  },
+  /// Revoke the version-control credential named `id` (§4.13; A-625 part 3): the human surface, proving issuer
+  /// authority. Served on the partition the id routes to. Answered `CredentialRevoked`; refused `Forbidden` on a
+  /// consumer's channel, `GrantIssuerUnverified` when the proof does not verify, and `NotFound` for an id not held.
+  /// Appended.
+  RevokeCredential {
+    /// The credential's id: the SHA-256 of a key's blob or of a token.
+    id: [u8; 32],
+    /// The proof of issuer authority: `BLAKE3_keyed(issuer_secret, "slates.credential-revoke" ‖ id)`.
+    proof: [u8; 32],
+  },
+  /// Sets a principal's tool identities whole (§4.13; §4.17.1 "A push is a work" item 4; A-664): git's author and
+  /// committer and Mercurial's user, which the commits the server makes for the principal carry. Its owner's act on
+  /// the control channel, proven by the keyed hash under the launcher's secret (`slates_server::landing::
+  /// identities_proof`): refused `Forbidden` on a consumer-bound channel whatever its proof, `GrantIssuerUnverified`
+  /// without it, `PolicyChanged` from a version the record has moved past. Each identity is held to its tool's rules
+  /// (`BadRequest` naming the part). A session reads them once, at its first submit, so a setting applies from each
+  /// session that begins after it. Answered `IdentitiesSet`. Appended.
+  SetIdentities {
+    /// The principal.
+    principal: Principal,
+    /// The identities, whole.
+    identities: ToolIdentities,
+    /// The version the setter read: 0 for a principal with none yet.
+    read: u64,
+    /// The keyed hash under the launcher's secret, over the principal, the identities and the version read.
+    proof: [u8; 32],
+  },
+  /// Import a repository's history from the host into repository `repository`'s store (§4.15, read-only), on the
+  /// partition its name hashes to; the repository's owner asks. A Mercurial repository's comes from the host directory
+  /// `path` holding its `.hg` (§4.17.3 piece 3; A-675, A-678), and its store must be the empty one its record was made
+  /// with. A Subversion repository's comes from the dump stream `svnadmin dump` wrote (format 2 or 3) in the host file
+  /// `path` (§4.17.4 piece 6; A-628, A-652 part 3), which continues the repository's history, each revision committed
+  /// as a client's commit is. The import runs a turn at a time on the owner shard, and the request is answered when it
+  /// ends: `RepositoryImported` or `DumpImported` with what it took, or `ImportRefused` with its fault, every refusal by
+  /// kind. Appended.
+  ImportRepository {
+    /// The repository's name.
+    repository: String,
+    /// The host directory that holds a Mercurial repository's `.hg`, or the host file that holds a Subversion dump.
+    path: String,
+  },
+  /// Read repository `repository`'s policy (§4.17.1 "Policy"; A-622), on the partition its name hashes to: its owner's
+  /// verb, as setting it is, so a setter can change one part and keep the rest (`slates repository policy`). Answered
+  /// `RepositoryPolicy` with its version and every part; refused `NotFound` for no such repository, `Forbidden` for
+  /// any principal but its owner, and `BadRequest` for a rule naming a principal the wire cannot carry. Appended.
+  DescribeRepositoryPolicy {
+    /// The repository's name.
+    repository: String,
+  },
+  /// Export revisions `first` to `last` of Subversion repository `repository` as the dump stream `svnadmin dump` writes
+  /// for the same range (§4.17.4 piece 6; A-628, A-652 part 3): format 2, or format 3 with `deltas` (`--deltas`); a
+  /// range starting after revision 0 written incrementally (`--incremental`). The dump is written into a new volume
+  /// `name` holding it as [`DUMP_FILE`] in its root, which the caller lands where it wants the file, under a grant
+  /// (§4.15, R10), or reads through a mount. Served on the partition the repository's name hashes to, for the
+  /// repository's owner; the export runs in slices on its owner shard and the request is answered when it ends:
+  /// `DumpExported`, or refused by kind (`Unsupported` for another tool's repository, `BadRequest` for a range the
+  /// repository does not hold, `AlreadyExists` for a name taken, `BudgetExceeded`). Appended.
+  ExportDump {
+    /// The repository's name.
+    repository: String,
+    /// The range's first revision.
+    first: u64,
+    /// Its last revision.
+    last: u64,
+    /// Whether texts and property changes are written as deltas (format 3).
+    deltas: bool,
+    /// The new volume's name.
+    name: String,
+  },
+  /// Admit work `work` over green `green` at the green's owner (A-247, A-697 part a): the node that will hold the work
+  /// asks the green's owner, which judges the relayed principal's rights from the green's record, records the work's
+  /// floor at the head (`WorkFloorSet`, which keeps the head's history while the work reads it), and answers
+  /// `WorkAdmitted` with the work and its base. A node's verb, never a client's: served only as a forward from another
+  /// node, under the forward's completion record (so a resent forward is answered once), and refused `Unsupported` from
+  /// a client of the green's own node. Refused as a creation is: `NotFound` for no such green, `NotShared` for a
+  /// principal of another node the green is not shared with, `Forbidden` for one without the right. Appended.
+  AdmitWork {
+    /// The green.
+    green: VolumeId,
+    /// The work, its id minted on the asking node's partition.
+    work: VolumeId,
+  },
+  /// Move work `work`'s floor on green `green` to version `base`, or drop it (`None`), at the green's owner (A-247,
+  /// A-697 part b): the node holding a work over a green another node owns tells the owner when the work's base rises or
+  /// the work is gone, so the owner keeps the history the work reads and no more. A node's verb, never a client's:
+  /// refused `Unsupported` from a client of either node. It is monotone and idempotent, so it forwards with no completion
+  /// record, as a read does: a floor only rises (a lower or equal base is a no-op), a drop is final, and a work with no
+  /// floor at the owner (never admitted, or dropped) is left without one, so a late or repeated move changes nothing.
+  /// Answered `WorkFloorMoved`; `NotFound` for no such green. Appended.
+  MoveWorkFloor {
+    /// The green.
+    green: VolumeId,
+    /// The work, a work of the asking node.
+    work: VolumeId,
+    /// The work's base now, or `None` when the work is gone.
+    base: Option<u64>,
+  },
+  /// Commit a work's increment by the verdict a holder computed (A-697 part c; A-658 part 3b; A-645 "Merges computed
+  /// anywhere, committed by position"): the node holding work `work` over green `green`, which another node owns,
+  /// composed the work's increment, computed its verdict on its replica of the green, and sends both to the owner, which
+  /// takes the verdict by position (`Green::judge_computed`: at the head it was computed against it stands, and once the
+  /// green moved only what the versions since changed is judged again) and commits it as a submit does, answering as a
+  /// submit is answered (`Submitted`, a conflict, or the submit's refusals). A node's verb, never a client's: served only
+  /// as a forward from another node, under the forward's completion record (keyed by the client's own submit), and
+  /// refused `Unsupported` from a client of either node. A verdict that is not this increment's, or one computed past
+  /// the owner's head, is refused `BadRequest`. Appended.
+  SubmitComputed {
+    /// The work, a work of the asking node.
+    work: VolumeId,
+    /// Its green.
+    green: VolumeId,
+    /// The increment, as `Increment::encode` writes it.
+    increment: Vec<u8>,
+    /// Its verdict, as `Computed::encode` writes it (A-658 part 3a).
+    computed: Vec<u8>,
+    /// What the owner judges the write policy, the signature and the commit by.
+    carried: ComputedSubmit,
+  },
+  /// One page of the session log (`slates log`, A-773): the caller's works, each with the green version it started
+  /// from and how its last submission ended, and the landings presented and awaiting a grant, in key order past
+  /// `after` (`None` begins). A read: a scatter over the shards, each reporting the works and the waiting landings its
+  /// partition holds, never a walk of the landing history. It shows a pending grant and never makes one (R10). Appended.
+  SessionLog {
+    /// The last line of the previous page, or `None` for the first page.
+    after: Option<LogCursor>,
+  },
+}
+
+/// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
+/// repository's tool has.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyNames {
+  /// git refs, by `git for-each-ref`'s pattern: a ref, a prefix ending at a slash, or a glob.
+  Refs,
+  /// Mercurial named branches, by name or `*`.
+  Branches,
+  /// Mercurial bookmarks, by name or `*`.
+  Bookmarks,
+  /// Mercurial topics, by name or `*`.
+  Topics,
+  /// Subversion paths: `/path`, or `:glob:/path` with wildcards.
+  Paths,
+}
+
+/// A right a policy rule decides (§4.17.1 "Policy"; A-622, A-644's requirements).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyRight {
+  /// Read the branch.
+  Read,
+  /// Submit a work to it.
+  Submit,
+  /// Move it to a head that does not descend from its current one.
+  Rewrite,
+  /// Delete it.
+  Delete,
+  /// Bring it a merge commit (A-644): a requirement, which a rule denying it imposes (a linear history) and a later
+  /// rule allowing it lifts for whom it names; where no rule speaks, nothing is required. git's alone. Appended.
+  MergeCommit,
+  /// Bring it a commit no trusted signer signed (A-644): a requirement as `MergeCommit` is (signed commits). git's
+  /// alone. Appended.
+  UnsignedCommit,
+}
+
+/// Whether a policy rule allows its right or denies it (A-622).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyEffect {
+  /// It allows the right.
+  Allow,
+  /// It denies the right.
+  Deny,
+}
+
+/// One entry of the principals a policy rule speaks to (A-622).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PolicyEntry {
+  /// This principal.
+  Is {
+    /// The principal.
+    principal: Principal,
+  },
+  /// Every principal but this one (acl's `!user`, authz's `~user`).
+  IsNot {
+    /// The principal excepted.
+    principal: Principal,
+  },
+}
+
+/// The principals a policy rule speaks to (A-622).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum PolicyWho {
+  /// Every principal.
+  Anyone,
+  /// Each principal one of the entries names.
+  AnyOf {
+    /// The entries.
+    entries: Vec<PolicyEntry>,
+  },
+}
+
+/// One policy rule (§4.17.1 "Policy"; A-622): on the names `pattern` covers, `effect` for `right` to the principals
+/// `who` names.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRule {
+  /// What the pattern names.
+  pub names: PolicyNames,
+  /// The pattern, in its tool's form: not empty, holding no NUL, and for Subversion a path from the root.
+  pub pattern: String,
+  /// The right it decides.
+  pub right: PolicyRight,
+  /// Whether it allows or denies.
+  pub effect: PolicyEffect,
+  /// Whom it speaks to.
+  pub who: PolicyWho,
+}
+
+/// A hook point (§4.17.1; A-597's points), each its tool's (A-622).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HookPointName {
+  /// git's `pre-receive`.
+  GitPreReceive,
+  /// git's `update`.
+  GitUpdate,
+  /// git's `post-receive`.
+  GitPostReceive,
+  /// Mercurial's `pretxnchangegroup`.
+  HgPretxnchangegroup,
+  /// Mercurial's `changegroup`.
+  HgChangegroup,
+  /// Subversion's `pre-commit`.
+  SvnPreCommit,
+  /// Subversion's `pre-revprop-change`.
+  SvnPreRevpropChange,
+  /// Subversion's `post-commit`.
+  SvnPostCommit,
+  /// Subversion's `start-commit` (A-648). Appended.
+  SvnStartCommit,
+  /// Subversion's `post-revprop-change` (A-648). Appended.
+  SvnPostRevpropChange,
+  /// Subversion's `pre-lock` (A-648). Appended.
+  SvnPreLock,
+  /// Subversion's `post-lock` (A-648). Appended.
+  SvnPostLock,
+  /// Subversion's `pre-unlock` (A-648). Appended.
+  SvnPreUnlock,
+  /// Subversion's `post-unlock` (A-648). Appended.
+  SvnPostUnlock,
+}
+
+/// One configured hook (§4.17.1: "a program the repository's owner configured"; A-622).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HookConfig {
+  /// The point it runs at.
+  pub point: HookPointName,
+  /// Its name: at a Mercurial point, the point's name alone or with a `.suffix`, one hook a name; git and Subversion
+  /// keep one hook a point, named for its point.
+  pub name: String,
+  /// The program it runs: an absolute path on the host that runs the repository's hooks.
+  pub program: String,
+}
+
+/// A variable of a Subversion repository's hooks-env (A-648), as `SetRepositoryPolicy` gives it: one `NAME = value`
+/// line of a section of the file `svnserve.conf`'s `hooks-env` names.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HooksEnvVariable {
+  /// Its name: not empty, holding no `=` and no NUL.
+  pub name: String,
+  /// Its value, holding no NUL.
+  pub value: Vec<u8>,
+}
+
+/// A section of a Subversion repository's hooks-env (A-648), as `SetRepositoryPolicy` gives it: the variables the hook
+/// named as the section runs with, or, in the section named `default`, those of every hook with no section of its own.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HooksEnvSection {
+  /// Its name, a hook's or `default`.
+  pub name: String,
+  /// Its variables, in order.
+  pub variables: Vec<HooksEnvVariable>,
 }
 
 /// The tool a repository serves (§4.17; A-575), as `CreateRepository` names it.
@@ -1202,6 +1560,41 @@ pub enum VcsTool {
   Mercurial,
   /// Subversion.
   Subversion,
+}
+
+/// git's author and committer of the commits the server makes for a principal (A-664): the name and the email as git
+/// writes them.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GitIdentity {
+  /// The name.
+  pub name: String,
+  /// The email: may be empty, which git writes `<>`.
+  pub email: String,
+}
+
+/// A principal's identities in the tools whose objects the server makes for it (§4.13; A-664): git's author and
+/// committer, and Mercurial's user (`Name <address>`). `None` where it has none.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolIdentities {
+  /// git's.
+  pub git: Option<GitIdentity>,
+  /// Mercurial's.
+  pub mercurial: Option<String>,
+  /// Subversion's author: the principal's own name, as the svn+ssh edge names a commit's author (A-664's Subversion
+  /// objects). Its session fills it from the principal its channel proved, over whatever the client sent. Appended.
+  pub subversion: Option<String>,
+}
+
+/// What a submit carries for the commit the server makes of its work (§4.17.1 "A push is a work" item 4; A-664): the
+/// message the client gives, and the session's tool identities. The identities are its channel's to fill: read once a
+/// session, at its first submit, from the principal's record, and written over whatever the client sent, so a merge
+/// records the principal's own identities and never a client's claim.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Authorship {
+  /// The commit's message: a green of a repository refuses a submit without one (`MessageRequired`).
+  pub message: Option<String>,
+  /// The session's identities: a green of a repository refuses a submit with none in its tool (`IdentityRequired`).
+  pub identities: ToolIdentities,
 }
 
 /// How a repository names its objects (§4.17.1 item 1; A-575), as `CreateRepository` names it: fixed at creation.
@@ -1237,6 +1630,10 @@ pub const IMAGE_FILE: &str = "image.ext2";
 /// Format: the name of the archive file in an archive volume's root (`ArchiveExport`, A-441): the snapshot's archive in
 /// the format of `slates_archive` (§4.11), its own magic and version inside.
 pub const ARCHIVE_FILE: &str = "snapshot.slatesarchive";
+
+/// Format: the name of the dump file in the root of a volume a Subversion repository's export makes (`ExportDump`, A-652
+/// part 3): the stream `svnadmin dump` writes, which `svnadmin load` takes.
+pub const DUMP_FILE: &str = "repository.dump";
 
 /// What an image merge did (§4.6, A-160), counted.
 #[derive(Wire, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1707,6 +2104,76 @@ pub struct ShardReport {
   /// This node's failover estimate (A-363): live on the control shard, which runs the coordinator; elsewhere the
   /// recovery prior alone. Appended.
   pub failover: FailoverReport,
+  /// Each repository this shard owns with an event since it was made here, and its usage (A-724 piece 1's ledger,
+  /// `slates_vcs::usage`): what the share model reads, reported so a load run can see where a shard's time went.
+  /// Appended.
+  pub repositories: Vec<RepositoryUsageReport>,
+  /// This shard's part of the daemon's memory by kind ([`MemoryKindReport`]): on the control shard the anchor segment
+  /// and content object whole, on every shard its arenas and its clients' ring regions. Appended.
+  pub memory: Vec<MemoryKindReport>,
+}
+
+/// One kind of the daemon's mapped memory (§4.14; A-232's gotcha, main's ruling of 2026-11-20): read in the daemon's own
+/// process with nothing suspended, so no inspector need suspend it (`vmmap`, `heap`), which past the anchor's window gets
+/// it killed by design. Kinds: `segment` (the anchor segment), `content` (the anchor content object, the shards' arenas
+/// among its bytes), `arenas` (the shards' arena extents), `regions` (the clients' ring regions) and `heap` (the
+/// allocators' bytes).
+#[derive(Wire, Clone, Debug, PartialEq, Eq, Default)]
+pub struct MemoryKindReport {
+  /// The kind.
+  pub kind: String,
+  /// Its mappings: one each for the segment and the content object, an arena's extents, a region per client, the large
+  /// allocations mapped on their own for the heap.
+  pub mappings: u64,
+  /// The address space it reserves: the mappings' lengths, or for the heap what the allocators hold from the OS.
+  pub reserved_bytes: u64,
+  /// Its bytes in RAM, from the kernel's page table at the last completed sweep of the shard that maps it (or for the
+  /// heap the bytes live allocations hold, now); 0 until a sweep completes ([`MemoryKindReport::measured`]).
+  pub resident_bytes: u64,
+  /// Its bytes written, where the OS says (macOS); `None` where it does not, and for the heap.
+  pub modified_bytes: Option<u64>,
+  /// Whether `resident_bytes` is a reading: each sweep that maps the kind has completed at least once (each status
+  /// request advances a shard's sweep, A-744's bound).
+  pub measured: bool,
+}
+
+/// One repository's usage on its owner shard (A-724; `slates_vcs::usage::Usage`), as a shard's report carries it.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryUsageReport {
+  /// The repository's name.
+  pub name: String,
+  /// Intakes (pushes, commits) begun.
+  pub intakes_begun: u64,
+  /// Intakes answered.
+  pub intakes_answered: u64,
+  /// Intake steps run.
+  pub intake_steps: u64,
+  /// The shard clock's nanoseconds those steps ran.
+  pub intake_step_ns: u64,
+  /// Bytes the clients sent for them.
+  pub intake_bytes_in: u64,
+  /// Fetch requests begun.
+  pub fetches_begun: u64,
+  /// The shard clock's nanoseconds fetch steps ran.
+  pub fetch_step_ns: u64,
+  /// The shard clock's nanoseconds at its first event.
+  pub first_ns: u64,
+  /// The shard clock's nanoseconds at its latest event.
+  pub last_ns: u64,
+  /// The longest one intake step ran, in nanoseconds: how long an intake held its shard at once.
+  pub longest_intake_step_ns: u64,
+  /// A git push's longest step of each phase on this shard, in nanoseconds: a run of the body read, the body's end, a
+  /// turn of the pack's checks, and the answer's last step (seal, hooks, verdicts, commit, report). Zeros for others.
+  pub longest_push_phases_ns: Vec<u64>,
+  /// A git push's steps of each phase on this shard, in the phases' order above.
+  pub push_phase_steps: Vec<u64>,
+  /// The nanoseconds those steps ran, by phase.
+  pub push_phase_ns: Vec<u64>,
+  /// The nanoseconds from the repository's previous push step's end to each step's start, by the step's phase: before
+  /// a check turn or the answer, the push's wait for its shard; before an input step, that and the client's bytes.
+  pub push_phase_gap_ns: Vec<u64>,
+  /// The nanoseconds from each git push's beginning to its first step, summed.
+  pub push_first_gap_ns: u64,
 }
 
 /// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last
@@ -1889,6 +2356,52 @@ pub struct FailoverReport {
 }
 
 impl RequestBody {
+  /// A `Submit` of `work` naming `evidence`, with no message: the one way a `Submit` is made, its fields given once here
+  /// (A-664), so a field a submit gains is not restated at every caller. [`RequestBody::with_message`] adds a message.
+  pub fn submit(work: VolumeId, evidence: Vec<[u8; 32]>) -> RequestBody {
+    RequestBody::Submit {
+      work,
+      evidence,
+      authorship: Authorship::default(),
+    }
+  }
+
+  /// This submit carrying `message` for the commit the server makes of its work (A-664); any other request as it is.
+  #[must_use]
+  pub fn with_message(mut self, message: String) -> RequestBody {
+    if let Some(authorship) = self.authorship_mut() {
+      authorship.message = Some(message);
+    }
+    self
+  }
+
+  /// What a submit carries for the commit the server makes of its work (A-664); `None` for a request that submits
+  /// nothing.
+  pub fn authorship(&self) -> Option<&Authorship> {
+    match self {
+      RequestBody::Submit { authorship, .. }
+      | RequestBody::EditSubmit { authorship, .. }
+      | RequestBody::SubmitHeld { authorship, .. }
+      | RequestBody::EditSubmitHeld { authorship, .. }
+      | RequestBody::SubmitApproved { authorship, .. }
+      | RequestBody::SubmitSigned { authorship, .. } => Some(authorship),
+      _ => None,
+    }
+  }
+
+  /// [`RequestBody::authorship`], to change: the channel writes the session's identities here (A-664).
+  pub fn authorship_mut(&mut self) -> Option<&mut Authorship> {
+    match self {
+      RequestBody::Submit { authorship, .. }
+      | RequestBody::EditSubmit { authorship, .. }
+      | RequestBody::SubmitHeld { authorship, .. }
+      | RequestBody::EditSubmitHeld { authorship, .. }
+      | RequestBody::SubmitApproved { authorship, .. }
+      | RequestBody::SubmitSigned { authorship, .. } => Some(authorship),
+      _ => None,
+    }
+  }
+
   /// The volume a request is about, when it is about one. A green over a base is born on the base volume's owner
   /// shard, where the snapshot is walked, so `CreateGreen` names its base's volume. One rule for the daemon's routing
   /// and the client's waiting ([`Self::may_be_forwarded`]).
@@ -1899,6 +2412,9 @@ impl RequestBody {
       | RequestBody::Versions { green: volume }
       | RequestBody::ChangedSince { green: volume, .. }
       | RequestBody::CreateWork { green: volume, .. }
+      | RequestBody::AdmitWork { green: volume, .. }
+      | RequestBody::MoveWorkFloor { green: volume, .. }
+      | RequestBody::SubmitComputed { green: volume, .. }
       | RequestBody::Edit { work: volume, .. }
       | RequestBody::Declare { work: volume, .. }
       | RequestBody::Submit { work: volume, .. }
@@ -1969,6 +2485,7 @@ impl RequestBody {
       | RequestBody::Recover { .. }
       | RequestBody::PromoteRegion { .. }
       | RequestBody::Grants { .. }
+      | RequestBody::SessionLog { .. }
       | RequestBody::Audit { .. }
       | RequestBody::Acknowledge { .. }
       | RequestBody::Telemetry { .. }
@@ -1977,7 +2494,10 @@ impl RequestBody {
       | RequestBody::Enroll { .. }
       | RequestBody::Attest { .. }
       | RequestBody::Revoke { .. }
+      | RequestBody::SetIdentities { .. }
       | RequestBody::Renew { .. } => None,
+      // A credential is served on the partition its id routes to, never a volume's (A-625 part 3).
+      RequestBody::EnrollCredential { .. } | RequestBody::RevokeCredential { .. } => None,
       // Retired (A-267): refused where it arrives, so routed nowhere.
       RequestBody::Read { .. } => None,
       RequestBody::Share { volume, .. }
@@ -1992,7 +2512,11 @@ impl RequestBody {
       RequestBody::CreateRepository { .. }
       | RequestBody::CreateBranch { .. }
       | RequestBody::BindBranch { .. }
-      | RequestBody::RetireBranch { .. } => None,
+      | RequestBody::RetireBranch { .. }
+      | RequestBody::SetRepositoryPolicy { .. }
+      | RequestBody::ImportRepository { .. }
+      | RequestBody::DescribeRepositoryPolicy { .. }
+      | RequestBody::ExportDump { .. } => None,
     }
   }
 
@@ -2006,6 +2530,8 @@ impl RequestBody {
         | RequestBody::CreateRepository { .. }
         | RequestBody::CreateBranch { .. }
         | RequestBody::CreateWork { .. }
+        | RequestBody::AdmitWork { .. }
+        | RequestBody::SubmitComputed { .. }
         | RequestBody::Edit { .. }
         | RequestBody::EditStaged { .. }
         | RequestBody::EditSubmit { .. }
@@ -2041,7 +2567,8 @@ impl RequestBody {
   /// Whether a verb is a **read** a node forwards to a volume's owner without a completion record: a volume-scoped
   /// query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup"). A staging verb
   /// forwards the same way: a retried put of bytes already written is answered unchanged, and a retried begin only
-  /// strands a charged buffer that expires within a lease.
+  /// strands a charged buffer that expires within a lease. So does a work's floor move (`MoveWorkFloor`), monotone and
+  /// idempotent at the owner.
   pub fn forwards_as_read(&self) -> bool {
     matches!(
       self,
@@ -2056,6 +2583,8 @@ impl RequestBody {
         | RequestBody::ReadDir { .. }
         | RequestBody::StageBegin { .. }
         | RequestBody::StagePut { .. }
+        // A floor's move is monotone and idempotent (A-697 part b), so a resent forward changes nothing.
+        | RequestBody::MoveWorkFloor { .. }
     )
   }
 
@@ -2083,6 +2612,28 @@ impl RequestBody {
   pub fn may_be_forwarded(&self) -> bool {
     self.forwards_as_read() || self.forwards_as_write()
   }
+}
+
+/// What a submit computed on a holder node carries to its green's owner beside its increment and its verdict
+/// (`RequestBody::SubmitComputed`, A-697 part c): what the owner judges the write policy (A-285), the signature (A-321)
+/// and the commit the server makes (A-664) by, read on the holder, where the work's record is, as a work's shard reads
+/// them for its green's owner on one node.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ComputedSubmit {
+  /// The work's merge mode.
+  pub work_mode: WriteMode,
+  /// Whether the submit asks to be held for approval (`SubmitHeld`).
+  pub held: bool,
+  /// The launcher's approval of exactly this increment, by its identity (`SubmitApproved`), verified on the holder.
+  pub approved: Option<[u8; 32]>,
+  /// The signature over the merge's statement, if the submit carries one.
+  pub signature: Option<Vec<u8>>,
+  /// The work's trusted signers, read for a submit that carries a signature.
+  pub signers: Vec<Vec<u8>>,
+  /// Whether merges from the work must be signed.
+  pub signed_required: bool,
+  /// The message and the session's identities for the commit the server makes of the work.
+  pub authorship: Authorship,
 }
 
 /// One record session to a peer, as this node last saw it (§4.8; condition 7's evidence): the sender's congestion
@@ -2255,6 +2806,8 @@ pub struct DaemonReport {
   /// ends a daemon on purpose (a test's kill, an operator's) waits for it first. `false` with no anchor, which judges
   /// nothing. Appended.
   pub recovered: bool,
+  /// The daemon's mapped memory by kind ([`MemoryKindReport`]), every shard's part summed and the heap's added. Appended.
+  pub memory: Vec<MemoryKindReport>,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or
@@ -2481,6 +3034,20 @@ pub enum WorkOp {
     path: String,
     /// The metadata recorded by the declaring volume.
     node: IpcNode,
+  },
+  /// Copy `from`'s tree, as version `version` of the work's green holds it (the work's base when none), to `to`, by
+  /// reference (A-586; A-626 part 4: a copy made through a work; Subversion's copy with history): replacing what `to`
+  /// holds when `replace`, else refused where `to` holds anything. What the work does in `to`'s tree after it lands on
+  /// what the copy brings. Appended.
+  Copy {
+    /// The copied tree's root.
+    from: String,
+    /// Where it is copied to.
+    to: String,
+    /// The green's version it is copied from; none for the work's base.
+    version: Option<u64>,
+    /// Whether it replaces what `to` holds.
+    replace: bool,
   },
 }
 
@@ -3445,6 +4012,9 @@ pub enum LandingStage {
   Refused,
   /// Cancelled or crashed; a resume continues it.
   Aborted,
+  /// Withdrawn before any grant: a newer presentation of the same volume into the same target replaced it (A-779).
+  /// Appended.
+  Superseded,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
@@ -3990,8 +4560,9 @@ pub enum Refusal {
     /// The subject whose policy forbids it.
     by: PolicySubject,
   },
-  /// A `SetPolicy` named a policy version the policy has moved past (A-285): a raced or replayed setting changes nothing.
-  /// Read the policy again and set it from there. Appended.
+  /// A `SetPolicy` named a policy version the policy has moved past (A-285), or a `SetRepositoryPolicy` a repository
+  /// policy version it has moved past (A-622): a raced or replayed setting changes nothing. Read the policy again and set
+  /// it from there. Appended.
   PolicyChanged {
     /// The policy's version now.
     current: u64,
@@ -4065,6 +4636,67 @@ pub enum Refusal {
     /// The Win32 error code.
     code: u32,
   },
+  /// A submit to a green of a repository carried no message (§4.17.1 "A push is a work" item 4; A-664): the server makes
+  /// the tool's commit of the work, and a commit needs one. Refused before any work is built. Appended.
+  MessageRequired,
+  /// A submit to a green of a repository was made by a principal with no identity in the repository's tool (§4.17.1 item
+  /// 4; A-664): the commit the server makes names its author. Refused before any work is built; its owner sets the
+  /// identities (`SetIdentities`), which a session reads at its first submit. Appended.
+  IdentityRequired {
+    /// The repository's tool.
+    tool: VcsTool,
+  },
+  /// A repository's import was refused (`ImportRepository`, A-678), by its fault; the repository's store is as it was,
+  /// but for the revisions a Subversion dump's import committed before its fault (A-652 part 3). Appended.
+  ImportRefused {
+    /// Why.
+    fault: ImportFault,
+  },
+  /// A copy the submitted work declares was refused before any verdict (A-586, A-626 part 4; main's ruling of
+  /// 2026-11-20): no concurrent change caused it, so it is no conflict and no rebase answers it. Appended.
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyCase,
+  },
+  /// A credential's enrollment or revocation reached fewer members of the region than it must (A-764: a principal and
+  /// its credentials are fleet state, §4.13): an enrollment is acknowledged once `f + 1` members hold it, a revocation
+  /// once every member has let it go. What was done stands where it reached; the same request again reaches the rest.
+  /// Appended.
+  CredentialUnreplicated {
+    /// The members that hold it as asked, this one among them.
+    held: u64,
+    /// The members it must reach.
+    needed: u64,
+  },
+  /// A grant asked for a landing a newer presentation of the same volume into the same target superseded (A-779, main's
+  /// ruling 2026-11-20): an older state never lands over a newer one. Grant the newer, after reading it. Appended.
+  LandingSuperseded {
+    /// The newer presentation.
+    newer: u64,
+  },
+}
+
+/// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the
+/// wire. FSFS's commit refuses the first three too; the fourth follows from what a green retains; the rest are copies
+/// slates does not make yet (owed work, A-586). Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyCase {
+  /// The destination is the root.
+  Root,
+  /// The source's version is past the green's head.
+  PastHead,
+  /// Nothing stood in the source's tree at its version.
+  SourceEmpty,
+  /// The source's version's values are folded away.
+  VersionFolded,
+  /// A hard link in the source names a node outside it that changed after the version (owed).
+  OutsideNodeChanged,
+  /// The source changed after its version and a hard link stood in it then (owed).
+  ChangedSourceLink,
+  /// A rename or a hard link the work declares with an end in a copied tree (owed).
+  LinkAcrossCopy,
 }
 
 /// Why the bytes an `ArchiveImport` read make no volume ([`Refusal::ArchiveRefused`], A-453): each the class of the
@@ -4084,6 +4716,50 @@ pub enum ArchiveFault {
   /// out of canonical form, a total, extent, name or path that does not hold, or a tree that does not restore. A
   /// faulty or hostile writer made it.
   Malformed,
+}
+
+/// Why a repository's import was refused ([`Refusal::ImportRefused`], A-678): each the class of the import's refusals a
+/// caller acts on alike. Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum ImportFault {
+  /// The repository serves a tool whose history the import does not read: neither Mercurial's (its directory) nor
+  /// Subversion's (a dump, A-652 part 3).
+  NotMercurial,
+  /// The repository's store holds a history: an import takes the place of the empty store its creation made.
+  NotEmpty,
+  /// An import of the repository is under way: its end answers the request that started it.
+  UnderWay,
+  /// The request reached the repository's owner from another node, whose client the owner cannot answer later: ask the
+  /// owner's node.
+  Unawaited,
+  /// The repository's format is one the import does not read: a requirement it does not know, or does not take.
+  Format,
+  /// A file of the repository's store is missing, not of its format, or at odds with the rest: its path under `.hg`,
+  /// empty where the fault names no one file.
+  Damaged {
+    /// The path under `.hg`.
+    path: String,
+  },
+  /// A file, the listing or a text is larger than an import may hold at once.
+  PastRoom {
+    /// The bytes an import may hold at once.
+    room: u64,
+  },
+  /// A file is still being fetched from the base's store (an S3 base): ask again once it has landed.
+  Pending,
+  /// The import was given back before its end: its repository was freed.
+  Abandoned,
+  /// A Subversion dump the import refused as `svnadmin load` refuses the same stream (A-652 part 3): Subversion's error
+  /// number, the revision being loaded, and the path the refusal names. The revisions committed before it stay, as
+  /// `svnadmin load` keeps them. Appended.
+  Subversion {
+    /// Subversion's error number (`svn_error_codes.h`).
+    code: u32,
+    /// The revision being loaded; none before the stream's first revision record.
+    revision: Option<u64>,
+    /// The path the refusal names, empty where it names none.
+    path: String,
+  },
 }
 
 /// Why a target cannot be used ([`Refusal::Target`], A-299): each the class of a landing target's, a mount point's or a
@@ -4185,6 +4861,69 @@ pub enum DatabaseRefusal {
   },
   /// A record's encoding was refused.
   Encoding,
+  /// An entry of a repository's register made for a position other than the register's next, or naming a version of a
+  /// green other than the one after its head (§4.17.1 shared piece 2, A-603). Superseded by [`DatabaseRefusal::Moved`]
+  /// with A-603's repository-wide position (A-642): kept on the wire, never sent. Appended.
+  OutOfOrder {
+    /// The position or version the entry named.
+    named: u64,
+    /// The one the register holds next.
+    expected: u64,
+  },
+  /// An entry's check does not hold (A-603, A-642): what it checks changed since it was read (a name under a prefix, a
+  /// state log's position), as Mercurial's `check:heads` fails when a head was added. Appended.
+  CheckFailed {
+    /// The check's index among the entry's checks.
+    index: u32,
+  },
+  /// An entry's change of its repository's own state was made against another state (A-603): a phase root it adds is
+  /// one already, one it removes is not, or a marker it adds is held. Appended.
+  StateChanged {
+    /// The change's index among the entry's state changes.
+    index: u32,
+  },
+  /// A repository policy's rule its repository cannot hold (A-622): its pattern names what the repository's tool does
+  /// not have, is empty, holds a NUL, or is a Subversion path not from the root. Appended.
+  PolicyRuleMalformed {
+    /// The rule's index among the policy's rules.
+    index: u32,
+  },
+  /// A repository policy's hook its repository cannot hold (A-622): at another tool's point, named other than its point
+  /// allows or named twice there, or running a program that is not an absolute path. Appended.
+  PolicyHookMalformed {
+    /// The hook's index among the policy's hooks.
+    index: u32,
+  },
+  /// A green an entry moves or checks is not at the position the push read (§4.17.1 shared piece 2, A-642): it moved
+  /// since, so the entry is refused whole, naming the green. Appended.
+  Moved {
+    /// The green.
+    green: VolumeId,
+    /// The position the push read.
+    read: u64,
+    /// The position the green is at.
+    at: u64,
+  },
+  /// A repository policy's hooks-env section its repository cannot hold (A-648): in a repository that is not
+  /// Subversion's, named by nothing or holding a NUL, or with a variable no hook's environment can carry (a name empty
+  /// or holding `=` or a NUL, a value holding a NUL). Appended.
+  PolicyHooksEnvMalformed {
+    /// The section's index among the policy's hooks-env sections.
+    index: u32,
+  },
+  /// The partition's state would not fit its snapshot slot (A-724 piece 8, §4.17.5): refused before anything is written
+  /// past it; nothing of the request is durable. Appended.
+  SnapshotRoom {
+    /// The encoded state's bytes.
+    needed: u64,
+    /// The slot's bytes.
+    room: u64,
+  },
+  /// A repository's index cut moved other than one bit within an id's 32 (A-724 piece 9): the cut now. Appended.
+  IndexCutStep {
+    /// The cut's bits now.
+    current: u8,
+  },
 }
 
 /// What the volume core refused, where the refusals before [`Refusal::Volume`] name nothing closer (A-299): each the
@@ -4245,6 +4984,12 @@ pub enum VolumeRefusal {
   /// retained version or bytes, or the volume is at its retention allowance. Not the volume's quota: destroying a
   /// snapshot frees it. Appended (2026-11-18; until then it reached a client as `NoSpace`).
   RetentionExceeded,
+  /// A referenced file's content identity was not answered by the shard's content store (A-645 P3 ruling 2): the view's
+  /// bytes are not there to read. Appended.
+  ReferenceUnresolved,
+  /// The volume's referenced files still hold content identities, so it is neither destroyed nor cloned until its owner
+  /// releases them (A-645 P3 ruling 2). Appended.
+  ReferencesHeld,
 }
 
 /// Why a planned move was refused ([`Refusal::MoveRefused`], A-291): each names what the caller can change. Append-only.
@@ -4932,6 +5677,139 @@ pub enum ReplyBody {
     id: VolumeId,
     /// The manifest identity of the archive it was made from, verified against the tree: the exported snapshot's.
     manifest: [u8; 32],
+  },
+  /// A version-control credential was enrolled (`EnrollCredential`, A-625 part 3). Appended.
+  CredentialEnrolled {
+    /// Its id: the SHA-256 of a key's blob or of a token.
+    id: [u8; 32],
+  },
+  /// A version-control credential was revoked (`RevokeCredential`, A-625 part 3). Appended.
+  CredentialRevoked,
+  /// A principal's tool identities were set (`SetIdentities`, A-664): their version now. Appended.
+  IdentitiesSet {
+    /// The version now.
+    version: u64,
+  },
+  /// A repository's directory imported into its store (`ImportRepository`, A-678): what the import took. Appended.
+  RepositoryImported {
+    /// The changesets.
+    changesets: u32,
+    /// The manifest revisions.
+    manifests: u32,
+    /// The file logs.
+    file_logs: u64,
+    /// The file revisions, over every file log.
+    file_revisions: u64,
+    /// The obsolescence markers.
+    markers: u64,
+  },
+  /// A Subversion dump imported into its repository (`ImportRepository`, A-652 part 3): the revisions it committed, and
+  /// the repository's youngest revision now. Appended.
+  DumpImported {
+    /// The revisions committed.
+    revisions: u64,
+    /// The youngest revision.
+    youngest: u64,
+  },
+  /// A repository's policy (`DescribeRepositoryPolicy`): its version (0 for one never set) and every part, as
+  /// `SetRepositoryPolicy` gives them. Appended.
+  RepositoryPolicy {
+    /// The policy's version, which a `SetRepositoryPolicy` reads.
+    version: u64,
+    /// The rules, in order.
+    rules: Vec<PolicyRule>,
+    /// The hooks, in order.
+    hooks: Vec<HookConfig>,
+    /// A Subversion repository's hooks-env sections, in order.
+    hooks_env: Vec<HooksEnvSection>,
+    /// A git repository's keys trusted to sign its commits.
+    signers: Vec<Vec<u8>>,
+  },
+  /// A Subversion repository's range of revisions exported as a dump into a new volume (`ExportDump`, A-652 part 3):
+  /// the volume, which holds it as [`DUMP_FILE`], and the dump's length in bytes. Appended.
+  DumpExported {
+    /// The new volume.
+    id: VolumeId,
+    /// The dump's length in bytes.
+    dump_bytes: u64,
+  },
+  /// A work admitted over its green at the green's owner (`AdmitWork`, A-697 part a): the work, and the green's version
+  /// it is based on, whose history the owner keeps while the work reads it. Appended.
+  WorkAdmitted {
+    /// The work.
+    id: VolumeId,
+    /// The green's version the work is based on.
+    base: u64,
+  },
+  /// A work's floor moved or dropped at its green's owner, or left as it was where the move changed nothing
+  /// (`MoveWorkFloor`, A-697 part b). Appended.
+  WorkFloorMoved,
+  /// One page of the session log (`SessionLog`, A-773), in key order. Appended.
+  SessionLog {
+    /// The lines of this page.
+    lines: Vec<LogLine>,
+    /// The cursor that continues the walk (this page's last line), or `None` when this page ends it.
+    next: Option<LogCursor>,
+  },
+}
+
+/// Where a session log walk stands (A-773): a line's key. A work's line is keyed by the work alone, a waiting landing's
+/// by the volume it lands and its id, so a volume's own line sorts before its landings'.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogCursor {
+  /// The work, or the landed volume.
+  pub volume: VolumeId,
+  /// The landing, for a landing's line; `None` for a work's.
+  pub landing: Option<u64>,
+}
+
+/// One line of the session log (A-773): what a supervisor needs to decide the next action, nothing else.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum LogLine {
+  /// A work over a green.
+  Work {
+    /// The work.
+    id: VolumeId,
+    /// Its name.
+    name: String,
+    /// The green it is over.
+    green: VolumeId,
+    /// The green version it is based on: where it started, or where its last accepted submission or rebase moved it.
+    base: u64,
+    /// How its last submission ended.
+    mark: WorkMark,
+  },
+  /// A landing presented and awaiting its grant (§4.15 `AwaitingGrant`).
+  AwaitingGrant {
+    /// The landing.
+    landing: u64,
+    /// The volume it lands.
+    volume: VolumeId,
+    /// The host directory it would write.
+    target: String,
+    /// The manifest a grant must bind.
+    manifest: [u8; 32],
+  },
+}
+
+/// How a work's last submission ended (A-773). Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum WorkMark {
+  /// Nothing submitted since the work was made.
+  Open,
+  /// Accepted as this green version; the work stands on it.
+  Accepted {
+    /// The version it made.
+    version: u64,
+  },
+  /// Collided: the verdict's windows the work must rebase against or resolve.
+  Collided {
+    /// The verdict, as `Conflicts` reads it.
+    verdict: u64,
+    /// How many windows the verdict holds.
+    windows: u32,
+    /// Its first window: the file and range that collided.
+    first: Option<MergeWindow>,
   },
 }
 

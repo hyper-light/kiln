@@ -54,6 +54,9 @@
 #   that took a memmap2 map and are now thin callers (−2): +2. 37 → 45.
 #   Sealed blocks (`sealed.rs`, A-273 step 3, +5 on 2026-11-18: 63 → 68) went with the A-273 replicas, measured and
 #   rejected (2026-11-19, A-528): 68 → 63.
+#   Raised 80 → 83 on 2026-11-20 for `heap.rs` (the daemon's own memory report, §4.14, main's ruling after the anchor
+#   killed a daemon `vmmap` suspended): the zeroed `malloc_statistics_t` and `malloc_zone_statistics` on macOS (2) and
+#   glibc's `mallinfo2` on Linux (1), the system allocator's own statistics, which no safe wrapper offers.
 # slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
@@ -120,8 +123,9 @@
 #   blocked in its completion port is woken as Windows wakes an event's waiter (1). 101 → 102.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
-# slates-base (11): rustix marks kevent unsafe because the kernel fills the output list; one
-#   registration and one drain of the macOS/BSD directory watcher (2); the Windows fingerprint
+# slates-base (10): rustix marks kevent unsafe because the kernel fills the output list; one
+#   zero-timeout call (`hint_set::kevent_now`, 1; 2 -> 1 on 2026-11-19, A-709) shared by the macOS/BSD directory
+#   watcher's registrations and drains and the shard's hint set; the Windows fingerprint
 #   through the stable Win32 file-information calls (2), since the standard library's handle
 #   metadata is unstable on 1.98 (its two zeroed records are now built as literals); and the
 #   Windows contained opens (AUD-29-62, 2026-10-01: 6) — `NtCreateFile` relative to a retained
@@ -184,7 +188,8 @@
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
 #   NFS-listener descriptor (`daemon.rs`, added 2026-09-09 for the anchor-held listener, §4.6):
-#   `OwnedFd::from_raw_fd` on the number the anchor handed over across the spawn (1, Unix only);
+#   `OwnedFd::from_raw_fd` on the number the anchor handed over across the spawn (1, Unix only; since
+#   2026-11-19 the one site `held_listener` adopts the version-control edge's held listener too, A-625 part 3);
 #   and the daemon adopting a fleet node's inherited serve sockets (`fleet.rs` `adopt_inherited`,
 #   added 2026-09-28 with the anchor-held fleet ports, §4.8): the same `OwnedFd::from_raw_fd` on each
 #   number in `SLATES_ANCHOR_FLEET_SERVE`, one site called per plane (1, Unix only).
@@ -192,9 +197,6 @@
 #   `RegGetValueW` of a DWORD into a local, unprivileged (1, Windows only). 7 → 8.
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
-# slates-git (0): git's pkt-line and side-band-64k codecs (A-582) are bounds-checked byte slices read through a
-#   length check and written into vectors; safe Rust throughout.
-slates-git = 0
 
 # slates-hg (0): Mercurial's bundle2, bundle1, changegroup and delta codecs (A-514) are bounds-checked byte slices
 #   read through a cursor and written into vectors; safe Rust throughout.
@@ -318,7 +320,28 @@ slates-machine = 97
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 63
+slates-mem = 83
+# 2026-11-20 (+1, A-744, a range's pages in RAM, main's ruling: every site named, `// SAFETY:` directly above):
+#   17. `resident.rs`, Unix `os::query`: `libc::mincore` over a page-aligned range into a vector of one byte a page (the
+#   kernel reads only the page table; rustix has no wrapper). Windows answers a typed refusal, no unsafe code.
+# 2026-11-20 (+16, A-742, freed memory returns to the OS; main's ruling: every site named, a `// SAFETY:` line directly
+#   above each; `cargo xtask unsafe` 79/79 ok): `crates/mem/src/large.rs`, the slates binary's global allocator, which
+#   holds no lock (a unit struct, `Sync`; its counters are atomics). No safe wrapper exists for any site.
+#   1. `unsafe impl GlobalAlloc for LargeMapped` (the trait is unsafe to implement);
+#   2. `alloc`: the system allocator's `alloc`, forwarded;
+#   3. `alloc_zeroed`: the system allocator's `alloc_zeroed`, forwarded;
+#   4. `dealloc`: `os::unmap` of a mapped block;
+#   5. `dealloc`: the system allocator's `dealloc`, forwarded;
+#   6. `realloc`: the system allocator's `realloc`, forwarded;
+#   7. `realloc`: a block moved across the floor (alloc, copy, dealloc);
+#   8. Unix `os::map`: `rustix::mm::mmap_anonymous`;
+#   9. Unix `os::unmap` (unsafe fn: releasing a range in use frees it under its user);
+#   10. Unix `os::unmap`: `rustix::mm::munmap`;
+#   11. Windows `os::page_size`: `GetSystemInfo`;
+#   12. Windows `os::map`: `VirtualAlloc`;
+#   13. Windows `os::unmap` (unsafe fn, as 9);
+#   14. Windows `os::unmap`: `VirtualFree`;
+#   15-16. the module's two tests driving the allocator through `GlobalAlloc` (unsafe by signature).
 # 2026-11-04 (+2, A-205, Windows gives freed pages back, compiled only for Windows): `DiscardVirtualMemory` over a
 #   region's block (`region.rs`, `os::discard_slice`) and over a sparse object's committed run (`shared.rs`,
 #   `Inner::discard`). The call has no safe wrapper.
@@ -408,11 +431,15 @@ slates-mem = 63
 #   connection queued and the peer has not acknowledged, which with `tcpi_bytes_acked` (read through the existing
 #   `getsockopt` helper) tells a successor whether the stream a dead daemon left stands on a record's boundary. rustix
 #   wraps `FIONREAD` but not `SIOCOUTQ`, and no other call reads it.
-slates-rt = 107
+# 2026-11-20 (+2, A-748, `netsys.rs`, compiled only for Windows): a held listener shared with a daemon as an explicit
+#   duplicate made for its process: `share_listener`'s `WSADuplicateSocketW` (1), and `adopt_share`'s `WSASocketW` over
+#   the protocol record (`FROM_PROTOCOL_INFO`, 1). Winsock has no safe wrapper for either; the record itself crosses as
+#   bytes encoded and decoded field by field, with no unsafe view of it.
+slates-rt = 109
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
-slates-base = 11
+slates-base = 10
 slates-vfs = 0
 # 2026-11-18 (+19, §4.15 A-185, landing on Windows, `os_windows.rs` compiled only for Windows; built 2026-10-26 by
 #   another session with 18, the owner check grown by one when it was landed): Win32 and the NT layer have no safe
@@ -526,7 +553,10 @@ slates-ipc = 147
 # handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
 # 2026-11-18 (-3, A-475): the Windows liveness probe of a client's process (`peer.rs`'s open, zero-timeout wait and close)
 #   is gone with the poll it served; a client's process exit is awaited through the shard (`slates-rt`'s `handle_wait`).
-slates-server = 5
+# 2026-11-20 (+1, A-748, `daemon.rs` `shared_listeners`, compiled only for Windows): the daemon takes unique ownership of
+#   the reading end of the anchor's shared-listener pipe, handed in its spawn's explicit handle list and named in its
+#   environment, read once; its inheritance flag is cleared at once (`slates_ipc::win_spawn::clear_inheritance`).
+slates-server = 6
 slates-client = 0
 slates-api = 10
 slates-cli = 2
@@ -568,6 +598,10 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
+# slates-bridge-winfsp raised 159 -> 160 on 2026-11-20 (A-725, the relief receiver; counted by hand, for main's
+# `cargo xtask unsafe` to confirm): `inflight/relief.rs` `take_pointer`, the one `Box::from_raw` that takes the operation
+# state back out of the slot it was parked in by `Box::into_raw` (an `AtomicPtr` swapped empty, so its only owner); the
+# dispatcher's journal view moved its one slice block into `RegionAt::capture` and adds none.
 # slates-bridge-winfsp raised 156 -> 159 on 2026-11-19 (A-551, a folding volume's drive names each open by the spelling
 # Windows holds or the volume stores; counted by hand, for main's `cargo xtask unsafe` to confirm): in `host.rs` the
 # call of ntdll's `RtlUpcaseUnicodeChar` in `system_upcase`, the system's upcase table the driver compares names by,
@@ -653,7 +687,7 @@ slates-bridge-fskit = 9
 # channel. Its reader's view needs the section's handle borrowed once to duplicate it (+1, `purge_intents.rs`), and the
 # intent event's `SetEvent`, the control call's `WaitForMultipleObjects` and the old channel test's `WaitForSingleObject`
 # go (-3). Measured by `cargo xtask unsafe`.
-slates-bridge-winfsp = 159
+slates-bridge-winfsp = 160
 # Raised 3 -> 5 on 2026-10-19 for `udmabuf.rs` (the `UDMABUF_CREATE` ioctl and the descriptor it returns), which
 # confined a guest's DAX window to a descriptor covering only that window
 # (docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md). Lowered 5 -> 3 on 2026-10-25
@@ -703,3 +737,19 @@ slates-seal = 0
 # slates-svn (0): the Subversion server's pure pieces (A-500, §4.17.4): svndiff's integers, windows and sections read
 # and written by checked offsets and `get`, LZ4 through lz4_flex's safe codec; no casts, no maps, no FFI.
 slates-svn = 0
+# slates-vcs (0): the version-control servers' object store (A-581, §4.17.1 shared piece 3): content by BLAKE3 identity in
+# an ordered map, tables read by checked offsets and `get`; no casts, no maps, no FFI.
+slates-vcs = 0
+# slates-ssh (0): SSH's transport (A-594, §4.17.2): the wire types read by checked offsets and `get`, the cryptography
+#   through aws-lc-rs's safe API (X25519, Ed25519, SHA-256, AES-256-GCM, OpenSSH's ChaCha20-Poly1305); no FFI of its own.
+slates-ssh = 0
+# slates-git (0): git's codecs and pack reader (A-582, A-590, A-591, A-600, A-608, §4.17.2) are bounds-checked byte
+#   slices read through length checks and written into vectors; hashing through sha1-checked and aws-lc-rs's safe API;
+#   safe Rust throughout. (Moved into [budget] 2026-11-19: it sat above the table header, so the check never read it.)
+slates-git = 0
+# slates-http (0): the shared HTTP/1.1 request codec (A-595, §4.17.2 piece 8): heads and bodies read by checked offsets
+#   and `get`, gzip through flate2's safe API; no casts, no maps, no FFI.
+slates-http = 0
+# slates-http-edge (0): the HTTP edge's engine (A-625, §4.17.2): a state machine over bytes through slates-http's safe
+#   codec and rustls's safe API over aws-lc-rs; no FFI, no casts, no maps of its own.
+slates-http-edge = 0

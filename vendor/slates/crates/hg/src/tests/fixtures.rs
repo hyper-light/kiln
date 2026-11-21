@@ -317,3 +317,683 @@ pub(crate) mod wire {
       .unwrap_or_else(|| panic!("no capture {name}"))
   }
 }
+
+/// The objects' golden vectors (A-588): every revision of one repository stock 7.2 stored, each log's index as 7.2's
+/// `debugindex --debug` lists it, every revision's text as its `debugdata` writes it, and what 7.2 reads from each, as
+/// `fixtures/objects/make-object-fixtures.sh` wrote them (its header names the exact command and the run), compiled in
+/// by name.
+pub(crate) mod objects {
+  /// Lists each file's name with its bytes.
+  macro_rules! stored {
+    ($($name:literal),* $(,)?) => {
+      /// Every file, by its name.
+      const FILES: &[(&str, &[u8])] = &[$(($name, include_bytes!(concat!("../../fixtures/objects/", $name)))),*];
+    };
+  }
+
+  stored![
+    "changeset-0.txt",
+    "changeset-1.txt",
+    "changeset-10.txt",
+    "changeset-2.txt",
+    "changeset-3.txt",
+    "changeset-4.txt",
+    "changeset-5.txt",
+    "changeset-6.txt",
+    "changeset-7.txt",
+    "changeset-8.txt",
+    "changeset-9.txt",
+    "expected.txt",
+    "file-a-0.txt",
+    "file-a-1.txt",
+    "file-c-0.txt",
+    "file-c-1.txt",
+    "file-d-0.txt",
+    "file-e-0.txt",
+    "file-link-0.txt",
+    "file-meta-0.txt",
+    "file-run-0.txt",
+    "file-u-0.txt",
+    "index-changelog.txt",
+    "index-file-a.txt",
+    "index-file-c.txt",
+    "index-file-d.txt",
+    "index-file-e.txt",
+    "index-file-link.txt",
+    "index-file-meta.txt",
+    "index-file-run.txt",
+    "index-file-u.txt",
+    "index-manifest.txt",
+    "log.txt",
+    "manifest-0.txt",
+    "manifest-1.txt",
+    "manifest-2.txt",
+    "manifest-3.txt",
+    "manifest-4.txt",
+    "manifest-5.txt",
+    "manifest-6.txt",
+    "manifest-7.txt",
+    "manifest-8.txt",
+  ];
+
+  /// The file named `name`.
+  pub(crate) fn file(name: &str) -> &'static [u8] {
+    FILES
+      .iter()
+      .find(|(known, _)| *known == name)
+      .map(|(_, bytes)| *bytes)
+      .unwrap_or_else(|| panic!("no stored file {name}"))
+  }
+
+  /// Every file's name, in order.
+  pub(crate) fn names() -> impl Iterator<Item = &'static str> {
+    FILES.iter().map(|(name, _)| *name)
+  }
+}
+
+/// The revlog golden vectors (A-611): one history stock 7.2 stored in five repositories (zstd, zlib, split, revlog v2,
+/// changelog v2), each revlog's files as the store holds them, its `debugindex --debug` and `debugdeltachain`, and every
+/// revision's `debugdata` once, as `fixtures/revlogs/make-revlog-fixtures.sh` wrote them (its header names the exact
+/// command and the run), compiled in by name.
+pub(crate) mod revlogs {
+  /// Lists each file's name with its bytes.
+  macro_rules! stored {
+    ($($name:literal),* $(,)?) => {
+      /// Every file, by its name.
+      const FILES: &[(&str, &[u8])] = &[$(($name, include_bytes!(concat!("../../fixtures/revlogs/", $name)))),*];
+    };
+  }
+
+  stored![
+    "00changelog-0.txt",
+    "00changelog-1.txt",
+    "00changelog-10.txt",
+    "00changelog-11.txt",
+    "00changelog-12.txt",
+    "00changelog-2.txt",
+    "00changelog-3.txt",
+    "00changelog-4.txt",
+    "00changelog-5.txt",
+    "00changelog-6.txt",
+    "00changelog-7.txt",
+    "00changelog-8.txt",
+    "00changelog-9.txt",
+    "00manifest-0.txt",
+    "00manifest-1.txt",
+    "00manifest-10.txt",
+    "00manifest-11.txt",
+    "00manifest-12.txt",
+    "00manifest-2.txt",
+    "00manifest-3.txt",
+    "00manifest-4.txt",
+    "00manifest-5.txt",
+    "00manifest-6.txt",
+    "00manifest-7.txt",
+    "00manifest-8.txt",
+    "00manifest-9.txt",
+    "clv2-00changelog.chain",
+    "clv2-00changelog.dat",
+    "clv2-00changelog.i",
+    "clv2-00changelog.idx",
+    "clv2-00changelog.index",
+    "clv2-00changelog.sda",
+    "clv2-00manifest.chain",
+    "clv2-00manifest.dat",
+    "clv2-00manifest.i",
+    "clv2-00manifest.idx",
+    "clv2-00manifest.index",
+    "clv2-00manifest.sda",
+    "clv2-data_empty.dat",
+    "clv2-data_empty.i",
+    "clv2-data_empty.idx",
+    "clv2-data_empty.sda",
+    "clv2-data_grow.dat",
+    "clv2-data_grow.i",
+    "clv2-data_grow.idx",
+    "clv2-data_grow.sda",
+    "clv2-data_rand.dat",
+    "clv2-data_rand.i",
+    "clv2-data_rand.idx",
+    "clv2-data_rand.sda",
+    "clv2-empty.chain",
+    "clv2-empty.index",
+    "clv2-grow.chain",
+    "clv2-grow.index",
+    "clv2-rand.chain",
+    "clv2-rand.index",
+    "clv2-requires.txt",
+    "empty-0.txt",
+    "grow-0.txt",
+    "grow-1.txt",
+    "grow-10.txt",
+    "grow-11.txt",
+    "grow-2.txt",
+    "grow-3.txt",
+    "grow-4.txt",
+    "grow-5.txt",
+    "grow-6.txt",
+    "grow-7.txt",
+    "grow-8.txt",
+    "grow-9.txt",
+    "log.txt",
+    "rand-0.txt",
+    "rand-1.txt",
+    "split-00changelog.chain",
+    "split-00changelog.d",
+    "split-00changelog.i",
+    "split-00changelog.index",
+    "split-00manifest.chain",
+    "split-00manifest.d",
+    "split-00manifest.i",
+    "split-00manifest.index",
+    "split-data_empty.i",
+    "split-data_grow.d",
+    "split-data_grow.i",
+    "split-data_rand.d",
+    "split-data_rand.i",
+    "split-empty.chain",
+    "split-empty.index",
+    "split-grow.chain",
+    "split-grow.index",
+    "split-rand.chain",
+    "split-rand.index",
+    "split-requires.txt",
+    "v2-00changelog.chain",
+    "v2-00changelog.dat",
+    "v2-00changelog.i",
+    "v2-00changelog.idx",
+    "v2-00changelog.index",
+    "v2-00changelog.sda",
+    "v2-00manifest.chain",
+    "v2-00manifest.dat",
+    "v2-00manifest.i",
+    "v2-00manifest.idx",
+    "v2-00manifest.index",
+    "v2-00manifest.sda",
+    "v2-data_empty.dat",
+    "v2-data_empty.i",
+    "v2-data_empty.idx",
+    "v2-data_empty.sda",
+    "v2-data_grow.dat",
+    "v2-data_grow.i",
+    "v2-data_grow.idx",
+    "v2-data_grow.sda",
+    "v2-data_rand.dat",
+    "v2-data_rand.i",
+    "v2-data_rand.idx",
+    "v2-data_rand.sda",
+    "v2-empty.chain",
+    "v2-empty.index",
+    "v2-grow.chain",
+    "v2-grow.index",
+    "v2-rand.chain",
+    "v2-rand.index",
+    "v2-requires.txt",
+    "zlib-00changelog.chain",
+    "zlib-00changelog.d",
+    "zlib-00changelog.i",
+    "zlib-00changelog.index",
+    "zlib-00manifest.chain",
+    "zlib-00manifest.i",
+    "zlib-00manifest.index",
+    "zlib-data_empty.i",
+    "zlib-data_grow.i",
+    "zlib-data_rand.i",
+    "zlib-empty.chain",
+    "zlib-empty.index",
+    "zlib-grow.chain",
+    "zlib-grow.index",
+    "zlib-rand.chain",
+    "zlib-rand.index",
+    "zlib-requires.txt",
+    "zstd-00changelog.chain",
+    "zstd-00changelog.d",
+    "zstd-00changelog.i",
+    "zstd-00changelog.index",
+    "zstd-00manifest.chain",
+    "zstd-00manifest.i",
+    "zstd-00manifest.index",
+    "zstd-data_empty.i",
+    "zstd-data_grow.i",
+    "zstd-data_rand.i",
+    "zstd-empty.chain",
+    "zstd-empty.index",
+    "zstd-grow.chain",
+    "zstd-grow.index",
+    "zstd-rand.chain",
+    "zstd-rand.index",
+    "zstd-requires.txt",
+  ];
+
+  /// The file named `name`, if there is one.
+  pub(crate) fn find(name: &str) -> Option<&'static [u8]> {
+    FILES
+      .iter()
+      .find(|(known, _)| *known == name)
+      .map(|(_, bytes)| *bytes)
+  }
+
+  /// The file named `name`.
+  pub(crate) fn file(name: &str) -> &'static [u8] {
+    find(name).unwrap_or_else(|| panic!("no revlog fixture {name}"))
+  }
+}
+
+/// The store golden vectors (A-630): one history stock 7.2 stored twice, in a dotencode store and a hybrid one, each
+/// store's files whole, its file list, requirements and paths, and every revision's `debugdata` once, as
+/// `fixtures/store/make-store-fixtures.sh` wrote them (its header names the exact command and the run), compiled in
+/// by name.
+pub(crate) mod store {
+  /// Lists each file's name with its bytes.
+  macro_rules! stored {
+    ($($name:literal),* $(,)?) => {
+      /// Every file, by its name.
+      const FILES: &[(&str, &[u8])] = &[$(($name, include_bytes!(concat!("../../fixtures/store/", $name)))),*];
+    };
+  }
+
+  stored![
+    "00changelog-0.txt",
+    "00changelog-1.txt",
+    "00changelog-2.txt",
+    "00changelog-3.txt",
+    "00changelog-4.txt",
+    "00manifest-0.txt",
+    "00manifest-1.txt",
+    "00manifest-2.txt",
+    "00manifest-3.txt",
+    "00manifest-4.txt",
+    "dot-files.txt",
+    "dot-paths.txt",
+    "dot-requires.txt",
+    "dot/00changelog.d",
+    "dot/00changelog.i",
+    "dot/00manifest.i",
+    "dot/data/_capital___under.txt.i",
+    "dot/data/_f_o_o.i",
+    "dot/data/au~78.txt.i",
+    "dot/data/colon~3aquest~3fstar~2a.txt.i",
+    "dot/data/co~6d1.i",
+    "dot/data/co~6e.i",
+    "dot/data/foo.i",
+    "dot/data/lp~749.x.i",
+    "dot/data/plain.txt.i",
+    "dot/data/pr~6e.d.i",
+    "dot/data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+    "dot/data/tilde~7e~c3~a9.txt.i",
+    "dot/data/trailing .i",
+    "dot/data/trailing..i",
+    "dot/data/x.i.hg/inside.txt.i",
+    "dot/data/y.d.hg/inside.txt.i",
+    "dot/data/z.hg.hg/inside.txt.i",
+    "dot/data/~20space.i",
+    "dot/data/~2eleading.i",
+    "dot/dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+    "dot/dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+    "dot/dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+    "dot/fncache",
+    "dot/requires",
+    "f0-0.txt",
+    "f1-0.txt",
+    "f10-0.txt",
+    "f11-0.txt",
+    "f12-0.txt",
+    "f13-0.txt",
+    "f13-1.txt",
+    "f14-0.txt",
+    "f15-0.txt",
+    "f16-0.txt",
+    "f17-0.txt",
+    "f18-0.txt",
+    "f19-0.txt",
+    "f2-0.txt",
+    "f20-0.txt",
+    "f21-0.txt",
+    "f3-0.txt",
+    "f4-0.txt",
+    "f5-0.txt",
+    "f5-1.txt",
+    "f6-0.txt",
+    "f7-0.txt",
+    "f8-0.txt",
+    "f9-0.txt",
+    "hybrid-files.txt",
+    "hybrid-paths.txt",
+    "hybrid-requires.txt",
+    "hybrid/00changelog.d",
+    "hybrid/00changelog.i",
+    "hybrid/00manifest.i",
+    "hybrid/data/ space.i",
+    "hybrid/data/.leading.i",
+    "hybrid/data/_capital___under.txt.i",
+    "hybrid/data/_f_o_o.i",
+    "hybrid/data/au~78.txt.i",
+    "hybrid/data/colon~3aquest~3fstar~2a.txt.i",
+    "hybrid/data/co~6d1.i",
+    "hybrid/data/co~6e.i",
+    "hybrid/data/foo.i",
+    "hybrid/data/lp~749.x.i",
+    "hybrid/data/plain.txt.i",
+    "hybrid/data/pr~6e.d.i",
+    "hybrid/data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+    "hybrid/data/tilde~7e~c3~a9.txt.i",
+    "hybrid/data/trailing .i",
+    "hybrid/data/trailing..i",
+    "hybrid/data/x.i.hg/inside.txt.i",
+    "hybrid/data/y.d.hg/inside.txt.i",
+    "hybrid/data/z.hg.hg/inside.txt.i",
+    "hybrid/dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+    "hybrid/dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+    "hybrid/dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+    "hybrid/fncache",
+    "hybrid/requires",
+  ];
+
+  /// The file named `name`, if there is one.
+  pub(crate) fn find(name: &str) -> Option<&'static [u8]> {
+    FILES
+      .iter()
+      .find(|(known, _)| *known == name)
+      .map(|(_, bytes)| *bytes)
+  }
+
+  /// The file named `name`.
+  pub(crate) fn file(name: &str) -> &'static [u8] {
+    find(name).unwrap_or_else(|| panic!("no store fixture {name}"))
+  }
+}
+
+/// The import's golden vectors (A-630 parts 2 and 3): the history `fixtures/store` holds, stored again by stock 7.2 as a
+/// revlog version 2 store with the changelog's version 2 and the file index (`v2`) and as a version 1 store listed by
+/// the file index (`fileindex`), each store whole with its file list, its requirements, its file index's listing and
+/// docket as 7.2's `debug::file-index` prints them, and every repository's `.hg/requires` (also those of the dotencode,
+/// hybrid and pre-share-safe repositories whose stores are byte for byte `fixtures/store`'s), as
+/// `fixtures/import/make-import-fixtures.sh` wrote them (its header names the run), compiled in by name.
+pub(crate) mod import {
+  /// Lists each file's name with its bytes.
+  macro_rules! stored {
+    ($($name:literal),* $(,)?) => {
+      /// Every file, by its name.
+      const FILES: &[(&str, &[u8])] = &[$(($name, include_bytes!(concat!("../../fixtures/import/", $name)))),*];
+    };
+  }
+
+  stored![
+    "dot-hg-requires.txt",
+    "fileindex-fileindex-docket.txt",
+    "fileindex-fileindex.txt",
+    "fileindex-files.txt",
+    "fileindex-hg-requires.txt",
+    "fileindex-requires.txt",
+    "fileindex/00changelog.d",
+    "fileindex/00changelog.i",
+    "fileindex/00manifest.i",
+    "fileindex/data/_capital___under.txt.i",
+    "fileindex/data/_f_o_o.i",
+    "fileindex/data/au~78.txt.i",
+    "fileindex/data/colon~3aquest~3fstar~2a.txt.i",
+    "fileindex/data/co~6d1.i",
+    "fileindex/data/co~6e.i",
+    "fileindex/data/foo.i",
+    "fileindex/data/lp~749.x.i",
+    "fileindex/data/plain.txt.i",
+    "fileindex/data/pr~6e.d.i",
+    "fileindex/data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+    "fileindex/data/tilde~7e~c3~a9.txt.i",
+    "fileindex/data/trailing .i",
+    "fileindex/data/trailing..i",
+    "fileindex/data/x.i.hg/inside.txt.i",
+    "fileindex/data/y.d.hg/inside.txt.i",
+    "fileindex/data/z.hg.hg/inside.txt.i",
+    "fileindex/data/~20space.i",
+    "fileindex/data/~2eleading.i",
+    "fileindex/dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+    "fileindex/dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+    "fileindex/dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+    "fileindex/fileindex",
+    "fileindex/fileindex-list.150e1cfc",
+    "fileindex/fileindex-meta.b870a51b",
+    "fileindex/fileindex-tree.88698448",
+    "fileindex/requires",
+    "hybrid-hg-requires.txt",
+    "legacy-hg-requires.txt",
+    "v2-fileindex-docket.txt",
+    "v2-fileindex.txt",
+    "v2-files.txt",
+    "v2-hg-requires.txt",
+    "v2-requires.txt",
+    "v2/00changelog-150e1cfc.idx",
+    "v2/00changelog-88698448.sda",
+    "v2/00changelog-b870a51b.dat",
+    "v2/00changelog.i",
+    "v2/00manifest-1335303a.sda",
+    "v2/00manifest-6b8ab34b.idx",
+    "v2/00manifest-b875dfc5.dat",
+    "v2/00manifest.i",
+    "v2/data/_capital___under.txt-1f2c2f01.idx",
+    "v2/data/_capital___under.txt-5de78e5c.dat",
+    "v2/data/_capital___under.txt-92d73cd4.sda",
+    "v2/data/_capital___under.txt.i",
+    "v2/data/_f_o_o-05a21d65.idx",
+    "v2/data/_f_o_o-43c37dde.dat",
+    "v2/data/_f_o_o-e2c9362a.sda",
+    "v2/data/_f_o_o.i",
+    "v2/data/au~78.txt-2c10b55e.dat",
+    "v2/data/au~78.txt-7b2d6d46.idx",
+    "v2/data/au~78.txt-9dc8a096.sda",
+    "v2/data/au~78.txt.i",
+    "v2/data/colon~3aquest~3fstar~2a.txt-0641b566.dat",
+    "v2/data/colon~3aquest~3fstar~2a.txt-32090367.idx",
+    "v2/data/colon~3aquest~3fstar~2a.txt-fdde9d5b.sda",
+    "v2/data/colon~3aquest~3fstar~2a.txt.i",
+    "v2/data/com1-887782a2.dat",
+    "v2/data/com1-91214c9d.sda",
+    "v2/data/com1-9ea89e64.idx",
+    "v2/data/con-59d7cefb.idx",
+    "v2/data/con-675e7e32.sda",
+    "v2/data/con-768bf46f.dat",
+    "v2/data/co~6d1.i",
+    "v2/data/co~6e.i",
+    "v2/data/foo-6594c487.dat",
+    "v2/data/foo-88163688.sda",
+    "v2/data/foo-ea337809.idx",
+    "v2/data/foo.i",
+    "v2/data/lp~749.x-76ca3167.dat",
+    "v2/data/lp~749.x-7abfface.idx",
+    "v2/data/lp~749.x-958fa9e4.sda",
+    "v2/data/lp~749.x.i",
+    "v2/data/plain.txt-92beb6fd.dat",
+    "v2/data/plain.txt-c09e3fe7.idx",
+    "v2/data/plain.txt-ecdc8c03.sda",
+    "v2/data/plain.txt.i",
+    "v2/data/pr~6e.d-a4d11bc6.dat",
+    "v2/data/pr~6e.d-ecbdc938.idx",
+    "v2/data/pr~6e.d-fd586516.sda",
+    "v2/data/pr~6e.d.i",
+    "v2/data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt-06e3883a.idx",
+    "v2/data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt-65f67223.dat",
+    "v2/data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt-d7473fc6.sda",
+    "v2/data/quote~22lt~3cgt~3epipe~7cback~5cslash.txt.i",
+    "v2/data/tilde~7e~c3~a9.txt-171e199e.idx",
+    "v2/data/tilde~7e~c3~a9.txt-57ac65f3.dat",
+    "v2/data/tilde~7e~c3~a9.txt-b3ea699d.sda",
+    "v2/data/tilde~7e~c3~a9.txt.i",
+    "v2/data/trailing -1a19ef85.sda",
+    "v2/data/trailing -73b1936b.idx",
+    "v2/data/trailing -e7d3236b.dat",
+    "v2/data/trailing .i",
+    "v2/data/trailing.-00d6d3be.sda",
+    "v2/data/trailing.-3d4c58e4.idx",
+    "v2/data/trailing.-b0f8e721.dat",
+    "v2/data/trailing..i",
+    "v2/data/x.i.hg/inside.txt-791274ee.dat",
+    "v2/data/x.i.hg/inside.txt-f1188b0c.sda",
+    "v2/data/x.i.hg/inside.txt-faa1131a.idx",
+    "v2/data/x.i.hg/inside.txt.i",
+    "v2/data/y.d.hg/inside.txt-3e9ac652.idx",
+    "v2/data/y.d.hg/inside.txt-4046ec56.dat",
+    "v2/data/y.d.hg/inside.txt-ba969dfa.sda",
+    "v2/data/y.d.hg/inside.txt.i",
+    "v2/data/z.hg.hg/inside.txt-b71e11b5.idx",
+    "v2/data/z.hg.hg/inside.txt-d7a799ae.sda",
+    "v2/data/z.hg.hg/inside.txt-f7e0c86f.dat",
+    "v2/data/z.hg.hg/inside.txt.i",
+    "v2/data/~20space-539ee172.sda",
+    "v2/data/~20space-7f2eb713.dat",
+    "v2/data/~20space-9b3fc813.idx",
+    "v2/data/~20space.i",
+    "v2/data/~2eleading-265d8f66.sda",
+    "v2/data/~2eleading-a2b86225.idx",
+    "v2/data/~2eleading-f73766e4.dat",
+    "v2/data/~2eleading.i",
+    "v2/dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4e4b71aecd2d6306510b05e6cdbc9e0c6814bf03.idx",
+    "v2/dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa12a8264b75c8465edae102ccb3b9c5b108c5a2b.dat",
+    "v2/dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa78c585b2dae8e17cd25ee33209c1bc563533310.sda",
+    "v2/dh/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab1068971bbd8477250f462eb099cbb09d78312dc.i",
+    "v2/dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-e22e927cfb06485b2c677a81d45d5162c1c9005f.sda",
+    "v2/dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-f9f36e4c3c685d07240b7a978a965925d0261b1b.idx",
+    "v2/dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-fc0f121cf5080777c9e15f7c81df433fcf28c48c.dat",
+    "v2/dh/director/seventh_/third.di/fourth.d/fifth.di/sixth.di/eighth.d/deep-file-na8045308eb5772f8d366bd883527c27741dfa75db.i",
+    "v2/dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt-00cf578e.dateecb7397900171839840de7c29f521193a11026b.dat",
+    "v2/dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt-18857273.idxbc885b83760df24ca8dd319d77fdf3ce269b7af4.idx",
+    "v2/dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt-246a6c91.sda40cc1723fcb3b67d6649f9efcdde74aedb1a61b7.sda",
+    "v2/dh/upper_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.txt.i20053374f434dbfe7d9cbc451df115259a188c19.i",
+    "v2/fileindex",
+    "v2/fileindex-list.69d069c3",
+    "v2/fileindex-meta.619c4819",
+    "v2/fileindex-tree.5e69c5d1",
+    "v2/requires",
+  ];
+
+  /// The file named `name`, if there is one.
+  pub(crate) fn find(name: &str) -> Option<&'static [u8]> {
+    FILES
+      .iter()
+      .find(|(known, _)| *known == name)
+      .map(|(_, bytes)| *bytes)
+  }
+}
+
+/// The state's golden vectors (A-649 part 2): one history with phases, bookmarks and obsolescence markers stored by
+/// stock 7.2 in two repositories (`states`, bookmarks in `.hg/bookmarks`; `states-store`, bookmarks in the store), each
+/// store whole with its requirements, `.hg/bookmarks` where it is kept there, and 7.2's own listings of every changeset's
+/// phase, every bookmark and every marker, as `fixtures/state/make-state-fixtures.sh` wrote them (its header names the
+/// run); and what 7.2's `served` filter serves of each (A-680 part 1), as `make-served-fixtures.sh` wrote it; compiled in
+/// by name.
+pub(crate) mod state {
+  /// Lists each file's name with its bytes.
+  macro_rules! stored {
+    ($($name:literal),* $(,)?) => {
+      /// Every file, by its name.
+      const FILES: &[(&str, &[u8])] = &[$(($name, include_bytes!(concat!("../../fixtures/state/", $name)))),*];
+    };
+  }
+
+  stored![
+    "amended-root-bookmarks.txt",
+    "amended-root-files.txt",
+    "amended-root-hg-requires.txt",
+    "amended-root-markers.txt",
+    "amended-root-phases.txt",
+    "amended-root-requires.txt",
+    "amended-root-served-bookmarks.txt",
+    "amended-root-served-branchmap.txt",
+    "amended-root-served-heads.txt",
+    "amended-root-served-phases.txt",
+    "amended-root-served.txt",
+    "amended-root-unserved.txt",
+    "amended-root/00changelog.d",
+    "amended-root/00changelog.i",
+    "amended-root/00manifest.i",
+    "amended-root/data/a.i",
+    "amended-root/data/b.i",
+    "amended-root/data/c.i",
+    "amended-root/fncache",
+    "amended-root/obsstore",
+    "amended-root/phaseroots",
+    "amended-root/requires",
+    "divergent-bookmarks",
+    "divergent-bookmarks.txt",
+    "divergent-files.txt",
+    "divergent-hg-requires.txt",
+    "divergent-markers.txt",
+    "divergent-phases.txt",
+    "divergent-requires.txt",
+    "divergent-served-bookmarks.txt",
+    "divergent-served-branchmap.txt",
+    "divergent-served-heads.txt",
+    "divergent-served-phases.txt",
+    "divergent-served.txt",
+    "divergent-unserved.txt",
+    "divergent/00changelog.d",
+    "divergent/00changelog.i",
+    "divergent/00manifest.i",
+    "divergent/data/a.i",
+    "divergent/data/b.i",
+    "divergent/data/c.i",
+    "divergent/fncache",
+    "divergent/phaseroots",
+    "divergent/requires",
+    "states-bookmarks",
+    "states-bookmarks.txt",
+    "states-files.txt",
+    "states-hg-requires.txt",
+    "states-markers.txt",
+    "states-phases.txt",
+    "states-requires.txt",
+    "states-served-bookmarks.txt",
+    "states-served-branchmap.txt",
+    "states-served-heads.txt",
+    "states-served-phases.txt",
+    "states-served.txt",
+    "states-store-bookmarks.txt",
+    "states-store-files.txt",
+    "states-store-hg-requires.txt",
+    "states-store-markers.txt",
+    "states-store-phases.txt",
+    "states-store-requires.txt",
+    "states-store-served-bookmarks.txt",
+    "states-store-served-branchmap.txt",
+    "states-store-served-heads.txt",
+    "states-store-served-phases.txt",
+    "states-store-served.txt",
+    "states-store-unserved.txt",
+    "states-store/00changelog.d",
+    "states-store/00changelog.i",
+    "states-store/00manifest.i",
+    "states-store/bookmarks",
+    "states-store/data/a.i",
+    "states-store/data/b.i",
+    "states-store/data/c.i",
+    "states-store/data/d.i",
+    "states-store/fncache",
+    "states-store/obsstore",
+    "states-store/phaseroots",
+    "states-store/requires",
+    "states-unserved.txt",
+    "states/00changelog.d",
+    "states/00changelog.i",
+    "states/00manifest.i",
+    "states/data/a.i",
+    "states/data/b.i",
+    "states/data/c.i",
+    "states/data/d.i",
+    "states/fncache",
+    "states/obsstore",
+    "states/phaseroots",
+    "states/requires",
+  ];
+
+  /// The file named `name`, if there is one.
+  pub(crate) fn find(name: &str) -> Option<&'static [u8]> {
+    FILES
+      .iter()
+      .find(|(known, _)| *known == name)
+      .map(|(_, bytes)| *bytes)
+  }
+
+  /// The file named `name`.
+  pub(crate) fn file(name: &str) -> &'static [u8] {
+    find(name).unwrap_or_else(|| panic!("no state fixture {name}"))
+  }
+}

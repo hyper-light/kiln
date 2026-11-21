@@ -28,6 +28,9 @@ use crate::inode::{Attrs, BaseBody, Body, Home, Inode, Kind, SpecialNode};
 use crate::journal::{Op, OpLog};
 use crate::names::{self, NameEquivalence};
 use crate::quota::{Accounting, Quota};
+use crate::referenced::{
+  self, Identity, Piece, ReferencedBody, ReferencedContent, ReferencedCounts, ReferencedHolds,
+};
 use crate::snapshot::{Dead, Deadlist, Snapshot};
 use crate::trie::{self, TrieNode};
 
@@ -154,6 +157,9 @@ pub struct Store {
   /// publishes before its next unit of work, which tops the reserve up. Set by [`Volume::next_no`] and at recovery,
   /// cleared by the owner when a publication commits.
   pub counters_low: bool,
+  /// Whether a write stamped a file for the idle sweep since the owner last looked (A-715): set where a sealing volume's
+  /// write is stamped, taken by the owner, which arms its sweep's deadline then rather than sweeping on a tick.
+  pub sweep_owed: bool,
 }
 
 /// Shape: the share of [`Store::inode_reserve`] under which a volume's reserve is topped up (A-150): a half. The reserve
@@ -241,6 +247,7 @@ impl Store {
       shards_backings: crate::shards_backing::ShardsBackings::new(config.max_chunks),
       inode_reserve: 0,
       counters_low: false,
+      sweep_owed: false,
     }
   }
 
@@ -434,6 +441,9 @@ pub struct Volume {
   pub(crate) idle_pending: std::collections::BTreeSet<InodeNo>,
   pub(crate) state: VolumeState,
   pub(crate) destroy_queue: Vec<Dead>,
+  /// The content identities this volume's referenced files hold, one entry per hold (A-645 P3 ruling 2,
+  /// [`crate::referenced`]), and the counts of its referenced reads.
+  pub(crate) referenced: ReferencedLedger,
   /// Open and lookup references per inode number (§4.6 lifetime; the inode-addressed-io design):
   /// an inode's content and table entry survive `unlink` while any reference is held, so a file
   /// unlinked while open keeps serving until the last reference drops. Bounded by referenced
@@ -647,6 +657,53 @@ impl Leaf {
   }
 }
 
+/// Gives back one hold of each of `ids` through `content`, every one even past a refusal: the first refusal.
+fn release_all<'a>(
+  content: &mut dyn ReferencedHolds,
+  ids: impl Iterator<Item = &'a Identity>,
+) -> Result<(), VfsError> {
+  let mut first = Ok(());
+  for id in ids {
+    let released = content.release(id);
+    first = first.and(released);
+  }
+  first
+}
+
+/// A volume's referenced-file ledger (A-645 P3 ruling 2, [`crate::referenced`]): the identities held for its files, one
+/// entry per hold, and the counts of its referenced reads. Bounded by the content pieces its files name.
+#[derive(Debug, Default)]
+pub(crate) struct ReferencedLedger {
+  /// One entry per hold taken (or, when `owed`, to be taken) through the store's seam.
+  pub(crate) holds: Vec<Identity>,
+  /// Whether a recovery rebuilt `holds` from an image, so this daemon's store has not taken them.
+  pub(crate) owed: bool,
+  /// What referenced reads have returned and copied; a cell, since a read borrows the volume shared.
+  pub(crate) counts: std::cell::Cell<ReferencedCounts>,
+}
+
+impl ReferencedLedger {
+  /// Adds one read's counts.
+  fn count(&self, read: ReferencedCounts) {
+    let mut counts = self.counts.get();
+    counts.bytes_read = counts.bytes_read.saturating_add(read.bytes_read);
+    counts.bytes_copied = counts.bytes_copied.saturating_add(read.bytes_copied);
+    self.counts.set(counts);
+  }
+
+  /// Notes the identities a recovered body holds, owed to this daemon's store.
+  pub(crate) fn recovered(&mut self, body: &Body) {
+    if let Body::Referenced(body) = body {
+      for piece in body.pieces() {
+        if let Piece::Content { id, .. } = piece {
+          self.holds.push(*id);
+          self.owed = true;
+        }
+      }
+    }
+  }
+}
+
 /// A `readdir` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirRow<'a> {
@@ -770,6 +827,7 @@ impl Volume {
       idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      referenced: ReferencedLedger::default(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
       attachment_opens: BTreeMap::new(),
@@ -841,6 +899,11 @@ impl Volume {
     if config.names != origin.policy {
       return Err(VfsError::PolicyMismatch);
     }
+    // A referenced file's identities are held by its volume, not its inode (A-645 P3 ruling 2): a clone would share the
+    // inodes and hold nothing, so its reads would outlive the origin's release. A view is regenerated, never cloned.
+    if !origin.referenced.holds.is_empty() {
+      return Err(VfsError::ReferencesHeld);
+    }
     let snap = origin
       .snapshots
       .get_mut(snapshot_handle(snapshot))
@@ -898,6 +961,7 @@ impl Volume {
       idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      referenced: ReferencedLedger::default(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
       attachment_opens: BTreeMap::new(),
@@ -1006,6 +1070,7 @@ impl Volume {
       idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      referenced: ReferencedLedger::default(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
       attachment_opens: BTreeMap::new(),
@@ -1495,6 +1560,12 @@ impl Volume {
     }
   }
 
+  /// Whether the idle sweep still owes this volume a pass (A-715): a file written and not yet aged, or aged and not yet
+  /// sealed.
+  pub fn sweep_owes(&self) -> bool {
+    !self.written.is_empty() || !self.idle_pending.is_empty()
+  }
+
   /// Seals the open extents of files due a seal, until `budget_bytes` of open bytes are sealed (one cooperative slice);
   /// the rest wait for the next slice. A seal the store refuses leaves the file open, counted, until its next write.
   /// The changed inodes are marked for the next recovery image.
@@ -1678,6 +1749,74 @@ impl Volume {
     self.read_body(store, no, off, buf)
   }
 
+  /// Holds file `no`'s content as the head has it now for a reader that reads it over turns (A-768: a live log's whole
+  /// capture): appends each sealed extent that names a chunk to `out`, its chunk pinned ([`ChunkStore::pin_chunk`]), so
+  /// a write that replaces it, the publication that frees it and the deadlist walk leave its bytes readable until the
+  /// reader lets go ([`ChunkStore::unpin_extents`]); an open extent, which the next write changes in place, is copied.
+  /// `None`, appending nothing, for a body that holds no chunked content. Refused whole: what it pinned before a refusal
+  /// is unpinned.
+  pub fn pin_extents(
+    &self,
+    store: &mut Store,
+    no: InodeNo,
+    out: &mut Vec<Extent>,
+  ) -> Result<Option<PinnedFile>, VfsError> {
+    let inode = self.inode(store, no)?;
+    let size = inode.attrs.size;
+    let (sealed, open) = match &inode.body {
+      Body::Sealed(sealed) => (sealed, None),
+      Body::Open { open, sealed } => (
+        sealed,
+        Some((open.off, store.content.open_bytes(open).to_vec())),
+      ),
+      _ => return Ok(None),
+    };
+    let from = out.len();
+    out.extend(
+      sealed
+        .iter()
+        .filter(|extent| matches!(extent.src, ExtentSrc::Chunk { .. })),
+    );
+    for at in from..out.len() {
+      let pinned = match out.get(at).map(|extent| extent.src) {
+        Some(ExtentSrc::Chunk { chunk, .. }) => store.content.pin_chunk(chunk),
+        _ => Ok(()),
+      };
+      if let Err(refusal) = pinned {
+        let undone = out
+          .get(from..at)
+          .map_or(Ok(()), |held| store.content.unpin_extents(held));
+        out.truncate(from);
+        return Err(refusal.after_undo(undone));
+      }
+    }
+    Ok(Some(PinnedFile {
+      size,
+      extents: out.len().saturating_sub(from),
+      open,
+    }))
+  }
+
+  /// Reads up to `buf.len()` bytes at `off` of file `no`, a referenced file's content pieces through `content` (A-645
+  /// P3 ruling 2, [`crate::referenced`]); any other file reads as [`Volume::read`] reads it. Counted in
+  /// [`Volume::referenced_counts`].
+  pub fn read_referenced(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+    content: &dyn ReferencedContent,
+  ) -> Result<usize, VfsError> {
+    self.namespace_inode(store, no)?;
+    self.read_body_with(store, no, off, buf, Some(content))
+  }
+
+  /// What this volume's referenced reads have returned, and how much of it the store copied rather than lent.
+  pub fn referenced_counts(&self) -> ReferencedCounts {
+    self.referenced.counts.get()
+  }
+
   /// Reads any file-bodied inode, an attribute inode included: the attribute verbs' read.
   pub(crate) fn read_body(
     &self,
@@ -1685,6 +1824,17 @@ impl Volume {
     no: InodeNo,
     off: u64,
     buf: &mut [u8],
+  ) -> Result<usize, VfsError> {
+    self.read_body_with(store, no, off, buf, None)
+  }
+
+  fn read_body_with(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+    content: Option<&dyn ReferencedContent>,
   ) -> Result<usize, VfsError> {
     let inode = self.inode(store, no)?;
     if inode.kind.is_special() {
@@ -1738,6 +1888,11 @@ impl Volume {
         for e in overlapping(&b.pinned, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
+      }
+      // Its content pieces need the store: `read_referenced` lends it, and a read without one is refused.
+      Body::Referenced(body) => {
+        let read = referenced::read_into(body, content, off, out)?;
+        self.referenced.count(read);
       }
       Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
     }
@@ -1820,7 +1975,7 @@ impl Volume {
     name: &str,
     mode: u32,
   ) -> Result<InodeNo, VfsError> {
-    self.create_leaf(store, dir, name, mode, Leaf::File)
+    self.create_leaf(store, dir, name, mode, Leaf::File, None)
   }
 
   /// Creates a name with no content (A-26, A-294): a FIFO or socket name without a stream or listener, or a device
@@ -1834,7 +1989,7 @@ impl Volume {
     node: SpecialNode,
   ) -> Result<InodeNo, VfsError> {
     let dir = self.entry_dir(store, dir_no)?;
-    self.create_leaf(store, dir, name, mode, Leaf::Special(node))
+    self.create_leaf(store, dir, name, mode, Leaf::Special(node), None)
   }
 
   fn create_leaf(
@@ -1844,6 +1999,7 @@ impl Volume {
     name: &str,
     mode: u32,
     leaf: Leaf,
+    referenced: Option<Box<ReferencedBody>>,
   ) -> Result<InodeNo, VfsError> {
     let kind = leaf.kind();
     self.live()?;
@@ -1862,9 +2018,14 @@ impl Volume {
     let parent = store.dirs.get(dir)?.inode;
     let no = self.next_no(store)?;
     let now = self.clock.wall_ns();
-    let body = match leaf {
-      Leaf::Special(node) => node.body(),
-      Leaf::File => Body::Inline(Vec::new()),
+    // A referenced file's length is its pieces' sum, known now; its bytes are the content store's, charged to no volume.
+    let (body, size) = match (leaf, referenced) {
+      (Leaf::Special(node), _) => (node.body(), 0),
+      (Leaf::File, None) => (Body::Inline(Vec::new()), 0),
+      (Leaf::File, Some(body)) => {
+        let size = body.len();
+        (Body::Referenced(body), size)
+      }
     };
     let mut inode = Inode::new(no, self.epoch, kind, mode, body);
     inode.home = Home::new(parent, self.policy.hash(name));
@@ -1872,6 +2033,7 @@ impl Volume {
       inode.windows = crate::inode::WindowsAttributes::new_file();
     }
     stamp_all(&mut inode.attrs, now);
+    inode.attrs.size = size;
     let handle = self.install(store, no, inode)?;
     let child = leaf.child(no);
     // Publication: the name is the one step a client sees.
@@ -2512,6 +2674,7 @@ impl Volume {
     if kind == Kind::Symlink {
       return Err(VfsError::Invalid);
     }
+    self.refuse_referenced(store, no)?;
     if bytes.is_empty() {
       return Ok(0);
     }
@@ -2661,12 +2824,102 @@ impl Volume {
     Ok(())
   }
 
+  /// Refuses any change to a referenced file's content, `EROFS` (A-645 P3 ruling 2): its bytes are the content store's,
+  /// shared by identity, and a view is regenerated, never edited.
+  fn refuse_referenced(&self, store: &Store, no: InodeNo) -> Result<(), VfsError> {
+    match self.inode(store, no)?.body {
+      Body::Referenced(_) => Err(VfsError::ReadOnly),
+      _ => Ok(()),
+    }
+  }
+
+  /// Creates a read-only referenced file named `name` in the directory named by `dir_no` (A-645 P3 ruling 2,
+  /// [`crate::referenced`]): its content is `pieces`, in order, and its length their sum. Every content piece's identity
+  /// is held through `content` before the file exists, one hold a piece, and kept in the volume's ledger until
+  /// [`Volume::release_references`]; a hold refused, or the create refused, lets go of every hold it took.
+  pub fn create_referenced(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+    pieces: Vec<Piece>,
+    content: &mut dyn ReferencedHolds,
+  ) -> Result<InodeNo, VfsError> {
+    let body = ReferencedBody::new(pieces)?;
+    let ids: Vec<Identity> = body
+      .pieces()
+      .iter()
+      .filter_map(|piece| match piece {
+        Piece::Content { id, .. } => Some(*id),
+        Piece::Made(_) => None,
+      })
+      .collect();
+    let mut held = 0usize;
+    for id in &ids {
+      if let Err(refusal) = content.hold(id) {
+        return Err(refusal.after_undo(release_all(content, ids.iter().take(held))));
+      }
+      held = held.saturating_add(1);
+    }
+    let made = self
+      .entry_dir(store, dir_no)
+      .and_then(|dir| self.create_leaf(store, dir, name, mode, Leaf::File, Some(Box::new(body))));
+    match made {
+      Ok(no) => {
+        self.referenced.holds.extend(ids);
+        Ok(no)
+      }
+      Err(refusal) => Err(refusal.after_undo(release_all(content, ids.iter()))),
+    }
+  }
+
+  /// Lets go of every content identity this volume's referenced files hold, through `content`, the store that took
+  /// them (A-645 P3 ruling 2): the presenter's last step before it destroys the volume, which refuses while any is
+  /// held. A ledger a recovery rebuilt was never held by this daemon's store ([`Volume::references_owed`]), so it is
+  /// dropped without releasing. Every hold is given back even past a refusal, and the first refusal is the answer; the
+  /// ledger is empty either way, so a destroy can follow.
+  pub fn release_references(&mut self, content: &mut dyn ReferencedHolds) -> Result<(), VfsError> {
+    let holds = std::mem::take(&mut self.referenced.holds);
+    if std::mem::take(&mut self.referenced.owed) {
+      return Ok(());
+    }
+    release_all(content, holds.iter())
+  }
+
+  /// Whether this volume's ledger came from a recovery image and its store has not held it yet
+  /// ([`Volume::hold_owed_references`]).
+  pub fn references_owed(&self) -> bool {
+    self.referenced.owed
+  }
+
+  /// Takes the holds a recovered volume's ledger names through `content`, the successor's store (A-645 P3 ruling 2): a
+  /// refused hold lets go of those taken and leaves the ledger owed.
+  pub fn hold_owed_references(
+    &mut self,
+    content: &mut dyn ReferencedHolds,
+  ) -> Result<(), VfsError> {
+    if !self.referenced.owed {
+      return Ok(());
+    }
+    for (taken, id) in self.referenced.holds.iter().enumerate() {
+      if let Err(refusal) = content.hold(id) {
+        return Err(refusal.after_undo(release_all(
+          content,
+          self.referenced.holds.iter().take(taken),
+        )));
+      }
+    }
+    self.referenced.owed = false;
+    Ok(())
+  }
+
   /// Refuses an allocation of anything but a regular file, as a write is refused: a directory is
   /// `IsDirectory`, an IPC name `SpecialFileOperation`, and a symlink `Invalid` (POSIX `EINVAL` — a symlink is
   /// reached through `readlink`, never allocated as content; the `_ => Ok` arm formerly admitted it).
   fn allocatable(&self, store: &Store, no: InodeNo) -> Result<(), VfsError> {
     match self.kind(store, no)? {
-      Kind::File => Ok(()),
+      Kind::File => self.refuse_referenced(store, no),
       Kind::Dir => Err(VfsError::IsDirectory),
       Kind::Symlink => Err(VfsError::Invalid),
       Kind::Fifo | Kind::Socket | Kind::BlockDevice | Kind::CharDevice => {
@@ -2759,6 +3012,7 @@ impl Volume {
     if kind == Kind::Symlink {
       return Err(VfsError::Invalid);
     }
+    self.refuse_referenced(store, no)?;
     // The windows a truncate cuts away retain their chunks when a snapshot pins them (§4.2
     // retention): secured before anything changes.
     let retention = self.retention_of_truncate(store, no, len)?;
@@ -3317,6 +3571,7 @@ impl Volume {
     if self.kind(store, no)? == Kind::Symlink {
       return Err(VfsError::Invalid);
     }
+    self.refuse_referenced(store, no)?;
     let size = self.inode(store, no)?.attrs.size;
     if at > size {
       return Err(VfsError::Invalid);
@@ -3781,6 +4036,10 @@ impl Volume {
   pub fn destroy(&mut self, store: &mut Store) -> Result<(), VfsError> {
     if self.state == VolumeState::Destroyed {
       return Err(VfsError::Destroying);
+    }
+    // Its referenced files' holds leave first, through the store that took them ([`Volume::release_references`]).
+    if !self.referenced.holds.is_empty() {
+      return Err(VfsError::ReferencesHeld);
     }
     self.state = VolumeState::Destroying;
     // The whole volume's retention returns to the shard budgets (§4.2): settled here, at destroy,
@@ -6475,7 +6734,12 @@ impl Volume {
     // What a publication may patch (A-126): the windows this write can change, or, for a body that is not chunked,
     // nothing (the inode is imaged whole).
     let written_no = store.inodes.get(handle)?.no.0;
-    self.dirty.written(written_no, touched);
+    // The bytes the write changes: from the old end of the file when it grows it, since the zeros it opens are new too.
+    let old_size = store.inodes.get(handle)?.attrs.size;
+    let write_end = off.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    self
+      .dirty
+      .written(written_no, touched, (off.min(old_size), write_end));
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let landed = self.write_body(store, body, off, bytes);
     let inode = store.inodes.get_mut(handle)?;
@@ -6484,6 +6748,7 @@ impl Volume {
     if self.seal_key.is_some() && landed.written > 0 {
       self.written.insert(inode.no, self.sweep_tick);
       self.idle_pending.remove(&inode.no);
+      store.sweep_owed = true;
     }
     self.reconcile(before, content_by_epoch_within(store, handle, touched));
     match landed.refused {
@@ -7351,6 +7616,11 @@ pub(crate) fn read_frozen_body(
         store.content.read_extent_into(e, off, out)?;
       }
     }
+    // A referenced file as the snapshot froze it: its made pieces serve, and a content piece, which needs the store a
+    // snapshot read is not lent, is refused `ReferenceUnresolved`, never zeros presented as content.
+    Body::Referenced(body) => {
+      referenced::read_into(body, None, off, out)?;
+    }
     Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
   }
   Ok(want)
@@ -7393,6 +7663,18 @@ pub(crate) fn stamp_all(attrs: &mut Attrs, now: i64) {
 }
 
 /// Copies the overlap of `bytes` (at file offset `base`) into `out` (at file offset `off`).
+/// What [`Volume::pin_extents`] held of one file: its size then, how many sealed extents it appended (each chunk pinned),
+/// and a copy of its open extent with the offset it begins at.
+#[derive(Debug)]
+pub struct PinnedFile {
+  /// The file's size when it was pinned.
+  pub size: u64,
+  /// The sealed extents appended.
+  pub extents: usize,
+  /// The open extent's offset and bytes, copied.
+  pub open: Option<(u64, Vec<u8>)>,
+}
+
 pub(crate) fn copy_range(bytes: &[u8], base: u64, off: u64, out: &mut [u8]) {
   crate::content::copy_overlap(bytes, base, off, out);
 }
@@ -7777,7 +8059,7 @@ fn data_ranges(body: &Body, size: u64) -> Vec<(u64, u64)> {
       chunk_ranges(sealed, &mut ranges);
       ranges.push((open.off, open.off.saturating_add(open.len)));
     }
-    Body::Base(_) => ranges.push((0, size)),
+    Body::Base(_) | Body::Referenced(_) => ranges.push((0, size)),
     Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Device(_) => {}
   }
   ranges.sort_unstable();
@@ -8476,86 +8758,85 @@ mod clone_count_tests {
     (volume.inode_usage().0, volume.entry_usage().0)
   }
 
-  /// Makes `case`'s origin, clone and clone of the clone, images them, restarts, and compares: `Ok` when the restart
-  /// rebuilt each and every volume made of them reads and counts as before it, else the step that refused or the
-  /// first difference.
-  fn rebuilt_as_it_was(case: u32) -> Result<(), String> {
-    let mut store = store();
+  /// `case`'s origin: d with its files and the root's, a snapshot, files made after it and before-0 removed, and d
+  /// changed when the case says so. Returns the origin and its snapshot.
+  fn make_origin(store: &mut Store, case: u32) -> Result<(Volume, SnapshotId), String> {
     let mut origin = step(
       "make the origin",
-      Volume::create(&mut store, config(ORIGIN_PREFIX)),
+      Volume::create(store, config(ORIGIN_PREFIX)),
     )?;
-    let root = step("the origin's root", origin.root_inode(&store))?;
-    let inner = step("make d", origin.mkdir_no(&mut store, root, "d", DIR_MODE))?;
+    let root = step("the origin's root", origin.root_inode(store))?;
+    let inner = step("make d", origin.mkdir_no(store, root, "d", DIR_MODE))?;
     for n in 0..INNER {
       let name = format!("inner-{n}");
       step(
         "make d's files",
-        origin.create_file_no(&mut store, inner, &name, FILE_MODE),
+        origin.create_file_no(store, inner, &name, FILE_MODE),
       )?;
     }
     for n in 0..BEFORE {
       let name = format!("before-{n}");
       step(
         "make the root's files",
-        origin.create_file_no(&mut store, root, &name, FILE_MODE),
+        origin.create_file_no(store, root, &name, FILE_MODE),
       )?;
     }
-    let cut = step("snapshot the origin", origin.snapshot(&mut store))?;
+    let cut = step("snapshot the origin", origin.snapshot(store))?;
     for n in 0..AFTER {
       let name = format!("after-{n}");
       step(
         "make files after the snapshot",
-        origin.create_file_no(&mut store, root, &name, FILE_MODE),
+        origin.create_file_no(store, root, &name, FILE_MODE),
       )?;
     }
-    step(
-      "remove before-0",
-      origin.unlink_no(&mut store, root, "before-0"),
-    )?;
+    step("remove before-0", origin.unlink_no(store, root, "before-0"))?;
     if case & ORIGIN_CHANGES_D != 0 {
       step(
         "make inner-after",
-        origin.create_file_no(&mut store, inner, "inner-after", FILE_MODE),
+        origin.create_file_no(store, inner, "inner-after", FILE_MODE),
       )?;
-      step(
-        "remove inner-0",
-        origin.unlink_no(&mut store, inner, "inner-0"),
-      )?;
+      step("remove inner-0", origin.unlink_no(store, inner, "inner-0"))?;
     }
-    let mut clone = step(
-      "clone the origin's snapshot",
-      Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)),
-    )?;
-    let clone_root = step("the clone's root", clone.root_inode(&store))?;
-    let clone_inner = step("the clone's d", clone.lookup_no(&store, clone_root, "d"))?.inode;
+    Ok((origin, cut))
+  }
+
+  /// `case`'s changes to `clone`: a file made, an inherited file removed, a directory made, a snapshot of its own with
+  /// a file made after it, and an inherited file rewritten, each when the case says so. Returns the clone's snapshot,
+  /// if it took one.
+  fn change_clone(
+    store: &mut Store,
+    clone: &mut Volume,
+    case: u32,
+  ) -> Result<Option<SnapshotId>, String> {
+    let clone_root = step("the clone's root", clone.root_inode(store))?;
+    let clone_inner = step("the clone's d", clone.lookup_no(store, clone_root, "d"))?.inode;
     let inherited = step(
       "the clone's before-1",
-      clone.lookup_no(&store, clone_root, "before-1"),
+      clone.lookup_no(store, clone_root, "before-1"),
     )?
     .inode;
     step(
       "make clone-made",
-      clone.create_file_no(&mut store, clone_root, "clone-made", FILE_MODE),
+      clone.create_file_no(store, clone_root, "clone-made", FILE_MODE),
     )?;
     if case & CLONE_REMOVES_INHERITED != 0 {
       step(
         "remove inner-1 in the clone",
-        clone.unlink_no(&mut store, clone_inner, "inner-1"),
+        clone.unlink_no(store, clone_inner, "inner-1"),
       )?;
     }
     if case & CLONE_MAKES_DIRECTORY != 0 {
       step(
         "make e in the clone",
-        clone.mkdir_no(&mut store, clone_root, "e", DIR_MODE),
+        clone.mkdir_no(store, clone_root, "e", DIR_MODE),
       )?;
     }
     let clone_cut = if case & CLONE_SNAPSHOT != 0 {
-      let clone_cut = step("snapshot the clone", clone.snapshot(&mut store))?;
+      let clone_cut = step("snapshot the clone", clone.snapshot(store))?;
       let after = "after-the-clones-snapshot";
       step(
         "make a file after the clone's snapshot",
-        clone.create_file_no(&mut store, clone_root, after, FILE_MODE),
+        clone.create_file_no(store, clone_root, after, FILE_MODE),
       )?;
       Some(clone_cut)
     } else {
@@ -8564,9 +8845,23 @@ mod clone_count_tests {
     if case & CLONE_REWRITES_INHERITED != 0 {
       step(
         "rewrite before-1 in the clone",
-        clone.write(&mut store, inherited, 0, REWRITTEN),
+        clone.write(store, inherited, 0, REWRITTEN),
       )?;
     }
+    Ok(clone_cut)
+  }
+
+  /// Makes `case`'s origin, clone and clone of the clone, images them, restarts, and compares: `Ok` when the restart
+  /// rebuilt each and every volume made of them reads and counts as before it, else the step that refused or the
+  /// first difference.
+  fn rebuilt_as_it_was(case: u32) -> Result<(), String> {
+    let mut store = store();
+    let (mut origin, cut) = make_origin(&mut store, case)?;
+    let mut clone = step(
+      "clone the origin's snapshot",
+      Volume::clone_of(&store, &mut origin, cut, config(CLONE_PREFIX)),
+    )?;
+    let clone_cut = change_clone(&mut store, &mut clone, case)?;
     let clone_of_clone = match clone_cut {
       Some(clone_cut) if case & CLONE_OF_CLONE != 0 => Some(step(
         "clone the clone's snapshot",
@@ -8774,70 +9069,68 @@ mod upcase_name_tests {
     rows
   }
 
-  /// A-576, T-4.6 on a WinFsp drive's volume. Do: on a volume folding by Windows' upcase table, make `σ.txt`, then make
-  /// `ς.txt`, link `Σ.TXT` to another file, and rename that file onto `ς.txt`; make a precomposed and a decomposed `é`;
-  /// then make `σ.txt` and `ς.txt` on a `Fold` volume. Expect: under `Upcase` the make and the link refused `EEXIST`,
-  /// every spelling finding the one entry, the rename replacing that entry so one name is left, and the two `é` two
-  /// files, as on NTFS; under `Fold` two files, which a WinFsp drive takes for one name (A-551's third case).
+  /// A-576, A-737, T-4.6 on a WinFsp drive's volume. Do: on a volume folding by Windows' upcase table, make `ɐ.txt`,
+  /// then make `Ɐ.TXT`, link `Ɐ.Txt` to another file, and rename that file onto `Ɐ.txt`; make `σ.txt` and `ς.txt`, and a
+  /// precomposed and a decomposed `é`; then make the Kelvin sign's `K.txt` and `k.txt` on a `Fold` volume. Expect: under
+  /// `Upcase` the make and the link refused `EEXIST`, every spelling finding the one entry, the rename replacing that
+  /// entry so one name is left, and the sigmas and the two `é` four files, as on NTFS (Windows' table leaves final sigma
+  /// as it is, A-737); under `Fold` one name, which a WinFsp drive takes for two (A-551's third case).
   #[test]
   fn a_name_windows_folds_alike_to_an_entry_is_that_entry() {
     let mut store = store();
     let mut upcase = volume(&mut store, NameEquivalence::Upcase);
     let root = upcase.root();
-    let sigma = upcase
-      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+    let turned = upcase
+      .create_file(&mut store, root, "\u{250}.txt", MODE)
       .unwrap();
     assert_eq!(
-      upcase.create_file(&mut store, root, "\u{3c2}.txt", MODE),
+      upcase.create_file(&mut store, root, "\u{2c6f}.TXT", MODE),
       Err(VfsError::AlreadyExists)
     );
-    for spelling in ["\u{3c2}.txt", "\u{3a3}.TXT", "\u{3c3}.Txt"] {
+    for spelling in ["\u{2c6f}.txt", "\u{2c6f}.TXT", "\u{250}.Txt"] {
       assert_eq!(
         upcase
           .lookup(&store, root, spelling)
           .map(|found| found.inode),
-        Ok(sigma),
+        Ok(turned),
         "{spelling:?}"
       );
     }
     let other = upcase.create_file(&mut store, root, "other", MODE).unwrap();
     assert_eq!(
-      upcase.link(&mut store, root, "\u{3a3}.TXT", other),
+      upcase.link(&mut store, root, "\u{2c6f}.Txt", other),
       Err(VfsError::AlreadyExists)
     );
     upcase
-      .rename(&mut store, root, "other", root, "\u{3c2}.txt")
+      .rename(&mut store, root, "other", root, "\u{2c6f}.txt")
       .unwrap();
     let left = listed(&upcase, &store);
     assert_eq!(left.len(), 1, "one name is left: {left:?}");
     assert_eq!(
       upcase
-        .lookup(&store, root, "\u{3c3}.txt")
+        .lookup(&store, root, "\u{250}.txt")
         .map(|found| found.inode),
       Ok(other)
     );
-    upcase
-      .create_file(&mut store, root, "caf\u{e9}", MODE)
-      .unwrap();
-    upcase
-      .create_file(&mut store, root, "cafe\u{301}", MODE)
-      .unwrap();
-    assert_eq!(listed(&upcase, &store).len(), 3);
+    for apart in ["\u{3c3}.txt", "\u{3c2}.txt", "caf\u{e9}", "cafe\u{301}"] {
+      upcase.create_file(&mut store, root, apart, MODE).unwrap();
+    }
+    assert_eq!(listed(&upcase, &store).len(), 5);
 
     let mut store = self::store();
     let mut fold = volume(&mut store, NameEquivalence::Fold);
     let root = fold.root();
     fold
-      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .create_file(&mut store, root, "\u{212a}.txt", MODE)
       .unwrap();
-    fold
-      .create_file(&mut store, root, "\u{3c2}.txt", MODE)
-      .unwrap();
-    assert_eq!(listed(&fold, &store).len(), 2);
+    assert_eq!(
+      fold.create_file(&mut store, root, "k.txt", MODE),
+      Err(VfsError::AlreadyExists)
+    );
   }
 
-  /// A-576. Do: make `σ.txt` on a volume folding by Windows' upcase table, image it, and rebuild it in a fresh store as
-  /// a restart does; then make `ς.txt` and look `Σ.TXT` up there. Expect: the rebuilt volume folds as the table does, so
+  /// A-576, A-737. Do: make `ɐ.txt` on a volume folding by Windows' upcase table, image it, and rebuild it in a fresh
+  /// store as a restart does; then make `Ɐ.TXT` and look `Ɐ.txt` up there. Expect: the rebuilt volume folds as the table does, so
   /// the make is refused `EEXIST` and the look-up finds the file: the image keeps the policy and the rebuilt directory
   /// is ordered and found by the table's hash.
   #[test]
@@ -8846,7 +9139,7 @@ mod upcase_name_tests {
     let mut upcase = volume(&mut store, NameEquivalence::Upcase);
     let root = upcase.root();
     upcase
-      .create_file(&mut store, root, "\u{3c3}.txt", MODE)
+      .create_file(&mut store, root, "\u{250}.txt", MODE)
       .unwrap();
     let image = upcase.to_image(&store, None).unwrap();
     let mut fresh = self::store();
@@ -8863,9 +9156,9 @@ mod upcase_name_tests {
     let root = rebuilt.root();
     assert_eq!(rebuilt.policy(), NameEquivalence::Upcase);
     assert_eq!(
-      rebuilt.create_file(&mut fresh, root, "\u{3c2}.txt", MODE),
+      rebuilt.create_file(&mut fresh, root, "\u{2c6f}.TXT", MODE),
       Err(VfsError::AlreadyExists)
     );
-    assert!(rebuilt.lookup(&fresh, root, "\u{3a3}.TXT").is_ok());
+    assert!(rebuilt.lookup(&fresh, root, "\u{2c6f}.txt").is_ok());
   }
 }

@@ -4,7 +4,8 @@
 //! partition's lease wheel), a CLI attachment at its term's lapse (A-230, the partition's index of terms), a destroy
 //! whose completion record was refused at its retry deadline (the serve loop, woken then, steps it again), a grant at
 //! the first instant past its term (A-266, the grants' index of terms), and the look at what the shard owes the audit
-//! (A-265), a retry window after the record that armed it and again while anything is owed. One task a shard, the
+//! (A-265), a retry window after the record that armed it and again while anything is owed, and a recalled
+//! delegation's revocation at its lapse (A-709), and the idle sweep's next pass (A-715). One task a shard, the
 //! keeper, sleeps on the wheel until the earliest of them, releases what is due then, and sleeps until the next; a
 //! deadline set earlier than the one it sleeps for wakes it at once, so it re-arms. Nothing is scanned on a tick: each
 //! pass reads only the due entries of ordered indexes (the staging buffers by expiry, the seats by their capture's
@@ -69,6 +70,21 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   let _ended = crate::verbs::expire_lapsed_attachments(state);
   let now = state.clock.monotonic_ns();
   state.staging.expire(now, &mut state.store.metadata);
+  release_due_records(state, now);
+  release_due_reclaims(state, now);
+  wake_due_tasks(state, now);
+  expire_capture_deadlines(state, now);
+  let earliest = earliest_deadline(state);
+  if earliest.is_some_and(|at| at <= now) {
+    state.count(DEADLINE_STUCK, 1);
+  }
+  let next = armed_for(earliest, now, retry_window_ns());
+  state.deadline_armed = next;
+  next.map(|at| at.saturating_sub(now))
+}
+
+/// The grants and the audit due at `now`: each ended or sent again.
+fn release_due_records(state: &mut ShardState, now: u64) {
   // A grant past its term ends, recorded expired with its audit record in one atom (A-266), at the first instant past
   // its term (A-554); one whose record is refused stays due, and is tried again a retry window on.
   if state
@@ -84,6 +100,10 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   if state.landing.audit_look_at.is_some_and(|at| at <= now) {
     crate::landing::look_at_owed_audit(state, now);
   }
+}
+
+/// The looks and reclaims due at `now`, each handed to the reaper.
+fn release_due_reclaims(state: &mut ShardState, now: u64) {
   // A look at departures some shard did not answer is asked for again at its retry (A-222, A-554): the reaper takes it.
   if state.departures_retry_at.is_some_and(|at| at <= now) {
     state.departures_retry_at = None;
@@ -97,12 +117,30 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
   if state.nfs_purge_at.is_some_and(|at| at <= now) {
     crate::nfs::owe_purge_round(state);
   }
+}
+
+/// The placements, recalls, sweeps and retries due at `now`, each asked again or its task woken.
+fn wake_due_tasks(state: &mut ShardState, now: u64) {
   // §4.6, the backed route's L1 (A-193): the host is asked again for the placements it declined in a way likely to
   // hold, a retry window after the decline (A-570). A declined collapse costs milliseconds of compaction (1,954 and
   // 2,832 µs a step on adacachy at load 90), so a host out of huge pages is asked once a window, never once a range.
   if state.placement_rearm_at.is_some_and(|at| at <= now) {
     state.placement_rearm_at = None;
     state.store.shards_backings.rearm_placement();
+  }
+  // A delegation recalled and not returned within a lease is revoked at its lapse (RFC 8881 §10.4.5; A-709), by the
+  // recall drain, which arms the next lapse again.
+  if state.delegation_lapse_at.is_some_and(|at| at <= now) {
+    state.delegation_lapse_at = None;
+    crate::delegation::drain(state);
+  }
+  // The idle sweep's pass falls due a sweep's interval after what owed it (A-715): its task is woken to run it.
+  if state.idle_sweep_at.is_some_and(|at| at <= now) {
+    state.idle_sweep_at = None;
+    state.idle_sweep_running = true;
+    if let Some(sweeper) = state.idle_sweeper {
+      slates_rt::registry::wake(sweeper.0);
+    }
   }
   // A refused destroy record's retry: the serve loop steps destroys, so it is woken to (`verbs::step_destroys`).
   if state.destroy_retry_at.is_some_and(|at| at <= now) {
@@ -111,6 +149,10 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
       slates_rt::registry::wake(server.0);
     }
   }
+}
+
+/// The status pages whose capture deadline is past `now`, expired.
+fn expire_capture_deadlines(state: &mut ShardState, now: u64) {
   while let Some(&(at, index, generation)) = state.capture_deadlines.first() {
     if at > now {
       break;
@@ -121,7 +163,11 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
       client.status_pages.expire(now, &mut state.store.metadata);
     }
   }
-  let earliest = [
+}
+
+/// The earliest deadline set, of every kind the keeper releases.
+fn earliest_deadline(state: &mut ShardState) -> Option<u64> {
+  [
     state.staging.next_expiry(),
     state.capture_deadlines.first().map(|(at, ..)| *at),
     state.db.partition_mut().next_lease_expiry(),
@@ -133,16 +179,12 @@ fn release_due(state: &mut ShardState) -> Option<u64> {
     claim_due(state),
     state.nfs_purge_at,
     state.placement_rearm_at,
+    state.delegation_lapse_at,
+    state.idle_sweep_at,
   ]
   .into_iter()
   .flatten()
-  .min();
-  if earliest.is_some_and(|at| at <= now) {
-    state.count(DEADLINE_STUCK, 1);
-  }
-  let next = armed_for(earliest, now, retry_window_ns());
-  state.deadline_armed = next;
-  next.map(|at| at.saturating_sub(now))
+  .min()
 }
 
 /// Derived: the retry window (A-536, named by A-554): how long after a refusal a deadline its job could not end, or a
@@ -264,7 +306,8 @@ mod tests {
   /// Shape: how far ahead the tests set a deadline: a tenth of a liveness window, so the reap loop's tick, once a
   /// window, could not be what released it in time.
   const SOON_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 10;
-  /// Shape: how long a test looks for the release: half a liveness window, past the deadline and short of the tick.
+  /// Shape: how long a test looks for the release: half a liveness window, past the deadline and short of the tick, and
+  /// widened by the shard's measured descheduling ([`look_until`]).
   const RELEASED_WITHIN_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2;
   /// Shape: the pause between the test's looks, short beside the deadline.
   const LOOK_PAUSE_NS: u64 = 1_000_000;
@@ -279,18 +322,32 @@ mod tests {
     }
   }
 
-  /// Looks at `daemon`'s shard with `look` until it answers true or [`RELEASED_WITHIN_NS`] passes: how long that took.
+  /// Looks at `daemon`'s shard with `look` until it answers true: how long that took. Past [`RELEASED_WITHIN_NS`],
+  /// widened by the descheduling the shard measured meanwhile (`slates_rt::futures::scheduler_overrun_ns`), it gives up
+  /// and says how long it looked and what the shard measured. A host that keeps the shard off its CPUs delays the
+  /// keeper's wake by as much, which says nothing of the deadline the keeper armed; on a quiet host the shard measures
+  /// next to nothing and the bound is the half window. Once in eleven whole-suite runs on the loaded Mac Studio the CLI
+  /// attachment's and the write lease's tests missed the bare half window, though with the look allowed ten seconds
+  /// every release came 101 to 166 ms after its 100 ms term (A-660).
   fn look_until(
     daemon: &crate::daemon::Daemon,
     since: Instant,
     look: impl Fn(&mut ShardState) -> bool + Clone + Send + 'static,
-  ) -> Option<Duration> {
+  ) -> Result<Duration, String> {
     loop {
-      if crate::daemon::observe_first(daemon, look.clone()) {
-        return Some(since.elapsed());
+      let looked = look.clone();
+      let (held, overrun_ns) = crate::daemon::observe_first(daemon, move |state| {
+        (looked(state), slates_rt::futures::scheduler_overrun_ns())
+      });
+      if held {
+        return Ok(since.elapsed());
       }
-      if since.elapsed() > Duration::from_nanos(RELEASED_WITHIN_NS) {
-        return None;
+      let bound_ns = RELEASED_WITHIN_NS.saturating_add(overrun_ns);
+      if since.elapsed() > Duration::from_nanos(bound_ns) {
+        return Err(format!(
+          "looked {:?}; the shard measured {overrun_ns} ns of descheduling",
+          since.elapsed()
+        ));
       }
       // The harness paces its looks; the daemon under test waits on its wheel.
       #[allow(clippy::disallowed_methods)]
@@ -557,11 +614,7 @@ mod tests {
     );
   }
 
-  /// Shape: how long the re-arm test lets its daemon run before the decline: past the reap loop's first look a window
-  /// into the start, by half a window, so the loop's next look comes half a window after the decline.
-  const PAST_THE_FIRST_LOOK_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS / 2 * 3;
-
-  /// A-570 (the huge-page re-arm off the tick). Do: on a one-shard daemon past the reap loop's first look, remember a
+  /// A-570 (the huge-page re-arm off the tick). Do: on a one-shard daemon, remember a
   /// lasting decline of a huge-page placement, as a declined collapse does (`ShardsBackings::place`); watch for the
   /// re-arm. Expect: re-armed no sooner than a window after the decline and within half a window more, by the keeper.
   /// The reap loop's tick re-armed at its looks whatever their phase: half a window after the decline here, and at once
@@ -569,9 +622,6 @@ mod tests {
   #[test]
   fn a_declined_placement_is_asked_again_a_window_after_the_decline() {
     let daemon = crate::daemon::audit_daemon_of(1);
-    // The harness waits out the reap loop's first look; the daemon under test runs on.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
     let declined = Instant::now();
     crate::daemon::observe_first(&daemon, |state| {
       state.store.shards_backings.remember_decline();
@@ -621,15 +671,18 @@ mod tests {
   }
 
   /// A-536 (CLI attachments off the tick). Do: on a one-shard daemon whose failover delay, a CLI attachment's term, is a
-  /// tenth of a liveness window, create a volume and attach it for reading in the CLI's form; look until the attachment
-  /// is gone. Expect: ended within half a window, by the keeper at its term's lapse, found in the partition's index of
-  /// terms. The reap loop's tick, which walked every attachment for a lapsed term once a window, no longer does.
+  /// tenth of a liveness window, injected through the daemon's seam so that every beat publishes it (A-574, A-660),
+  /// create a volume and attach it for reading in the CLI's form; look until the attachment is gone. Expect: ended
+  /// within half a window, by the keeper at its term's lapse, found in the partition's index of terms. The reap loop's
+  /// tick, which walked every attachment for a lapsed term once a window, no longer does.
   #[test]
   fn a_lapsed_cli_attachment_ends_at_its_term_without_a_tick() {
     let daemon = crate::daemon::audit_daemon_of(1);
+    daemon
+      .inject_failover(Some(SOON_NS))
+      .expect("the failover delay injected");
     let begun = Instant::now();
     let attachment = crate::daemon::observe_first(&daemon, |state| {
-      state.failover_ns = SOON_NS;
       let volume = created(state, "termed");
       let reply = crate::verbs::dispatch(
         state,
@@ -682,6 +735,7 @@ mod tests {
         control: None,
         revoked: false,
         consumer_policy: None,
+        identities: None,
         owner_route: None,
         read_ahead: None,
         read_ahead_pending: 0,
@@ -777,11 +831,13 @@ mod tests {
   }
 
   /// A-525 (A-414's owed list; A-522's keeper). Do: on a one-shard daemon whose failover delay is a tenth of a liveness
-  /// window, seat a client and ask its status; capture the report, grown to several pages, only two delays later, as a
-  /// scatter on a starved daemon does; then look until the shard lets the capture go. Expect: the first page served at
-  /// the capture, and the capture held a delay from its capture, then let go by the keeper, within half a window. Before,
-  /// the deadline counted from the request by the operator's ten-second placeholder, so the capture was held ten seconds;
-  /// counted from the request by the delay, the first page would have been refused.
+  /// window, injected through the daemon's seam so that every beat publishes it, not written into the shard's state,
+  /// which the control shard's beat overwrites with its estimate (A-574, A-660), seat a client and ask its status;
+  /// capture the report, grown to several pages, only two delays later, as a scatter on a starved daemon does; then look
+  /// until the shard lets the capture go. Expect: the first page served at the capture, and the capture held a delay
+  /// from its capture, then let go by the keeper, within half a window. Before, the deadline counted from the request by
+  /// the operator's ten-second placeholder, so the capture was held ten seconds; counted from the request by the delay,
+  /// the first page would have been refused.
   #[test]
   fn a_status_capture_is_held_the_failover_delay_from_its_capture_not_its_request() {
     let daemon = crate::daemon::audit_daemon_of(1);
@@ -790,8 +846,10 @@ mod tests {
       sequence: 1,
     }
     .word();
+    daemon
+      .inject_failover(Some(DELAY_NS))
+      .expect("the failover delay injected");
     let (asked, report) = crate::daemon::observe_first(&daemon, move |state| {
-      state.failover_ns = DELAY_NS;
       let asked = seat(state, ASKING);
       let served = crate::verbs::status_on_channel(
         state,

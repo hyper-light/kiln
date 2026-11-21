@@ -28,7 +28,10 @@ use slates_merge::verdict::MergeConflictClass;
 fn conflict_class(outcome: &Outcome) -> Option<MergeConflictClass> {
   match outcome {
     Outcome::Conflict { windows } => windows.first().map(|window| window.class),
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } => None,
+    Outcome::Accepted { .. }
+    | Outcome::BaseUnavailable { .. }
+    | Outcome::CopyRefused { .. }
+    | Outcome::ContentUnread { .. } => None,
   }
 }
 
@@ -578,9 +581,14 @@ fn symlink_merges() {
     conflict_class(&green.submit(&Build::new().symlink("l", "other").at(3, 1))),
     Some(MergeConflictClass::CreateCreate)
   );
-  green.submit(&Build::new().create("a", b"file").at(4, 2));
   assert_eq!(
-    conflict_class(&green.submit(&Build::new().symlink("a", "t").at(5, 4))),
+    green.submit(&Build::new().create("a", b"file").at(4, 2)),
+    Outcome::Accepted { version: 3 }
+  );
+  // Based at version 3, which holds the file: the third increment conflicted and made no version,
+  // and a base past the head is a version the green never made (A-658).
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().symlink("a", "t").at(5, 3))),
     Some(MergeConflictClass::TypeChanged)
   );
 }
@@ -642,12 +650,18 @@ fn rmdir_merges() {
   );
 }
 
-/// A hard link merges as a namespace edge: identical accepts, differing conflicts, file/link is a
-/// type conflict.
+/// A hard link names the node at its target at the work's base (A-646): an identical link
+/// accepts, a link to another node after the name changed conflicts create against create, a link
+/// naming no node is refused delete against modify, and a file over a link is a type conflict.
 #[test]
 fn hard_link_merges() {
   let mut green = Green::new();
-  green.submit(&Build::new().create("f", b"shared").at(1, 0));
+  green.submit(
+    &Build::new()
+      .create("f", b"shared")
+      .create("other", b"other")
+      .at(1, 0),
+  );
   assert_eq!(
     green.submit(&Build::new().link("l", "f").at(2, 1)),
     Outcome::Accepted { version: 2 }
@@ -665,6 +679,13 @@ fn hard_link_merges() {
   assert_eq!(
     conflict_class(&green.submit(&Build::new().create("l", b"file").at(5, 3))),
     Some(MergeConflictClass::TypeChanged)
+  );
+  // Nothing stood at `missing` at version 2, so the link names no node, which no work can make
+  // (`link(2)` answers ENOENT). Judging its name would compare that node's home with the head's
+  // link there, so the node is judged first, even though version 3 changed the name as well.
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().link("l", "missing").at(6, 2))),
+    Some(MergeConflictClass::DeleteModify)
   );
 }
 
@@ -851,7 +872,8 @@ fn a_rebased_operation_still_merges_a_later_disjoint_head_move() {
 }
 
 /// An increment round-trips through encode/decode exactly (§4.8 chain persistence): the identity,
-/// base, ops document and post-state all survive, so a replayed chain rebuilds the same green.
+/// base, ops document and post-state all survive, so a replayed chain rebuilds the same green; and `encoded_len` is the
+/// encoding's length (A-742).
 #[test]
 fn an_increment_round_trips_through_encode_and_decode() {
   let inc = Build::new()
@@ -859,8 +881,12 @@ fn an_increment_round_trips_through_encode_and_decode() {
     .overwrite("f", 0, b"HELLO")
     .setxattr("f", "user.k", b"v")
     .at(7, 3);
-  let decoded = Increment::decode(&inc.encode()).expect("a valid increment decodes");
+  let bytes = inc.encode();
+  let decoded = Increment::decode(&bytes).expect("a valid increment decodes");
   assert_eq!(decoded, inc, "decode(encode(increment)) == increment");
+  // A-742: its length known without making the bytes, and the bytes reserved once at it.
+  assert_eq!(inc.encoded_len(), bytes.len());
+  assert_eq!(bytes.capacity(), bytes.len());
 }
 
 /// A truncated increment refuses by type rather than panicking (§4.8 — a torn chain entry).
@@ -1127,13 +1153,16 @@ fn apply_small_edits(green: &mut Green) {
   }
 }
 
-/// What the edits retained: less than one copy of the file for all of them together (one whole copy per edit before
-/// W2), the running total equal to the recount, the current file held once, and every version reconstructing.
+/// What the edits retained: the file as it was before them, once (its earlier block, which every version shares runs
+/// of), and what the edits wrote, never a copy per edit (one whole copy per edit before W2); the running total equal to
+/// the recount, the current file held once, and every version reconstructing. Since A-728 part 4 the earlier file is
+/// charged as the history's, which in memory it always was: before, the latest value's copy had stood in for the
+/// current file's bytes, and the earlier file went uncharged.
 fn assert_shared(green: &Green) {
   let retained = green.retained_bytes();
   assert!(
-    retained.history < LARGE_FILE_BYTES,
-    "{} small edits retained {} bytes, a copy of the file is {LARGE_FILE_BYTES}",
+    retained.history >= LARGE_FILE_BYTES && retained.history < 2 * LARGE_FILE_BYTES,
+    "{} small edits retained {} bytes; the earlier file is {LARGE_FILE_BYTES}, once",
     SMALL_EDITS,
     retained.history
   );
@@ -1175,11 +1204,12 @@ fn assert_fold_to_head(green: &mut Green, head: u64) {
     (retained, Some(LARGE_FILE_BYTES)),
     "balanced, and the current file is untouched"
   );
-  // What stays is the bytes the edits overwrote, held inside the chunk the current file still shares (W2): a chunk
-  // lives while any piece names it.
-  assert!(
-    retained <= usize::try_from(SMALL_EDITS).unwrap() * 4,
-    "nothing is retained but the overwritten bytes of a shared chunk: {retained}"
+  // Folded to the head, the latest value is all the history holds, and it names the current file's block (A-728): the
+  // earlier block and the edits' chunks are let go, and nothing is retained (before A-728, the overwritten bytes of the
+  // chunk the current value still shared stayed).
+  assert_eq!(
+    retained, 0,
+    "the history holds nothing beyond the current file once folded to it"
   );
   assert_eq!(green.fold_history_to_budget(head, 0), 0, "idempotent");
 }
@@ -1306,4 +1336,39 @@ fn assert_walks_match_from(green: &Green) {
     );
   }
   assert_eq!(green.changes_recounted(), green.changes_bytes());
+}
+
+/// §4.16 "The verdict" (perf's deferral, 2026-11-11). Do: a green holding `a` and `b`; another work overwrites `b`'s
+/// first byte; then a work based before it overwrites `a` (clean) and `b`'s first byte with other bytes (a conflict).
+/// Expect: the conflict, `a` unchanged, and no mapped file made, though `a`'s merge was clean. Then a work overwriting
+/// `a` alone is accepted: one mapped file made, holding exactly the bytes the overwrite gives. Made in the verdict, the
+/// conflict had built `a`'s new file and thrown it away.
+#[test]
+fn a_conflicting_verdict_makes_no_file_and_an_accept_makes_each_once() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("a", b"aaaa").at(1, 0));
+  green.submit(&Build::new().create("b", b"bbbb").at(2, 1));
+  green.submit(&Build::new().overwrite("b", 0, b"X").at(3, 2));
+  let before = green.mapped_files_made();
+  let outcome = green.submit(
+    &Build::new()
+      .overwrite("a", 1, b"A")
+      .overwrite("b", 0, b"Y")
+      .at(4, 2),
+  );
+  assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
+  assert_eq!(green.content("a"), Some(b"aaaa".as_slice()));
+  assert_eq!(
+    green.mapped_files_made(),
+    before,
+    "a conflict makes no file"
+  );
+  let outcome = green.submit(&Build::new().overwrite("a", 1, b"A").at(5, 3));
+  assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+  assert_eq!(green.content("a"), Some(b"aAaa".as_slice()));
+  assert_eq!(
+    green.mapped_files_made(),
+    before + 1,
+    "an accept makes its one file once"
+  );
 }

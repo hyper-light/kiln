@@ -285,6 +285,30 @@ pub enum BodyImage {
     /// The minor number.
     minor: u32,
   },
+  /// A read-only referenced file's pieces ([`Body::Referenced`], A-645 P3 ruling 2), in file order; appended, as
+  /// `Device` was. The identities are named, not carried: a successor's store holds their bytes, and the recovered
+  /// volume owes its holds ([`crate::Volume::hold_owed_references`]).
+  Referenced {
+    /// The pieces.
+    pieces: Vec<PieceImage>,
+  },
+}
+
+/// One piece of a referenced file in an image ([`crate::referenced::Piece`]).
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub enum PieceImage {
+  /// `len` bytes of the content-store object `id`.
+  Content {
+    /// The object's identity.
+    id: [u8; 32],
+    /// The bytes the piece shows.
+    len: u64,
+  },
+  /// Bytes the presenter made.
+  Made {
+    /// The bytes.
+    bytes: Vec<u8>,
+  },
 }
 
 /// A block of the shard's arena (A-64): its region, its offset within it and its length (a power-of-two number
@@ -2240,6 +2264,20 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
         born: open.born.0,
       }),
     }),
+    Body::Referenced(body) => Ok(BodyImage::Referenced {
+      pieces: body
+        .pieces()
+        .iter()
+        .map(|piece| match piece {
+          crate::referenced::Piece::Content { id, len } => {
+            PieceImage::Content { id: *id, len: *len }
+          }
+          crate::referenced::Piece::Made(bytes) => PieceImage::Made {
+            bytes: bytes.to_vec(),
+          },
+        })
+        .collect(),
+    }),
     Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Base(_) | Body::Device(_) => {
       Err(VfsError::RecoveryIncomplete)
     }
@@ -2634,6 +2672,7 @@ impl Volume {
       let no = InodeNo(image_inode.no);
       kinds.insert(image_inode.no, image_inode.kind);
       let body = body_for(store, claims, image_inode, no, epoch, &mut dirs)?;
+      self.referenced.recovered(&body);
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
@@ -2894,15 +2933,26 @@ impl Volume {
         continue;
       }
       let body = body_for(store, claims, image_inode, no, epoch, &mut dirs)?;
+      self.referenced.recovered(&body);
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
     }
     self.rebuild_entries(store, &snap.inodes, &Kinds::Map(&kinds), &dirs, &held)?;
     self.restore_identities(store, &snap.inodes)?;
-    // A clone's snapshot rebuilds its directories privately; a record the live snapshot shared with the origin
-    // (born at or before the origin epoch) is this snapshot's own copy now, born with it, so the snapshot's drop
-    // frees it rather than leaving it to the origin (A-64).
+    self.own_records_shared_with_the_origin(store, snap, epoch)?;
+    Self::tree_entries(store, snap, &dirs, &held)
+  }
+
+  /// A clone's snapshot rebuilds its directories privately; a record the live snapshot shared with the origin
+  /// (born at or before the origin epoch) is this snapshot's own copy now, born with it at `epoch`, so the snapshot's
+  /// drop frees it rather than leaving it to the origin (A-64).
+  fn own_records_shared_with_the_origin(
+    &self,
+    store: &mut Store,
+    snap: &SnapshotImage,
+    epoch: Epoch,
+  ) -> Result<(), VfsError> {
     if let Some(origin) = self.origin_epoch {
       for image_inode in snap.inodes.iter().filter(|i| Epoch(i.born) <= origin) {
         let handle = trie::get(&store.tries, self.inode_root, InodeNo(image_inode.no))
@@ -2910,16 +2960,25 @@ impl Volume {
         store.inodes.get_mut(handle)?.born = epoch;
       }
     }
-    // The tree's entries (§4.2's namespace dimension, A-549), by the rule the live count keeps: each name its own
-    // directories' images carry that names a child, and each live entry of a directory it shares with the head, whose
-    // node it is. Not what `rebuild_entries` counted through `dir_insert` above, which the caller sets the head's count
-    // back over.
+    Ok(())
+  }
+
+  /// The entries a rebuilt snapshot tree holds (§4.2's namespace dimension, A-549), by the rule the live count keeps:
+  /// each name its own directories' images carry that names a child, and each live entry of a directory it shares
+  /// with the head (`held`, its node in `dirs`). Not what `rebuild_entries` counted through `dir_insert`, which the
+  /// caller sets the head's count back over.
+  fn tree_entries(
+    store: &Store,
+    snap: &SnapshotImage,
+    dirs: &BTreeMap<u64, Handle<DirNode>>,
+    held: &BTreeSet<u64>,
+  ) -> Result<u64, VfsError> {
     let mut entries = snap
       .inodes
       .iter()
       .map(named_entries)
       .fold(0, u64::saturating_add);
-    for number in &held {
+    for number in held {
       let node = *dirs.get(number).ok_or(VfsError::RecoveryIncomplete)?;
       let live = store.dirs.get(node)?.live_len(&store.blocks);
       entries = entries.saturating_add(u64::try_from(live).unwrap_or(u64::MAX));
@@ -2979,6 +3038,7 @@ impl Volume {
         continue;
       }
       let body = body_for(store, claims, image_inode, no, epoch, dirs)?;
+      self.referenced.recovered(&body);
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
       self.table_set_in_order(store, no, handle, &mut cursor)?;
@@ -3190,7 +3250,9 @@ fn body_crc(body: &BodyImage) -> u32 {
     BodyImage::Symlink { target } | BodyImage::BaseLink { target } => crc32c(target.as_bytes()),
     BodyImage::Empty => crc32c(&[]),
     BodyImage::Directory { .. } => 0,
-    BodyImage::Base { .. } | BodyImage::Device { .. } => crc32c(&body.to_bytes()),
+    BodyImage::Base { .. } | BodyImage::Device { .. } | BodyImage::Referenced { .. } => {
+      crc32c(&body.to_bytes())
+    }
   }
 }
 
@@ -3274,6 +3336,27 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
       lost: *lost,
       file: crate::inode::FileTag::from_word(*file),
     })),
+    // A referenced file whose pieces do not sum to its size is corrupt, refused as a chunked one past its size is.
+    BodyImage::Referenced { pieces } => {
+      let body = crate::referenced::ReferencedBody::new(
+        pieces
+          .iter()
+          .map(|piece| match piece {
+            PieceImage::Content { id, len } => {
+              crate::referenced::Piece::Content { id: *id, len: *len }
+            }
+            PieceImage::Made { bytes } => {
+              crate::referenced::Piece::Made(bytes.clone().into_boxed_slice())
+            }
+          })
+          .collect(),
+      )
+      .map_err(|_| VfsError::RecoveryIncomplete)?;
+      if body.len() != size {
+        return Err(VfsError::RecoveryIncomplete);
+      }
+      Ok(Body::Referenced(Box::new(body)))
+    }
     BodyImage::Directory { .. }
     | BodyImage::Symlink { .. }
     | BodyImage::BaseLink { .. }
@@ -3474,6 +3557,7 @@ impl Claims {
             block,
             identity: chunk.identity,
             seal: None,
+            pins: crate::content::Pins::default(),
           },
           sealed,
         );

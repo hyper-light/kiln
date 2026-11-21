@@ -33,7 +33,8 @@ use slates_ipc::protocol::{
   VolumeSummary, WorkOp, unpack,
 };
 use slates_ipc::protocol::{
-  ChangedCursor, EntriesCursor, PlannedEntry, PolicySubject, Verification, WritePolicy,
+  ChangedCursor, CredentialMaterial, EntriesCursor, ObjectFormat, PlannedEntry, PolicySubject,
+  VcsTool, Verification, WritePolicy,
 };
 #[cfg(unix)]
 use slates_ipc::rendezvous::ControlDelivery;
@@ -261,6 +262,23 @@ pub struct CreateSpec {
   pub base: Option<String>,
 }
 
+/// What [`Client::create_repository`] takes: `CreateRepository`'s fields (§4.17.1 "The repository and its greens";
+/// A-575, A-685). A creator's defaults for each tool are the server crate's (`slates_server::object_formats`,
+/// `slates_server::root_binding`), which `slates repository create` asks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositorySpec {
+  /// The repository's name, unique everywhere.
+  pub name: String,
+  /// The tool it serves.
+  pub tool: VcsTool,
+  /// How it names its objects, fixed at creation.
+  pub format: ObjectFormat,
+  /// The namespace name its root is bound to: its default branch as its tool's server names it.
+  pub default_branch: String,
+  /// The green that becomes its root, an unbound green of the repository's partition; a new empty one when none.
+  pub green: Option<VolumeId>,
+}
+
 /// One page of a presented landing's entry list ([`Client::landing_entries_page`]; §4.15 step 2): the bytes of the
 /// entries' encodings from the page's cursor, the first and the last entry possibly in part.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -434,6 +452,10 @@ pub struct Client {
   retry_held: std::collections::BTreeMap<u32, Instant>,
   /// Ids released from `retry_held` at its bound or released by their caller unanswered.
   retry_released: u64,
+  /// Outstanding words answered `DurabilityPending` and sent again under their own id (A-354): the verb ran and recorded
+  /// its own reply, so the resend is answered that reply. Once each, so a recorded `DurabilityPending` (a yield, A-409) is
+  /// the answer. A subset of `awaited`, removed with its word.
+  durability_resent: std::collections::BTreeSet<u64>,
   /// Replies drained from the completion ring while looking for another request's reply, held by
   /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
   /// the ring on a completion-fd signal and matches by id, so replies that arrive out of order (a
@@ -1183,6 +1205,17 @@ pub enum MoveState {
   },
 }
 
+/// Whether `reply` is `DurabilityPending`: the verb ran and its own reply is recorded under its id, to be asked for again
+/// under that id (A-354).
+fn durability_pending(reply: &ReplyBody) -> bool {
+  matches!(
+    reply,
+    ReplyBody::Refused {
+      refusal: slates_ipc::protocol::Refusal::DurabilityPending { .. }
+    }
+  )
+}
+
 /// Maps a decoded reply body to a result: a refusal becomes the typed error, any other body passes
 /// through — the same rule [`Client::exchange`] applies to a synchronous reply.
 fn resolved(body: ReplyBody) -> Result<ReplyBody, ClientError> {
@@ -1506,6 +1539,7 @@ impl Client {
       unpublished_forgotten: 0,
       retry_held: std::collections::BTreeMap::new(),
       retry_released: 0,
+      durability_resent: std::collections::BTreeSet::new(),
       pending: Vec::new(),
       awaited: std::collections::BTreeMap::new(),
       edit_chains: std::collections::BTreeMap::new(),
@@ -2251,8 +2285,8 @@ impl Client {
   /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id
   /// retryable (bounded, the oldest forgotten and counted past the ring's slots); any other answer
   /// to a retried id releases it. On the async path (`by_word`: a caller holding the id's word, which
-  /// [`Self::begin_again`] resends) an `Overloaded` or `OwnerUnreachable` refusal is held as well, within the
-  /// reconnect budget (`retry_held`).
+  /// [`Self::begin_again`] resends) an `Overloaded`, `OwnerUnreachable` or `DurabilityPending` (A-354) refusal is
+  /// held as well, within the reconnect budget (`retry_held`).
   fn note_reply(&mut self, word: u64, body: &ReplyBody, by_word: bool) {
     let sequence = RequestId::from_word(word).sequence;
     let held_for_retry = by_word
@@ -2261,6 +2295,7 @@ impl Client {
         ReplyBody::Refused {
           refusal: slates_ipc::protocol::Refusal::Overloaded { .. }
             | slates_ipc::protocol::Refusal::OwnerUnreachable { .. }
+            | slates_ipc::protocol::Refusal::DurabilityPending { .. }
         }
       );
     if held_for_retry {
@@ -2328,10 +2363,18 @@ impl Client {
   /// channel bound again to the consumer first, when the client holds one — and a resend under the
   /// same id.
   fn exchange(&mut self, id: RequestId, body: &RequestBody) -> Result<ReplyBody, ClientError> {
+    // A-354: a verb whose reply was held past the failover SLO ran once and recorded its own reply, answering
+    // `DurabilityPending` now; sent again under the same id it is answered that reply from its record, never run again.
+    // Once: a second `DurabilityPending` is a recorded one (its owner yielded the volume, A-409) and is the answer.
+    let mut resent_pending = false;
     loop {
       self.rebind_if_needed()?;
       if let Some(reply) = self.round_trip(id, body)? {
         self.note_reply(id.word(), &reply, false);
+        if !resent_pending && durability_pending(&reply) {
+          resent_pending = true;
+          continue;
+        }
         return resolved(reply);
       }
     }
@@ -2460,9 +2503,10 @@ impl Client {
   }
 
   /// Sends `body` again under `word`, an id the caller already used and was answered with a refusal the protocol
-  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`): the daemon answers from the
-  /// verb's completion record once it is durable, or runs it if it never ran. The acknowledgement names such an id
-  /// owed from its refusal until this resend (within the reconnect budget for the first two;
+  /// marks retryable under the same id (`Overloaded`, `OwnerUnreachable`, `Unpublished`, `DurabilityPending`): the
+  /// daemon answers from the verb's completion record once it is durable (a `DurabilityPending` verb's own reply, A-354),
+  /// or runs it if it never ran. The acknowledgement names such an id owed from its refusal until this resend (within
+  /// the reconnect budget for `Overloaded`, `OwnerUnreachable` and `DurabilityPending`;
   /// [`Self::release_retryable`] releases one the caller gives up). The word is
   /// awaited again, so its reply is taken as a [`Self::begin`]'s is, within the same in-flight bound. `Ok(false)` when
   /// the ring has no slot (nothing was sent).
@@ -2518,6 +2562,24 @@ impl Client {
       return Ok(true);
     };
     self.resend(word, &body)
+  }
+
+  /// Whether `reply`, drained for the outstanding `word`, was a first `DurabilityPending` this client answered by sending
+  /// the request again under `word` (A-354): the verb ran once and recorded its own reply, which the resend is answered,
+  /// so an async caller is handed that reply and never runs the verb again. `false` (the reply is the answer) for any other
+  /// reply, a word answered so before, one not outstanding, or a resend the ring had no room for or the channel refused.
+  fn resent_for_durability(&mut self, word: u64, reply: &ReplyBody) -> bool {
+    if !durability_pending(reply) || self.durability_resent.contains(&word) {
+      return false;
+    }
+    let Some(body) = self.awaited.get(&word).cloned() else {
+      return false;
+    };
+    if matches!(self.resend(word, &body), Ok(true)) {
+      self.durability_resent.insert(word);
+      return true;
+    }
+    false
   }
 
   /// The async path's bind of a reconnected channel (AUD-29-19): nothing to do when the channel is bound
@@ -2632,6 +2694,7 @@ impl Client {
   /// dropped on arrival. Returns whether it was outstanding.
   pub fn abandon(&mut self, word: u64) -> bool {
     self.pending.retain(|(held, _, _)| *held != word);
+    self.durability_resent.remove(&word);
     if self.edit_chains.remove(&word).is_some()
       || self.list_chains.remove(&word).is_some()
       || self.changed_chains.remove(&word).is_some()
@@ -2715,6 +2778,7 @@ impl Client {
     if let Some(pos) = self.pending.iter().position(|(held, _, _)| *held == word) {
       let (_, body, stamp) = self.pending.remove(pos);
       self.awaited.remove(&word);
+      self.durability_resent.remove(&word);
       // A page taken as a raw reply ends its walk: the caller has the page, and nothing waits on the chain.
       self.list_chains.remove(&word);
       self.changed_chains.remove(&word);
@@ -2725,7 +2789,11 @@ impl Client {
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
       if reply.request == word {
+        if self.resent_for_durability(word, &body) {
+          continue;
+        }
         self.awaited.remove(&word);
+        self.durability_resent.remove(&word);
         self.list_chains.remove(&word);
         self.changed_chains.remove(&word);
         self.verdict_chains.remove(&word);
@@ -2798,6 +2866,9 @@ impl Client {
         // Anything else is not this bind's answer: the next send attests again.
         _ => {}
       }
+      return;
+    }
+    if self.resent_for_durability(id_word, &body) {
       return;
     }
     if self.awaited.contains_key(&id_word)
@@ -3326,10 +3397,7 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<RequestId, ClientError> {
-    let id = self.begin(&RequestBody::Submit {
-      work,
-      evidence: evidence.to_vec(),
-    })?;
+    let id = self.begin(&RequestBody::submit(work, evidence.to_vec()))?;
     // Its verdict may count windows its reply could not carry, read as a chain under this word (A-267).
     self
       .verdict_chains
@@ -3826,6 +3894,171 @@ impl Client {
     }
   }
 
+  /// Creates a version-control repository (§4.17.1 "The repository and its greens"; A-575, A-685) on the partition its
+  /// name hashes to: its record and its root, `spec.green` (an unbound green of that partition, which joins as it
+  /// stands) or a new empty green, bound to `spec.default_branch`; the root's id. Refused typed, nothing made:
+  /// `AlreadyExists` for a name any repository holds, `InvalidName` for an empty name or one holding a NUL, `NotGreen`,
+  /// `Forbidden` or `NotFound` for a root that cannot join, `TableAtCapacity` past the partition's tables.
+  pub fn create_repository(&mut self, spec: &RepositorySpec) -> Result<VolumeId, ClientError> {
+    match self.call(&RequestBody::CreateRepository {
+      name: spec.name.clone(),
+      tool: spec.tool,
+      format: spec.format,
+      default_branch: spec.default_branch.clone(),
+      green: spec.green,
+    })? {
+      ReplyBody::GreenCreated { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "create_repository",
+      }),
+    }
+  }
+
+  /// Imports a history into repository `repository`'s empty store (A-678, A-652 part 3; the CLI's verb A-710): `path`
+  /// is a host path the daemon reads, a Mercurial repository's directory for a Mercurial repository or a Subversion
+  /// dump for a Subversion one; answered when the import ends, with what it took. Refused typed (`ImportRefused` with
+  /// its fault, `NotFound` for no such repository), nothing imported.
+  pub fn import_repository(
+    &mut self,
+    repository: &str,
+    path: &str,
+  ) -> Result<Imported, ClientError> {
+    match self.call(&RequestBody::ImportRepository {
+      repository: repository.to_owned(),
+      path: path.to_owned(),
+    })? {
+      ReplyBody::RepositoryImported {
+        changesets,
+        manifests,
+        file_logs,
+        file_revisions,
+        markers,
+      } => Ok(Imported::Mercurial {
+        changesets,
+        manifests,
+        file_logs,
+        file_revisions,
+        markers,
+      }),
+      ReplyBody::DumpImported {
+        revisions,
+        youngest,
+      } => Ok(Imported::Dump {
+        revisions,
+        youngest,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "import_repository",
+      }),
+    }
+  }
+
+  /// Makes branch `name` of repository `repository` at `version` of branch `from`, its head when `None`, its owner asking
+  /// (A-575; `slates repository branch create`): the new branch's green. Refused typed (`NotFound`, `Forbidden`,
+  /// `AlreadyExists` for a name bound, and the version's own refusals).
+  pub fn create_branch(
+    &mut self,
+    repository: &str,
+    (name, from, version): (&str, &str, Option<u64>),
+  ) -> Result<VolumeId, ClientError> {
+    match self.call(&RequestBody::CreateBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+      from: from.to_owned(),
+      version,
+    })? {
+      ReplyBody::GreenCreated { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "create_branch",
+      }),
+    }
+  }
+
+  /// Binds branch `name` of repository `repository` to `green`, a member of its lineage no name binds (A-575; `slates
+  /// repository branch bind`): what restores a retired branch. Refused typed.
+  pub fn bind_branch(
+    &mut self,
+    repository: &str,
+    name: &str,
+    green: VolumeId,
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::BindBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+      green,
+    })? {
+      ReplyBody::Acknowledged => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "bind_branch",
+      }),
+    }
+  }
+
+  /// Retires branch `name` of repository `repository`: the name leaves the namespace and its green stays in the lineage
+  /// (A-575; `slates repository branch retire`). Refused typed.
+  pub fn retire_branch(&mut self, repository: &str, name: &str) -> Result<(), ClientError> {
+    match self.call(&RequestBody::RetireBranch {
+      repository: repository.to_owned(),
+      name: name.to_owned(),
+    })? {
+      ReplyBody::Acknowledged => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "retire_branch",
+      }),
+    }
+  }
+
+  /// Reads repository `repository`'s policy whole, its owner asking (A-622; `slates repository policy`): its version and
+  /// every part. Refused typed (`NotFound`, `Forbidden` for a principal but the owner).
+  pub fn describe_repository_policy(
+    &mut self,
+    repository: &str,
+  ) -> Result<RepositoryPolicy, ClientError> {
+    match self.call(&RequestBody::DescribeRepositoryPolicy {
+      repository: repository.to_owned(),
+    })? {
+      ReplyBody::RepositoryPolicy {
+        version,
+        rules,
+        hooks,
+        hooks_env,
+        signers,
+      } => Ok(RepositoryPolicy {
+        version,
+        rules,
+        hooks,
+        hooks_env,
+        signers,
+      }),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "describe_repository_policy",
+      }),
+    }
+  }
+
+  /// Sets repository `repository`'s policy whole to `policy`, made from the version `policy.version` names, its owner
+  /// asking (A-622). Refused typed (`PolicyChanged` with the version now when the policy has moved since, `NotFound`,
+  /// `Forbidden`, `Database`, `BadRequest`).
+  pub fn set_repository_policy(
+    &mut self,
+    repository: &str,
+    policy: &RepositoryPolicy,
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::SetRepositoryPolicy {
+      repository: repository.to_owned(),
+      read: policy.version,
+      rules: policy.rules.clone(),
+      hooks: policy.hooks.clone(),
+      hooks_env: policy.hooks_env.clone(),
+      signers: policy.signers.clone(),
+    })? {
+      ReplyBody::Acknowledged => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "set_repository_policy",
+      }),
+    }
+  }
+
   /// Re-pins a green attachment to `version`, or to the head (§4.16 `advance`): the version now
   /// pinned and the paths the move invalidated.
   pub fn advance(
@@ -4165,10 +4398,7 @@ impl Client {
     work: VolumeId,
     evidence: &[[u8; 32]],
   ) -> Result<Submitted, ClientError> {
-    let reply = self.call(&RequestBody::Submit {
-      work,
-      evidence: evidence.to_vec(),
-    })?;
+    let reply = self.call(&RequestBody::submit(work, evidence.to_vec()))?;
     self
       .verdict_of(work, VerdictKind::Submit, reply)?
       .submitted()
@@ -4234,8 +4464,9 @@ impl Client {
         work,
         evidence,
         signature: signature.to_vec(),
+        authorship: Default::default(),
       },
-      None => RequestBody::Submit { work, evidence },
+      None => RequestBody::submit(work, evidence),
     })?;
     self.judged_of(work, reply)
   }
@@ -4254,6 +4485,7 @@ impl Client {
       work,
       evidence: evidence.to_vec(),
       signature: None,
+      authorship: Default::default(),
     })? {
       ReplyBody::MergeApprovalRequired {
         identity,
@@ -4299,6 +4531,7 @@ impl Client {
       identity,
       proof,
       signature: signature.map(<[u8]>::to_vec),
+      authorship: Default::default(),
     })?;
     self.judged_of(work, reply)
   }
@@ -4380,6 +4613,7 @@ impl Client {
       delete_len,
       insert,
       evidence: evidence.to_vec(),
+      authorship: Default::default(),
     };
     let inline = request(slates_ipc::protocol::EditBytes::Inline {
       bytes: bytes.to_vec(),
@@ -5061,6 +5295,41 @@ impl Client {
     }
   }
 
+  /// Enrolls a version-control credential for `principal` until `expires_ns` on the wall clock (§4.13, §4.17.2
+  /// "Access"; A-625 part 3): the human surface's verb with its proof of issuer authority
+  /// (`slates_server::credentials::enroll_proof`). Returns the credential's id: an SSH key's fingerprint, or the hash a
+  /// token was given by.
+  pub fn enroll_credential(
+    &mut self,
+    principal: Principal,
+    material: CredentialMaterial,
+    expires_ns: Option<u64>,
+    proof: [u8; 32],
+  ) -> Result<[u8; 32], ClientError> {
+    match self.call(&RequestBody::EnrollCredential {
+      principal,
+      material,
+      expires_ns,
+      proof,
+    })? {
+      ReplyBody::CredentialEnrolled { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "enroll_credential",
+      }),
+    }
+  }
+
+  /// Revokes the version-control credential named `id` (§4.13; A-625 part 3): the human surface's verb with its proof of
+  /// issuer authority (`slates_server::credentials::revoke_proof`).
+  pub fn revoke_credential(&mut self, id: [u8; 32], proof: [u8; 32]) -> Result<(), ClientError> {
+    match self.call(&RequestBody::RevokeCredential { id, proof })? {
+      ReplyBody::CredentialRevoked => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "revoke_credential",
+      }),
+    }
+  }
+
   /// Sets a principal's rights on a volume (§4.13 "Access lists"; `admin` on the volume is required;
   /// rights all false remove the entry; the owner's rights are not an entry).
   pub fn share(
@@ -5418,4 +5687,46 @@ fn fs_done(reply: ReplyBody, verb: &'static str) -> Result<u64, ClientError> {
     ReplyBody::FsDone { size } => Ok(size),
     _ => Err(ClientError::UnexpectedReply { verb }),
   }
+}
+
+/// A repository's policy as its owner reads and sets it ([`Client::describe_repository_policy`],
+/// [`Client::set_repository_policy`]; A-622): its version, and every part in the wire's forms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryPolicy {
+  /// The version read, which a set is made from.
+  pub version: u64,
+  /// The rules, in order.
+  pub rules: Vec<slates_ipc::protocol::PolicyRule>,
+  /// The hooks, in order.
+  pub hooks: Vec<slates_ipc::protocol::HookConfig>,
+  /// A Subversion repository's hooks-env sections.
+  pub hooks_env: Vec<slates_ipc::protocol::HooksEnvSection>,
+  /// A git repository's keys trusted to sign its commits.
+  pub signers: Vec<Vec<u8>>,
+}
+
+/// What a repository's import took ([`Client::import_repository`], A-710).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Imported {
+  /// A Mercurial repository's directory: its changesets, manifest revisions, file logs, file revisions over every file
+  /// log, and obsolescence markers.
+  Mercurial {
+    /// The changesets.
+    changesets: u32,
+    /// The manifest revisions.
+    manifests: u32,
+    /// The file logs.
+    file_logs: u64,
+    /// The file revisions, over every file log.
+    file_revisions: u64,
+    /// The obsolescence markers.
+    markers: u64,
+  },
+  /// A Subversion dump: the revisions it committed, and the repository's youngest revision now.
+  Dump {
+    /// The revisions committed.
+    revisions: u64,
+    /// The youngest revision.
+    youngest: u64,
+  },
 }

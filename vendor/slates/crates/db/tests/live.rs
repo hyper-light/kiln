@@ -6,6 +6,12 @@
 //! - **Agreement**: no position is ever durable with two values, whichever owner made it durable.
 //! - **NoLoss**: every takeover adopts a head whose state holds every durable entry, at its position, unchanged.
 //! - **StaleNeverCommits**: whatever a superseded owner still makes durable lies inside the head that superseded it.
+//! - **ReadSafety** (A-601; `FencedLedger.tla`'s rule, as `crates/db/src/register_nemesis.rs` judges the register):
+//!   every read phase one could make were the current owner lost, through whichever live holders it asks, adopts a head
+//!   whose state holds every durable write, at its position, unchanged, however far the other holders lag or whatever
+//!   superseded chain they hold. NoLoss judges the one read each takeover makes; this judges every read one could make,
+//!   after every step and every settling delivery. A violation is reported at the run's end, after the other checks, so
+//!   a history another check breaks is named by that check.
 //! - **Convergence**: once the network heals, every live holder holds exactly the owner's state, and every durable
 //!   write is in it.
 //!
@@ -265,6 +271,15 @@ struct Run {
   restarts: u64,
   /// Of those, the ones that fell between a publication's image and its entry's append.
   restarts_between: u64,
+  /// The steps taken, for a ReadSafety violation's message.
+  steps_taken: usize,
+  /// ReadSafety's first violation ([`Run::read_safety`]), reported by [`Run::settle`] after the run's other checks.
+  read_safety_broken: Option<String>,
+  /// The judgements ReadSafety made with a durable write to hold: its non-vacuity counter.
+  reads_judged: u64,
+  /// Of those, the ones where a host phase one would ask lacked a durable write (it lagged, or held a superseded
+  /// owner's chain) and every head a read could adopt held them all: the case the rule is about.
+  reads_past_a_stale_holder: u64,
 }
 
 impl Run {
@@ -334,6 +349,10 @@ impl Run {
       restart: None,
       restarts: 0,
       restarts_between: 0,
+      steps_taken: 0,
+      read_safety_broken: None,
+      reads_judged: 0,
+      reads_past_a_stale_holder: 0,
     }
   }
 
@@ -746,9 +765,20 @@ impl Run {
     let successor_holder = self.holders.remove(&successor).unwrap();
     // With `following`, the successor's holders are the set the takeover counted, less itself: what the durable
     // writes are held by. The configuration's candidates may be a set the old owner was still moving to, which holds
-    // none of them; the successor moves to it by a transition of its own.
+    // none of them; the successor moves to it by a transition of its own. Without it, they are the holders the
+    // superseded shipper committed, as the daemon's successor ships to the record's holders (`live_ship`'s
+    // `live_holders`), never a member that joined since: it holds none of the log, and named here it let a later phase
+    // one count `f + 1` holders none of which held a durable write (A-601's ReadSafety, 2026-11-19).
     let mut holders: Vec<HostId> = match self.following {
-      None => self.holders.keys().copied().collect(),
+      None => {
+        let committed = self.owners[old].shipper.holders().to_vec();
+        self
+          .holders
+          .keys()
+          .copied()
+          .filter(|host| committed.contains(host))
+          .collect()
+      }
       Some(Following::Joint) => self.owners[old].recorded.clone(),
       Some(Following::RecordAtOnce | Following::Fixed) => self.configuration.clone(),
     };
@@ -1113,7 +1143,139 @@ impl Run {
     }
   }
 
+  /// ReadSafety (A-601; `FencedLedger.tla`'s rule, §4.8 "Leases and reads"), judged now over every read phase one
+  /// could make were the current owner lost within the failures the run tolerates (`lost < f`, the nemesis's own
+  /// guard for a takeover; past it phase one waits for every surviving holder, `adopt_past_tolerance`). Phase one asks
+  /// the live candidates and adopts the greatest head among their reports once `f + 1` come from the holders it counts
+  /// ([`adopt`]), so a host's head can be adopted whenever `f + 1` counted holders, the host itself if it is one,
+  /// report no greater head (one with no copy reports nothing). Every such head's state must hold every durable write,
+  /// at its position, unchanged: a read adopting a stale chain would hand the successor, and every read it then
+  /// answers, a state older than a write already acknowledged. The first violation is kept with its step, and
+  /// [`Run::settle`] reports it after the run's other checks, so a history one of those breaks is still named by it.
+  fn read_safety(&mut self) {
+    if self.durable.is_empty() || self.read_safety_broken.is_some() || self.lost >= self.f {
+      return;
+    }
+    let (asked, counted) = self.phase_one_now();
+    let needed = usize::try_from(self.f + 1).unwrap();
+    if counted.len() < needed {
+      return;
+    }
+    self.reads_judged += 1;
+    // The durable writes are every position from 0 to the greatest durable one (`note_durable` records each).
+    let durable: Vec<u64> = self.durable.values().copied().collect();
+    let mut past_a_stale_holder = false;
+    for host in asked {
+      let lacking = self.first_lacking(host, &durable);
+      past_a_stale_holder |= lacking.is_some();
+      if let (Some(read), Some(position)) = (self.read_adopting(host, &counted, needed), lacking) {
+        self.read_safety_broken = Some(format!(
+          "ReadSafety: at step {}, phase one asking {read:?} adopts host {}'s head {:?}, which lacks durable \
+           position {position}",
+          self.steps_taken,
+          host.0,
+          self.reported_head(host)
+        ));
+        return;
+      }
+    }
+    if past_a_stale_holder {
+      self.reads_past_a_stale_holder += 1;
+    }
+  }
+
+  /// The holder set phase one would count toward `f + 1` were the current owner lost now (A-240), by the run's rules
+  /// ([`Run::phase_one_hosts`], [`Run::phase_one_asked`]): `None` under the mutation that counts any `f + 1`
+  /// candidates.
+  fn counted_set_now(&self) -> Option<Vec<HostId>> {
+    let owner = &self.owners[self.current];
+    match (self.following, self.counting) {
+      (None, Counting::Holders) => Some(owner.shipper.holders().to_vec()),
+      (None, Counting::AnyCandidate) => None,
+      (Some(Following::Joint), _) => Some(owner.recorded.clone()),
+      (Some(Following::RecordAtOnce | Following::Fixed), _) => Some(self.configuration.clone()),
+    }
+  }
+
+  /// The live hosts phase one would ask were the current owner lost now, every one of them reachable, and those of them
+  /// whose reports count toward `f + 1`.
+  fn phase_one_now(&self) -> (Vec<HostId>, Vec<HostId>) {
+    let owner = self.owners[self.current].host;
+    let counted_set = self.counted_set_now();
+    let named = |host: &HostId| {
+      self.following.is_none()
+        || self.configuration.contains(host)
+        || counted_set.as_ref().is_some_and(|set| set.contains(host))
+    };
+    let live = |host: &HostId| self.holders.get(host).is_some_and(|holder| holder.alive);
+    let asked: Vec<HostId> = self
+      .hosts
+      .iter()
+      .copied()
+      .filter(|host| *host != owner && named(host) && live(host))
+      .collect();
+    let counted = asked
+      .iter()
+      .copied()
+      .filter(|host| counted_set.as_ref().is_none_or(|set| set.contains(host)))
+      .collect();
+    (asked, counted)
+  }
+
+  /// The head `host` would report to phase one now: `None` while it holds no copy.
+  fn reported_head(&self, host: HostId) -> Option<Head> {
+    self
+      .holders
+      .get(&host)
+      .and_then(|holder| holder.replica.as_ref())
+      .and_then(Replica::head)
+  }
+
+  /// A read through which phase one would adopt `host`'s head: `host` with `needed` of the `counted` holders whose
+  /// heads rank no higher (itself among them when it is one), or `None` when fewer than `needed` do. A head of equal
+  /// rank may be the one adopted, so it counts.
+  fn read_adopting(&self, host: HostId, counted: &[HostId], needed: usize) -> Option<Vec<HostId>> {
+    let rank = |host: HostId| self.reported_head(host).map(|head| head.rank());
+    let ceiling = rank(host);
+    let mut read: Vec<HostId> = counted
+      .iter()
+      .copied()
+      .filter(|other| rank(*other) <= ceiling)
+      .take(needed)
+      .collect();
+    if read.len() < needed {
+      return None;
+    }
+    if !read.contains(&host) {
+      read.push(host);
+    }
+    Some(read)
+  }
+
+  /// The first durable position `host`'s state lacks or holds another value at, or `None` when it holds every one.
+  fn first_lacking(&self, host: HostId, durable: &[u64]) -> Option<usize> {
+    let state = self
+      .holders
+      .get(&host)
+      .map(|holder| holder.state.as_slice())
+      .unwrap_or_default();
+    if state.get(..durable.len()) == Some(durable) {
+      return None;
+    }
+    (0..durable.len()).find(|position| state.get(*position) != durable.get(*position))
+  }
+
+  /// One step of the nemesis ([`Run::act`]), then ReadSafety judged over what it left.
   fn step(&mut self) {
+    self.act();
+    self.steps_taken += 1;
+    self.read_safety();
+  }
+
+  /// One step's choice, drawn from the run's seed: a write, a delivery, a loss or duplicate, a period, a cut or heal, a
+  /// superseded owner's step, a takeover, a holder learning the owner, a crash, a reconfiguration, a record, an
+  /// activation, or an owner's restart.
+  fn act(&mut self) {
     // An owner restart now and then (A-344), drawn only in runs that restart owners, so every other run replays as before.
     if self.restart.is_some() && self.rng.chance(RESTART_PER_MILLE) {
       self.restart_owner();
@@ -1169,6 +1331,32 @@ impl Run {
     {
       self.reconfigure();
     }
+    self.deliver_until_converged();
+    if !self.converged() {
+      self.note(|| self.convergence_state());
+    }
+    assert!(
+      self.converged(),
+      "Convergence: live holders never caught up"
+    );
+    let owner = &self.owners[self.current];
+    for (position, value) in &self.durable {
+      assert_eq!(
+        owner.state.get(usize::try_from(*position).unwrap()),
+        Some(value),
+        "NoLoss at the end: durable position {position}"
+      );
+    }
+    // ReadSafety, judged after every step and every delivery here, is reported last, so a history another check breaks
+    // is named by that check.
+    if let Some(broken) = self.read_safety_broken.take() {
+      panic!("{broken}");
+    }
+  }
+
+  /// Delivers the network's messages, the daemon's period after each, until the live holders converge or the budget
+  /// runs out.
+  fn deliver_until_converged(&mut self) {
     // Messages of superseded owners are still delivered: they must change nothing. The budget covers the backlog in
     // flight at the heal on top of the steps to converge: a run whose candidates changed often heals with thousands of
     // re-sends in flight (6,160 in one f = 2 run), which a bare 10,000 never drained.
@@ -1187,24 +1375,10 @@ impl Run {
       self.record();
       self.activate();
       self.follow();
+      self.read_safety();
       if self.converged() {
         break;
       }
-    }
-    if !self.converged() {
-      self.note(|| self.convergence_state());
-    }
-    assert!(
-      self.converged(),
-      "Convergence: live holders never caught up"
-    );
-    let owner = &self.owners[self.current];
-    for (position, value) in &self.durable {
-      assert_eq!(
-        owner.state.get(usize::try_from(*position).unwrap()),
-        Some(value),
-        "NoLoss at the end: durable position {position}"
-      );
     }
   }
 
@@ -1300,8 +1474,12 @@ impl Run {
   }
 }
 
-fn run_seeds(f: u64, rule: EmptyReport) -> (u64, u64, u64, u64, u64) {
-  let mut totals = (0, 0, 0, 0, 0);
+/// What [`run_seeds`] counted over its seeds: takeovers, installs, stale refusals, durable positions, empty reports
+/// counted, ReadSafety's judgements, and those of them past a holder without a durable write.
+type NemesisCounts = (u64, u64, u64, u64, u64, u64, u64);
+
+fn run_seeds(f: u64, rule: EmptyReport) -> NemesisCounts {
+  let mut totals = (0, 0, 0, 0, 0, 0, 0);
   for seed in 0..SEEDS {
     let mut run = Run::new(f, seed, rule);
     for _ in 0..STEPS {
@@ -1313,25 +1491,106 @@ fn run_seeds(f: u64, rule: EmptyReport) -> (u64, u64, u64, u64, u64) {
     totals.2 += run.stale_refusals;
     totals.3 += u64::try_from(run.durable.len()).unwrap();
     totals.4 += run.empty_reports;
+    totals.5 += run.reads_judged;
+    totals.6 += run.reads_past_a_stale_holder;
   }
   totals
 }
 
 /// A-200, AC-8.3: under loss, duplication, reordering, partitions, holder crashes, owner loss with takeover and a
-/// superseded owner shipping on, at `f = 1` and `f = 2`, every history holds Agreement, NoLoss, StaleNeverCommits and
-/// Convergence. The counters are the non-vacuity check: takeovers happened, installs caught holders up, superseded
-/// owners were refused by fences, and writes became durable.
+/// superseded owner shipping on, at `f = 1` and `f = 2`, every history holds Agreement, NoLoss, StaleNeverCommits,
+/// ReadSafety (A-601) and Convergence. The counters are the non-vacuity check: takeovers happened, installs caught
+/// holders up, superseded owners were refused by fences, writes became durable, and ReadSafety judged reads, some of
+/// them past a holder that lacked a durable write.
 #[test]
 fn the_live_log_holds_the_register_invariants_under_the_nemesis() {
   for f in [1, 2] {
-    let (takeovers, installs, stale_refusals, durable, empty) =
+    let (takeovers, installs, stale_refusals, durable, empty, judged, past_stale) =
       run_seeds(f, EmptyReport::FenceAndCount);
     eprintln!(
       "f={f}: {SEEDS} seeds x {STEPS} steps: {takeovers} takeovers, {installs} installs, {stale_refusals} stale \
-       refusals, {durable} durable positions, {empty} empty reports counted"
+       refusals, {durable} durable positions, {empty} empty reports counted; ReadSafety judged {judged} times, \
+       {past_stale} of them past a holder without a durable write"
     );
     assert!(takeovers > 0 && installs > 0 && stale_refusals > 0 && durable > 0 && empty > 0);
+    assert!(
+      judged > 0 && past_stale > 0,
+      "ReadSafety judged {judged} times, {past_stale} past a stale holder"
+    );
   }
+}
+
+/// A-601, ReadSafety's own red check (`FencedLedger.tla`'s rule): a write durable at position 0 under the first owner
+/// (epoch 1) on one holder, and the other holder holding position 0 from a later owner (epoch 2) that wrote another
+/// value there, as a holder would if a takeover had adopted a head without the durable write. Do: judge the run's state
+/// at `f = 1`, where phase one counts both holders. Expect: a ReadSafety violation naming position 0, since phase one
+/// adopts the later owner's head, the greater. The nemesis's mutations break other checks first or alongside, so this
+/// is where the rule itself is shown to tell.
+#[test]
+fn the_read_safety_check_finds_a_read_that_adopts_a_head_without_a_durable_write() {
+  let mut run = Run::new(1, 0, EmptyReport::FenceAndCount);
+  let first = run.owners[0]
+    .shipper
+    .append(1_u64.to_le_bytes().to_vec())
+    .unwrap();
+  hold(&mut run, HostId(2), Replica::new(HostId(1), OBJECT), &first);
+  run.durable.insert(0, 1);
+  let later_owner = HostId(4);
+  let mut later = Shipper::new(
+    (later_owner, OBJECT, HostEpoch(2)),
+    Quorum { f: 1 },
+    &[HostId(3)],
+    None,
+    bounds_of(8, 16, 8),
+  );
+  let other = later.append(9_u64.to_le_bytes().to_vec()).unwrap();
+  hold(
+    &mut run,
+    HostId(3),
+    Replica::new(later_owner, OBJECT),
+    &other,
+  );
+  run.read_safety();
+  let broken = run.read_safety_broken.unwrap_or_default();
+  assert!(
+    broken.contains("ReadSafety") && broken.contains("lacks durable position 0"),
+    "the read adopting host 3's epoch-2 head is named: {broken:?}"
+  );
+}
+
+/// A-601, the rule's other side: a holder that lacks the durable write (here it holds no copy at all) is no violation
+/// while every read phase one could make adopts a head that holds it. Do: hold position 0's durable value on one of the
+/// `f = 1` run's two holders, the other holding nothing, and judge. Expect: no violation, and the judgement counted as
+/// one past a holder without the durable write, since a holder with no copy reports nothing and never ranks above one
+/// that holds the write.
+#[test]
+fn a_read_past_a_holder_without_a_durable_write_adopts_the_head_that_holds_it() {
+  let mut run = Run::new(1, 0, EmptyReport::FenceAndCount);
+  let first = run.owners[0]
+    .shipper
+    .append(1_u64.to_le_bytes().to_vec())
+    .unwrap();
+  hold(&mut run, HostId(2), Replica::new(HostId(1), OBJECT), &first);
+  run.durable.insert(0, 1);
+  run.read_safety();
+  assert_eq!(
+    (
+      run.read_safety_broken,
+      run.reads_judged,
+      run.reads_past_a_stale_holder
+    ),
+    (None, 1, 1)
+  );
+}
+
+/// Hands `host` the copy `replica` with `entry` accepted and its value applied, as a holder's delivery does.
+fn hold(run: &mut Run, host: HostId, mut replica: Replica, entry: &Entry) {
+  replica.accept(entry).unwrap();
+  let holder = run.holders.get_mut(&host).unwrap();
+  holder.state.push(u64::from_le_bytes(
+    entry.payload.as_slice().try_into().unwrap(),
+  ));
+  holder.replica = Some(replica);
 }
 
 /// A-200 phase one, the rule for a candidate that holds no copy (2026-11-05): its empty report counts toward `f + 1`
@@ -3120,5 +3379,431 @@ fn a_live_log_past_its_tolerance_is_taken_from_every_surviving_holder() {
     adopt_past_tolerance(&[(a, None), (fresh_b, None)], &wait),
     PastTolerance::Adopt(None),
     "nobody holds any of the log: nothing to adopt"
+  );
+}
+
+/// Shape: the measured append's payload: the 2.4 MB the live_chaos probes measured a delta and a whole entry at
+/// (w-forming, 2026-11-20).
+const MEASURED_APPEND_BYTES: usize = 2_400_000;
+/// Shape: the appends each measurement takes the best of.
+const MEASURED_APPENDS: usize = 9;
+
+/// A measurement, not a check (run with `--release -- --ignored --nocapture`; w-forming's A/B for the live append
+/// turn, 2026-11-20): the wall time of one append of [`MEASURED_APPEND_BYTES`] as `live_ship::append_entry` makes it,
+/// a delta and a whole state, best and median of [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_live_append_turn() {
+  for whole in [false, true] {
+    let mut times = Vec::new();
+    for _ in 0..MEASURED_APPENDS {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+      let began = std::time::Instant::now();
+      let head = live_append(&mut shipper, &payload, whole);
+      times.push(began.elapsed());
+      assert_eq!(head.position, 0);
+    }
+    times.sort_unstable();
+    println!(
+      "LIVE_APPEND_TURN path=returned whole={whole} bytes={MEASURED_APPEND_BYTES} best={:?} median={:?}",
+      times[0],
+      times[MEASURED_APPENDS / 2]
+    );
+    let mut kept_times = Vec::new();
+    for _ in 0..MEASURED_APPENDS {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+      let began = std::time::Instant::now();
+      let head = if whole {
+        let head = shipper.append_checkpoint_kept(payload.clone()).unwrap();
+        shipper.mark_checkpoint(head);
+        head
+      } else {
+        shipper.append_kept(payload.clone()).unwrap()
+      };
+      kept_times.push(began.elapsed());
+      assert_eq!(head.position, 0);
+    }
+    kept_times.sort_unstable();
+    println!(
+      "LIVE_APPEND_TURN path=kept whole={whole} bytes={MEASURED_APPEND_BYTES} best={:?} median={:?}",
+      kept_times[0],
+      kept_times[MEASURED_APPENDS / 2]
+    );
+  }
+}
+
+/// Golden equivalence (w-forming, 2026-11-20): an entry's identity, now hashed as its fields stream, is the BLAKE3 of
+/// its canonical bytes, as every host computes it. Do: hash entries with empty, one-byte, page and multi-MiB payloads at
+/// several places in a chain. Expect each identity equal to `blake3(encode())`.
+#[test]
+fn an_entrys_identity_is_the_blake3_of_its_canonical_bytes() {
+  for (position, size) in [(0_u64, 0_usize), (1, 1), (7, 4096), (u64::MAX, 3 << 20)] {
+    let entry = Entry {
+      owner: HostId(0x0102_0304_0506_0708),
+      object: OBJECT,
+      position,
+      epoch: HostEpoch(9),
+      previous: [0xab; 32],
+      payload: (0..size)
+        .map(|at| u8::try_from(at % 251).unwrap())
+        .collect(),
+    };
+    assert_eq!(
+      entry.identity(),
+      *blake3::hash(&entry.encode()).as_bytes(),
+      "position {position}, {size} bytes"
+    );
+  }
+}
+
+/// The append as `live_ship::append_entry` makes it: the payload cloned into the shipper, then the entry's head read
+/// for the volume's newest position and, on a whole state, its checkpoint.
+fn live_append(shipper: &mut Shipper, payload: &[u8], whole: bool) -> Head {
+  let entry = if whole {
+    shipper.append_checkpoint(payload.to_vec()).unwrap()
+  } else {
+    shipper.append(payload.to_vec()).unwrap()
+  };
+  let newest = entry.head();
+  if whole {
+    shipper.mark_checkpoint(entry.head());
+  }
+  newest
+}
+
+/// A-757 part 2 (w-forming, 2026-11-20): a whole state's identity hashed a slice at a time across an owner's turns is
+/// the identity the shipper computes in one, and a hasher of a place the chain has left is refused. Do: on two equal
+/// shippers, append a whole state of a few hundred KiB, one at once and one fed to an [`slates_db::live::EntryHasher`]
+/// in 4 KiB slices; then seed a hasher, append a delta, and offer it; and offer one fed short. Expect: equal heads; the
+/// stale hasher refused `Behind` at the delta's head; the short one refused `Behind`.
+#[test]
+fn a_whole_state_hashed_in_slices_appends_at_the_head_hashed_at_once() {
+  const WHOLE: usize = 300_000;
+  const SLICE: usize = 4096;
+  let payload: Vec<u8> = (0..WHOLE)
+    .map(|at| u8::try_from(at % 253).unwrap())
+    .collect();
+  let mut at_once = shipper_bounded_by_whole(WHOLE * 4);
+  let mut in_slices = shipper_bounded_by_whole(WHOLE * 4);
+  let first = at_once.append_kept(vec![1, 2, 3]).unwrap();
+  assert_eq!(in_slices.append_kept(vec![1, 2, 3]).unwrap(), first);
+  let expected = at_once.append_checkpoint_kept(payload.clone()).unwrap();
+  let mut hasher = in_slices.entry_hasher(payload.len()).unwrap();
+  for slice in payload.chunks(SLICE) {
+    hasher.feed(slice);
+  }
+  assert_eq!(hasher.fed(), hasher.length());
+  assert_eq!(
+    in_slices
+      .append_checkpoint_hashed(payload.clone(), hasher)
+      .unwrap(),
+    expected
+  );
+  let mut stale = in_slices.entry_hasher(payload.len()).unwrap();
+  stale.feed(&payload);
+  let moved = in_slices.append_kept(vec![9]).unwrap();
+  assert_eq!(
+    in_slices.append_checkpoint_hashed(payload.clone(), stale),
+    Err(LiveError::Behind { head: Some(moved) })
+  );
+  let mut short = in_slices.entry_hasher(payload.len()).unwrap();
+  short.feed(&payload[..SLICE]);
+  assert_eq!(
+    in_slices.append_checkpoint_hashed(payload, short),
+    Err(LiveError::Behind { head: Some(moved) })
+  );
+}
+
+/// Shape: the slice a hashing turn feeds in the A/B: one archive page, the floor a whole build's turn hashes.
+const MEASURED_SLICE_BYTES: usize = 64 << 10;
+
+/// A measurement (w-forming's A/B for A-757 part 2; run alone in release with `--ignored --nocapture --exact`, under
+/// `/usr/bin/time -l` for its peak RSS): the append turn of a [`MEASURED_APPEND_BYTES`] whole state with its identity
+/// hashed in that turn, best and median of [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_whole_append_turn_hashed_at_once() {
+  let mut turns = Vec::new();
+  for _ in 0..MEASURED_APPENDS {
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let began = std::time::Instant::now();
+    let head = shipper.append_checkpoint_kept(payload).unwrap();
+    shipper.mark_checkpoint(head);
+    turns.push(began.elapsed());
+  }
+  turns.sort_unstable();
+  println!(
+    "WHOLE_APPEND_TURN path=at_once bytes={MEASURED_APPEND_BYTES} append_turn best={:?} median={:?}",
+    turns[0],
+    turns[MEASURED_APPENDS / 2]
+  );
+}
+
+/// The same whole state with its identity fed [`MEASURED_SLICE_BYTES`] a turn before the append (A-757 part 2): the
+/// longest hashing turn and the append turn, best and median of [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_whole_append_turn_hashed_in_slices() {
+  let mut turns = Vec::new();
+  let mut slices = Vec::new();
+  for _ in 0..MEASURED_APPENDS {
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let mut hasher = shipper.entry_hasher(payload.len()).unwrap();
+    let mut longest = std::time::Duration::ZERO;
+    for slice in payload.chunks(MEASURED_SLICE_BYTES) {
+      let began = std::time::Instant::now();
+      hasher.feed(slice);
+      longest = longest.max(began.elapsed());
+    }
+    slices.push(longest);
+    let began = std::time::Instant::now();
+    let head = shipper.append_checkpoint_hashed(payload, hasher).unwrap();
+    shipper.mark_checkpoint(head);
+    turns.push(began.elapsed());
+  }
+  turns.sort_unstable();
+  slices.sort_unstable();
+  println!(
+    "WHOLE_APPEND_TURN path=in_slices bytes={MEASURED_APPEND_BYTES} append_turn best={:?} median={:?}; longest \
+     {MEASURED_SLICE_BYTES}-byte hashing turn best={:?} median={:?}",
+    turns[0],
+    turns[MEASURED_APPENDS / 2],
+    slices[0],
+    slices[MEASURED_APPENDS / 2]
+  );
+}
+
+/// A-757 part 2b (w-forming, 2026-11-20): a large delta's identity hashed in slices appends at the head a delta hashed
+/// at once takes, under the delta credit. Do: on two equal shippers, append a delta of a few hundred KiB, one at once
+/// and one fed in 4 KiB slices. Expect equal heads, and `admits_delta` true before each.
+#[test]
+fn a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once() {
+  const DELTA: usize = 200_000;
+  const SLICE: usize = 4096;
+  let payload: Vec<u8> = (0..DELTA)
+    .map(|at| u8::try_from(at % 239).unwrap())
+    .collect();
+  let mut at_once = shipper_bounded_by_whole(DELTA * 4);
+  let mut in_slices = shipper_bounded_by_whole(DELTA * 4);
+  assert!(at_once.admits_delta(payload.len()) && in_slices.admits_delta(payload.len()));
+  let expected = at_once.append_kept(payload.clone()).unwrap();
+  let mut hasher = in_slices.entry_hasher(payload.len()).unwrap();
+  for slice in payload.chunks(SLICE) {
+    hasher.feed(slice);
+  }
+  assert_eq!(in_slices.append_hashed(payload, hasher).unwrap(), expected);
+}
+
+/// A measurement (w-forming's A/B for A-757 part 2b; run alone in release with `--ignored --nocapture --exact`, under
+/// `/usr/bin/time -l`): a [`MEASURED_APPEND_BYTES`] delta's append turn, hashed at once (`append_kept`) and hashed
+/// [`MEASURED_SLICE_BYTES`] a turn before (`append_hashed`), with the longest hashing turn; best and median of
+/// [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_delta_append_turn() {
+  let mut at_once = Vec::new();
+  let mut hashed = Vec::new();
+  let mut slices = Vec::new();
+  for _ in 0..MEASURED_APPENDS {
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let began = std::time::Instant::now();
+    shipper.append_kept(payload).unwrap();
+    at_once.push(began.elapsed());
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let mut hasher = shipper.entry_hasher(payload.len()).unwrap();
+    let mut longest = std::time::Duration::ZERO;
+    for slice in payload.chunks(MEASURED_SLICE_BYTES) {
+      let began = std::time::Instant::now();
+      hasher.feed(slice);
+      longest = longest.max(began.elapsed());
+    }
+    slices.push(longest);
+    let began = std::time::Instant::now();
+    shipper.append_hashed(payload, hasher).unwrap();
+    hashed.push(began.elapsed());
+  }
+  for times in [&mut at_once, &mut hashed, &mut slices] {
+    times.sort_unstable();
+  }
+  let median = MEASURED_APPENDS / 2;
+  println!(
+    "DELTA_APPEND_TURN bytes={MEASURED_APPEND_BYTES} at_once best={:?} median={:?}; hashed append best={:?} median={:?}; \
+     longest {MEASURED_SLICE_BYTES}-byte hashing turn best={:?} median={:?}",
+    at_once[0], at_once[median], hashed[0], hashed[median], slices[0], slices[median]
+  );
+}
+
+/// A-757 part 3 (w-forming, 2026-11-20): the whole state the owner keeps is the entry's one copy, lent while the retained
+/// tail holds it and after the tail lets it go. Do: bound a shipper's tail to two small entries, append a whole state and
+/// keep it, then append deltas until the tail has let it go; then keep a later delta's position, then none. Expect the
+/// whole state's payload lent at each step until another is kept, then not; nothing lent once none is kept.
+#[test]
+fn a_kept_whole_state_is_lent_after_the_retained_tail_lets_it_go() {
+  const SMALL: usize = 16;
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    bounds_of(64, 2, SMALL),
+  );
+  let whole: Vec<u8> = vec![7; SMALL];
+  let head = shipper.append_checkpoint_kept(whole.clone()).unwrap();
+  shipper.keep(Some(head.position));
+  shipper.mark_checkpoint(head);
+  assert_eq!(shipper.payload_at(head.position), Some(whole.as_slice()));
+  let mut last = head;
+  for value in 0..4u8 {
+    last = shipper.append_kept(vec![value; SMALL]).unwrap();
+  }
+  assert!(
+    !shipper.retains_after(head.position),
+    "the tail let the whole state go"
+  );
+  assert_eq!(
+    shipper.payload_at(head.position),
+    Some(whole.as_slice()),
+    "the kept whole state is still lent"
+  );
+  shipper.keep(Some(last.position));
+  assert_eq!(
+    shipper.payload_at(head.position),
+    None,
+    "the old one let go"
+  );
+  shipper.keep(None);
+  for value in 4..8u8 {
+    shipper.append_kept(vec![value; SMALL]).unwrap();
+  }
+  assert_eq!(
+    shipper.payload_at(last.position),
+    None,
+    "none kept, none lent"
+  );
+}
+
+/// Shape: the live volumes the at-rest measurement holds whole states for.
+const MEASURED_VOLUMES: usize = 50;
+
+/// A measurement (w-forming's A/B for A-757 part 3; run alone in release under `/usr/bin/time -l` for its peak RSS):
+/// [`MEASURED_VOLUMES`] owners each holding a [`MEASURED_APPEND_BYTES`] whole state as `live_ship` held it before part 3,
+/// the payload cloned into the shipper and its own copy kept beside it.
+#[test]
+#[ignore = "a measurement: run alone in release under /usr/bin/time -l"]
+fn measure_whole_states_held_twice() {
+  let held: Vec<(Shipper, Vec<u8>)> = (0..MEASURED_VOLUMES)
+    .map(|_| {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+      let head = shipper.append_checkpoint_kept(payload.clone()).unwrap();
+      shipper.mark_checkpoint(head);
+      (shipper, payload)
+    })
+    .collect();
+  println!("WHOLE_STATES_HELD path=twice volumes={}", held.len());
+}
+
+/// The same owners as part 3 holds them: the payload moved into the shipper and kept there, lent back.
+#[test]
+#[ignore = "a measurement: run alone in release under /usr/bin/time -l"]
+fn measure_whole_states_held_once() {
+  let held: Vec<Shipper> = (0..MEASURED_VOLUMES)
+    .map(|_| {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let head = shipper
+        .append_checkpoint_kept(vec![0x5a_u8; MEASURED_APPEND_BYTES])
+        .unwrap();
+      shipper.keep(Some(head.position));
+      shipper.mark_checkpoint(head);
+      assert!(shipper.payload_at(head.position).is_some());
+      shipper
+    })
+    .collect();
+  println!("WHOLE_STATES_HELD path=once volumes={}", held.len());
+}
+
+/// A-757 part 4 (w-forming, 2026-11-20): a holder's identity of a received entry, hashed a slice at a time, is the entry's
+/// identity, and the guard given it admits exactly what the guard that hashes admits. Do: build an entry of a few hundred
+/// KiB extending an empty replica, feed it to `EntryHasher::of` in 4 KiB slices, and check it both ways; commit it, and
+/// check it again both ways (a duplicate). Expect the identities equal, `Apply` at the same head both ways, then `Held`
+/// both ways.
+#[test]
+fn a_holder_hashing_an_entry_in_slices_admits_what_the_hashing_guard_admits() {
+  const PAYLOAD: usize = 300_000;
+  const SLICE: usize = 4096;
+  let mut shipper = shipper_bounded_by_whole(PAYLOAD * 4);
+  let entry = shipper
+    .append(
+      (0..PAYLOAD)
+        .map(|at| u8::try_from(at % 233).unwrap())
+        .collect(),
+    )
+    .unwrap();
+  let mut hasher = slates_db::live::EntryHasher::of(&entry).unwrap();
+  for slice in entry.payload.chunks(SLICE) {
+    hasher.feed(slice);
+  }
+  let identity = hasher.finish().unwrap();
+  assert_eq!(identity, entry.identity());
+  let mut replica = Replica::new(HostId(1), OBJECT);
+  let hashing = replica.check(&entry).unwrap();
+  assert_eq!(replica.check_identified(&entry, identity).unwrap(), hashing);
+  assert_eq!(hashing, Admitted::Apply(entry.head()));
+  replica.commit(entry.epoch, entry.head());
+  assert_eq!(replica.check(&entry).unwrap(), Admitted::Held);
+  assert_eq!(
+    replica.check_identified(&entry, identity).unwrap(),
+    Admitted::Held
+  );
+}
+
+/// A measurement (w-forming's A/B for A-757 part 4; run in release with `--ignored --nocapture --exact`): a holder's
+/// take turn of a [`MEASURED_APPEND_BYTES`] entry, the guard hashing it (`check`) and given its identity hashed in
+/// [`MEASURED_SLICE_BYTES`] slices before (`check_identified`), with the longest slice; best and median of
+/// [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_holders_take_turn() {
+  let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+  let entry = shipper
+    .append(vec![0x5a_u8; MEASURED_APPEND_BYTES])
+    .unwrap();
+  let replica = Replica::new(HostId(1), OBJECT);
+  let (mut hashing, mut given, mut slices) = (Vec::new(), Vec::new(), Vec::new());
+  for _ in 0..MEASURED_APPENDS {
+    let began = std::time::Instant::now();
+    let admitted = replica.check(&entry).unwrap();
+    hashing.push(began.elapsed());
+    let mut hasher = slates_db::live::EntryHasher::of(&entry).unwrap();
+    let mut longest = std::time::Duration::ZERO;
+    for slice in entry.payload.chunks(MEASURED_SLICE_BYTES) {
+      let began = std::time::Instant::now();
+      hasher.feed(slice);
+      longest = longest.max(began.elapsed());
+    }
+    slices.push(longest);
+    let identity = hasher.finish().unwrap();
+    let began = std::time::Instant::now();
+    assert_eq!(
+      replica.check_identified(&entry, identity).unwrap(),
+      admitted
+    );
+    given.push(began.elapsed());
+  }
+  for times in [&mut hashing, &mut given, &mut slices] {
+    times.sort_unstable();
+  }
+  let median = MEASURED_APPENDS / 2;
+  println!(
+    "HOLDER_TAKE_TURN bytes={MEASURED_APPEND_BYTES} hashing best={:?} median={:?}; identified best={:?} median={:?}; \
+     longest {MEASURED_SLICE_BYTES}-byte slice best={:?} median={:?}",
+    hashing[0], hashing[median], given[0], given[median], slices[0], slices[median]
   );
 }

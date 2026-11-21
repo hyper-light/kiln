@@ -156,6 +156,13 @@ impl VolumeSet for ShardVolumeSet {
   fn entries(&self) -> Vec<(String, VolumeId)> {
     let capability = self.capability;
     state::with_state(|s| {
+      // A work mounts like any volume (A-774): its capability's volume gets its slot here, at the mount's first look.
+      if let Some((attachment, _)) = capability
+        && let Some(record) = s.db.partition().attachment(attachment)
+      {
+        let volume = record.volume;
+        crate::mounted_work::ensure_slot(s, volume);
+      }
       // List each volume under its provisioned mount name (its slot's `name`), so `ls /` shows friendly
       // names and `cd <name>` resolves by matching it (`MultiExport`) — but only the volume the presented
       // mount capability authorizes (§4.13; AUD-01). Without a capability nothing is listed: a volume
@@ -336,6 +343,8 @@ fn with_export<R>(
   capability: MountCapability,
   f: impl FnOnce(&mut Export<'_>) -> R,
 ) -> Option<R> {
+  // A mounted work's slot, made again after a restart (A-774).
+  crate::mounted_work::ensure_slot(s, volume);
   let handle = *s.by_id.get(&volume)?;
   crate::verbs::relieve_deferred(s);
   let write_verifier = s.write_verifier;
@@ -3967,9 +3976,6 @@ mod purge_round_tests {
 
   use crate::daemon::LIVENESS_BUDGET_NS;
 
-  /// Shape: how long the test lets its daemon run before the purge is owed: past the reap loop's first look a window
-  /// into the start, by half a window, so the loop's next look comes half a window after the refused round.
-  const PAST_THE_FIRST_LOOK_NS: u64 = LIVENESS_BUDGET_NS / 2 * 3;
   /// Shape: how long past a window after the refused round the test waits for the next round: half a window.
   const AGAIN_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2;
   /// Shape: the pause between the test's looks.
@@ -3977,7 +3983,7 @@ mod purge_round_tests {
   /// Shape: the NFSv4 client the test makes and drops: any owner and uid.
   const OWNER: &[u8] = b"purge-round-test";
 
-  /// A-570 (the NFS purge off the tick). Do: on a one-shard daemon past the reap loop's first look, its owners refusing
+  /// A-570 (the NFS purge off the tick). Do: on a one-shard daemon, its owners refusing
   /// every purge (`Daemon::inject_nfs_purge_refusal`'s flag), make and drop an NFSv4 client, so its table owes the
   /// purge, and run a purge round as a client's call would, refused; then watch for the next round. Expect: the next
   /// round no sooner than a window after the refused one and within half a window more, at the deadline the table's
@@ -3985,9 +3991,6 @@ mod purge_round_tests {
   #[test]
   fn a_refused_purge_goes_again_a_window_after_its_round() {
     let daemon = crate::daemon::audit_daemon_of(1);
-    // The harness waits out the reap loop's first look; the daemon under test runs on.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
     let refused_at = Instant::now();
     crate::daemon::observe_first(&daemon, |state| {
       state.nfs_purges_refused = true;

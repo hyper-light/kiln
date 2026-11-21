@@ -135,6 +135,12 @@ pub struct MergeShardState {
   /// (`crate::green_adopt::readopt_at_boot`). Every verb on it is answered `Overloaded` meanwhile. Bounded by the greens
   /// this shard owns; empty once the boot has re-adopted or fenced each.
   pub(crate) awaiting_adoption: BTreeMap<DbVolumeId, crate::green_adopt::AwaitingAdoption>,
+  /// The base snapshot of each mounted work of this shard (A-774, `crate::mounted_work`): what its mount changed is its
+  /// slot's op log since it. One entry a mounted work, dropped with the work.
+  pub(crate) mounted: crate::mounted_work::MountedBases,
+  /// The head version each green's landing view holds (A-774, `crate::mounted_work::ensure_green_view`): one entry a
+  /// green landed, dropped with the green.
+  pub(crate) green_views: crate::mounted_work::GreenViews,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -230,33 +236,65 @@ pub(crate) fn record_goes_to_holders(state: &ShardState, green: DbVolumeId) -> b
   !local_hold.placed(config.quorum)
 }
 
-/// [`checkpoint_green`], with the doubling rule waived when `doubling` is [`Doubling::Now`]: what a submit refused at
-/// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
-/// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
-pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, doubling: Doubling) {
+/// What the doubling rule of [`checkpoint_green`] weighs for a green: the version a checkpoint would be taken at, the
+/// bytes it would fold there, and the size of the checkpoint the green holds. The rule reads them through
+/// [`fold_inputs`] alone, and so does a test whose expectation turns on whether the rule folds
+/// (`repository::tests::write_until_folded`), so the test follows the checkpoint's and the increments' encodings rather
+/// than leaning on their sizes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FoldInputs {
+  /// The version a checkpoint would be taken at: the green's checkpoint floor ([`checkpoint_floor`]).
+  pub(crate) floor: u64,
+  /// The bytes the checkpoint would fold: the chain's increments from the one after the version held (the
+  /// partition's `green_floor`) up to `floor`.
+  pub(crate) to_fold: usize,
+  /// The size of the checkpoint the green holds; 0 while it holds none, so its first one is taken at once.
+  pub(crate) held_bytes: usize,
+}
+
+impl FoldInputs {
+  /// Whether the doubling rule waits: the bytes to fold are still under the size of the checkpoint held.
+  pub(crate) fn waits(self) -> bool {
+    self.to_fold < self.held_bytes
+  }
+}
+
+/// The doubling rule's inputs for `green` as they stand ([`FoldInputs`]), or none when its checkpoint floor is not past
+/// the version its chain begins after, so a checkpoint would fold nothing.
+pub(crate) fn fold_inputs(state: &ShardState, green: DbVolumeId) -> Option<FoldInputs> {
   let floor = checkpoint_floor(state, green);
   let partition = state.db.partition();
   // The chain begins after the checkpoint held, or after the green's adoption by its takeover (A-333).
   let held = partition.green_floor(green);
-  let held_bytes = partition
-    .green_checkpoint(green)
-    .map_or(0, |(_, bytes)| bytes.len());
-  let Some(folds) = floor
+  let folds = floor
     .checked_sub(held)
     .filter(|folds| *folds > 0)
-    .and_then(|folds| usize::try_from(folds).ok())
-  else {
+    .and_then(|folds| usize::try_from(folds).ok())?;
+  Some(FoldInputs {
+    floor,
+    to_fold: partition
+      .green_chain(green)
+      .iter()
+      .take(folds)
+      .map(Vec::len)
+      .sum(),
+    held_bytes: partition
+      .green_checkpoint(green)
+      .map_or(0, |(_, bytes)| bytes.len()),
+  })
+}
+
+/// [`checkpoint_green`], with the doubling rule waived when `doubling` is [`Doubling::Now`]: what a submit refused at
+/// the chain's cap does first (`verbs::submit`, A-238), since the floor may have risen since the last accept (a work
+/// destroyed, rebased or reset), and a chain at its cap refuses every submit whose accept would take it.
+pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, doubling: Doubling) {
+  let Some(inputs) = fold_inputs(state, green) else {
     return;
   };
-  let folded: usize = partition
-    .green_chain(green)
-    .iter()
-    .take(folds)
-    .map(Vec::len)
-    .sum();
-  if doubling == Doubling::Wait && folded < held_bytes {
+  if doubling == Doubling::Wait && inputs.waits() {
     return;
   }
+  let floor = inputs.floor;
   // The head's identity beside it (A-257): the amortized rule above bounds how often this reads the identity.
   let Some(checkpoint) = state.greens.get_mut(&green).and_then(|mut engine| {
     let mut checkpoint = engine.checkpoint(floor)?;
@@ -269,14 +307,20 @@ pub(crate) fn checkpoint_green_when(state: &mut ShardState, green: DbVolumeId, d
   let op = Op::GreenCheckpointed {
     green,
     version: floor,
-    checkpoint: checkpoint.encode(),
+    checkpoint: checkpoint.into_encoded(),
   };
   let now = state.clock.monotonic_ns();
   let recorded = state
     .db
     .partition()
     .check(&op, now)
-    .and_then(|()| state.db.mutate(&mut state.segment, &op, now).map(|_| ()));
+    // Moved into the record, never copied: the checkpoint is the green's whole changed state (A-742).
+    .and_then(|()| {
+      state
+        .db
+        .mutate_owned(&mut state.segment, op, now)
+        .map(|_| ())
+    });
   match recorded {
     Ok(()) => state.count(CHECKPOINT_TAKEN, 1),
     Err(_) => state.count(CHECKPOINT_REFUSED, 1),
@@ -579,7 +623,7 @@ pub(crate) enum StoreVerb {
   Resize,
   /// `clone`: a work is the clone of a green version (`create_work`).
   Clone,
-  /// `land`: landing a merge volume onto disk (owed with the extent-backed green).
+  /// `land`: a work lands through its green (a green's head lands through its store-backed view, A-774).
   Land,
   /// `destroy_snapshot`, `read_base`, `rewitness`, `pin`: the volume-core and base-plane verbs.
   Base,
@@ -612,7 +656,7 @@ pub(crate) fn refuse_store_verb(
       feature: "clone of a merge volume: create a work over the green".to_owned(),
     },
     (_, StoreVerb::Land) => Refusal::Unsupported {
-      feature: "landing a merge volume".to_owned(),
+      feature: "landing a work volume: submit it, then land its green".to_owned(),
     },
     (_, StoreVerb::Base) => Refusal::Unsupported {
       feature: "the volume-core and base-plane verbs on a merge volume".to_owned(),
@@ -1331,6 +1375,8 @@ pub(crate) fn destroy_merge_volume(
   crate::verbs::retire_local_tombstones(state);
   // A retired work may have held the oldest reachable version of its green: fold and credit. A
   // destroyed green credits everything it charged as retention.
+  // A mounted work's slot goes with it (A-774).
+  crate::mounted_work::release(state, id);
   if let Some(work) = state.works.remove(&id) {
     crate::work_charge::release(state, work.charged);
     // The floor goes with it: on this shard in this transaction, elsewhere by a message once it has committed (A-247).
@@ -1848,6 +1894,11 @@ pub enum GreenFence {
     /// The version the entry was acknowledged as.
     version: u64,
   },
+  /// The chain entry for `version` names content (A-760) the shard's content plane does not hold.
+  ContentMissing {
+    /// The version the entry was acknowledged as.
+    version: u64,
+  },
   /// Replaying the chain entry for `version` did not reach the head identity the entry recorded (A-257).
   IdentityDiverged {
     /// The version the entry was acknowledged as.
@@ -1995,6 +2046,40 @@ pub struct PendingMergeRecord {
   /// these, so inputs larger than one shipment cross in several; a target not here is sent the inputs from their
   /// first chunk. Bounded by the candidates times the inputs' chunks; a target leaves once it holds the inputs.
   pub lacking: BTreeMap<HostId, Vec<[u8; 32]>>,
+  /// When it was enqueued, on the host's monotonic clock: what [`SUBMIT_PLACE`] times its placement from.
+  pub enqueued_ns: u64,
+  /// The shipments that carried its inputs so far ([`SUBMIT_SHIPMENTS`]): inputs larger than one shipment's bound
+  /// cross in several, one a record-plane pass.
+  pub shipments: u64,
+}
+
+/// Counter pairs (how many were timed, and their nanoseconds or their count) of a submit's phases (A-697's measured
+/// breakdown, main's ruling of 2026-11-20: the by-reference forward is measured before and after, phase by phase). A
+/// mean is the second over the first. On the green's owner: the verdict ([`SUBMIT_JUDGE`]), the chain's append
+/// ([`SUBMIT_APPEND`]), the version's placement at the quorum from its enqueue ([`SUBMIT_PLACE`]) and the shipments its
+/// inputs took ([`SUBMIT_SHIPMENTS`]); on a holder, the recomputation of a version into its replica
+/// ([`SUBMIT_RECOMPUTE`]); and on a holder node submitting its own work (`crate::work_home`), the composition, the
+/// verdict computed on its replica, the forward to the owner and the wait for its replica to hold the version.
+pub(crate) const SUBMIT_JUDGE: (&str, &str) = ("merge.submit.judge", "merge.submit.judge_ns");
+/// See [`SUBMIT_JUDGE`]: the version's increment and verdict appended to the green's chain.
+pub(crate) const SUBMIT_APPEND: (&str, &str) = ("merge.submit.append", "merge.submit.append_ns");
+/// See [`SUBMIT_JUDGE`]: from the version's enqueue to its record placed at the quorum, its inputs shipped first.
+pub(crate) const SUBMIT_PLACE: (&str, &str) = ("merge.submit.place", "merge.submit.place_ns");
+/// See [`SUBMIT_JUDGE`]: the versions placed, and the input shipments they took in all.
+pub(crate) const SUBMIT_SHIPMENTS: (&str, &str) =
+  ("merge.submit.shipped_versions", "merge.submit.shipments");
+/// See [`SUBMIT_JUDGE`]: a holder's recomputation of a version into its replica.
+pub(crate) const SUBMIT_RECOMPUTE: (&str, &str) =
+  ("merge.submit.recompute", "merge.submit.recompute_ns");
+
+/// Counts one timed phase of `amount` ([`SUBMIT_JUDGE`] and its siblings).
+pub(crate) fn count_phase(
+  state: &mut ShardState,
+  (count, sum): (&'static str, &'static str),
+  amount: u64,
+) {
+  state.count(count, 1);
+  state.count(sum, amount);
 }
 
 /// Faults a test injects on a holder (never reachable from the wire): refuse every content put
@@ -2299,6 +2384,8 @@ pub(crate) fn insert_pending(
       first_period: stamped,
       work,
       lacking: BTreeMap::new(),
+      enqueued_ns: slates_machine::clock::monotonic_ns(),
+      shipments: 0,
     },
   );
   nudge_record_plane(state);
@@ -2616,6 +2703,20 @@ fn ship_version(
     value,
   };
   let shipments = cut_shipments(state, (object, version), groups);
+  let carrying = shipments
+    .iter()
+    .filter(|(_, inputs)| inputs.is_some())
+    .count();
+  if let Some(pending) = state
+    .merge
+    .pending
+    .get_mut(&object)
+    .and_then(|pending_green| pending_green.records.get_mut(&version))
+  {
+    pending.shipments = pending
+      .shipments
+      .saturating_add(u64::try_from(carrying).unwrap_or(u64::MAX));
+  }
   for (targets, inputs) in shipments {
     if let Some(inputs) = &inputs {
       state.count(INPUTS_UNPLACED, 1);
@@ -3048,11 +3149,20 @@ fn record_merge_acks_in(
     .pending
     .get(&object)
     .and_then(|pending_green| pending_green.records.get(&version))
-    .map(|pending| (pending.record.placed(quorum), pending.first_period));
+    .map(|pending| {
+      (
+        pending.record.placed(quorum),
+        pending.first_period,
+        (pending.enqueued_ns, pending.shipments),
+      )
+    });
   record_merge_acks(state, local, object, version, placement, quorum);
-  if let Some((false, first)) = before
+  if let Some((false, first, (enqueued_ns, shipments))) = before
     && placed_version(state, object).is_some_and(|placed| placed >= version)
   {
+    let now = slates_machine::clock::monotonic_ns();
+    count_phase(state, SUBMIT_PLACE, now.saturating_sub(enqueued_ns));
+    count_phase(state, SUBMIT_SHIPMENTS, shipments);
     let waited = period.saturating_sub(first.unwrap_or(period));
     let counter = if waited == 0 {
       PLACED_WITHIN_PERIOD
@@ -3179,7 +3289,64 @@ pub struct AwaitingAcceptance {
   pub origin: u64,
   /// The request id.
   pub id: RequestId,
+  /// For a request forwarded from another node: the forward's exchange waiting on this node's control shard for the
+  /// completion, as (that shard, its awaited call), answered when the version resolves ([`resolve_accepted`],
+  /// [`await_forwarded`]); `None` until the exchange attaches, and for every other request.
+  pub forwarded: Option<(u16, u64)>,
 }
+
+/// What [`await_forwarded`] found of a forwarded request's deferred acceptance.
+pub(crate) enum ForwardedAcceptance {
+  /// Its completion is recorded: these bytes are the reply.
+  Completed(Vec<u8>),
+  /// It waits for its version's commit, and the exchange is now answered when that resolves.
+  Waiting,
+  /// Neither: no completion and no wait (a restart between dropped it), so the exchange answers retryable.
+  Gone,
+}
+
+/// Attaches the forward's exchange, waiting as `waiter` (the control shard and its awaited call), to the deferred
+/// acceptance of `(origin, id)` on this owner shard (AUD-11; A-697's measured forward), or gives its completion when it
+/// is recorded already. Before, the exchange looked at the completion window once a heartbeat, so a commit of 30 ms was
+/// answered at about 100 (the release bench, 2026-11-20).
+pub(crate) fn await_forwarded(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  waiter: (u16, u64),
+) -> ForwardedAcceptance {
+  if let slates_wire::request::Seen::Completed(bytes) =
+    state
+      .db
+      .partition()
+      .completion(origin, id.client, id.sequence)
+  {
+    return ForwardedAcceptance::Completed(bytes);
+  }
+  let Some(key) = state
+    .merge
+    .awaiting_by_request
+    .get(&(origin, id.client, id.sequence))
+    .copied()
+  else {
+    return ForwardedAcceptance::Gone;
+  };
+  let Some(entry) = state.merge.awaiting.get_mut(&key).and_then(|waiting| {
+    waiting
+      .iter_mut()
+      .find(|entry| entry.origin == origin && entry.id == id)
+  }) else {
+    return ForwardedAcceptance::Gone;
+  };
+  entry.forwarded = Some(waiter);
+  state.count(ACCEPTANCE_FORWARD_ATTACHED, 1);
+  ForwardedAcceptance::Waiting
+}
+
+/// Format: a forward's exchange attached to its deferred acceptance, answered when the version resolves
+/// ([`await_forwarded`]), the non-vacuity count of the event-driven forwarded completion.
+pub(crate) const ACCEPTANCE_FORWARD_ATTACHED: &str = "merge.acceptance_forward_attached";
+/// Format: a forward's exchange answered at its version's resolve ([`resolve_accepted`]).
+pub(crate) const ACCEPTANCE_FORWARD_ANSWERED: &str = "merge.acceptance_forward_answered";
 
 /// Registers the acceptance of `version` of `green` as **waiting** for its record to commit at the
 /// quorum (AUD-11): the reply is not written and the completion not recorded until
@@ -3197,7 +3364,12 @@ pub(crate) fn defer_acceptance(state: &mut ShardState, green: DbVolumeId, versio
     .awaiting
     .entry((object, version))
     .or_default()
-    .push(AwaitingAcceptance { route, origin, id });
+    .push(AwaitingAcceptance {
+      route,
+      origin,
+      id,
+      forwarded: None,
+    });
   state
     .merge
     .awaiting_by_request
@@ -3274,7 +3446,12 @@ pub(crate) fn serve_awaiting(
     .awaiting
     .entry((object, version))
     .or_default()
-    .push(AwaitingAcceptance { route, origin, id });
+    .push(AwaitingAcceptance {
+      route,
+      origin,
+      id,
+      forwarded: None,
+    });
   state
     .merge
     .awaiting_by_request
@@ -3299,7 +3476,12 @@ pub(crate) fn join_awaiting(state: &mut ShardState, origin: u64, id: RequestId) 
   if let Some(waiting) = state.merge.awaiting.get_mut(&key)
     && route.is_some()
   {
-    waiting.push(AwaitingAcceptance { route, origin, id });
+    waiting.push(AwaitingAcceptance {
+      route,
+      origin,
+      id,
+      forwarded: None,
+    });
   }
   true
 }
@@ -3398,6 +3580,11 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
         continue;
       }
       state.count(ACCEPTANCE_RESOLVED, 1);
+      // A forward's exchange waiting on its control shard is answered now, with the reply just recorded.
+      if let Some((control, call)) = entry.forwarded {
+        crate::xshard::answer_awaited(control, call, recorded.clone());
+        state.count(ACCEPTANCE_FORWARD_ANSWERED, 1);
+      }
       let Some(route) = entry.route else {
         continue;
       };
@@ -3750,7 +3937,14 @@ fn recompute(
     };
     let increment = Increment::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?;
     let mut replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
-    match replica.submit(&increment) {
+    let started = slates_machine::clock::monotonic_ns();
+    let outcome = replica.submit(&increment);
+    count_phase(
+      state,
+      SUBMIT_RECOMPUTE,
+      slates_machine::clock::monotonic_ns().saturating_sub(started),
+    );
+    match outcome {
       Outcome::Accepted { version } if version == value.version => {}
       // The owner accepted it; a holder that computes anything else has diverged.
       _ => return Err(RECOMPUTE_MISMATCH),
@@ -3781,6 +3975,8 @@ fn recompute(
   // later increment is based below it.
   fold_replica(state, &mut replica, value.folded_below);
   state.merge.replicas.insert(object, replica);
+  // A submit of a work on this holder node waits for its version here (A-697 part d).
+  crate::work_home::replica_reached(state, object);
   Ok(())
 }
 
@@ -3951,6 +4147,8 @@ mod tests {
       first_period: None,
       work: None,
       lacking: BTreeMap::new(),
+      enqueued_ns: 0,
+      shipments: 0,
     };
     assert!(carries_inputs(&pending, &[second, third]));
     assert!(!carries_inputs(&pending, &[second]));
@@ -4052,6 +4250,8 @@ mod tests {
             first_period: None,
             work: None,
             lacking: BTreeMap::new(),
+            enqueued_ns: 0,
+            shipments: 0,
           },
         );
       }
@@ -4494,6 +4694,8 @@ mod tests {
           first_period: None,
           work: None,
           lacking: BTreeMap::new(),
+          enqueued_ns: 0,
+          shipments: 0,
         },
       );
       let ack = |holder, sequence, manifest| {

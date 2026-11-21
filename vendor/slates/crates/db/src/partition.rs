@@ -20,10 +20,11 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  GrantState, LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NameAliasRecord,
-  NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord,
-  NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX,
-  SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  GrantState, IdentityRecord, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
+  LineageEdge, NameAliasRecord, NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
+  NfsOpenRecord, NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES,
+  SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone,
+  VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -178,6 +179,29 @@ pub struct PartitionSnapshot {
   /// Every lineage's members (§4.17.1 item 4, A-575; appended), lineage by lineage in id order, each in the order it
   /// joined.
   pub repository_members: Vec<crate::catalog::MemberRecord>,
+  /// The review comments of this partition's repositories (§4.17.1 shared piece 6, A-596; appended), by repository,
+  /// request and number.
+  pub review_comments: Vec<crate::catalog::ReviewCommentRecord>,
+  /// Their approvals (A-596; appended), by repository, request and approver.
+  pub review_approvals: Vec<crate::catalog::ReviewApprovalRecord>,
+  /// Every repository's own state: its state logs' positions and what they hold (§4.17.1 shared piece 2, A-603 rebuilt
+  /// by A-642; appended), by repository order.
+  pub repository_registers: Vec<crate::catalog::RegisterRecord>,
+  /// The atomic records kept, by key, each with the positions pointing to it still (A-642; appended).
+  pub atomic_records: Vec<crate::catalog::AtomicHeld>,
+  /// The principals' tool identities this partition keeps (§4.13; A-664; appended), by principal key.
+  pub identities: Vec<IdentityRecord>,
+  /// The version-control credentials this partition holds (§4.13, §4.17.2 "Access"; A-625 part 3; appended), by id.
+  pub credentials: Vec<crate::catalog::CredentialRecord>,
+  /// The least counter a volume id minted here may take: one past the highest counter of every volume created here
+  /// (A-694; appended), so a recovery mints the ids the live partition would.
+  pub volume_counter: u64,
+  /// The least number a family id minted here may take: one past the highest number of every family id created here,
+  /// a repository's or a green's (A-636 part 2b-2; appended), so a recovery mints the family ids the live partition
+  /// would.
+  pub family_counter: u64,
+  /// The version-control credentials revoked here (A-764; appended), by id: each never enrolled again.
+  pub credential_tombstones: Vec<[u8; 32]>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -289,8 +313,15 @@ pub struct Partition {
   /// The enrolled consumers, by id (§4.13; bounded by the enrollments a human makes, one durable record
   /// each — never grown by a workload).
   consumers: BTreeMap<u64, ConsumerRecord>,
+  /// The principals' tool identities (§4.13; A-664), by principal key: one record a principal, each set whole by its
+  /// owner, so bounded by the principals its owners name, never grown by a workload.
+  identities: BTreeMap<Vec<u8>, IdentityRecord>,
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
+  /// The landings presented and awaiting a grant (§4.15 `AwaitingGrant`), by the volume they land and their id
+  /// (A-773): what the session log shows, so its read costs the landings waiting, never the partition's landing
+  /// history. Kept by `apply` beside `landings` and rebuilt from them at a restore; bounded by `landings`.
+  awaiting_grant: BTreeSet<(VolumeId, u64)>,
   /// The audit records retained, oldest first: at most `caps.audit_records` (A-265).
   audit: std::collections::VecDeque<AuditRecord>,
   /// The audit records dropped oldest first past the bound (A-265), snapshotted with the window.
@@ -312,6 +343,14 @@ pub struct Partition {
   /// The highest grant id ever issued here (A-266): the table holds live grants only, so this mark, snapshotted, is
   /// what keeps an ended grant's id from being issued again after a restart.
   grants_issued_through: u64,
+  /// The least counter a volume id minted here may take (A-694): one past the highest counter of every volume created
+  /// here, advanced by each creation's apply and snapshotted, so the ids an append mints for several new volumes before
+  /// any is recorded never repeat, and a recovery mints what the live partition would (`crate::Db::volume_counter_at`).
+  volume_counter: u64,
+  /// The least number a family id minted here may take (A-636 part 2b-2): one past the highest number of every family
+  /// id created here, a repository's or a green's, advanced by each creation's apply and snapshotted, as
+  /// [`volume_counter`](Partition::volume_counter) is for ids of no family (`crate::Db::family_number_at`).
+  family_counter: u64,
   /// Each green volume's merge chain (§4.16): its accepted increments after its checkpoint (all of them while it holds
   /// none), encoded, in commit order, so recovery replays them to rebuild the green. Bounded by `green_chain_bytes`
   /// against the cap.
@@ -330,6 +369,12 @@ pub struct Partition {
   /// The repositories and their namespaces (§4.17.1, A-515): repositories bounded by `caps.volumes`, bindings by the
   /// greens each binds.
   repositories: crate::repository::Repositories,
+  /// The review records of those repositories (§4.17.1 shared piece 6, A-596): their bytes counted in
+  /// `green_chain_bytes` against the merge byte budget; they leave with their review's close and their repository.
+  reviews: crate::review::Reviews,
+  /// The version-control credentials whose ids route here (§4.13, §4.17.2 "Access"; A-625 part 3): their bytes counted
+  /// in `green_chain_bytes` against the table byte budget; each leaves with its revocation.
+  credentials: crate::credentials::Credentials,
   /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
   /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
   green_origins: BTreeMap<VolumeId, Vec<u8>>,
@@ -427,6 +472,7 @@ impl Partition {
       client_id_high_water: 0,
       grants: BTreeMap::new(),
       consumers: BTreeMap::new(),
+      identities: BTreeMap::new(),
       nfs_opens: BTreeMap::new(),
       nfs_delegations: BTreeMap::new(),
       seal_keys: BTreeMap::new(),
@@ -444,6 +490,7 @@ impl Partition {
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
+      awaiting_grant: BTreeSet::new(),
       audit: std::collections::VecDeque::new(),
       audit_dropped: 0,
       green_chains: BTreeMap::new(),
@@ -458,16 +505,31 @@ impl Partition {
       audit_outbox_next: 0,
       audit_received: BTreeMap::new(),
       grants_issued_through: 0,
+      volume_counter: 0,
+      family_counter: 0,
       captured_bases: std::collections::BTreeSet::new(),
       carried: BTreeMap::new(),
       repositories: crate::repository::Repositories::new(),
+      reviews: crate::review::Reviews::new(),
+      credentials: crate::credentials::Credentials::new(),
       tombstones: BTreeMap::new(),
     }
+  }
+
+  /// The version-control credentials whose ids route to this partition (§4.13, §4.17.2 "Access"; A-625 part 3): what
+  /// the HTTP edge's authenticator and the SSH edge's key holders look a presented credential up in.
+  pub fn credentials(&self) -> &crate::credentials::Credentials {
+    &self.credentials
   }
 
   /// The repositories this partition holds and their namespaces (§4.17.1, A-515).
   pub fn repositories(&self) -> &crate::repository::Repositories {
     &self.repositories
+  }
+
+  /// The review records of this partition's repositories (§4.17.1 shared piece 6, A-596).
+  pub fn reviews(&self) -> &crate::review::Reviews {
+    &self.reviews
   }
 
   /// What the catalog holds under `id`, as a repository's namespace asks it (§4.17.1: a namespace binds greens).
@@ -516,6 +578,15 @@ impl Partition {
   /// The caps.
   pub fn caps(&self) -> PartitionCaps {
     self.caps
+  }
+
+  /// The bytes the green chains may still grow by before an increment is refused (`green_chains` at its cap): what a
+  /// caller sizing a chain entry beforehand checks, so it can checkpoint first and append once (A-742).
+  pub fn green_chain_room(&self) -> usize {
+    self
+      .caps
+      .green_chain_bytes
+      .saturating_sub(self.green_chain_bytes)
   }
 
   /// A green volume's merge chain (§4.16): its accepted increments after its checkpoint
@@ -621,6 +692,8 @@ impl Partition {
     self
       .green_checkpoints
       .insert(green, (version, bytes.to_vec()));
+    // The green's log below the checkpoint is folded: its pointers to atomic records there go with it (A-642).
+    self.repositories.fold_atomic(green, version);
   }
 
   /// A green volume's encoded origin (§4.16), or `None` for a green that started from scratch
@@ -1148,9 +1221,54 @@ impl Partition {
     self.grants_issued_through
   }
 
+  /// The least counter a volume id minted here may take (A-694): one past the highest counter of every volume created
+  /// here.
+  pub fn volume_counter(&self) -> u64 {
+    self.volume_counter
+  }
+
+  /// The least number a family id minted here may take (A-636 part 2b-2): one past the highest number of every family
+  /// id created here.
+  pub fn family_counter(&self) -> u64 {
+    self.family_counter
+  }
+
+  /// Moves the minting counters past `id`, a volume's or a repository's just created (A-694; A-636 part 2b-2): the
+  /// family counter past a family id's number, the volume counter past any other id's counter. Advanced whatever the
+  /// creation's insert meets, as a replay must.
+  fn minted(&mut self, id: [u8; 16]) {
+    match crate::register::ObjectId(id).family_number() {
+      Some(number) => {
+        self.family_counter = self.family_counter.max(u64::from(number).saturating_add(1));
+      }
+      None => {
+        let counter = crate::catalog::VolumeId { bytes: id }.counter();
+        self.volume_counter = self.volume_counter.max(counter.saturating_add(1));
+      }
+    }
+  }
+
   /// An enrolled consumer's record (§4.13), or `None` if no such consumer was ever enrolled.
   pub fn consumer(&self, id: u64) -> Option<&ConsumerRecord> {
     self.consumers.get(&id)
+  }
+
+  /// A principal's tool identities (§4.13; A-664), or `None` when its owner never set them here.
+  pub fn identities(&self, principal: &Principal) -> Option<&IdentityRecord> {
+    self.identities.get(&principal.key())
+  }
+
+  /// A principal's identities set as the version after its current one (A-664), the first setting's 1: a setting made
+  /// from a stale read is refused `PolicyChanged` with the version now, and changes nothing.
+  fn check_identities(&self, record: &IdentityRecord) -> Result<(), DbError> {
+    let current = self
+      .identities(&record.principal)
+      .map_or(0, |held| held.version);
+    if current.checked_add(1) == Some(record.version) {
+      Ok(())
+    } else {
+      Err(DbError::PolicyChanged { current })
+    }
   }
 
   /// The NFSv4 opens held at this partition's files (§4.6 A-37).
@@ -1299,6 +1417,27 @@ impl Partition {
   /// A landing.
   pub fn landing(&self, id: u64) -> Option<&LandingRecord> {
     self.landings.get(&id)
+  }
+
+  /// The landings awaiting a grant from `from` (a volume and, within it, a landing id), in that order (A-773): a seek
+  /// into the waiting set, so a page costs the lines it carries.
+  pub fn awaiting_grant_from(
+    &self,
+    from: std::ops::Bound<(VolumeId, u64)>,
+  ) -> impl Iterator<Item = &LandingRecord> + '_ {
+    self
+      .awaiting_grant
+      .range((from, std::ops::Bound::Unbounded))
+      .filter_map(|(_, id)| self.landings.get(id))
+  }
+
+  /// Keeps `awaiting_grant` equal to the landings whose state is `AwaitingGrant`.
+  fn note_awaiting(&mut self, volume: VolumeId, id: u64, state: LandingState) {
+    if state == LandingState::AwaitingGrant {
+      self.awaiting_grant.insert((volume, id));
+    } else {
+      self.awaiting_grant.remove(&(volume, id));
+    }
   }
 
   /// The highest landing id the partition holds, or `None` when it holds none — asked once at boot, so
@@ -1495,9 +1634,72 @@ impl Partition {
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
       | Op::RepositoryDestroyed { .. }
-      | Op::RepositoryGreenJoined { .. } => self
-        .repositories
-        .check(op, self.caps.volumes, |id| self.held(id)),
+      | Op::RepositoryGreenJoined { .. } => self.repositories.check(
+        op,
+        self.caps.volumes,
+        |id| self.held(id),
+        |green| self.green_head(green),
+      ),
+      // A repository recorded whole by its successor (A-636 part 2c-2): `crate::repository`; its state and policy fit the
+      // merge byte budget.
+      Op::RepositoryRebuilt { record, parts } => {
+        self.repositories.check(
+          op,
+          self.caps.volumes,
+          |id| self.held(id),
+          |green| self.green_head(green),
+        )?;
+        let added = crate::repository::Repositories::rebuilt_bytes(record, parts);
+        self.merge_bytes_fit(0, added)
+      }
+      // An entry of a repository's register (A-603): its rules, then its versions' chain entries and the state it adds
+      // within the merge budget, less the state it removes.
+      Op::RepositoryAdvanced { entry } => self.check_entry(entry, &[]),
+      // A repository's policy, set whole (A-622): `crate::repository`; its rules and hooks fit the merge byte budget,
+      // the policy it replaces given back.
+      Op::RepositoryPolicySet { repository, policy } => {
+        self.repositories.check(
+          op,
+          self.caps.volumes,
+          |id| self.held(id),
+          |green| self.green_head(green),
+        )?;
+        let bytes = self.repositories.policy_bytes(*repository, policy);
+        self.merge_bytes_fit(bytes.released, bytes.added)
+      }
+      // A repository's index cut (A-724 piece 9): `crate::repository`, one bit at a time; no bytes move.
+      Op::RepositoryIndexCut { .. } => self.repositories.check(
+        op,
+        self.caps.volumes,
+        |id| self.held(id),
+        |green| self.green_head(green),
+      ),
+      // A review record keeps §4.17.1's rules (A-596): `crate::review`; its bytes fit the merge byte budget.
+      Op::ReviewCommented { .. }
+      | Op::ReviewCommentMoved { .. }
+      | Op::ReviewCommentOutdated { .. }
+      | Op::ReviewApproved { .. }
+      | Op::ReviewApprovalStaled { .. }
+      | Op::ReviewClosed { .. } => {
+        self
+          .reviews
+          .check(op, |id| self.repositories.repository(id).is_some())?;
+        let (released, added) = self.reviews.charge(op);
+        self.merge_bytes_fit(released, added)
+      }
+      // A version-control credential (A-625 part 3): `crate::credentials`; its bytes fit the table byte budget, and the
+      // refusal names the table the human was adding to.
+      Op::CredentialEnrolled { .. }
+      | Op::CredentialRevoked { .. }
+      | Op::CredentialTombstoned { .. } => {
+        self.credentials.check(op)?;
+        let (released, added) = self.credentials.charge(op);
+        self
+          .merge_bytes_fit(released, added)
+          .map_err(|_| DbError::Capacity {
+            table: "credentials",
+          })
+      }
       Op::TombstoneAdopted { tombstone } => {
         if self.volume(tombstone.volume).is_some()
           || self.tombstones.contains_key(&tombstone.volume)
@@ -1686,6 +1888,7 @@ impl Partition {
         .get(consumer)
         .map(|_| ())
         .ok_or(DbError::NotFound),
+      Op::IdentitiesSet { record } => self.check_identities(record),
       Op::LandingLeaseTaken { record } => self.check_landing_lease(record, now_ns),
       Op::LandingLeaseReleased { target } => self
         .landing_lease(target)
@@ -1700,6 +1903,11 @@ impl Partition {
         Ok(())
       }
       Op::LandingStateChanged { id, .. } => self.landing(*id).map(|_| ()).ok_or(DbError::NotFound),
+      // Only a landing still awaiting its grant is superseded, and only by another landing this partition holds.
+      Op::LandingSuperseded { id, by } => match (self.landing(*id), self.landing(*by)) {
+        (Some(older), Some(_)) if older.state == LandingState::AwaitingGrant && id != by => Ok(()),
+        _ => Err(DbError::NotFound),
+      },
       // The audit is never refused (A-265): its records are the history of what happened, kept or counted as dropped.
       Op::AuditAppended { .. }
       | Op::AuditOwed { .. }
@@ -1750,6 +1958,60 @@ impl Partition {
       // A green adopted by its successor is recorded by its adoption (A-333): a new volume, checked as a creation is.
       Op::GreenAdopted { record, .. } => self.check_volume_created(record),
     }
+  }
+
+  /// The guard for recording `made`, new volumes, and then `entry` (A-635): judged whole before the first is recorded,
+  /// since what a transaction records before a refusal commits with it. Each made volume is checked as its creation is,
+  /// with the ids and names of those made before it and the volumes table's room for all of them; then the entry, each
+  /// made green counted one the partition holds, at no version yet. A push that makes new branches records them so.
+  pub fn check_creating(
+    &self,
+    made: &[crate::catalog::VolumeRecord],
+    entry: &crate::catalog::RepositoryEntry,
+  ) -> Result<(), DbError> {
+    for (index, record) in made.iter().enumerate() {
+      self.check_volume_created(record)?;
+      if made
+        .iter()
+        .take(index)
+        .any(|earlier| earlier.id == record.id || earlier.name == record.name)
+      {
+        return Err(DbError::AlreadyExists {
+          existing: record.id.bytes,
+        });
+      }
+    }
+    if self.volume_slots_used().saturating_add(made.len()) > self.caps.volumes {
+      return Err(DbError::Capacity { table: "volumes" });
+    }
+    self.check_entry(entry, made)
+  }
+
+  /// The guard for an entry of a repository's register (A-603): its rules, then its versions' chain entries and the
+  /// state it adds within the merge budget, less the state it removes. `made` are volumes recorded before it in its
+  /// transaction (A-635), each held as its record says, a green at no version yet.
+  fn check_entry(
+    &self,
+    entry: &crate::catalog::RepositoryEntry,
+    made: &[crate::catalog::VolumeRecord],
+  ) -> Result<(), DbError> {
+    let held = |id: VolumeId| match made.iter().find(|record| record.id == id) {
+      Some(record) if matches!(record.policy.role, crate::catalog::Role::Green { .. }) => {
+        crate::repository::Held::Green
+      }
+      Some(_) => crate::repository::Held::NotGreen,
+      None => self.held(id),
+    };
+    let head = |green: VolumeId| {
+      if made.iter().any(|record| record.id == green) {
+        0
+      } else {
+        self.green_head(green)
+      }
+    };
+    self.repositories.check_entry(entry, held, head)?;
+    let bytes = crate::repository::Repositories::entry_bytes(entry);
+    self.merge_bytes_fit(bytes.released, bytes.added)
   }
 
   /// The check of a volume's creation, and of a green's by its adoption (A-333): the id and the name free here (a name
@@ -1889,10 +2151,31 @@ impl Partition {
   }
 
   /// Applies a recorded operation; unconditional, so replay is deterministic. A record the
-  /// operation names that does not exist (a corrupted history) is a typed refusal.
+  /// operation names that does not exist (a corrupted history) is a typed refusal. What it moved of a repository's
+  /// state logs is kept as their records until the next operation starts (A-636 part 2b;
+  /// [`Partition::take_state_log_records`]).
   pub fn apply(&mut self, op: &Op) -> Result<(), DbError> {
+    self.repositories.clear_made();
+    self.apply_op(op)?;
+    self
+      .repositories
+      .seal_made(|| slates_wire::Wire::to_bytes(op));
+    Ok(())
+  }
+
+  /// The state logs' records the operation last applied made, each stamped with the operation's identity and spans
+  /// (A-636 part 2b), leaving none: what the database hands its owner to ship once the operation is durable.
+  pub fn take_state_log_records(&mut self) -> Vec<crate::catalog::StateLogRecord> {
+    self.repositories.take_made()
+  }
+
+  /// [`Partition::apply`]'s operation itself.
+  fn apply_op(&mut self, op: &Op) -> Result<(), DbError> {
     match op {
-      Op::VolumeCreated { record } => self.insert_volume(record.clone()),
+      Op::VolumeCreated { record } => {
+        self.minted(record.id.bytes);
+        self.insert_volume(record.clone())
+      }
       Op::VolumeStateChanged { id, state } => self.update_volume(*id, |v| v.state = *state),
       Op::VolumeResized { id, size } => self.update_volume(*id, |v| {
         v.policy.size = *size;
@@ -1972,12 +2255,50 @@ impl Partition {
         self.carried.insert(*volume, (carried.clone(), *mark));
         Ok(())
       }
-      Op::RepositoryCreated { .. }
-      | Op::RepositoryBranchAdded { .. }
+      Op::RepositoryCreated { record } | Op::RepositoryRebuilt { record, .. } => {
+        self.minted(record.id.bytes);
+        self.apply_repository(op)
+      }
+      Op::RepositoryBranchAdded { .. }
       | Op::RepositoryBranchRetired { .. }
       | Op::RepositoryDefaultSet { .. }
-      | Op::RepositoryDestroyed { .. }
-      | Op::RepositoryGreenJoined { .. } => self.repositories.apply(op),
+      | Op::RepositoryGreenJoined { .. }
+      | Op::RepositoryAdvanced { .. }
+      | Op::RepositoryPolicySet { .. }
+      | Op::RepositoryIndexCut { .. } => self.apply_repository(op),
+      // A destroyed repository's review records leave with it, their bytes back to the merge budget (A-596), as its
+      // register's state does (A-603).
+      Op::RepositoryDestroyed { repository } => {
+        self.apply_repository(op)?;
+        let released = self.reviews.repository_removed(*repository);
+        self.green_chain_bytes = self.green_chain_bytes.saturating_sub(released);
+        Ok(())
+      }
+      Op::ReviewCommented { .. }
+      | Op::ReviewCommentMoved { .. }
+      | Op::ReviewCommentOutdated { .. }
+      | Op::ReviewApproved { .. }
+      | Op::ReviewApprovalStaled { .. }
+      | Op::ReviewClosed { .. } => {
+        let (released, added) = self.reviews.charge(op);
+        self.reviews.apply(op)?;
+        self.green_chain_bytes = self
+          .green_chain_bytes
+          .saturating_sub(released)
+          .saturating_add(added);
+        Ok(())
+      }
+      Op::CredentialEnrolled { .. }
+      | Op::CredentialRevoked { .. }
+      | Op::CredentialTombstoned { .. } => {
+        let (released, added) = self.credentials.charge(op);
+        self.credentials.apply(op)?;
+        self.green_chain_bytes = self
+          .green_chain_bytes
+          .saturating_sub(released)
+          .saturating_add(added);
+        Ok(())
+      }
       // Re-adopted here (A-362): the stale record goes with what `remove_volume` takes, and nothing of a destroy's.
       Op::VolumeRelinquished { id } => self.remove_volume(*id),
       Op::TombstoneAdopted { tombstone } => {
@@ -2246,6 +2567,12 @@ impl Partition {
         record.write_version = record.write_version.saturating_add(1);
         Ok(())
       }
+      Op::IdentitiesSet { record } => {
+        self
+          .identities
+          .insert(record.principal.key(), record.clone());
+        Ok(())
+      }
       Op::LandingLeaseTaken { record } => {
         self
           .landing_leases
@@ -2261,6 +2588,7 @@ impl Partition {
       }
       Op::LandingRecorded { record } => {
         self.landings.insert(record.id, record.clone());
+        self.note_awaiting(record.volume, record.id, record.state);
         Ok(())
       }
       Op::LandingStateChanged {
@@ -2273,6 +2601,16 @@ impl Partition {
         landing.state = *state;
         landing.written = *written;
         landing.conflicts = *conflicts;
+        let volume = landing.volume;
+        self.note_awaiting(volume, *id, *state);
+        Ok(())
+      }
+      Op::LandingSuperseded { id, by } => {
+        let landing = self.landings.get_mut(id).ok_or(DbError::NotFound)?;
+        landing.state = LandingState::Superseded;
+        landing.superseded_by = Some(*by);
+        let volume = landing.volume;
+        self.note_awaiting(volume, *id, LandingState::Superseded);
         Ok(())
       }
       Op::AuditAppended { record } => {
@@ -2354,6 +2692,36 @@ impl Partition {
 
   /// Whether replacing `released` bytes of the merge budget with `added` keeps it within the partition's cap: the
   /// typed refusal at the bound otherwise (bounded growth, CLAUDE.md banned item 8).
+  /// Applies a repository operation (A-515, A-575, A-603): the repositories' own change, then an entry's versions as
+  /// the greens' chain entries, each charged to the merge budget with what the repositories' state gained, less what it
+  /// released.
+  fn apply_repository(&mut self, op: &Op) -> Result<(), DbError> {
+    let bytes = match op {
+      // Each green an entry moves goes from its head before it (A-642): what its atomic record holds of its log.
+      Op::RepositoryAdvanced { entry } => {
+        let greens =
+          crate::repository::Repositories::green_spans(entry, |green| self.green_head(green));
+        self.repositories.apply_advanced(entry, greens)?
+      }
+      _ => self.repositories.apply(op)?,
+    };
+    if let Op::RepositoryAdvanced { entry } = op {
+      for version in &entry.versions {
+        self.green_chain_bytes = self.green_chain_bytes.saturating_add(version.entry.len());
+        self
+          .green_chains
+          .entry(version.green)
+          .or_default()
+          .push(version.entry.clone());
+      }
+    }
+    self.green_chain_bytes = self
+      .green_chain_bytes
+      .saturating_sub(bytes.released)
+      .saturating_add(bytes.added);
+    Ok(())
+  }
+
   fn merge_bytes_fit(&self, released: usize, added: usize) -> Result<(), DbError> {
     if self
       .green_chain_bytes
@@ -2626,6 +2994,13 @@ impl Partition {
       repositories: self.repositories.repositories().cloned().collect(),
       repository_branches: self.repositories.bindings().collect(),
       repository_members: self.repositories.memberships().collect(),
+      review_comments: self.reviews.comment_records().cloned().collect(),
+      review_approvals: self.reviews.approval_records().cloned().collect(),
+      repository_registers: self.repositories.registers().collect(),
+      atomic_records: self.repositories.atomic_held(),
+      identities: self.identities.values().cloned().collect(),
+      credentials: self.credentials.records().cloned().collect(),
+      credential_tombstones: self.credentials.tombstones().copied().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -2642,6 +3017,8 @@ impl Partition {
       audit_next_seq: self.audit_next_seq,
       audit_dropped: self.audit_dropped,
       grants_issued_through: self.grants_issued_through,
+      volume_counter: self.volume_counter,
+      family_counter: self.family_counter,
       audit_outbox: self.audit_outbox.iter().cloned().collect(),
       audit_outbox_next: self.audit_outbox_next,
       audit_received: self
@@ -2675,10 +3052,16 @@ impl Partition {
     }
   }
 
-  /// Restores the enrolled consumers (§4.13) and the owed tombstones (AUD-29-43) a snapshot carries.
+  /// Restores the enrolled consumers and the principals' tool identities (§4.13, A-664) and the owed tombstones
+  /// (AUD-29-43) a snapshot carries.
   fn restore_consumers_and_tombstones(&mut self, snapshot: &PartitionSnapshot) {
     for c in &snapshot.consumers {
       self.consumers.insert(c.consumer, c.clone());
+    }
+    for record in &snapshot.identities {
+      self
+        .identities
+        .insert(record.principal.key(), record.clone());
     }
     for tombstone in &snapshot.tombstones {
       self.tombstones.insert(tombstone.volume, tombstone.sequence);
@@ -2846,11 +3229,14 @@ impl Partition {
     }
     for l in &snapshot.landings {
       p.landings.insert(l.id, l.clone());
+      p.note_awaiting(l.volume, l.id, l.state);
     }
     p.audit = snapshot.audit.iter().cloned().collect();
     p.audit_dropped = snapshot.audit_dropped;
     p.audit_next_seq = snapshot.audit_next_seq;
     p.grants_issued_through = snapshot.grants_issued_through;
+    p.volume_counter = snapshot.volume_counter;
+    p.family_counter = snapshot.family_counter;
     p.audit_outbox = snapshot.audit_outbox.iter().cloned().collect();
     p.audit_outbox_next = snapshot.audit_outbox_next;
     p.audit_received = snapshot
@@ -2874,7 +3260,26 @@ impl Partition {
       &snapshot.repositories,
       &snapshot.repository_branches,
       &snapshot.repository_members,
+      &snapshot.repository_registers,
+      &snapshot.atomic_records,
     )?;
+    // The repositories' own state is charged to the merge budget as it was when recorded (A-603).
+    p.green_chain_bytes = p
+      .green_chain_bytes
+      .saturating_add(p.repositories.state_bytes());
+    // The review records, charged to the merge byte budget as when they were recorded (A-596).
+    p.reviews = crate::review::Reviews::restore(
+      &snapshot.review_comments,
+      &snapshot.review_approvals,
+      |id| p.repositories.repository(id).is_some(),
+    )?;
+    p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.reviews.bytes());
+    // The version-control credentials, charged to the table byte budget as when each was enrolled (A-625 part 3).
+    p.credentials = crate::credentials::Credentials::restore(
+      &snapshot.credentials,
+      &snapshot.credential_tombstones,
+    )?;
+    p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.credentials.bytes());
     Ok(p)
   }
 
@@ -2924,3 +3329,7 @@ impl Partition {
     }
   }
 }
+
+#[cfg(test)]
+#[path = "tests/identities.rs"]
+mod identities_tests;

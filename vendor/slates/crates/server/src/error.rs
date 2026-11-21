@@ -191,6 +191,8 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
       found: *found,
       expected: *expected,
     }),
+    VfsError::ReferenceUnresolved => volume(VolumeRefusal::ReferenceUnresolved),
+    VfsError::ReferencesHeld => volume(VolumeRefusal::ReferencesHeld),
   }
 }
 
@@ -262,6 +264,38 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::InvalidName => Refusal::InvalidName,
     // A green live members of its lineage were made from is pinned by them, as a snapshot by its clones (A-575).
     DbError::BranchedFrom { .. } => volume(VolumeRefusal::Pinned),
+    // A review record's change its rules refuse (§4.17.1 shared piece 6, A-596): an argument the change does not take
+    // (a version not after the record's, an approval bound back, an outdated comment moved). No verb records review
+    // operations yet; the review verbs (owed) type their refusals on the wire, as A-299 did the database's.
+    DbError::Review(_) => volume(VolumeRefusal::Invalid),
+    // An entry of a repository's logs refused (A-603, A-642): a green moved from the position the push read, named; a
+    // check that no longer holds; or a state change made against another state. Each server answers its tool's words
+    // for a repository that moved under the push.
+    DbError::Moved { green, read, at } => database(DatabaseRefusal::Moved {
+      green: slates_ipc::protocol::VolumeId { bytes: *green },
+      read: *read,
+      at: *at,
+    }),
+    DbError::CheckFailed { index } => database(DatabaseRefusal::CheckFailed { index: *index }),
+    DbError::StateChanged { index } => database(DatabaseRefusal::StateChanged { index: *index }),
+    // A repository's policy set from a version it has moved past, or one its repository cannot hold (A-622).
+    DbError::PolicyChanged { current } => Refusal::PolicyChanged { current: *current },
+    DbError::PolicyRuleMalformed { index } => {
+      database(DatabaseRefusal::PolicyRuleMalformed { index: *index })
+    }
+    DbError::PolicyHookMalformed { index } => {
+      database(DatabaseRefusal::PolicyHookMalformed { index: *index })
+    }
+    DbError::PolicyHooksEnvMalformed { index } => {
+      database(DatabaseRefusal::PolicyHooksEnvMalformed { index: *index })
+    }
+    DbError::IndexCutStep { current } => {
+      database(DatabaseRefusal::IndexCutStep { current: *current })
+    }
+    DbError::SnapshotRoom { needed, room } => database(DatabaseRefusal::SnapshotRoom {
+      needed: *needed,
+      room: *room,
+    }),
   }
 }
 
@@ -373,6 +407,29 @@ mod tests {
           refusal: VolumeRefusal::Memory
         },
         "{memory:?}"
+      );
+    }
+  }
+
+  /// A-596 (§4.17.1 shared piece 6). Do: map each rule a review record's change can break. Expect each typed as the
+  /// volume core's `Invalid`, an argument the change does not take, never words.
+  #[test]
+  fn every_review_refusal_is_typed() {
+    use slates_db::error::ReviewRefusal;
+    for rule in [
+      ReviewRefusal::Outdated,
+      ReviewRefusal::Stale,
+      ReviewRefusal::NotAfter,
+      ReviewRefusal::Behind,
+      ReviewRefusal::Ended,
+      ReviewRefusal::Empty,
+    ] {
+      assert_eq!(
+        refusal_of_db(&DbError::Review(rule)),
+        Refusal::Volume {
+          refusal: VolumeRefusal::Invalid
+        },
+        "{rule:?}"
       );
     }
   }

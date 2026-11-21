@@ -45,9 +45,15 @@ use std::os::windows::ffi::OsStrExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 /// Shape: shards for the test daemon, as `tests/winfsp.rs`.
 const SHARDS: &str = "2";
-/// Shape: how long the drive gets to answer after the mount's reply: ten liveness budgets, as `tests/winfsp.rs`.
+/// Shape: how long a call on the drive gets before it counts as wedging the drive ([`within_wait`]): ten liveness
+/// budgets, as `tests/winfsp.rs`. The bound that test proves, not a wait on the daemon: the drive's answer after its
+/// mount and a change reaching another name are waited for while the daemon gains CPU (`process_wait::Judged`) since
+/// 2026-11-20.
 const WAIT_FOR: Duration = Duration::from_secs(10);
 /// Shape: the pause between polls.
 const POLL: Duration = Duration::from_millis(20);
@@ -249,12 +255,10 @@ impl Drive {
     let letter = free_drive_letter();
     let (code, _, err) = run(&instance, &["mount", &id, &letter]);
     assert_eq!(code, 0, "mount: {err}");
-    let started = Instant::now();
+    // While the anchor's process gains CPU (until 2026-11-20 within `WAIT_FOR`).
+    let mut judged = process_wait::Judged::of(anchor.child.id());
     while std::fs::metadata(format!("{letter}\\")).is_err() {
-      assert!(
-        started.elapsed() < WAIT_FOR,
-        "{letter} never answered within {WAIT_FOR:?}"
-      );
+      judged.look(&format!("{letter} answered"));
       pause();
     }
     Drive {
@@ -379,16 +383,17 @@ fn links_and_index(path: &str) -> (u32, u64) {
   )
 }
 
-/// Polls `seen` until it holds, within [`WAIT_FOR`]; answers how long that took. A change through one name of a file
+/// Polls `seen` until it holds, while `instance`'s daemon gains CPU (`process_wait::Judged` on the pid its `status` names;
+/// until 2026-11-20 within [`WAIT_FOR`]); answers how long that took. A change through one name of a file
 /// reaches the file nodes of its other names at the mount's next round, not before the change's own reply (A-360): each
 /// name has its own node in WinFsp's driver, and the mount tells them by notification.
-fn eventually(what: &str, mut seen: impl FnMut() -> bool) -> Duration {
+fn eventually(instance: &str, what: &str, mut seen: impl FnMut() -> bool) -> Duration {
   let started = Instant::now();
+  let (code, out, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "status: {err}");
+  let mut judged = process_wait::Judged::of(value_of(&out, "pid").parse().unwrap());
   while !seen() {
-    assert!(
-      started.elapsed() < WAIT_FOR,
-      "{what}: not seen within {WAIT_FOR:?}"
-    );
+    judged.look(what);
     pause();
   }
   started.elapsed()
@@ -438,18 +443,22 @@ fn a_hard_link_made_through_the_drive_names_the_same_file() {
     drive.read_through_slates("first.txt").as_deref(),
     Some("written through the second name")
   );
-  let told = eventually("the second name's write through the first name", || {
-    std::fs::read(drive.path("first.txt")).unwrap() == b"written through the second name"
-  });
+  let told = eventually(
+    &drive.instance,
+    "the second name's write through the first name",
+    || std::fs::read(drive.path("first.txt")).unwrap() == b"written through the second name",
+  );
   eprintln!("the first name read the second name's write {told:?} after its close");
   std::fs::remove_file(drive.path("first.txt")).unwrap();
   assert_eq!(
     std::fs::read(drive.path("second.txt")).unwrap(),
     b"written through the second name"
   );
-  let told = eventually("one link left after the first name's delete", || {
-    links_and_index(&drive.path("second.txt")) == (1, second_index)
-  });
+  let told = eventually(
+    &drive.instance,
+    "one link left after the first name's delete",
+    || links_and_index(&drive.path("second.txt")) == (1, second_index),
+  );
   eprintln!("the second name counted one link {told:?} after the first name's delete");
   std::fs::write(drive.path("third.txt"), b"another file").unwrap();
   assert_eq!(
@@ -1497,16 +1506,21 @@ impl OtherAccount {
     Some(account)
   }
 
-  /// Opens `path` for reading as this account (this thread impersonates it for the one call): `Ok` or the Win32 error.
-  fn open(&self, path: &str) -> Result<(), i32> {
-    let name = wide(path);
-    // SAFETY: the account's live token; this thread reverts below before anything else runs on it.
+  /// This thread impersonates the account until [`revert_to_self`]; a test fails where it cannot.
+  fn impersonate(&self) {
+    // SAFETY: the account's live token; the caller reverts before anything else runs on this thread.
     let impersonated = unsafe { windows_sys::Win32::Security::ImpersonateLoggedOnUser(self.token) };
     assert!(
       impersonated != 0,
       "ImpersonateLoggedOnUser: {}",
       std::io::Error::last_os_error()
     );
+  }
+
+  /// Opens `path` for reading as this account (this thread impersonates it for the one call): `Ok` or the Win32 error.
+  fn open(&self, path: &str) -> Result<(), i32> {
+    let name = wide(path);
+    self.impersonate();
     // SAFETY: a terminated path, no security attributes and no template; a valid handle is closed at once.
     let handle = unsafe {
       windows_sys::Win32::Storage::FileSystem::CreateFileW(
@@ -1520,13 +1534,7 @@ impl OtherAccount {
       )
     };
     let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(-1);
-    // SAFETY: ends this thread's impersonation, which the call above began.
-    let reverted = unsafe { windows_sys::Win32::Security::RevertToSelf() };
-    assert!(
-      reverted != 0,
-      "RevertToSelf: {}",
-      std::io::Error::last_os_error()
-    );
+    revert_to_self();
     if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
       return Err(error);
     }
@@ -1534,6 +1542,17 @@ impl OtherAccount {
     unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
     Ok(())
   }
+}
+
+/// Ends this thread's impersonation ([`OtherAccount::impersonate`]); a test fails where it cannot.
+fn revert_to_self() {
+  // SAFETY: ends this thread's impersonation, which `impersonate` began.
+  let reverted = unsafe { windows_sys::Win32::Security::RevertToSelf() };
+  assert!(
+    reverted != 0,
+    "RevertToSelf: {}",
+    std::io::Error::last_os_error()
+  );
 }
 
 impl Drop for OtherAccount {
@@ -1708,6 +1727,34 @@ fn every_spelling_of_a_file_on_a_folding_drive_is_one_file_to_windows() {
     std::fs::read_to_string(drive.path("caf\u{e9}.TXT")).unwrap(),
     "made as Caf\u{e9}.txt"
   );
+}
+
+/// A-576, A-737 (goal 87): names Windows' own upcase table takes for one are one file on a folding drive, and names it
+/// keeps apart are two, as on NTFS. Do: on a folding volume's drive, make `ɐ.txt` and read `Ɐ.TXT`; make `ς.txt` and
+/// then `σ.txt`. Expect: `Ɐ.TXT` reads `ɐ.txt`'s bytes and its final path names `ɐ.txt`; `ς.txt` and `σ.txt` two files
+/// with their own bytes. Windows' table leaves final sigma `ς` as it is (dumped through `RtlUpcaseUnicodeChar` on both
+/// architectures, A-737), so A-576's premise that a Windows-alike `ς` beside `σ` must be refused does not hold.
+#[test]
+fn names_windows_folds_alike_are_one_file_on_a_folding_drive_and_final_sigma_is_two() {
+  if !live_mount_runs() {
+    return;
+  }
+  let drive = Drive::mount_with("fold-upcase", &["--fold"]);
+  std::fs::write(drive.path("\u{250}.txt"), b"turned").unwrap();
+  assert_eq!(
+    std::fs::read(drive.path("\u{2c6f}.TXT")).unwrap(),
+    b"turned"
+  );
+  let canonical = final_path(&drive.path("\u{2c6f}.TXT"));
+  eprintln!("A-576 the final path of `\u{2c6f}.TXT`: {canonical:?}");
+  assert_eq!(
+    canonical,
+    Ok(format!("\\\\?\\{}\\\u{250}.txt", drive.letter))
+  );
+  std::fs::write(drive.path("\u{3c2}.txt"), b"final").unwrap();
+  std::fs::write(drive.path("\u{3c3}.txt"), b"medial").unwrap();
+  assert_eq!(std::fs::read(drive.path("\u{3c2}.txt")).unwrap(), b"final");
+  assert_eq!(std::fs::read(drive.path("\u{3c3}.txt")).unwrap(), b"medial");
 }
 
 /// A-551. Do: on an exact volume's drive, make `a.txt` and `A.TXT` with different bytes, open `A.TXT` sharing nothing

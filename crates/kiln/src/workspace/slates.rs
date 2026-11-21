@@ -148,7 +148,14 @@ pub const INSTANCE: &str = "kiln";
 /// `EACCES` (main's macOS microVM drive, r134). It uses neither 49, a host refusal's code carrying its numbering
 /// (`HostFault::Base` names an `OsCode`; kiln matches only `HostFault::Target`), nor 50, a volume exported to one client
 /// (`Instance::export`, for kiln's Kubernetes engine, W10).
-pub const CONTRACT: u32 = 50;
+///
+/// 57 since kiln took Slates at 8ce3d6152 (from 50; Slates' A-769). kiln takes the revision for 57's
+/// `container_engine::export_engine`, the export route's judge (where an engine mounts a volume's NFS export from, on
+/// every host, Windows' Docker Desktop among them), which w-k90-containers' Windows leg of A-520's export route waits on;
+/// and 57's `EngineFault::Untested` carries its profile boxed. It uses none of 51 to 56 (a submit's message and
+/// identities, the version-control edges' addresses in `ProcessOptions` and `StartSpec`, a Subversion import's fault):
+/// kiln builds no `StartSpec` or `ProcessOptions` by its fields, and matches none of their enums whole.
+pub const CONTRACT: u32 = 57;
 /// The word that makes kiln's executable one of Slates' processes rather than kiln: `kiln slates-role
 /// --instance <name> anchor --shards <n>` is an instance's anchor, and the daemon its anchor starts
 /// runs the same way. Every such process carries its instance's name in its arguments.

@@ -38,9 +38,9 @@ use std::fmt;
 use slates_client::ClientError;
 use slates_ipc::error::RouteRefusal;
 use slates_ipc::protocol::{
-  ArchiveFault, AttachTransport, DatabaseRefusal, HostPathReason, MoveRefusal, OwnMountUse,
-  Principal, RecoveryCause, Refusal, SnapshotId, TargetRefusal, UnsupportedReason, VolumeId,
-  VolumeRefusal,
+  ArchiveFault, AttachTransport, CopyCase, DatabaseRefusal, HostPathReason, ImportFault,
+  MoveRefusal, OwnMountUse, Principal, RecoveryCause, Refusal, SnapshotId, TargetRefusal,
+  UnsupportedReason, VcsTool, VolumeId, VolumeRefusal,
 };
 use slates_ipc::{DeliveryFault, IpcError};
 
@@ -335,6 +335,12 @@ pub enum Stale {
   },
   /// An approval of another manifest than the one about to be written: present again.
   Approval,
+  /// An approval of a landing a newer presentation of the same volume into the same target superseded (A-779): an
+  /// older state never lands over a newer one. Read and grant the newer.
+  Superseded {
+    /// The newer presentation.
+    newer: u64,
+  },
   /// A grant missing, expired or revoked.
   Grant,
   /// The disk changed under these entries after the plan was made (§4.15 step 4): present again.
@@ -410,8 +416,9 @@ pub enum RetryCause {
   /// A stream's holder record has not reached its shard yet (A-181).
   HolderPending,
   /// The verb ran on its owner, but what its reply waits for (a live volume's log on `f` candidates, a destroy's
-  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): its effects stay on the
-  /// owner, never claimed durable, and the call made again runs the verb again.
+  /// tombstone placed at `f + 1`) was not held within the failover SLO from the hold (A-354): it took effect once and
+  /// recorded its own reply, which the client asks for again under the request's id itself (since 2026-11-20), so this
+  /// reaches a caller only where that resend found no room. Asked again under a new id it runs again: a new request.
   DurabilityPending {
     /// How long the reply was held, nanoseconds.
     held_ns: u64,
@@ -429,6 +436,14 @@ pub enum RetryCause {
   /// A move's records were not placed within the fleet's failover SLO, so it was not reported and the volume thawed
   /// (A-291): ask for the move again.
   MoveUnplaced,
+  /// A credential's enrollment or revocation reached `held` of the `needed` members of the region (A-764): what was done
+  /// stands where it reached; ask again to reach the rest.
+  CredentialUnreplicated {
+    /// The members that hold it as asked.
+    held: u64,
+    /// The members it must reach.
+    needed: u64,
+  },
 }
 
 /// Why no daemon answers.
@@ -488,6 +503,12 @@ pub enum Invalid {
   Kind(KindMismatch),
   /// The green requires evidence on every increment, and the merge carried none.
   EvidenceRequired,
+  /// A submit to a green of a repository carried no message, which the commit the server makes of its work needs (A-664;
+  /// the submit request carries one, `slates_ipc::protocol::RequestBody::with_message`).
+  MessageRequired,
+  /// A submit to a green of a repository was made by a principal with no identity in the repository's tool (A-664): its
+  /// owner sets the principal's identities (`SetIdentities`), and a session reads them at its first submit.
+  IdentityRequired(VcsTool),
   /// A green's base must be a complete immutable snapshot, and this one still serves entries from a host folder: pin the
   /// whole base and snapshot again. Or a capture's folder moved under it (`Instance::capture_base`, A-291): capture it
   /// again once nothing writes it.
@@ -528,6 +549,18 @@ pub enum Invalid {
   /// The bytes an archive import read make no volume, by their kind (A-453): another format's file, a newer format, a
   /// copy cut off or altered, or an archive a faulty writer made. Nothing was made.
   Archive(ArchiveFault),
+  /// A repository's import was refused by its fault (A-678): another tool's repository, a store with a history, an
+  /// import under way, a format or a file the import does not take, more than it may hold, a fetch still pending, or
+  /// the import given back. The repository's store is as it was.
+  Import(ImportFault),
+  /// A copy the submitted work declares was refused before any verdict, by its case (A-586; main's ruling of
+  /// 2026-11-20): no rebase answers it; nothing of the work was applied.
+  Copy {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyCase,
+  },
 }
 
 /// Why a move's target cannot take the volume ([`Invalid::MoveTarget`], A-291).
@@ -837,6 +870,7 @@ impl Error {
       Refusal::UnknownBase { green, version } => Error::Stale(Stale::Base { green, version }),
       Refusal::AttachmentExpired { attachment } => Error::Stale(Stale::Attachment { attachment }),
       Refusal::GrantMismatch => Error::Stale(Stale::Approval),
+      Refusal::LandingSuperseded { newer } => Error::Stale(Stale::Superseded { newer }),
       Refusal::PolicyChanged { current } => Error::Stale(Stale::Policy { current }),
       Refusal::VerdictReplaced { work } => Error::Stale(Stale::Verdict { work }),
       Refusal::GrantInvalid => Error::Stale(Stale::Grant),
@@ -936,11 +970,19 @@ impl Error {
       Refusal::NotGreen => Error::Invalid(Invalid::Kind(KindMismatch::NotGreen)),
       Refusal::NotWork => Error::Invalid(Invalid::Kind(KindMismatch::NotWork)),
       Refusal::EvidenceRequired => Error::Invalid(Invalid::EvidenceRequired),
+      Refusal::MessageRequired => Error::Invalid(Invalid::MessageRequired),
+      Refusal::IdentityRequired { tool } => Error::Invalid(Invalid::IdentityRequired(tool)),
       Refusal::ConsistentBaseUnavailable => Error::Invalid(Invalid::LiveBase),
       Refusal::DigestNotClean => Error::Invalid(Invalid::NoCleanDigest),
       Refusal::ChosenPathUnavailable { reason } => Error::Invalid(Invalid::ChosenPath(reason)),
       Refusal::ImageRefused { reason } => Error::Invalid(Invalid::Image(Note::new(reason))),
       Refusal::ArchiveRefused { fault } => Error::Invalid(Invalid::Archive(fault)),
+      Refusal::ImportRefused { fault } => Error::Invalid(Invalid::Import(fault)),
+      Refusal::CopyRefused { path, case } => Error::Invalid(Invalid::Copy { path, case }),
+      Refusal::CredentialUnreplicated { held, needed } => retry(
+        RetryCause::CredentialUnreplicated { held, needed },
+        pause_ns,
+      ),
       Refusal::OwnMount { path, used_as } => Error::Invalid(Invalid::OwnMount { path, used_as }),
       Refusal::Destroying => Error::Unusable(Unusable::Destroying),
       Refusal::Archived => Error::Unusable(Unusable::Archived),
@@ -983,7 +1025,9 @@ impl Error {
   /// A volume-core refusal, by the class of thing a consumer does about it (A-299).
   fn of_volume(refusal: VolumeRefusal) -> Error {
     match refusal {
-      VolumeRefusal::Pinned | VolumeRefusal::DaxMapped => Error::Busy(Busy::Volume(refusal)),
+      VolumeRefusal::Pinned | VolumeRefusal::DaxMapped | VolumeRefusal::ReferencesHeld => {
+        Error::Busy(Busy::Volume(refusal))
+      }
       VolumeRefusal::StaleHandle | VolumeRefusal::BaseDrift => Error::Stale(Stale::Volume(refusal)),
       VolumeRefusal::NotPermitted | VolumeRefusal::LinkProtected => {
         Error::Denied(Denied::Volume(refusal))
@@ -993,9 +1037,9 @@ impl Error {
       | VolumeRefusal::DigestCacheFull
       | VolumeRefusal::Memory
       | VolumeRefusal::RetentionExceeded => Error::Exhausted(Exhausted::Volume(refusal)),
-      VolumeRefusal::JournalIncomplete { .. } | VolumeRefusal::RecoveryVersion { .. } => {
-        Error::Unusable(Unusable::Volume(refusal))
-      }
+      VolumeRefusal::JournalIncomplete { .. }
+      | VolumeRefusal::RecoveryVersion { .. }
+      | VolumeRefusal::ReferenceUnresolved => Error::Unusable(Unusable::Volume(refusal)),
       VolumeRefusal::NotDirectory
       | VolumeRefusal::IsDirectory
       | VolumeRefusal::NotEmpty
@@ -1546,6 +1590,9 @@ pub enum IssuerFault {
   },
   /// The segment the handoff names could not be attached or read (gone, another machine's, another layout).
   Attach(slates_anchor::AnchorError),
+  /// The anchor's issuer route refused the claim or did not answer (Linux, A-754): no anchor of this user and instance
+  /// listens, or the secret is not the one it printed.
+  Route(slates_ipc::IpcError),
   /// The daemon has not published an issuer secret yet (an all-zero secret is no authority): it is still starting.
   NotPublished,
   /// This authority is the launcher's secret (A-299), which proves grants, merges, policies, enrollments and
@@ -1563,6 +1610,7 @@ impl fmt::Display for IssuerFault {
       ),
       Self::Malformed { reason } => write!(f, "the anchor's handoff is malformed: {reason}"),
       Self::Attach(error) => write!(f, "attaching the anchor: {error}"),
+      Self::Route(error) => write!(f, "claiming the anchor's segment over its issuer route: {error}"),
       Self::NotPublished => f.write_str("the daemon has published no issuer secret yet"),
       Self::LauncherCannotRecover => f.write_str(
         "the launcher's secret cannot confirm a consensus recovery; that needs the anchor's segment",
@@ -1656,11 +1704,11 @@ impl fmt::Display for StartFault {
 #[cfg(test)]
 mod tests {
   use slates_client::ClientError;
-  use slates_ipc::protocol::{Refusal, VolumeId};
+  use slates_ipc::protocol::{ImportFault, Refusal, VolumeId};
 
   use super::{
-    Busy, Denied, Error, Exhausted, Existing, HostFault, Missing, Note, OsCode, ProtocolFault,
-    RetryCause, Stale, TargetRefusal, Unreported, Unusable,
+    Busy, Denied, Error, Exhausted, Existing, HostFault, Invalid, Missing, Note, OsCode,
+    ProtocolFault, RetryCause, Stale, TargetRefusal, Unreported, Unusable,
   };
 
   /// Shape: the pause a test's retryable refusal carries.
@@ -1722,6 +1770,38 @@ mod tests {
     assert_eq!(overloaded.retry_pause_ns(), Some(PAUSE_NS));
   }
 
+  /// A-586 (main's ruling of 2026-11-20): do type a copy refused before its verdict as a consumer meets it; expect an
+  /// invalid request naming the copy's destination and case, never retried.
+  #[test]
+  fn a_copy_refusal_is_typed_invalid_by_its_case() {
+    let refused = ClientError::Refused(Refusal::CopyRefused {
+      path: "y".to_owned(),
+      case: slates_ipc::protocol::CopyCase::LinkAcrossCopy,
+    });
+    let typed = Error::of_client("w", refused, None, PAUSE_NS);
+    let expected = Invalid::Copy {
+      path: "y".to_owned(),
+      case: slates_ipc::protocol::CopyCase::LinkAcrossCopy,
+    };
+    assert_eq!(typed, Error::Invalid(expected));
+    assert!(!typed.is_retryable());
+  }
+
+  /// A-678: do type a repository import's refusal as a consumer meets it, from a call that names no volume; expect an
+  /// invalid request naming the import's fault, never retried.
+  #[test]
+  fn an_import_refusal_is_typed_invalid_by_its_fault() {
+    let fault = ImportFault::Damaged {
+      path: "store/data/a.i".to_owned(),
+    };
+    let refused = ClientError::Refused(Refusal::ImportRefused {
+      fault: fault.clone(),
+    });
+    let typed = Error::of_client("i", refused, None, PAUSE_NS);
+    assert_eq!(typed, Error::Invalid(Invalid::Import(fault)));
+    assert!(!typed.is_retryable());
+  }
+
   /// A volume-core refusal as a consumer meets it.
   fn volume_refused(refusal: slates_ipc::protocol::VolumeRefusal) -> Error {
     Error::of_client(
@@ -1737,7 +1817,7 @@ mod tests {
   #[test]
   fn a_volume_cores_holders_and_moved_views_are_typed() {
     use slates_ipc::protocol::VolumeRefusal as V;
-    for held in [V::Pinned, V::DaxMapped] {
+    for held in [V::Pinned, V::DaxMapped, V::ReferencesHeld] {
       assert_eq!(volume_refused(held), Error::Busy(Busy::Volume(held)));
     }
     for moved in [V::StaleHandle, V::BaseDrift] {
@@ -1777,7 +1857,7 @@ mod tests {
       found: 3,
       expected: 4,
     };
-    for unusable in [journal, image] {
+    for unusable in [journal, image, V::ReferenceUnresolved] {
       assert_eq!(
         volume_refused(unusable),
         Error::Unusable(Unusable::Volume(unusable))
