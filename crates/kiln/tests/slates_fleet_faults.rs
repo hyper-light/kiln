@@ -244,6 +244,30 @@ impl Lab {
             }
         }
         eprintln!("PROVEN: every runner's engine is its host");
+        // Each runner's headroom judgement off (as `vm_e2e`'s runners have it): on a loaded host kiln's balancer counts the
+        // lab's runner under strain and queues its agent for room that never comes (adacachy, 2026-11-20: a move-cut
+        // flow's start stayed queued past 900 s).
+        for n in &self.nodes {
+            let path = format!("/api/runners/{}/headroom", n.machine);
+            let began = Instant::now();
+            loop {
+                let (code, body) = self.fleet.request("PUT", &path, Some(&json!({"enabled": false})))?;
+                if code == 200 {
+                    break;
+                }
+                anyhow::ensure!(began.elapsed() < WITHIN, "{}'s headroom off: {code} {}", n.name, String::from_utf8_lossy(&body));
+                std::thread::sleep(LOOK);
+            }
+            loop {
+                let headroom = self.fleet.call("GET", &path, None)?;
+                if headroom.get("applied").and_then(Value::as_bool) == Some(true) {
+                    break;
+                }
+                anyhow::ensure!(began.elapsed() < WITHIN, "{}'s headroom off never applied: {headroom}", n.name);
+                std::thread::sleep(LOOK);
+            }
+        }
+        eprintln!("PROVEN: every runner's headroom judgement is off");
         Ok(())
     }
 
