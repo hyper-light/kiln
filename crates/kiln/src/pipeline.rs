@@ -25,6 +25,10 @@ pub enum SpecError {
     MatrixTooLarge { job: String, count: usize, limit: usize },
     #[error("job `{job}`'s requires `{expr}`: {why}")]
     Requires { job: String, expr: String, why: String },
+    /// A step that uses an action (`uses:`), which only the CI engine runs (docs/ci.md W07): v1 reads it, so a file
+    /// both engines read stays valid here, and plans none of its job.
+    #[error("job `{job}`'s step {step} uses an action (`{uses}`), which v1 doesn't run: the CI engine runs it (a repository's `kiln_workflows`, docs/ci.md W29-R16)")]
+    Action { job: String, step: String, uses: String },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -141,6 +145,18 @@ pub struct JobSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires: Option<serde_yaml::Value>,
     pub steps: Vec<StepSpec>,
+    /// Its steps that use an action (`uses:`, with their `with:`), which only the CI engine runs: read and left out of
+    /// `steps` as the file is parsed ([`parse`]), and its plan refused ([`SpecError::Action`]).
+    #[serde(skip)]
+    pub actions: Vec<ActionStep>,
+}
+
+/// A step that uses an action ([`JobSpec::actions`]): its name as the file gives it (its `name`, else its place,
+/// `steps[N]`), and the action.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActionStep {
+    pub step: String,
+    pub uses: String,
 }
 
 fn default_runs_on() -> Vec<String> {
@@ -347,17 +363,36 @@ impl Context {
 pub fn parse(src: &str) -> Result<Pipeline, SpecError> {
     let mut doc: serde_yaml::Value = serde_yaml::from_str(src)?;
     // The CI engine's `memo:` on a step (docs/ci.md W24-R07, W28-R76) is read and left out here, so
-    // `.kiln/` workflows that share steps on the engine still run on v1 until it takes them over.
+    // `.kiln/` workflows that share steps on the engine still run on v1 until it takes them over. A step
+    // that uses an action (`uses:`, docs/ci.md W07) is the engine's alone: read and left out of its job's
+    // steps too, kept as its job's `actions`, so its plan is refused naming it ([`SpecError::Action`]).
+    let mut actions: BTreeMap<String, Vec<ActionStep>> = BTreeMap::new();
     if let Some(jobs) = doc.get_mut("jobs").and_then(serde_yaml::Value::as_mapping_mut) {
-        for job in jobs.values_mut() {
-            for step in job.get_mut("steps").and_then(serde_yaml::Value::as_sequence_mut).into_iter().flatten() {
+        for (id, job) in jobs.iter_mut() {
+            let Some(steps) = job.get_mut("steps").and_then(serde_yaml::Value::as_sequence_mut) else {
+                continue;
+            };
+            let mut kept = Vec::with_capacity(steps.len());
+            for (place, mut step) in std::mem::take(steps).into_iter().enumerate() {
                 if let Some(m) = step.as_mapping_mut() {
                     m.remove("memo");
+                    if let Some(uses) = m.get("uses") {
+                        let name = m.get("name").map(yaml_scalar).filter(|n| !n.is_empty()).unwrap_or_else(|| format!("steps[{place}]"));
+                        actions.entry(yaml_scalar(id)).or_default().push(ActionStep { step: name, uses: yaml_scalar(uses) });
+                        continue;
+                    }
                 }
+                kept.push(step);
             }
+            *steps = kept;
         }
     }
-    let p: Pipeline = serde_yaml::from_value(doc)?;
+    let mut p: Pipeline = serde_yaml::from_value(doc)?;
+    for (id, steps) in actions {
+        if let Some(job) = p.jobs.get_mut(&id) {
+            job.actions = steps;
+        }
+    }
     validate(&p)?;
     Ok(p)
 }
@@ -373,7 +408,7 @@ pub fn requirements(v: Option<&serde_yaml::Value>) -> Vec<String> {
 
 fn validate(p: &Pipeline) -> Result<(), SpecError> {
     for (id, job) in &p.jobs {
-        if job.steps.is_empty() {
+        if job.steps.is_empty() && job.actions.is_empty() {
             return Err(SpecError::NoSteps(id.clone()));
         }
         match &job.requires {
@@ -515,6 +550,7 @@ pub fn from_ir(wf: &kiln_ci::wf::Workflow) -> Result<Pipeline, String> {
             requires: (!j.kiln.requires.is_empty())
                 .then(|| serde_yaml::Value::Sequence(j.kiln.requires.iter().map(|t| serde_yaml::Value::String(t.src.clone())).collect())),
             steps,
+            actions: Vec::new(),
         };
         jobs.insert(j.id.clone(), spec);
     }
@@ -549,6 +585,11 @@ fn yaml_value(v: &kiln_ci::wf::ir::YVal) -> serde_yaml::Value {
 /// Expand matrices and interpolate expressions. `needs` are rewritten to matrix-expanded keys so a
 /// job depending on a matrix job waits for every leg.
 pub fn plan(p: &Pipeline, base: &Context) -> Result<Vec<PlannedJob>, SpecError> {
+    // A job with a step that uses an action is the CI engine's ([`JobSpec::actions`]): v1 plans none of the
+    // pipeline rather than run the rest of it as if that step weren't there.
+    if let Some((job, a)) = p.jobs.iter().find_map(|(id, j)| j.actions.first().map(|a| (id, a))) {
+        return Err(SpecError::Action { job: job.clone(), step: a.step.clone(), uses: a.uses.clone() });
+    }
     let mut legs: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut out = Vec::new();
     for (id, job) in &p.jobs {
@@ -694,11 +735,16 @@ jobs:
       - run: cargo bench
 "#;
 
-    /// kiln's own `.kiln/*.yaml` read both ways: as v1 pipelines and in the CI engine's kiln
-    /// dialect, so neither grows a key the other refuses.
+    /// kiln's own `.kiln/*.yaml` read both ways while v1 reads them: as v1 pipelines and in the CI
+    /// engine's kiln dialect, so neither grows a key the other refuses. Once `.kiln/config.yaml`
+    /// moves them to the engine (`kiln_workflows: on`, W29-R16 stage 3), v1 stands aside and they
+    /// are the engine's alone, read in its dialect only: release.yaml's `kiln/upload@v1` and
+    /// `kiln/download@v1` steps (kiln plan 01a1cd8e…, step 16) are the engine's, and v1 has none.
     #[test]
     fn kilns_own_workflows_read_both_ways() -> anyhow::Result<()> {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.kiln");
+        let settings: crate::ci::repo_config::RepoConfig = serde_yaml::from_str(&std::fs::read_to_string(dir.join("config.yaml"))?)?;
+        let v1 = settings.kiln_workflows() != Some(true);
         let mut read = 0;
         for e in std::fs::read_dir(&dir)?.filter_map(Result::ok) {
             let path = e.path();
@@ -711,7 +757,9 @@ jobs:
             if !text.lines().any(|l| l.starts_with("jobs:")) {
                 continue;
             }
-            parse(&text).map_err(|e| anyhow::anyhow!("{name} as v1: {e}"))?;
+            if v1 {
+                parse(&text).map_err(|e| anyhow::anyhow!("{name} as v1: {e}"))?;
+            }
             let (wf, diags) = kiln_ci::wf::parse_workflow(&format!(".kiln/{name}"), &text, kiln_ci::expr::Dialect::Kiln);
             let errors: Vec<String> = diags.iter().filter(|d| d.is_error()).map(|d| format!("{d:?}")).collect();
             anyhow::ensure!(wf.is_some() && errors.is_empty(), "{name} in the kiln dialect: {errors:?}");
@@ -757,6 +805,29 @@ jobs:
         let built = jobs.iter().any(|j| j.steps.iter().any(|s| s.run.contains("release # abc")));
         assert!(built);
         assert!(ctx.eval(bench.and_then(|b| b.condition.as_deref()).unwrap_or("false")));
+        Ok(())
+    }
+
+    /// docs/ci.md W07, W29-R16: a step that uses an action (`uses:`, its `with:`) is the CI engine's. v1 reads it, so a
+    /// file both engines read stays valid here (kiln's release.yaml hands Windows' Shards from one job to another so),
+    /// and refuses to plan its pipeline, naming the step and its action, rather than run the rest as if it weren't
+    /// there. Do parse a pipeline whose `pack` job runs a command and uploads with a named action step, and whose
+    /// `take` job has only an unnamed one; plan it. Expect both read, each action kept on its job (by its name, else
+    /// its place) and out of its steps, and the plan refused naming `pack`'s step and its action.
+    #[test]
+    fn w07_a_step_that_uses_an_action_reads_in_v1_and_its_plan_is_refused() -> anyhow::Result<()> {
+        let src = "name: r\njobs:\n  pack:\n    steps:\n      - run: make\n      - name: hand it over\n        uses: kiln/upload@v1\n        with: { name: out, path: out }\n  take:\n    needs: [pack]\n    steps:\n      - uses: kiln/download@v1\n        with: { name: out }\n";
+        let p = parse(src)?;
+        let pack = p.jobs.get("pack").ok_or_else(|| anyhow::anyhow!("no pack"))?;
+        assert_eq!(pack.steps.iter().map(|s| s.run.as_str()).collect::<Vec<_>>(), ["make"]);
+        assert_eq!(pack.actions, [ActionStep { step: "hand it over".into(), uses: "kiln/upload@v1".into() }]);
+        let take = p.jobs.get("take").ok_or_else(|| anyhow::anyhow!("no take"))?;
+        assert!(take.steps.is_empty(), "{:?}", take.steps);
+        assert_eq!(take.actions, [ActionStep { step: "steps[0]".into(), uses: "kiln/download@v1".into() }]);
+        match plan(&p, &Context::default()) {
+            Err(SpecError::Action { job, step, uses }) => assert!(job == "pack" && step == "hand it over" && uses == "kiln/upload@v1", "{job} {step} {uses}"),
+            other => anyhow::bail!("v1 planned a pipeline with an action step: {other:?}"),
+        }
         Ok(())
     }
 

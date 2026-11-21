@@ -1,8 +1,8 @@
 //! CP-T3.2 through a runner: a message sent twice under one key reaches its agent once, and both
-//! sends are answered with what became of it. A runner of its own (`kiln agent`, connected over
-//! QUIC like any other) holds the agent: the server sends the message as `HarnessSend`, the
-//! runner's host takes it down the session's lane through its inbox, and says what became of it
-//! over its link. The agent's harness is a stand-in for Claude Code that keeps what it's sent.
+//! sends are answered alike, with the server's receipt of the one message it keeps for the agent (W20).
+//! A runner of its own (`kiln agent`, connected over QUIC like any other) holds the agent: the server
+//! sends the message as `HarnessSend`, and the runner's host takes it down the session's lane through
+//! its inbox. The agent's harness is a stand-in for Claude Code that keeps what it's sent.
 #![cfg(unix)]
 
 mod common;
@@ -101,6 +101,8 @@ fn a_message_sent_twice_under_one_key_through_a_runner_reaches_its_agent_once() 
         let (_, runners) = api("GET", "/api/agents", None)?;
         Ok(runners.as_array().into_iter().flatten().any(|r| r.get("name") == Some(&json!(common::machine("t3-runner"))) && r.get("connected") == Some(&json!(true))))
     })?;
+    // Its sessions on its host, where the stand-in is.
+    common::agents::on_host(server.port, &server.admin, "t3-runner", &state, Duration::from_secs(90))?;
     // An agent on it, its harness running there.
     let cwd = dir.path().join("agent");
     std::fs::create_dir_all(&cwd)?;
@@ -108,18 +110,19 @@ fn a_message_sent_twice_under_one_key_through_a_runner_reaches_its_agent_once() 
     anyhow::ensure!(status == 200, "starting an agent on the runner: {status} {made}");
     let id = made.pointer("/agents/0/id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no agent: {made}"))?.to_owned();
     wait("its harness started on the runner", &mut || Ok(started.exists()))?;
-    // Sent twice under one key: the same message, answered alike, the second a repeat.
+    // Sent twice under one key: the same message, answered alike, the second a repeat. Each answer is the
+    // server's receipt of the message it keeps for the agent (W20: its id, revision and generation), not the
+    // runner's word on taking it, which the server can't give for it (`harness::ops::publication_answer`).
     let send = || api("POST", &format!("/api/harness/agents/{id}/send"), Some(&json!({"text": "deploy the fix", "key": "deploy-1"})));
     let (s1, first) = send()?;
     let (s2, again) = send()?;
     anyhow::ensure!(s1 == 200 && s2 == 200, "{s1} {first} / {s2} {again}");
     let message = first.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
     anyhow::ensure!(!message.is_empty() && again.get("message") == first.get("message"), "the same message: {first} {again}");
-    let answer = |v: &Value, k: &str| v.pointer(&format!("/accepted/{k}")).cloned();
-    for k in ["seq", "at", "epoch", "session", "message"] {
-        anyhow::ensure!(answer(&first, k).is_some() && answer(&first, k) == answer(&again, k), "{k}: {first} {again}");
+    for k in ["id", "revision", "generation"] {
+        anyhow::ensure!(first.get(k).is_some() && first.get(k) == again.get(k), "{k}: {first} {again}");
     }
-    anyhow::ensure!(answer(&first, "repeat").is_none() && answer(&again, "repeat") == Some(json!(true)), "{first} {again}");
+    anyhow::ensure!(first.get("repeat") == Some(&json!(false)) && again.get("repeat") == Some(&json!(true)), "{first} {again}");
     // One prompt reached the harness on the runner.
     wait("the harness got its prompt", &mut || Ok(!prompts(&heard).is_empty()))?;
     std::thread::sleep(Duration::from_millis(500));

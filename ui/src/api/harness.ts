@@ -3,15 +3,15 @@
  * the API to list, start and stop agents, and a live session store fed by its websocket.
  * Nothing here is specific to one harness: Claude Code, Codex and the rest all speak this.
  */
-import { KINDS_READ, SESSIONS_READ } from "./launch-reads";
-import { fromColumns, isColumns, type Columns } from "./columns";
-import { listAsked, listedAgain } from "./last-words";
+import { KINDS_READ } from "./launch-reads";
+import { call, listAgents } from "./agents-list";
 import * as React from "react";
 import { ownAgentAction } from "@/lib/own-agent-action";
-import { ApiError, identifiedMailScope, mailScope, onAuthChange, onMailScopeChange, request, wsUrl } from "@/api/client";
+import { ApiError, identifiedMailScope, mailScope, onAuthChange, onMailScopeChange, request } from "@/api/client";
 import { apiPath } from "@/lib/peer-base";
 import { events } from "@/api/events";
 import { readFrame, unread } from "./frames";
+import { sessionSocketUrl, storesHere, takeSessionSocket, type EarlySocket } from "./session-socket";
 import type { TerminalSessionInfo } from "./types";
 import { stateAtOpen } from "./session-availability";
 import { heldCommand, heldFrom, publicationReceipt, useHeld, type Held, type PublicationReceipt } from "./held";
@@ -275,9 +275,6 @@ export interface LandingPlan {
   why_not?: string;
 }
 
-/** Whether an agent is one of the agents kiln lists: a card's helper (`helper`, `agents.about`) is the card's, no row of them. */
-export const listed = (a: AgentInfo) => !a.helper;
-
 /** What a person asks about a piece of code in an agent's conversation (`agents.about`). */
 export interface AboutAsk {
   path: string;
@@ -377,38 +374,17 @@ export interface Spec {
   workspace?: { kind: "folder" | "volume" };
   /** How it's held when not as a process on its machine: a microVM of its own (`microvm`), made from the Agentfile `image` names (api/agentfiles.ts; kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31). */
   isolation?: Isolation;
-  /** The person's environment it runs with (`agentenvs`, docs/agents.md, "Environments"), by id; none: its machine's user's. */
-  agentenv?: string;
+  /** The person's environments it runs with (`agentenvs`, docs/agents.md, "Environments"), a stack by id, top first; none: its machine's user's (those applied on their own join under them). */
+  agentenvs?: string[];
 }
 
 /** Where agents can have workspaces of their own, by target (`local`, `agent:<name>`). */
 /** Per target: a workspace mounted on its host, and under `served` a volume served to its microVMs (W8 piece 4). */
 export type WorkspacesAvailable = Record<string, { available: boolean; why_not?: string; served?: { available: boolean; why_not?: string } }>;
 
-/* ------------------------------------------------------------------ REST */
+export { listed } from "./agents-list";
 
-async function call<T>(method: string, path: string, body?: unknown, signal?: AbortSignal, headers?: Record<string, string>): Promise<T> {
-  const res = await fetch(path, {
-    method,
-    credentials: "same-origin",
-    headers: body === undefined ? headers : { "content-type": "application/json", ...headers },
-    body: body === undefined ? undefined : JSON.stringify(body),
-    signal,
-  });
-  if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    try {
-      const j = (await res.json()) as { error?: string };
-      if (j.error) msg = j.error;
-    } catch {
-      /* not json */
-    }
-    // With its status, for what tells one answer from another (a start asked again, refused as there already: starting.ts).
-    throw new ApiError(res.status, msg);
-  }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
-}
+/* ------------------------------------------------------------------ REST */
 
 /** A port an agent's machine listens on (`crate::browser::apps::Listening`). */
 export interface Listening {
@@ -525,7 +501,7 @@ export function startAsk(target: string, spec: Spec, count: number, ids?: string
     ...(spec.speed !== undefined ? { speed: spec.speed } : {}),
     ...(spec.reach !== undefined ? { reach: spec.reach } : {}),
     ...(spec.shell ? { shell: spec.shell } : {}),
-    ...(spec.agentenv ? { agentenv: spec.agentenv } : {}),
+    ...(spec.agentenvs?.length ? { agentenvs: spec.agentenvs } : {}),
   };
 }
 
@@ -605,17 +581,8 @@ export const harnessApi = {
   planLanding: (id: string) => call<LandingPlan>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, {}),
   /** Write it exactly as the plan whose manifest this is (a person's go-ahead); if it changed since, nothing is written and the new plan comes back. */
   land: (id: string, manifest: string) => call<{ landed?: unknown } & Partial<LandingPlan> & { changed?: boolean }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/land`, { manifest }),
-  /**
-   * The agents, as the list tells them lean and as columns (W21-R02; a server from before answers the list itself).
-   * What was known of their last words is as old as the list before: the rows that show them ask again.
-   */
-  list: (signal?: AbortSignal) => {
-    const since = listAsked();
-    return call<AgentInfo[] | Columns>("GET", SESSIONS_READ, undefined, signal).then((read) => {
-      listedAgain(since);
-      return (isColumns(read) ? fromColumns<AgentInfo>(read) : read).filter(listed);
-    });
-  },
+  /** The agents, as the list tells them (agents-list.ts). */
+  list: listAgents,
   /** One agent, or null when there's none under `id` (yet, or any more). */
   session: (id: string) =>
     call<AgentInfo>("GET", `/api/harness/sessions/${encodeURIComponent(id)}`).catch((e: unknown) => {
@@ -966,11 +933,6 @@ const LINGER_MS = 30_000;
 const KEEP = 8;
 /** Match the server mirror's rolling event window (harness/core.rs and registry.rs). */
 const MAX_EVENTS = 4000;
-/**
- * The browser unpacks gzip itself (every current one does): a session's snapshot comes packed, a
- * long conversation's history in a tenth of the bytes.
- */
-const GUNZIP = typeof DecompressionStream !== "undefined";
 /** A speculative snapshot is stopped while decoding, before allocating its whole expanded text. */
 async function gunzip(data: ArrayBuffer, take: (bytes: number) => boolean, own: (reader: ReadableStreamDefaultReader<Uint8Array> | null) => void): Promise<string> {
   const reader = new Blob([data]).stream().pipeThrough(new DecompressionStream("gzip")).getReader();
@@ -1085,20 +1047,6 @@ export const changesPatched = (was: FileChange[] | null, u: { set?: FileChange[]
   }
   return now;
 };
-
-/** A conversation's window (W21-R02; docs/wire.md, "Windows"): its newest turns and about this many bytes of them at the most. */
-const WINDOW = { recent_turns: "8", event_bytes: "262144" };
-/**
- * The window's first part: the fewest bytes a window is bounded to (history.rs `FLOOR`), its newest events, which are
- * the ones a conversation opens on. The socket's snapshot is that part alone, so a slow link carries a screen's worth
- * before the conversation shows, not the window (kiln-lab bar, 41,000 events: 88 KB packed for the window). The rest
- * of the window follows it on the socket as a message of its own (`earlier`), and joins above what's shown.
- */
-const FIRST_BYTES = 16 * 1024;
-/** The socket's query: a snapshot packed when it can be unpacked here, a state and a changeset as what changed in them, and its events a window. */
-const TAKES = `${GUNZIP ? "?z=gzip&" : "?"}patch=state&patch=changes&window=1&lean=1&${new URLSearchParams(WINDOW)}`;
-/** And the window's first part ahead, asked where nothing of the conversation is shown yet: what's shown already is added to or replaced whole. */
-const TAKES_FIRST = `&first_bytes=${FIRST_BYTES}`;
 
 /** The session socket's frames, by tag: a frame with another isn't applied (`frames.ts`). */
 const SESSION_FRAMES = {
@@ -2073,11 +2021,15 @@ export class SessionStore {
     this.frames = 0;
     this.incoming = null;
     let ws: WebSocket;
+    // The socket its page's navigation opened already (session-socket.ts), when it asks for what this would.
+    let early: EarlySocket | undefined;
     try {
       // What's shown already: only what came after it, when the server's copy can say. A window whose rest never came
       // (its socket closed first) is asked for again from its start: what came after it wouldn't bring the rest.
       const after = this.born && this.rev && !this.snap.history?.filling ? `&after=${this.born}.${this.rev}` : "";
-      ws = new WebSocket(wsUrl(`/api/harness/sessions/${encodeURIComponent(this.id)}/ws${TAKES}${this.snap.ready ? "" : TAKES_FIRST}${after}`));
+      const url = sessionSocketUrl(this.id, !this.snap.ready, after);
+      early = takeSessionSocket(this.id, url);
+      ws = early?.ws ?? new WebSocket(url);
     } catch {
       this.retry();
       return;
@@ -2140,6 +2092,11 @@ export class SessionStore {
       this.ws = null;
       this.lost();
     };
+    // Taken open: what it said meanwhile, in order, as it would have come.
+    if (early) {
+      if (ws.readyState === WebSocket.OPEN) this.sendAgain(ws);
+      for (const message of early.heard) ws.onmessage?.(message);
+    }
   }
 
   /** A message as it came: at once, unless a packed one before it is still being unpacked. */
@@ -2819,6 +2776,8 @@ export class SessionStore {
 export const beforeWindow = (floor: number | null, held: ReadonlyMap<string, HEvent>, e: HEvent): boolean => floor !== null && e.seq < floor && !held.has(e.id);
 
 const stores = new Map<string, SessionStore>();
+// A page's navigation readies its store itself from here on (session-socket.ts).
+storesHere(readySession);
 let currentMailScope = mailScope();
 onMailScopeChange(() => {
   const next = mailScope();
@@ -2851,6 +2810,25 @@ export function sessionStore(id: string): SessionStore {
   // Acquisition itself is foreground intent: rendering can suspend before ready()/subscribe().
   store.promote();
   return store;
+}
+
+/** Session `id`'s store held until its first snapshot is in, or `signal` says its page was left: what opening its page reads first. */
+export function readySession(id: string, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  const store = sessionStore(id);
+  return new Promise<void>((resolve) => {
+    const release = store.subscribe(() => {});
+    let released = false;
+    const stop = () => {
+      if (released) return;
+      released = true;
+      release();
+      signal?.removeEventListener("abort", stop);
+      resolve();
+    };
+    signal?.addEventListener("abort", stop, { once: true });
+    void store.ready().then(stop, stop);
+  });
 }
 
 export function prefetchSession(id: string, budget: number): SessionPrefetchLease | null {

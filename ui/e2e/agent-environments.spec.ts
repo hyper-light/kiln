@@ -1,9 +1,12 @@
-// Environments (docs/agents.md, "Environments", "In the Engine tab"; decided by the user, 2026-11-18),
-// against the mock (mock/agentenvs.ts): the Engine tab on a session on bare metal, its Environments and
-// Agents and no Sandboxes, this session's environment first and marked, a secret by its name; one made,
-// changed in place, applied to this session (which starts again on its conversation), refused deletion
-// while it runs with it, then put back on the machine's user's environment and deleted; and Mission
-// control's composer carrying the environment chosen in More options into the start as `agentenv`.
+// Environments (docs/agents.md, "Environments", "Scopes, stacks, and applied on its own", "In the Engine
+// tab"; decided by the user, 2026-11-18 and 2026-11-19), against the mock (mock/agentenvs.ts): the Engine
+// tab on a session on bare metal, its Environments and Agents and no Sandboxes, this session's stack above
+// the cards (top first, those that joined on their own badged) and its cards first and marked, a secret by
+// its name; one made, changed in place, applied on top of this session's stack (which starts again on its
+// conversation), refused deletion while it runs with it, then taken out and deleted; the stack reordered
+// with up and down and by dragging; a card's scope as chips beside its "Apply on its own" switch; the
+// filter by chips, from this session's own; and Mission control's composer carrying a stack chosen in More
+// options into the start as `agentenvs`, offering only those whose scope matches it.
 import { expect as expectNow, test, type Page } from "@playwright/test";
 
 const expect = expectNow.configure({ timeout: 15_000 });
@@ -44,19 +47,29 @@ async function press(b: import("@playwright/test").Locator) {
   await b.click();
 }
 
+/** This session's stack, as its rows read (a name, then "auto" where it joined on its own). */
+const stackOf = (body: import("@playwright/test").Locator) => body.getByRole("list", { name: "This session's environments" }).getByRole("listitem");
+
+/** Every environment shown, its scope's filter cleared. */
+async function showAll(body: import("@playwright/test").Locator) {
+  await press(body.getByRole("button", { name: "Show all", exact: true }));
+}
+
 /** No page scrolls sideways. */
 const sideways = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
 
-test("a session on bare metal has the Engine tab: Environments and Agents, no Sandboxes; this session's first and marked, a secret by its name", async ({ page }) => {
+test("a session on bare metal has the Engine tab: Environments and Agents, no Sandboxes; this session's stack first and marked, a secret by its name", async ({ page }) => {
   const said = errors(page);
   const { body, list } = await engine(page);
   await expect(body.locator(".in-sec-toggle")).toHaveText([/^Environments/, /^Agents/]);
-  // This session's environment, chosen at the top; its card first, marked.
-  await expect(body.getByLabel("This session's environment").locator("option:checked")).toHaveText("release-tools");
-  await expect(body.getByLabel("This session's environment").locator("option").first()).toHaveText("Machine environment (default)");
+  // This session's stack at the top, top first: the one it was given, then those that joined on their own, badged.
+  await expect(stackOf(body)).toHaveText([/^release-tools$/, /^linux-cache\s*auto$/, /^plan-quiet\s*auto$/]);
+  await expect(body.getByRole("button", { name: "Take linux-cache out" })).toBeDisabled();
+  await expect(body.getByText("Takes these at its next start")).toHaveCount(0);
+  // Their cards first, in its order, marked.
   const lines = list.locator(":scope > li.df-defrow");
-  await expect(lines.first()).toContainText("release-tools");
-  await expect(lines.first().getByRole("img", { name: "This session runs with it" })).toBeVisible();
+  await expect(lines.locator(".df-defname").first()).toHaveText("release-tools");
+  for (const i of [0, 1, 2]) await expect(lines.nth(i).getByRole("img", { name: "This session runs with it" })).toBeVisible();
   await expect(lines.first()).toContainText("Machine base · v3");
   // Opened, its variables are its fields: a secret by its name (never a value), a value as it is, the machine's variable it takes.
   await list.getByRole("button", { name: "Expand release-tools" }).click();
@@ -81,9 +94,11 @@ test("a session on bare metal has the Engine tab: Environments and Agents, no Sa
   await expect(ran.getByRole("row").nth(1).getByRole("img", { name: "This session runs with it" })).toBeVisible();
   await expect(ran.getByRole("img", { name: "This session runs with it" })).toHaveCount(1);
   await expect(ran.getByRole("row")).toHaveCount(4);
-  // Sorted and found: most variables first after this session's; Secrets chosen, only those that give one.
+  // Sorted and found: this session's first, then those its scope filter shows (clean-ci is Codex's), most variables first.
   await body.getByRole("combobox", { name: "Sort environments" }).selectOption("vars");
-  await expect(lines.locator(".df-defname")).toHaveText(["release-tools", "aws-agents", "clean-ci"]);
+  await expect(lines.locator(".df-defname")).toHaveText(["release-tools", "linux-cache", "plan-quiet", "aws-agents"]);
+  await showAll(body);
+  await expect(lines.locator(".df-defname")).toHaveText(["release-tools", "linux-cache", "plan-quiet", "aws-agents", "clean-ci"]);
   expect(await sideways(page)).toBe(0);
   expect(said, said.join("\n")).toEqual([]);
 });
@@ -133,28 +148,32 @@ test("one made, changed in place, applied to this session, refused deletion whil
   await expect(names().nth(0)).toHaveValue("GH_TOKEN");
   await expect(names().nth(1)).toHaveValue("CARGO_HOME");
 
-  // Chosen for this session from the dropdown, confirmed first: it restarts the session.
+  // Applied from its card, asked first: it goes on top of this session's stack, which restarts the session.
   const body = page.locator(".hx-inspector-body").filter({ visible: true }).first();
-  const choose = body.getByLabel("This session's environment");
-  await choose.selectOption({ label: "e2e-env" });
-  await expect(body.getByRole("group", { name: "Restart this session?" })).toHaveText(/Restart this session with e2e-env\?/);
-  const put = page.waitForRequest((r) => r.method() === "PUT" && r.url().endsWith("/api/harness/sessions/fam-docs/agentenv"));
-  await body.getByRole("button", { name: "Restart with e2e-env" }).click();
-  expect((await put).postDataJSON()).toEqual({ agentenv: expectNow.stringMatching(/^env-/) });
+  await press(tree.getByRole("button", { name: "Apply e2e-env to this session" }));
+  await expect(tree.getByRole("group", { name: "Apply e2e-env?" })).toHaveText(/Restart this session with e2e-env on top\?/);
+  let put = page.waitForRequest((r) => r.method() === "PUT" && r.url().endsWith("/api/harness/sessions/fam-docs/agentenv"));
+  await press(tree.getByRole("button", { name: "Restart with e2e-env on top" }));
+  // Those that joined on their own at its foot aren't sent: they join again on their own.
+  expect((await put).postDataJSON()).toEqual({ agentenvs: [expectNow.stringMatching(/^env-/), "env-release"] });
+  await expect(stackOf(body)).toHaveText([/^e2e-env$/, /^release-tools$/, /^linux-cache\s*auto$/, /^plan-quiet\s*auto$/]);
   const lines = list.locator(":scope > li.df-defrow");
   await expect(lines.first()).toContainText("e2e-env");
   await expect(lines.first().getByRole("img", { name: "This session runs with it" })).toBeVisible();
-  await expect(list.locator(":scope > li.df-defrow", { hasText: "release-tools" }).getByRole("img", { name: "This session runs with it" })).toHaveCount(0);
+  await expect(tree.getByRole("button", { name: "Apply e2e-env to this session" })).toHaveCount(0);
 
   // Deleting it while this session runs with it: refused, in the server's words.
   await press(tree.getByRole("button", { name: "Delete", exact: true }));
   await press(tree.getByRole("button", { name: "Delete e2e-env" }));
   await expect(tree.getByRole("alert")).toHaveText("e2e-env can't be deleted: “Update the docs” runs with it. Put it on another environment first.");
 
-  // Back on the machine environment, then deleted.
-  await choose.selectOption({ label: "Machine environment (default)" });
-  await body.getByRole("button", { name: "Restart with the machine environment" }).click();
-  await expect(choose.locator("option:checked")).toHaveText("Machine environment (default)");
+  // Taken out of the stack, saved and asked again, then deleted.
+  await press(body.getByRole("button", { name: "Take e2e-env out" }));
+  await press(body.getByRole("button", { name: "Save this session's environments" }));
+  put = page.waitForRequest((r) => r.method() === "PUT" && r.url().endsWith("/api/harness/sessions/fam-docs/agentenv"));
+  await press(body.getByRole("button", { name: "Restart with these" }));
+  expect((await put).postDataJSON()).toEqual({ agentenvs: ["env-release"] });
+  await expect(stackOf(body)).toHaveText([/^release-tools$/, /^linux-cache\s*auto$/, /^plan-quiet\s*auto$/]);
   await expect(list.locator(":scope > li.df-defrow", { hasText: "e2e-env" }).getByRole("img", { name: "This session runs with it" })).toHaveCount(0);
   await press(tree.getByRole("button", { name: "Delete", exact: true }));
   await press(tree.getByRole("button", { name: "Delete e2e-env" }));
@@ -165,7 +184,8 @@ test("one made, changed in place, applied to this session, refused deletion whil
 
 test("a card's head is edited in place: renamed, tagged and untagged, described; each saved at once over its version", async ({ page }) => {
   const said = errors(page);
-  const { list } = await engine(page);
+  const { body, list } = await engine(page);
+  await showAll(body);
   const card = list.locator(":scope > li.df-defrow", { hasText: "clean-ci" });
   const patched = () => page.waitForRequest((r) => r.method() === "PATCH" && r.url().includes("/api/agentenvs/"));
   // Renamed: the name pressed is a field in its place (the card then holds no "clean-ci" text, so it's found in the list); Enter saves.
@@ -203,7 +223,8 @@ test("a card's head is edited in place: renamed, tagged and untagged, described;
 
 test("each environment starts folded to its head, opens to its form, and is kept as it was left", async ({ page }) => {
   const said = errors(page);
-  const { list } = await engine(page);
+  const { body, list } = await engine(page);
+  await showAll(body);
   for (const n of ["release-tools", "clean-ci", "aws-agents"]) {
     await expect(list.getByRole("button", { name: `Expand ${n}` })).toHaveAttribute("aria-expanded", "false");
     await expect(list.getByRole("list", { name: `${n}: variables and sessions` })).toHaveCount(0);
@@ -215,6 +236,7 @@ test("each environment starts folded to its head, opens to its form, and is kept
   // Kept as it was left.
   await page.reload();
   await tab(page, "Engine");
+  await showAll(body);
   await expect(list.getByRole("list", { name: "clean-ci: variables and sessions" })).toBeVisible();
   await expect(list.getByRole("button", { name: "Expand aws-agents" })).toBeVisible();
   // Opened, it's its form: no edit button to press first.
@@ -224,7 +246,7 @@ test("each environment starts folded to its head, opens to its form, and is kept
   expect(said, said.join("\n")).toEqual([]);
 });
 
-test("the composer's Environment row: the machine's user's by default, one of the person's carried into the start as `agentenv`, and kept", async ({ page }) => {
+test("the composer's Environment row: the machine's user's by default, a stack of the person's whose scope matches, ordered, carried into the start as `agentenvs`, and kept", async ({ page }) => {
   const said = errors(page);
   await page.request.post("/api/mock/agentenvs");
   await page.goto("/agents");
@@ -232,21 +254,136 @@ test("the composer's Environment row: the machine's user's by default, one of th
   const pick = page.getByLabel("The environment it runs with");
   await expect(pick).toHaveValue("");
   await expect(pick.locator("option").first()).toHaveText("Machine environment (default)");
+  // Offered: those whose scope matches a Claude Code session (clean-ci is Codex's on Linux).
+  await expect(pick.locator("option")).not.toContainText(["clean-ci v1"]);
   await pick.selectOption({ label: "release-tools v3" });
+  const stack = page.getByRole("list", { name: "The environments it runs with" }).getByRole("listitem");
+  await expect(stack).toHaveText(["release-tools"]);
+  // Another added under it, then moved up.
+  const add = page.getByLabel("Add an environment");
+  await expect(add.locator("option").first()).toHaveText("Add");
+  await expect(add.locator("option")).not.toContainText(["release-tools v3"]);
+  await add.selectOption({ label: "aws-agents v2" });
+  await expect(stack).toHaveText(["release-tools", "aws-agents"]);
+  await page.getByRole("button", { name: "Move aws-agents up" }).click();
+  await expect(stack).toHaveText(["aws-agents", "release-tools"]);
   // Closed, More options says it.
   await page.getByRole("button", { name: /^More options/ }).click();
-  await expect(page.locator(".mc-sum")).toContainText("Environment: release-tools");
+  await expect(page.locator(".mc-sum")).toContainText("Environment: aws-agents + release-tools");
   const start = page.locator(".mc-start");
-  await expect(start).toHaveAttribute("aria-label", /, with release-tools$/);
+  await expect(start).toHaveAttribute("aria-label", /, with aws-agents \+ release-tools$/);
   await page.getByRole("textbox", { name: "Its first message" }).fill(`Check the docs build (${Date.now()})`);
   const asked = page.waitForRequest((r) => r.method() === "POST" && new URL(r.url()).pathname === "/api/harness/agents");
   await start.click();
-  expect((await asked).postDataJSON()).toMatchObject({ agentenv: "env-release" });
+  expect((await asked).postDataJSON()).toMatchObject({ agentenvs: ["env-aws", "env-release"] });
   await expect(page).toHaveURL(/\/agents\/[0-9a-f]{32}$/);
-  // Kept for the next start.
+  // Kept for the next start; one taken out goes.
   await page.goto("/agents");
   await page.getByRole("button", { name: /^More options/ }).click();
-  await expect(page.getByLabel("The environment it runs with")).toHaveValue("env-release");
+  await expect(stack).toHaveText(["aws-agents", "release-tools"]);
+  await page.getByRole("button", { name: "Take aws-agents out" }).click();
+  await expect(stack).toHaveText(["release-tools"]);
+  expect(await sideways(page)).toBe(0);
+  expect(said, said.join("\n")).toEqual([]);
+});
+
+test("a card's scope: chips in their own section, added by key and value, taken away; Everywhere where it has none; its Apply on its own switch joins this session's stack", async ({ page }) => {
+  const said = errors(page);
+  const { body, list } = await engine(page);
+  const patched = () => page.waitForRequest((r) => r.method() === "PATCH" && r.url().includes("/api/agentenvs/"));
+  await list.getByRole("button", { name: "Expand release-tools" }).click();
+  await expect(list.getByRole("list", { name: "release-tools's scope" })).toContainText("Everywhere");
+  await list.getByRole("button", { name: "Expand aws-agents" }).click();
+  const scope = list.getByRole("list", { name: "aws-agents's scope" });
+  await expect(scope.getByRole("listitem")).toHaveText(["harness: claude"]);
+  // Added: its key from the menu, its value typed (suggested), Enter.
+  await scope.getByRole("button", { name: "Add to aws-agents's scope" }).click();
+  const key = scope.getByRole("combobox", { name: "aws-agents's scope: key" });
+  await key.selectOption("os");
+  // As wide as its key and its arrow, in every engine (not its longest option's width).
+  expect((await key.boundingBox())!.width).toBeLessThan(50);
+  let sent = patched();
+  await scope.getByRole("combobox", { name: "aws-agents's scope: os" }).fill("linux");
+  await scope.getByRole("combobox", { name: "aws-agents's scope: os" }).press("Enter");
+  expect((await sent).postDataJSON()).toEqual({
+    version: 2,
+    scope: [
+      { key: "os", value: "linux" },
+      { key: "harness", value: "claude" },
+    ],
+  });
+  await expect(scope.getByRole("listitem")).toHaveText(["os: linux", "harness: claude"]);
+  sent = patched();
+  await scope.getByRole("button", { name: "Remove harness: claude" }).click();
+  expect((await sent).postDataJSON()).toEqual({ version: 3, scope: [{ key: "os", value: "linux" }] });
+  // Applied on its own: it joins this session's stack under the one given by name (by name among those of as many chips), badged;
+  // its harness takes it as it next starts.
+  const auto = list.getByRole("switch", { name: "Apply aws-agents on its own" });
+  await expect(auto).toHaveAttribute("aria-checked", "false");
+  sent = patched();
+  await auto.click();
+  expect((await sent).postDataJSON()).toEqual({ version: 4, auto: true });
+  await expect(auto).toHaveAttribute("aria-checked", "true");
+  await expect(stackOf(body)).toHaveText([/^release-tools$/, /^aws-agents\s*auto$/, /^linux-cache\s*auto$/, /^plan-quiet\s*auto$/]);
+  await expect(body.getByText("Takes these at its next start")).toBeVisible();
+  expect(await sideways(page)).toBe(0);
+  expect(said, said.join("\n")).toEqual([]);
+});
+
+test("the filter by chips starts from this session's own; a chip taken away widens it; Show all and This session", async ({ page }) => {
+  const said = errors(page);
+  const { body, list } = await engine(page);
+  const filter = body.getByRole("list", { name: "Scope filter" });
+  await expect(filter.getByRole("listitem")).toHaveText(["machine: metal-ryzen-02", "os: linux", "arch: amd64", "harness: claude", /^model: /, "permission: claude:plan", "effort: claude:high"]);
+  const names = list.locator(":scope > li.df-defrow .df-defname");
+  await expect(names).not.toContainText(["clean-ci"]);
+  // Its harness taken away: Codex's clean-ci on Linux is shown too.
+  await filter.getByRole("button", { name: "Remove harness: claude" }).click();
+  await expect(names.filter({ hasText: "clean-ci" })).toHaveCount(1);
+  // One added: Windows only shows those whose scope names no system, or Windows.
+  await filter.getByRole("button", { name: "Add to Scope filter" }).click();
+  await filter.getByRole("combobox", { name: "Scope filter: key" }).selectOption("os");
+  await filter.getByRole("combobox", { name: "Scope filter: os" }).fill("windows");
+  await filter.getByRole("combobox", { name: "Scope filter: os" }).press("Enter");
+  await filter.getByRole("button", { name: "Remove os: linux" }).click();
+  await expect(names.filter({ hasText: "clean-ci" })).toHaveCount(0);
+  await showAll(body);
+  await expect(filter.getByRole("listitem")).toHaveCount(0);
+  await expect(names).toHaveCount(5);
+  await press(body.getByRole("button", { name: "This session", exact: true }));
+  await expect(filter.getByRole("listitem")).toHaveCount(7);
+  await expect(names).toHaveCount(4);
+  expect(said, said.join("\n")).toEqual([]);
+});
+
+test("this session's stack reordered: with up and down (× puts it back), then by dragging, saved with ✓ and asked again", async ({ page }) => {
+  const said = errors(page);
+  const { body } = await engine(page);
+  const rows = stackOf(body);
+  await expect(rows).toHaveText([/^release-tools$/, /^linux-cache\s*auto$/, /^plan-quiet\s*auto$/]);
+  await expect(body.getByRole("button", { name: "Save this session's environments" })).toHaveCount(0);
+  await press(body.getByRole("button", { name: "Move release-tools down" }));
+  await expect(rows).toHaveText([/^linux-cache\s*auto$/, /^release-tools$/, /^plan-quiet\s*auto$/]);
+  await press(body.getByRole("button", { name: "Discard changes to this session's environments" }));
+  await expect(rows).toHaveText([/^release-tools$/, /^linux-cache\s*auto$/, /^plan-quiet\s*auto$/]);
+  // plan-quiet dragged by its handle to the top.
+  await rows.first().evaluate((el) => el.scrollIntoView({ block: "center" }));
+  const grip = rows.nth(2).locator(".ev-grip");
+  const from = (await grip.boundingBox())!;
+  const to = (await rows.first().boundingBox())!;
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(from.x + from.width / 2, to.y + 4, { steps: 8 });
+  await page.mouse.up();
+  await expect(rows).toHaveText([/^plan-quiet\s*auto$/, /^release-tools$/, /^linux-cache\s*auto$/]);
+  await press(body.getByRole("button", { name: "Save this session's environments" }));
+  await expect(body.getByRole("group", { name: "Restart this session?" })).toHaveText(/Restart this session with these\?/);
+  const put = page.waitForRequest((r) => r.method() === "PUT" && r.url().endsWith("/api/harness/sessions/fam-docs/agentenv"));
+  await press(body.getByRole("button", { name: "Restart with these" }));
+  // Moved above one given by name, it's given by name; the one left at the foot joins on its own still.
+  expect((await put).postDataJSON()).toEqual({ agentenvs: ["env-plan", "env-release"] });
+  await expect(rows).toHaveText([/^plan-quiet$/, /^release-tools$/, /^linux-cache\s*auto$/]);
+  await expect(body.getByText("Takes these at its next start")).toHaveCount(0);
   expect(await sideways(page)).toBe(0);
   expect(said, said.join("\n")).toEqual([]);
 });

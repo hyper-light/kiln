@@ -33,6 +33,36 @@ export function takeTyping(el: HTMLElement | null) {
   box?.setSelectionRange(box.value.length, box.value.length);
 }
 
+/**
+ * Find (⌘F, Ctrl+F) asked for while the page comes: its find bar opens with the page (`findAsked`),
+ * not the browser's. The page's own shortcut comes with the page; the early box's page listens from
+ * the moment it shows, and lets the ask go as it does (the page has read it by then).
+ */
+let finding: string | null = null;
+export const findAsked = (id: string) => finding === id;
+function useAskFind(id: string) {
+  return React.useCallback(
+    (el: HTMLElement | null) => {
+      if (!el) return;
+      const ask = (e: KeyboardEvent) => {
+        if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== "f") return;
+        // Asked again from a find bar (a thread loading in a whole page): the browser's own find, as the page's.
+        if (document.activeElement?.closest(".hx-find")) return;
+        e.preventDefault();
+        finding = id;
+        // The find bar takes the focus, not the message box (`takeTyping`).
+        typing = false;
+      };
+      window.addEventListener("keydown", ask);
+      return () => {
+        window.removeEventListener("keydown", ask);
+        if (finding === id) finding = null;
+      };
+    },
+    [id],
+  );
+}
+
 /** A message of yours the conversation doesn't show yet, drawn as it will be (timeline.tsx's `Sending`). */
 function Mine({ text, at, files, word, failed }: { text: string; at: number; files?: string[]; word: string; failed?: boolean }) {
   return (
@@ -143,8 +173,9 @@ export function EarlyComposer({ id, start }: { id: string; start?: Start }) {
     if (!text || failed) return;
     if (await useHeld.getState().hold(id, { id: clientId(), text, at: Date.now(), mode: "queue" })) setDraft(id, "");
   };
+  const askFind = useAskFind(id);
   return (
-    <div className="hx-composer cp">
+    <div className="hx-composer cp" ref={askFind}>
       <div className="hx-compose-box">
         <div className="cp-field">
           <div className="hx-compose-input cp-mirror" aria-hidden="true">

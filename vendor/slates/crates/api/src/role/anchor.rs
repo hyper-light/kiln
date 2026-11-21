@@ -181,6 +181,104 @@ fn hold_fleet_serve(
   Ok(())
 }
 
+/// Binds the version-control servers' shared HTTP edge's listener at the address the operator gave (`--vcs-http`; A-625
+/// part 3), as the daemon binds its own (`slates_server::daemon::bind_vcs_http_listener`), and gives it to `supervisor`
+/// to hand to every daemon it spawns ([`slates_anchor::ENV_VCS_HTTP`]), so the edge's port never drops while a daemon
+/// restarts: a client that connects then waits in the listener's queue for the next daemon. An address that cannot be
+/// bound refuses the anchor's start by name, as a fleet node's serve sockets do: the operator asked for the edge there.
+/// One that cannot be made inheritable is not held, and each daemon binds its own, as for the NFS listener.
+fn hold_vcs_http_listener(
+  supervisor: &mut Supervisor,
+  config: &DaemonConfig,
+  address: slates_rt::tcp::SocketAddrV4,
+) -> Result<(), Failure> {
+  let listener = slates_server::daemon::bind_vcs_http_listener(config, address)
+    .map_err(|e| failed("vcs-http", format!("{address}: {e}")))?;
+  let owned = listener.into_owned();
+  // Unix hands it to each daemon inherited at its number, so it must be inheritable; Windows shares it with each
+  // daemon as an explicit duplicate made for that daemon's process (A-748), and needs nothing of it here.
+  #[cfg(unix)]
+  if let Err(e) = rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::empty()) {
+    slates_machine::log_line!(
+      "slates anchor: the version-control edge's listener cannot be made inheritable ({e}); each daemon binds its own"
+    );
+    return Ok(());
+  }
+  supervisor.hold_vcs_http_listener(owned);
+  Ok(())
+}
+
+/// Binds the version-control servers' SSH edge's listener at the address the operator gave (`--vcs-ssh`; A-684), as the
+/// daemon binds its own (`slates_server::daemon::bind_vcs_ssh_listener`), and gives it to `supervisor` to hand to every
+/// daemon it spawns ([`slates_anchor::ENV_VCS_SSH`]), as [`hold_vcs_http_listener`] does the HTTP edge's: an address that
+/// cannot be bound refuses the anchor's start by name, and one that cannot be made inheritable is not held, each daemon
+/// then binding its own.
+fn hold_vcs_ssh_listener(
+  supervisor: &mut Supervisor,
+  config: &DaemonConfig,
+  address: slates_rt::tcp::SocketAddrV4,
+) -> Result<(), Failure> {
+  let listener = slates_server::daemon::bind_vcs_ssh_listener(config, address)
+    .map_err(|e| failed("vcs-ssh", format!("{address}: {e}")))?;
+  let owned = listener.into_owned();
+  // Unix hands it to each daemon inherited at its number, so it must be inheritable; Windows shares it with each
+  // daemon as an explicit duplicate made for that daemon's process (A-748), and needs nothing of it here.
+  #[cfg(unix)]
+  if let Err(e) = rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::empty()) {
+    slates_machine::log_line!(
+      "slates anchor: the SSH edge's listener cannot be made inheritable ({e}); each daemon binds its own"
+    );
+    return Ok(());
+  }
+  supervisor.hold_vcs_ssh_listener(owned);
+  Ok(())
+}
+
+/// Makes the SSH edge's Ed25519 host key from the system's generator and publishes its seed in `segment`
+/// (`slates_anchor::layout::SUP_SSH_HOST_SEED`; A-684), before any daemon reads the segment: every daemon under this
+/// anchor serves the edge with it, so a restart keeps the key a client pinned, for as long as the anchor lives. A draw
+/// that fails refuses the anchor's start by name, as an address that cannot be bound does: the operator asked for the
+/// edge. The copy here is wiped once published.
+fn publish_ssh_host_key(segment: &mut AnchorSegment) -> Result<(), Failure> {
+  let mut seed = [0u8; slates_anchor::layout::SSH_HOST_SEED_BYTES];
+  slates_transport::handshake::secure_random(&mut seed)
+    .map_err(|e| failed("vcs-ssh host key", e))?;
+  let published = segment
+    .publish_ssh_host_seed(&seed)
+    .map_err(|e| failed("vcs-ssh host key", e));
+  seed.fill(0);
+  std::hint::black_box(&seed);
+  published
+}
+
+/// Binds the svn:// listener at the address the operator gave (`--vcs-svn`; A-689), as the daemon binds its own
+/// (`slates_server::daemon::bind_vcs_svn_listener`), and gives it to `supervisor` to hand to every daemon it spawns
+/// ([`slates_anchor::ENV_VCS_SVN`]), so the listener's port never drops while a daemon restarts: a client that connects
+/// then waits in the listener's queue for the next daemon. An address that cannot be bound refuses the anchor's start by
+/// name, as the HTTP edge's does: the operator asked for the listener there. One that cannot be made inheritable is not
+/// held, and each daemon binds its own, as for the NFS listener. On Windows it is shared with each daemon as an explicit
+/// duplicate made for its process (A-748).
+fn hold_vcs_svn_listener(
+  supervisor: &mut Supervisor,
+  config: &DaemonConfig,
+  address: slates_rt::tcp::SocketAddrV4,
+) -> Result<(), Failure> {
+  let listener = slates_server::daemon::bind_vcs_svn_listener(config, address)
+    .map_err(|e| failed("vcs-svn", format!("{address}: {e}")))?;
+  let owned = listener.into_owned();
+  // Unix hands it to each daemon inherited at its number, so it must be inheritable; Windows shares it with each
+  // daemon as an explicit duplicate made for that daemon's process (A-748), and needs nothing of it here.
+  #[cfg(unix)]
+  if let Err(e) = rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::empty()) {
+    slates_machine::log_line!(
+      "slates anchor: the svn:// listener cannot be made inheritable ({e}); each daemon binds its own"
+    );
+    return Ok(());
+  }
+  supervisor.hold_vcs_svn_listener(owned);
+  Ok(())
+}
+
 fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
   Failure::Failed(format!("{what}: {e}"))
 }
@@ -249,6 +347,12 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
       .publish_launcher_secret(secret.bytes())
       .map_err(|e| failed("launcher secret", e))?;
   }
+  // The SSH edge's host key (A-684), made here at the anchor's start and published the same way, on the page locked
+  // above where the OS allows, so every daemon serves the edge with one key and a restart keeps it beside the port held
+  // below. A fleet node's edge presents the node's own key, read from its plan by each daemon, so its anchor makes none.
+  if options.vcs_ssh.is_some() && options.fleet.is_none() {
+    publish_ssh_host_key(&mut segment)?;
+  }
   // A crash loop's backoff doubles to its cap (A-311, [`restart_policy`]), logged with its derivation as the daemon's
   // derived constants are.
   let policy = restart_policy(&config);
@@ -273,6 +377,19 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   #[cfg(unix)]
   if let Some(selection) = &options.fleet {
     hold_fleet_serve(&mut supervisor, selection)?;
+  }
+  // The version-control edge's listener is held the same way (A-625 part 3): bound once here, at the address the
+  // operator gave, and handed to every daemon, so a restart never drops the edge's port.
+  if let Some(address) = options.vcs_http {
+    hold_vcs_http_listener(&mut supervisor, &config, address)?;
+  }
+  // And the SSH edge's (A-684), whose host key the segment already holds.
+  if let Some(address) = options.vcs_ssh {
+    hold_vcs_ssh_listener(&mut supervisor, &config, address)?;
+  }
+  // And the svn:// listener (A-689): bound once here and handed to every daemon, so a restart never drops its port.
+  if let Some(address) = options.vcs_svn {
+    hold_vcs_svn_listener(&mut supervisor, &config, address)?;
   }
   // The FUSE devices daemons mount are held the same way (A-61): a daemon sends each to the anchor, and the
   // next daemon takes back the mounts it recovers. A channel that cannot be opened refuses the anchor's start:
@@ -316,8 +433,9 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
       .unwrap_or(0),
     config.runtime.shards
   );
-  announce_issuer_surface(&supervisor);
-  observe(&mut supervisor, &mut clock, now)
+  let issuer = IssuerSurface::open(&options.instance)?;
+  announce_issuer_surface(&supervisor, &issuer);
+  observe(&mut supervisor, &mut clock, now, &issuer)
 }
 
 /// The issuer surface (§4.13 "Grants"; `slates grant`, `enroll`, `revoke`, `run`): a command that
@@ -326,7 +444,7 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
 /// mode and per-user name are the authentication, so any process of this user may open it — and it is
 /// printed for the anchor's shell to export.
 #[cfg(not(target_os = "linux"))]
-fn announce_issuer_surface(supervisor: &Supervisor) {
+fn announce_issuer_surface(supervisor: &Supervisor, _issuer: &IssuerSurface) {
   if let Ok(handoff) = supervisor.segment().handoff_env() {
     let exports: Vec<String> = handoff
       .iter()
@@ -339,10 +457,69 @@ fn announce_issuer_surface(supervisor: &Supervisor) {
   }
 }
 
-/// On Linux the handoff is a descriptor (a memfd) only this process's children hold; there is
-/// nothing a shell could export, so nothing is printed.
+/// On Linux the handoff is a descriptor (a memfd) only this process's children hold, so the anchor prints its issuer
+/// route's name and the secret it answers to instead (A-754, `slates_ipc::issuer_route`): a process that exports them
+/// claims the segment's descriptor over the route, where the anchor checks its user and the secret, and proves as a
+/// child would. Whoever holds the printed secret can issue, as whoever holds the printed name can on macOS and Windows.
 #[cfg(target_os = "linux")]
-fn announce_issuer_surface(_supervisor: &Supervisor) {}
+fn announce_issuer_surface(_supervisor: &Supervisor, issuer: &IssuerSurface) {
+  slates_machine::log_line!(
+    "slates anchor: issuer surface: export {}={} {}={}",
+    slates_ipc::issuer_route::ENV_ISSUER_ROUTE,
+    issuer.route.name(),
+    slates_ipc::issuer_route::ENV_ISSUER_SECRET,
+    slates_ipc::issuer_route::secret_text(&issuer.secret)
+  );
+}
+
+/// The anchor's issuer route on Linux (A-754): its abstract socket and the secret printed for it, made at the anchor's
+/// start from the system's generator and kept for the anchor's life. Nothing elsewhere, where the segment's name is the
+/// surface.
+struct IssuerSurface {
+  #[cfg(target_os = "linux")]
+  route: slates_ipc::issuer_route::IssuerRoute,
+  #[cfg(target_os = "linux")]
+  secret: [u8; slates_ipc::issuer_route::SECRET_BYTES],
+}
+
+impl IssuerSurface {
+  /// Binds `instance`'s issuer route and draws its secret (Linux); nothing to make elsewhere. A route that cannot be
+  /// bound, or a secret that cannot be drawn, refuses the anchor's start by name: without them no separate process
+  /// could issue.
+  #[cfg(target_os = "linux")]
+  fn open(instance: &str) -> Result<IssuerSurface, Failure> {
+    let route = slates_ipc::issuer_route::IssuerRoute::bind(instance)
+      .map_err(|e| failed("issuer route", e))?;
+    let mut secret = [0u8; slates_ipc::issuer_route::SECRET_BYTES];
+    slates_transport::handshake::secure_random(&mut secret)
+      .map_err(|e| failed("issuer secret", e))?;
+    Ok(IssuerSurface { route, secret })
+  }
+
+  /// See the Linux arm: the segment's printed name is the surface here.
+  #[cfg(not(target_os = "linux"))]
+  fn open(_instance: &str) -> Result<IssuerSurface, Failure> {
+    Ok(IssuerSurface {})
+  }
+
+  /// Answers every claim waiting on the route (Linux): one with the printed secret from this user is handed the
+  /// segment's descriptor and length; each read within a beat, so a turn of the loop is never held longer.
+  #[cfg(target_os = "linux")]
+  fn answer(&self, supervisor: &Supervisor) {
+    let segment = supervisor.segment();
+    let len = u64::try_from(segment.len()).unwrap_or(u64::MAX);
+    let _ = self.route.answer_waiting(
+      &self.secret,
+      segment.object_fd(),
+      len,
+      Duration::from_nanos(HEARTBEAT_NS),
+    );
+  }
+
+  /// See the Linux arm: nothing waits elsewhere.
+  #[cfg(not(target_os = "linux"))]
+  fn answer(&self, _supervisor: &Supervisor) {}
+}
 
 /// Stops the daemon through the graceful protocol (`slates_anchor::layout::SUP_STOP`): asks it to stop, then
 /// steps the stop each heartbeat until it exits — on its own after handing off any consensus leadership it
@@ -581,13 +758,14 @@ fn on_lapse(
     Lapse::Withheld => {
       slates_machine::log_line!(
         "slates anchor: the daemon's heartbeat lapsed ({} ms old, past {} ms: the {} ms window plus this anchor's \
-         lateness p99 of {} ms over {} waits, at most {} ms); killing it",
+         lateness p99 of {} ms over {} waits, at most {} ms); {}; killing it",
         beat_age / NS_PER_MS,
         seen.bound / NS_PER_MS,
         LIVENESS_BUDGET_NS / NS_PER_MS,
         lateness.p99_ns() / NS_PER_MS,
         lateness.len(),
-        slates_server::watchdog::WINDOW_CEILING_NS / NS_PER_MS
+        slates_server::watchdog::WINDOW_CEILING_NS / NS_PER_MS,
+        stuck_task_words(supervisor.stuck_task())
       );
       supervisor.kill().map_err(|e| failed("kill", e))?;
       Ok(true)
@@ -649,6 +827,19 @@ fn judge_lapse(watchdog_looking: bool, window_ns: u64, process: impl FnOnce() ->
   }
 }
 
+/// What the daemon's watchdog found its stuck shard polling (A-740), in the kill line's words.
+fn stuck_task_words(task: Option<slates_anchor::StuckTask>) -> String {
+  task.map_or_else(
+    || "its watchdog recorded no stuck task".to_owned(),
+    |task| {
+      format!(
+        "its watchdog found shard {} stuck in task {}, at its poll {}",
+        task.shard, task.label, task.polls
+      )
+    },
+  )
+}
+
 /// What a start's verdict says when it is to be killed, naming the window it was judged by: a wedge's, `window_ns`
 /// ([`anchor_window_ns`]), and a spin's, the window of CPU the verdict carries. `None` while it is alive.
 fn start_stuck(verdict: Verdict, window_ns: u64) -> Option<String> {
@@ -694,6 +885,7 @@ fn observe(
   supervisor: &mut Supervisor,
   clock: &mut HostClock,
   started: u64,
+  issuer: &IssuerSurface,
 ) -> Result<(), Failure> {
   let mut starting_since = Some(started);
   // The start under way, judged in the daemon's own CPU time and its beats until its watchdog takes the beat over
@@ -742,6 +934,8 @@ fn observe(
       stop_gracefully(supervisor, clock, &lateness)?;
       return Ok(());
     }
+    // A process claiming the segment over the issuer route is answered within a turn (A-754).
+    issuer.answer(supervisor);
     let now = clock.monotonic_ns();
     let bound = lateness.lapse_bound_ns();
     publish_lapse_bound(supervisor, bound, &mut published_bound);
@@ -841,7 +1035,9 @@ fn observe(
         failed_in_a_row,
       } => {
         slates_machine::log_line!(
-          "slates anchor: daemon exited ({exit_code:?}); restarted as pid {} ({failed_in_a_row} failed starts in a row)",
+          "slates anchor: daemon exited ({exit_code:?}: {}); restarted as pid {} ({failed_in_a_row} failed starts in a \
+           row)",
+          exit_cause(exit_code, kill_sent),
           supervisor
             .child_pid()
             .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string())
@@ -867,7 +1063,8 @@ fn observe(
         // Never given up on (A-119): every hard mount waits for the daemon. The loop is recorded for the health
         // plane and the restart comes after the backoff.
         slates_machine::log_line!(
-          "slates anchor: the daemon is in a crash loop (last exit {exit_code:?}); restarting it in {} ms",
+          "slates anchor: the daemon is in a crash loop (last exit {exit_code:?}: {}); restarting it in {} ms",
+          exit_cause(exit_code, kill_sent),
           retry_in_ns / NS_PER_MS
         );
         kill_sent = false;
@@ -997,6 +1194,71 @@ fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, (budget_ns, gap_ns): (u64
 /// to the NFSv4 lease the daemon `config` derives grants its clients (A-525, `RestartPolicy::derive`).
 fn restart_policy(config: &DaemonConfig) -> slates_machine::Derived<RestartPolicy> {
   RestartPolicy::derive(config.nfs_v4.lease_ns)
+}
+
+/// Format: the base a POSIX shell adds a signal's number to for the status of a process the signal ended (POSIX.1-2017,
+/// Shell Command Language §2.8.2, "Exit Status for Commands": greater than 128), and the base Git Bash's `kill` (the
+/// MSYS2 runtime) passes `TerminateProcess` for a native Windows process, so its exit code reads as a shell's would.
+const SIGNALLED_EXIT_BASE: i32 = 128;
+/// Format: SIGTERM's number (POSIX), the termination request a shell's `kill` sends by default.
+const SIGTERM_NUMBER: i32 = 15;
+/// Format: SIGKILL's number (POSIX).
+const SIGKILL_NUMBER: i32 = 9;
+
+/// Why the daemon's process ended, in words, for the anchor's restart and crash-loop lines (main's ruling of 2026-11-20:
+/// a legitimate exit is said, not left as a bare code). `kill_sent`: the anchor itself killed it (a stuck start, a lapsed
+/// beat), whose own line came first. Pure, so the words are tested on every host.
+///
+/// The case that asked for it: on jupiter, w-interop's matrix script ended with `kill $ANCHOR` from Git Bash, which ends
+/// a native Windows process's tree, its children first, each by `TerminateProcess` with 128 + SIGTERM's 15; the daemon
+/// went first and the anchor logged "daemon exited (Some(143)); restarted" before it went too (reproduced there,
+/// 2026-11-20, with the run's own binary: the same line, nothing after it, no slates process left).
+fn exit_cause(exit_code: Option<i32>, kill_sent: bool) -> &'static str {
+  if kill_sent {
+    return "the anchor's own kill, said above";
+  }
+  match exit_code {
+    None => "ended by a signal, which leaves no exit code (Unix)",
+    Some(0) => "it exited by itself, cleanly",
+    Some(code) if code == i32::from(super::EXIT_FAILED) => {
+      "it ended itself as failed: its watchdog judged a shard stuck, or a start step failed (its last lines say which)"
+    }
+    Some(code) if code == SIGNALLED_EXIT_BASE.saturating_add(SIGTERM_NUMBER) => {
+      "ended from outside by a termination request, not by slates: 128 + SIGTERM's 15, what a shell's `kill` leaves, \
+       and on Windows what Git Bash's `kill` passes `TerminateProcess` for each process of a native tree it ends, \
+       children first, so the anchor may log this restart just before it is ended too"
+    }
+    Some(code) if code == SIGNALLED_EXIT_BASE.saturating_add(SIGKILL_NUMBER) => {
+      "killed from outside, not by slates: 128 + SIGKILL's 9, what a shell's `kill -9` leaves (Git Bash's on Windows)"
+    }
+    Some(_) => "an exit code of its own, which its last lines explain",
+  }
+}
+
+#[cfg(test)]
+mod exit_cause_tests {
+  use super::*;
+
+  /// The Windows exit 143 (w-interop's matrices on jupiter, 2026-11-20: "daemon exited (Some(143)); restarted" with no
+  /// kill line, the run's last line). Reproduced there: Git Bash's `kill` of the anchor ends the native process tree,
+  /// the daemon first with 128 + SIGTERM's 15, so the anchor logs a restart before it goes too. Do: name the exits the
+  /// anchor meets. Expect 143 said as a termination from outside naming Git Bash's `kill`, 137 as a kill from outside,
+  /// the watchdog's failure code as the watchdog's, a clean exit as clean, no code as a signal's, and any exit after the
+  /// anchor's own kill as that kill, whatever its code.
+  #[test]
+  fn a_daemons_exit_is_named_in_words_143_as_a_termination_from_outside() {
+    let outside = exit_cause(Some(143), false);
+    assert!(
+      outside.contains("ended from outside") && outside.contains("Git Bash"),
+      "143: {outside:?}"
+    );
+    assert!(exit_cause(Some(137), false).contains("killed from outside"));
+    assert!(exit_cause(Some(i32::from(super::super::EXIT_FAILED)), false).contains("watchdog"));
+    assert!(exit_cause(Some(0), false).contains("cleanly"));
+    assert!(exit_cause(None, false).contains("signal"));
+    assert!(exit_cause(Some(143), true).contains("the anchor's own kill"));
+    assert!(exit_cause(Some(7), false).contains("its own"));
+  }
 }
 
 #[cfg(test)]

@@ -32,8 +32,6 @@ use slates_wire::request::RequestId;
 
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
 const DEADLINE_NS: u64 = 5_000_000_000;
-/// Shape: how long a client waits for a full ring to drain before giving up.
-const CREDIT_WAIT: Duration = Duration::from_secs(5);
 /// Shape: shards per test daemon: two, so a client lands on a shard other than the control
 /// shard's and the cross-shard hand-off runs.
 const TEST_SHARDS: u16 = 2;
@@ -46,23 +44,16 @@ struct Client {
 }
 
 impl Client {
+  /// A client of `instance`, whose daemon started before this, its rendezvous held and published by then: the claim
+  /// waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait (A-571's rule;
+  /// until 2026-11-20 a five-second retry, `CREDIT_WAIT`).
   fn connect(instance: &str) -> Client {
-    let started = Instant::now();
-    loop {
-      match connect(instance) {
-        Ok(connected) => {
-          let client = connected.region.client_id();
-          return Client {
-            end: ClientEnd::connected(connected),
-            client,
-            sequence: 0,
-          };
-        }
-        Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
-          std::hint::spin_loop();
-        }
-        Err(e) => panic!("{e}"),
-      }
+    let connected = connect(instance).unwrap_or_else(|e| panic!("{e}"));
+    let client = connected.region.client_id();
+    Client {
+      end: ClientEnd::connected(connected),
+      client,
+      sequence: 0,
     }
   }
 
@@ -98,14 +89,16 @@ impl Client {
       body,
     )
     .unwrap();
-    let started = Instant::now();
-    loop {
-      match self.end.send(&slot) {
-        Ok(()) => break,
-        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::hint::spin_loop(),
-        Err(e) => panic!("{e}"),
-      }
-    }
+    // A full ring is waited out while the daemon lives, as every client end waits (A-571).
+    let roomed = self
+      .end
+      .send_when_room(|end| end.send(&slot))
+      .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+      roomed,
+      slates_ipc::room::Roomed::Sent,
+      "the daemon went away while its ring was full"
+    );
     let reply = self
       .end
       .wait(Some(DEADLINE_NS))
@@ -220,6 +213,145 @@ fn daemon(name: &str) -> (Daemon, String) {
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
+}
+
+/// Shape: the stop watch's install budget before 2026-11-20: the observe budget, ten liveness windows, at which a control
+/// shard still busy with recovered work refused the install and the daemon stopped itself (w-interop's restart loop).
+const OLD_STOP_WATCH_BUDGET_NS: u64 = slates_server::daemon::OBSERVE_BUDGET_NS;
+
+/// Set once the test gives the stop watch its reason ([`a_stop_watch_asked_of_a_busy_control_shard_is_installed_and_waits_for_a_reason`]).
+static STOP_REASON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once the stop watch's wait returned.
+static STOP_WATCH_RETURNED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+/// Set once the busy work holding the control shard alone has ended.
+static BUSY_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long the busy work holds the control shard: the old install budget held to this build's cost (the CPU an
+/// observation gave a busy shard before calling it one that would never answer, `observe::held_to_this_build`), and a
+/// liveness window more, so the old install is refused while the shard is still busy.
+fn busy_span_ns() -> u64 {
+  slates_machine::build_cost::build_cost()
+    .map_or(OLD_STOP_WATCH_BUDGET_NS, |cost| {
+      cost.scale(OLD_STOP_WATCH_BUDGET_NS)
+    })
+    .saturating_add(slates_server::daemon::LIVENESS_BUDGET_NS)
+}
+
+/// Holds `daemon`'s control shard alone with busy work for `span_ns`, a heartbeat's spin at a time between yields (each
+/// yield a step, as recovered work slices), and raises `ended` when the work ends. Returns once the shard took the work.
+fn hold_control_alone(
+  daemon: &Daemon,
+  span_ns: u64,
+  ended: &'static std::sync::atomic::AtomicBool,
+) {
+  daemon
+    .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |_| {
+      let busy = slates_rt::futures::spawn_alone(async move {
+        let end = slates_rt::futures::now_ns().saturating_add(span_ns);
+        while slates_rt::futures::now_ns() < end {
+          let slice_end =
+            slates_rt::futures::now_ns().saturating_add(slates_server::daemon::HEARTBEAT_NS);
+          while slates_rt::futures::now_ns() < slice_end {
+            std::hint::spin_loop();
+          }
+          slates_rt::futures::yield_now().await;
+        }
+        ended.store(true, std::sync::atomic::Ordering::Release);
+      });
+      busy.and_then(slates_rt::futures::detach).is_ok()
+    })
+    .map(|spawned| assert!(spawned, "the busy work was spawned alone"))
+    .expect("the control shard took the busy work");
+}
+
+/// Set once the busy work of [`a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs`] has ended.
+static OBSERVED_BUSY_ENDED: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+/// R3 and A-232 (2026-11-20, main's ruling after w-interop's restart loop): a default observation waits while its shard
+/// lives, however long the shard is busy. Do: hold the control shard alone with busy work for [`busy_span_ns`] (the old
+/// observe budget at this build's cost and a window more); meanwhile ask the control shard's counters, a default
+/// observation (`Daemon::fleet_refusals`). Expect them answered, after the work ended. Before, a default observation had
+/// the observe budget, ten liveness windows, and a shard that stepped busy past that budget's CPU without reaching the
+/// question ended it with a deadline: the hazard that refused the stop watch and stopped the daemon.
+#[test]
+fn a_default_observation_of_a_busy_control_shard_is_answered_once_it_runs() {
+  use std::sync::atomic::Ordering;
+  let (daemon, _instance) = daemon("observe-busy");
+  let span_ns = busy_span_ns();
+  hold_control_alone(&daemon, span_ns, &OBSERVED_BUSY_ENDED);
+  let began = Instant::now();
+  let answered = daemon.fleet_refusals();
+  let waited = began.elapsed();
+  let after_the_work = OBSERVED_BUSY_ENDED.load(Ordering::Acquire);
+  drop(daemon);
+  eprintln!(
+    "the control shard was busy {:?}; the observation waited {waited:?} and ended {}",
+    Duration::from_nanos(span_ns),
+    if answered.is_ok() {
+      "answered"
+    } else {
+      "refused"
+    }
+  );
+  assert!(
+    answered.is_ok(),
+    "the observation was answered, not refused while the shard worked: {:?}",
+    answered.err()
+  );
+  assert!(
+    after_the_work,
+    "it was answered once the work let the shard reach it"
+  );
+}
+
+/// A daemon never stops itself because its control shard is busy (w-interop's git matrix, 2026-11-20: a restart's
+/// recovered encode work held the control shard 36 s, the stop watch's install was refused at its 10 s budget, the daemon
+/// logged "the stop watch could not be installed ... stopping" and exited 0, and its anchor restarted it into the same
+/// work, 78 times). Do: hold the control shard alone with busy work, a heartbeat's spin at a time between yields (each
+/// yield a step, as recovered work slices), for [`busy_span_ns`]; meanwhile wait for a reason to stop; once the work ends,
+/// look again two heartbeats later, then give the watch its reason. Expect the watch still waiting after the work (taken
+/// in, not refused), and its wait to end once given its reason. Before, the watch was installed by an observation the
+/// busy shard could not answer within its budget, and its refusal ended the wait while the shard was still busy, which
+/// the daemon's role took as its reason to stop.
+#[test]
+fn a_stop_watch_asked_of_a_busy_control_shard_is_installed_and_waits_for_a_reason() {
+  use std::sync::atomic::Ordering;
+  let (daemon, _instance) = daemon("stop-watch-busy");
+  let span_ns = busy_span_ns();
+  hold_control_alone(&daemon, span_ns, &BUSY_ENDED);
+  let giver = std::thread::spawn(|| {
+    while !BUSY_ENDED.load(Ordering::Acquire) {
+      #[allow(clippy::disallowed_methods)] // a test watches the busy work's end on the wall
+      std::thread::sleep(Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS));
+    }
+    #[allow(clippy::disallowed_methods)] // two of the watch's heartbeats
+    std::thread::sleep(Duration::from_nanos(
+      2 * slates_server::daemon::HEARTBEAT_NS,
+    ));
+    let waiting_after_busy = !STOP_WATCH_RETURNED.load(Ordering::Acquire);
+    STOP_REASON.store(true, Ordering::Release);
+    waiting_after_busy
+  });
+  let began = Instant::now();
+  daemon.wait_for_stop(|| STOP_REASON.load(Ordering::Acquire));
+  STOP_WATCH_RETURNED.store(true, Ordering::Release);
+  let waited = began.elapsed();
+  let waiting_after_busy = giver.join().unwrap();
+  drop(daemon);
+  eprintln!(
+    "the control shard was busy {:?}; the watch waited {waited:?}, still waiting after the work: {waiting_after_busy}",
+    Duration::from_nanos(span_ns)
+  );
+  assert!(
+    waiting_after_busy,
+    "the watch was taken in and waited past the busy work, not refused while it ran (waited {waited:?})"
+  );
+  assert!(
+    waited >= Duration::from_nanos(span_ns),
+    "the watch ended at its reason, after the work"
+  );
 }
 
 /// §2.6 boot step 2 (A-312). Do: start a daemon of [`TEST_SHARDS`] shards and ask how often its start beat. Expect at least
@@ -546,13 +678,15 @@ fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
       Control::Spawn(Box::new(SpawnRequest::new(
         Box::pin(async move {
           entered.send(()).unwrap();
-          released.recv_timeout(CREDIT_WAIT).unwrap();
+          // Held until the test releases it: the test lives as long as this wait (A-571's rule).
+          released.recv().unwrap();
         }),
         None,
       ))),
     )
     .unwrap();
-    held.recv_timeout(CREDIT_WAIT).unwrap();
+    // The shard runs the task while the daemon lives; a task dropped unrun drops its sender, which ends this wait.
+    held.recv().unwrap();
     releases.push(release);
   }
   let Kick::Eventfd(observer) =
@@ -634,7 +768,7 @@ fn shard_holdings(client: &mut Client) -> Vec<(u64, u64)> {
 /// 1 MiB volumes on one partition, exhausted its version slots and could not run
 /// (docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md). Do: create volumes
 /// whose names place them on every shard, destroy them all, then read each shard's holdings. Expect: every
-/// shard back to no volume and no committed byte within the credit wait.
+/// shard back to no volume and no committed byte, waited for while the daemon lives.
 #[test]
 fn a_destroy_completes_on_an_owner_shard_that_has_no_client() {
   let (daemon, instance) = daemon("destroy-owner");
@@ -657,16 +791,14 @@ fn a_destroy_completes_on_an_owner_shard_that_has_no_client() {
       ReplyBody::Destroyed
     ));
   }
-  let started = Instant::now();
-  loop {
-    let holdings = shard_holdings(&mut client);
-    if holdings.iter().all(|held| *held == (0, 0)) {
-      break;
-    }
-    assert!(
-      started.elapsed() < CREDIT_WAIT,
-      "a destroy never completed on its owner: {holdings:?} (volumes, committed bytes per shard)"
-    );
+  // Waited while the daemon lives (A-232's rule): each look is a status the daemon answers, which fails the test at once
+  // when the daemon has gone. Until 2026-11-20 five seconds on the wall (`CREDIT_WAIT`), which a host that kept the
+  // owner shard off its CPU could outlast with the destroy still stepping.
+  while !shard_holdings(&mut client)
+    .iter()
+    .all(|held| *held == (0, 0))
+  {
+    std::thread::yield_now();
   }
   drop(daemon);
 }
@@ -940,7 +1072,8 @@ fn resize_and_destroy(client: &mut Client, id: slates_ipc::protocol::VolumeId) {
       refusal: Refusal::Destroying | Refusal::NotFound
     }
   ));
-  let started = Instant::now();
+  // Waited while the daemon lives: each look is an answer of the live daemon, a gone one failing the call at once
+  // (A-232's rule; until 2026-11-20 five seconds on the wall, `CREDIT_WAIT`).
   loop {
     let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
@@ -949,10 +1082,7 @@ fn resize_and_destroy(client: &mut Client, id: slates_ipc::protocol::VolumeId) {
     if names == vec!["one-clone"] {
       break;
     }
-    assert!(
-      started.elapsed() < CREDIT_WAIT,
-      "destroy completes in slices: {names:?}"
-    );
+    std::thread::yield_now();
   }
 }
 
@@ -2249,7 +2379,8 @@ fn version_reservation_scenario() {
     client.call(&RequestBody::Destroy { volume: grower }),
     ReplyBody::Destroyed
   ));
-  let started = Instant::now();
+  // Waited while the daemon lives: each look is an answer of the live daemon, a gone one failing the call at once
+  // (A-232's rule; until 2026-11-20 five seconds on the wall, `CREDIT_WAIT`).
   loop {
     let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
@@ -2257,10 +2388,7 @@ fn version_reservation_scenario() {
     if !volumes.iter().any(|v| v.id == grower) {
       break;
     }
-    assert!(
-      started.elapsed() < CREDIT_WAIT,
-      "destroy completes in slices: {volumes:?}"
-    );
+    std::thread::yield_now();
   }
   // With the hold returned, a fresh volume is admitted again — the hold is released on teardown.
   assert!(
@@ -2684,7 +2812,8 @@ fn snapshot_destroy_scenario() {
     client.call(&RequestBody::Destroy { volume: clone }),
     ReplyBody::Destroyed
   ));
-  let started = Instant::now();
+  // Waited while the daemon lives: each look is an answer of the live daemon, a gone one failing the call at once
+  // (A-232's rule; until 2026-11-20 five seconds on the wall, `CREDIT_WAIT`).
   loop {
     let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
@@ -2692,7 +2821,7 @@ fn snapshot_destroy_scenario() {
     if volumes.iter().all(|v| v.name != "clone") {
       break;
     }
-    assert!(started.elapsed() < CREDIT_WAIT, "clone destroy completes");
+    std::thread::yield_now();
   }
   // With the pin released, the snapshot can now be destroyed.
   assert!(
@@ -2823,18 +2952,12 @@ fn a_foreign_principal_cannot_drive_another_accounts_merge() {
       path: "d".to_owned(),
     },
   }));
-  assert_foreign_merge_refused(intruder.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::submit(work, Vec::new())));
   assert_foreign_merge_refused(intruder.call(&RequestBody::Rebase { work }));
   // The green never advanced under the foreign calls; the owner still drives its own submit to success.
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = owner.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  })
+  } = owner.call(&RequestBody::submit(work, Vec::new()))
   else {
     panic!("the owner submits its own work");
   };
@@ -2871,10 +2994,7 @@ fn a_shared_green_is_read_and_worked_by_the_principal_it_names() {
   ));
   let (green, work) = owner_green_and_work(&mut owner);
   assert!(matches!(
-    owner.call(&RequestBody::Submit {
-      work,
-      evidence: Vec::new(),
-    }),
+    owner.call(&RequestBody::submit(work, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -2932,10 +3052,7 @@ fn the_sharer_reads_and_works_the_green(sharer: &mut Client, green: VolumeId) {
     }),
     ReplyBody::Edited
   ));
-  let submitted = sharer.call(&RequestBody::Submit {
-    work: own,
-    evidence: Vec::new(),
-  });
+  let submitted = sharer.call(&RequestBody::submit(own, Vec::new()));
   assert!(
     matches!(
       submitted,
@@ -2993,10 +3110,7 @@ fn merge_submit_scenario() {
   // A merges on the fast path; the chain advances.
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: a,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(a, Vec::new()))
   else {
     panic!("submit a");
   };
@@ -3034,10 +3148,7 @@ fn merge_submit_scenario() {
   // B, still based on version 0, touched the same file — it conflicts rather than clobbering A.
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: b,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(b, Vec::new()))
   else {
     panic!("submit b");
   };
@@ -3083,10 +3194,7 @@ fn merge_modify_scenario() {
   };
   edit(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3103,10 +3211,7 @@ fn merge_modify_scenario() {
   edit(&mut client, modw, 0, 5, b"world");
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: modw,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(modw, Vec::new()))
   else {
     panic!("submit");
   };
@@ -3156,10 +3261,7 @@ fn merge_lagging_scenario() {
   let (seed, _) = work(&mut client, "seed");
   create_file(&mut client, seed, "base", b"x");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3173,10 +3275,7 @@ fn merge_lagging_scenario() {
   create_file(&mut client, b, "b", b"b-content");
   // B submits first, advancing the green to version 2; A now lags at base 1.
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: b,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(b, Vec::new())),
     ReplyBody::Submitted {
       version: Some(2),
       ..
@@ -3185,10 +3284,7 @@ fn merge_lagging_scenario() {
   // A, based on version 1, touched a different file — it merges past version 2 as version 3.
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: a,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(a, Vec::new()))
   else {
     panic!("submit a");
   };
@@ -3263,10 +3359,7 @@ fn rebase_clean_part(client: &mut Client, green: slates_ipc::protocol::VolumeId)
 
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: tail,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(tail, Vec::new()))
   else {
     panic!("submit");
   };
@@ -3286,10 +3379,7 @@ fn rebase_conflict_part(client: &mut Client, green: slates_ipc::protocol::Volume
   edit_f(client, winner, 0, 2, b"PP");
   edit_f(client, loser, 0, 2, b"QQ");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: winner,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(winner, Vec::new())),
     ReplyBody::Submitted {
       version: Some(4),
       ..
@@ -3333,10 +3423,7 @@ fn merge_rebase_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"0123456789");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3345,10 +3432,7 @@ fn merge_rebase_scenario() {
   let front = work_over(&mut client, green, "front");
   edit_f(&mut client, front, 0, 0, b"AB");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: front,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(front, Vec::new())),
     ReplyBody::Submitted {
       version: Some(2),
       ..
@@ -3402,10 +3486,7 @@ fn declare_metadata_part(client: &mut Client, green: slates_ipc::protocol::Volum
   );
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: meta,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(meta, Vec::new()))
   else {
     panic!("submit meta");
   };
@@ -3444,10 +3525,8 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   let other = set(client, "xattr-c", b"BB");
 
   // The first sets the attribute; it advances the green to version 3, storing "AA".
-  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::Submit {
-    work: first,
-    evidence: Vec::new(),
-  }) else {
+  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::submit(first, Vec::new()))
+  else {
     panic!("submit xattr-a");
   };
   assert_eq!(version, Some(3), "the first xattr set is version 3");
@@ -3455,10 +3534,7 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   // The second, based on 2, sets a different value — it conflicts against the stored "AA".
   let ReplyBody::Submitted {
     version, conflicts, ..
-  } = client.call(&RequestBody::Submit {
-    work: other,
-    evidence: Vec::new(),
-  })
+  } = client.call(&RequestBody::submit(other, Vec::new()))
   else {
     panic!("submit xattr-c");
   };
@@ -3534,10 +3610,7 @@ fn merge_declare_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit {
-      work: seed,
-      evidence: Vec::new()
-    }),
+    client.call(&RequestBody::submit(seed, Vec::new())),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -3725,10 +3798,10 @@ fn create_until_the_ledger_refuses(client: &mut Client) -> Vec<slates_ipc::proto
   }
 }
 
-/// Waits, within the credit budget, until the daemon lists exactly `count` volumes (a destroy
-/// completes in cooperative slices).
+/// Waits, while the daemon lives, until it lists exactly `count` volumes (a destroy completes in cooperative slices).
 fn wait_for_volume_count(client: &mut Client, count: usize) {
-  let started = Instant::now();
+  // Waited while the daemon lives: each look is an answer of the live daemon, a gone one failing the call at once
+  // (A-232's rule; until 2026-11-20 five seconds on the wall, `CREDIT_WAIT`).
   loop {
     let ReplyBody::Listed { volumes, .. } = client.call(&RequestBody::List { after: None }) else {
       panic!("list");
@@ -3736,10 +3809,7 @@ fn wait_for_volume_count(client: &mut Client, count: usize) {
     if volumes.len() == count {
       return;
     }
-    assert!(
-      started.elapsed() < CREDIT_WAIT,
-      "destroy completes in slices: {volumes:?}"
-    );
+    std::thread::yield_now();
   }
 }
 
@@ -3860,10 +3930,7 @@ fn edit_at(
 
 /// Submits `work` with no evidence and asserts it was accepted as `version`.
 fn submit_accepted(client: &mut Client, work: slates_ipc::protocol::VolumeId, version: u64) {
-  let reply = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let reply = client.call(&RequestBody::submit(work, Vec::new()));
   match reply {
     ReplyBody::Submitted {
       version: Some(got),
@@ -3876,10 +3943,7 @@ fn submit_accepted(client: &mut Client, work: slates_ipc::protocol::VolumeId, ve
 
 /// A `Submit` request with no evidence.
 fn submit_of(work: slates_ipc::protocol::VolumeId) -> RequestBody {
-  RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  }
+  RequestBody::submit(work, Vec::new())
 }
 
 /// An `Edit` request creating `f` on `work`.
@@ -4076,10 +4140,7 @@ fn role_evidence_part(client: &mut Client) {
     refusal_of(client, &submit_of(sw)),
     Refusal::EvidenceRequired
   );
-  let reply = client.call(&RequestBody::Submit {
-    work: sw,
-    evidence: vec![[7u8; 32]],
-  });
+  let reply = client.call(&RequestBody::submit(sw, vec![[7u8; 32]]));
   assert!(
     matches!(
       reply,
@@ -4533,8 +4594,9 @@ const RETENTION_EDITS: u64 = 6;
 /// lagging work still names the old version the copies are kept for it (the fold floor is its base),
 /// a conflicting submit from it is cached and charged too, and destroying it raises the floor to the
 /// head, folds every copy away and credits the charge — so only the rejected-result cache remains
-/// charged. Non-vacuous: the history grew with the edits before the fold (by less than one copy of the file for all of
-/// them) and is zero after it, and every observation has `charged == history + rejected`.
+/// charged. Non-vacuous: the history grew with the edits before the fold (the earlier file once, which the lagging work
+/// keeps, and what the edits wrote: under two copies for all of them, A-728 part 4's honest charge) and is zero after
+/// it, and every observation has `charged == history + rejected`.
 #[test]
 fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded() {
   let (daemon, instance) = daemon("merge-retention");
@@ -4551,11 +4613,14 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
     submit_accepted(&mut client, writer, 2 + edit);
   }
   let retained = daemon.merge_retention(g).unwrap();
+  // The honest charge (A-728 part 4, main's ruling): the lagging work keeps the file as it was before the edits, once,
+  // which the history holds (its earlier block); the edits add what they wrote. Never a copy per edit (W2).
+  let file = RETENTION_FILE_BYTES as u64;
   assert!(
-    retained.history > 0 && retained.history < RETENTION_FILE_BYTES as u64,
-    "the small edits retained what they changed for the lagging work, less than one copy of the file for all \
-     of them (W2: a whole copy per edit before 2026-11-07, {} bytes): {retained:?}",
-    RETENTION_EDITS * RETENTION_FILE_BYTES as u64
+    retained.history >= file && retained.history < 2 * file,
+    "the small edits retained the earlier file once for the lagging work and what they wrote, under two copies of \
+     the file for all of them (W2: a whole copy per edit before 2026-11-07, {} bytes): {retained:?}",
+    RETENTION_EDITS * file
   );
   assert_balanced(&retained, 0);
 
@@ -4700,10 +4765,7 @@ fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them(
   };
   assert_eq!(edit(&mut client, b"before"), ReplyBody::Edited);
   // Submitted, so the green holds the file and a new work's seeded copy of it costs bytes.
-  let submitted = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let submitted = client.call(&RequestBody::submit(work, Vec::new()));
   assert!(
     matches!(
       submitted,

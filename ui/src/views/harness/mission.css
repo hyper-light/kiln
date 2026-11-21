@@ -1501,6 +1501,39 @@ html[data-motion="paused"] .ms-pick::before {
 .mc-none {
   color: #6d7078;
 }
+/* The environments row: the stack, top first, a row each with its moves at the right, then the pick that adds one. */
+.mc-opt-envs .mc-opt-val {
+  flex-direction: column;
+  align-items: stretch;
+  padding: 4px 0;
+}
+.mc-envs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.mc-envs > li {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+  border-bottom: 1px solid #17191d;
+  color: #ededee;
+  font-size: 13px;
+}
+.mc-envs > li > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-envs .ms-go:disabled {
+  color: #45474e;
+}
+.mc-opt-envs .mc-pick {
+  align-self: flex-start;
+  padding: 6px 0;
+}
 /* The Agentfile row (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31): the pick, then the way to the Agentfiles. */
 .mc-opt-agentfile .mc-opt-val {
   flex-wrap: wrap;

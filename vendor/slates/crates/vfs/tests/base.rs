@@ -281,12 +281,12 @@ fn answers_without_src(vol: &mut Volume, host: &mut SimHost, store: &mut Store) 
   let Child::Dir(src) = src.child else {
     panic!("/src is a directory");
   };
+  // `OsCode::native` builds the code in this platform's numbering (A-539), so it is compared, not matched.
+  let gone = slates_vfs::host::OsCode::native(GONE_ERRNO);
   assert!(
     matches!(
       vol.with_host(host).readdir(store, src),
-      Err(VfsError::BaseUnavailable(Some(
-        slates_vfs::host::OsCode::native(GONE_ERRNO)
-      )))
+      Err(VfsError::BaseUnavailable(Some(code))) if code == gone
     ),
     "listing the gone directory refuses rather than show part of it"
   );
@@ -2838,7 +2838,7 @@ fn an_untouched_base_directory_the_disk_made_a_file_shows_the_file() {
   assert_eq!(vol.diverged(&store), Vec::new());
 }
 /// §4.6 cache posture: an outsider's change beneath a base directory reaches the kernel caches of the volume's
-/// transports through the watcher's hints, drained each reap tick. Do: load a base directory, park a counting waker on
+/// transports through the watcher's hints, drained at the kernel's report (A-709). Do: load a base directory, park a counting waker on
 /// the overlay volume, edit a file beneath it from outside, and drain the hints. Expect the parked task woken, so a FUSE
 /// mount delivers the stale marks without waiting for its kernel's next request — and a drain with no hints to wake no one.
 #[test]

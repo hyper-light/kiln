@@ -770,6 +770,9 @@ impl HexRun {
                 // output end too.
                 closing.close();
                 let _ = (out.join(), err.join());
+                if let Some(words) = refusal_said(&end) {
+                    let _ = said_tx.send_blocking(Said::Out(Output::Stderr(words)));
+                }
                 let _ = said_tx.send_blocking(Said::Ended(end));
             })
         })();
@@ -840,6 +843,14 @@ fn spawn_reader(name: &str, stream: hex_api::OwnedStream, said: crate::memory::q
             }
         }
     })
+}
+
+/// What a member's end that Hex refused says on its stderr, its last words, so kiln's word on its session says why it
+/// ended (its error is its stderr's tail) where its exit code can't: a member whose command Shards never started
+/// ("its command never started (status 128): the volume at /tmp/...", adacachy's KVM, 2026-11-20) ended as a bare
+/// `exit -1`. None for an end Hex collected.
+fn refusal_said(end: &Result<hex_api::Exit, hex_api::Refusal>) -> Option<Vec<u8>> {
+    end.as_ref().err().map(|why| format!("kiln: its microVM ended its harness's run: {why}\n").into_bytes())
 }
 
 /// A member's end as the seam says it: killed through [`Run::kill`], or by KILL, `Killed`; its code; a signal's
@@ -1096,7 +1107,19 @@ pub(crate) mod tests {
     use kiln_seams::records::{Consistency, SimRecords};
     use kiln_seams::sandbox::{Boundary, Egress, Exit, Launch, Limits, Link, Output, Refusal, Run, Sandbox as _, Signal};
 
-    use super::{Charge, Charged, HexVms, NO_SERVER, USE, Used, host_cpu_ns};
+    use super::{Charge, Charged, HexVms, NO_SERVER, USE, Used, host_cpu_ns, refusal_said};
+
+    /// kiln goal 90 (adacachy's KVM drive, 2026-11-20): a member's end Hex refused says why on its stderr, the words
+    /// its session's error carries, where its exit code is a bare -1; one Hex collected says nothing more.
+    #[test]
+    fn g90_a_refused_members_end_says_why_on_its_stderr() -> anyhow::Result<()> {
+        let refused: Result<hex_api::Exit, H> = Err(H::Failed { id: BoxId::new("kiln-z1-0")?, why: "its command never started (status 128)".into() });
+        let said = refusal_said(&refused).map(|w| String::from_utf8_lossy(&w).into_owned()).unwrap_or_default();
+        assert!(said.contains("kiln-z1-0") && said.contains("its command never started (status 128)"), "{said}");
+        assert_eq!(refusal_said(&Ok(hex_api::Exit::Code(0))), None);
+        assert_eq!(refusal_said(&Ok(hex_api::Exit::Unknown)), None);
+        Ok(())
+    }
 
     /// The sandbox over Hex's simulator, its boxes numbered as a runner process of epoch 7 numbers those of its runs
     /// that reserve nothing.

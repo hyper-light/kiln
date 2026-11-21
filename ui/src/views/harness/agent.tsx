@@ -25,7 +25,6 @@ import { Loadable } from "@/components/ui/loading";
 import { ConfirmDialog } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 import { errorMessage, useLocalStorage, useMediaQuery } from "@/lib/hooks";
-import { AccountDialog } from "./account-card";
 import { Composer, type ToMark } from "./composer";
 import { useAgentActions } from "./actions";
 import { MoveDialog, movable } from "./move";
@@ -51,14 +50,17 @@ import { BranchPanel } from "./subagent-branch";
 import { BesideTerminals, openBeside as openTerminal } from "./beside";
 import { useDrafts } from "./state";
 import { PlanSourceContext } from "@/views/plans/save";
-import { useReviewWaits } from "@/views/plans/review";
+import { useReviewWaits } from "@/views/plans/review-waits";
 import { revealReview } from "@/views/plans/reveal";
 import { useEndWithChildren } from "./family";
 import { asAnswered, sendCommand, stillAsked, useAnswered } from "./answered";
 import { keepOf, liveRoot, subagentRows, subagentTree, takesMessage, threadCrumbs, threadFrom, topOf, type Crumb, type SubagentNode, type ThreadFrom } from "./subagent-tree";
-import { EarlyComposer, EarlyLine, EarlyTurns } from "./early";
+import { EarlyComposer, EarlyLine, EarlyTurns, findAsked } from "./early";
 import { settled, useStart, type Start } from "./starting";
 import { AboutContext } from "@/components/code/about";
+
+// Signing its harness in (or out) loads as it's asked for, not with the conversation (goal 8).
+const AccountDialog = React.lazy(() => import("./account-card").then((m) => ({ default: m.AccountDialog })));
 
 type PhoneTab = "work" | InspectorTab;
 
@@ -159,7 +161,9 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const tabAsked = params.get("tab");
   const tabWanted: InspectorTab | null = tabAsked === "plan" || tabAsked === "tools" || tabAsked === "engine" ? tabAsked : null;
   const [tab, setTab] = React.useState<InspectorTab>(() => tabWanted ?? "changes");
-  const [phoneTab, setPhoneTab] = React.useState<PhoneTab>(() => tabWanted ?? "work");
+  // Asked for (⌘F) while the page came (early.tsx): open, its box taking the focus, on the phone's conversation as ⌘F opens it.
+  const [findEarly] = React.useState(() => findAsked(id));
+  const [phoneTab, setPhoneTab] = React.useState<PhoneTab>(() => (findEarly ? "work" : (tabWanted ?? "work")));
   const [confirmStop, setConfirmStop] = React.useState(false);
   const [settings, setSettings] = React.useState(false);
   /** /login or /logout: the harness's account on its machine, opened in place over the composer. */
@@ -185,7 +189,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   // /login and /logout open the account in the conversation, below what was said: brought into view once.
   // Find in the conversation (Ctrl/⌘F, or the head's button): the words, and the match shown. A
   // match found from Mission Control (`?find=`) opens it already looking.
-  const [findOpen, setFindOpen] = React.useState(() => Boolean(params.get("find")));
+  const [findOpen, setFindOpen] = React.useState(() => Boolean(params.get("find")) || findEarly);
   const [findQ, setFindQ] = React.useState(() => params.get("find") ?? "");
   const [findAt, setFindAt] = React.useState<FindNow | null>(null);
   const findInput = React.useRef<HTMLInputElement>(null);
@@ -358,6 +362,7 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
           onClose={closeFind}
           partial={hasEarlier ? findEvents.length : undefined}
           inputRef={findInput}
+          autoFocus={findEarly}
         />
       )}
       {findOpen && hasEarlier && <EarlierMatches agent={subId ?? id} q={findQ} before={findEvents[0]?.at} beforeSeq={findHistory?.hasMore ? (findHistory.before ?? undefined) : undefined} />}
@@ -486,7 +491,11 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
       tabs={<PhoneTabs store={store} tab={phoneTab} onTab={setPhoneTab} />}
       after={
         <>
-          {account && info && <AccountDialog key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />}
+          {account && info && (
+            <React.Suspense fallback={null}>
+              <AccountDialog key={account} target={info.target} kind={info.kind} intent={account} onClose={() => setAccount(null)} />
+            </React.Suspense>
+          )}
           {dragging && (
             <div className="hx-dropzone" aria-hidden="true">
               <span>{attachments.enabled ? "Drop screenshots or files to attach" : "This agent can't take attachments"}</span>

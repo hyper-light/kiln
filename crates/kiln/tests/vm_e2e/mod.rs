@@ -1811,9 +1811,10 @@ impl<'a> Watch<'a> {
 
     /// Its harness gone for good, by kiln's word: no runner holds it; its startup refused while its
     /// process lives; or its process ended with no restart set, where it never started (kiln starts
-    /// again only what started) or kiln has said a word of it since its end and set none. kiln sends
-    /// an end and its decision on it one after the other, so an end with no restart yet is waited on
-    /// until kiln's next word.
+    /// again only what started), kiln said it stopped starting it again (`STOPPED_STARTING`, which
+    /// may be said before the wait first looks), or kiln has said a word of it since its end and set
+    /// none. kiln sends an end and its decision on it one after the other, so an end with no restart
+    /// yet is waited on until kiln's next word.
     fn ended(&mut self, info: &Value) -> Option<Stuck> {
         match status(info) {
             "crashed" => return Some(Stuck::Crashed),
@@ -1834,6 +1835,10 @@ impl<'a> Watch<'a> {
         }
         let code = exit.get("code").and_then(Value::as_i64);
         if info.get("starts").and_then(Value::as_array).is_none_or(Vec::is_empty) {
+            return Some(Stuck::Ended { code, error });
+        }
+        // kiln's word that it stopped starting it again is its decision, whenever the wait first looks.
+        if error.as_deref().is_some_and(|e| e.contains(kiln::harness::session::STOPPED_STARTING)) {
             return Some(Stuck::Ended { code, error });
         }
         let at = exit.get("at").and_then(Value::as_i64).unwrap_or_default();

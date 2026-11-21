@@ -1631,7 +1631,9 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             boxed(|| own_op(&hub, &caller, name, json!({"agent": id}))).await
         }
         (&Method::POST, ["api", "harness", "sessions", id, "restart"]) => boxed(|| own_op(&hub, &caller, "sessions.restart", json!({"agent": id}))).await,
-        // An environment applied to it (`agentenvs.apply`, docs/agents.md "Environments").
+        // Its environments as scopes see it (`agentenvs.session`), and a stack of them applied to it (`agentenvs.apply`,
+        // docs/agents.md "Environments").
+        (&Method::GET, ["api", "harness", "sessions", id, "agentenv"]) => boxed(|| own_op(&hub, &caller, "agentenvs.session", json!({"agent": id}))).await,
         (&Method::PUT, ["api", "harness", "sessions", id, "agentenv"]) => {
             let id = (*id).to_owned();
             let mut body = boxed(|| body_value(req)).await?;

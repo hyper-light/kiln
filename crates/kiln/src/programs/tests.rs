@@ -154,30 +154,36 @@ fn plan_row(c: &rusqlite::Connection, id: &str, title: &str, body: &str, tags: &
 }
 
 
-/// Waits (up to 10 s) for `holds`: what a session does with a command comes a moment after it.
-async fn until(what: &str, holds: impl Fn() -> bool) -> anyhow::Result<()> {
-    for _ in 0..1_000 {
-        if holds() {
-            return Ok(());
-        }
-        crate::rt::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    anyhow::bail!("{what}: not in 10 s")
+/// Waits for `holds`, of session `id` as kiln's record has it: what a session does with a command comes a moment
+/// after it, and is looked at again as its feed or the mail moves (`source_until`), with no clock to cut it short (a
+/// 10 s bound refused "the session settled" in a targeted parallel run on adacachy, 2026-11-20).
+async fn until(hub: &Hub, id: &str, what: &str, holds: impl Fn() -> bool) -> anyhow::Result<()> {
+    crate::harness::ops::end_to_end::source_until(hub, id, what, || {
+        let held = holds();
+        async move { Ok(held) }
+    })
+    .await
 }
 
-/// Session `id`'s state changed as its machine would report it (its usage, a pause).
+/// Session `id`'s state changed as its machine would report it (its usage, a pause): on its owner, published through
+/// the owner's own ordered output (`Session::publish_owned_change`), and once kiln's record of it says so. Ingested
+/// beside that output instead, a state the owner had published before it (a threshold kiln sent it, say) could reach
+/// the record after it and say the usage that preceded it: a full parallel run on adacachy saw `programs.assign`
+/// put a goal under way above 80% that way (2026-11-20). In order, nothing published before it comes after it.
 async fn report(hub: &Hub, id: &str, f: impl FnOnce(&mut crate::harness::model::State)) -> anyhow::Result<()> {
     let session = hub.harness.local.get(id).ok_or_else(|| anyhow::anyhow!("no source session {id}"))?;
-    // The test's provider report is authoritative on its owner too; later real source
-    // events must not restore the usage that preceded this report.
-    let st = {
+    let (limits, pause) = {
         let mut core = session.core.lock();
         f(&mut core.state);
         core.touch_state();
-        core.state.clone()
+        (core.state.limits.clone(), core.state.pause.clone())
     };
-    hub.harness.ingest(&crate::harness::registry::Location::Local, id, crate::harness::core::Update::State { state: Box::new(st) }).await;
-    Ok(())
+    session.publish_owned_change().await.map_err(anyhow::Error::msg)?;
+    crate::harness::ops::end_to_end::source_until(hub, id, "the report in kiln's record", || {
+        let seen = hub.harness.info(id).is_some_and(|i| i.limits == limits && i.pause == pause);
+        async move { Ok(seen) }
+    })
+    .await
 }
 
 fn weekly_at(pct: f64) -> Vec<Limit> {
@@ -225,7 +231,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
                 let id = opened.into_iter().next().map(|i| i.id).ok_or_else(|| anyhow::anyhow!("nothing opened"))?;
                 // Settled: its harness (there's none) didn't start, so what it says next is what
                 // the test reports for it.
-                until("the session settled", || hub.harness.info(&id).is_some_and(|i| i.status != Status::Starting)).await?;
+                until(&hub, &id, "the session settled", || hub.harness.info(&id).is_some_and(|i| i.status != Status::Starting)).await?;
                 crate::harness::ops::end_to_end::source_ready(&hub, &id).await?;
                 anyhow::Ok(id)
             }
@@ -339,11 +345,12 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
         // The thresholds, held: kiln's set; one a person sets stays theirs.
         let pause_at = |agent: &str| hub.harness.info(agent).and_then(|i| i.pause_at);
         enforce(&hub).await;
-        until("the workers' thresholds", || pause_at(&hex) == Some(80) && pause_at(&sends) == Some(95)).await?;
+        until(&hub, &hex, "Hex T7's threshold", || pause_at(&hex) == Some(80)).await?;
+        until(&hub, &sends, "Sends T3's threshold", || pause_at(&sends) == Some(95)).await?;
         let kept: BTreeMap<String, u8> = kv_json(&hub.store, thresholds_key("m1")).await?;
         assert_eq!(kept, BTreeMap::from([(hex.clone(), 80), (sends.clone(), 95)]));
         assert!(matches!(hub.harness.command(&hub, &hex, Command::PauseAt { percent: Some(90) }).await, crate::harness::registry::Sent::Taken));
-        until("the person's threshold", || pause_at(&hex) == Some(90)).await?;
+        until(&hub, &hex, "the person's threshold", || pause_at(&hex) == Some(90)).await?;
         enforce(&hub).await;
         assert_eq!((pause_at(&hex), pause_at(&sends)), (Some(90), Some(95)), "the person's stays");
         let sent: BTreeMap<String, u8> = kv_json(&hub.store, thresholds_key("m1")).await?;
@@ -375,7 +382,7 @@ fn a_program_shows_each_track_s_worker_goal_pass_and_slot_and_holds_the_usage_ru
             Ok(connection.query_row("SELECT body FROM agent_mail WHERE recipient=?1 AND json_extract(body,'$.command.text')=?2", rusqlite::params![recipient, text], |row| row.get::<_, String>(0))?)
         }).await?;
         enforce(&hub).await;
-        until("T3's worker held to 80", || pause_at(&sends) == Some(80)).await?;
+        until(&hub, &sends, "T3's worker held to 80", || pause_at(&sends) == Some(80)).await?;
         let sent: BTreeMap<String, u8> = kv_json(&hub.store, thresholds_key("m1")).await?;
         assert_eq!((pause_at(&hex), sent.get(&hex).copied(), sent.get(&sends).copied()), (Some(90), Some(80), Some(80)), "the person's still, nothing sent to it");
         // A legacy unsent marker recovers on the existing event owner. Its deterministic ID

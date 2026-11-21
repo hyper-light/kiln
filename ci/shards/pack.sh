@@ -100,6 +100,11 @@ env ${crt[@]+"${crt[@]}"} ${shards_c[@]+"${shards_c[@]}"} SHARDS_HELPERS=beside 
 mkdir -p "$out"
 for f in "$helpers/$dir_name/shards-vm$exe" "$helpers/$dir_name/shards-net$exe" "$target/$dir_name/shards$exe"; do
   name=$(basename "$f")
+  # The same bytes as last time stay as they are: kiln's build.rs watches these files (rerun-if-changed), and one
+  # copied again, newer than its last run, would run it and build kiln again at every cargo command.
+  if cmp -s "$built/$f" "$out/$name"; then
+    continue
+  fi
   cp "$built/$f" "$out/$name.part"
   if [ ${#crt[@]} -gt 0 ] && grep -a -q -i 'vcruntime140' "$out/$name.part"; then
     echo "pack: $name imports the Visual C++ runtime (vcruntime140.dll), which a clean Windows lacks" >&2

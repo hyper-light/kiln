@@ -16,6 +16,13 @@
 //! differential test drives this at `f = 0` and at a simulated `f = 1` whose holder stubs
 //! acknowledge locally, and asserts the observable outcomes are identical.
 
+use crate::catalog::StateLog;
+
+#[cfg(test)]
+mod class_tests;
+#[cfg(test)]
+mod family_tests;
+
 /// A host in the fleet (its id; the creator host lives in a volume id's high bits, §4.8
 /// "Lookup"). One host on a laptop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -94,37 +101,227 @@ impl ObjectId {
   }
 
   /// The catalog register of this object (§4.8 "catalog entries are registers the owner writes under that
-  /// epoch"): the same id with the register-class bit set. It is placed, owned and taken over exactly as
-  /// its object is ([`ObjectId::placement_key`]), so a volume's catalog and its head always share their
-  /// holders and their successor.
+  /// epoch"; AUD-29-17): its register of class [`RegisterClass::Catalog`]. It is placed, owned and taken over
+  /// exactly as its object is ([`ObjectId::placement_key`]), so a volume's catalog and its head always share
+  /// their holders and their successor.
   pub const fn catalog(self) -> ObjectId {
-    let mut bytes = self.0;
-    bytes[CLASS_BYTE] |= CATALOG_CLASS;
-    ObjectId(bytes)
+    self.in_class(RegisterClass::Catalog)
   }
 
   /// Whether this id names a catalog register ([`ObjectId::catalog`]).
   pub const fn is_catalog(&self) -> bool {
-    self.0[CLASS_BYTE] & CATALOG_CLASS != 0
+    matches!(self.class(), RegisterClass::Catalog)
   }
 
-  /// The object whose placement and takeover this id follows: the id itself with its register-class bit
-  /// cleared, so every register class of one object ranks the same holders and the same successor.
+  /// Which register of its object this id names (§4.8 "Data model"; AUD-29-17; A-636 part 2a), read from the
+  /// class bits of its counter's top byte: none for the object's own register; the top bit alone for its
+  /// catalog; the second bit for one of a repository's state logs, which the top and third bits then name.
+  pub const fn class(&self) -> RegisterClass {
+    let byte = self.0[CLASS_BYTE];
+    if byte & STATE_CLASS == 0 {
+      return if byte & CATALOG_CLASS == 0 {
+        RegisterClass::Own
+      } else {
+        RegisterClass::Catalog
+      };
+    }
+    RegisterClass::State(match (byte & CATALOG_CLASS != 0, byte & STATE_LOW != 0) {
+      (false, false) => StateLog::Names,
+      (false, true) => StateLog::Phases,
+      (true, false) => StateLog::Markers,
+      (true, true) => StateLog::Locks,
+    })
+  }
+
+  /// This object's register of class `class` (A-636 part 2a): its placement key with the class's bits set.
+  /// Every register of one object is placed, owned and taken over as the object is, so a repository's state
+  /// logs share the repository's holders and successor, as a volume's catalog shares its volume's. An id
+  /// minted at or below [`MAX_OBJECT_COUNTER`] carries no class bit, so each of its registers leads back to it.
+  pub const fn in_class(self, class: RegisterClass) -> ObjectId {
+    let mut bytes = self.placement_key().0;
+    bytes[CLASS_BYTE] |= class_bits(class);
+    ObjectId(bytes)
+  }
+
+  /// The object this id is a register of: the id with its register class's bits cleared, so every register of one
+  /// object leads back to it, and is placed and taken over by its [`line_key`](ObjectId::line_key), so every register
+  /// of one object ranks the same holders and the same successor. An id whose second counter bit is clear (an own or
+  /// catalog register's) keeps every bit below the top one as it is, so such an id is placed exactly as before the state
+  /// logs' class.
   pub const fn placement_key(&self) -> ObjectId {
     let mut bytes = self.0;
-    bytes[CLASS_BYTE] &= !CATALOG_CLASS;
+    let class = if bytes[CLASS_BYTE] & STATE_CLASS == 0 {
+      CATALOG_CLASS
+    } else {
+      CLASS_BITS
+    };
+    bytes[CLASS_BYTE] &= !class;
     ObjectId(bytes)
+  }
+
+  /// A family id (A-636 part 2b-2): an object of a repository's family, the repository's own id or a green minted to
+  /// join it, minted by `creator` on `partition` as its `number`th family id there, under the repository's `tag`. The
+  /// family bit and the tag name the family wherever the id goes, so every object of one family is placed and taken
+  /// over as one ([`ObjectId::line_key`]), with nothing stored per object (§2 item 12: ids route to owners). `None` for
+  /// a tag past [`MAX_FAMILY_TAG`].
+  pub const fn family(creator: HostId, partition: u16, tag: u16, number: u32) -> Option<ObjectId> {
+    if tag > MAX_FAMILY_TAG {
+      return None;
+    }
+    let creator = creator.0.to_be_bytes();
+    let partition = partition.to_be_bytes();
+    let tag = tag.to_be_bytes();
+    let number = number.to_be_bytes();
+    Some(ObjectId([
+      creator[0],
+      creator[1],
+      creator[2],
+      creator[3],
+      creator[4],
+      creator[5],
+      creator[6],
+      creator[7],
+      partition[0],
+      partition[1],
+      FAMILY_BIT | tag[0],
+      tag[1],
+      number[0],
+      number[1],
+      number[2],
+      number[3],
+    ]))
+  }
+
+  /// Whether this id is a family id ([`ObjectId::family`]), of any register class.
+  pub const fn is_family(&self) -> bool {
+    self.0[CLASS_BYTE] & FAMILY_BIT != 0
+  }
+
+  /// A family id's tag, the family it names on its partition ([`ObjectId::family`]); `None` for an id of no family.
+  pub const fn family_tag(&self) -> Option<u16> {
+    if !self.is_family() {
+      return None;
+    }
+    Some(u16::from_be_bytes([
+      self.0[CLASS_BYTE] & FAMILY_TAG_HIGH,
+      self.0[FAMILY_TAG_BYTE],
+    ]))
+  }
+
+  /// A family id's number, unique among the family ids its creator minted on its partition ([`ObjectId::family`]);
+  /// `None` for an id of no family.
+  pub const fn family_number(&self) -> Option<u32> {
+    if !self.is_family() {
+      return None;
+    }
+    let [.., a, b, c, d] = self.0;
+    Some(u32::from_be_bytes([a, b, c, d]))
+  }
+
+  /// The object this id's register is placed and taken over by (A-636 part 2b-2): its placement key, but for a family
+  /// id the family itself, the placement key with its creator and its number cleared, so a repository, its registers and
+  /// every green minted to join it share one set of holders and one successor, whichever host minted each. Rendezvous
+  /// hashes it ([`candidates_for`], [`RegionalConfiguration::successor`]). An id of no family is its placement key, so
+  /// every such id is placed and taken over exactly as before.
+  pub const fn line_key(&self) -> ObjectId {
+    let key = self.placement_key();
+    if !key.is_family() {
+      return key;
+    }
+    // The family's bytes: the partition, the class byte (its class bits cleared: the family bit and the tag's high four
+    // bits) and the tag's low byte. The creator's eight and the number's four are not the family's.
+    let [
+      _,
+      _,
+      _,
+      _,
+      _,
+      _,
+      _,
+      _,
+      partition_high,
+      partition_low,
+      tag_high,
+      tag_low,
+      ..,
+    ] = key.0;
+    ObjectId([
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      partition_high,
+      partition_low,
+      tag_high,
+      tag_low,
+      0,
+      0,
+      0,
+      0,
+    ])
   }
 }
 
-/// Format: the byte of an object id carrying its register-class bit — the first byte of the per-creator
+/// Which register of its object an id names (§4.8 "Data model": heads, chain versions, leases and catalog entries
+/// are registers the owner writes; AUD-29-17; A-642; A-636 part 2a). Every register of one object is placed, owned
+/// and taken over as the object is ([`ObjectId::placement_key`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RegisterClass {
+  /// The object's own register: a volume's head and chain, a green's log of versions (A-642).
+  Own,
+  /// The object's catalog register (AUD-29-17).
+  Catalog,
+  /// One of a repository's state logs (A-642): its names, Mercurial's phase roots or markers, or Git LFS's locks.
+  /// The object is the repository, so its state moves as one.
+  State(StateLog),
+}
+
+/// The bits of an id's class byte that name `class` ([`ObjectId::class`]).
+const fn class_bits(class: RegisterClass) -> u8 {
+  match class {
+    RegisterClass::Own => OWN_CLASS,
+    RegisterClass::Catalog => CATALOG_CLASS,
+    RegisterClass::State(StateLog::Names) => STATE_CLASS,
+    RegisterClass::State(StateLog::Phases) => STATE_CLASS | STATE_LOW,
+    RegisterClass::State(StateLog::Markers) => STATE_CLASS | CATALOG_CLASS,
+    RegisterClass::State(StateLog::Locks) => CLASS_BITS,
+  }
+}
+
+/// Format: the byte of an object id carrying its register class — the first byte of the per-creator
 /// counter (bytes 10–15 of a volume id, after the creator and the partition).
 const CLASS_BYTE: usize = 10;
-/// Format: the register-class bit — the counter's top bit — set for a catalog register.
+/// Format: the catalog's bit (AUD-29-17), the counter's top bit: set alone for a catalog register, and one of
+/// the two bits that name a state log beside [`STATE_CLASS`].
 const CATALOG_CLASS: u8 = 0x80;
-/// The largest per-creator counter an object id may carry: the counter's 48 bits less the class bit, so
-/// no object's own id ever reads as a catalog register. An id minter refuses past it.
-pub const MAX_OBJECT_COUNTER: u64 = (1u64 << 47) - 1;
+/// Format: the state logs' bit (A-636 part 2a), the counter's second bit: set for a repository's state log,
+/// which the top bit and the third ([`STATE_LOW`]) name.
+const STATE_CLASS: u8 = 0x40;
+/// Format: the counter's third bit, the low bit of a state log's name.
+const STATE_LOW: u8 = 0x20;
+/// Format: an object's own register sets no class bit.
+const OWN_CLASS: u8 = 0;
+/// Every bit a register class sets: an id minted at or below [`MAX_OBJECT_COUNTER`] carries none of them.
+const CLASS_BITS: u8 = CATALOG_CLASS | STATE_CLASS | STATE_LOW;
+/// Format: the family bit (A-636 part 2b-2), the counter's fourth bit, just below the class bits: set for a family id
+/// ([`ObjectId::family`]), whose next twelve bits are its tag and whose last four bytes are its number.
+const FAMILY_BIT: u8 = 0x10;
+/// Format: the bits of the class byte below the family bit, a family id's tag's high four bits.
+const FAMILY_TAG_HIGH: u8 = 0x0F;
+/// Format: the byte of a family id holding its tag's low eight bits, after the class byte.
+const FAMILY_TAG_BYTE: usize = 11;
+/// Format: a family's tag is twelve bits, the class byte's low four and the byte after it, so its largest is 4,095.
+pub const MAX_FAMILY_TAG: u16 = (1u16 << 12) - 1;
+/// The largest per-creator counter an object id of no family may carry: the counter's 48 bits less the three a
+/// register class sets ([`CLASS_BITS`]: the catalog's top bit, AUD-29-17, and the state logs' two below it, A-636 part
+/// 2a) and the family bit below them ([`FAMILY_BIT`], A-636 part 2b-2), so no object's own id reads as another register
+/// or as a family's. An id minter refuses past it.
+/// Format: the counter is the id's last six bytes, 48 bits; the classes take its top three and the family bit the next.
+pub const MAX_OBJECT_COUNTER: u64 = (1u64 << 44) - 1;
 
 /// The width of an encoded object id (16 bytes) — its place in every register wire layout.
 pub const OBJECT_BYTES: usize = size_of::<ObjectId>();
@@ -501,14 +698,21 @@ pub fn copyset_for(object: ObjectId, copysets: &[Vec<HostId>]) -> Option<Vec<Hos
 /// research calls for a good mixer, and this is replaced by the measured one when placement is
 /// tuned in Phase 8).
 fn rendezvous_weight(host: u64, object: &ObjectId) -> u64 {
+  // Every register class of one object hashes as that object, so its classes share holders and successor; and every
+  // object of one repository's family hashes as the family (A-636 part 2b-2), so they share them too.
+  rendezvous_weight_of(host, &object.line_key().0)
+}
+
+/// The rendezvous weight of `member` (a host, or a shard of one node) for `key`: the one hash every placement in slates
+/// ranks by, an object's line key ([`rendezvous_weight`]) or a content's identity (A-724: content homed by identity,
+/// §4.17.5, across a node's shards and a region's members alike, R8).
+pub fn rendezvous_weight_of(member: u64, key: &[u8]) -> u64 {
   /// Format: the FNV-1a 64-bit offset basis (Fowler, Noll, Vo).
   const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
   /// Format: the FNV-1a 64-bit prime.
   const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
   let mut hash = FNV_OFFSET;
-  // Every register class of one object hashes as that object, so its classes share holders and successor.
-  let key = object.placement_key();
-  for byte in host.to_le_bytes().iter().chain(key.0.iter()) {
+  for byte in member.to_le_bytes().iter().chain(key.iter()) {
     hash ^= u64::from(*byte);
     hash = hash.wrapping_mul(FNV_PRIME);
   }
@@ -549,6 +753,17 @@ pub fn rendezvous_ranked(hosts: &[HostId], object: ObjectId) -> Vec<HostId> {
     .collect();
   ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
   ranked.into_iter().map(|(_, host)| host).collect()
+}
+
+/// `members` in rendezvous order for `key` ([`rendezvous_weight_of`]): the highest weight first, the lowest member
+/// breaking a tie, as [`rendezvous_ranked`] orders hosts for an object.
+pub fn rendezvous_ranked_by_key(members: &[u64], key: &[u8]) -> Vec<u64> {
+  let mut ranked: Vec<(u64, u64)> = members
+    .iter()
+    .map(|member| (rendezvous_weight_of(*member, key), *member))
+    .collect();
+  ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+  ranked.into_iter().map(|(_, member)| member).collect()
 }
 
 /// The number of **distinct copysets** Copyset Replication lays down over `hosts` nodes at scatter width

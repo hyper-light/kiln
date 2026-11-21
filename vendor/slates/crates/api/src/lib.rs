@@ -292,9 +292,47 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// PersistentVolume's `nfs.path`), its `Debug` showing the path without its token; [`ExportOptions`] asks for it
 /// read-only or beneath a directory; the simulator answers it with a path of its own per export (kiln's Kubernetes
 /// engine, its W10; 2026-11-19).
+/// 51: a submit to a repository's green carries the message of the commit the server makes of its work, and its
+/// session's identities (A-664; §4.17.1 "A push is a work" item 4): one refused without a message is
+/// [`Invalid::MessageRequired`], and one by a principal with no identity in the repository's tool
+/// [`Invalid::IdentityRequired`], naming the tool, a [`VcsTool`] (re-exported); the wire's `Refusal::MessageRequired`
+/// and `IdentityRequired`, `RequestBody::SetIdentities` and `ReplyBody::IdentitiesSet` are appended, and each submit
+/// request carries an `Authorship` (2026-11-19).
+/// 52: a role starts the version-control servers' shared HTTP edge (A-625 part 3; §4.17.2 "Transports" item 1):
+/// [`role::ProcessOptions`] gains `vcs_http`, the address `--vcs-http ADDRESS` names, which [`role::Role::parse`] reads
+/// with `role::vcs_http_address` (an address off loopback refused for a daemon that is no fleet node, whose edge
+/// would serve cleartext) and [`role::Role::args`] gives back to the daemon an anchor starts; a fleet node's edge
+/// presents the node's own identity; a starter's anchor asks for none (2026-11-19).
+/// 53: a host's anchor starts the version-control edge too, and holds its port (A-625 part 3): [`StartSpec`] gains
+/// `vcs_http`, which its anchor's role and command carry; an anchor binds the edge's listener once, at that address, and
+/// hands it to every daemon it starts, so a restart never drops the edge's port; an address it cannot bind ends its
+/// start, as a fleet node's serve sockets do (2026-11-19).
+/// 54: a role starts the svn:// listener, and a host's anchor holds it (A-689, A-656 part 2; §4.17.4 piece 7):
+/// [`role::ProcessOptions`] gains `vcs_svn`, the address `--vcs-svn ADDRESS` names, which [`role::Role::parse`] reads
+/// with [`role::vcs_address`], now the one reader of both version-control flags (it replaces `vcs_http_address`: an
+/// address off loopback refused for a daemon that is no fleet node, which serves both in cleartext), and
+/// [`role::Role::args`] gives back to the daemon an anchor starts; [`StartSpec`] gains `vcs_svn`, which its anchor's
+/// role and command carry; an anchor binds the listener once, at that address, and hands it to every daemon it starts,
+/// so a restart never drops its port; an address it cannot bind ends its start (2026-11-19).
+/// 55: a Subversion repository's history imported from a dump (A-652 part 3): the re-exported [`ImportFault`] gains
+/// `ImportFault::Subversion`, the dump refused as `svnadmin load` refuses it (Subversion's error number, the revision
+/// being loaded and the path), which [`Invalid::Import`] names (2026-11-19).
+/// 56: a role starts the version-control servers' SSH edge (A-684; §4.17.2 "Transports" item 2): [`role::ProcessOptions`]
+/// and [`StartSpec`] gain `vcs_ssh`, the address `--vcs-ssh ADDRESS` names, which [`role::Role::parse`] reads with
+/// [`role::vcs_ssh_address`] (any IPv4 address and port: SSH encrypts every connection) and [`role::Role::args`] gives
+/// back to the daemon an anchor starts; the anchor binds the edge's listener once and makes its Ed25519 host key at its
+/// start, and hands both to every daemon it starts, so a restart keeps the port and the key a client pinned; a fleet
+/// node's edge presents the node's own key; the daemon's log names the edge's address and its key's SHA256 fingerprint
+/// (2026-11-19).
+/// 57: the export route's judge (A-769, A-520's export route): [`container_engine::export_engine`] asks a runtime's
+/// engine as [`container_engine::engine_profile`] does, on every host (Windows' Docker Desktop over its named pipe
+/// among them), and answers a [`container_engine::ExportEngine`] (where it mounts a volume's NFS export from:
+/// [`container_engine::MountsFrom`], the host's kernel or Docker Desktop's VM) or an [`EngineFault`]; the re-exported
+/// [`container_engine::ProfileRefusal`] gains `RootlessCannotMount` (appended): an embedder matching it exhaustively
+/// gains the variant (2026-11-20).
 ///
 /// Format: one whole number, the last of the versions above.
-pub const CONTRACT: u32 = 50;
+pub const CONTRACT: u32 = 57;
 
 /// How requests address an S3 base's bucket: virtual-hosted, the bucket in the host name, or path-style.
 pub use slates_base::s3::client::Style as S3Style;
@@ -318,11 +356,11 @@ pub use slates_client::{Attachment, Client, Deadlines, ShardsStream, StreamEnd, 
 pub use slates_ipc::protocol::{
   ARCHIVE_FILE, ArchiveFault, AttachTransport, ChangedCursor, ConflictClass, DaemonReport,
   DatabaseRefusal, FailoverReport, Filter, GrantScope, GreenBase, HostAnswer, HostMountEvidence,
-  HostPathReason, Intent, JournalReport, LandingDegradation, LandingDurability, LossReport,
-  MountReport, NamePolicy, OciBinding, OwnMountUse, PastTolerance, PlacedState, PlannedAction,
-  PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall, SnapshotId,
-  TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeRefusal,
-  VolumeSummary, VolumeTakeover,
+  HostPathReason, ImportFault, Intent, JournalReport, LandingDegradation, LandingDurability,
+  LossReport, MountReport, NamePolicy, OciBinding, OwnMountUse, PastTolerance, PlacedState,
+  PlannedAction, PlannedContent, PlannedEntry, Principal, ReadAt, RecoveryCause, Shortfall,
+  SnapshotId, TargetRefusal, TelemetryReport, TransportReport, UnsupportedReason, VcsTool,
+  VolumeId, VolumeRefusal, VolumeSummary, VolumeTakeover,
 };
 /// The rendezvous's and the channel's own typed refusals the contract carries.
 pub use slates_ipc::{DeliveryFault, error::RouteRefusal};

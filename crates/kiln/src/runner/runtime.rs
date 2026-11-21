@@ -6745,16 +6745,24 @@ jobs:
     }
 
     /// W05-R37, docs/needs.md E3.9: a leg whose lease is lost is killed, not cancelled. Its running
-    /// step ignores SIGINT and SIGTERM, so a cancel would wait out GitHub's 10 s of grace; killed
-    /// once it runs, it ends at once, and nothing more runs, not even the step `if: always()` a
-    /// cancel would leave to run.
+    /// step outlives SIGINT and SIGTERM, noting each it's given, so a cancel would wait out GitHub's
+    /// 10 s of grace; killed once it runs, it's given neither (no grace: SIGKILL at once), the leg
+    /// ends, and nothing more runs, not even the step `if: always()` a cancel would leave to run.
+    /// What it was sent is the step's own record, not a clock's: on a loaded machine the leg's end
+    /// can come seconds after the kill (4.6 s in one full parallel run on adacachy, 2026-11-20),
+    /// however at once it was killed.
     #[cfg(unix)]
     #[test]
     fn w05_r37_a_leg_whose_lease_is_lost_is_killed_at_once() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let mark = |name: &str| tmp.path().join(name).display().to_string();
+        // Each signal of a cancel's noted and outlived: the shell waits on a background sleep (which a
+        // shell without job control starts ignoring SIGINT), so a trapped signal ends the wait, the
+        // trap notes it, and the loop goes on.
         let src = format!(
-            "on: push\njobs:\n  b:\n    runs-on: x\n    steps:\n      - run: |\n          trap '' INT TERM\n          touch \"{}\"\n          sleep 30\n      - if: always()\n        run: touch \"{}\"\n",
+            "on: push\njobs:\n  b:\n    runs-on: x\n    steps:\n      - run: |\n          trap 'touch \"{}\"' INT\n          trap 'touch \"{}\"' TERM\n          touch \"{}\"\n          while :; do sleep 30 & wait $! || true; done\n      - if: always()\n        run: touch \"{}\"\n",
+            mark("got-int"),
+            mark("got-term"),
             mark("started"),
             mark("after")
         );
@@ -6775,23 +6783,22 @@ jobs:
         let kill = Shutdown::new();
         let leg = Leg { a, work_dir: tmp.path().join("work"), runner_name: "test-runner".into(), up: Uplink(tx), cancel: Shutdown::new(), kill: kill.clone(), http: std::sync::Arc::new(crate::http::client::Client::public()?), warm: Default::default(), cache_max: None };
         let started = tmp.path().join("started");
-        let (result, took) = crate::rt::block_on(async move {
+        let result = crate::rt::block_on(async move {
             let killer = crate::rt::spawn(async move {
                 let deadline = Instant::now() + Duration::from_secs(60);
                 while !started.exists() && Instant::now() < deadline {
                     crate::rt::sleep(Duration::from_millis(20)).await;
                 }
                 kill.cancel();
-                Instant::now()
             });
             let result = leg.run().await;
-            let killed = killer.await.map_err(|_| anyhow::anyhow!("the task that kills it ended without a word"))?;
-            Ok::<_, anyhow::Error>((result, killed.elapsed()))
+            killer.await.map_err(|_| anyhow::anyhow!("the task that kills it ended without a word"))?;
+            Ok::<_, anyhow::Error>(result)
         })?;
         assert_eq!(result.status, Status::Cancelled, "{result:?}");
         assert!(tmp.path().join("started").exists(), "its step ran");
+        assert!(!tmp.path().join("got-int").exists() && !tmp.path().join("got-term").exists(), "killed, it was given no grace: neither SIGINT nor SIGTERM");
         assert!(!tmp.path().join("after").exists(), "nothing ran after it was killed");
-        assert!(took < Duration::from_secs(3), "it ended {took:?} after it was killed (a cancel waits 10 s)");
         Ok(())
     }
 

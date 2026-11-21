@@ -1,0 +1,344 @@
+[
+  {
+    "name": "no chips: every session",
+    "scope": [],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": true
+  },
+  {
+    "name": "no chips: every session (no agent, no effort)",
+    "scope": [],
+    "facts": {
+      "machine": "m-lin",
+      "os": "linux",
+      "arch": "amd64",
+      "harness": "codex",
+      "model": "gpt-6",
+      "permission": "codex:on-request"
+    },
+    "matches": true
+  },
+  {
+    "name": "one key, one chip",
+    "scope": [
+      {
+        "key": "os",
+        "value": "macos"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": true
+  },
+  {
+    "name": "one key, one chip, other value",
+    "scope": [
+      {
+        "key": "os",
+        "value": "linux"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": false
+  },
+  {
+    "name": "one key, any of its chips",
+    "scope": [
+      {
+        "key": "harness",
+        "value": "codex"
+      },
+      {
+        "key": "harness",
+        "value": "claude"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": true
+  },
+  {
+    "name": "keys together: all of them",
+    "scope": [
+      {
+        "key": "harness",
+        "value": "claude"
+      },
+      {
+        "key": "os",
+        "value": "linux"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": false
+  },
+  {
+    "name": "keys together, each matched",
+    "scope": [
+      {
+        "key": "harness",
+        "value": "claude"
+      },
+      {
+        "key": "os",
+        "value": "macos"
+      },
+      {
+        "key": "arch",
+        "value": "arm64"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": true
+  },
+  {
+    "name": "machine by id",
+    "scope": [
+      {
+        "key": "machine",
+        "value": "m-lin"
+      }
+    ],
+    "facts": {
+      "machine": "m-lin",
+      "os": "linux",
+      "arch": "amd64",
+      "harness": "codex",
+      "model": "gpt-6",
+      "permission": "codex:on-request"
+    },
+    "matches": true
+  },
+  {
+    "name": "agent chip, session from no definition",
+    "scope": [
+      {
+        "key": "agent",
+        "value": "kiln:reviewer"
+      }
+    ],
+    "facts": {
+      "machine": "m-lin",
+      "os": "linux",
+      "arch": "amd64",
+      "harness": "codex",
+      "model": "gpt-6",
+      "permission": "codex:on-request"
+    },
+    "matches": false
+  },
+  {
+    "name": "agent chip, its definition",
+    "scope": [
+      {
+        "key": "agent",
+        "value": "kiln:reviewer"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": true
+  },
+  {
+    "name": "permission names its harness",
+    "scope": [
+      {
+        "key": "permission",
+        "value": "claude:plan"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": true
+  },
+  {
+    "name": "permission of another harness never matches",
+    "scope": [
+      {
+        "key": "permission",
+        "value": "codex:plan"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": false
+  },
+  {
+    "name": "effort chip, session without effort",
+    "scope": [
+      {
+        "key": "effort",
+        "value": "codex:high"
+      }
+    ],
+    "facts": {
+      "machine": "m-lin",
+      "os": "linux",
+      "arch": "amd64",
+      "harness": "codex",
+      "model": "gpt-6",
+      "permission": "codex:on-request"
+    },
+    "matches": false
+  },
+  {
+    "name": "effort chip, its harness and effort",
+    "scope": [
+      {
+        "key": "effort",
+        "value": "claude:high"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": true
+  },
+  {
+    "name": "model chip",
+    "scope": [
+      {
+        "key": "model",
+        "value": "gpt-6"
+      }
+    ],
+    "facts": {
+      "machine": "m-lin",
+      "os": "linux",
+      "arch": "amd64",
+      "harness": "codex",
+      "model": "gpt-6",
+      "permission": "codex:on-request"
+    },
+    "matches": true
+  },
+  {
+    "name": "permissions of two harnesses: any of them",
+    "scope": [
+      {
+        "key": "permission",
+        "value": "claude:plan"
+      },
+      {
+        "key": "permission",
+        "value": "codex:on-request"
+      }
+    ],
+    "facts": {
+      "machine": "m-lin",
+      "os": "linux",
+      "arch": "amd64",
+      "harness": "codex",
+      "model": "gpt-6",
+      "permission": "codex:on-request"
+    },
+    "matches": true
+  },
+  {
+    "name": "a key no session has a value for fails only that key",
+    "scope": [
+      {
+        "key": "os",
+        "value": "macos"
+      },
+      {
+        "key": "agent",
+        "value": "kiln:x"
+      }
+    ],
+    "facts": {
+      "machine": "m-mac",
+      "os": "macos",
+      "arch": "arm64",
+      "harness": "claude",
+      "agent": "kiln:reviewer",
+      "model": "claude-opus-5-5",
+      "permission": "claude:plan",
+      "effort": "claude:high"
+    },
+    "matches": false
+  }
+]

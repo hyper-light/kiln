@@ -265,7 +265,18 @@ pub fn land_verb(
   principal: &Principal,
   call: LandCall<'_>,
 ) -> ReplyBody {
-  // A merge volume has no store-backed snapshot to land (§4.16; the extent-backed green is owed).
+  // A green lands its head through its store-backed view (A-774), under the grant any volume's landing takes; a work
+  // lands through its green.
+  let id = crate::verbs::to_db_volume(call.volume);
+  if matches!(
+    crate::merge_service::merge_role(state, id),
+    Some(crate::merge_service::MergeRole::Green { .. })
+  ) {
+    if let Err(refusal) = crate::mounted_work::ensure_green_view(state, id, call.snapshot) {
+      return crate::verbs::refused(refusal);
+    }
+    return land_verb_os(state, client_id, principal, call);
+  }
   if let Some(reply) = crate::merge_service::refuse_store_verb(
     state,
     call.volume,
@@ -726,7 +737,8 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     };
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
-      Err((host, refusal)) => {
+      Err(handed) => {
+        let (host, refusal) = *handed;
         slot.host = Some(BaseHost::Disk(host));
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
         return refused(target_refusal(&refusal, &prepared.target));
@@ -1736,7 +1748,8 @@ fn begin_granted(
     };
     match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
       Ok(pair) => pair,
-      Err((host, refusal)) => {
+      Err(handed) => {
+        let (host, refusal) = *handed;
         slot.host = Some(BaseHost::Disk(host));
         drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
         return not_run(
@@ -2455,6 +2468,7 @@ fn record_refused(state: &mut ShardState, attempt: &Attempt<'_>) -> Result<(), s
         state: ended,
         written,
         conflicts: attempt.conflicts,
+        superseded_by: None,
       },
     }
   };
@@ -2678,12 +2692,29 @@ struct Presenter<'a> {
   signature: Option<&'a [u8]>,
 }
 
-/// Whether a presentation by `client` of `volume` into `target` would pass the shard's bound: a client's
-/// re-presentation of the same volume and target replaces its own and never does (AUD-29-07).
+/// The landings awaiting a grant that a new presentation of `volume` into `target` supersedes (A-779): every one of
+/// that volume and target the partition's waiting index holds, unless a landing of the volume is running now. Read
+/// from the index's range for the volume, so it costs that volume's waiting landings.
+fn superseded_by_presentation(state: &ShardState, volume: DbVolumeId, target: &str) -> Vec<u64> {
+  if state.landing.running.contains_key(&volume) {
+    return Vec::new();
+  }
+  state
+    .db
+    .partition()
+    .awaiting_grant_from(std::ops::Bound::Included((volume, 0)))
+    .take_while(|landing| landing.volume == volume)
+    .filter(|landing| landing.target == target)
+    .map(|landing| landing.id)
+    .collect()
+}
+
+/// Whether a presentation by `client` of `volume` into `target` would pass the shard's bound: one that replaces a
+/// presentation, its client's own (AUD-29-07) or any client's it supersedes (A-779), never does.
 fn presentations_full(state: &ShardState, client: u32, volume: DbVolumeId, target: &str) -> bool {
   let replaces = state.landing.awaiting.values().any(|awaiting| {
     awaiting.client == client && awaiting.volume == volume && awaiting.target == target
-  });
+  }) || !superseded_by_presentation(state, volume, target).is_empty();
   !replaces && state.landing.awaiting.len() >= state.config.landings_awaiting_per_shard
 }
 
@@ -2757,10 +2788,17 @@ fn present(
       refusal: slates_ipc::protocol::TargetRefusal::TooLong { longest },
     });
   }
-  // A client presenting the same volume and target again replaces its earlier presentation, whose id is no
-  // longer grantable (AUD-29-07): re-planning costs no room.
-  state.landing.awaiting.retain(|_, awaiting| {
-    !(awaiting.client == client && awaiting.volume == ids.volume && awaiting.target == ids.target)
+  // A presentation of the same volume into the same target, by any client, supersedes every earlier one still
+  // awaiting its grant (A-779, main's ruling 2026-11-20; AUD-29-07 replaced only the same client's): their ids are no
+  // longer grantable, and re-planning costs no room. A landing of the volume running now is left to finish.
+  let superseded = superseded_by_presentation(state, ids.volume, ids.target);
+  // A granted landing's presentation kept for its resume (an aborted run's) is no presentation awaiting a grant, so it
+  // stays; the same client's own re-presentation replaces it as before (AUD-29-07).
+  state.landing.awaiting.retain(|id, awaiting| {
+    !(superseded.contains(id)
+      || (awaiting.client == client
+        && awaiting.volume == ids.volume
+        && awaiting.target == ids.target))
   });
   state.landing.awaiting.insert(
     landing_id,
@@ -2788,6 +2826,7 @@ fn present(
     state: DbLandingState::AwaitingGrant,
     written: 0,
     conflicts: u32::try_from(conflicts.len()).unwrap_or(u32::MAX),
+    superseded_by: None,
   };
   let planned = DbAuditRecord {
     seq: 0,
@@ -2806,6 +2845,15 @@ fn present(
     .and_then(|_| write_audit(state, vec![planned], now))
   {
     return refused(crate::error::refusal_of_db(&e));
+  }
+  for older in superseded {
+    let op = Op::LandingSuperseded {
+      id: older,
+      by: landing_id,
+    };
+    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+      return refused(crate::error::refusal_of_db(&e));
+    }
   }
   // The presentation is recorded, so its reply must always fit (A-267): the conflicts one reply holds beside the
   // summary, the rest counted; every entry, its conflict among it, is read a page at a time (`LandingEntries`).
@@ -2907,6 +2955,7 @@ fn finish(
     state: db_state,
     written: u32::try_from(report.written).unwrap_or(u32::MAX),
     conflicts: u32::try_from(report.conflicts).unwrap_or(u32::MAX),
+    superseded_by: None,
   };
   // A landing under a fresh id is recorded; one under its presentation's id moves that presentation's
   // record out of `AwaitingGrant` (AUD-29-07), its grant named by the audit records that follow.
@@ -3266,6 +3315,16 @@ pub fn grant_verb(
     return crate::verbs::forbidden("grant");
   }
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
+    // A presentation a newer one superseded is refused by kind, naming the newer (A-779): an older state never lands
+    // over a newer one.
+    if let Some(newer) = state
+      .db
+      .partition()
+      .landing(landing_id)
+      .and_then(|landing| landing.superseded_by)
+    {
+      return crate::verbs::refused(Refusal::LandingSuperseded { newer });
+    }
     return crate::verbs::refused(Refusal::NotFound);
   };
   if !proven_by_launcher(
@@ -3372,6 +3431,28 @@ pub fn policy_proof(
   bytes.extend_from_slice(&version.to_le_bytes());
   let mut hasher = blake3::Hasher::new_keyed(secret);
   hasher.update(POLICY_DOMAIN);
+  hasher.update(&bytes);
+  *hasher.finalize().as_bytes()
+}
+
+/// Format: the domain tag of an identities proof (A-664), so it never verifies as a grant, enrollment, revocation or
+/// policy proof.
+const IDENTITIES_DOMAIN: &[u8] = b"slates.identities";
+
+/// The proof that sets `principal`'s tool `identities` from version `read` (A-664): the keyed hash under the launcher's
+/// secret over the principal, the identities and the version read, as a policy's is (A-285), under its own domain.
+pub fn identities_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  principal: &slates_ipc::protocol::Principal,
+  identities: &slates_ipc::protocol::ToolIdentities,
+  read: u64,
+) -> [u8; 32] {
+  let mut bytes = Vec::new();
+  slates_wire::Wire::encode(principal, &mut bytes);
+  slates_wire::Wire::encode(identities, &mut bytes);
+  bytes.extend_from_slice(&read.to_le_bytes());
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(IDENTITIES_DOMAIN);
   hasher.update(&bytes);
   *hasher.finalize().as_bytes()
 }
@@ -3597,7 +3678,7 @@ pub(crate) fn db_policy(policy: WritePolicy) -> slates_db::catalog::WritePolicy 
 }
 
 /// A wire mode as the catalog records it.
-fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
+pub(crate) fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
   match mode {
     WriteMode::Bypass => slates_db::catalog::WriteMode::Bypass,
     WriteMode::Ask => slates_db::catalog::WriteMode::Ask,
@@ -3605,16 +3686,20 @@ fn db_mode(mode: WriteMode) -> slates_db::catalog::WriteMode {
   }
 }
 
-/// A recorded policy as the wire carries it.
-pub(crate) fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolicy {
-  let mode = |mode| match mode {
+/// A recorded mode as the wire carries it.
+pub(crate) fn wire_mode(mode: slates_db::catalog::WriteMode) -> WriteMode {
+  match mode {
     slates_db::catalog::WriteMode::Bypass => WriteMode::Bypass,
     slates_db::catalog::WriteMode::Ask => WriteMode::Ask,
     slates_db::catalog::WriteMode::Forbid => WriteMode::Forbid,
-  };
+  }
+}
+
+/// A recorded policy as the wire carries it.
+pub(crate) fn wire_policy(policy: slates_db::catalog::WritePolicy) -> WritePolicy {
   WritePolicy {
-    merge: mode(policy.merge),
-    land: mode(policy.land),
+    merge: wire_mode(policy.merge),
+    land: wire_mode(policy.land),
     require_signed_merges: policy.require_signed_merges,
   }
 }
@@ -4218,6 +4303,7 @@ fn wire_landing_stage(state: DbLandingState) -> slates_ipc::protocol::LandingSta
     DbLandingState::Partial => Stage::Partial,
     DbLandingState::Refused => Stage::Refused,
     DbLandingState::Aborted => Stage::Aborted,
+    DbLandingState::Superseded => Stage::Superseded,
   }
 }
 
@@ -4233,6 +4319,7 @@ fn landing_state_name(state: DbLandingState) -> String {
     DbLandingState::Partial => "partial",
     DbLandingState::Refused => "refused",
     DbLandingState::Aborted => "aborted",
+    DbLandingState::Superseded => "superseded",
   }
   .to_owned()
 }
@@ -4753,52 +4840,66 @@ mod landed_reply_tests {
     const BOTH: u32 = 5;
     /// Shape: see `BOTH`.
     const BOTH_ERRNO: i32 = 5;
-    let win32 = OsCode::Win32(BOTH);
-    let errno = OsCode::Errno(BOTH_ERRNO);
+    assert_answers_and_targets_keep_their_numbering(BOTH, BOTH_ERRNO);
+    assert_cells_and_bases_keep_their_numbering(BOTH, BOTH_ERRNO);
+  }
+
+  /// The reply's answer and a target's refusal carry Win32 `code` and errno `errno_code`, one number, each in its
+  /// own variant, a path on the daemon's own mount too.
+  fn assert_answers_and_targets_keep_their_numbering(code: u32, errno_code: i32) {
+    let win32 = OsCode::Win32(code);
+    let errno = OsCode::Errno(errno_code);
     assert_eq!(
       super::answer_of(HostError::Unavailable(win32)),
-      HostAnswer::Win32 { code: BOTH }
+      HostAnswer::Win32 { code }
     );
     assert_eq!(
       super::answer_of(HostError::NoSpace(errno)),
-      HostAnswer::Errno { errno: BOTH_ERRNO }
+      HostAnswer::Errno { errno: errno_code }
     );
     assert_eq!(
       crate::error::target_of_host(&HostError::Exists(win32)),
-      TargetRefusal::HostWin32 { code: BOTH }
+      TargetRefusal::HostWin32 { code }
     );
     assert_eq!(
       crate::error::target_of_host(&HostError::Unavailable(errno)),
-      TargetRefusal::Host { errno: BOTH_ERRNO }
+      TargetRefusal::Host { errno: errno_code }
     );
     // A path on this daemon's own mount carries the platform's deadlock-avoided code in its own numbering (A-227):
     // Windows' `ERROR_POSSIBLE_DEADLOCK` rode in an errno's place before A-539.
     assert_eq!(
       super::answer_of(HostError::OwnMount(win32)),
-      HostAnswer::Win32 { code: BOTH }
+      HostAnswer::Win32 { code }
     );
     assert_eq!(
       crate::error::target_of_host(&HostError::OwnMount(win32)),
-      TargetRefusal::HostWin32 { code: BOTH }
+      TargetRefusal::HostWin32 { code }
     );
     assert_eq!(
       crate::error::target_of_host(&HostError::OwnMount(errno)),
-      TargetRefusal::Host { errno: BOTH_ERRNO }
+      TargetRefusal::Host { errno: errno_code }
     );
+  }
+
+  /// A crashed landing's cell and a base directory's refusal carry Win32 `code` and errno `errno_code`, one number,
+  /// each in its own variant.
+  fn assert_cells_and_bases_keep_their_numbering(code: u32, errno_code: i32) {
+    let win32 = OsCode::Win32(code);
+    let errno = OsCode::Errno(errno_code);
     assert_eq!(
       super::degradation_of(&slates_land::engine::Degradation::Crashed { code: win32 }),
-      LandingDegradation::CrashedWin32 { code: BOTH }
+      LandingDegradation::CrashedWin32 { code }
     );
     assert_eq!(
       super::degradation_of(&slates_land::engine::Degradation::Crashed { code: errno }),
-      LandingDegradation::Crashed { errno: BOTH_ERRNO }
+      LandingDegradation::Crashed { errno: errno_code }
     );
-    let base = |code| crate::error::base_unavailable("/base".to_owned(), code);
+    let base = |os_code| crate::error::base_unavailable("/base".to_owned(), os_code);
     assert_eq!(
       base(Some(win32)),
       Refusal::BaseUnavailableWin32 {
         path: "/base".to_owned(),
-        code: BOTH
+        code
       }
     );
     assert_eq!(
@@ -4917,9 +5018,6 @@ mod owed_audit_tests {
 
   use crate::daemon::LIVENESS_BUDGET_NS;
 
-  /// Shape: how long the test lets its daemon run before the record is owed: past the reap loop's first look, a window
-  /// after its start, by a tenth of a window, and short of its second.
-  const PAST_THE_FIRST_LOOK_NS: u64 = LIVENESS_BUDGET_NS + LIVENESS_BUDGET_NS / 10;
   /// Shape: how long past a window after the send the test waits for the batch to be sent again: half a window.
   const RESENT_WITHIN_NS: u64 = LIVENESS_BUDGET_NS / 2;
   /// Shape: the pause between the test's looks at the shard's count, short beside half a window.
@@ -4927,7 +5025,7 @@ mod owed_audit_tests {
   /// Shape: the partition the record is owed from: the second shard's, so the control partition is another shard's.
   const OWING: usize = 1;
 
-  /// A-554 (the owed audit off the tick; A-265's resend). Do: on a two-shard daemon past the reap loop's first look,
+  /// A-554 (the owed audit off the tick; A-265's resend). Do: on a two-shard daemon,
   /// with the second shard's acknowledgements withheld so its batch stays owed as if each were lost, owe the control
   /// partition one audit record there and send it as a verb's transaction does; watch the shard's resends. Expect: the
   /// batch sent again no sooner than a window after its send, when its acknowledgement could still be on its way, and
@@ -4937,9 +5035,6 @@ mod owed_audit_tests {
   #[test]
   fn an_unacknowledged_audit_batch_is_sent_again_a_window_after_its_send() {
     let daemon = crate::daemon::audit_daemon_of(2);
-    // The harness waits out the reap loop's first look; the daemon under test runs on.
-    #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(Duration::from_nanos(PAST_THE_FIRST_LOOK_NS));
     let sent = Instant::now();
     crate::daemon::observe_at(&daemon, OWING, |state| {
       state.landing.acknowledgement_withheld = true;

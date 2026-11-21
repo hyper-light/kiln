@@ -789,8 +789,8 @@ mod tests {
                 compared.push(format!("{file}:{}", p.spec_id));
             }
         }
-        // ci.yaml's ui and vendor; sim's nightly; stress's pods; e2e's pod jobs.
-        for want in ["ci.yaml:ui", "ci.yaml:vendor", "sim.yaml:nightly", "stress.yaml:pods", "e2e.yaml:rust", "e2e.yaml:fanout-pods", "e2e.yaml:gate"] {
+        // ci.yaml's ui, locks and vendor; sim's nightly; stress's pods; e2e's pod jobs.
+        for want in ["ci.yaml:ui", "ci.yaml:locks", "ci.yaml:vendor", "sim.yaml:nightly", "stress.yaml:pods", "e2e.yaml:rust", "e2e.yaml:fanout-pods", "e2e.yaml:gate"] {
             assert!(compared.iter().any(|c| c == want), "{want} not compared: {compared:?}");
         }
         // ci.yaml's rust runs on a bare-metal Linux runner since aa98b33d6 (its library's tests compile past what a pod

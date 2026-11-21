@@ -6,11 +6,11 @@ Slates' A-278), linked from here, never through its command line (the person, 20
 `crates/kiln/src/workspace/slates.rs` calls it, and kiln's own executable runs the instance's anchor and daemon
 (`kiln slates-role`, served by `slates_api::role::main`), so kiln carries no Slates binary and the daemon is the same
 code as the client kiln links. kiln speaks the library's typed consumer contract (A-299) and pins the version it was
-written against (`workspace::slates::CONTRACT`, 48 at this revision): a re-vendor that moves it fails kiln's unit test
+written against (`workspace::slates::CONTRACT`, 57 at this revision): a re-vendor that moves it fails kiln's unit test
 `w1_kiln_speaks_the_contract_it_was_written_against`.
 
 - **Upstream:** https://github.com/hyper-light/slates, branch `main`, commit
-  `38ed3dfd8e69921c46861de3487e7c1de5fc1d51` (2026-11-18), MIT (`LICENSE`).
+  `8ce3d61523e1bb6921f28958ecf90c50e3e6c710` (2026-11-20), MIT (`LICENSE`).
 - **What is here:** upstream's tree, at upstream's paths: its crates (`crates/*`), its root manifest, its toolchain,
   lint and format settings with the budgets its own checks read (`clippy.toml`, `rustfmt.toml`,
   `rust-toolchain.toml`, `unsafe-budget.toml`, `ratchets.toml`), its `xtask`, its agents' skills (`skills/`, which its
@@ -44,8 +44,7 @@ branch, and Slates' agent is told of it; a vendoring change alone (the first bel
 | File | Change | Why | Recorded as |
 |---|---|---|---|
 | `Cargo.toml` | each of hyper-raft's crates taken by path from kiln's copy (`../hyper-raft/crates/hyper-*`), not from `vendor/hyper-raft/*`; the root's `[patch.crates-io]` points aws-lc-rs at kiln's copy (`../aws-lc-rs/aws-lc-rs`) and leaves aws-lc-sys crates.io's | kiln holds one copy of each: two linked copies of hyper-raft fail CP-M1's one-revision test, and Slates' own copies (its `vendor/`) aren't here. A path dependency can't be patched, so the paths change | `0001-its-crates-on-kiln-s-one-hyper-raft-and-aws-lc-rs.patch` |
-| `crates/bridge-fuse/src/abi.rs`, `bridge.rs`, `shards_fs.rs` | a `SETXATTR`'s form read from each request (`abi::setxattr_head`), for the bridge's dispatch and Shards' owner word alike: the extended head only where its second 8 bytes are a known setter's flag and a zero pad (upstream's A-741, slates main `e0c06750`) | kiln's macOS microVM g266 drive refused a run's every write `EACCES`, intermittently: Linux sizes a `SETXATTR` by the form it holds at the call and holds it until INIT's reply (`fuse_setxattr`, `fuse_block_alloc`), so Shards' init's owner word comes in the short form on a connection that kept the extended one, and was missed. Folds away when kiln takes Slates at or past `e0c06750` | `0002-a-setxattr-s-form-is-the-request-s-own-so-shards-owner-word.patch` |
-| `crates/ipc/src/rendezvous.rs` | a Windows claim reads the bootstrap header's process marks (bytes 24-48: the daemon's and the anchor's) alone, never the whole 64-byte header (`marks_image`, for `unanswered_end` and `holder_lives`; upstream's A-717, slates main `721f4ff97`) | kiln's slates_e2e drives on GitHub's Windows (runs 44784112194, microVM on windows-2025; 44784299374, bare metal on windows-latest) ended at Slates' anchor, "the channel's shared memory refused: shared layout refused at 0 for 64 bytes: TouchesWord": the header's bytes 8-24 are declared words (doorbell, claim mark, start stamp), so every Windows client's connect was refused. Folds away when kiln takes Slates at or past `721f4ff97` | `0003-a-windows-claim-reads-the-bootstrap-header-s-process-marks.patch` |
+| `crates/server/src/moves.rs`, `carry.rs`, `fleet.rs`, `forward_lane.rs` | a planned move prepared unfrozen and frozen only once ready to hand over (`moves::freeze`), the failover bound running from the freeze; a prepared move lasts while its mover asks, the healer passes it by, and each move logs its hops (upstream's A-784, slates main `3f4fadda`) | kiln's live move (goal 91): most first move asks were refused `unplaced` (asks 1-3 at 3.2 s, the 4th reported 120 ms after it), every ask for five minutes once across two Macs | `0002-a-planned-move-is-prepared-unfrozen-and-frozen-only-once.patch` |
 
 ## Taking a newer upstream
 

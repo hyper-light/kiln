@@ -37,6 +37,8 @@ pub mod budget;
 pub mod dax_object;
 pub mod error;
 pub mod handle;
+pub mod heap;
+pub mod large;
 pub mod lock;
 #[cfg(loom)]
 pub mod loom_bounds;
@@ -44,6 +46,7 @@ pub mod mpsc;
 pub mod prefault;
 mod ranges;
 pub mod region;
+pub mod resident;
 pub mod ring;
 pub mod segmented;
 pub mod shared;
@@ -61,7 +64,9 @@ pub use mpsc::MpscRing;
 pub use region::Region;
 pub use ring::SpscRing;
 pub use segmented::Segmented;
-pub use shared::{ExclusiveObject, Handoff, SharedObject, SparseObject, mapping_granule};
+pub use shared::{
+  ExclusiveObject, Handoff, SharedObject, SparseObject, mapping_granule, unlink_handoff,
+};
 pub use slab::Slab;
 pub use words::{Layout, RunId, SpanId, SpanRun, Width, WordRun, Words};
 

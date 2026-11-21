@@ -101,7 +101,7 @@ pub struct Bounds {
 }
 
 impl Bounds {
-  /// The tightest bounds that admit `value` as [`write`] writes it: its written length, its longest word, its depth and
+  /// The tightest bounds that admit `value` as [`write`](fn@write) writes it: its written length, its longest word, its depth and
   /// its item count. `None` when a measure overflows.
   pub fn of(value: &Value<'_>) -> Option<Self> {
     let mut bounds = Self::default();
@@ -590,6 +590,16 @@ pub fn write(value: &Value<'_>, out: &mut Vec<u8>) -> Result<(), ItemError> {
   out.push(SPACE);
   Ok(())
 }
+
+/// Appends the head of a string item of `length` bytes, `length:`, for a caller that writes its bytes in pieces after it
+/// and the item's closing space ([`write`]'s `Value::String` as one string's three parts; A-751).
+pub fn write_string_head(length: u64, out: &mut Vec<u8>) {
+  write_decimal(length, out);
+  out.push(STRING_MARK);
+}
+
+/// The space that ends every item, after a string written in pieces ([`write_string_head`]).
+pub const ITEM_END: u8 = SPACE;
 
 /// Appends `number` in decimal, its shortest form.
 fn write_decimal(number: u64, out: &mut Vec<u8>) {

@@ -6,12 +6,15 @@
 //! (`0001`) and response end (`0002`). A pack travels inside the `packfile` section multiplexed by side-band-64k
 //! ([`sideband`]): each data packet's first byte names its band, 1 the pack, 2 progress, 3 a fatal error. Under
 //! protocol v2's `sideband-all` every data packet of a response is multiplexed so. This crate reads and writes both,
-//! byte for byte as stock git 2.50 writes them, and nothing more yet: protocol v2's messages, deltas, pack indexes and
-//! packs are A-582's next parts (GAPS, the §4.17 entry).
+//! byte for byte as stock git 2.50 writes them. It also names objects ([`object_name`], A-600): the object header, and an
+//! object's name in either `object-format`, SHA-1 with git's collision detection or SHA-256. And it speaks protocols v0
+//! and v1 for clients older than v2 ([`v0`], A-604): the ref advertisement with its capabilities, a fetch's request and
+//! negotiation lines, and the shallow-update. Protocol v2's messages, deltas, pack indexes and packs are A-582's next
+//! parts (GAPS, the §4.17 entry).
 //!
 //! **Sources** (read 2026-11-19). git's `Documentation/gitprotocol-common.txt` ("pkt-line Format"),
 //! `gitprotocol-v2.txt` ("Packet-Line Framing", "packfile section", `sideband-all`) and `gitprotocol-capabilities.txt`
-//! ("side-band, side-band-64k") [B]; and git's `pkt-line.c` and `sideband.c` [C], which is what clients run, followed
+//! ("side-band, side-band-64k") \[B\]; and git's `pkt-line.c` and `sideband.c` \[C\], which is what clients run, followed
 //! where the documents leave room: a length digit may be of either case (`hexval`), `0003` is refused ("bad line
 //! length"), `0004` is a data packet with no data, and a band other than 1, 2 and 3 is refused ("bad band").
 //!
@@ -40,11 +43,28 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod admission;
+pub mod delta;
+pub mod derived;
+pub mod entry;
+pub mod http;
+pub mod lfs;
+pub mod negotiation;
+pub mod object_name;
+pub mod objects;
 pub mod out;
+pub mod pack;
 pub mod pktline;
+pub mod positions;
+pub mod receive;
+pub mod refname;
 pub mod sideband;
+pub mod store;
+pub mod unpack;
+pub mod upload;
+pub mod v0;
+pub mod v2;
 
-pub use admission::{Admission, PastAdmission};
+pub use admission::{Admission, Hold, PastAdmission};
 
 /// A count or a length as `u64`. Every `usize` fits on the targets slates ships (Appendix B.2), and one that did not
 /// would saturate, which every caller then refuses, rather than wrap.
@@ -55,3 +75,19 @@ pub(crate) fn to_u64(value: usize) -> u64 {
 #[cfg(test)]
 #[path = "tests/fixtures.rs"]
 mod fixtures;
+
+#[cfg(test)]
+#[path = "tests/pack_fixtures.rs"]
+mod pack_fixtures;
+
+#[cfg(test)]
+#[path = "tests/v2_rest_fixtures.rs"]
+mod v2_rest_fixtures;
+
+#[cfg(test)]
+#[path = "tests/protected_fixtures.rs"]
+mod protected_fixtures;
+
+#[cfg(test)]
+#[path = "tests/served.rs"]
+mod served;

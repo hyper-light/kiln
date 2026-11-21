@@ -134,19 +134,42 @@ fn master(hub: &Hub) -> anyhow::Result<[u8; 32]> {
 
 fn master_at(p: &std::path::Path) -> anyhow::Result<[u8; 32]> {
     match std::fs::read(p) {
-        Ok(b) if b.len() == 32 => {
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&b);
-            Ok(k)
-        }
-        Ok(_) => anyhow::bail!("{} is not a 32-byte key", p.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let k: [u8; 32] = random()?;
-            crate::util::write_secret(p, &k, 0o600)?;
-            Ok(k)
-        }
+        Ok(b) => key_in(p, &b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => made_at(p),
         Err(e) => Err(e.into()),
     }
+}
+
+/// The master key's bytes `b`, read from `p`.
+fn key_in(p: &std::path::Path, b: &[u8]) -> anyhow::Result<[u8; 32]> {
+    <[u8; 32]>::try_from(b).map_err(|_| anyhow::anyhow!("{} is not a 32-byte key", p.display()))
+}
+
+/// The master key made at `p`, where there was none: written whole into a file of its own beside it, then linked into
+/// place only while no key is there, so first uses at once (the server's tasks, observe's, another process) all end
+/// with the one key that's kept, never each with its own or with a file another is writing. One that finds a key
+/// linked first uses it.
+fn made_at(p: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let k: [u8; 32] = random()?;
+    let tmp = p.with_extension(format!("new.{}", crate::util::new_id()));
+    let linked = write_new(&tmp, &k).and_then(|()| std::fs::hard_link(&tmp, p));
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(k),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => key_in(p, &std::fs::read(p)?),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// `bytes` in a new file at `p`, only its owner's to read, on the disk before it's used.
+fn write_new(p: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = crate::os::with_mode(std::fs::OpenOptions::new().create_new(true).write(true), 0o600).open(p)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 /// A key of its own for `label`, from the master key: one kiln checks with and never stores (an
@@ -705,6 +728,24 @@ mod tests {
         // Fresh nonces: the same value seals differently each time.
         let (again, n2) = seal(&k, b"hunter2", &s.aad("PASS"))?;
         assert!(again != sealed && n2 != nonce);
+        Ok(())
+    }
+
+    /// The master key's first uses at once each get the one key kept: a webhook's secret derived from it while
+    /// observe's credentials or a leg's OIDC key make it checks against the same key later (W03-R02).
+    #[test]
+    fn w03_r02_first_uses_at_once_share_one_master_key() -> anyhow::Result<()> {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir()?;
+            let p = dir.path().join("secrets").join("master.key");
+            let keys: Vec<[u8; 32]> = std::thread::scope(|s| {
+                let hands: Vec<_> = (0..16).map(|_| s.spawn(|| master_at(&p))).collect();
+                hands.into_iter().map(|h| h.join().map_err(|_| anyhow::anyhow!("a thread panicked"))?).collect::<anyhow::Result<Vec<_>>>()
+            })?;
+            let kept = master_at(&p)?;
+            assert!(keys.iter().all(|k| *k == kept), "each first use got the kept key");
+            assert_eq!(std::fs::read_dir(p.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?)?.count(), 1, "nothing left beside it");
+        }
         Ok(())
     }
 }

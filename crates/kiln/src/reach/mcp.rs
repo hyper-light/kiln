@@ -1154,11 +1154,12 @@ pub fn serve() -> anyhow::Result<()> {
     serve_over(Link::Socket(sock), prefer, cwd, session, &mut std::io::stdin().lock(), Box::new(std::io::stdout()))
 }
 
-/// Without Unix sockets no runner of the machine answers `kiln reach mcp`: here a harness reaches
-/// kiln's MCP from a microVM of its own, over its lane ([`serve_lane`]).
+/// Without Unix sockets `kiln reach mcp` reaches its runner over the loopback the runner gave its harness
+/// (`super::loopback`: its address and the session's token in its environment), where the runner serves it as the
+/// session's lane ([`serve_lane`]).
 #[cfg(not(unix))]
 pub fn serve() -> anyhow::Result<()> {
-    anyhow::bail!("`kiln reach mcp` reaches its runner over a Unix socket, which no runner here serves: a harness on this machine reaches kiln's MCP from a microVM of its own, over its lane")
+    super::loopback::serve_from_env().unwrap_or_else(|| anyhow::bail!("`kiln reach mcp` was given no runner's loopback ({}): a harness its runner started on this machine is given one", super::loopback::ADDR_ENV))
 }
 
 /// kiln's MCP for isolated session `here.session`, over one connection of its lane (kiln plan

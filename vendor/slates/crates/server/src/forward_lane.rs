@@ -136,6 +136,8 @@ const SILENCE_AWAITED_RECEIVER: &str = "fleet.forward.silence_awaited_receiver";
 const SESSIONLESS_TURN: &str = "fleet.forward.sessionless_turn";
 /// The status count of a lane whose path's measured floor passed the failover SLO ([`note_floor`]), once a crossing.
 const FLOOR_PAST_SLO: &str = "fleet.forward.floor_past_slo";
+/// The status count of the log lines written about lanes' floors ([`note_floor`]): at most one a lane a window.
+const FLOOR_LOGGED: &str = "fleet.forward.floor_logged";
 /// The status count of a forward whose failover bound its path's floor held past the SLO ([`FailoverBound`]), once a
 /// forward: the non-vacuity count of the floor, so a test of a path slower than the SLO shows the floor held it.
 const HELD_PAST_SLO: &str = "fleet.forward.held_past_slo";
@@ -232,7 +234,22 @@ struct Lane {
   drained_turn: u64,
   /// The floor of the path to the peer as the lane's latest driving turn measured it on the session it borrowed
   /// ([`path_floor_ns`]); 0 before any. Each forward holds its failover bound at the largest it saw ([`FailoverBound`]).
+  /// Kept while the lane is idle (the lane is), so a floor measured once is not crossed again by the next forward.
   floor_ns: u64,
+  /// Whether the log's last line about this lane's floor said it is past the failover delay ([`note_floor`]).
+  floor_logged_past: bool,
+  /// When that line was written, on the wall; 0: none yet.
+  floor_logged_ns: u64,
+  /// The floor's crossings of the failover delay since that line, told with the next one.
+  floor_crossings: u64,
+}
+
+impl Lane {
+  /// Whether the lane holds nothing and nobody drives it: what an idle lane of a peer no longer a member is pruned by
+  /// ([`ForwardLanes::prune_idle`]).
+  fn idle(&self) -> bool {
+    self.tickets.is_empty() && self.abandon.is_empty() && !self.driving
+  }
 }
 
 /// Every peer's lane, in the control shard's state.
@@ -268,6 +285,8 @@ fn enqueue(peer: HostId, requests: &[Vec<u8>], place: &mut Place) -> Option<(u64
     let queued = s
       .forward_lanes
       .queue(peer, requests, place, bound, futures::now_ns());
+    let members = &s.council.configuration().members;
+    s.forward_lanes.prune_idle(members);
     if queued.is_none() {
       s.count(LANE_FULL, 1);
     } else if resend {
@@ -279,6 +298,17 @@ fn enqueue(peer: HostId, requests: &[Vec<u8>], place: &mut Place) -> Option<(u64
 }
 
 impl ForwardLanes {
+  /// The widest floor this shard has measured on any lane to a peer ([`path_floor_ns`]), nanoseconds; zero with none:
+  /// what a move's report of its hops puts beside its bound (`crate::moves`).
+  pub(crate) fn widest_floor_ns(&self) -> u64 {
+    self
+      .lanes
+      .values()
+      .map(|lane| lane.floor_ns)
+      .max()
+      .unwrap_or(0)
+  }
+
   /// Queues `requests` on `peer`'s lane under a new forwarder at `place`, at `now`: its id and its tickets, in order,
   /// or `None` when the lane would hold more than `bound`. A first issue takes its own tickets as its place and records
   /// it in `place`; a resend (`place` already recorded) is queued at the first issue's place, each request at the
@@ -330,8 +360,23 @@ impl ForwardLanes {
     Some((forwarder, tickets))
   }
 
+  /// Drops the idle lanes of peers not in `members` (the council's configuration now): a lane is kept while it is idle,
+  /// so what it measured of its path (its floor) outlives a forward, and the lanes are bounded by the members and the
+  /// lanes in use. Until 2026-11-20 a lane left with nothing was dropped at once, so every forward made it afresh, its
+  /// floor measured from nothing, and a floor past the failover delay was crossed and logged again by each forward:
+  /// about a million lines, 260 MB, in one of w-fed-faults' flows.
+  fn prune_idle(&mut self, members: &[HostId]) {
+    if self.lanes.len() <= members.len() {
+      return;
+    }
+    self
+      .lanes
+      .retain(|peer, lane| !lane.idle() || members.contains(peer));
+  }
+
   /// Removes `forwarder`'s tickets from `peer`'s lane: an open one's exchange is abandoned on the next turn, and if it
-  /// was driving, the lane is left undriven and the next waiter woken to drive it. A lane left with nothing is dropped.
+  /// was driving, the lane is left undriven and the next waiter woken to drive it. A lane left with nothing is kept
+  /// ([`ForwardLanes::prune_idle`]).
   fn leave(&mut self, peer: HostId, forwarder: u64, tickets: &[u64], was_driving: bool) {
     let Some(lane) = self.lanes.get_mut(&peer) else {
       return;
@@ -353,9 +398,6 @@ impl ForwardLanes {
       if let Some(next) = lane.waiters.values().next() {
         next.wake_by_ref();
       }
-    }
-    if lane.tickets.is_empty() && lane.abandon.is_empty() && !lane.driving {
-      self.lanes.remove(&peer);
     }
   }
 }
@@ -501,40 +543,69 @@ fn path_floor_ns(congestion_ns: u64, pto_ns: u64) -> u64 {
 }
 
 /// Measures the floor of the path to `peer` on the session a driving turn borrowed ([`Lane::floor_ns`]), and says in the
-/// log when it first passes the failover SLO, and when it falls back under it: while it is past, the lane's forwards run
-/// at the floor and cannot meet the SLO ([`FailoverBound`]).
+/// log when it is past the failover delay, and when it is back within it: while it is past, the lane's forwards run at
+/// the floor and cannot meet the delay ([`FailoverBound`]). A line is written only where what the log last said of the
+/// lane differs from what is so now, at most once a window ([`floor_log_window_ns`]), and tells the crossings since the
+/// last line; so a floor that sits at the delay and crosses it again and again (3,102 ms against 3,100) is one line a
+/// window, not one a crossing. Each crossing past is counted ([`FLOOR_PAST_SLO`]), each line too ([`FLOOR_LOGGED`]).
 fn note_floor(peer: HostId, endpoint: &Endpoint) {
   let congestion_ns = endpoint.persistent_congestion_duration();
   let pto_ns = endpoint.pto();
   let floor_ns = path_floor_ns(congestion_ns, pto_ns);
-  let crossed = state::with_state(|s| {
+  let now_ns = futures::now_ns();
+  let line = state::with_state(|s| {
     let slo_ns = s.failover_ns;
     let lane = s.forward_lanes.lanes.get_mut(&peer)?;
     let was_past = lane.floor_ns > slo_ns;
     lane.floor_ns = floor_ns;
     let past = floor_ns > slo_ns;
+    if past != was_past {
+      lane.floor_crossings = lane.floor_crossings.saturating_add(1);
+    }
+    let window_ns = floor_log_window_ns(slo_ns, floor_ns);
+    let due = lane.floor_logged_ns == 0 || now_ns >= lane.floor_logged_ns.saturating_add(window_ns);
+    let line = (past != lane.floor_logged_past && due).then(|| {
+      let crossings = std::mem::take(&mut lane.floor_crossings);
+      lane.floor_logged_past = past;
+      lane.floor_logged_ns = now_ns;
+      (past, slo_ns, crossings)
+    });
     if past && !was_past {
       s.count(FLOOR_PAST_SLO, 1);
     }
-    (past != was_past).then_some((past, slo_ns))
+    if line.is_some() {
+      s.count(FLOOR_LOGGED, 1);
+    }
+    line
   })
   .flatten();
-  match crossed {
-    Some((true, slo_ns)) => slates_machine::log_line!(
+  match line {
+    Some((true, slo_ns, crossings)) => slates_machine::log_line!(
       "slates-server: forward lane to {peer:?}: the path's measured floor {} ms is past the failover SLO {} ms (its \
-       silence window {} ms, its probe timeout {} ms): its forwards run at the floor and cannot meet the SLO",
+       silence window {} ms, its probe timeout {} ms): its forwards run at the floor and cannot meet the SLO ({} \
+       crossings since the last line)",
       floor_ns / NS_PER_MS,
       slo_ns / NS_PER_MS,
       crate::daemon::LIVENESS_BUDGET_NS.max(congestion_ns) / NS_PER_MS,
-      pto_ns / NS_PER_MS
+      pto_ns / NS_PER_MS,
+      crossings
     ),
-    Some((false, slo_ns)) => slates_machine::log_line!(
-      "slates-server: forward lane to {peer:?}: the path's measured floor {} ms is back within the failover SLO {} ms",
+    Some((false, slo_ns, crossings)) => slates_machine::log_line!(
+      "slates-server: forward lane to {peer:?}: the path's measured floor {} ms is back within the failover SLO {} ms \
+       ({} crossings since the last line)",
       floor_ns / NS_PER_MS,
-      slo_ns / NS_PER_MS
+      slo_ns / NS_PER_MS,
+      crossings
     ),
     None => {}
   }
+}
+
+/// Derived: the least time between two lines about one lane's floor ([`note_floor`]): the longer of the failover delay
+/// and the floor, the bound on one forward's life ([`FailoverBound::at_ns`]). Within it no forward begun after a line
+/// has ended, so another line would tell the operator nothing that one forward could have acted on.
+fn floor_log_window_ns(slo_ns: u64, floor_ns: u64) -> u64 {
+  slo_ns.max(floor_ns)
 }
 
 /// What a batch's stall is judged against at a look ([`Stall::judge`]): two instants on the wall and two counts, each
@@ -824,9 +895,11 @@ async fn drive_turn(
     }
     Turn::SessionOut => {
       count_miss(peer, missed);
-      if futures::sleep(crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD)
+      // Waits for the session's return (or its link's change) within what is left, then looks again: a pace of a tenth
+      // of a period kept a session handed back just after a look waiting out the rest of it.
+      if crate::fleet::session_returned(&[peer], left_ns)
         .await
-        .is_err()
+        .is_none()
       {
         return Some(None);
       }
@@ -1359,7 +1432,10 @@ impl ServedForwards {
   }
 
   /// Runs `serve` for the request on `stream_id` as a child task of the loop. `Some(reply)` to send at once when the
-  /// task could not be spawned (an empty reply, counted).
+  /// task could not be spawned (an empty reply, counted). The task is labelled with the line that called this (A-740:
+  /// `#[track_caller]` carries the caller's site into `futures::spawn_child`), so a shard found stuck in one names the
+  /// request it serves, not this helper.
+  #[track_caller]
   pub(crate) fn spawn(
     &mut self,
     stream_id: u64,
@@ -1490,6 +1566,45 @@ mod tests {
   /// resend took fresh tickets at the back of the lane, and P went out after every forward first queued after it: a
   /// read through a client node whose session to its owner died was refused `OwnerUnreachable` at its failover bound,
   /// given up again and again behind a burst's backlog (the bug record of 2026-11-09, finding (b)).
+  /// The lane kept while idle (2026-11-20, w-fed-faults' log flood): do leave a peer's only forward, then make lanes to a
+  /// second and a third peer, the second left idle and the third holding a forward, and prune with the first alone a
+  /// member. Expect the first's idle lane kept with what it measured (its floor), the second's idle lane of a non-member
+  /// dropped, the third's busy one kept. Before, a lane left with nothing was dropped at once, so the next forward made it
+  /// afresh and measured its floor from nothing.
+  #[test]
+  fn an_idle_lane_is_kept_for_a_member_and_pruned_for_a_peer_gone() {
+    let (gone, busy) = (HostId(2), HostId(3));
+    let mut lanes = ForwardLanes::default();
+    let (only, tickets) = lanes
+      .queue(PEER, &[b"p".to_vec()], &mut Place::default(), BOUND, 0)
+      .unwrap();
+    if let Some(lane) = lanes.lanes.get_mut(&PEER) {
+      lane.floor_ns = 7;
+    }
+    lanes.leave(PEER, only, &tickets, false);
+    let (left, left_tickets) = lanes
+      .queue(gone, &[b"g".to_vec()], &mut Place::default(), BOUND, 0)
+      .unwrap();
+    lanes.leave(gone, left, &left_tickets, false);
+    lanes
+      .queue(busy, &[b"b".to_vec()], &mut Place::default(), BOUND, 0)
+      .unwrap();
+    lanes.prune_idle(&[PEER]);
+    assert_eq!(
+      lanes.lanes.get(&PEER).map(|lane| lane.floor_ns),
+      Some(7),
+      "a member's idle lane is kept with its floor"
+    );
+    assert!(
+      !lanes.lanes.contains_key(&gone),
+      "a gone peer's idle lane is dropped"
+    );
+    assert!(
+      lanes.lanes.contains_key(&busy),
+      "a busy lane is kept, member or not"
+    );
+  }
+
   #[test]
   fn a_resend_is_begun_ahead_of_every_forward_first_queued_after_it() {
     let mut lanes = ForwardLanes::default();
@@ -1664,6 +1779,56 @@ mod tests {
         run.step(step);
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod spawn_label_tests {
+  /// A-740's labels through a serve loop's child tasks (w-forming, 2026-11-20; found by use: a 17 ms poll was named by
+  /// the one `forward_lane.rs` line inside `ServedForwards::spawn`, whichever request it served). Do: on a shard, from a
+  /// task there, spawn a request's serve through `ServedForwards::spawn` whose future reads the task the shard's pulse
+  /// says it is polling. Expect it named by the line of this test that spawned it. Before, by the line in `spawn` that
+  /// called `futures::spawn_child`.
+  #[test]
+  // The test thread waits off-shard for what the shard's task reports.
+  #[allow(clippy::disallowed_methods)]
+  fn a_served_forwards_label_names_the_line_that_spawned_it() {
+    /// Shape: how long the test thread waits for the report.
+    const REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    let daemon = crate::daemon::audit_daemon();
+    let (seen, label) = std::sync::mpsc::sync_channel::<(u32, Option<u32>)>(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let home = state.shard;
+      let loop_task = slates_rt::futures::spawn(async move {
+        let mut forwards = super::ServedForwards::new();
+        let spawned_at = line!() + 1;
+        let _ = forwards.spawn(1, async move {
+          let named = slates_rt::registry::with_entry(home, |entry| entry.pulse.polling().label)
+            .flatten()
+            .and_then(|label| match label {
+              slates_rt::label::TaskLabel::Site(site)
+                if site.file().ends_with("forward_lane.rs") =>
+              {
+                Some(site.line())
+              }
+              _ => None,
+            });
+          let _ = seen.try_send((spawned_at, named));
+          Vec::new()
+        });
+        slates_rt::futures::yield_now().await;
+        slates_rt::futures::yield_now().await;
+      })
+      .unwrap();
+      slates_rt::futures::detach(loop_task).unwrap();
+    });
+    let (spawned_at, named) = label.recv_timeout(REPORT_WAIT).unwrap();
+    assert_eq!(
+      named,
+      Some(spawned_at),
+      "the serve is named by the line that spawned it"
+    );
+    daemon.stop();
   }
 }
 

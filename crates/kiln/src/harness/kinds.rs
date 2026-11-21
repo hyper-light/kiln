@@ -120,8 +120,13 @@ impl Kind {
     }
 
     /// The process to start for session `session` of `spec` (cwd, environment and arguments).
-    #[cfg_attr(not(unix), allow(unused_variables))]
     pub fn launch(&self, spec: &Spec, session: &str) -> anyhow::Result<Process> {
+        self.launch_over(spec, session, &super::agentenv::said())
+    }
+
+    /// [`Kind::launch`], with `user` the machine's user's environment.
+    #[cfg_attr(not(unix), allow(unused_variables))]
+    pub(crate) fn launch_over(&self, spec: &Spec, session: &str, user: &[(String, String)]) -> anyhow::Result<Process> {
         if self.protocol == Protocol::Terminal {
             anyhow::bail!("{} has no structured mode; run it in a terminal ({})", self.name, self.program);
         }
@@ -135,7 +140,7 @@ impl Kind {
             anyhow::bail!("{cwd} is not a directory on this machine");
         }
         p.current_dir(&cwd);
-        set_env(&mut p, spec);
+        set_env_over(&mut p, spec, user);
         // `PWD` names where it starts, as a shell sets it for what it runs (POSIX `cd`), whatever environment it was
         // handed: a person's shell's names their own folder, as it was when that shell started, where an agent on a
         // volume starts at the mount (docs/agentic.md W2).
@@ -150,10 +155,20 @@ impl Kind {
                 // kiln's operations, through the runner); else the server's, where this machine's
                 // kiln serves it.
                 let local = local_tools(spec);
+                // On Windows, where a runner has no reach socket, its loopback (docs/reach.md §9).
+                #[cfg(windows)]
+                let looped = windows_tools(spec, session);
+                #[cfg(not(windows))]
+                let looped: Option<std::path::PathBuf> = None;
                 match (&local, crate::mcp::kit()) {
                     #[cfg(unix)]
                     (Some((kiln, sock, prefer)), _) => {
                         p.arg("--mcp-config").arg(crate::reach::mcp::claude_config(kiln, sock, *prefer, session));
+                    }
+                    _ if looped.is_some() => {
+                        if let Some(config) = &looped {
+                            p.arg("--mcp-config").arg(config);
+                        }
                     }
                     // Its own token: kiln knows which agent calls, and whom it acts for.
                     (_, Some(kit)) => {
@@ -463,6 +478,18 @@ fn local_tools(spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<
 #[cfg(not(unix))]
 fn local_tools(_spec: &Spec) -> Option<(std::path::PathBuf, &'static str, Option<&str>)> {
     None
+}
+
+/// Claude Code's kiln MCP on a Windows runner: `kiln reach mcp` over the runner's loopback, with the session's own
+/// token, in a config file only this user reads (`reach::loopback`); none where the session asked for no reach.
+#[cfg(windows)]
+fn windows_tools(spec: &Spec, session: &str) -> Option<std::path::PathBuf> {
+    let pref = spec.reach.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    if pref == Some("off") {
+        return None;
+    }
+    let kiln = crate::os::this_kiln().ok()?;
+    crate::reach::loopback::claude_config(&kiln, pref, session)
 }
 
 /// The MCP servers an ACP agent's session gets (`session/new`'s `mcpServers`): the runner's own.

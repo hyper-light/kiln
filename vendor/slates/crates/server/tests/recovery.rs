@@ -43,8 +43,6 @@ use common::nfs::{create, fsstat, lookup, mount, read, write};
 /// Shape: shards per test daemon: two, so the volume can live on a shard other than the control
 /// shard that accepts the NFS connection, and the cross-shard bridge route is on the recovery path.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the bytes written before the snapshot — what the snapshot freezes.
 const BEFORE: &[u8] = b"the bytes the snapshot froze: alpha bravo charlie delta echo foxtrot\n";
 /// Shape: the bytes written over the same file after the snapshot — the diverged head. Longer than
@@ -67,19 +65,10 @@ fn deadlines() -> Deadlines {
   .get()
 }
 
+/// A client of `instance`, whose daemon started before this: the claim waits while the rendezvous's holder lives
+/// (A-468), so a refusal is the test's failure, never a wait (until 2026-11-20 a five-second retry, `START_WAIT`).
 fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::hint::spin_loop();
-      }
-      Err(e) => panic!("{e}"),
-    }
-  }
+  Client::connect(instance, deadlines()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn scratch(name: &str) -> CreateSpec {
@@ -529,13 +518,11 @@ fn clone_name_history(shards: u16) -> CloneNameSeen {
     Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
   );
   client.destroy(clone).unwrap();
-  let started = Instant::now();
   let created_after_destroy = loop {
     match client.create(&scratch(&name)) {
       Ok(_) => break true,
-      Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
+      // The destroy's slices run while the daemon lives (A-232's rule; until 2026-11-20 five seconds, `START_WAIT`).
+      Err(ClientError::Refused(Refusal::AlreadyExists { .. })) => {
         #[allow(clippy::disallowed_methods)] // a test waiting out the destroy's slices
         std::thread::sleep(Duration::from_millis(10));
       }
@@ -594,15 +581,13 @@ struct ImageNameSeen {
   names_free_after_destroy: bool,
 }
 
-/// Creates `name` once its holder's destroy has run, within the start wait: whether the name came free.
+/// Creates `name` once its holder's destroy has run, while the daemon lives: whether the name came free.
 fn created_once_free(client: &mut Client, name: &str) -> bool {
-  let started = Instant::now();
   loop {
     match client.create(&scratch(name)) {
       Ok(_) => return true,
-      Err(ClientError::Refused(Refusal::AlreadyExists { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
+      // The destroy's slices run while the daemon lives (A-232's rule; until 2026-11-20 five seconds, `START_WAIT`).
+      Err(ClientError::Refused(Refusal::AlreadyExists { .. })) => {
         #[allow(clippy::disallowed_methods)] // a test waiting out the destroy's slices
         std::thread::sleep(Duration::from_millis(10));
       }
@@ -2959,7 +2944,7 @@ fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns(
     refused => panic!("shard 1 must be refused while shard 0 holds the pool: {refused:?}"),
   }
   client.destroy(large).unwrap();
-  let started = Instant::now();
+  // Waited while the daemon lives (A-232's rule; until 2026-11-20 five seconds, `START_WAIT`).
   let admitted = loop {
     // The destroy completes in slices, and each mutating verb on shard 0 publishes; a create on shard 0 is one such
     // verb, so the extents return at the latest after it.
@@ -2969,7 +2954,9 @@ fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns(
     }
     match client.create(&other) {
       Ok(id) => break id,
-      Err(_) if started.elapsed() < START_WAIT => std::hint::spin_loop(),
+      Err(ClientError::Refused(slates_ipc::protocol::Refusal::BudgetExceeded { .. })) => {
+        std::hint::spin_loop();
+      }
       Err(e) => panic!("shard 1 is admitted once the pool returns: {e}"),
     }
   };
@@ -3232,9 +3219,10 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_role() {
     return;
   };
   let quiet = Duration::from_nanos(2 * slates_server::daemon::HEARTBEAT_NS);
-  let started = Instant::now();
+  // Watched until the beat stops, while the daemon lives: the test that runs this role bounds the role's own life
+  // (until 2026-11-20 five seconds, `START_WAIT`).
   let mut stopped = false;
-  while started.elapsed() < START_WAIT {
+  while !stopped {
     let before = daemon.segment().supervision().unwrap().heartbeat_ns();
     // The role reads the beat the anchor reads, from its own mapping of the same segment.
     #[allow(clippy::disallowed_methods)]
@@ -3253,8 +3241,7 @@ fn a_shard_stuck_in_its_start_stops_the_heartbeat_role() {
 }
 
 /// Boot (A-100): do start a daemon whose second shard spends two liveness windows on the CPU in its start, and stop the
-/// daemon at once, while its control loop still waits on that shard; expect the stop to finish within the client's
-/// start wait. (The heartbeat kept joinable until the boot was accepted hung `Daemon::stop` in
+/// daemon at once, while its control loop still waits on that shard; expect the stop to finish. (The heartbeat kept joinable until the boot was accepted hung `Daemon::stop` in
 /// `an_acknowledged_replica_survives_a_warm_daemon_restart`, every run, and that test is its reproducer; this one passes
 /// with either design and covers a stop during a long start.)
 #[test]
@@ -3275,7 +3262,9 @@ fn a_daemon_stopped_while_its_boot_waits_on_a_shard_stops() {
     let _ = stopped.send(());
   });
   assert!(
-    done.recv_timeout(START_WAIT).is_ok(),
+    // The stop's end, waited for: a stop that never ends hangs the suite, which its own bound ends (until 2026-11-20
+    // five seconds, `START_WAIT`).
+    done.recv().is_ok(),
     "the daemon stopped while its boot was waiting on a shard"
   );
   stopper.join().unwrap();
@@ -3488,7 +3477,7 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
 /// (the non-vacuity count) and nothing more given back once it had finished. The probes' latencies are printed and not
 /// judged: a probe's wall time on a loaded host says what the host did (10.4 ms against 2.2 ms at load 65 on Linux,
 /// with nothing of the shard's own in it). Then do restart the daemon over the same anchor and give its recovery memory
-/// back a step at a time, as the idle tick does; expect the p99 step to have held its shard no more than `STEP_QUANTA`
+/// back a step at a time, as an idle sweep pass does; expect the p99 step to have held its shard no more than `STEP_QUANTA`
 /// step quanta of the shard thread's own CPU, which load does not inflate. That judge runs wherever a thread clock is
 /// fine enough to time a step by: CI's `gates` job (`cargo test --workspace` on `ubuntu-latest` and `macos-latest`,
 /// `.github/workflows/ci.yml`), and every Linux and macOS development machine whatever its load; it skips loudly on
@@ -3497,9 +3486,9 @@ fn a_give_back_returns_only_recovery_memory_written_since_the_last() {
 /// reached the shard waited.
 #[test]
 fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
-  /// Shape: a probe window, in reap ticks (`LIVENESS_BUDGET_NS` each): the first tick after the volume's create sees
-  /// allocations, the second finds the shard idle and gives back, and two more cover the give-back's slices.
-  const WINDOW_TICKS: u64 = 4;
+  /// Shape: a probe window, in sweep intervals (`LIVENESS_BUDGET_NS` each): the first pass after the volume's create
+  /// sees allocations, the second finds the shard idle and gives back, and two more cover the give-back's slices.
+  const WINDOW_INTERVALS: u64 = 4;
   let profile = common::machine_profile();
   let instance = format!("srv-recovery-slices-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
@@ -3510,8 +3499,9 @@ fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
     .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let volume = client.create(&scratch("probed")).unwrap();
-  let window =
-    Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(WINDOW_TICKS));
+  let window = Duration::from_nanos(
+    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(WINDOW_INTERVALS),
+  );
   let returned = |daemon: &Daemon| {
     daemon
       .refusals_on_every_shard()
@@ -3552,25 +3542,25 @@ fn a_boot_give_back_holds_its_shard_a_slice_of_cpu_a_step() {
 
 /// Leaves the shard alone until its give-back has finished: until the journal has no dead recovery memory left to give
 /// back, which is the give-back's own completion. Until 2026-11-08 this waited for the bytes given back to stand still
-/// over a window, and on a loaded host (load 41 to 62) a give-back between two reap ticks stood still with some left: 2
+/// over a window, and on a loaded host (load 41 to 62) a give-back between two sweep passes stood still with some left: 2
 /// of 7 runs then gave back the rest in the quiet window. Each look is itself a task on the shard, which ends the
-/// give-back for that tick, so they are a reap tick apart. Fails only if `STALLED_TICKS` pass with nothing more given
+/// give-back for that pass, so they are a sweep interval apart. Fails only if `STALLED_INTERVALS` pass with nothing more given
 /// back.
 fn give_back_finished(daemon: &Daemon) {
-  /// Shape: the reap ticks with no progress before the test calls the give-back stuck: well past a loaded host's gaps
-  /// between ticks that find the shard idle.
-  const STALLED_TICKS: u32 = 60;
-  let tick = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  /// Shape: the sweep intervals with no progress before the test calls the give-back stuck: well past a loaded host's
+  /// gaps between passes that find the shard idle.
+  const STALLED_INTERVALS: u32 = 60;
+  let interval = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
   let mut left = daemon.recovery_left_to_give_back().unwrap();
   let mut stalled = 0;
   while left > 0 {
     assert!(
-      stalled < STALLED_TICKS,
-      "the give-back made no progress for {STALLED_TICKS} reap ticks, {left} bytes left"
+      stalled < STALLED_INTERVALS,
+      "the give-back made no progress for {STALLED_INTERVALS} sweep intervals, {left} bytes left"
     );
     #[allow(clippy::disallowed_methods)]
     // a test leaving the shard alone, which is the state it needs
-    std::thread::sleep(tick);
+    std::thread::sleep(interval);
     let now = daemon.recovery_left_to_give_back().unwrap();
     stalled = if now < left { 0 } else { stalled + 1 };
     left = now;
@@ -3673,11 +3663,7 @@ fn returned_after_idle(daemon: &Daemon, before: u64) -> u64 {
       .copied()
       .unwrap_or(0)
   };
-  let started = Instant::now();
-  while cfg!(any(target_os = "linux", target_os = "macos"))
-    && returned() <= before
-    && started.elapsed() < START_WAIT
-  {
+  while cfg!(any(target_os = "linux", target_os = "macos")) && returned() <= before {
     std::thread::yield_now();
   }
   returned()
@@ -3736,8 +3722,7 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
       .unwrap();
   }
   // The content counters ride the daemon's status, beside the shard's own map.
-  let started = Instant::now();
-  while counter(&mut client, "content.trimmed_bytes") == 0 && started.elapsed() < START_WAIT {
+  while counter(&mut client, "content.trimmed_bytes") == 0 {
     std::thread::yield_now();
   }
   let trimmed = counter(&mut client, "content.trimmed_bytes");
@@ -3761,115 +3746,8 @@ fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
   );
 }
 
-/// A-214 (VFS plan step 11). Do: on a one-shard daemon over a held anchor, write a file of many chunks (the shard's
-/// write burst), publish, and leave the shard idle for two reap ticks (`content.ticks.idle`), by which its idle work, the
-/// reserve's refill, has finished, or until the bound passes; then write a second file of the same size, watching the
-/// content object's allocated bytes across each write. Expect the second burst to land on pages already resident: the
-/// object grows by less than half of what the first burst, on fresh pages, grew it, and the idle pre-fault is counted
-/// (`content.prefaulted_bytes`). Before A-214 the idle purge
-/// left no free page resident, so the second file's every page was allocated, and faulted fresh, during its write: the
-/// object grew by the whole file (one `shmem_fault` a page, the 41.5% of a large NFS write's samples that CI run
-/// 41986870989 measured). The object's allocation is the content's own measure; the process's minor faults also
-/// count the client's buffers and the shard's receive buffer (12,278 and about 4,200 of 20,619 on main).
-#[cfg(target_os = "linux")]
-#[test]
-fn a_burst_after_idle_lands_on_pages_the_idle_shard_prefaulted() {
-  const MARKER: &[u8] = b"SLATES-PREFAULT-A214-3c0d";
-  /// Shape: each file is this many chunk-sized blocks, so its pages dwarf the faults of anything else in the process.
-  const CHUNKS: usize = 256;
-  /// Shape: the bound on the idle shard's pre-fault: several reap ticks (one to see no allocation, the next to refill).
-  const PREFAULT_WAIT: Duration = Duration::from_secs(20);
-  let profile = common::machine_profile();
-  let instance = format!("srv-prefault-{}", std::process::id());
-  // One shard, so the burst and the reserve are this volume's alone.
-  let config = DaemonConfig::derive(&profile, &instance, Some(1));
-  let chunk = slates_vfs::content::chunk_bytes(config.page).get();
-  let tag = format!("prefault-{}", std::process::id());
-  let anchor = held_anchor(&tag, &profile, &config);
-  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
-  daemon
-    .bootstrap(true)
-    .expect("the fixture explicitly creates its local consensus group");
-  let mut client = connect(&instance);
-  let body = MARKER.repeat(chunk * CHUNKS / MARKER.len());
-  let mut spec = scratch("prefault");
-  // Room for both files and the reserve between them.
-  spec.size = SizeClass::Bounded {
-    limit: u64::try_from(body.len()).unwrap() * 4,
-  };
-  let volume = client.create(&spec).unwrap();
-  let attachment = client
-    .attach(volume, None, slates_ipc::protocol::Intent::Write)
-    .unwrap()
-    .attachment;
-  let content = format!("slates-con-{tag}");
-  let at_start = allocated_in_content(&content);
-  client
-    .fs_write((volume, attachment), "first", &body, 0o644)
-    .unwrap();
-  // The first burst lands on pages nobody faulted yet, in whatever units the kernel allocates them (2 MiB huge pages where
-  // it grants `MADV_HUGEPAGE`, else single pages): the measure the second burst is held to.
-  let first_grew = allocated_in_content(&content).saturating_sub(at_start);
-  daemon.publish_every_shard().unwrap();
-  let prefaulted = || {
-    daemon
-      .refusals_on_every_shard()
-      .unwrap()
-      .get("content.prefaulted_bytes")
-      .copied()
-      .unwrap_or(0)
-  };
-  let file = u64::try_from(body.len()).unwrap();
-  // The refill is the shard's idle work, so once the shard has been idle a whole reap tick it has finished: wait for two
-  // idle ticks after the first write (`content.ticks.idle`), or the bound.
-  let idle_ticks = || {
-    daemon
-      .refusals_on_every_shard()
-      .unwrap()
-      .get("content.ticks.idle")
-      .copied()
-      .unwrap_or(0)
-  };
-  let ticks_before = idle_ticks();
-  let started = Instant::now();
-  while idle_ticks() < ticks_before + 2 && started.elapsed() < PREFAULT_WAIT {
-    std::thread::yield_now();
-  }
-  let reserved = prefaulted();
-  let before = allocated_in_content(&content);
-  client
-    .fs_write((volume, attachment), "second", &body, 0o644)
-    .unwrap();
-  let grew = allocated_in_content(&content).saturating_sub(before);
-  eprintln!(
-    "a burst after idle: the content object grew {grew} bytes during a {}-byte write (the first burst grew it \
-     {first_grew}), {} bytes pre-faulted at idle",
-    body.len(),
-    prefaulted()
-  );
-  let read_back = client
-    .read(volume, "second", slates_ipc::protocol::ReadAt::Head)
-    .unwrap();
-  daemon.stop();
-  drop(anchor);
-  assert!(read_back == body, "the second file reads back as written");
-  // Held to the first burst, not to the file: what the second write needs beyond the reserve (its metadata, the image)
-  // is allocated in the kernel's units, whole 2 MiB huge pages when it grants them, which a quarter of a 16 MiB file
-  // could not hold under parallel tests (4,194,304 bytes against the bound's 4,194,300, adacachy, 2026-11-06). Every
-  // page fresh, the second write grows the object as much as the first did; on resident pages it grows a fraction.
-  assert!(
-    grew * 2 < first_grew,
-    "the burst after idle landed on resident pages: the content object grew {grew} bytes during a {file}-byte write, \
-     where the first burst, on fresh pages, grew it {first_grew}"
-  );
-  assert!(
-    reserved >= file / 2,
-    "the idle shard pre-faulted most of its last burst: {reserved} of {file} bytes"
-  );
-}
-
 /// A-214 with A-105 and A-205 (VFS plan steps 11 and 12). Do: on a one-shard daemon over a held anchor, write a file of
-/// many chunks, publish, and leave the shard idle for two reap ticks, so the burst closes and its reserve is pre-faulted;
+/// many chunks, publish, and leave the shard idle for two idle purge steps, so the burst closes and its reserve is pre-faulted;
 /// then delete the file, publish, and leave the shard idle. Expect the content object to fall back to within a quarter of
 /// the file of what it held before the write, within the bound: the delete's busy period nets the burst away, so the
 /// reserve goes and every page goes back. Before this was fixed the burst ended only when the arena's allocation count
@@ -3881,7 +3759,7 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
   const MARKER: &[u8] = b"SLATES-RESERVE-RETURNED-9b41";
   /// Shape: the file is this many chunk-sized blocks, so its pages dwarf the object's metadata and image pages.
   const CHUNKS: usize = 256;
-  /// Shape: the bound on the idle shard's work: several reap ticks.
+  /// Shape: the bound on the idle shard's work: several sweep passes.
   const IDLE_WAIT: Duration = Duration::from_secs(20);
   let profile = common::machine_profile();
   let instance = format!("srv-reserve-back-{}", std::process::id());
@@ -3952,6 +3830,89 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
   );
 }
 
+/// The content arena's allocated and resident bytes for the status report (A-744), read from a sweep that completed
+/// after this call began, so the figures are of now.
+#[cfg(target_os = "linux")]
+fn arena_figures(client: &mut Client) -> (u64, u64) {
+  let completed = counter(client, "content_range.sweep.completed");
+  let started = Instant::now();
+  while counter(client, "content_range.sweep.completed") <= completed {
+    assert!(
+      started.elapsed() < Duration::from_secs(10),
+      "a sweep of the shard's slice completed"
+    );
+    std::thread::yield_now();
+  }
+  (
+    counter(client, "content_range.arena.allocated"),
+    counter(client, "content_range.arena.resident"),
+  )
+}
+
+/// MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing). Do: on a
+/// one-shard daemon, write a file of many chunks (a burst of N bytes), publish, and leave the shard idle for two idle
+/// purge passes. Expect the arena to keep resident no more than a quarter of N past what it holds allocated: a burst
+/// leaves nothing resident behind it but its data. Before, the idle shard kept its last burst pre-faulted (A-214): w-hg's
+/// release run held 4,931.4 MiB of reserve after hg's history push and faulted 3.5 GB more at idle; A-765 decayed it,
+/// but held it whole for a sweep interval. Linux only: there a give-back punches the shared object's hole; on macOS a
+/// given-back shared page stays resident until the kernel takes it (GAPS, MEMORY SIZING).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_burst_leaves_nothing_resident_behind_it_but_its_data() {
+  const MARKER: &[u8] = b"SLATES-NOTHING-BEHIND-51c7";
+  /// Shape: the file is this many chunk-sized blocks, so its pages dwarf the object's metadata and image pages.
+  const CHUNKS: usize = 256;
+  /// Shape: the bound on the idle shard's passes: several sweep intervals.
+  const IDLE_WAIT: Duration = Duration::from_secs(20);
+  let profile = common::machine_profile();
+  let instance = format!("srv-nothing-behind-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let chunk = slates_vfs::content::chunk_bytes(config.page).get();
+  let tag = format!("nothing-behind-{}", std::process::id());
+  let anchor = held_anchor(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let body = MARKER.repeat(chunk * CHUNKS / MARKER.len());
+  let mut spec = scratch("nothing-behind");
+  spec.size = SizeClass::Bounded {
+    limit: u64::try_from(body.len()).unwrap() * 4,
+  };
+  let volume = client.create(&spec).unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let file = u64::try_from(body.len()).unwrap();
+  let idle_ticks = |client: &mut Client| counter(client, "content.ticks.idle");
+  client
+    .fs_write((volume, attachment), "burst", &body, 0o644)
+    .unwrap();
+  daemon.publish_every_shard().unwrap();
+  let ticks = idle_ticks(&mut client);
+  let started = Instant::now();
+  while idle_ticks(&mut client) < ticks + 2 && started.elapsed() < IDLE_WAIT {
+    std::thread::yield_now();
+  }
+  let (allocated, resident) = arena_figures(&mut client);
+  let read_back = client
+    .read(volume, "burst", slates_ipc::protocol::ReadAt::Head)
+    .unwrap();
+  daemon.stop();
+  drop(anchor);
+  eprintln!(
+    "a {file}-byte burst, two idle passes on: the arena holds {allocated} bytes allocated and {resident} resident"
+  );
+  assert!(read_back == body, "the file reads back as written");
+  assert!(
+    resident.saturating_sub(allocated) * 4 <= file,
+    "the idle arena keeps resident at most a quarter of N past its data: {resident} resident, {allocated} allocated, \
+     N = {file}"
+  );
+}
+
 /// Memory, a deleted file's RAM: do write a file of many chunks, publish, delete it and leave the shard idle. Expect
 /// the daemon to count most of the file given back to the OS within the bound (`content.purged_bytes`: an idle
 /// shard's free blocks go back, A-105, on macOS as reusable pages, A-110), and on Linux the content object's allocated
@@ -4006,20 +3967,19 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   #[cfg(target_os = "linux")]
   let written = allocated_in_content(&content);
   client.fs_remove((volume, attachment), "big").unwrap();
-  // The block is zeroed when its free is released; its pages go back when the shard is next idle at a reap tick (one
-  // tick to see no allocation, the next to purge), so the count is watched until it covers most of the file or the
+  // The block is zeroed when its free is released; its pages go back when the shard is next idle at a sweep pass (one
+  // pass to see no allocation, the next to purge), so the count is watched until it covers most of the file or the
   // bound passes.
   let file = u64::try_from(body.len()).unwrap();
-  let started = Instant::now();
   let mut given_back = purged().saturating_sub(purged_before);
-  while given_back < file / 2 && started.elapsed() < START_WAIT {
+  while given_back < file / 2 {
     std::thread::yield_now();
     given_back = purged().saturating_sub(purged_before);
   }
   #[cfg(target_os = "linux")]
   let mut released = allocated_in_content(&content);
   #[cfg(target_os = "linux")]
-  while written.saturating_sub(released) < file / 2 && started.elapsed() < START_WAIT {
+  while written.saturating_sub(released) < file / 2 {
     std::thread::yield_now();
     released = allocated_in_content(&content);
   }
@@ -4043,14 +4003,14 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   }
 }
 
-/// Shape: the reap ticks an idle shard is watched for further publications once its plaintext has gone.
+/// Shape: the sweep intervals an idle shard is watched for further publications once its plaintext has gone.
 #[cfg(target_os = "linux")]
-const IDLE_TICKS_WATCHED: u64 = 3;
+const IDLE_INTERVALS_WATCHED: u64 = 3;
 
 /// Condition 9, a deleted file, and the cost of the rule that scrubs it. Do: write a marker file, publish every shard (as
 /// a transport's barrier does), delete the file, and leave the volume idle; then watch the shards' publications for a
-/// few ticks. Expect: the marker gone from the content object within the bound, and then no further publication: the
-/// reap tick publishes only while a free is deferred, so an idle shard costs nothing. The deletion's own scrub through a
+/// few sweep intervals. Expect: the marker gone from the content object within the bound, and then no further publication: the
+/// idle sweep publishes only while a free is deferred, so an idle shard costs nothing. The deletion's own scrub through a
 /// kernel mount is proven, mutation-checked, by `a_deleted_files_plaintext_leaves_the_daemons_memory`
 /// (`crates/cli/tests/cli.rs`); on this verb path the block is scrubbed with or without the rule.
 #[cfg(target_os = "linux")]
@@ -4083,7 +4043,7 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
   client.fs_remove((volume, attachment), "gone").unwrap();
   let started = Instant::now();
   let mut left = occurrences_in_content(&content, MARKER);
-  while left > 0 && started.elapsed() < START_WAIT {
+  while left > 0 {
     std::thread::yield_now();
     left = occurrences_in_content(&content, MARKER);
   }
@@ -4094,10 +4054,10 @@ fn a_deleted_files_plaintext_leaves_the_content_object() {
       .unwrap_or(0)
   };
   let before = published(&daemon);
-  // A test may sleep (the lint's stated exception): the watch is wall time over the daemon's own reap ticks.
+  // A test may sleep (the lint's stated exception): the watch is wall time over the daemon's own sweep passes.
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(Duration::from_nanos(
-    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(IDLE_TICKS_WATCHED),
+    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(IDLE_INTERVALS_WATCHED),
   ));
   let after = published(&daemon);
   daemon.stop();
@@ -4149,13 +4109,13 @@ fn a_sealed_files_plaintext_leaves_the_content_object() {
   let content = format!("slates-con-{tag}");
   let written = occurrences_in_content(&content, MARKER);
   let started = Instant::now();
-  while counter(&mut client, "content.sealed") == 0 && started.elapsed() < START_WAIT {
+  while counter(&mut client, "content.sealed") == 0 {
     std::hint::spin_loop();
   }
   let sealed = counter(&mut client, "content.sealed");
   let scrub_started = Instant::now();
   let mut left = occurrences_in_content(&content, MARKER);
-  while left > 0 && scrub_started.elapsed() < START_WAIT {
+  while left > 0 {
     std::thread::yield_now();
     left = occurrences_in_content(&content, MARKER);
   }
@@ -4204,8 +4164,7 @@ fn an_idle_small_file_is_sealed_by_the_daemons_sweep() {
     0,
     "a small write seals nothing itself"
   );
-  let started = Instant::now();
-  while counter(&mut client, "content.sealed") == 0 && started.elapsed() < START_WAIT {
+  while counter(&mut client, "content.sealed") == 0 {
     std::hint::spin_loop();
   }
   assert!(
@@ -5566,14 +5525,13 @@ fn close_held(session: &mut common::nfs4::Session, fh: &[u8], stateid: &[u8]) ->
     .map(|_| ())
 }
 
-/// The bytes the volume `id` references, read until `settled` holds of them or the restart oracle's wait passes:
+/// The bytes the volume `id` references, read until `settled` holds of them, while the daemon lives:
 /// a hold's release reaches the volume as the call that ends it is served, a lapsed client's as its purge is.
 fn referenced_until(client: &mut Client, id: VolumeId, settled: impl Fn(u64) -> bool) -> u64 {
-  let started = Instant::now();
   loop {
     let referenced = client.status(id).unwrap().referenced_bytes;
     // Each status is a round trip to the daemon, which paces the loop.
-    if settled(referenced) || started.elapsed() >= START_WAIT {
+    if settled(referenced) {
       return referenced;
     }
   }

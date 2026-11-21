@@ -52,6 +52,70 @@ pub(crate) fn bytes_acked_in(info: &[u8; TCP_INFO_THROUGH_BYTES_ACKED]) -> Optio
   ))
 }
 
+// ============================================================================== a connection's round trip, as its kernel measured it
+
+/// Format: where Linux's `struct tcp_info` keeps `tcpi_rtt`, the smoothed round trip in microseconds, a `__u32` in the
+/// kernel's byte order: after eight one-byte fields and fifteen `__u32`s (`include/uapi/linux/tcp.h`, unchanged from
+/// 2.6 through mainline, read 2026-11-19).
+const TCP_INFO_RTT_AT: usize = 68;
+
+/// Format: the bytes of Linux's `struct tcp_info` read for `tcpi_rtt`, through its end ([`TCP_INFO_RTT_AT`] and its four
+/// bytes).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const TCP_INFO_THROUGH_RTT: usize = 72;
+
+/// Format: where macOS's `struct tcp_connection_info` keeps `tcpi_srtt`, the smoothed round trip in milliseconds, a
+/// `u_int32_t` in the kernel's byte order: after four one-byte fields and ten `u_int32_t`s (xnu `bsd/netinet/tcp.h`).
+const TCP_CONNECTION_INFO_SRTT_AT: usize = 44;
+
+/// Format: the bytes of macOS's `struct tcp_connection_info` read for `tcpi_srtt`, through its end
+/// ([`TCP_CONNECTION_INFO_SRTT_AT`] and its four bytes).
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+pub(crate) const TCP_CONNECTION_INFO_THROUGH_SRTT: usize = 48;
+
+/// Format: the clock Linux measures `tcpi_rtt` with, and Windows `RttUs`: microseconds, in nanoseconds.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) const MICROSECOND_NS: u64 = 1_000;
+
+/// Format: the clock macOS measures `tcpi_srtt` with: milliseconds (xnu's `TCP_RETRANSHZ`, 1000 a second), in
+/// nanoseconds.
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+const MILLISECOND_NS: u64 = 1_000_000;
+
+/// The `u32` at `at` in `record`, in the kernel's byte order.
+fn word_at(record: &[u8], at: usize) -> Option<u32> {
+  let end = at.checked_add(size_of::<u32>())?;
+  let word = record.get(at..end)?;
+  Some(u32::from_ne_bytes(
+    <[u8; size_of::<u32>()]>::try_from(word).ok()?,
+  ))
+}
+
+/// The round trip in the first [`TCP_INFO_THROUGH_RTT`] bytes of a Linux `struct tcp_info`: `tcpi_rtt`, microseconds.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn linux_round_trip_in(
+  info: &[u8; TCP_INFO_THROUGH_RTT],
+) -> Option<crate::tcp::RoundTrip> {
+  let micros = word_at(info, TCP_INFO_RTT_AT)?;
+  Some(crate::tcp::RoundTrip {
+    ns: u64::from(micros).saturating_mul(MICROSECOND_NS),
+    resolution_ns: MICROSECOND_NS,
+  })
+}
+
+/// The round trip in the first [`TCP_CONNECTION_INFO_THROUGH_SRTT`] bytes of a macOS `struct tcp_connection_info`:
+/// `tcpi_srtt`, milliseconds.
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+pub(crate) fn macos_round_trip_in(
+  info: &[u8; TCP_CONNECTION_INFO_THROUGH_SRTT],
+) -> Option<crate::tcp::RoundTrip> {
+  let millis = word_at(info, TCP_CONNECTION_INFO_SRTT_AT)?;
+  Some(crate::tcp::RoundTrip {
+    ns: u64::from(millis).saturating_mul(MILLISECOND_NS),
+    resolution_ns: MILLISECOND_NS,
+  })
+}
+
 /// The bytes a stream's writers have handed its kernel since the connection was made, from the kernel's two counters
 /// (A-550): the bytes acknowledged (`acked`; none where the kernel keeps no such count) and the bytes queued and not yet
 /// acknowledged (`queued`). Their sum is the count only when both describe one instant, and they are read apart, so the
@@ -227,6 +291,40 @@ mod handed_tests {
       past,
       Err(RtError::DriverRefused { code: None, .. })
     ));
+  }
+}
+
+#[cfg(test)]
+mod round_trip_tests {
+  use super::{
+    TCP_CONNECTION_INFO_THROUGH_SRTT, TCP_INFO_THROUGH_RTT, linux_round_trip_in,
+    macos_round_trip_in,
+  };
+  use crate::tcp::RoundTrip;
+
+  /// A-625 part 2, golden vectors: Linux keeps `tcpi_rtt` (microseconds) in bytes 68..72 of `struct tcp_info`, macOS
+  /// `tcpi_srtt` (milliseconds) in bytes 44..48 of `struct tcp_connection_info`. Do: fill each record with 0xFF and put a
+  /// round trip in native order where its kernel keeps it. Expect it read in nanoseconds with its clock's resolution; a
+  /// read one word early or late would take 0xFF bytes into it.
+  #[test]
+  fn each_kernels_round_trip_is_read_where_it_keeps_it() {
+    let mut linux = [0xFFu8; TCP_INFO_THROUGH_RTT];
+    linux[68..72].copy_from_slice(&1_234u32.to_ne_bytes());
+    let mut macos = [0xFFu8; TCP_CONNECTION_INFO_THROUGH_SRTT];
+    macos[44..48].copy_from_slice(&7u32.to_ne_bytes());
+    assert_eq!(
+      (linux_round_trip_in(&linux), macos_round_trip_in(&macos)),
+      (
+        Some(RoundTrip {
+          ns: 1_234_000,
+          resolution_ns: 1_000
+        }),
+        Some(RoundTrip {
+          ns: 7_000_000,
+          resolution_ns: 1_000_000
+        })
+      )
+    );
   }
 }
 
@@ -706,6 +804,30 @@ mod imp {
     Ok(state == [TCP_ESTABLISHED])
   }
 
+  /// The connection's round trip as its kernel measured it (`crate::tcp::RoundTrip`), from the record
+  /// [`established`] reads: Linux `TCP_INFO`'s `tcpi_rtt`.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn round_trip(socket: &Socket) -> Result<crate::tcp::RoundTrip, RtError> {
+    let mut info = [0u8; super::TCP_INFO_THROUGH_RTT];
+    get_option(&socket.fd, libc::IPPROTO_TCP, libc::TCP_INFO, &mut info)
+      .map_err(|e| refused("getsockopt(TCP_INFO)", e))?;
+    super::linux_round_trip_in(&info).ok_or_else(|| invalid("getsockopt(TCP_INFO)"))
+  }
+
+  /// See the Linux arm: macOS `TCP_CONNECTION_INFO`'s `tcpi_srtt`.
+  #[cfg(not(target_os = "linux"))]
+  pub(crate) fn round_trip(socket: &Socket) -> Result<crate::tcp::RoundTrip, RtError> {
+    let mut info = [0u8; super::TCP_CONNECTION_INFO_THROUGH_SRTT];
+    get_option(
+      &socket.fd,
+      libc::IPPROTO_TCP,
+      libc::TCP_CONNECTION_INFO,
+      &mut info,
+    )
+    .map_err(|e| refused("getsockopt(TCP_CONNECTION_INFO)", e))?;
+    super::macos_round_trip_in(&info).ok_or_else(|| invalid("getsockopt(TCP_CONNECTION_INFO)"))
+  }
+
   /// The bytes this stream's writers have handed the kernel since the connection was made (A-550): `tcpi_bytes_acked`
   /// plus `SIOCOUTQ`, settled against acknowledgements arriving between the two readings ([`super::settle_handed`]).
   ///
@@ -759,7 +881,51 @@ mod imp {
     Ok(None)
   }
 
-  #[cfg(all(test, target_os = "linux"))]
+  /// Ends both directions of the connection, whoever else holds a copy of its descriptor.
+  pub(crate) fn shutdown(socket: &Socket) -> Result<(), RtError> {
+    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Both)
+      .map_err(|e| refused("shutdown", e))
+  }
+
+  /// Ends this side's sending (`SHUT_WR`) and keeps its receiving: the peer reads end of stream after every byte sent.
+  pub(crate) fn shutdown_write(socket: &Socket) -> Result<(), RtError> {
+    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Write)
+      .map_err(|e| refused("shutdown(SHUT_WR)", e))
+  }
+
+  /// A listening socket handed over (a supervisor's, across an exec), made non-blocking and close-on-exec.
+  pub(crate) fn adopt_listener(fd: OwnedStream) -> Result<Socket, RtError> {
+    set_nonblocking_cloexec(&fd)?;
+    Ok(Socket { fd })
+  }
+
+  /// A connected stream handed over (from another shard, or across an exec), made ready to serve ([`prepared`]).
+  pub(crate) fn adopt_stream(fd: OwnedStream) -> Result<Socket, RtError> {
+    prepared(fd)
+  }
+
+  /// The socket's descriptor, borrowed: to hand a duplicate to another process by `SCM_RIGHTS`.
+  pub(crate) fn as_fd(socket: &Socket) -> std::os::fd::BorrowedFd<'_> {
+    std::os::fd::AsFd::as_fd(&socket.fd)
+  }
+
+  /// A send the kernel took nothing of without blocking: the stream is broken (`EPIPE`).
+  pub(crate) fn broken_pipe(call: &'static str) -> RtError {
+    refused(call, rustix::io::Errno::PIPE)
+  }
+
+  /// A request the caller's own arguments made impossible (`EINVAL`).
+  pub(crate) fn invalid(call: &'static str) -> RtError {
+    refused(call, rustix::io::Errno::INVAL)
+  }
+
+  /// A call that would have had to wait where the caller knew it would not (`EAGAIN`).
+  pub(crate) fn would_block(call: &'static str) -> RtError {
+    refused(call, rustix::io::Errno::AGAIN)
+  }
+
+  #[cfg(test)]
+  #[cfg(target_os = "linux")]
   mod tests {
     use std::os::fd::OwnedFd;
 
@@ -804,49 +970,6 @@ mod imp {
       }
       assert_eq!(bytes_handed(&socket), Ok(Some(1_000)), "read by the peer");
     }
-  }
-
-  /// Ends both directions of the connection, whoever else holds a copy of its descriptor.
-  pub(crate) fn shutdown(socket: &Socket) -> Result<(), RtError> {
-    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Both)
-      .map_err(|e| refused("shutdown", e))
-  }
-
-  /// Ends this side's sending (`SHUT_WR`) and keeps its receiving: the peer reads end of stream after every byte sent.
-  pub(crate) fn shutdown_write(socket: &Socket) -> Result<(), RtError> {
-    rustix::net::shutdown(&socket.fd, rustix::net::Shutdown::Write)
-      .map_err(|e| refused("shutdown(SHUT_WR)", e))
-  }
-
-  /// A listening socket handed over (a supervisor's, across an exec), made non-blocking and close-on-exec.
-  pub(crate) fn adopt_listener(fd: OwnedStream) -> Result<Socket, RtError> {
-    set_nonblocking_cloexec(&fd)?;
-    Ok(Socket { fd })
-  }
-
-  /// A connected stream handed over (from another shard, or across an exec), made ready to serve ([`prepared`]).
-  pub(crate) fn adopt_stream(fd: OwnedStream) -> Result<Socket, RtError> {
-    prepared(fd)
-  }
-
-  /// The socket's descriptor, borrowed: to hand a duplicate to another process by `SCM_RIGHTS`.
-  pub(crate) fn as_fd(socket: &Socket) -> std::os::fd::BorrowedFd<'_> {
-    std::os::fd::AsFd::as_fd(&socket.fd)
-  }
-
-  /// A send the kernel took nothing of without blocking: the stream is broken (`EPIPE`).
-  pub(crate) fn broken_pipe(call: &'static str) -> RtError {
-    refused(call, rustix::io::Errno::PIPE)
-  }
-
-  /// A request the caller's own arguments made impossible (`EINVAL`).
-  pub(crate) fn invalid(call: &'static str) -> RtError {
-    refused(call, rustix::io::Errno::INVAL)
-  }
-
-  /// A call that would have had to wait where the caller knew it would not (`EAGAIN`).
-  pub(crate) fn would_block(call: &'static str) -> RtError {
-    refused(call, rustix::io::Errno::AGAIN)
   }
 }
 
@@ -1507,9 +1630,22 @@ mod imp {
     Ok(())
   }
 
-  /// Whether the connection is still established, from Windows' own record of it (`SIO_TCP_INFO`, version 0, Windows
-  /// 10 1703 and later): its state is `TCPSTATE_ESTABLISHED`.
+  /// Whether the connection is still established, from Windows' own record of it ([`tcp_info`]): its state is
+  /// `TCPSTATE_ESTABLISHED`.
   pub(crate) fn established(socket: &Socket) -> Result<bool, RtError> {
+    Ok(tcp_info(socket)?.State == TCPSTATE_ESTABLISHED)
+  }
+
+  /// The connection's round trip as Windows measured it ([`tcp_info`]'s `RttUs`, microseconds).
+  pub(crate) fn round_trip(socket: &Socket) -> Result<crate::tcp::RoundTrip, RtError> {
+    Ok(crate::tcp::RoundTrip {
+      ns: u64::from(tcp_info(socket)?.RttUs).saturating_mul(super::MICROSECOND_NS),
+      resolution_ns: super::MICROSECOND_NS,
+    })
+  }
+
+  /// Windows' own record of the connection (`SIO_TCP_INFO`, version 0, Windows 10 1703 and later).
+  fn tcp_info(socket: &Socket) -> Result<TCP_INFO_v0, RtError> {
     let version: u32 = 0;
     let mut info = TCP_INFO_v0::default();
     let mut returned = 0u32;
@@ -1531,7 +1667,7 @@ mod imp {
     if rc == SOCKET_ERROR {
       return Err(last("WSAIoctl(SIO_TCP_INFO)"));
     }
-    Ok(info.State == TCPSTATE_ESTABLISHED)
+    Ok(info)
   }
 
   /// Ends both directions of the connection, whoever else holds a copy of the socket.
@@ -1599,6 +1735,66 @@ mod imp {
     unsafe { std::os::windows::io::OwnedSocket::from_raw_socket(raw) }
   }
 
+  /// A listener's share with process `process` (A-748): Winsock's protocol record of an explicit duplicate of the
+  /// listening socket made for that process alone (`WSADuplicateSocketW`), in [`super::share::encode`]'s bytes. The
+  /// listener stays the caller's; the share names a duplicate that process makes into its own socket with
+  /// [`adopt_share`], never an inherited handle (A-183: no Windows socket is inherited or shared by inheritance).
+  pub(crate) fn share_listener(owned: &OwnedStream, process: u32) -> Result<Vec<u8>, RtError> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{WSADuplicateSocketW, WSAPROTOCOL_INFOW};
+    ensure_started()?;
+    let Ok(raw) = SOCKET::try_from(owned.as_raw_socket()) else {
+      return Err(RtError::DriverRefused {
+        call: "WSADuplicateSocketW(SOCKET)",
+        code: None,
+      });
+    };
+    let mut record = WSAPROTOCOL_INFOW::default();
+    // SAFETY: `raw` is the caller's live socket, borrowed for the call; `record` is a plain-data record this frame
+    // owns, which the call fills; a refusal is checked before it is read.
+    if unsafe { WSADuplicateSocketW(raw, process, &raw mut record) } == SOCKET_ERROR {
+      return Err(last("WSADuplicateSocketW"));
+    }
+    Ok(super::share::encode(&record))
+  }
+
+  /// The listener a share names ([`share_listener`], made for this process): its socket made from the protocol record
+  /// (`WSASocketW` with `FROM_PROTOCOL_INFO`), kept from this process's children, non-blocking, as an adopted listener
+  /// is. A share made for another process, or one already made into a socket, is refused by Winsock, typed.
+  pub(crate) fn adopt_share(share: &[u8]) -> Result<Socket, RtError> {
+    use windows_sys::Win32::Networking::WinSock::FROM_PROTOCOL_INFO;
+    ensure_started()?;
+    let record = super::share::decode(share).ok_or(RtError::DriverRefused {
+      call: "adopt(listener share)",
+      code: None,
+    })?;
+    // SAFETY: `record` is a whole protocol record this frame owns, borrowed for the call; Winsock reads it and makes a
+    // new socket, checked against INVALID_SOCKET.
+    let raw = unsafe {
+      WSASocketW(
+        FROM_PROTOCOL_INFO,
+        FROM_PROTOCOL_INFO,
+        FROM_PROTOCOL_INFO,
+        &raw const record,
+        0,
+        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+      )
+    };
+    if raw == INVALID_SOCKET {
+      return Err(last("WSASocketW(FROM_PROTOCOL_INFO)"));
+    }
+    let socket = Socket { socket: raw };
+    let kind = int_option(&socket, SO_TYPE, "getsockopt(SO_TYPE)")?;
+    if kind != SOCK_STREAM {
+      return Err(RtError::DriverRefused {
+        call: "adopt(SO_TYPE)",
+        code: Some(kind),
+      });
+    }
+    set_nonblocking(&socket)?;
+    Ok(socket)
+  }
+
   /// A send Windows took nothing of without blocking: the stream can take no more (`WSAESHUTDOWN`, Winsock's nearest
   /// to `EPIPE`).
   pub(crate) fn broken_pipe(call: &'static str) -> RtError {
@@ -1631,9 +1827,192 @@ pub(crate) use imp::{OwnedDatagram, OwnedStream, Socket};
 pub(crate) use imp::{
   accept, adopt_listener, adopt_stream, broken_pipe, bytes_handed, connect, connected, discard,
   established, into_owned, invalid, listen, make_sends_whole, peek, read, reserve_buffers,
-  set_nodelay, shutdown, shutdown_write, stream_socket, want_bytes, would_block, write,
+  round_trip, set_nodelay, shutdown, shutdown_write, stream_socket, want_bytes, would_block, write,
   write_vectored,
 };
 pub(crate) use imp::{
   adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,
 };
+#[cfg(windows)]
+pub(crate) use imp::{adopt_share, share_listener};
+
+/// Winsock's protocol record of a duplicated socket (`WSAPROTOCOL_INFOW`, A-748) as bytes and back, field by field in
+/// its declared order, each little-endian: 628 bytes. What a supervisor hands the daemon it spawned for each listener
+/// it holds, so the record crosses a pipe as plain bytes and is read back whole or refused.
+#[cfg(windows)]
+mod share {
+  use windows_sys::Win32::Networking::WinSock::{WSAPROTOCOL_INFOW, WSAPROTOCOLCHAIN};
+  use windows_sys::core::GUID;
+
+  /// Format: the record's length: five words, a GUID (16), a word, the protocol chain (a length and seven entries, 32),
+  /// nine signed words, two words and the protocol's name in 256 UTF-16 units (`ws2spi.h`, `WSAPROTOCOL_INFOW`).
+  pub(super) const RECORD_BYTES: usize = 628;
+
+  /// `record`'s bytes.
+  pub(super) fn encode(record: &WSAPROTOCOL_INFOW) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(RECORD_BYTES);
+    for word in [
+      record.dwServiceFlags1,
+      record.dwServiceFlags2,
+      record.dwServiceFlags3,
+      record.dwServiceFlags4,
+      record.dwProviderFlags,
+    ] {
+      bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    bytes.extend_from_slice(&record.ProviderId.data1.to_le_bytes());
+    bytes.extend_from_slice(&record.ProviderId.data2.to_le_bytes());
+    bytes.extend_from_slice(&record.ProviderId.data3.to_le_bytes());
+    bytes.extend_from_slice(&record.ProviderId.data4);
+    bytes.extend_from_slice(&record.dwCatalogEntryId.to_le_bytes());
+    bytes.extend_from_slice(&record.ProtocolChain.ChainLen.to_le_bytes());
+    for entry in record.ProtocolChain.ChainEntries {
+      bytes.extend_from_slice(&entry.to_le_bytes());
+    }
+    for signed in [
+      record.iVersion,
+      record.iAddressFamily,
+      record.iMaxSockAddr,
+      record.iMinSockAddr,
+      record.iSocketType,
+      record.iProtocol,
+      record.iProtocolMaxOffset,
+      record.iNetworkByteOrder,
+      record.iSecurityScheme,
+    ] {
+      bytes.extend_from_slice(&signed.to_le_bytes());
+    }
+    bytes.extend_from_slice(&record.dwMessageSize.to_le_bytes());
+    bytes.extend_from_slice(&record.dwProviderReserved.to_le_bytes());
+    for unit in record.szProtocol {
+      bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+  }
+
+  /// Reads fixed-width little-endian values off the front of a record's bytes.
+  struct Reader<'a>(&'a [u8]);
+
+  impl Reader<'_> {
+    fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
+      let (head, rest) = self.0.split_first_chunk::<N>()?;
+      self.0 = rest;
+      Some(*head)
+    }
+    fn word(&mut self) -> Option<u32> {
+      self.take().map(u32::from_le_bytes)
+    }
+    fn signed(&mut self) -> Option<i32> {
+      self.take().map(i32::from_le_bytes)
+    }
+    fn half(&mut self) -> Option<u16> {
+      self.take().map(u16::from_le_bytes)
+    }
+  }
+
+  /// The record `bytes` hold, none unless they are exactly one record's length.
+  pub(super) fn decode(bytes: &[u8]) -> Option<WSAPROTOCOL_INFOW> {
+    if bytes.len() != RECORD_BYTES {
+      return None;
+    }
+    let mut reader = Reader(bytes);
+    let mut record = WSAPROTOCOL_INFOW {
+      dwServiceFlags1: reader.word()?,
+      dwServiceFlags2: reader.word()?,
+      dwServiceFlags3: reader.word()?,
+      dwServiceFlags4: reader.word()?,
+      dwProviderFlags: reader.word()?,
+      ProviderId: GUID {
+        data1: reader.word()?,
+        data2: reader.half()?,
+        data3: reader.half()?,
+        data4: reader.take()?,
+      },
+      dwCatalogEntryId: reader.word()?,
+      ProtocolChain: WSAPROTOCOLCHAIN {
+        ChainLen: reader.signed()?,
+        ChainEntries: [0; 7],
+      },
+      ..WSAPROTOCOL_INFOW::default()
+    };
+    read_tail(&mut reader, &mut record)?;
+    Some(record)
+  }
+
+  /// The record's fields after its protocol chain's length, read into `record` in order: the chain's entries, the nine
+  /// signed fields, the message size and reserved word, and the protocol's name.
+  fn read_tail(reader: &mut Reader<'_>, record: &mut WSAPROTOCOL_INFOW) -> Option<()> {
+    for entry in &mut record.ProtocolChain.ChainEntries {
+      *entry = reader.word()?;
+    }
+    for signed in [
+      &mut record.iVersion,
+      &mut record.iAddressFamily,
+      &mut record.iMaxSockAddr,
+      &mut record.iMinSockAddr,
+      &mut record.iSocketType,
+      &mut record.iProtocol,
+      &mut record.iProtocolMaxOffset,
+      &mut record.iNetworkByteOrder,
+      &mut record.iSecurityScheme,
+    ] {
+      *signed = reader.signed()?;
+    }
+    record.dwMessageSize = reader.word()?;
+    record.dwProviderReserved = reader.word()?;
+    for unit in &mut record.szProtocol {
+      *unit = reader.half()?;
+    }
+    Some(())
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::*;
+
+    /// A-748. Do: encode a record whose every field differs, and decode it; decode a byte short and a byte long.
+    /// Expect: the record back field for field, at 628 bytes; both wrong lengths refused.
+    #[test]
+    fn a_protocol_record_crosses_as_bytes_whole_or_not_at_all() {
+      let mut record = WSAPROTOCOL_INFOW {
+        dwServiceFlags1: 1,
+        dwServiceFlags2: 2,
+        dwServiceFlags3: 3,
+        dwServiceFlags4: 4,
+        dwProviderFlags: 5,
+        ProviderId: GUID {
+          data1: 6,
+          data2: 7,
+          data3: 8,
+          data4: [9, 10, 11, 12, 13, 14, 15, 16],
+        },
+        dwCatalogEntryId: 17,
+        ProtocolChain: WSAPROTOCOLCHAIN {
+          ChainLen: -18,
+          ChainEntries: [19, 20, 21, 22, 23, 24, 25],
+        },
+        iVersion: 26,
+        iAddressFamily: 27,
+        iMaxSockAddr: 28,
+        iMinSockAddr: 29,
+        iSocketType: 30,
+        iProtocol: 31,
+        iProtocolMaxOffset: 32,
+        iNetworkByteOrder: 33,
+        iSecurityScheme: 34,
+        dwMessageSize: 35,
+        dwProviderReserved: 36,
+        ..WSAPROTOCOL_INFOW::default()
+      };
+      record.szProtocol[0] = u16::from(b'T');
+      record.szProtocol[255] = 0xffff;
+      let bytes = encode(&record);
+      assert_eq!(bytes.len(), RECORD_BYTES);
+      assert_eq!(encode(&decode(&bytes).unwrap()), bytes);
+      assert!(decode(&bytes[1..]).is_none());
+      let mut long = bytes.clone();
+      long.push(0);
+      assert!(decode(&long).is_none());
+    }
+  }
+}

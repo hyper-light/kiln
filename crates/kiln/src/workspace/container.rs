@@ -40,6 +40,17 @@ use super::slates::Made;
 /// Format: the NFS version the engine mounts an export at (Slates serves NFSv4.2: A-71's Docker workload ran over it,
 /// and the Kubernetes engine's PersistentVolume asks it).
 const NFS_VERSION: &str = "4.2";
+/// How many times an engine volume's removal is tried before its release says it stayed: an engine may still count a
+/// container it just removed as the volume's user for a moment (Docker Desktop 29.3.1, w-k90-containers' r8).
+pub(crate) const VOLUME_RM_TRIES: u32 = 10;
+/// How long between an engine volume's removal's tries ([`VOLUME_RM_TRIES`]) on a machine.
+pub(crate) const VOLUME_RM_PAUSE_LIVE: std::time::Duration = std::time::Duration::from_millis(500);
+/// The pause taken: [`VOLUME_RM_PAUSE_LIVE`]'s, but none to speak of between a stand-in's tries.
+#[cfg(not(test))]
+const VOLUME_RM_PAUSE: std::time::Duration = VOLUME_RM_PAUSE_LIVE;
+/// See above.
+#[cfg(test)]
+const VOLUME_RM_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 /// Format: the container option that holds `nosuid`: no process of the container gains a privilege by an exec.
 const NO_NEW_PRIVILEGES: &str = "--security-opt=no-new-privileges";
 /// Format: the container option that holds `nodev`: no device node is made through the container.
@@ -273,13 +284,35 @@ async fn start_with(steps: &impl Steps, made: &Made, plan: &Plan) -> Result<Runn
 async fn release_with(steps: &impl Steps, running: &Running, made: &Made) -> anyhow::Result<()> {
     // The container first: its engine lets go of the files it held open. One that won't go keeps the rest.
     steps.engine(&running.program, &["rm".to_owned(), "--force".to_owned(), running.container.clone()]).await?;
-    // Then its engine volume, whose mount goes with it; one that won't go keeps the export it mounts.
-    steps.engine(&running.program, &["volume".to_owned(), "rm".to_owned(), "--force".to_owned(), running.volume.clone()]).await?;
-    // Then the export: its capability reaches nothing after. One that won't go ends with its volume anyway.
+    // Then its engine volume, whose mount goes with it: tried again while the engine still counts the container it just
+    // removed as its user, at most VOLUME_RM_TRIES times.
+    let rm = ["volume".to_owned(), "rm".to_owned(), "--force".to_owned(), running.volume.clone()];
+    let mut stayed = None;
+    for tried in 1..=VOLUME_RM_TRIES {
+        match steps.engine(&running.program, &rm).await {
+            Ok(_) => {
+                stayed = None;
+                break;
+            }
+            Err(e) => {
+                tracing::debug!(volume = %running.volume, tried, error = %format!("{e:#}"), "an ended container's engine volume wasn't removed yet");
+                stayed = Some(e);
+                if tried < VOLUME_RM_TRIES {
+                    #[allow(clippy::disallowed_methods)] // (c) the container engine sends no notification when it lets go of its volume: asked again
+                    crate::rt::sleep(VOLUME_RM_PAUSE).await;
+                }
+            }
+        }
+    }
+    // Then the export, whatever the engine said: its capability reaches nothing after, so a volume left behind mounts
+    // nothing of the workspace. One that won't go ends with its volume anyway.
     if let Err(e) = steps.detach(running.export).await {
         tracing::warn!(mount = %made.mount, error = %format!("{e:#}"), "an ended container's export wasn't detached: it ends with its volume");
     }
-    Ok(())
+    match stayed {
+        None => Ok(()),
+        Some(e) => Err(e.context(format!("the engine volume {} stayed after {VOLUME_RM_TRIES} tries", running.volume))),
+    }
 }
 
 /// [`end`] over `steps`.
@@ -387,6 +420,8 @@ mod tests {
     /// taken, and each engine command's arguments kept in `commands`.
     struct Stand {
         port: Option<u16>,
+        /// How many `volume rm` fail before one goes (the engine still counting a container just removed as its user).
+        volume_rm_fails: Mutex<u32>,
         answers: Vec<(&'static str, Result<String, String>)>,
         said: Mutex<Vec<String>>,
         commands: Mutex<Vec<Vec<String>>>,
@@ -394,7 +429,7 @@ mod tests {
 
     impl Stand {
         fn new() -> Stand {
-            Stand { port: Some(PORT), answers: vec![("run", Ok("c0ffee".to_owned()))], said: Mutex::new(Vec::new()), commands: Mutex::new(Vec::new()) }
+            Stand { port: Some(PORT), volume_rm_fails: Mutex::new(0), answers: vec![("run", Ok("c0ffee".to_owned()))], said: Mutex::new(Vec::new()), commands: Mutex::new(Vec::new()) }
         }
 
         fn answering(word: &'static str, answer: Result<String, String>) -> Stand {
@@ -439,6 +474,13 @@ mod tests {
             }
             let first = args.first().map(String::as_str).unwrap_or_default();
             let key = if first == "volume" { args.get(1).map(String::as_str).unwrap_or_default() } else { first };
+            if first == "volume" && key == "rm"
+                && let Ok(mut fails) = self.volume_rm_fails.lock()
+                && *fails > 0
+            {
+                *fails -= 1;
+                anyhow::bail!("remove kiln-a-1: volume is in use - [c0ffee]");
+            }
             match self.answers.iter().find(|(w, _)| *w == key) {
                 Some((_, answer)) => answer.clone().map_err(|why| anyhow::anyhow!(why)),
                 None => Ok(String::new()),
@@ -643,7 +685,7 @@ mod tests {
         assert_eq!((by_runtime.available, by_runtime.missing, by_runtime.program.as_deref(), by_runtime.engine), (false, Some(ContainerMissing::Profile), Some(DOCKER), None));
         assert!(by_runtime.why_not.as_deref().is_some_and(|w| w.starts_with("Slates refused this machine's container engine: ")), "{:?}", by_runtime.why_not);
         let untested = judged(Engine::DockerEngine, false);
-        let by_profile = refused(EngineFault::Untested { endpoint: untested.endpoint.clone(), profile: untested.profile, refusal: ProfileRefusal::UserNamespaceUntested });
+        let by_profile = refused(EngineFault::Untested { endpoint: untested.endpoint.clone(), profile: Box::new(untested.profile), refusal: ProfileRefusal::UserNamespaceUntested });
         assert_eq!((by_profile.missing, by_profile.engine.as_deref(), by_profile.version.as_deref()), (Some(ContainerMissing::Profile), Some("docker-engine"), Some("29.3.1")));
         let windows = refused(EngineFault::Unsupported { platform: "windows" });
         assert_eq!((windows.available, windows.missing), (false, Some(ContainerMissing::Platform)));
@@ -661,5 +703,26 @@ mod tests {
             desktop,
             ContainerFacts { available: true, program: Some(DOCKER.to_owned()), engine: Some("docker-desktop".to_owned()), endpoint: Some("unix:///var/run/docker.sock".to_owned()), version: Some("29.3.1".to_owned()), image: Some(IMAGE.to_owned()), why_not: None, missing: None }
         );
+    }
+
+    /// W9 (w-k90-containers' r8 on Docker Desktop 29.3.1: an ended session's engine volume left behind). Do: release a
+    /// container whose engine still counts it as its volume's user for a moment (its first two `volume rm` refused), then
+    /// one whose volume never goes. Expect the first's volume removed on a later try, then its export detached; the
+    /// second's tries bounded, its export detached whatever the engine said, and its release an error naming the volume.
+    #[test]
+    fn w9_an_engine_volume_still_in_use_is_removed_on_a_later_try_and_its_export_detached_whatever_it_said() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let running = Running { container: "c0ffee".to_owned(), volume: "kiln-a-1".to_owned(), export: 29, program: DOCKER.to_owned() };
+            let stand = Stand { volume_rm_fails: Mutex::new(2), ..Stand::new() };
+            release_with(&stand, &running, &made()).await?;
+            assert_eq!(stand.said(), ["rm", "volume rm", "volume rm", "volume rm", "detach 29"]);
+            let stand = Stand { volume_rm_fails: Mutex::new(u32::MAX), ..Stand::new() };
+            let refused = release_with(&stand, &running, &made()).await;
+            assert!(refused.as_ref().is_err_and(|e| format!("{e:#}").contains("kiln-a-1")), "{refused:?}");
+            let said = stand.said();
+            assert_eq!(said.iter().filter(|s| *s == "volume rm").count(), usize::try_from(VOLUME_RM_TRIES).unwrap_or(0));
+            assert_eq!(said.last().map(String::as_str), Some("detach 29"), "the export goes whatever the engine said: {said:?}");
+            Ok(())
+        })
     }
 }

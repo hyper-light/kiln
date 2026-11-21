@@ -1545,12 +1545,21 @@ mod tests {
     }
 
     /// Step 17 part 7: Claude Code loads kiln's own skills and those kiln installed for its session
-    /// from their folders, as on the machine; another harness takes none.
+    /// from their folders, as on the machine; another harness takes none. kiln's own are the server's kit's
+    /// where this process serves one (`mcp::kit`, which a server sets once per process: in this test binary
+    /// another test's server may set it at any time), else the runner's folder (`mcp::plugin_dir`).
     #[test]
     fn s17_claude_codes_plugin_folders_are_kilns_skills_and_its_sessions() -> anyhow::Result<()> {
-        let own = crate::mcp::plugin_dir().map(|d| d.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("no folder of kiln's skills"))?;
+        let own = || {
+            let dir = crate::mcp::kit().map(|k| k.plugin_dir.clone()).or_else(|| crate::mcp::plugin_dir().map(Path::to_path_buf));
+            dir.map(|d| d.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("no folder of kiln's skills"))
+        };
         let installed = crate::skills::place::session_folder("s-1").map(|d| d.to_string_lossy().into_owned()).ok_or_else(|| anyhow::anyhow!("no folder of its installed skills"))?;
-        assert_eq!(plugin_folders(kind("claude")?, "s-1"), [own, installed]);
+        // The kit is set once and never changes: what it was as the folders were asked lies between these two.
+        let before = own()?;
+        let folders = plugin_folders(kind("claude")?, "s-1");
+        let after = own()?;
+        assert!(folders == [before.clone(), installed.clone()] || folders == [after.clone(), installed.clone()], "{folders:?}: neither {before} nor {after}, then {installed}");
         assert!(plugin_folders(kind("codex")?, "s-1").is_empty());
         Ok(())
     }

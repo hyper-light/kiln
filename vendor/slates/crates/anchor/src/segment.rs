@@ -11,10 +11,12 @@ use crate::layout::{
   Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAUNCHER_SECRET_BYTES,
   LAYOUT_VERSION, MAGIC, PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD,
   RING_SEQ_BASE, RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES,
-  SESSION_SECRET_BYTES, SUP_GENERATION, SUP_HEARTBEAT, SUP_HOLD_REFUSALS, SUP_ISSUER,
-  SUP_LAPSE_BOUND, SUP_LAUNCHER_PRESENT, SUP_LAUNCHER_SECRET, SUP_LOG_REFUSALS, SUP_LOOKED,
-  SUP_PID, SUP_RECOVERED, SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_SERVING,
-  SUP_SESSION_PRESENT, SUP_SESSION_SECRET, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
+  SESSION_SECRET_BYTES, SSH_HOST_SEED_BYTES, STUCK_LABEL_WORDS, SUP_GENERATION, SUP_HEARTBEAT,
+  SUP_HOLD_REFUSALS, SUP_ISSUER, SUP_LAPSE_BOUND, SUP_LAUNCHER_PRESENT, SUP_LAUNCHER_SECRET,
+  SUP_LOG_REFUSALS, SUP_LOOKED, SUP_PID, SUP_RECOVERED, SUP_RESTARTS, SUP_SEAL_PRESENT,
+  SUP_SEAL_ROOT, SUP_SERVING, SUP_SESSION_PRESENT, SUP_SESSION_SECRET, SUP_SSH_HOST_PRESENT,
+  SUP_SSH_HOST_SEED, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, SUP_STUCK_LABEL,
+  SUP_STUCK_LABEL_LEN, SUP_STUCK_POLLS, SUP_STUCK_SHARD, SUP_STUCK_WRITTEN, State,
 };
 
 /// The node's sealing root as the anchor holds it (A-92): its key id and its key bytes.
@@ -97,6 +99,23 @@ fn segment_words(geometry: &Geometry) -> Words {
         .with(WordRun::racy(
           at.saturating_add(SUP_LAUNCHER_SECRET),
           LAUNCHER_SECRET_BYTES,
+        ))
+        // The SSH edge's host key (A-684): its published word, and its seed, written once by the anchor before any
+        // daemon reads it.
+        .with(WordRun::one(
+          at.saturating_add(SUP_SSH_HOST_PRESENT),
+          Width::U64,
+        ))
+        .with(WordRun::racy(
+          at.saturating_add(SUP_SSH_HOST_SEED),
+          SSH_HOST_SEED_BYTES,
+        ))
+        // Format: the stuck task's record (A-740): four words (written, shard, polls, label length), then the label.
+        .with(WordRun::strided(
+          at.saturating_add(SUP_STUCK_WRITTEN),
+          size_of::<u64>(),
+          STUCK_LABEL_WORDS.saturating_add(4),
+          Width::U64,
         )),
       // The content pool's owner words (A-98), each claimed by compare-and-swap.
       RegionKind::Pool => words.with(WordRun::strided(
@@ -148,6 +167,19 @@ impl std::fmt::Debug for AnchorSegment {
       .field("len", &self.object.len())
       .finish()
   }
+}
+
+/// What a daemon's watchdog found its stuck shard polling (A-740; `layout::SUP_STUCK_WRITTEN`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StuckTask {
+  /// The daemon that wrote it.
+  pub pid: u64,
+  /// The stuck shard.
+  pub shard: u16,
+  /// The task's polls begun, the one it is stuck in included.
+  pub polls: u64,
+  /// The task's label: where it was spawned, or the work it named.
+  pub label: String,
 }
 
 /// The supervision block, through atomic words.
@@ -571,6 +603,13 @@ impl AnchorSegment {
     self.content = Some(object);
   }
 
+  /// A borrow of the segment's own descriptor, for the anchor's issuer route to hand a process that proved the issuer's
+  /// secret (A-754): the memfd its children inherit, which no other process can otherwise reach. Linux only.
+  #[cfg(target_os = "linux")]
+  pub fn object_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.object.as_fd()
+  }
+
   /// The content object, if any (a shard reads and publishes its recovery image through it).
   pub fn content(&self) -> Option<&SparseObject> {
     self.content.as_ref()
@@ -752,6 +791,126 @@ impl AnchorSegment {
     Ok(Some(secret))
   }
 
+  /// Records what the daemon's watchdog found its stuck shard polling (`layout::SUP_STUCK_WRITTEN`, A-740), written by
+  /// the daemon `pid` before it withholds the beat: the written word cleared, the fields, then the pid released after
+  /// them. A label past the record's room is cut at a character boundary.
+  pub fn record_stuck_task(&self, task: &StuckTask) -> Result<(), AnchorError> {
+    let spec = self.spec(RegionKind::Supervision)?;
+    let written = self.word_at(spec, SUP_STUCK_WRITTEN)?;
+    written.store(0, Ordering::Release);
+    self
+      .word_at(spec, SUP_STUCK_SHARD)?
+      .store(u64::from(task.shard), Ordering::Relaxed);
+    self
+      .word_at(spec, SUP_STUCK_POLLS)?
+      .store(task.polls, Ordering::Relaxed);
+    let room = STUCK_LABEL_WORDS.saturating_mul(size_of::<u64>());
+    let mut len = task.label.len().min(room);
+    while !task.label.is_char_boundary(len) {
+      len = len.saturating_sub(1);
+    }
+    let bytes = task.label.as_bytes().get(..len).unwrap_or_default();
+    self
+      .word_at(spec, SUP_STUCK_LABEL_LEN)?
+      .store(u64::try_from(len).unwrap_or(0), Ordering::Relaxed);
+    for (index, chunk) in bytes.chunks(size_of::<u64>()).enumerate() {
+      let mut word = [0u8; size_of::<u64>()];
+      word
+        .get_mut(..chunk.len())
+        .unwrap_or_default()
+        .copy_from_slice(chunk);
+      let at = SUP_STUCK_LABEL.saturating_add(index.saturating_mul(size_of::<u64>()));
+      self
+        .word_at(spec, at)?
+        .store(u64::from_le_bytes(word), Ordering::Relaxed);
+    }
+    written.store(task.pid, Ordering::Release);
+    Ok(())
+  }
+
+  /// What the daemon's watchdog last found its stuck shard polling ([`AnchorSegment::record_stuck_task`]); none while
+  /// no daemon wrote one, or while one is being written.
+  pub fn stuck_task(&self) -> Result<Option<StuckTask>, AnchorError> {
+    let spec = self.spec(RegionKind::Supervision)?;
+    let written = self.word_at(spec, SUP_STUCK_WRITTEN)?;
+    let pid = written.load(Ordering::Acquire);
+    if pid == 0 {
+      return Ok(None);
+    }
+    let shard = self.word_at(spec, SUP_STUCK_SHARD)?.load(Ordering::Relaxed);
+    let polls = self.word_at(spec, SUP_STUCK_POLLS)?.load(Ordering::Relaxed);
+    let room = STUCK_LABEL_WORDS.saturating_mul(size_of::<u64>());
+    let len = usize::try_from(
+      self
+        .word_at(spec, SUP_STUCK_LABEL_LEN)?
+        .load(Ordering::Relaxed),
+    )
+    .unwrap_or(0)
+    .min(room);
+    let mut bytes = Vec::with_capacity(room);
+    for index in 0..STUCK_LABEL_WORDS {
+      let at = SUP_STUCK_LABEL.saturating_add(index.saturating_mul(size_of::<u64>()));
+      bytes.extend_from_slice(
+        &self
+          .word_at(spec, at)?
+          .load(Ordering::Relaxed)
+          .to_le_bytes(),
+      );
+    }
+    bytes.truncate(len);
+    if written.load(Ordering::Acquire) != pid {
+      return Ok(None);
+    }
+    Ok(Some(StuckTask {
+      pid,
+      shard: u16::try_from(shard).unwrap_or(u16::MAX),
+      polls,
+      label: String::from_utf8_lossy(&bytes).into_owned(),
+    }))
+  }
+
+  /// Publishes the seed of the version-control SSH edge's host key (`layout::SUP_SSH_HOST_PRESENT`, A-684): the seed,
+  /// then the published word, released after it, so a reader that sees the word sees the whole seed. The anchor
+  /// publishes it once, before it starts any daemon, from the system's generator; every daemon under the anchor serves
+  /// its SSH edge with it, so a restart keeps the key a client pinned.
+  pub fn publish_ssh_host_seed(
+    &mut self,
+    seed: &[u8; SSH_HOST_SEED_BYTES],
+  ) -> Result<(), AnchorError> {
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_SSH_HOST_SEED,
+      SSH_HOST_SEED_BYTES,
+    )?;
+    self.object.write_racy(at, seed)?;
+    let spec = self.spec(RegionKind::Supervision)?;
+    self
+      .word_at(spec, SUP_SSH_HOST_PRESENT)?
+      .store(1, Ordering::Release);
+    Ok(())
+  }
+
+  /// The seed of the SSH edge's host key, if this segment's anchor published one (A-684): none on a fresh segment, under
+  /// an anchor asked for no SSH edge or a fleet node's, and under an older anchor. The caller wipes its copy when done.
+  pub fn ssh_host_seed(&self) -> Result<Option<[u8; SSH_HOST_SEED_BYTES]>, AnchorError> {
+    let spec = self.spec(RegionKind::Supervision)?;
+    if self
+      .word_at(spec, SUP_SSH_HOST_PRESENT)?
+      .load(Ordering::Acquire)
+      != 1
+    {
+      return Ok(None);
+    }
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_SSH_HOST_SEED,
+      SSH_HOST_SEED_BYTES,
+    )?;
+    let mut seed = [0u8; SSH_HOST_SEED_BYTES];
+    self.object.read_racy(at, &mut seed)?;
+    Ok(Some(seed))
+  }
+
   /// Publishes the node's sealing root (A-92): its key id and bytes, then the published word, released after
   /// them, so a reader that sees the word sees the whole record. One daemon runs under an anchor at a time, so
   /// there is one writer.
@@ -807,6 +966,51 @@ impl AnchorSegment {
     );
     record.fill(0);
     Ok(Some(parsed))
+  }
+
+  /// What of a region is in RAM, and written where the OS says (`slates_mem::resident`, A-744): the kernel's page
+  /// table read, no byte of the segment touched.
+  pub fn region_residency(
+    &self,
+    kind: RegionKind,
+  ) -> Result<slates_mem::resident::Residency, AnchorError> {
+    let range = self.range(self.spec(kind)?)?;
+    Ok(
+      self
+        .object
+        .residency(range.start, range.end.saturating_sub(range.start))?,
+    )
+  }
+
+  /// What of `len` bytes at `at` in the whole mapped segment is in RAM, and written where the OS says
+  /// (`slates_mem::resident`, A-744): the daemon's own memory report sweeps the segment whole with it (§4.14), nothing
+  /// suspended. Refused past the segment's end.
+  pub fn residency_of(
+    &self,
+    at: usize,
+    len: usize,
+  ) -> Result<slates_mem::resident::Residency, AnchorError> {
+    Ok(self.object.residency(at, len)?)
+  }
+
+  /// [`AnchorSegment::region_residency`] of `len` bytes at `at` within the region, a span past the region refused
+  /// (`Geometry`): what a caller walking a large region a bounded step at a time asks (A-744). Words and payloads alike:
+  /// the kernel's page table is read, no byte.
+  pub fn region_residency_of(
+    &self,
+    kind: RegionKind,
+    at: usize,
+    len: usize,
+  ) -> Result<slates_mem::resident::Residency, AnchorError> {
+    let range = self.range(self.spec(kind)?)?;
+    let start = range
+      .start
+      .checked_add(at)
+      .filter(|start| start.saturating_add(len) <= range.end)
+      .ok_or(AnchorError::Geometry {
+        reason: "a residency span past its region",
+      })?;
+    Ok(self.object.residency(start, len)?)
   }
 
   /// A region's length in bytes.

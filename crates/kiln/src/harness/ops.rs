@@ -1572,10 +1572,11 @@ pub mod input {
         pub reach: Option<String>,
         /// The terminal session it belongs to, where a person starts it from one.
         pub shell: Option<String>,
-        /// One of your environments it starts with (docs/agents.md, "Environments"), by id: its variables over the
-        /// machine's user's environment, or a clean one. Left out: an agent's agents run with its own, a person's
-        /// with the machine's user's.
-        pub agentenv: Option<String>,
+        /// The stack of your environments it starts with (docs/agents.md, "Environments"), by id, top first: their
+        /// variables over the machine's user's environment, or a clean one, where two set one the higher winning.
+        /// Those of yours applied on their own whose scope matches it join under them. Left out: an agent's agents
+        /// run with its own, a person's with none but those applied on their own; [] names none.
+        pub agentenvs: Option<Vec<String>>,
         /// Its task apart from the words of the agent definition it runs (as agentdefs_run starts one): what
         /// a split's variant that's another agent is told after that agent's words. Which definition it runs is
         /// kiln's to say, as agentdefs_run starts it.
@@ -2476,7 +2477,7 @@ for line in sys.stdin:
             let core = s.core.lock();
             !core.meta.version.is_empty() && core.state.status == crate::harness::model::Status::Running
         });
-        let cpu = || hub.harness.local.get(id).and_then(|s| *s.pid.lock()).and_then(|pid| crate::os::metrics::cpu_us_of(&[pid]));
+        let cpu = || hub.harness.local.get(id).and_then(|s| *s.pid.lock()).and_then(at_work);
         let mut waits = kiln_ci::place::keeper::Waits::default();
         waits.said(0);
         let (mut moved, mut spent) = (None, cpu());
@@ -2507,19 +2508,93 @@ for line in sys.stdin:
                     }
                     () = committed.notified().fuse() => break,
                     () = async move { match still { Some(s) => s.await, None => std::future::pending().await } }.fuse() => {
+                        // Its turn ended in the window: it owes kiln nothing now, and what's awaited is
+                        // kiln's move (the registry's relay of that end), which the wait follows by
+                        // liveness alone. Refused for its CPU time, a turn ended 41 ms in whose end the
+                        // relay hadn't yet carried (goals::ops' keyed-control test, a full parallel run on
+                        // adacachy, 2026-11-20).
+                        if !owes() {
+                            continue;
+                        }
+                        // Its process waits in a read of its input ([`reads_its_input`]): kiln's records
+                        // hold its turn as under way, but what's awaited is kiln's move (the turn's message,
+                        // queued and not yet in the pipe; or the answer it wrote, unread in kiln's end of
+                        // its stdout pipe), so its window starts again, as for a source whose time moved.
+                        // Refused for its CPU time: a turn kiln held as under way (its session Running, the
+                        // registry's view still Idle, its last end the turn's before) with its source still
+                        // a whole window of 67 ms (the keyed-control test), and the reviewed plan's run
+                        // (goals::stack_tests), Running and Idle, at windows of 9 to 153 ms (targeted
+                        // parallel runs on adacachy, 2026-11-20).
+                        if hub.harness.local.get(id).and_then(|s| *s.pid.lock()).is_some_and(reads_its_input) {
+                            waits.heard(ms());
+                            continue;
+                        }
                         let now = cpu();
-                        if now.is_some() && now != spent {
+                        if now.is_some_and(|(time, busy)| busy || spent.is_none_or(|(was, _)| was != time)) {
                             spent = now;
                             waits.heard(ms());
                             continue;
                         }
                         let state = hub.harness.info(id).map(|i| format!("{:?}", i.status)).unwrap_or_else(|| "gone".into());
                         let last = moved.map_or_else(|| "hasn't moved since the wait began".to_owned(), |at| format!("last moved {at} ms into the wait and hasn't since"));
-                        anyhow::bail!("{what}: its source {last}, a whole window of the slowest gap between moves seen in this run ({} ms), its CPU time {now:?} µs as it was at the window's start; its state {state}", waits.slowest().unwrap_or(0));
+                        anyhow::bail!("{what}: its source {last}, a whole window of the slowest gap between moves seen in this run ({} ms), its time on and waiting for a CPU and whether it runs or waits on its disk {now:?} as at the window's start; its state {state}", waits.slowest().unwrap_or(0));
                     }
                 }
             }
         }
+    }
+
+    /// Whether source process `pid` moved as the machine sees it, for [`until`]'s still window: its threads' time on a
+    /// CPU and waiting in a run queue for one, in ns, and whether one runs or waits on its disk now (Linux's
+    /// `/proc/<pid>/task/*/schedstat` and `stat`). `/proc/<pid>/stat`'s CPU time (`os::metrics::cpu_us_of`) moves in
+    /// clock ticks, 10 ms each, and a turn of the recording program costs less than one: the wait refused live sources
+    /// still at one tick, Running with their turn under way, as a loaded machine held them in its run queue or in an
+    /// fsync (goals::ops' keyed-control test, 3 of 10 targeted runs on adacachy, 2026-11-20). Elsewhere, the CPU time
+    /// as `cpu_us_of` reads it (macOS's in its own fine units).
+    #[cfg(target_os = "linux")]
+    fn at_work(pid: u32) -> Option<(u64, bool)> {
+        let mut seen: Option<(u64, bool)> = None;
+        for task in std::fs::read_dir(format!("/proc/{pid}/task")).ok()?.flatten() {
+            let Ok(sched) = std::fs::read_to_string(task.path().join("schedstat")) else { continue };
+            let time = sched.split_whitespace().take(2).filter_map(|v| v.parse::<u64>().ok()).fold(0u64, u64::saturating_add);
+            let stat = std::fs::read_to_string(task.path().join("stat")).unwrap_or_default();
+            let busy = stat.rsplit_once(')').and_then(|(_, rest)| rest.trim_start().chars().next()).is_some_and(|state| matches!(state, 'R' | 'D'));
+            let (was, any) = seen.unwrap_or((0, false));
+            seen = Some((was.saturating_add(time), any || busy));
+        }
+        seen
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn at_work(pid: u32) -> Option<(u64, bool)> {
+        crate::os::metrics::cpu_us_of(&[pid]).map(|us| (us, false))
+    }
+
+    /// Whether source process `pid` waits in a read of its standard input, where a harness kiln drives over its stdio
+    /// waits for kiln's next message (Linux's `/proc/<pid>/task/*/syscall`: the call a blocked thread is in, and its
+    /// first argument). Elsewhere, never said.
+    ///
+    /// Asked of the source's process because nothing kiln keeps says it. That read blocks only while the source's stdin
+    /// pipe is empty, so it says both that everything kiln wrote has reached it and that it waits on kiln's next word.
+    /// Kiln's own records say neither: a message is under way in the session's state from the moment the adapter
+    /// queues it, and its handover (its durable `ProviderFlight` stage, the stdin queue, the writer task's write) is
+    /// recorded nowhere a wait reads; and an answer the source wrote that kiln's reader hasn't yet read (its task
+    /// starved on a loaded machine, as the window's refusals were) is held in the kernel's pipe buffer, which only
+    /// the kernel can say is there. Harnesses that wait on their input in `epoll` or `select` (Claude Code's node)
+    /// are never said to read it, and their windows are refused by their CPU time as before.
+    #[cfg(target_os = "linux")]
+    fn reads_its_input(pid: u32) -> bool {
+        let read = nix::libc::SYS_read.to_string();
+        std::fs::read_dir(format!("/proc/{pid}/task")).into_iter().flatten().flatten().any(|task| {
+            let call = std::fs::read_to_string(task.path().join("syscall")).unwrap_or_default();
+            let mut words = call.split_whitespace();
+            words.next() == Some(read.as_str()) && words.next() == Some("0x0")
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reads_its_input(_: u32) -> bool {
+        false
     }
 
     pub(crate) async fn source_ready(hub: &Hub, id: &str) -> anyhow::Result<()> {

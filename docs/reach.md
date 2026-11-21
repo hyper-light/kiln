@@ -906,7 +906,12 @@ agent stays where it is.
   and keep its session); today every link goes through the server.
 - Pinning fingerprints from the UI (today: `kiln reach status`, `kiln reach forget`).
 - Windows runners as the doing side (the process side is there; the local socket is Unix-only), and
-  so `kiln run` and the `kiln` MCP server for agents on Windows runners.
+  so `kiln run` from a person's shell there. Since 2026-11-20 an agent a Windows runner starts as a
+  process gets the `kiln` MCP server all the same (`reach::loopback`): the runner listens on the
+  loopback alone and serves each connection in its own process as the session's lane, by the token
+  its launch was given (its MCP config, a file only its user reads), never by where it came from;
+  `kiln reach mcp` there carries its standard input and output over it. Claude Code's harnesses get
+  it today; Codex's, ACP agents' and Antigravity's still don't.
 - Agents that agents start (`kiln spawn`): kiln doesn't record whom they act for yet, so on a kiln
   others sign in to they can't call kiln's operations (the machines they can).
 - Moving agents of ACP harnesses (Gemini, opencode, goose, amp) and Antigravity keeps their

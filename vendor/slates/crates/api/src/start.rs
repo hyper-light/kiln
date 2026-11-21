@@ -56,6 +56,19 @@ pub struct StartSpec {
   /// The fleet this node joins (§2.6 boot step 6); `None` for an instance run alone, whose group [`Instance::start`]
   /// makes.
   pub fleet: Option<FleetSelection>,
+  /// Where the version-control servers' shared HTTP edge listens, when the host starts one (`--vcs-http`, A-625 part 3;
+  /// [`crate::role::vcs_address`]'s rule: cleartext on a loopback address alone without a fleet): the anchor binds it
+  /// once and holds it across its daemons' restarts. `None` starts no edge.
+  pub vcs_http: Option<slates_rt::tcp::SocketAddrV4>,
+  /// Where the version-control servers' SSH edge listens, when the host starts one (`--vcs-ssh`, A-684;
+  /// [`crate::role::vcs_ssh_address`]: any IPv4 address and port): the anchor binds it once and makes the edge's host key
+  /// at its start (a fleet node's edge presents the node's own key), and holds both across its daemons' restarts. `None`
+  /// starts no edge.
+  pub vcs_ssh: Option<slates_rt::tcp::SocketAddrV4>,
+  /// Where the svn:// listener listens, when the host starts one (`--vcs-svn`, A-689, A-656 part 2;
+  /// [`crate::role::vcs_address`]'s rule: ra_svn is cleartext, on a loopback address alone without a fleet): the anchor
+  /// binds it once and holds it across its daemons' restarts, as it holds the HTTP edge's. `None` starts no listener.
+  pub vcs_svn: Option<slates_rt::tcp::SocketAddrV4>,
   /// The launcher's secret (A-299, [`crate::launcher`]), handed to the anchor at the start so the host's authority
   /// outlives its own restarts and the daemon's; `None` for an instance whose authority is the anchor segment's alone.
   pub launcher: Option<LauncherSecret>,
@@ -87,6 +100,9 @@ impl StartSpec {
       shards: None,
       quick: false,
       fleet: None,
+      vcs_http: None,
+      vcs_ssh: None,
+      vcs_svn: None,
       launcher: None,
       until_served: false,
     }
@@ -112,17 +128,20 @@ impl StartSpec {
       quick: self.quick,
       shards: self.shards,
       fleet: self.fleet.clone(),
+      vcs_http: self.vcs_http,
+      vcs_ssh: self.vcs_ssh,
+      vcs_svn: self.vcs_svn,
     })
   }
 
-  /// The anchor's command: `PROGRAM PREFIX... --instance NAME anchor [--quick] [--shards N] [--fleet PATH --node
-  /// NAME]`. Its standard input is closed, or, with a launcher's secret, a pipe holding the secret's record and then its
-  /// end ([`crate::launcher`]), so the anchor's read always ends; a host that wraps the command (`systemd-run --scope`)
-  /// keeps the command's standard input, which an exec passes unchanged. Standard output and error are the host's to
-  /// direct: the roles write their log lines to standard error. On Unix the anchor leads a process group of its own, so
-  /// a signal meant for the host's group (a terminal's interrupt) does not stop the instance; a host stops it through
-  /// [`Anchor::stop`], or by sending the anchor `SIGTERM` itself. Refused [`StartFault::Launcher`] when the pipe cannot
-  /// be made.
+  /// The anchor's command: `PROGRAM PREFIX... --instance NAME anchor [--quick] [--shards N] [--fleet PATH --node NAME]
+  /// [--vcs-http ADDRESS] [--vcs-ssh ADDRESS] [--vcs-svn ADDRESS]`. Its standard input is closed, or, with a
+  /// launcher's secret, a pipe holding the secret's record and then its end ([`crate::launcher`]), so the anchor's read always ends; a host that
+  /// wraps the command (`systemd-run --scope`) keeps the command's standard input, which an exec passes unchanged.
+  /// Standard output and error are the host's to direct: the roles write their log lines to standard error. On Unix the
+  /// anchor leads a process group of its own, so a signal meant for the host's group (a terminal's interrupt) does not
+  /// stop the instance; a host stops it through [`Anchor::stop`], or by sending the anchor `SIGTERM` itself. Refused
+  /// [`StartFault::Launcher`] when the pipe cannot be made.
   pub fn anchor_command(&self) -> Result<Command, Error> {
     self.anchor_command_under(&[])
   }
@@ -372,4 +391,75 @@ fn stop_after(child: Child, error: Error) -> Error {
     );
   }
   error
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A-625 part 3 (§4.17.2 "Transports" item 1). Do: make a host's spec that asks for the version-control edge on a
+  /// loopback address, then its anchor's role and command. Expect: the role carries the address, and the command names
+  /// it after `--vcs-http`, so the anchor the host starts holds the edge's listener and hands it to every daemon.
+  #[test]
+  fn a_hosts_anchor_is_started_with_the_vcs_http_edge_it_asks_for() {
+    let address = slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, 8080);
+    let mut spec = StartSpec::new("edge", PathBuf::from("slates"), &[]);
+    spec.vcs_http = Some(address);
+    assert_eq!(spec.role().options().vcs_http, Some(address));
+    let command = spec.anchor_command().expect("the anchor's command");
+    let words: Vec<String> = command
+      .get_args()
+      .map(|word| word.to_string_lossy().into_owned())
+      .collect();
+    assert!(
+      words
+        .windows(2)
+        .any(|pair| pair[0] == "--vcs-http" && pair[1] == "127.0.0.1:8080"),
+      "{words:?}"
+    );
+  }
+
+  /// A-684 (§4.17.2 "Transports" item 2). Do: make a host's spec that asks for the version-control SSH edge on a loopback
+  /// address, then its anchor's role and command. Expect: the role carries the address, and the command names it after
+  /// `--vcs-ssh`, so the anchor the host starts holds the edge's listener and host key for every daemon.
+  #[test]
+  fn a_hosts_anchor_is_started_with_the_vcs_ssh_edge_it_asks_for() {
+    let address = slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, 2222);
+    let mut spec = StartSpec::new("ssh-edge", PathBuf::from("slates"), &[]);
+    spec.vcs_ssh = Some(address);
+    assert_eq!(spec.role().options().vcs_ssh, Some(address));
+    let command = spec.anchor_command().expect("the anchor's command");
+    let words: Vec<String> = command
+      .get_args()
+      .map(|word| word.to_string_lossy().into_owned())
+      .collect();
+    assert!(
+      words
+        .windows(2)
+        .any(|pair| pair[0] == "--vcs-ssh" && pair[1] == "127.0.0.1:2222"),
+      "{words:?}"
+    );
+  }
+
+  /// A-689 (§4.17.4 piece 7). Do: make a host's spec that asks for the svn:// listener on a loopback address, then its
+  /// anchor's role and command. Expect: the role carries the address, and the command names it after `--vcs-svn`, so
+  /// the anchor the host starts holds the listener and hands it to every daemon.
+  #[test]
+  fn a_hosts_anchor_is_started_with_the_svn_listener_it_asks_for() {
+    let address = slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, 3690);
+    let mut spec = StartSpec::new("svn", PathBuf::from("slates"), &[]);
+    spec.vcs_svn = Some(address);
+    assert_eq!(spec.role().options().vcs_svn, Some(address));
+    let command = spec.anchor_command().expect("the anchor's command");
+    let words: Vec<String> = command
+      .get_args()
+      .map(|word| word.to_string_lossy().into_owned())
+      .collect();
+    assert!(
+      words
+        .windows(2)
+        .any(|pair| pair[0] == "--vcs-svn" && pair[1] == "127.0.0.1:3690"),
+      "{words:?}"
+    );
+  }
 }

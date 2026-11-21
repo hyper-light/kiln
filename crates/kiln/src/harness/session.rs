@@ -3172,6 +3172,15 @@ enum Done {
 
 /// Longest a run of the harness's CLI may take.
 const RUN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long a session waits for its run's exit once its run was told to end, before it reads as ended: a process's ends
+/// as it's killed; a container's only once the container, its engine volume and its export are let go
+/// (`sandbox::container`), which an engine may take seconds over (Docker Desktop: w-k90-containers' r49, its container
+/// still listed after the session read ended), and a session must never read ended while its container is still there
+/// (docs/agentic.md W9).
+fn ended_within(container: bool) -> Duration {
+    if container { Duration::from_secs(60) } else { Duration::from_secs(5) }
+}
 /// Most of a run's output handed back.
 const RUN_OUTPUT_MAX: usize = 32 * 1024;
 /// Largest file a read hands back.
@@ -3272,6 +3281,10 @@ fn again(ran: Ran, slowest: Option<Duration>) -> Again {
     }
 }
 
+/// The words that say kiln stopped starting a harness again after its end ([`halt_words`]): its end is final until a
+/// person restarts it or sends it a message, so a waiter reading kiln's word on it waits no longer.
+pub const STOPPED_STARTING: &str = "so kiln stopped starting it again";
+
 /// Why kiln stopped starting a harness again, in words, `how` how its process ended and
 /// `slowest` the slowest start of its kind that got ready here.
 fn halt_words(halt: Halt, how: &str, slowest: Option<Duration>) -> Option<String> {
@@ -3281,8 +3294,8 @@ fn halt_words(halt: Halt, how: &str, slowest: Option<Duration>) -> Option<String
     };
     match halt {
         Halt::NeverLaunched => None,
-        Halt::NeverReady => Some(format!("Its process ended before it was ready ({how}) after kiln started it again, so kiln stopped starting it again: a start that never gets ready makes no progress ({record}). Send a message or restart it.")),
-        Halt::CutAgain => Some(format!("Its process ended ({how}) part-way through the turn kiln started it again to pick up, no turn ending in between, so kiln stopped starting it again: that turn makes no progress. Send a message or restart it.")),
+        Halt::NeverReady => Some(format!("Its process ended before it was ready ({how}) after kiln started it again, {STOPPED_STARTING}: a start that never gets ready makes no progress ({record}). Send a message or restart it.")),
+        Halt::CutAgain => Some(format!("Its process ended ({how}) part-way through the turn kiln started it again to pick up, no turn ending in between, {STOPPED_STARTING}: that turn makes no progress. Send a message or restart it.")),
     }
 }
 /// What an agent is told when its process ended part-way through a turn and started again.
@@ -4304,8 +4317,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     let isolated = s.spec.lock().isolation.is_some();
     let mut core = s.core.lock();
     if isolated && !local {
-        let text = format!("Couldn't move to {to}: {} — it goes on here", crate::workspace::slates_move::MoveRefused::Isolated.reported());
-        core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
+        refuse_move(&mut core, MoveNote::Asked, &to, false, &crate::workspace::slates_move::MoveRefused::Isolated.reported());
         core.touch_state();
         return None;
     }
@@ -4322,7 +4334,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
     } else {
         format!("Moving to {to}{into}…")
     };
-    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text });
+    move_noted(&mut core, MoveNote::Asked, Level::Info, text);
     core.touch_state();
     Some(Move { to, cwd, note, picks_up: picks_up && !local, kind: kind.filter(|_| !local), model, local, native: native && local, slates: slates.filter(|_| !local) })
 }
@@ -4378,7 +4390,53 @@ fn branch(s: &Session, files: &Files, words: &str, top: bool, task: Option<&str>
 
 /// How a move is getting on before it starts (its repository being copied there).
 fn moving_note(s: &Session, text: &str) {
-    s.core.lock().upsert("move-pending", None, super::model::Body::Notice { level: Level::Info, text: text.to_owned() });
+    move_noted(&mut s.core.lock(), MoveNote::Latest, Level::Info, text.to_owned());
+}
+
+/// The notices of a session's moves: each move asked keeps one of its own on its timeline (`move-pending-<n>`, n
+/// counting the moves asked from 1), its progress and how it ended said there, so a refusal of each stays and a reader
+/// of the timeline counts them (w-fed-move's finding 3, kiln goal 91: one notice for every move had each refusal
+/// overwrite the last). The latest is the move under way. This machine's alone: none goes along with a move.
+const MOVE_NOTE: &str = "move-pending";
+
+/// Whether event `id` is one of a session's move notices ([`MOVE_NOTE`]), the one before each move kept its own among them.
+fn is_move_note(id: &str) -> bool {
+    id == MOVE_NOTE || id.strip_prefix(MOVE_NOTE).and_then(|n| n.strip_prefix('-')).is_some_and(|n| n.parse::<u64>().is_ok())
+}
+
+/// Which move a notice says something of: a move just asked, which takes a notice of its own, or the latest one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveNote {
+    Asked,
+    Latest,
+}
+
+/// `text` said at `level` in the notice of the move `which` names ([`MOVE_NOTE`]): the latest move's where none was asked yet.
+fn move_noted(core: &mut Core, which: MoveNote, level: Level, text: String) {
+    let asked = core.events().filter(|e| is_move_note(&e.id)).count();
+    let n = match which {
+        MoveNote::Asked => asked.saturating_add(1),
+        MoveNote::Latest => asked.max(1),
+    };
+    core.upsert(&format!("{MOVE_NOTE}-{n}"), None, super::model::Body::Notice { level, text });
+}
+
+/// How many of a session's moves its timeline says were refused: each its own notice, said as a warning.
+fn refused_moves(core: &Core) -> usize {
+    core.events().filter(|e| is_move_note(&e.id) && matches!(e.body, Body::Notice { level: Level::Warn, .. })).count()
+}
+
+/// A move that couldn't be, said in the notice of the move `which` names, with its count among the session's refused
+/// moves: the session goes on here.
+fn refuse_move(core: &mut Core, which: MoveNote, to: &str, local: bool, why: &str) {
+    let latest_refused = which == MoveNote::Latest && core.events().rfind(|e| is_move_note(&e.id)).is_some_and(|e| matches!(e.body, Body::Notice { level: Level::Warn, .. }));
+    let count = refused_moves(core).saturating_add(usize::from(!latest_refused));
+    let text = if local {
+        format!("This machine's newer kiln runner couldn't take this agent over: {why} — it goes on here (refused move {count})")
+    } else {
+        format!("Couldn't move to {to}: {why} — it goes on here (refused move {count})")
+    };
+    move_noted(core, which, Level::Warn, text);
 }
 
 /// How long a session leaving may take to get its folder's last changes into the sync log.
@@ -4708,12 +4766,7 @@ fn move_failed(s: &Session, mv: &Move, why: &str) {
     let mut core = s.core.lock();
     core.hold = false;
     core.touch_state();
-    let text = if mv.local {
-        format!("This machine's newer kiln runner couldn't take this agent over: {why} — it goes on here")
-    } else {
-        format!("Couldn't move to {}: {why} — it goes on here", mv.to)
-    };
-    core.upsert("move-pending", None, super::model::Body::Notice { level: Level::Warn, text });
+    refuse_move(&mut core, MoveNote::Latest, &mv.to, mv.local, why);
 }
 
 /// Hand the session to this machine's newer runner process (its turn is over, its harness down),
@@ -4767,7 +4820,7 @@ where
     let (events, state, cwd) = {
         let core = s.core.lock();
         // The note that it was about to go is this process's alone.
-        (core.events().filter(|e| e.id != "move-pending").cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone())
+        (core.events().filter(|e| !is_move_note(&e.id)).cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone())
     };
     let carry = match kind.protocol {
         super::kinds::Protocol::Acp(_) | super::kinds::Protocol::AgyStreamJson => {
@@ -4893,7 +4946,7 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     let (events, mut state, from_cwd, session) = {
         let core = s.core.lock();
         // The note that it was about to move is this machine's alone.
-        (core.events().filter(|e| e.id != "move-pending").cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone(), core.state.harness_session.clone())
+        (core.events().filter(|e| !is_move_note(&e.id)).cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone(), core.state.harness_session.clone())
     };
     let mut note = format!("This conversation moved from {me} (where it worked in {from_cwd}) to {} (it works in {} now).", mv.to, mv.cwd);
     if let Some(n) = &mv.note {
@@ -5830,7 +5883,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 // It can't be handed over: stopped, so the next image starts it again
                                 // (its conversation goes on) without two of it running.
                                 p.terminate(Duration::from_secs(2));
-                                let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                                let within = ended_within(s.spec.lock().container.is_some());
+                                let _ = crate::rt::timeout(within, &mut p.exit).await;
                                 *s.pid.lock() = None;
                                 keep_ran_in(&s, &files, kept_in.as_deref()).await;
                                 s.ended_run(None, p.boundary());
@@ -5906,6 +5960,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             })
                             .await;
                             p.terminate(Duration::from_secs(3));
+                            // A container's run ends only once its container is let go: read ended after that.
+                            if s.spec.lock().container.is_some() {
+                                let _ = crate::rt::timeout(ended_within(true), &mut p.exit).await;
+                            }
                             *s.pid.lock() = None;
                             keep_ran_in(&s, &files, kept_in.as_deref()).await;
                             s.ended_run(None, p.boundary());
@@ -5994,12 +6052,14 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     if rewind_to.is_some() {
                         p.terminate(Duration::from_secs(2));
-                        let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        let within = ended_within(s.spec.lock().container.is_some());
+                        let _ = crate::rt::timeout(within, &mut p.exit).await;
                         break;
                     }
                     if forcing {
                         p.terminate(Duration::from_secs(2));
-                        let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                        let within = ended_within(s.spec.lock().container.is_some());
+                        let _ = crate::rt::timeout(within, &mut p.exit).await;
                         ending = true;
                         break;
                     }
@@ -6053,7 +6113,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         p.stdin.close();
                         if crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await.is_err() {
                             p.terminate(Duration::from_secs(2));
-                            let _ = crate::rt::timeout(Duration::from_secs(5), &mut p.exit).await;
+                            let within = ended_within(s.spec.lock().container.is_some());
+                            let _ = crate::rt::timeout(within, &mut p.exit).await;
                         }
                         ending = true;
                         break;
@@ -6517,6 +6578,17 @@ mod in_microvm_alone_tests {
 #[cfg(test)]
 mod tests {
     use crate::util::Must as _;
+
+    /// W9 (w-k90-containers' r49: a session read ended while its container was still listed). Do: compare how long a
+    /// container session waits for its run's exit with what its container's release may take at most (its engine
+    /// volume's removal tried `VOLUME_RM_TRIES` times, `VOLUME_RM_PAUSE_LIVE` apart, beside the container's own removal).
+    /// Expect the wait the longer by a margin, and a process's wait as before.
+    #[test]
+    fn w9_a_container_session_waits_out_its_containers_release_before_it_reads_ended() {
+        let release = crate::workspace::container::VOLUME_RM_PAUSE_LIVE * crate::workspace::container::VOLUME_RM_TRIES;
+        assert!(ended_within(true) >= release * 4 + Duration::from_secs(20), "{:?} vs {release:?}", ended_within(true));
+        assert_eq!(ended_within(false), Duration::from_secs(5));
+    }
 
     /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17 (goal 65's finding): what a microVM's run keeps
     /// beside its person's volume names the Agentfile its conversation ran in, at its version, and its
@@ -8956,5 +9028,43 @@ sys.exit(1)
         assert_eq!(read_tail(&f, Some(100)), Some(("one\ntwo\n".to_owned(), 8, false)));
         std::fs::remove_dir_all(dir.parent().unwrap_or(&dir))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod move_note_tests {
+    use super::*;
+
+    fn notices(core: &Core) -> Vec<(String, String)> {
+        core.events()
+            .filter_map(|e| match &e.body {
+                Body::Notice { text, .. } if is_move_note(&e.id) => Some((e.id.clone(), text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// w-fed-move's finding 3 (kiln goal 91's live move, 2026-11-20): each move asked keeps its own notice, its progress
+    /// and how it ended said there, so identical refusals stay one each, counted, and a reader of the timeline counts
+    /// them; the latest is the move under way. Do: ask a move, refuse it, ask again, refuse it the same way, ask a third
+    /// time and move on. Expect: three notices; the two refusals each kept, word for word but their counts 1 and 2; the
+    /// third the move's progress.
+    #[test]
+    fn fed_move_each_refused_move_keeps_its_own_notice_with_its_count() {
+        let mut core = Core::new();
+        let why = "Slates refused the move: unplaced [kind: unplaced]";
+        for _ in 0..2 {
+            move_noted(&mut core, MoveNote::Asked, Level::Info, "Moving to b…".to_owned());
+            move_noted(&mut core, MoveNote::Latest, Level::Info, "Moving to b: its workspace volume moves there first".to_owned());
+            refuse_move(&mut core, MoveNote::Latest, "b", false, why);
+        }
+        move_noted(&mut core, MoveNote::Asked, Level::Info, "Moving to b…".to_owned());
+        let said: Vec<String> = notices(&core).into_iter().map(|(_, text)| text).collect();
+        assert_eq!(
+            said,
+            [format!("Couldn't move to b: {why} — it goes on here (refused move 1)"), format!("Couldn't move to b: {why} — it goes on here (refused move 2)"), "Moving to b…".to_owned()],
+            "one notice for each move asked, each refusal kept with its count"
+        );
+        assert_eq!(refused_moves(&core), 2);
     }
 }

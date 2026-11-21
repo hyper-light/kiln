@@ -53,6 +53,34 @@ pub enum Handoff {
   Name(String),
 }
 
+/// Removes the name a handed-off object is opened by, so the object lives only as long as its holders (w-sizing, found
+/// by use on 2026-11-20). macOS keeps a shared-memory object while its name exists, whoever holds it, and only its
+/// creator unlinks the name, on drop: an anchor killed with `SIGKILL` never drops, so its segment and content object
+/// (45.9 GB and 146.0 GB of address space on the 96 GB Studio) stayed in the kernel with every page the daemon had
+/// dirtied, until reboot. Four killed anchors held 21 GB of the big Studio's memory with no process alive. A daemon
+/// whose anchor is gone calls this for the anchor's objects as it leaves: nobody adopts them after the anchor (a new
+/// anchor creates its own under a new name). Linux hands objects by descriptor and Windows' sections close with their
+/// last handle, so there is no name to remove there. A name already gone is no refusal.
+#[cfg(target_os = "macos")]
+pub fn unlink_handoff(handoff: &Handoff) -> Result<(), MemError> {
+  match handoff {
+    Handoff::Name(name) => match rustix::shm::unlink(name.as_str()) {
+      Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+      Err(errno) => Err(MemError::OsRefused {
+        call: "shm_unlink",
+        code: Some(errno.raw_os_error()),
+      }),
+    },
+    Handoff::Descriptor(_) => Ok(()),
+  }
+}
+
+/// [`unlink_handoff`] where an object has no name that outlives its holders: nothing to remove.
+#[cfg(not(target_os = "macos"))]
+pub fn unlink_handoff(_handoff: &Handoff) -> Result<(), MemError> {
+  Ok(())
+}
+
 /// A shared memory object and its full view, reached by copy and through its declared words.
 pub struct SharedObject {
   inner: platform::Inner,
@@ -170,6 +198,24 @@ impl SharedObject {
   /// Whether the map is empty.
   pub fn is_empty(&self) -> bool {
     self.len == 0
+  }
+
+  /// What of `len` bytes at `offset` is in RAM, and written where the OS says ([`crate::resident::of_range`], A-744),
+  /// pages of `page` bytes: the kernel's page table read, no byte of the object touched, nothing suspended (the daemon's
+  /// own memory report, §4.14). Refused `OutOfRange` past the object's end.
+  pub fn residency(
+    &self,
+    offset: usize,
+    len: usize,
+    page: usize,
+  ) -> Result<crate::resident::Residency, MemError> {
+    if offset.checked_add(len).is_none_or(|end| end > self.len) {
+      return Err(MemError::OutOfRange {
+        offset,
+        len: self.len,
+      });
+    }
+    crate::resident::of_range(self.inner.base().wrapping_add(offset), len, page)
   }
 
   /// Copies the `into.len()` bytes at `offset` out, for the side that owns them under the layout's
@@ -437,6 +483,13 @@ impl SparseObject {
     })
   }
 
+  /// A borrow of the object's descriptor, for an anchor handing it to a process that proved the issuer's secret over its
+  /// issuer route (A-754, Linux's `SCM_RIGHTS`). Unix only; no reference to the bytes is formed.
+  #[cfg(unix)]
+  pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.inner.as_fd()
+  }
+
   /// The owned Windows section's handle value, borrowed until an acknowledged duplicate or receive view is made.
   #[cfg(windows)]
   pub fn handle_value(&self) -> Result<u64, MemError> {
@@ -490,6 +543,21 @@ impl SparseObject {
   /// Whether the map is empty.
   pub fn is_empty(&self) -> bool {
     self.len == 0
+  }
+  /// What of `len` bytes at `offset` is in RAM, and written where the OS says ([`crate::resident::of_range`], A-744):
+  /// the kernel's page table read, no byte of the object touched. Refused `OutOfRange` past the object's end.
+  pub fn residency(
+    &self,
+    offset: usize,
+    len: usize,
+  ) -> Result<crate::resident::Residency, MemError> {
+    if offset.checked_add(len).is_none_or(|end| end > self.len) {
+      return Err(MemError::OutOfRange {
+        offset,
+        len: self.len,
+      });
+    }
+    crate::resident::of_range(self.inner.base().wrapping_add(offset), len, self.page)
   }
 
   /// Copies the `into.len()` bytes at `offset` out (committed first); refused past the end or touching a

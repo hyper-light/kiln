@@ -14,10 +14,10 @@ use std::fmt::Debug;
 use std::ops::Bound;
 
 /// All the room there is, for the tests that are not about the bound.
-const ALL_ROOM: usize = usize::MAX;
+pub(crate) const ALL_ROOM: usize = usize::MAX;
 
 /// A transaction name of the form §4.17.4 item 3.1 gives: the base revision, `-`, and a work's id in base 36.
-const TRANSACTION: &str = "0-1z";
+pub(crate) const TRANSACTION: &str = "0-1z";
 
 /// A text named by one byte.
 fn text(mark: u8) -> Text {
@@ -182,15 +182,7 @@ fn revision_zero_is_an_empty_root_that_is_its_own_copy_root() {
   let index = Index::new();
   assert_eq!(index.youngest(), 0);
   let root = at(&index, "/", 0);
-  assert_eq!(root.kind(), NodeKind::Directory);
-  assert_eq!((root.created_path(), root.created_revision()), ("/", 0));
-  assert_eq!(root.copy_root(), root.id());
-  assert_eq!((root.predecessor(), root.predecessor_count()), (None, 0));
-  assert_eq!((root.node_id(), root.copy_id()), (ROOT_NODE, ROOT_COPY));
-  assert_eq!(
-    (root.text(), root.properties(), root.mergeinfo_count()),
-    (None, PropertyList::Empty, 0)
-  );
+  assert_an_empty_root_that_is_its_own_copy_root(&root);
   assert_eq!(
     index.history("/").unwrap(),
     &[HistoryEntry {
@@ -239,12 +231,13 @@ fn a_change_makes_a_new_node_revision_of_every_directory_above_it_and_none_besid
   let mut index = trunk();
   let before = at(&index, "/trunk/lib", 1).id();
   commit(&mut index, vec![edit("/trunk/lib/a.c", 3)]);
-  for path in ["/", "/trunk", "/trunk/lib", "/trunk/lib/a.c"] {
-    assert_eq!(index.created_revision(path, 2).unwrap(), Some(2), "{path}");
-  }
-  for path in ["/branches", "/trunk/README"] {
-    assert_eq!(index.created_revision(path, 2).unwrap(), Some(1), "{path}");
-  }
+  assert_created_in(
+    &index,
+    &["/", "/trunk", "/trunk/lib", "/trunk/lib/a.c"],
+    2,
+    2,
+  );
+  assert_created_in(&index, &["/branches", "/trunk/README"], 2, 1);
   let lib = at(&index, "/trunk/lib", 2);
   assert_eq!(
     (lib.predecessor(), lib.predecessor_count()),
@@ -283,21 +276,10 @@ fn a_path_beneath_a_copy_is_its_sources_node_revision_until_it_changes_there() {
   );
   let (branch_id, _, branch_copy) = identities(&index, "/branches/b1", 2);
   commit(&mut index, vec![edit("/branches/b1/lib/a.c", 4)]);
-  let changed = at(&index, "/branches/b1/lib/a.c", 3);
-  assert_eq!(
-    (changed.created_path(), changed.created_revision()),
-    ("/branches/b1/lib/a.c", 3)
-  );
-  assert_eq!(
-    (changed.node_id(), changed.predecessor()),
-    (source_line, Some(source_id))
-  );
-  assert_eq!(changed.copy_id(), branch_copy);
-  assert_eq!(changed.copy_root(), branch_id);
-  let lib = at(&index, "/branches/b1/lib", 3);
-  assert_eq!(
-    (lib.created_path(), lib.copy_id(), lib.copy_root()),
-    ("/branches/b1/lib", branch_copy, branch_id)
+  assert_a_new_node_revision_on_the_branch(
+    &index,
+    (source_id, source_line),
+    (branch_id, branch_copy),
   );
   assert_eq!(
     index
@@ -563,6 +545,71 @@ fn mergeinfo_counts_every_node_holding_it_at_and_beneath_a_directory() {
   assert_eq!(counts(&index, 7, &["/trunk", "/"]), [0, 0]);
 }
 
+/// After an edit on branch b1 in revision 3: its `lib/a.c` is a new node-revision of the source's line (`source`: the
+/// source's node-revision and node identities), with b1's copy identity and b1 as its copy root (`branch`: b1's
+/// node-revision and copy identities), and so is its `lib` directory.
+fn assert_a_new_node_revision_on_the_branch(
+  index: &Index,
+  (source_id, source_line): (NodeRevisionId, NodeId),
+  (branch_id, branch_copy): (NodeRevisionId, CopyId),
+) {
+  let changed = at(index, "/branches/b1/lib/a.c", 3);
+  assert_eq!(
+    (changed.created_path(), changed.created_revision()),
+    ("/branches/b1/lib/a.c", 3)
+  );
+  assert_eq!(
+    (changed.node_id(), changed.predecessor()),
+    (source_line, Some(source_id))
+  );
+  assert_eq!(changed.copy_id(), branch_copy);
+  assert_eq!(changed.copy_root(), branch_id);
+  let lib = at(index, "/branches/b1/lib", 3);
+  assert_eq!(
+    (lib.created_path(), lib.copy_id(), lib.copy_root()),
+    ("/branches/b1/lib", branch_copy, branch_id)
+  );
+}
+
+/// `/d/f` replaced in revision 5 by a copy of its revision 2 shares an ancestor with revision 2, while the plain re-add
+/// of revision 4 is unrelated to it.
+fn assert_the_replacement_by_copy_relates_and_the_re_add_does_not(index: &Index) {
+  assert_eq!(at(index, "/d/f", 5).copy_from(), Some(("/d/f", 2)));
+  assert_eq!(
+    index.relation(("/d/f", 5), ("/d/f", 2)).unwrap(),
+    NodeRelation::CommonAncestor
+  );
+  assert_eq!(
+    index.relation(("/d/f", 4), ("/d/f", 2)).unwrap(),
+    NodeRelation::Unrelated
+  );
+}
+
+/// Revision zero's root as FSFS makes it: a directory created at `/` in revision 0, its own copy root, with no
+/// predecessor, the root's node and copy identities, and no text, properties or mergeinfo.
+fn assert_an_empty_root_that_is_its_own_copy_root(root: &Node<'_>) {
+  assert_eq!(root.kind(), NodeKind::Directory);
+  assert_eq!((root.created_path(), root.created_revision()), ("/", 0));
+  assert_eq!(root.copy_root(), root.id());
+  assert_eq!((root.predecessor(), root.predecessor_count()), (None, 0));
+  assert_eq!((root.node_id(), root.copy_id()), (ROOT_NODE, ROOT_COPY));
+  assert_eq!(
+    (root.text(), root.properties(), root.mergeinfo_count()),
+    (None, PropertyList::Empty, 0)
+  );
+}
+
+/// The revision each of `paths` was last created in, as of `revision`, is `created`.
+fn assert_created_in(index: &Index, paths: &[&str], revision: Revision, created: Revision) {
+  for path in paths {
+    assert_eq!(
+      index.created_revision(path, revision).unwrap(),
+      Some(created),
+      "{path}"
+    );
+  }
+}
+
 /// A-553 (§4.17.4 item 2, "History"): a path's history lists every node-revision created at it and every deletion of
 /// it, a replacement once; a directory's lists every revision that changed anything beneath it.
 #[test]
@@ -589,16 +636,90 @@ fn a_history_list_holds_every_creation_and_deletion_at_its_path() {
   assert_eq!(revisions(index.history("/").unwrap()), [0, 1, 2, 3, 4, 5]);
   assert_eq!(index.created_revision("/d/f", 3).unwrap(), None);
   assert_eq!(index.created_revision("/d/f", 4).unwrap(), Some(4));
-  assert_eq!(at(&index, "/d/f", 5).copy_from(), Some(("/d/f", 2)));
+  assert_the_replacement_by_copy_relates_and_the_re_add_does_not(&index);
+  assert!(index.history("/never").unwrap().is_empty());
+}
+
+/// A-652 (`tree.c` `copy_helper`, `dag.c` `svn_fs_fs__dag_copy`): do replace `/trunk/README` by a copy of the very
+/// node-revision it holds, then `/trunk` by a copy of its own, a revision each, the deletion first as `svnadmin load` and
+/// a client's `delete-entry` then `add-file` make it. Expect each a copy, as FSFS makes one once its destination holds
+/// no node: its source's line, a fresh copy identity, its own copy root, the node-revision it replaced its predecessor
+/// and one more predecessor, created in its revision, related to what it replaced, and what stood beneath the directory
+/// standing beneath it again as the same node-revisions.
+#[test]
+fn a_replacement_by_a_copy_of_the_node_it_replaces_is_a_copy() {
+  let mut index = trunk();
+  let file = at(&index, "/trunk/README", 1);
+  let (file_id, file_line, file_copy, file_count) = (
+    file.id(),
+    file.node_id(),
+    file.copy_id(),
+    file.predecessor_count(),
+  );
+  let second = commit(
+    &mut index,
+    vec![replaced_by_copy(
+      "/trunk/README",
+      NodeKind::File,
+      "/trunk/README",
+      1,
+    )],
+  );
+  assert_a_copy_of(
+    &index,
+    "/trunk/README",
+    second,
+    (file_id, file_line, file_copy, file_count),
+  );
   assert_eq!(
-    index.relation(("/d/f", 5), ("/d/f", 2)).unwrap(),
+    index
+      .relation(("/trunk/README", second), ("/trunk/README", 1))
+      .unwrap(),
     NodeRelation::CommonAncestor
   );
-  assert_eq!(
-    index.relation(("/d/f", 4), ("/d/f", 2)).unwrap(),
-    NodeRelation::Unrelated
+  let directory = at(&index, "/trunk", second);
+  let replaced = (
+    directory.id(),
+    directory.node_id(),
+    directory.copy_id(),
+    directory.predecessor_count(),
   );
-  assert!(index.history("/never").unwrap().is_empty());
+  let a_c = at(&index, "/trunk/lib/a.c", second).id();
+  let third = commit(
+    &mut index,
+    vec![replaced_by_copy(
+      "/trunk",
+      NodeKind::Directory,
+      "/trunk",
+      second,
+    )],
+  );
+  assert_a_copy_of(&index, "/trunk", third, replaced);
+  assert_eq!(at(&index, "/trunk/lib/a.c", third).id(), a_c);
+  assert_eq!(
+    revisions(index.history("/trunk/README").unwrap()),
+    [1, second]
+  );
+}
+
+/// The node at `path` in `revision` is a copy made in that revision of the node-revision `replaced` names (its id, node
+/// identity, copy identity and predecessor count), copied from its own path in the revision before.
+fn assert_a_copy_of(
+  index: &Index,
+  path: &str,
+  revision: Revision,
+  (id, line, copy, count): (NodeRevisionId, NodeId, CopyId, u64),
+) {
+  let node = at(index, path, revision);
+  assert_eq!((node.node_id(), node.predecessor()), (line, Some(id)));
+  assert_ne!(node.copy_id(), copy);
+  assert_eq!(node.copy_root(), node.id());
+  assert_eq!(node.predecessor_count(), count + 1);
+  assert_eq!(
+    (node.created_path(), node.created_revision()),
+    (path, revision)
+  );
+  assert_eq!(node.copy_from(), Some((path, revision - 1)));
 }
 
 /// A-553 (module documentation, "Reading"): a deleted directory leaves nothing beneath it, a later copy over the same
@@ -795,13 +916,6 @@ fn a_row_its_revision_cannot_hold_is_refused_and_changes_nothing() {
       160_004,
     ),
     (
-      vec![replaced_by_copy("/trunk", directory, "/trunk", 1)],
-      IndexRefusal::CopyOntoItself {
-        path: "/trunk".to_owned(),
-      },
-      160_004,
-    ),
-    (
       vec![edit("/trunk/README", 3), edit("/trunk/README", 4)],
       IndexRefusal::Duplicate {
         path: "/trunk/README".to_owned(),
@@ -926,18 +1040,54 @@ fn a_transaction_name_outside_what_svn_fs_h_promises_is_refused() {
   assert_eq!(index.transaction(2).unwrap(), Some("41-Zz.9"));
 }
 
-/// A-553 (§2 ban 8: every structure has a bound and a typed refusal at it): a revision that would take the index past
-/// the room its caller gives, by one entry, is refused and changes nothing; the same revision with exactly the room
-/// it needs is accepted. The edit makes four node-revisions: the file, its two directories and the root.
+/// The entries `record` would make `index` hold: what its plan with no room is refused naming.
+fn needed_by(index: &Index, record: RevisionRecord) -> usize {
+  match index.plan(record, 0).unwrap_err() {
+    IndexRefusal::Room { needed, .. } => needed,
+    other => panic!("{other:?}"),
+  }
+}
+
+/// A deletion, which changes its parent's map, needs more than its own entries past `needed`: refused one entry short
+/// of them, accepted with exactly them.
+fn assert_a_deletion_refused_one_entry_past_its_room(index: &mut Index, needed: usize) {
+  let deletion = RevisionRecord {
+    transaction: TRANSACTION.to_owned(),
+    changes: vec![deleted("/trunk/README", NodeKind::File)],
+  };
+  let after_deletion = needed_by(index, deletion.clone());
+  assert!(
+    after_deletion > needed + 2 + 1,
+    "the maps uncharged: {after_deletion}"
+  );
+  assert_eq!(
+    index
+      .append(deletion.clone(), after_deletion - 1)
+      .unwrap_err(),
+    IndexRefusal::Room {
+      needed: after_deletion,
+      room: after_deletion - 1
+    }
+  );
+  assert_eq!(index.append(deletion, after_deletion).unwrap(), 3);
+  assert_eq!(index.entries(), after_deletion);
+}
+
+/// A-553 (§2 ban 8: every structure has a bound and a typed refusal at it), with A-759's maps charged: a revision
+/// that would take the index past the room its caller gives, by one entry, is refused and changes nothing; the same
+/// revision with exactly the room it needs is accepted. The edit makes four node-revisions (the file, its two
+/// directories and the root) and changes the three directories' children maps, whose bytes are charged too, so it
+/// needs more than four entries; so does a deletion, which changes its parent's map.
 #[test]
 fn an_index_that_would_outgrow_its_room_is_refused_one_entry_past_it() {
   let mut index = trunk();
-  let needed = index.entries() + 4;
-  let before = format!("{index:?}");
   let record = || RevisionRecord {
     transaction: TRANSACTION.to_owned(),
     changes: vec![edit("/trunk/lib/a.c", 3)],
   };
+  let needed = needed_by(&index, record());
+  assert!(needed > index.entries() + 4, "the maps uncharged: {needed}");
+  let before = format!("{index:?}");
   let refusal = index.append(record(), needed - 1).unwrap_err();
   assert_eq!(
     refusal,
@@ -950,21 +1100,7 @@ fn an_index_that_would_outgrow_its_room_is_refused_one_entry_past_it() {
   assert_eq!(format!("{index:?}"), before);
   assert_eq!(index.append(record(), needed).unwrap(), 2);
   assert_eq!(index.entries(), needed);
-  let deletion = RevisionRecord {
-    transaction: TRANSACTION.to_owned(),
-    changes: vec![deleted("/trunk/README", NodeKind::File)],
-  };
-  let after_deletion = needed + 2 + 1;
-  assert_eq!(
-    index
-      .append(deletion.clone(), after_deletion - 1)
-      .unwrap_err(),
-    IndexRefusal::Room {
-      needed: after_deletion,
-      room: after_deletion - 1
-    }
-  );
-  assert_eq!(index.append(deletion, after_deletion).unwrap(), 3);
+  assert_a_deletion_refused_one_entry_past_its_room(&mut index, needed);
 }
 
 /// A-553: a node-revision another index made, or none made, is refused as `SVN_ERR_FS_ID_NOT_FOUND`; a relation to
@@ -1002,10 +1138,10 @@ const COPY_CAP: usize = 24;
 /// A node-revision of the naive filesystem, held as FSFS holds one (`structure` 551-588): identities as revision and
 /// number, the copy root as a revision and a path.
 #[derive(Clone, Debug)]
-struct NaiveNode {
-  kind: NodeKind,
-  node_id: (Revision, u64),
-  copy_id: (Revision, u64),
+pub(crate) struct NaiveNode {
+  pub(crate) kind: NodeKind,
+  pub(crate) node_id: (Revision, u64),
+  pub(crate) copy_id: (Revision, u64),
   created_path: String,
   created_revision: Revision,
   predecessor: Option<usize>,
@@ -1013,7 +1149,7 @@ struct NaiveNode {
   copy_from: Option<(String, Revision)>,
   copy_root: (Revision, String),
   text: Option<Text>,
-  properties: PropertyList,
+  pub(crate) properties: PropertyList,
 }
 
 /// How a naive clone took its copy identity (`tree.c` `copy_id_inherit_t`).
@@ -1026,7 +1162,7 @@ enum Way {
 
 /// What a history met, so the oracle can show each rule it compared was exercised.
 #[derive(Clone, Copy, Debug, Default)]
-struct Census {
+pub(crate) struct Census {
   /// Clones that kept their copy identity.
   kept: usize,
   /// Clones that took their parent's copy identity where it differed from their own: lazy copies.
@@ -1036,9 +1172,10 @@ struct Census {
   /// Copies, and copies into their own source's subtree.
   copies: usize,
   self_copies: usize,
-  /// Deletions and replacements.
+  /// Deletions and replacements, and replacements by a copy of the very node-revision they replace.
   deletions: usize,
   replacements: usize,
+  replaced_by_itself: usize,
   /// Revisions with no rows.
   empty: usize,
   /// Index answers created at another path than the one asked: paths beneath a copy.
@@ -1053,6 +1190,9 @@ struct Census {
   /// transaction already cloned with another copy identity, which the other order compares against the parent's old
   /// node-revision (`get_copy_inheritance`'s comparison of the two copy identities).
   sensitive: usize,
+  /// Directory listings holding a name the index never named beneath the directory itself, reached through a copy's
+  /// source (`Index::children`).
+  listed_through_copies: usize,
 }
 
 impl Census {
@@ -1065,11 +1205,13 @@ impl Census {
     self.self_copies += other.self_copies;
     self.deletions += other.deletions;
     self.replacements += other.replacements;
+    self.replaced_by_itself += other.replaced_by_itself;
     self.empty += other.empty;
     self.beneath_copies += other.beneath_copies;
     self.mergeinfo_beneath += other.mergeinfo_beneath;
     self.reordered += other.reordered;
     self.sensitive += other.sensitive;
+    self.listed_through_copies += other.listed_through_copies;
     for (sum, more) in self.relations.iter_mut().zip(other.relations) {
       *sum += more;
     }
@@ -1116,15 +1258,15 @@ fn moved(path: &str, from: &str, to: &str) -> String {
 /// The naive filesystem: every node-revision ever made and every revision's whole tree, path by path; FSFS's operations
 /// applied to them literally (`tree.c`, `dag.c`); and what each revision's deletions removed.
 #[derive(Clone, Debug)]
-struct NaiveFs {
-  nodes: Vec<NaiveNode>,
-  trees: Vec<BTreeMap<String, usize>>,
+pub(crate) struct NaiveFs {
+  pub(crate) nodes: Vec<NaiveNode>,
+  pub(crate) trees: Vec<BTreeMap<String, usize>>,
   deleted: Vec<BTreeMap<String, usize>>,
 }
 
 impl NaiveFs {
   /// Revision 0: the root alone.
-  fn new() -> Self {
+  pub(crate) fn new() -> Self {
     let root = NaiveNode {
       kind: NodeKind::Directory,
       node_id: (0, 0),
@@ -1151,9 +1293,16 @@ impl NaiveFs {
   }
 
   /// A transaction on the youngest revision, its root already a new node-revision (`create_new_txn_noderev_from_rev`).
-  fn begin(&mut self) -> Txn<'_> {
+  pub(crate) fn begin(&mut self) -> Txn<'_> {
+    let youngest = u64::try_from(self.trees.len() - 1).unwrap();
+    self.begin_on(youngest)
+  }
+
+  /// A transaction on revision `base`, its root already a new node-revision of `base`'s root, numbered as the next
+  /// revision so that no identity it makes equals one a revision holds: a work's transaction on its base (A-592).
+  pub(crate) fn begin_on(&mut self, base: Revision) -> Txn<'_> {
     let revision = u64::try_from(self.trees.len()).unwrap();
-    let mut tree = self.trees.last().unwrap().clone();
+    let mut tree = self.trees[usize::try_from(base).unwrap()].clone();
     let old_root = tree["/"];
     let mut root = self.nodes[old_root].clone();
     root.predecessor = Some(old_root);
@@ -1204,7 +1353,7 @@ type Opened = (String, Option<usize>, Way);
 
 /// A transaction of the naive filesystem: its tree as it stands, the node-revisions it made, and what its deletions
 /// removed.
-struct Txn<'fs> {
+pub(crate) struct Txn<'fs> {
   fs: &'fs mut NaiveFs,
   revision: Revision,
   tree: BTreeMap<String, usize>,
@@ -1217,10 +1366,15 @@ struct Txn<'fs> {
 
 impl Txn<'_> {
   /// Makes the transaction the next revision; answers what it met.
-  fn commit(self) -> Census {
+  pub(crate) fn commit(self) -> Census {
     self.fs.trees.push(self.tree);
     self.fs.deleted.push(self.deleted);
     self.census
+  }
+
+  /// The transaction's tree as it stands, never committed: what A-592's oracle merges.
+  pub(crate) fn into_tree(self) -> BTreeMap<String, usize> {
+    self.tree
   }
 
   /// Keeps a node-revision this transaction made.
@@ -1350,6 +1504,12 @@ impl Txn<'_> {
       }
       Action::Replace => {
         self.census.replacements += 1;
+        let replaced = self.tree[&change.path];
+        if let Some(source) = &change.copy_from
+          && self.fs.at(source.revision, &source.path) == replaced
+        {
+          self.census.replaced_by_itself += 1;
+        }
         self.delete(&change.path);
         self.add(change);
       }
@@ -1448,7 +1608,7 @@ impl Txn<'_> {
 
 /// One generated wish for a revision; a transaction turns it into a row when its tree allows one, else drops it.
 #[derive(Clone, Copy, Debug)]
-struct Wish {
+pub(crate) struct Wish {
   op: u8,
   place: u16,
   source: u16,
@@ -1459,7 +1619,7 @@ struct Wish {
 }
 
 /// Any wish.
-fn wish() -> impl Strategy<Value = Wish> {
+pub(crate) fn wish() -> impl Strategy<Value = Wish> {
   (
     any::<u8>(),
     any::<u16>(),
@@ -1482,7 +1642,7 @@ fn wish() -> impl Strategy<Value = Wish> {
 
 /// Histories of up to nine revisions of up to six wishes each, and the priorities that rank a revision's rows in a
 /// drive order.
-fn histories() -> impl Strategy<Value = (Vec<Vec<Wish>>, Vec<u32>)> {
+pub(crate) fn histories() -> impl Strategy<Value = (Vec<Vec<Wish>>, Vec<u32>)> {
   (
     prop::collection::vec(prop::collection::vec(wish(), 0..7), 1..10),
     prop::collection::vec(any::<u32>(), 1..24),
@@ -1500,7 +1660,7 @@ fn pick<T: Clone>(choices: &[T], pick: u16) -> Option<T> {
 
 impl Txn<'_> {
   /// The rows a revision's wishes make, each applied as it is made: generation is itself one drive order.
-  fn rows_from(&mut self, wishes: &[Wish]) -> Vec<ChangedPath> {
+  pub(crate) fn rows_from(&mut self, wishes: &[Wish]) -> Vec<ChangedPath> {
     let mut rows: Vec<ChangedPath> = Vec::new();
     for wish in wishes {
       if let Some(row) = self.row_for(wish, &rows) {
@@ -1585,7 +1745,7 @@ impl Txn<'_> {
   /// A copy of a path of an earlier revision, of at most `COPY_CAP` paths, at a free place or over `replacing`.
   fn copy_of(&self, wish: &Wish, path: String, action: Action) -> Option<ChangedPath> {
     let revision = u64::from(wish.from) % self.revision;
-    let tree = &self.fs.trees[usize::try_from(revision).unwrap()];
+    let tree = self.fs.trees.get(usize::try_from(revision).ok()?)?;
     let sources: Vec<&String> = tree.keys().collect();
     let source = pick(&sources, wish.source)?.clone();
     if tree
@@ -1626,14 +1786,12 @@ impl Txn<'_> {
     Some(deleted(&path, self.kind(&path)))
   }
 
-  /// A replacement of an untouched path by a new node or by a copy that does not land on its own node-revision.
+  /// A replacement of an untouched path by a new node or by a copy, its own node-revision's among them (A-652): the
+  /// deletion comes first, so FSFS's `copy_helper` finds no node at the destination and copies.
   fn replacement(&self, wish: &Wish, rows: &[ChangedPath]) -> Option<ChangedPath> {
     let path = self.untouched(wish, rows)?;
     if wish.flags & 16 != 0 {
-      let row = self.copy_of(wish, path.clone(), Action::Replace)?;
-      let source = row.copy_from.as_ref()?;
-      let same = self.fs.at(source.revision, &source.path) == self.tree[&path];
-      return (!same).then_some(row);
+      return self.copy_of(wish, path, Action::Replace);
     }
     let kind = if wish.flags & 32 != 0 {
       NodeKind::Directory
@@ -1819,7 +1977,7 @@ impl Pairings {
 
 /// The naive answer at `path` in `revision`, if present.
 fn naive_answer(fs: &NaiveFs, path: &str, revision: Revision) -> Option<Answer> {
-  let label = *fs.trees[usize::try_from(revision).unwrap()].get(path)?;
+  let label = *fs.trees.get(usize::try_from(revision).ok()?)?.get(path)?;
   let node = &fs.nodes[label];
   Some(Answer {
     label,
@@ -1840,11 +1998,14 @@ fn naive_answer(fs: &NaiveFs, path: &str, revision: Revision) -> Option<Answer> 
   })
 }
 
-/// The index's answer at `path` in `revision`, if present.
-fn index_answer(index: &Index, path: &str, revision: Revision) -> Option<Answer> {
-  let node = index.node(path, revision).unwrap()?;
+/// The index's answer at `path` in `revision`, if present; a refusal of the question is the oracle's failure.
+fn index_answer(index: &Index, path: &str, revision: Revision) -> Result<Option<Answer>, String> {
+  let asked = index.node(path, revision);
+  let Some(node) = asked.map_err(|refusal| format!("{path}@{revision}: {refusal:?}"))? else {
+    return Ok(None);
+  };
   let id = |id: NodeRevisionId| id.0;
-  Some(Answer {
+  Ok(Some(Answer {
     label: id(node.id()),
     node_id: (node.node_id().revision, node.node_id().number),
     copy_id: (node.copy_id().revision, node.copy_id().number),
@@ -1862,7 +2023,7 @@ fn index_answer(index: &Index, path: &str, revision: Revision) -> Option<Answer>
       properties: node.properties(),
       mergeinfo: node.mergeinfo_count(),
     },
-  })
+  }))
 }
 
 /// Every path any revision of `fs` held.
@@ -1876,10 +2037,13 @@ fn every_path(fs: &NaiveFs) -> BTreeSet<String> {
 /// Holds two naive replays of one history equal at every path of every revision.
 fn same_naive(left: &NaiveFs, right: &NaiveFs) -> Result<(), String> {
   let mut pairings = Pairings::new();
-  for (revision, tree) in left.trees.iter().enumerate() {
-    let revision = u64::try_from(revision).unwrap();
+  for (position, tree) in left.trees.iter().enumerate() {
+    let revision = u64::try_from(position).map_err(|error| error.to_string())?;
     let paths: Vec<&String> = tree.keys().collect();
-    let other: Vec<&String> = right.trees[usize::try_from(revision).unwrap()]
+    let other: Vec<&String> = right
+      .trees
+      .get(position)
+      .ok_or_else(|| format!("revision {revision}: absent from the other replay"))?
       .keys()
       .collect();
     if paths != other {
@@ -1888,8 +2052,9 @@ fn same_naive(left: &NaiveFs, right: &NaiveFs) -> Result<(), String> {
       ));
     }
     for path in paths {
-      let first = naive_answer(left, path, revision).unwrap();
-      let second = naive_answer(right, path, revision).unwrap();
+      let absent = || format!("{path}@{revision}: listed and absent");
+      let first = naive_answer(left, path, revision).ok_or_else(absent)?;
+      let second = naive_answer(right, path, revision).ok_or_else(absent)?;
       pairings.same(&first, &second, &format!("{path}@{revision}"))?;
     }
   }
@@ -1923,7 +2088,7 @@ fn same_as_index(index: &Index, fs: &NaiveFs, census: &mut Census) -> Result<(),
     for path in &paths {
       let place = format!("{path}@{revision}");
       match (
-        index_answer(index, path, revision),
+        index_answer(index, path, revision)?,
         naive_answer(fs, path, revision),
       ) {
         (None, None) => {}
@@ -1942,7 +2107,81 @@ fn same_as_index(index: &Index, fs: &NaiveFs, census: &mut Census) -> Result<(),
   for path in &paths {
     same_history(index, fs, path, &mut pairings)?;
   }
+  for revision in 0..=index.youngest() {
+    same_listings(index, fs, revision, census)?;
+  }
   same_relations(index, &places, census)
+}
+
+/// The name of `path` when it stands one level beneath `directory`.
+fn child_name(directory: &str, path: &str) -> Option<String> {
+  let name = path.rsplit('/').next().unwrap_or_default();
+  (path != directory && parent_path(path) == directory).then(|| name.to_owned())
+}
+
+/// Holds every directory's listing in `revision` equal to the naive tree's (the names one level beneath it, in byte
+/// order), a file's and the youngest absent path's none; counts the listings holding a name only a copy's source gave.
+fn same_listings(
+  index: &Index,
+  fs: &NaiveFs,
+  revision: Revision,
+  census: &mut Census,
+) -> Result<(), String> {
+  let tree = &fs.trees[usize::try_from(revision).map_err(|error| error.to_string())?];
+  for (path, &label) in tree {
+    let listed = index
+      .children(path, revision)
+      .map_err(|refusal| format!("{path}@{revision}: {refusal:?}"))?;
+    let expected = (fs.nodes[label].kind == NodeKind::Directory).then(|| {
+      tree
+        .keys()
+        .filter_map(|other| child_name(path, other))
+        .collect::<Vec<_>>()
+    });
+    if listed != expected {
+      return Err(format!(
+        "{path}@{revision}: listed {listed:?}, naive {expected:?}"
+      ));
+    }
+    // A-759: each child's node-revision in the listing is the one its own path resolves to.
+    for (name, id) in index
+      .listing(path, revision)
+      .map_err(|refusal| format!("{path}@{revision}: {refusal:?}"))?
+      .into_iter()
+      .flatten()
+    {
+      let child = if path == "/" {
+        format!("/{name}")
+      } else {
+        format!("{path}/{name}")
+      };
+      let resolved = index
+        .node(&child, revision)
+        .map_err(|refusal| format!("{child}@{revision}: {refusal:?}"))?
+        .map(|node| node.id());
+      if resolved != Some(id) {
+        return Err(format!(
+          "{child}@{revision}: listed {id:?}, resolved {resolved:?}"
+        ));
+      }
+    }
+    let through_copy = listed.iter().flatten().any(|name| {
+      let child = if path == "/" {
+        format!("/{name}")
+      } else {
+        format!("{path}/{name}")
+      };
+      index.history(&child).is_ok_and(<[HistoryEntry]>::is_empty)
+    });
+    census.listed_through_copies += usize::from(through_copy);
+  }
+  let absent = index
+    .children("/never/named", revision)
+    .map_err(|refusal| format!("/never/named@{revision}: {refusal:?}"))?;
+  if absent.is_some() {
+    return Err(format!("/never/named@{revision} listed {absent:?}"));
+  }
+  Ok(())
 }
 
 /// Holds one path's index history equal to its naive history.
@@ -1954,7 +2193,7 @@ fn same_history(
 ) -> Result<(), String> {
   let ours: Vec<(Revision, bool, usize)> = index
     .history(path)
-    .unwrap()
+    .map_err(|refusal| format!("{path}: {refusal:?}"))?
     .iter()
     .map(|entry| match entry.event {
       HistoryEvent::Created(node) => (entry.revision, true, node.0),
@@ -2088,11 +2327,13 @@ fn the_index_equals_a_naive_filesystem_replaying_the_same_revisions() {
     census.self_copies,
     census.deletions,
     census.replacements,
+    census.replaced_by_itself,
     census.empty,
     census.beneath_copies,
     census.mergeinfo_beneath,
     census.reordered,
     census.sensitive,
+    census.listed_through_copies,
   ];
   assert!(
     met.iter().all(|&count| count > 0),
@@ -2102,4 +2343,35 @@ fn the_index_equals_a_naive_filesystem_replaying_the_same_revisions() {
     census.relations.iter().all(|&count| count > 0),
     "a relation never met: {census:?}"
   );
+}
+
+/// A-655 (`Index::plan`, `Index::commit_planned`; `transaction.c` `commit_body` 3784-3786). Do: plan a change of
+/// `/trunk/README` after revision 1, append another revision, then commit the plan; plan the change again and commit
+/// it. Expect: the stale plan refused out of date (`E160028`), the index as the append left it; the fresh plan
+/// committed as revision 3, the index equal to the one `append` makes of the same record.
+#[test]
+fn a_plan_is_refused_once_a_revision_was_appended_after_it() {
+  let mut index = trunk();
+  let record = || RevisionRecord {
+    transaction: TRANSACTION.to_owned(),
+    changes: vec![edit("/trunk/README", 3)],
+  };
+  let stale = index.plan(record(), ALL_ROOM).unwrap();
+  commit(&mut index, vec![edit("/trunk/lib/a.c", 4)]);
+  let before = format!("{index:?}");
+  let refusal = index.commit_planned(stale).unwrap_err();
+  let answered = (refusal.subversion_code(), format!("{index:?}"));
+  assert_eq!(
+    refusal,
+    IndexRefusal::OutOfDate {
+      planned: 2,
+      next: 3
+    }
+  );
+  assert_eq!(answered, (160_028, before));
+  let mut appended = index.clone();
+  let fresh = index.plan(record(), ALL_ROOM).unwrap();
+  assert_eq!(index.commit_planned(fresh), Ok(3));
+  assert_eq!(appended.append(record(), ALL_ROOM), Ok(3));
+  assert_eq!(format!("{index:?}"), format!("{appended:?}"));
 }
