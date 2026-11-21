@@ -268,13 +268,26 @@ fn rehomed_path(path: &str, over: &str, top: &str) -> Option<String> {
 /// its first and every one after, readies its workspace here and nowhere else.
 pub async fn prepare(spec: &mut crate::harness::session::Spec, id: &str) -> anyhow::Result<()> {
     let Some(w) = spec.workspace.clone().filter(|w| w.kind == "volume") else { return Ok(()) };
+    // One its agent has already, on its machine's host: no instance there to make it again in (Slates isn't there, or
+    // its anchor won't start), it goes on in its folder, said in the log, rather than refused at every start (the
+    // person's word, 2026-11-21).
+    if let Some(m) = w.made.as_ref().filter(|m| w.owner.is_none() && spec.isolation.is_none() && !m.mount.is_empty())
+        && let After::Folder(why) = after_restart(slates::ensure_up().await.map_err(|e| format!("{e:#}")))
+    {
+        return in_its_folder(spec, &w, m, id, &why).await;
+    }
     if let Some(m) = w.made.as_ref().filter(|_| w.owner.is_none())
         && slates::gone(m).await?
     {
-        // Its volume went with its machine's Slates instance (the machine started again: a volume lives in its anchor's
-        // memory), and what it changed there with it. It starts again in a new one over its folder as it is now, said
-        // in the log, rather than refused at every start from now on.
-        tracing::warn!(session = %id, volume = %m.volume, "an agent's workspace volume is gone with its machine's Slates instance: it starts in a new one over its folder");
+        // Its volume went with its machine's Slates instance (the machine started again, or its daemon was lost: a volume
+        // lives in its anchor's memory), and what it changed there with it. Whatever of it Slates still holds is
+        // destroyed, so nothing of it lingers half alive, and it starts again in a new one like it (the person's word,
+        // 2026-11-21): over the same folder, at its own place there, the same size, mounted at the same point (its name
+        // is its agent's, and a mount its daemon left there dead is taken down first: `place::ready`), so its folder,
+        // its environment and the project its harness keeps for the folder (a Claude Code conversation's) stay as they
+        // were. Said in the log, rather than refused at every start from now on.
+        slates::destroy_remains(m).await?;
+        tracing::warn!(session = %id, volume = %m.volume, mount = %m.mount, "an agent's workspace volume is gone with its machine's Slates instance, and the changes it held were lost: it starts again in a new one like it, at the same mount");
         if let Some(over) = w.over.as_deref().filter(|_| !m.mount.is_empty()) {
             spec.env = rehomed(&spec.env, &place::top(&m.mount).to_string_lossy(), over);
             spec.cwd = Some(if w.sub.is_empty() { over.to_owned() } else { Path::new(over).join(&w.sub).to_string_lossy().into_owned() });
@@ -345,6 +358,50 @@ pub fn arrived_here(spec: &mut crate::harness::session::Spec) -> bool {
             false
         }
     }
+}
+
+/// What an agent's start does with the volume it has already, given whether its machine's Slates instance answers
+/// (`up`, started where it wasn't: `slates::ensure_up`): its volume used, mounted again or made anew like it where it's
+/// gone ([`prepare`]); or, with no instance to make it in (Slates isn't there, or its anchor won't start), its folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum After {
+    Volume,
+    Folder(String),
+}
+
+fn after_restart(up: Result<(), String>) -> After {
+    match up {
+        Ok(()) => After::Volume,
+        Err(why) => After::Folder(format!("its machine's Slates instance can't start, so its volume can't be made again: {why}")),
+    }
+}
+
+/// Agent `spec`, whose volume `m` (of workspace `w`) it can't work in again for `why`, goes on in the folder the volume
+/// was laid over, its own place there (`over` and `sub`), as no volume can be made for it there now ([`after_restart`]):
+/// its environment moved back off the mount, the mount its daemon left behind taken down where
+/// it's dead (`place::let_go_dead`), and a conversation it goes on with moved to where its harness looks from that folder
+/// (Claude Code's `--resume` looks in the project it keeps for the folder alone: `harness::homes::rehome`), said in the
+/// log.
+async fn in_its_folder(spec: &mut crate::harness::session::Spec, w: &Workspace, m: &slates::Made, id: &str, why: &str) -> anyhow::Result<()> {
+    let over = w.over.clone().ok_or_else(|| anyhow::anyhow!("{why}, and its workspace doesn't say what folder it was laid over"))?;
+    let folder = if w.sub.is_empty() { PathBuf::from(&over) } else { Path::new(&over).join(&w.sub) };
+    anyhow::ensure!(folder.is_dir(), "{why}, and its folder {} isn't a folder on this machine", folder.display());
+    let point = PathBuf::from(&m.mount);
+    crate::rt::blocking(move || place::let_go_dead(&point)).await??;
+    spec.env = rehomed(&spec.env, &place::top(&m.mount).to_string_lossy(), &over);
+    let cwd = folder.to_string_lossy().into_owned();
+    spec.cwd = Some(cwd.clone());
+    spec.workspace = Some(Workspace { kind: "folder".to_owned(), ..Workspace::default() });
+    if let Some(session) = spec.resume.clone() {
+        let (kind, dirs, branch) = (spec.kind.clone(), crate::harness::homes::Dirs::here(&spec.env), spec.fork);
+        let to = cwd.clone();
+        let moved = crate::rt::blocking(move || if branch { crate::harness::homes::rehome_branch(&kind, &dirs, &session, &to) } else { crate::harness::homes::rehome(&kind, &dirs, &session, &to) }).await?;
+        if let Err(not) = moved {
+            anyhow::bail!("{why}, and its conversation's record couldn't be moved to its folder: {not}");
+        }
+    }
+    tracing::warn!(session = %id, volume = %m.volume, folder = %cwd, why, "an agent's workspace volume can't be used again: it goes on in its folder");
+    Ok(())
 }
 
 /// Agent `spec`'s workspace volume as it was placed here, `arrived`: where its mount moved, its folder and its
@@ -727,6 +784,65 @@ mod tests {
 
     fn made(volume: &str, mount: &str) -> slates::Made {
         slates::Made { volume: volume.into(), name: format!("kiln-{volume}"), mount: mount.into(), ..Default::default() }
+    }
+
+    /// The person's word, 2026-11-21: an agent that has a volume, starting again, works in its volume, mounted again or
+    /// made anew like it where it's gone, while its machine's Slates instance answers; with no instance to make it in
+    /// (Slates isn't there, or its anchor won't start), its folder, saying why. Do judge a start whose instance answered
+    /// and one whose instance couldn't start; expect the volume for the first and the folder, naming the cause, for the
+    /// second.
+    #[test]
+    fn w2_an_agent_with_a_volume_starting_again_keeps_a_volume_while_slates_answers_else_its_folder() {
+        assert_eq!(after_restart(Ok(())), After::Volume);
+        let after = after_restart(Err("no daemon at instance kiln".to_owned()));
+        assert!(matches!(&after, After::Folder(why) if why.contains("can't start") && why.contains("no daemon at instance kiln")), "{after:?}");
+    }
+
+    /// The person's word, 2026-11-21: an agent whose volume can't be made again (no Slates instance there to make it in)
+    /// goes on in its folder, its conversation with it. Do hand `in_its_folder` a Claude Code agent working in `src` of a volume laid over a repository, taking up its
+    /// conversation, its transcript in the project Claude Code keeps for the mount's folder and its environment naming
+    /// the mount; expect it in the repository's `src` as a folder, its environment moved back off the mount, its
+    /// transcript in the project Claude Code keeps for that folder (where `--resume` looks), none left in the mount's,
+    /// and nothing made in the mount's place. Without a folder it was laid over, it's refused, saying why.
+    #[test]
+    fn w2_an_agent_whose_volume_cant_be_made_again_goes_on_in_its_folder_with_its_conversation() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let t = tempfile::tempdir()?;
+            let repo = t.path().join("repo");
+            std::fs::create_dir_all(repo.join("src"))?;
+            let mount = t.path().join("workspaces").join("kiln-a");
+            let (repo_s, mount_s) = (repo.to_string_lossy().into_owned(), mount.to_string_lossy().into_owned());
+            let config = t.path().join(".claude");
+            let session = "0e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b";
+            let on_mount = format!("{mount_s}/src");
+            let theirs = crate::harness::handoff::claude_project_dir(&config, &on_mount);
+            std::fs::create_dir_all(&theirs)?;
+            std::fs::write(theirs.join(format!("{session}.jsonl")), "{\"type\":\"user\"}\n")?;
+            let w = Workspace { kind: "volume".into(), over: Some(repo_s.clone()), sub: "src".into(), made: Some(made("a", &mount_s)), ..Workspace::default() };
+            let mut spec = crate::harness::session::Spec {
+                kind: "claude".into(),
+                cwd: Some(on_mount.clone()),
+                resume: Some(session.into()),
+                env: vec![("CLAUDE_CONFIG_DIR".into(), config.to_string_lossy().into_owned()), ("OLDPWD".into(), on_mount.clone())],
+                workspace: Some(w.clone()),
+                ..Default::default()
+            };
+            let m = made("a", &mount_s);
+            in_its_folder(&mut spec, &w, &m, "01a1ffd0", "its volume is gone").await?;
+            let folder = repo.join("src").to_string_lossy().into_owned();
+            anyhow::ensure!(spec.cwd.as_deref() == Some(folder.as_str()), "{:?}", spec.cwd);
+            anyhow::ensure!(spec.workspace == Some(Workspace { kind: "folder".into(), ..Workspace::default() }), "{:?}", spec.workspace);
+            anyhow::ensure!(spec.env.iter().any(|(k, v)| k == "OLDPWD" && *v == folder), "{:?}", spec.env);
+            let ours = crate::harness::handoff::claude_project_dir(&config, &folder);
+            anyhow::ensure!(ours.join(format!("{session}.jsonl")).is_file(), "its transcript where `--resume` looks from its folder");
+            anyhow::ensure!(!theirs.join(format!("{session}.jsonl")).exists(), "one record of it, not two");
+            anyhow::ensure!(!mount.exists(), "nothing made in the mount's place");
+            let mut lost = crate::harness::session::Spec { kind: "claude".into(), ..Default::default() };
+            let bare = Workspace { over: None, ..w.clone() };
+            let refused = in_its_folder(&mut lost, &bare, &m, "01a1ffd0", "its volume is gone").await;
+            anyhow::ensure!(refused.as_ref().is_err_and(|e| e.to_string().contains("what folder it was laid over")), "{refused:?}");
+            Ok(())
+        })
     }
 
     fn volume_at(volume: &str, mount: &str, over: &str) -> Workspace {

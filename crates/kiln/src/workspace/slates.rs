@@ -941,6 +941,20 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     }
 }
 
+/// What Slates still holds of workspace `m`'s volume, gone from its instance ([`gone`]), destroyed, its being missing
+/// there taken as done; and its base let go with it, as [`remove`] lets it go (K5). Refused, typed, otherwise.
+pub async fn destroy_remains(m: &Made) -> anyhow::Result<()> {
+    let id = volume_id(&m.volume)?;
+    match call("destroy", move |i| Ok(i.destroy(id))).await? {
+        Ok(()) | Err(slates_api::Error::NotFound(_)) => {}
+        Err(refused) => anyhow::bail!("Slates refused the destroy of its old volume {}: {refused}", m.volume),
+    }
+    if let Some(base) = &m.base {
+        release_base(base, id).await;
+    }
+    Ok(())
+}
+
 /// Whether workspace `m`'s volume is gone from its machine's instance (Slates answers it missing): a volume lives in its
 /// anchor's memory, so one made before its machine (or the anchor) started again went with it, and what it held too.
 pub async fn gone(m: &Made) -> anyhow::Result<bool> {
