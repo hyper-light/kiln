@@ -246,6 +246,18 @@ jobs:
           sudo swapoff -a || true
           sudo fallocate -l 16G /swapfile-ci && sudo chmod 600 /swapfile-ci && sudo mkswap /swapfile-ci && sudo swapon /swapfile-ci
           echo CARGO_BUILD_JOBS=2 >> "$GITHUB_ENV"
+          # Linux on arm64 links with the toolchain's own lld, as Linux x86-64's Rust does by default: GNU ld
+          # failed kiln's link there after 90 min of build (run 44867288588), and lld links in a fraction of its
+          # memory with aarch64's long-branch thunks. Where the toolchain carries none, cc's default stays.
+          if [ "$(uname -m)" = aarch64 ]; then
+            gcc_ld="$(rustc --print sysroot)/lib/rustlib/aarch64-unknown-linux-gnu/bin/gcc-ld"
+            if [ -x "$gcc_ld/ld.lld" ]; then
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clink-arg=-fuse-ld=lld -Clink-arg=-B$gcc_ld" >> "$GITHUB_ENV"
+              echo "linking with $gcc_ld/ld.lld"
+            else
+              echo "no ld.lld in $gcc_ld: linking with cc's default"
+            fi
+          fi
           df -h /
           free -g
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -273,7 +285,9 @@ jobs:
             out="$RUNNER_TEMP/$step.txt"
             if [ "$outcome" = success ] || [ ! -s "$out" ]; then continue; fi
             # The failed tests' own output (cargo's `---- name stdout ----` sections) and the summary; else the end.
-            text=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | awk '/^---- / { f = 1 } /^(failures:|test result:|error)/ { f = 1 } f' | head -n 200)
+            # A line past 300 characters keeps its ends: a failed link's `cc` command alone filled the annotation's 4 KiB
+            # before the linker said why (run 44867288588's ubuntu-24.04-arm build).
+            text=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | awk 'length($0) > 300 { $0 = substr($0, 1, 120) " [...] " substr($0, length($0) - 120) } 1' | awk '/^---- / { f = 1 } /^(failures:|test result:|error)/ { f = 1 } f' | head -n 200)
             [ -n "$text" ] || text=$(sed -e 's/\r$//' "$out" | tail -n 60)
             echo "::error title=${{ matrix.os }} $step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
           done
