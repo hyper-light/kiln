@@ -426,8 +426,8 @@ impl Lab {
     fn start_agent(&self, i: usize) -> anyhow::Result<(String, slates_api::VolumeId)> {
         let on = self.node(i)?.machine.clone();
         let spec = json!({"kind": "claude", "on": on, "cwd": self.project, "prompt": "wait", "workspace": "volume", "isolation": "none"});
-        // Asked again while kiln says the runner hasn't yet said what it has ("try again"): a runner's facts come a
-        // moment after it connects, and a start before them is refused, not failed.
+        // Asked again while kiln says the runner hasn't yet said what it has ("try again"), or went away while placing it:
+        // a runner's facts come a moment after it connects, and a start before them is refused, not failed.
         let began = Instant::now();
         let started = loop {
             let (code, body) = self.fleet.request("POST", "/api/ops/agents.start", Some(&spec))?;
@@ -435,7 +435,10 @@ impl Lab {
             if (200..300).contains(&code) {
                 break serde_json::from_str::<Value>(&text)?;
             }
-            anyhow::ensure!(code == 409 && text.contains("try again") && began.elapsed() < WITHIN, "POST /api/ops/agents.start: {code} {text}");
+            // Also a start whose runner went away while placing it (its link to the server dropped, as on a loaded host:
+            // adacachy, 2026-11-20): asked again once it is back.
+            let again = text.contains("try again") || text.contains("went away before it was placed");
+            anyhow::ensure!(code == 409 && again && began.elapsed() < WITHIN, "POST /api/ops/agents.start: {code} {text}");
             std::thread::sleep(LOOK);
         };
         // `agents.start` answers `{"agents": [brief], "parent"}` (harness/ops.rs `start_ask`).
