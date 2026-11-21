@@ -865,7 +865,10 @@ pub mod feature {
     /// exported to the folder's owner, and the questions about that session's folder answered from it. Only a runner that
     /// named it is asked to hold one.
     pub const WORKSPACE_HOLD: &str = "workspace.hold";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD];
+    /// This runner resets its agents (`harness::model::Command::Reset`, docs/agents.md "Reset"): what each has pending
+    /// ends, its intake opens again and its harness starts again fresh. Only a runner that named it is asked to reset one.
+    pub const RESET: &str = "harness.reset";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD, RESET];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {

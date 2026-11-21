@@ -5147,6 +5147,51 @@ impl Registry {
         }
     }
 
+    /// Session `id` reset (`agents.reset`; docs/agents.md, "Reset"; Ada, 2026-11-21). What kiln holds for it and hasn't
+    /// handed out is cancelled first, so none of it reaches the fresh harness. Then its runner resets it
+    /// (`Command::Reset`): what it had pending ends there, each message it was handed cancelled to its sender, and its
+    /// harness starts again fresh on its conversation. Then what kiln handed out before the reset ends too, as its
+    /// runner let it go. Each sender is told its message was cancelled. A machine that's away, or whose runner predates
+    /// resets (no `harness.reset`), is refused, nothing done. How many messages kiln held that ended.
+    pub async fn reset(&self, hub: &Arc<Hub>, id: &str, by: String, why: Option<String>) -> Result<usize, String> {
+        let Some(loc) = self.location(id) else { return Err(format!("kiln doesn't run agent {id}")) };
+        if let Location::Machine(machine) = &loc {
+            let inst = hub.instances.load();
+            let holder = inst.owner(&crate::instances::Owned::Agent(id.to_owned())).or_else(|| inst.newest(machine));
+            let resets = holder.and_then(|p| inst.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::RESET));
+            if !resets {
+                return Err(format!("{}'s runner can't reset agents yet: it resets once it's upgraded (it names harness.reset)", hub.shown(machine)));
+            }
+        }
+        let line = super::mail::newest(&hub.store, id.to_owned()).await.map_err(|e| format!("what kiln holds for it couldn't be read: {e}"))?;
+        let held = super::mail::cancel_for(&hub.store, id.to_owned(), line, false).await.map_err(|e| format!("what kiln holds for it couldn't be cancelled: {e}"))?;
+        let mut ended = held.len();
+        super::mail_delivery::cancelled(hub, id, held).await;
+        // Its harness starts again with its environment opened again, given to it first, as a stop by force's does.
+        if let Err(why) = self.agentenv_again(hub, id).await {
+            tracing::warn!(target: "kiln.agentenvs", session = %id, %why, "a session reset goes on with the environment it had: its own couldn't be opened again");
+        }
+        let c = Command::Reset { by: Some(by), why };
+        let sent = match loc {
+            Location::Local => {
+                if self.local.command_at(id, c, Some(self.epoch_of(id))) { Sent::Taken } else { Sent::NoSession }
+            }
+            Location::Machine(machine) => {
+                let json = serde_json::to_string(&c).map_err(|e| format!("its reset couldn't be written: {e}"))?;
+                let p = hub.command_start(&machine, &ServerMsg::HarnessCmd { session: id.to_owned(), json }).await;
+                Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await)
+            }
+        };
+        if let Some((_, why)) = sent.failure() {
+            return Err(format!("its runner didn't take the reset: {why}"));
+        }
+        let handed = super::mail::cancel_for(&hub.store, id.to_owned(), line, true).await.map_err(|e| format!("it was reset, but what kiln had handed it couldn't be cancelled: {e}"))?;
+        ended = ended.saturating_add(handed.len());
+        super::mail_delivery::cancelled(hub, id, handed).await;
+        hub.harness.mail_delivery.changed();
+        Ok(ended)
+    }
+
     /// [`Registry::dispatch`], to session `id` alone.
     async fn dispatch_one(&self, hub: &Hub, id: &str, c: Command) -> Pending {
         self.dispatch_relayed(hub, id, c, None).await
@@ -5166,6 +5211,11 @@ impl Registry {
                 code: crate::wire::channel::Refusal::Refused,
                 why: "a session's environment is kiln's to give it: apply one with agentenvs.apply (PUT /api/harness/sessions/:id/agentenv)".into(),
             });
+        }
+        // A reset is kiln's to do (docs/agents.md, "Reset"): `agents.reset` ends what kiln holds for the session first,
+        // then sends it by [`Registry::reset`]. One sent as a command is refused, from whichever client.
+        if matches!(&c, Command::Reset { .. }) {
+            return Pending::Now(Sent::Rejected { code: crate::wire::channel::Refusal::Refused, why: "a reset is kiln's to do: use agents.reset (POST /api/harness/agents/:id/reset)".into() });
         }
         // A harness started again starts with its environment opened again, its newest version and its secrets read
         // again (docs/agents.md, "Where they apply"): given to it first, on its own command stream, then the restart

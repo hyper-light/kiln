@@ -705,6 +705,49 @@ impl Inbox {
         }
     }
 
+    /// Every communication of session `session`'s at `epoch` its journal holds and that never came to an end, ended as
+    /// `disposition` now (a reset, docs/agents.md "Reset": cancelled for whoever asked), a page at a time, each as it
+    /// was read (one written since is read again). Its original stays, as every terminal record's does, until its
+    /// server acknowledges the end; one that came to an end already is left as it is. Each one ended, with its lease,
+    /// for its sender to be told.
+    pub async fn end_pending(&self, session: &str, epoch: u64, disposition: &super::admission::Disposition) -> Result<Vec<Disposed>, Refusal> {
+        check_session(session)?;
+        let mut ended = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        let mut conflicts = 0usize;
+        loop {
+            let page = self.records.scan(PENDING, Scan { prefix: session_prefix(session), after: after.clone(), limit: PAGE, at: Consistency::Linearizable }).await.map_err(|e| unavailable(session, &e.to_string()))?;
+            let last = page.rows.last().map(|row| row.key.clone());
+            let mut tx = Tx::default();
+            let mut these = Vec::new();
+            for row in page.rows {
+                let mut pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &format!("its pending communication is unreadable: {e}")))?;
+                if pending.disposition.is_some() || pending.lease.epoch != epoch {
+                    continue;
+                }
+                pending.disposition = Some(disposition.clone());
+                pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
+                tx.conds.push(Cond::At { family: PENDING.into(), key: row.key.clone(), rev: row.rev });
+                tx.writes.push(Write::Put { family: PENDING.into(), key: row.key, value: json(session, &pending)? });
+                these.push(Disposed { lease: pending.lease, disposition: disposition.clone() });
+            }
+            if !tx.writes.is_empty() {
+                match self.records.commit(tx).await {
+                    Ok(_) => ended.append(&mut these),
+                    Err(records::Refusal::Conflict { .. }) if conflicts < RETRIES => {
+                        conflicts = conflicts.saturating_add(1);
+                        continue;
+                    }
+                    Err(e) => return Err(unavailable(session, &e.to_string())),
+                }
+            }
+            if !page.more {
+                return Ok(ended);
+            }
+            after = last;
+        }
+    }
+
     /// Persist the exact terminal cause before publishing its receipt. Failure leaves the
     /// original body and lease pending, rather than releasing credit on uncertain persistence.
     pub async fn dispose_pending(&self, session: &str, message: &str, epoch: u64, disposition: super::admission::Disposition) -> Result<Option<Pending>, Refusal> {
@@ -1197,6 +1240,36 @@ mod tests {
         assert!(block(i.pending("s1", "consumed"))?.is_some_and(|p| p.disposition.is_some()), "a terminal one waits for its acknowledgement");
         assert!(block(i.pending("s1", "now"))?.is_some_and(|p| p.lease.epoch == 6), "what it takes at its epoch stays");
         assert_eq!(block(i.let_go_left_behind("s1", 6))?, 0, "once gone, nothing more goes");
+        Ok(())
+    }
+
+    /// docs/agents.md, "Reset": a reset ends every communication its session never finished at its epoch, cancelled,
+    /// and touches nothing else: one that came to an end keeps its end, and one of another epoch is another stay's.
+    #[test]
+    fn a_reset_ends_what_never_finished_at_its_epoch_and_nothing_else() -> Result<(), Refusal> {
+        use crate::harness::admission::{CancelReason, Consumption, Disposition, Stage};
+        let at_epoch = |message: &str, epoch: u64, stage: Stage| {
+            let mut pending = pending_message(message, message);
+            pending.lease.epoch = epoch;
+            pending.lease.stage = stage;
+            pending
+        };
+        let i = inbox();
+        block(i.open("s1", 3))?;
+        for (message, stage) in [("given", Stage::ProviderFlight), ("queued", Stage::Queued), ("done", Stage::ProviderFlight)] {
+            block(i.accept_pending("s1", message, &digest(message, &[]), Some(3), 10, &at_epoch(message, 3, stage)))?;
+        }
+        block(i.dispose_pending("s1", "done", 3, Disposition::Consumed { boundary: Consumption::ProviderAccepted }))?;
+        let cancelled = Disposition::Cancelled { reason: CancelReason::User };
+        let mut ended: Vec<String> = block(i.end_pending("s1", 3, &cancelled))?.into_iter().map(|d| d.lease.message).collect();
+        ended.sort();
+        assert_eq!(ended, ["given", "queued"]);
+        for message in ["given", "queued"] {
+            assert_eq!(block(i.pending("s1", message))?.and_then(|p| p.disposition), Some(cancelled.clone()), "{message} kept, cancelled, for its acknowledgement");
+        }
+        assert!(matches!(block(i.pending("s1", "done"))?.and_then(|p| p.disposition), Some(Disposition::Consumed { .. })), "what came to an end keeps its end");
+        assert!(block(i.end_pending("s1", 3, &cancelled))?.is_empty(), "ended once");
+        assert!(block(i.end_pending("s1", 4, &cancelled))?.is_empty(), "another epoch's are another stay's");
         Ok(())
     }
 

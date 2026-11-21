@@ -1571,7 +1571,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let op = format!("agents.{what}");
             boxed(|| own_op(&hub, &caller, &op, v)).await
         }
-        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "control" | "restart" | "stop" | "change" | "land" | "about" | "credential" | "pin" | "unpin" | "park" | "unpark" | "archive" | "restore")]) => {
+        (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "control" | "restart" | "reset" | "stop" | "change" | "land" | "about" | "credential" | "pin" | "unpin" | "park" | "unpark" | "archive" | "restore")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
             // A send's idempotency key may come as the standard header (CP-T3.2).
             let key = idempotency_key(&req);

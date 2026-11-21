@@ -6631,6 +6631,46 @@ while True:
         })
     }
 
+    /// docs/agents.md, "Reset" (Ada, 2026-11-21: "clear all pending messages, actions, etc., kill and then restart the
+    /// agent in a fresh harness"): a session that takes no messages (its admission given up on, a message its harness was
+    /// handed and never seen to an end, one waiting in kiln's queue) is reset. Each of those ends cancelled in its
+    /// journal, for its sender to be told; its queue is empty; it takes messages again; and its timeline says who reset
+    /// it, why, and what ended.
+    #[test]
+    fn a_reset_session_ends_what_it_had_pending_and_takes_messages_again() -> anyhow::Result<()> {
+        use crate::harness::admission::{CancelReason, Disposition, Lease, Stage};
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = with_inbox(tx);
+            let inbox = host.inbox.clone().ok_or_else(|| anyhow::anyhow!("the host has no inbox"))?;
+            let s = host.open(Some("stuck".into()), no_harness(dir.path()))?;
+            host.settled("stuck").await;
+            let epoch = s.epoch();
+            let input = s.core.lock().input.clone().ok_or_else(|| anyhow::anyhow!("it has no input"))?;
+            for (id, stage) in [("given", Stage::ProviderFlight), ("queued", Stage::Queued)] {
+                let lease = Lease { message: id.into(), peer: "admin".into(), epoch, bytes: 10, stage, token: Some(crate::harness::mail::Token { revision: 1, generation: 1 }), handoff: None };
+                inbox.accept_pending("stuck", id, &inbox::digest(id, &[]), Some(epoch), 1, &inbox::Pending::new(lease.clone(), message(id, id))).await?;
+                input.controller.lock().restore(lease).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            }
+            s.core.lock().state.queue.push(QueueItem { id: "queued".into(), text: "queued".into(), at: 0, attachments: Vec::new(), overrides: None, reply_to: None });
+            input.controller.lock().unavailable().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            assert_eq!(input.controller.lock().capacity().target, 0, "stuck: it takes no messages");
+            anyhow::ensure!(host.command("stuck", Command::Reset { by: Some("you".into()), why: Some("it took no messages".into()) }), "the reset wasn't taken");
+            let said = || s.core.lock().events().find_map(|e| match &e.body { Body::Notice { text, .. } if e.id.starts_with("reset-") => Some(text.clone()), _ => None });
+            soon("its reset", || said().is_some()).await?;
+            let capacity = input.controller.lock().capacity();
+            assert!(capacity.target > 0 && capacity.admitted == 0, "it takes messages again, holding none: {capacity:?}");
+            for id in ["given", "queued"] {
+                assert_eq!(inbox.pending("stuck", id).await?.and_then(|p| p.disposition), Some(Disposition::Cancelled { reason: CancelReason::User }), "{id} cancelled in its journal");
+            }
+            assert!(s.core.lock().state.queue.is_empty(), "its queue is empty");
+            let text = said().unwrap_or_default();
+            assert!(text.starts_with("Reset by you (it took no messages): the 2 messages pending for it cancelled"), "{text}");
+            Ok(())
+        })
+    }
+
     /// CP-T3.2: handing sessions over ends even when their lanes wait on a sink nobody drains: it
     /// waits for them [`SETTLE_WAIT`] at most. The runner's loop polls the hand-over beside the sink
     /// it drains (`agent.rs`, `HarnessApplied::Native`), so there its lanes settle and it goes on;

@@ -641,7 +641,7 @@ impl Acp {
                     self.change(core, id, value);
                 }
             }
-            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } => {}
+            Command::StopTask { .. } | Command::StopTasks | Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } | Command::Reset { .. } => {}
             // A pause's commands are the session's (`harness::pause`).
             Command::Resume | Command::AutoResume { .. } | Command::PauseAt { .. } | Command::MaxSubagents { .. } | Command::MoveOnLimit { .. } | Command::LimitHold { .. } | Command::Pause { task: None, .. } | Command::Perms { task: None, .. } | Command::Branch { .. } => {}
             Command::Pause { on, task: Some(task) } => self.pause_subagent(core, &task, on),

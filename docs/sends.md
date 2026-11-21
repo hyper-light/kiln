@@ -102,6 +102,12 @@ was sent, for good (Slates, 2026-11-20: back on a Mac it had left, it took none 
 messages or its 23 agents' there all night, each held in kiln). What came to an end there stays
 until the server acknowledges it, as each does.
 
+**A reset** (docs/agents.md, "Reset") ends all of a session's messages that never came to an end:
+what kiln holds for it and hasn't handed out is cancelled first, then its runner cancels what it was
+handed (each record ended in its journal, its sender told), then what kiln handed out before the
+reset that its runner didn't hold. Each original stays in kiln's history; a message sent after the
+reset was asked goes to the fresh harness.
+
 **Blue/green.** A session handed to the new build of its runner (another runner process of the same
 machine, at the same epoch) brings its inbox's newest ids the same way, and refuses messages while
 it's handed over. The new build takes no messages until it's promoted (each refused `moved`, and

@@ -2534,6 +2534,19 @@ pub enum Command {
         agentenv: Option<super::agentenv::Resolved>,
         restart: bool,
     },
+    /// Reset (docs/agents.md, "Reset"; Ada, 2026-11-21): everything pending ends (each message it was sent and
+    /// never finished cancelled, its queue, its approvals and its tasks; a pause, a hold and a move or switch
+    /// waiting), its message intake opens again, and its harness is killed and started again fresh on the same
+    /// conversation. `by` is who asked, as kiln says it, and `why` their words, said in its timeline. kiln's alone
+    /// to send (`agents.reset`, which ends what kiln holds for it first): one from a client is refused.
+    Reset {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        why: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

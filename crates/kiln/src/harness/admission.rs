@@ -791,6 +791,22 @@ impl Controller {
         self.changed()
     }
 
+    /// Its session reset (docs/agents.md, "Reset"): every lease it still holds ends, its bytes released (its caller ended
+    /// each one's communication first, in its journal and to its sender), and it takes messages again however its
+    /// storage last stood, restoring or unavailable: the reset read and wrote that journal whole. Its ownership stays as
+    /// it is (a fence or a promotion is a move's, which no reset undoes), and so does what it learned of its own
+    /// consumption: the session is the same, only what it had pending is gone.
+    pub fn reset(&mut self) -> Result<(), Error> {
+        let released = self.leases.values().map(|lease| lease.bytes).fold(0usize, usize::saturating_add);
+        self.leases.clear();
+        self.physical.release_for(released, Some(&self.account));
+        self.observations = Observations::default();
+        self.readiness = Readiness::Ready;
+        self.retarget(None);
+        self.credit()?;
+        self.changed()
+    }
+
     fn waiting(&self, cause: WaitCause) -> Admission { Admission::Waiting { epoch: self.epoch, generation: self.generation, cause } }
 
     /// Reserve before inbox acceptance and before any lane/ctl enqueue. An offer carries the
@@ -1057,6 +1073,29 @@ mod tests {
             assert_eq!(pool.counts().0, 0);
             Ok(())
         })
+    }
+
+    /// docs/agents.md, "Reset": a reset ends every lease, frees its bytes and takes messages again, from storage it had
+    /// given up on too (Slates, 2026-11-21: unavailable for good), with a newer generation its server takes; a fence stays.
+    #[test]
+    fn a_reset_ends_every_lease_and_takes_messages_again_but_keeps_a_fence() -> Result<(), Error> {
+        let pool = PhysicalBudget::new(100);
+        let mut controller = Controller::new(1, Arc::clone(&pool));
+        assert!(matches!(controller.offer("agents", "peer", 1, 30, None, 1)?, Admission::Reserved(_)));
+        assert!(matches!(controller.offer("persons", "admin", 1, 20, None, 2)?, Admission::Reserved(_)));
+        controller.unavailable()?;
+        assert_eq!(controller.capacity().target, 0);
+        let before = controller.capacity();
+        controller.reset()?;
+        let after = controller.capacity();
+        assert_eq!((after.admitted, after.bytes), (0, 0));
+        assert_eq!(pool.counts().0, 0, "its bytes are free");
+        assert!(after.target > 0 && controller.writes_ready(), "it takes messages again: {after:?}");
+        assert!(after.generation > before.generation && after.retry_permission() > before.retry_permission());
+        controller.fence(true)?;
+        controller.reset()?;
+        assert_eq!(controller.capacity().target, 0, "a fence is a move's: a reset doesn't lift it");
+        Ok(())
     }
 
     #[test]

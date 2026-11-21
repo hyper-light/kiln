@@ -640,6 +640,14 @@ export const harnessApi = {
   stop: (id: string) => ownAgentAction(call<void>("DELETE", `/api/harness/agents/${encodeURIComponent(id)}`), [id]),
   /** End an agent for good; with `children`, the agents it started (and theirs) end first. */
   end: (id: string, children: boolean) => ownAgentAction(call<{ ended: string[] }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/stop`, { children }), [id], (r) => r.ended),
+  /**
+   * Reset an agent (`agents.reset`, docs/agents.md "Reset"): everything it has pending ends (the messages waiting for it are
+   * cancelled, each sender told so; its queue, approvals and tasks), its intake opens again, and its harness starts again
+   * fresh on the same conversation. `why` is said in its timeline beside who reset it; `cancelled` is how many of the
+   * messages kiln held for it were.
+   */
+  reset: (id: string, why?: string) =>
+    ownAgentAction(call<{ agent: string; reset: boolean; cancelled: number }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/reset`, why ? { why } : {}), [id]),
   /** Ask about a piece of code in its conversation: a child of it answers, reading only; with no subagents, it does, in its conversation (`itself`). */
   about: (id: string, ask: AboutAsk) => call<{ agents: AgentBrief[]; itself: boolean; sent?: { sent: boolean; message?: string } }>("POST", `/api/harness/agents/${encodeURIComponent(id)}/about`, ask),
   /** What an agent last said, and how it stands. */
