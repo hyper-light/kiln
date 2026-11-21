@@ -98,9 +98,13 @@ impl FlowEvent {
     }
 }
 
+/// Where an admitted message is on its way to its harness. `Waiting` is the one stage that holds no lease: a message
+/// routed to its session (docs/sends.md, "Routed to its session") that its inbox took into custody while the depth held
+/// it back, kept in the session's own journal and handed to it, here, once there's room (`Host::admit_waiting`). Appended
+/// last: a build from before reads no journal row that has it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Stage { Reserved, InboxAccepted, InCtl, Carried, Queued, ProviderFlight }
+pub enum Stage { Reserved, InboxAccepted, InCtl, Carried, Queued, ProviderFlight, Waiting }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub enum Replay { #[default] Waiting, ProviderReady }
@@ -538,11 +542,14 @@ pub struct Controller {
     readiness: Readiness,
     ownership: Ownership,
     available: bool,
+    /// Told at each change of what it admits (every new generation, and each new credit): what waits in a session's own
+    /// journal to be handed to it is looked at again then (`Host::admit_waiting`), never on a timer.
+    room: Arc<crate::rt::Changed>,
 }
 
 impl Controller {
     pub fn new(epoch: u64, physical: Arc<PhysicalBudget>) -> Self {
-        let mut controller = Self { epoch, generation: 0, retry_generation: 0, leases: BTreeMap::new(), peers: VecDeque::new(), demand: BTreeMap::new(), waiting: BTreeMap::new(), physical, account: Arc::new(AtomicUsize::new(0)), observations: Observations::default(), target: 0, learning: Learning::Bootstrap, learned: None, readiness: Readiness::Ready, ownership: Ownership::Here, available: true };
+        let mut controller = Self { epoch, generation: 0, retry_generation: 0, leases: BTreeMap::new(), peers: VecDeque::new(), demand: BTreeMap::new(), waiting: BTreeMap::new(), physical, account: Arc::new(AtomicUsize::new(0)), observations: Observations::default(), target: 0, learning: Learning::Bootstrap, learned: None, readiness: Readiness::Ready, ownership: Ownership::Here, available: true, room: Arc::new(crate::rt::Changed::new()) };
         controller.retarget(None);
         controller
     }
@@ -704,8 +711,12 @@ impl Controller {
         }
     }
 
-    fn changed(&mut self) -> Result<(), Error> { self.generation = self.generation.checked_add(1).ok_or(Error::Overflow)?; Ok(()) }
-    fn credit(&mut self) -> Result<(), Error> { self.retry_generation = self.retry_generation.checked_add(1).ok_or(Error::Overflow)?; Ok(()) }
+    fn changed(&mut self) -> Result<(), Error> { self.generation = self.generation.checked_add(1).ok_or(Error::Overflow)?; self.room.notify(); Ok(()) }
+    fn credit(&mut self) -> Result<(), Error> { self.retry_generation = self.retry_generation.checked_add(1).ok_or(Error::Overflow)?; self.room.notify(); Ok(()) }
+
+    /// Told at each change of what it admits ([`Self::room`]'s field): a wait for room begun before a change ends at it.
+    pub fn room(&self) -> Arc<crate::rt::Changed> { Arc::clone(&self.room) }
+
 
     /// Authenticated peers with unresolved custody, supplied by lifecycle events. Their arrival
     /// order is retained. A sender joining or leaving changes neither what this receiver learned
@@ -791,6 +802,22 @@ impl Controller {
         self.changed()
     }
 
+    /// Its session reset (docs/agents.md, "Reset"): every lease it still holds ends, its bytes released (its caller ended
+    /// each one's communication first, in its journal and to its sender), and it takes messages again however its
+    /// storage last stood, restoring or unavailable: the reset read and wrote that journal whole. Its ownership stays as
+    /// it is (a fence or a promotion is a move's, which no reset undoes), and so does what it learned of its own
+    /// consumption: the session is the same, only what it had pending is gone.
+    pub fn reset(&mut self) -> Result<(), Error> {
+        let released = self.leases.values().map(|lease| lease.bytes).fold(0usize, usize::saturating_add);
+        self.leases.clear();
+        self.physical.release_for(released, Some(&self.account));
+        self.observations = Observations::default();
+        self.readiness = Readiness::Ready;
+        self.retarget(None);
+        self.credit()?;
+        self.changed()
+    }
+
     fn waiting(&self, cause: WaitCause) -> Admission { Admission::Waiting { epoch: self.epoch, generation: self.generation, cause } }
 
     /// Reserve before inbox acceptance and before any lane/ctl enqueue. An offer carries the
@@ -809,15 +836,18 @@ impl Controller {
         if epoch != self.epoch { return Err(Error::StaleEpoch); }
         if let Some(lease) = self.leases.get(message) { return Ok(Admission::Existing(lease.clone())); }
         if self.ownership != Ownership::Here { return Ok(self.waiting(WaitCause::Fenced)); }
-        if !self.available { return Ok(self.waiting(WaitCause::ConsumptionUnknown)); }
+        // A person's message goes in a part of the inbox of its own: no turn and no depth holds it,
+        // only its bytes. Agents' and kiln's take their turns under the learned depth. A paused,
+        // held or frozen agent's queue still takes a person's (it's listed there and goes once the
+        // agent takes messages again), as before custody moved to the server (W20); an agent's or
+        // kiln's waits for it to take them again.
+        let person = super::mail::person(peer);
+        if !self.available && !person { return Ok(self.waiting(WaitCause::ConsumptionUnknown)); }
         match self.readiness {
             Readiness::Restoring => return Ok(self.waiting(WaitCause::Restoring)),
             Readiness::Unavailable => return Ok(self.waiting(WaitCause::SourceUnavailable)),
             Readiness::Ready => {}
         }
-        // A person's message goes in a part of the inbox of its own: no turn and no depth holds it,
-        // only its bytes. Agents' and kiln's take their turns under the learned depth.
-        let person = super::mail::person(peer);
         // The offering sender has a place in this round even once the server's claim took its
         // head off the waiting list. A depth that moved goes out under a new generation, whatever
         // this offer's answer.
@@ -867,6 +897,8 @@ impl Controller {
 
     pub fn restore(&mut self, lease: Lease) -> Result<(), Error> {
         if lease.epoch != self.epoch { return Err(Error::StaleEpoch); }
+        // One still waiting in its session's own journal holds no lease and no room: it's offered when there's room.
+        if lease.stage == Stage::Waiting { return Ok(()); }
         if self.leases.contains_key(&lease.message) { return Ok(()); }
         self.physical.restore(lease.bytes, &self.account)?;
         self.leases.insert(lease.message.clone(), lease);
@@ -1004,6 +1036,25 @@ mod tests {
         Ok(())
     }
 
+    /// Routed custody (docs/sends.md, "Routed to its session"): a paused agent's queue still takes a person's message,
+    /// as before custody moved to the server, while an agent's waits for it to take messages again; a fence or a restore
+    /// holds both. A message waiting in its session's journal holds no lease, restored or not.
+    #[test]
+    fn a_paused_agent_takes_a_persons_message_and_holds_an_agents() -> Result<(), Error> {
+        let mut c = Controller::new(1, PhysicalBudget::new(100));
+        c.available(false)?;
+        assert!(matches!(c.offer("p1", "user:ada", 1, 10, None, 1)?, Admission::Reserved(_)), "a person's goes in while paused");
+        assert!(matches!(c.offer("a1", "agent:a", 1, 10, None, 1)?, Admission::Waiting { cause: WaitCause::ConsumptionUnknown, .. }), "an agent's waits while paused");
+        c.available(true)?;
+        c.fence(true)?;
+        assert!(matches!(c.offer("p2", "user:ada", 1, 10, None, 1)?, Admission::Waiting { cause: WaitCause::Fenced, .. }), "a fence holds a person's too");
+        c.fence(false)?;
+        c.restore(Lease { message: "w1".into(), peer: "agent:a".into(), epoch: 1, bytes: 10, stage: Stage::Waiting, token: None, handoff: None })?;
+        assert!(c.lease("w1").is_none(), "one waiting in its journal holds no lease");
+        assert_eq!(c.capacity().admitted, 1);
+        Ok(())
+    }
+
     #[test]
     fn retry_permission_excludes_own_rollback_metadata_and_buffers_but_observes_foreign_release() -> Result<(), Error> {
         use std::task::Poll;
@@ -1057,6 +1108,29 @@ mod tests {
             assert_eq!(pool.counts().0, 0);
             Ok(())
         })
+    }
+
+    /// docs/agents.md, "Reset": a reset ends every lease, frees its bytes and takes messages again, from storage it had
+    /// given up on too (Slates, 2026-11-21: unavailable for good), with a newer generation its server takes; a fence stays.
+    #[test]
+    fn a_reset_ends_every_lease_and_takes_messages_again_but_keeps_a_fence() -> Result<(), Error> {
+        let pool = PhysicalBudget::new(100);
+        let mut controller = Controller::new(1, Arc::clone(&pool));
+        assert!(matches!(controller.offer("agents", "peer", 1, 30, None, 1)?, Admission::Reserved(_)));
+        assert!(matches!(controller.offer("persons", "admin", 1, 20, None, 2)?, Admission::Reserved(_)));
+        controller.unavailable()?;
+        assert_eq!(controller.capacity().target, 0);
+        let before = controller.capacity();
+        controller.reset()?;
+        let after = controller.capacity();
+        assert_eq!((after.admitted, after.bytes), (0, 0));
+        assert_eq!(pool.counts().0, 0, "its bytes are free");
+        assert!(after.target > 0 && controller.writes_ready(), "it takes messages again: {after:?}");
+        assert!(after.generation > before.generation && after.retry_permission() > before.retry_permission());
+        controller.fence(true)?;
+        controller.reset()?;
+        assert_eq!(controller.capacity().target, 0, "a fence is a move's: a reset doesn't lift it");
+        Ok(())
     }
 
     #[test]

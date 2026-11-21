@@ -1844,6 +1844,36 @@ pub struct Session {
     agentenv: Mutex<Option<super::agentenv::Resolved>>,
 }
 
+#[cfg(test)]
+impl Session {
+    /// A session no task runs, at `epoch` (tests elsewhere in the harness): what it's told waits in its command channel,
+    /// whose receiving end the caller holds (dropped, the channel closes), so what it was handed stays handed.
+    pub(crate) fn idle_for_tests(id: &str, epoch: u64) -> (Self, Box<dyn std::any::Any + Send>) {
+        let (ctl, rx) = crate::memory::queue::unbounded::<Ctl>(&crate::memory::owners::CHANNELS);
+        let s = Session {
+            id: id.into(),
+            spec: Mutex::new(Spec::default()),
+            created_at: 0,
+            core: Mutex::new(Core::new()),
+            info: Mutex::new(Info::default()),
+            ctl,
+            pid: Mutex::new(None),
+            turn_open: std::sync::atomic::AtomicBool::new(false),
+            ran: Mutex::new((None, Vec::new())),
+            left: Mutex::new(Vec::new()),
+            moving: Mutex::new(false),
+            prompted: std::sync::atomic::AtomicBool::new(false),
+            carried: Mutex::new(None),
+            ended: std::sync::atomic::AtomicBool::new(false),
+            ended_changed: crate::rt::Changed::new(),
+            owned_reach: Mutex::new(std::collections::HashMap::new()),
+            agentenv: Mutex::new(None),
+        };
+        s.core.lock().state.epoch = epoch;
+        (s, Box::new(rx))
+    }
+}
+
 impl Session {
     pub(crate) async fn promotion_changed(&self) -> Result<(), String> { self.ctl.send(Ctl::Promotion).await.map_err(|_| "the legacy session owner stopped before its persisted transition could progress".to_owned()) }
     pub(super) fn input_changed(&self) { let _ = self.ctl.try_send(Ctl::OwnedChanged); }
@@ -2153,6 +2183,89 @@ fn unset_machine_vars(s: &Session, env: &super::agentenv::Resolved, user: &[(Str
     let names: Vec<String> = missing.iter().map(|(k, of)| if k == of { k.clone() } else { format!("{k} (from {of})") }).collect();
     let text = format!("This machine's user has no {}: environment {} leaves {} unset", names.join(", "), env.name, if missing.len() == 1 { "it" } else { "them" });
     s.core.lock().upsert(&format!("agentenv-unset:{}", Core::now()), None, super::model::Body::Notice { level: Level::Warn, text });
+}
+
+/// Its session reset (`Command::Reset`; docs/agents.md, "Reset"; Ada, 2026-11-21: "clear all pending messages, actions,
+/// etc., kill and then restart the agent in a fresh harness"), once its harness is down, so no callback of the process
+/// it ran races what ends here, and after that process's end gave kiln's queue back what its adapter held. Everything
+/// it had pending ends: kiln's queue and its subagents' queues; every communication its journal holds that never came to
+/// an end at its epoch, cancelled, each one's sender told so (what an earlier stay here left goes too); a hold, a pause
+/// and the input it had yet to flush. Its admission takes messages again (`Controller::reset`), and its timeline says
+/// who reset it and why, what ended, and, where its journal couldn't be written, that it takes none until it can. Its
+/// conversation, goals, plan and settings stay. How many messages ended.
+async fn reset_session(s: &Session, by: Option<&str>, why: Option<&str>, harness: &str) -> usize {
+    use super::admission::{CancelReason, Disposition, FlowEvent};
+    let (mut ended, input, epoch, frozen) = {
+        let mut core = s.core.lock();
+        let mut ended: std::collections::BTreeSet<String> = core.state.queue.drain(..).map(|q| q.id).collect();
+        for t in &mut core.state.tasks {
+            ended.extend(t.queue.drain(..).map(|q| q.id));
+        }
+        core.hold = false;
+        core.limit_ask = None;
+        core.state.switching = None;
+        core.state.pause = None;
+        let frozen = core.state.frozen.take().is_some();
+        core.input_stages.clear();
+        core.input_retained.clear();
+        core.input_receipts.clear();
+        core.input_legacy_flights.clear();
+        core.drop_unfinished(true);
+        core.touch_state();
+        (ended, core.input.clone(), core.state.epoch, frozen)
+    };
+    if frozen {
+        let _ = crate::headroom::pause(&s.id, false);
+    }
+    let mut failed = None;
+    let mut events = Vec::new();
+    if let Some(input) = &input {
+        let cancelled = Disposition::Cancelled { reason: CancelReason::User };
+        let journal = match input.inbox.let_go_left_behind(&s.id, epoch).await {
+            Ok(_) => input.inbox.end_pending(&s.id, epoch, &cancelled).await,
+            Err(e) => Err(e),
+        };
+        match journal {
+            Ok(disposed) => {
+                let mut c = input.controller.lock();
+                for d in &disposed {
+                    let _ = c.finish(&d.lease.message, d.disposition.clone(), input.now_ns(), false);
+                }
+                if let Err(e) = c.reset() {
+                    failed = Some(format!("{e:?}"));
+                }
+                let capacity = c.capacity();
+                for d in disposed {
+                    if let Some(token) = d.lease.token {
+                        events.push(FlowEvent::Disposed { token, epoch: d.lease.epoch, disposition: d.disposition, capacity: capacity.clone() });
+                    }
+                    ended.insert(d.lease.message);
+                }
+                events.push(FlowEvent::Capacity { capacity });
+            }
+            Err(e) => failed = Some(e.to_string()),
+        }
+    }
+    let mut core = s.core.lock();
+    if let Some(input) = &input {
+        core.state.admission = Some(input.controller.lock().capacity());
+    }
+    for event in events {
+        core.out.push(Update::MailFlow { event: Box::new(event) });
+    }
+    let who = by.map(str::trim).filter(|b| !b.is_empty()).unwrap_or("kiln");
+    let because = why.map(str::trim).filter(|w| !w.is_empty()).map(|w| format!(" ({w})")).unwrap_or_default();
+    let messages = match ended.len() {
+        0 => "nothing it was sent was pending".to_owned(),
+        1 => "the 1 message pending for it cancelled".to_owned(),
+        n => format!("the {n} messages pending for it cancelled"),
+    };
+    let intake = failed.as_deref().map(|why| format!("; its intake couldn't be opened again ({why}): it takes no messages until it can")).unwrap_or_default();
+    let text = format!("Reset by {who}{because}: {messages}, its tasks stopped and its queue emptied; {harness} starts again fresh, the conversation going on{intake}");
+    let level = if failed.is_some() { Level::Warn } else { Level::Info };
+    core.upsert(&format!("reset-{}", Core::now()), None, Body::Notice { level, text });
+    core.touch_state();
+    ended.len()
 }
 
 /// Stop what it left running that kiln took back over: one (its task id), or all of them.
@@ -4308,11 +4421,14 @@ struct Move {
 }
 
 /// A move asked for: kiln's queue waits (what is queued goes along), and the timeline says so.
-/// `now`: the turn under way isn't waited for (the caller interrupts it). None: an isolated agent
-/// doesn't go to another machine (its microVM and what its harness keeps there are this one's, kiln
-/// plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), refused before anything of it stops, saying so.
+/// `now`: the turn under way isn't waited for (the caller interrupts it). `unstarted`: no turn is
+/// under way, only messages its harness never started, which nothing ends (`Adapter::unstarted_only`):
+/// there's no turn to wait for (the caller asks the harness what it holds, and they leave the
+/// session). None: an isolated agent doesn't go to another machine (its microVM and what its
+/// harness keeps there are this one's, kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 17), refused
+/// before anything of it stops, saying so.
 #[allow(clippy::too_many_arguments)]
-fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool, slates: Option<crate::workspace::slates_move::VolumeMove>) -> Option<Move> {
+fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: bool, unstarted: bool, kind: Option<&'static Kind>, model: Option<String>, local: bool, native: bool, slates: Option<crate::workspace::slates_move::VolumeMove>) -> Option<Move> {
     // Its spec before its core: never the one lock inside the other.
     let isolated = s.spec.lock().isolation.is_some();
     let mut core = s.core.lock();
@@ -4322,7 +4438,7 @@ fn move_wanted(s: &Session, to: String, cwd: String, note: Option<String>, now: 
         return None;
     }
     core.hold = true;
-    let busy = !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
+    let busy = !unstarted && !(core.state.status == Status::Idle && core.state.approvals.is_empty()) && !matches!(core.state.status, Status::Exited);
     let picks_up = now && busy;
     let into = kind.map(|k| format!(", to go on in {}", k.name)).unwrap_or_default();
     let text = if local {
@@ -5523,6 +5639,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 let mut ending = false;
                 // Stopped by force (`Command::ForceStop`): it starts again now, whatever is under way.
                 let mut forcing = false;
+                // Reset (`Command::Reset`): stopped by force, and once its harness is down what it had pending ends
+                // (`reset_session`), who asked and their words said in its timeline.
+                let mut resetting: Option<(Option<String>, Option<String>)> = None;
                 // Where this machine keeps what's an agent's own: whose each file it changes is.
                 let roots = std::sync::Arc::new(super::whose::Roots::of(&spec));
                 // The agent-control link it's driven over, said once it's made.
@@ -5642,6 +5761,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 s.core.lock().upsert(&format!("force-stop:{}", Core::now()), None, super::model::Body::Notice { level: Level::Info, text });
                                 forcing = true;
                             }
+                            // Reset (docs/agents.md, "Reset"): what it runs ends with its harness, now, and what it had
+                            // pending once that's down; it starts again at once, the turn under way not taken up again.
+                            Command::Reset { by, why } => {
+                                s.turn_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                                s.stop_owned_reach(None);
+                                stop_left(&s, None).await;
+                                resetting = Some((by, why));
+                                forcing = true;
+                            }
                             Command::Snapshot => {
                                 for u in s.snapshot() {
                                     let _ = sink.send((s.id.clone(), u)).await;
@@ -5681,9 +5809,15 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                 }
                             }
                             Command::MoveTo { to, cwd, note, now, kind: into, model, local, native, slates } => {
-                                if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
+                                // No turn under way, only what its harness never started: nothing
+                                // would end the wait (Slates, 2026-11-20: 2.5 minutes, until its
+                                // person's message stopped it).
+                                let unstarted = adapter.unstarted_only(&s.core.lock());
+                                if let Some(mv) = move_wanted(&s, to, cwd, note, now, unstarted, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
                                     // Not waiting for the turn: it stops here, and goes on there.
-                                    if mv.picks_up {
+                                    // Or none is under way: asked what it holds, its harness
+                                    // answers, and what it never started leaves the session.
+                                    if mv.picks_up || unstarted {
                                         adapter.command(&mut s.core.lock(), Command::Interrupt);
                                     }
                                     moving = Some(mv);
@@ -6175,6 +6309,20 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         let mut core = s.core.lock();
                         adapter.exited(&mut core, None, None);
                     }
+                    // Reset: its harness is down, and what its adapter held is back in kiln's queue, so now what it
+                    // had pending ends; and with it a move, a switch or a setting's start again that waited.
+                    if let Some((by, why)) = resetting.take() {
+                        reset_session(&s, by.as_deref(), why.as_deref(), kind.name).await;
+                        moving = None;
+                        switching = None;
+                        reloading = false;
+                        swap_now = false;
+                        in_place = false;
+                        carry.retain(|c| !is_message(c));
+                        for_room.retain(|c| !is_message(c));
+                        flush(&s, &sink, None).await;
+                        on_change();
+                    }
                     first = false;
                     continue;
                 }
@@ -6296,7 +6444,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             };
             // A start asked for: kiln's own, its wait over, or a person's (a restart, a message),
             // which the restart rule reads apart ([`Ran::again`]).
-            if let Ev::Ctl(Some(Ctl::Cmd(c))) = &ev && matches!(**c, Command::Restart | Command::Send { task: None, .. } | Command::SkillRun { .. }) {
+            if let Ev::Ctl(Some(Ctl::Cmd(c))) = &ev && matches!(**c, Command::Restart | Command::Reset { .. } | Command::Send { task: None, .. } | Command::SkillRun { .. }) {
                 ours = woke;
             }
             match ev {
@@ -6311,6 +6459,27 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         at_state(&mut s.core.lock(), client, &revision, *command, |core, command| adapter.command(core, command));
                     }
                     Command::Restart => {
+                        if s.core.lock().has_room() {
+                            break;
+                        }
+                        start_asked = true;
+                    }
+                    // Reset (docs/agents.md, "Reset") while its harness is down: what it had pending ends now, and its
+                    // harness starts again fresh, now where there's room, else once there is.
+                    Command::Reset { by, why } => {
+                        s.turn_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                        s.stop_owned_reach(None);
+                        stop_left(&s, None).await;
+                        reset_session(&s, by.as_deref(), why.as_deref(), kind.name).await;
+                        moving = None;
+                        switching = None;
+                        reloading = false;
+                        swap_now = false;
+                        in_place = false;
+                        carry.retain(|c| !is_message(c));
+                        for_room.retain(|c| !is_message(c));
+                        flush(&s, &sink, None).await;
+                        on_change();
                         if s.core.lock().has_room() {
                             break;
                         }
@@ -6350,7 +6519,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     // Another runner: it goes there, now.
                     Command::MoveTo { to, cwd, note, now, kind: into, model, local, native, slates } => {
-                        if let Some(mv) = move_wanted(&s, to, cwd, note, now, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
+                        if let Some(mv) = move_wanted(&s, to, cwd, note, now, false, into.as_deref().and_then(Kind::get).filter(|k| k.id != kind.id), model, local, native, slates) {
                             moving = Some(mv);
                             break;
                         }

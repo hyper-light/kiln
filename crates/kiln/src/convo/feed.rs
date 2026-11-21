@@ -134,6 +134,10 @@ pub enum Msg {
         kept: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         about: Option<u64>,
+        /// It takes the sessions' inbox rows ([`Row::Inbox`](super::rows::Row::Inbox)); a taker from before doesn't
+        /// say so, and isn't sent them (its feed reads on past them).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        inbox: bool,
     },
     /// Runner to server: part `part` (from 0) of `parts` of a batch that follows `from` and reads
     /// through `upto` (its bytes: JSON [`Changes`], brotli-compressed when `zip`). `told`: where
@@ -330,6 +334,8 @@ struct Shipping {
     zipped: bool,
     /// It takes record lines as they are kept (it said so).
     kept: bool,
+    /// It takes the sessions' inbox rows (it said so).
+    inbox: bool,
     /// Read and sent through here.
     sent: u64,
     /// The batches sent and not yet acknowledged, in the order sent: their `from` and `upto`.
@@ -390,7 +396,7 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, commits: s
         None
     };
     let mut up = false;
-    let mut st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
+    let mut st = Shipping { acked: None, zipped: false, kept: false, inbox: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
     let hello = |out: &crate::memory::queue::Sender<(String, Vec<u8>)>| out.try_send((encode(&Msg::Hello { store: me.clone(), restore }), Vec::new())).is_ok();
     // Its turns on its shard: what waits in its queue is taken without waiting (its link's words pile up there while it
     // reads), so it's given up between them once its turn would pass the quantum (goal 9, plan 01a1a87b2cec step 3).
@@ -442,7 +448,7 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, commits: s
         match ev {
             Some(Link::Up) => {
                 up = true;
-                st = Shipping { acked: None, zipped: false, kept: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
+                st = Shipping { acked: None, zipped: false, kept: false, inbox: false, sent: 0, flight: VecDeque::new(), told: None, heard: Instant::now() };
                 stats.link(true);
                 stats.hello(false);
                 hello(&out);
@@ -454,7 +460,7 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, commits: s
                 retry = None;
                 stats.link(false);
             }
-            Some(Link::Heard(Msg::From { store, rev, zip, kept, about })) if store == me => {
+            Some(Link::Heard(Msg::From { store, rev, zip, kept, about, inbox })) if store == me => {
                 // Asked to go on from where a batch of it, sent since, starts: an answer to one
                 // sent before it went on from there (a batch already on its way when it was told,
                 // or a hello's answer that came late). That batch follows; sending it again had
@@ -470,6 +476,7 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, commits: s
                 st.acked = Some(rev);
                 st.zipped = zip;
                 st.kept = kept;
+                st.inbox = inbox;
                 st.sent = rev;
                 st.told = Some(rev);
                 st.flight.clear();
@@ -524,12 +531,12 @@ async fn ship(store: Store, rx: crate::memory::queue::Receiver<Link>, commits: s
             if through.is_some_and(|end| st.sent >= end) {
                 break;
             }
-            let (from, kept) = (st.sent, st.kept);
+            let (from, kept, inbox) = (st.sent, st.kept, st.inbox);
             let s = store.clone();
             // How far its store had grown as this read began: what's committed after is the next read's.
             let read_at = store.grown();
             let began = Instant::now();
-            let mut batch = match crate::rt::blocking(move || s.changes_as(from, BATCH_BYTES, kept)).await {
+            let mut batch = match crate::rt::blocking(move || s.changes_as(from, BATCH_BYTES, kept, inbox)).await {
                 Ok(Ok(b)) => {
                     retry = None;
                     b
@@ -849,7 +856,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
             let Some(rev) = stands(&s) else { return Vec::new() };
             tracing::info!(%machine, store = %s, from = rev, "conversation feed: a runner's store sends the server's what it has after this");
             taking.entry((peer, s.clone())).or_default().told = Some(rev);
-            vec![Msg::From { store: s, rev, zip: true, kept: true, about: None }]
+            vec![Msg::From { store: s, rev, zip: true, kept: true, about: None, inbox: true }]
         }
         Msg::Batch { store: s, from, upto, part, parts, zip, told, hand_on } => {
             let key = (peer, s.clone());
@@ -865,7 +872,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                     return Vec::new();
                 }
                 t.told = Some(rev);
-                vec![Msg::From { store: s.clone(), rev, zip: true, kept: true, about: Some(from) }]
+                vec![Msg::From { store: s.clone(), rev, zip: true, kept: true, about: Some(from), inbox: true }]
             };
             // Where it stands, when a batch didn't come whole: what it told a runner from before,
             // if it did since a batch was last taken (nothing taken since, it still stands there).
@@ -1216,7 +1223,7 @@ mod tests {
         let Some(Msg::From { mut rev, zip, kept, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
         let told = Some(rev);
         loop {
-            let batch = runner.changes_as(rev, bytes, kept)?;
+            let batch = runner.changes_as(rev, bytes, kept, true)?;
             if batch.rows.is_empty() {
                 return Ok(rev);
             }
@@ -1305,7 +1312,7 @@ mod tests {
         }
         runner.sync()?;
         let batch = runner.changes(2, 1 << 20)?;
-        let from = |rev: u64, about: u64| vec![Msg::From { store: runner.id().to_owned(), rev, zip: true, kept: true, about: Some(about) }];
+        let from = |rev: u64, about: u64| vec![Msg::From { store: runner.id().to_owned(), rev, zip: true, kept: true, about: Some(about), inbox: true }];
         let send = |partial: &mut HashMap<(hyper_transport::PeerId, String), Taking>, peer: hyper_transport::PeerId, msgs: Vec<(Msg, Vec<u8>)>| {
             let mut answer = Vec::new();
             for (m, data) in msgs {
@@ -1461,7 +1468,7 @@ mod tests {
         // Each bound here only ends a hang: a loaded machine takes what time it takes.
         let (json, _) = crate::rt::timeout(HANG, out.recv()).await??;
         anyhow::ensure!(matches!(decode(&json), Some(Msg::Hello { .. })), "a hello first: {json}");
-        ship.link(Link::Heard(Msg::From { store: runner.id().to_owned(), rev: 0, zip: false, kept: false, about: None }));
+        ship.link(Link::Heard(Msg::From { store: runner.id().to_owned(), rev: 0, zip: false, kept: false, about: None, inbox: false }));
         let mut partial = HashMap::new();
         while server.kept("a1", 10)?.map_or(0, |k| k.events.len()) < 1 {
             let (json, data) = crate::rt::timeout(HANG, out.recv()).await??;
@@ -1759,7 +1766,7 @@ mod tests {
         let mut taking = HashMap::new();
         let hello = take(&feed, &mut taking, 7, "box", Msg::Hello { store: runner.id().to_owned(), restore: false }, Vec::new());
         let Some(Msg::From { rev, zip, kept, .. }) = hello.into_iter().next() else { anyhow::bail!("no answer to hello") };
-        let batch = runner.changes_as(rev, BATCH_BYTES, kept)?;
+        let batch = runner.changes_as(rev, BATCH_BYTES, kept, true)?;
         let json = serde_json::to_vec(&batch)?;
         let thing = batch_thing(runner.id(), rev, batch.upto, &crate::util::sha256_hex(&json));
         let send = |taking: &mut HashMap<(hyper_transport::PeerId, String), Taking>, json: Vec<u8>, hand_on: Option<String>| -> anyhow::Result<Vec<Msg>> {
@@ -1786,7 +1793,7 @@ mod tests {
         // A giver from before: taken as before, no receipt.
         runner.send("a1", &said("m2", 2, "two"));
         runner.sync()?;
-        let next = runner.changes_as(batch.upto, BATCH_BYTES, kept)?;
+        let next = runner.changes_as(batch.upto, BATCH_BYTES, kept, true)?;
         let mut answer = Vec::new();
         for (m, data) in parts(runner.id(), batch.upto, &next, zip, Some(batch.upto))? {
             answer = take(&feed, &mut taking, 7, "box", m, data);
@@ -1847,7 +1854,7 @@ mod tests {
             ship.link(Link::Up);
             assert!(matches!(next_sent(&out, Duration::from_secs(5)).await, Some(Msg::Hello { .. })));
             let me = runner.id().to_owned();
-            let from = |about| Link::Heard(Msg::From { store: me.clone(), rev: 0, zip: false, kept: false, about });
+            let from = |about| Link::Heard(Msg::From { store: me.clone(), rev: 0, zip: false, kept: false, about, inbox: false });
             ship.link(from(None));
             assert!(matches!(next_sent(&out, Duration::from_secs(5)).await, Some(Msg::Batch { from: 0, told: Some(0), .. })));
             // Told again while that batch is on its way: about one sent before it went on from 0
@@ -1871,11 +1878,11 @@ mod tests {
         runner.sync()?;
         let records = |c: &Changes| -> Vec<(bool, bool)> { c.rows.iter().filter_map(|c| if let super::super::rows::Row::Record(r) = &c.row { Some((r.kept.is_some(), r.line.is_empty())) } else { None }).collect() };
         // As kept: the long line goes compressed, the short one as it is.
-        assert_eq!(records(&runner.changes_as(0, 1 << 20, true)?), vec![(false, false), (true, true)]);
+        assert_eq!(records(&runner.changes_as(0, 1 << 20, true, true)?), vec![(false, false), (true, true)]);
         // A taker from before never says `kept`, and gets text.
-        assert_eq!(records(&runner.changes_as(0, 1 << 20, false)?), vec![(false, false), (false, false)]);
-        assert_eq!(decode(r#"{"t":"from","store":"s","rev":1,"zip":true}"#), Some(Msg::From { store: "s".into(), rev: 1, zip: true, kept: false, about: None }));
-        assert_eq!(encode(&Msg::From { store: "s".into(), rev: 1, zip: true, kept: false, about: None }), r#"{"t":"from","store":"s","rev":1,"zip":true}"#);
+        assert_eq!(records(&runner.changes_as(0, 1 << 20, false, true)?), vec![(false, false), (false, false)]);
+        assert_eq!(decode(r#"{"t":"from","store":"s","rev":1,"zip":true}"#), Some(Msg::From { store: "s".into(), rev: 1, zip: true, kept: false, about: None, inbox: false }));
+        assert_eq!(encode(&Msg::From { store: "s".into(), rev: 1, zip: true, kept: false, about: None, inbox: false }), r#"{"t":"from","store":"s","rev":1,"zip":true}"#);
         // The server, which takes them so, keeps them and reads them back the same.
         feed_all(&runner, &server, "box", 1 << 20)?;
         assert_eq!(server.record("a1", "s-1", 0, 10)?, vec![(0, "{\"type\":\"summary\"}".to_owned()), (1, long)]);

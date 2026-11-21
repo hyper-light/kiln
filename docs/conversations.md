@@ -21,6 +21,7 @@ For each agent session (kiln's id):
 | the session | info, meta, state (queue, pause, limits …), changeset, its epoch | the session's updates (`Open`, `State`, `Meta`, `Changes`) |
 | its events | every timeline event, upserted by id: messages, thoughts, tool calls with output, notices | `Events` updates (streamed text is kept once its event is whole) |
 | the harness's record | the harness's own transcript, line by line: Claude Code's JSONL, Codex's rollouts | followed on the session's machine as its files grow (`convo/record.rs`) |
+| its inbox and journal | the ids of the messages it took, its head and epoch, the messages in its custody and those waiting to be handed to it (docs/sends.md) | its inbox, as it takes and hands on each message (`convo/inbox.rs`) |
 
 - **Large payloads** stay as they are today. Tool output is clipped to `TEXT_MAX` in the event, and
   a task's full output is read on its machine.
@@ -105,6 +106,10 @@ C, no SIMD, no FTS.
     Code's session id, or a Codex rollout's file name.
   - `drops(rev, session, what, source, n, at)`: what was dropped.
   - `peers(peer, rev, at)`: through where this store has each peer's feed.
+  - `inbox(family, key, session, value, rev)` (migration 5): each session's inbox and journal, rows as
+    kiln-seams' `Records` keeps them, as they are now. A deleted row stays, its value NULL, so the feed
+    carries the delete; every row of one inbox commit shares its number, and a feed's batch never parts
+    them.
 - **Migrations an older kiln lives with.** A new build that takes a runner's store over migrates
   it, and a rollback hands it back to the older build, which skips the migrations it doesn't know
   (see "A runner's upgrade"). So each migration leaves a store an older kiln still reads and
@@ -149,6 +154,9 @@ what it took, and says through where it has it.
 - **Nothing is lost.** A runner killed, a server killed mid-turn, or a runner away for days: the
   server's number says where to go on, and the runner's store still has everything after it.
   Applying is idempotent: events upsert by id, record lines by number.
+- **The sessions' inboxes.** A store's inbox rows go to a taker that says it takes them (`inbox` in
+  its answer), the server and, from its store, the mirrors: so a session's inbox and journal outlive its
+  machine as its conversation does. A taker from before isn't sent them; its feed reads on past them.
 - **What the server keeps from where.** A runner that sends its store is the one source of its
   sessions in the server's store. The server stops keeping them from their updates, which a
   reconnect sends again in full. A runner from before the feed is kept from its updates, as in C1.

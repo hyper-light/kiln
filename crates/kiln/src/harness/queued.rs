@@ -263,6 +263,19 @@ impl Kept {
         if now.saturating_sub(since) < HEARD_MS { Now::Waiting } else { Now::Gone }
     }
 
+    /// When a look at it next comes out otherwise though its agent's queue stays as it is (G9 step 3:
+    /// what wakes the goal driver for it): not seen in the queue yet, taken as gone [`SHOW_MS`] after
+    /// it was sent; gone from it, its handing not heard of, taken as lost [`HEARD_MS`] after. None:
+    /// only a change to the queue changes it.
+    pub fn due(&self) -> Option<i64> {
+        let shown = (!self.seen && !self.direct).then(|| self.at.saturating_add(SHOW_MS));
+        let heard = self.gone_at.map(|g| g.saturating_add(HEARD_MS));
+        match (shown, heard) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// What it last said may not have reached the agent: its queue wasn't seen holding that.
     pub fn lost(&self) -> bool {
         self.text != self.held

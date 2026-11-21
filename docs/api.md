@@ -198,8 +198,9 @@ agent calls passes one gate, before any of it runs (`crate::ops::call`, so CI's,
 experiments', Ship's and deployments' operations as much as kiln's own):
 
 - At once: reads; its acts on itself and on what it started (its children and theirs, the plan runs they
-  ran); messages and questions to its person's other agents, as their own rules have them; and every
-  other change it may already make.
+  ran); messages and questions to its person's other agents, as their own rules have them; a reset of
+  any of its person's other agents (`agents.reset`, docs/agents.md "Reset"; Ada, 2026-11-21: agents
+  reset stuck agents, without a click); and every other change it may already make.
 - Waiting on its person's click: an operation the registry marks destructive (`destructive`, enforced
   here, not only a hint to MCP clients); a change to another of its person's agents it didn't start
   (interrupting, ending or resuming it); and any change to their agent definitions. Asked in a person's

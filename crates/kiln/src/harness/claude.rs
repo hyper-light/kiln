@@ -772,6 +772,16 @@ impl Claude {
         self.turn || !self.inflight.is_empty() || !core.state.approvals.is_empty()
     }
 
+    /// Busy only with messages written to it that it never started: no turn under way, nothing
+    /// asked of a person, every message in flight still sent or queued. Nothing of that ends by
+    /// itself. Claude Code 2.1.327 left kiln's "Continue where you left off" so for good, written
+    /// ten seconds after a pause's interrupt and in none of its transcript's lines (Slates,
+    /// 2026-11-20). Asked what it holds (an interrupt, which cuts nothing here), it answers, and
+    /// what it never started leaves the session ([`Self::still_queued`]).
+    pub fn unstarted_only(&self, core: &Core) -> bool {
+        !self.turn && core.state.approvals.is_empty() && !self.inflight.is_empty() && self.inflight.iter().all(|id| matches!(core.state.delivery.get(id), Some(Delivery::Sent | Delivery::Queued)))
+    }
+
     fn settle(&self, core: &mut Core) {
         let running = self.turn || !self.inflight.is_empty();
         core.settle_status(running);
@@ -933,7 +943,7 @@ impl Claude {
             }
             // Restarts and snapshots are the session's (it owns the process and the sink).
             // The session itself does these (a move is not the harness's business).
-            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } => {}
+            Command::Restart | Command::ForceStop | Command::Snapshot | Command::MoveTo { .. } | Command::Moving { .. } | Command::HandedOver { .. } | Command::OwnEdits { .. } | Command::RemoveTask { .. } | Command::Override { .. } | Command::Agentenv { .. } | Command::Reset { .. } => {}
             Command::McpEnable { name, enabled } => {
                 let what = format!("{} {name}", if enabled { "Enable" } else { "Disable" });
                 self.request(core, Pending::McpChange(what), json!({"subtype": "mcp_toggle", "serverName": name, "enabled": enabled}));

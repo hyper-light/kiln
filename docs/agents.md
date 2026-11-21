@@ -278,8 +278,11 @@ starts the harness again on its conversation, as applying one does.
 
 **Applied on its own** (`auto`). An environment with `auto` on joins the stack of each of its
 owner's sessions its scope matches: as one starts, and, when its scope or `auto` changes, each of
-their sessions running (without starting its harness again: it takes it as its harness next starts,
-and the Engine tab says so). Those it joins go under the environments the session was given by
+their sessions running (its harness starting again on it once nothing is under way, its conversation
+going on, as applying one does). A change to what an environment gives (its variables or its base)
+reaches each running session it's in, given by name or on its own, the same way: a running agent
+takes every change to its environments (the person's decision, 2026-11-21; taken only as its harness
+next started, a change never reached an agent that ran on). Those it joins go under the environments the session was given by
 name, the one with more chips over one with fewer (more specific first), then by name. Turned off,
 or its scope changed so a session no longer matches, it leaves the stacks it joined on its own,
 not those it was put in by name. An environment with `secret` variables never joins a session in a
@@ -499,6 +502,31 @@ sessions, and an agent's to do to the agents it started (and theirs), as `agents
   does ("Crashed agents", below), so its transcript, goals and subagents stay its own, and its
   timeline says it was stopped by force. One whose harness had exited starts again, and a crashed
   one is resumed in place. One still starting, or on a machine that's away, is refused.
+
+### Reset
+
+An agent that's stuck (it takes no messages, its queue never goes, a move or a pause it can't leave)
+is reset from its page's ⋯ menu (Reset…, asked in a line under its head, why in your words if you
+like), as an operation (`agents.reset`: "Operations", below), an MCP tool (`agents_reset`) or
+`POST /api/harness/agents/:id/reset` (Ada, 2026-11-21). A reset:
+
+- **Ends everything it had pending.** Each message to it that kiln holds and hasn't handed out is
+  cancelled first, so none reaches the fresh harness; then, on its machine, kiln's queue and its
+  subagents' queues, every message it was handed and never finished, its approvals and its tasks
+  (its shells, monitors and remote runs), and a pause, a hold, or a move or switch that waited.
+  Each message's sender is told it was cancelled; its original stays in kiln's history. A message
+  sent after the reset was asked goes to the fresh harness.
+- **Opens its intake again,** however it stood: its admission takes messages again
+  (`Controller::reset`), and what an earlier stay on its machine left behind goes (docs/sends.md).
+- **Kills its harness and starts it again fresh,** on the same conversation: its transcript, goals,
+  plan, settings and subagents stay its own, and the turn that was under way isn't taken up again.
+
+Its timeline says who reset it (you, or the agent that asked, by name) and why, and what ended. You
+reset your own agents; and any agent may reset any other agent that works for the same person, at
+once, without your click (Ada, 2026-11-21: "agents can reset stuck agents"). One whose machine is
+away is refused, as is one whose runner predates resets (it names `harness.reset` once upgraded):
+nothing is done to it. A crashed one has nothing running to reset: it comes back fresh by a resume
+("Crashed agents", below), and is reset then if it's still stuck.
 
 ### An agent definition's limits
 
@@ -1207,7 +1235,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `agents.get` | `GET /api/harness/agents/:id` | → `{agent: Agent, info, state, live, definition}` (its state without the catalogs; `definition`: the agent definition it started from, `{id, version, name, current}`, its `version` then and the definition's `current` one now, or null: docs/api.md, "Agent definitions") |
 | `agents.start` | `POST /api/harness/agents` | `{kind, on?, cwd?, prompt?, model?, effort?, mode?, name?, count?, workspace?}` → `{agents: [Agent], parent}` |
 | `agents.about` | `POST /api/harness/agents/:id/about` | `{path, code, line?, end_line?, selection?, change?, question?, now?}` → `{agents: [Agent], itself}`: a child of the agent, reading only, answers what a person tapped in its conversation (a name, a line, a change) in four parts (what it is, what it does here, where else it's used, what's worth knowing); when the agent runs no subagents (`max_subagents` 0) it answers itself (`itself: true`, `sent` as `agents.send` answers), after its turn or with `now` between its steps. The child is a helper (`helper: "about"` on it): no row of Mission Control, its parent not told of it, ended once no card has read it (`agents.result`) for 90 seconds |
-| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?, status?: {key, task?}}` (or the `Idempotency-Key` header) → durable receipt `{sent: true, retained: true, message, id, revision, generation, disposition, repeat}`: retained custody is separate from actual model consumption; mode defaults to `steer` for agents, `queue` for people ("Sending again" and "Replaceable progress", below) |
+| `agents.send` | `POST /api/harness/agents/:id/send` | `{text, mode?: "queue" \| "steer" \| "now", key?, status?: {key, task?}}` (or the `Idempotency-Key` header) → routed to the runner its agent is on (docs/sends.md, "Routed to its session"), its inbox's answer once it took it into custody there: `{sent: true, message, accepted: {session, message, epoch, at, seq, repeat}}`; to a runner from before routing, or one that's away, the server's durable receipt `{sent: true, retained: true, message, id, revision, generation, disposition, repeat}`. Either is custody, not the model's reading it; mode defaults to `steer` for agents, `queue` for people ("Sending again" and "Replaceable progress", below) |
 | `agents.messages` | `GET /api/harness/agents/:id/messages` | `{from?, status_key?, task?, after?, bytes?}` → byte-bounded `{items, next}` of accepted originals, including superseded statuses; another sender's incoming history requires permission to see the recipient conversation |
 | `agents.message_body` | `GET /api/harness/agents/:id/message-body` | `{revision, from?, path?, offset?, bytes?}` → bounded original-value inspection: JSON-pointer object keys, array length, scalar or UTF-8 string range; `/$transfers` inspects custody-transfer receipts |
 | `agents.wait` | `POST /api/harness/agents/wait` | `{agent?` or `agents?` (a list, or `a,b`), `until?: "settled" \| "change"`, `any?`, `timeout_s?`, `hand_over?}` → `{done, timed_out, waited_ms, until, agents: [Agent], messages?: [{from, name, text, at}]}` (`messages`: what other agents sent the agent that waits, handed over: "Waiting") |
@@ -1219,6 +1247,7 @@ code-mode function (`kiln.agents.start`) and, from a kiln shell, a CLI command.
 | `sessions.pause` | `POST /api/harness/sessions/:id/pause` | → `{agent, asked: "pause", engine}`: its machine holds it, and the subagents kiln started under it; `agents.get` says once it's paused, its timeline why not ("Pause, resume and restart", above); 409 when it's paused already |
 | `sessions.resume` | `DELETE /api/harness/sessions/:id/pause` | → `{agent, asked: "resume", engine}`: a person's pause ends, and a usage limit's; 409 when nothing pauses it |
 | `sessions.restart` | `POST /api/harness/sessions/:id/restart` | → `{agent, how: "force_stop" \| "start" \| "resume", engine, resumed?}`: its harness starts again from its own launch, in a fresh microVM where it ran in one, under its id, its conversation going on; 409 while it's starting, 502 while its machine is away |
+| `agents.reset` | `POST /api/harness/agents/:id/reset` | `{why?}` → `{agent, reset: true, cancelled, engine}`: everything it had pending ends (the messages to it kiln held, `cancelled` of them, and on its machine its queue, approvals, tasks and the messages it was handed and never finished, each sender told), its intake opens again, and its harness starts again fresh on the same conversation ("Reset", above); any agent working for the same person resets it at once; 409 where its runner predates resets, 502 while its machine is away |
 | `agents.change` | `POST /api/harness/agents/:id/change` | `{title?, body?, draft?, ready?, trunk?, fix_checks?, threads?}` → `{change_request: Change}`: opens its change request from its work, or pushes a new version; `draft` opens it a draft on every host, `ready` marks its draft ready, and `threads` names the threads a new version fixes ("Change requests from agents", below) |
 | `agents.changes` | `GET /api/harness/changes` | `agent?` → `{changes: [Change]}`, newest first |
 | `agents.workspace` | `GET /api/harness/agents/:id/workspace` | → `{workspace: {kind, over, sub, volume, mount} \| null, drift: [path]}` ("Workspaces of their own", below) |

@@ -13,9 +13,9 @@ use turso_core::{CheckpointMode, Connection, ConnectOpts, Database, DatabaseOpts
 
 use std::collections::HashMap;
 
-use super::rows::{EventRow, RecordRow, Row};
+use super::rows::{EventRow, InboxRow, RecordRow, Row};
 use super::sql;
-use super::store::{Change, Changes, Compacting, Engine, Kept, Look, Mark, Query, Read, SearchFrom, Took, Unended};
+use super::store::{Change, Changes, Compacting, Engine, InboxPage, Kept, Look, Mark, Query, Read, SearchFrom, Took, Unended};
 use super::telemetry::CompactView;
 
 /// Rows of each kind a feed reads at once.
@@ -23,7 +23,7 @@ const FEED_PAGE: usize = 512;
 /// The big tables, copied a batch at a time while compacting: every row of them has a number
 /// (`rev`), so what is written meanwhile is copied again by its number, and what a drop took away
 /// is taken away from the copy too. The other tables are small, and go whole at the swap.
-const COMPACT_SCANNED: [&str; 4] = ["sessions", "events", "records", "drops"];
+const COMPACT_SCANNED: [&str; 5] = ["sessions", "events", "records", "drops", "inbox"];
 /// Rows in one step of compacting, at most (a step also stops at its bytes).
 const COMPACT_ROWS: i64 = 4096;
 /// The copy's page cache while compacting.
@@ -232,6 +232,23 @@ fn int(v: i64) -> Value {
 
 fn seq(v: u64) -> Value {
     Value::from_i64(i64::try_from(v).unwrap_or(i64::MAX))
+}
+
+/// Bytes, as a blob is bound.
+fn bytes(b: &[u8]) -> anyhow::Result<Value> {
+    Value::from_slice(b).map_err(|e| anyhow::anyhow!("a value couldn't be held: {e}"))
+}
+
+/// The first key past every key that starts with `prefix` (None: there's none).
+fn past(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if let Some(next) = last.checked_add(1) {
+            end.push(next);
+            return Some(end);
+        }
+    }
+    None
 }
 
 /// A file beside the store's: its name with `suffix` added.
@@ -546,6 +563,44 @@ impl Link<'_> {
         self.conn.prepare(sql).map_err(fail)
     }
 
+    /// As [`super::store::Engine::inbox_get`], on this link's connection.
+    fn inbox_get(&self, family: &str, key: &[u8]) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
+        let mut stmt = self.prepare(sql::INBOX_GET)?;
+        let mut out = None;
+        self.run(&mut stmt, &[txt(family), bytes(key)?], |r| {
+            if let Some(v) = r.get_value(0).to_blob() {
+                out = Some((v.to_vec(), u(r, 1)));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// As [`super::store::Engine::inbox_scan`], on this link's connection.
+    fn inbox_scan(&self, family: &str, prefix: &[u8], after: Option<&[u8]>, limit: usize) -> anyhow::Result<InboxPage> {
+        let mut stmt = self.prepare(sql::INBOX_SCAN)?;
+        let end = if prefix.is_empty() { None } else { past(prefix) };
+        let after = match after {
+            Some(a) => bytes(a)?,
+            None => Value::Null,
+        };
+        let end = match end {
+            Some(e) => bytes(&e)?,
+            None => Value::Null,
+        };
+        let want = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut rows = Vec::new();
+        self.run(&mut stmt, &[txt(family), bytes(prefix)?, after, end, int(want)], |r| {
+            let key = r.get_value(0).to_blob().map(<[u8]>::to_vec).unwrap_or_default();
+            let value = r.get_value(1).to_blob().map(<[u8]>::to_vec).unwrap_or_default();
+            rows.push((key, value, u(r, 2)));
+            Ok(())
+        })?;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        Ok((rows, more))
+    }
+
     /// As [`super::store::Engine::unended`], on this link's connection (a reader's beside the writer).
     fn unended(&self, since: i64) -> anyhow::Result<Vec<Unended>> {
         let mut stmt = self.prepare(sql::SESSIONS_UNENDED)?;
@@ -840,6 +895,8 @@ fn event_of(r: &TRow) -> anyhow::Result<EventRow> {
 
 /// The statements a transaction writes with, prepared once for it.
 struct Writes {
+    /// Prepared as an inbox row is first written: a store at a schema from before the inbox has no table for it.
+    inbox: Option<Statement>,
     session: Statement,
     machine: Statement,
     open: Statement,
@@ -915,6 +972,7 @@ fn unsqueeze(v: &Value) -> anyhow::Result<String> {
 impl Turso {
     fn writes(&self) -> anyhow::Result<Writes> {
         Ok(Writes {
+            inbox: None,
             session: self.prepare(sql::SESSION_UPSERT)?,
             machine: self.prepare(sql::SESSION_MACHINE)?,
             open: self.prepare(sql::SESSION_OPEN)?,
@@ -990,8 +1048,40 @@ impl Turso {
                 self.run(&mut w.machine, &[txt(session), txt(machine)], none)?;
                 self.touch(session);
             }
+            // A row of its inbox and journal as its store has it now; a deleted one kept deleted, fed on as one.
+            Row::Inbox(i) => {
+                let value = match &i.value {
+                    Some(v) => bytes(v)?,
+                    None => Value::Null,
+                };
+                if w.inbox.is_none() {
+                    w.inbox = Some(self.prepare(sql::INBOX_PUT)?);
+                }
+                let Some(put) = w.inbox.as_mut() else { return Ok(false) };
+                self.run(put, &[txt(&i.family), bytes(&i.key)?, txt(&i.session), value, r], none)?;
+            }
         }
         Ok(true)
+    }
+
+    /// The inbox's rows after `from`, as [`Turso::feed_page`] reads a kind's: each commit's rows whole, though they share
+    /// its number (a page cut short reads the rest of the last commit it read).
+    fn feed_inbox(&self, from: u64, max_bytes: usize) -> anyhow::Result<(Vec<(u64, String, Vec<Row>, Option<u64>)>, bool)> {
+        let row_of = |r: &TRow| -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)> {
+            let session = r.get::<String>(0).unwrap_or_default();
+            let row = InboxRow { session: session.clone(), family: r.get::<String>(1).unwrap_or_default(), key: r.get_value(2).to_blob().map(<[u8]>::to_vec).unwrap_or_default(), value: r.get_value(3).to_blob().map(<[u8]>::to_vec) };
+            Ok((u(r, 4), session, vec![Row::Inbox(Box::new(row))], None))
+        };
+        let (mut out, more) = self.feed_page(sql::FEED_INBOX, from, max_bytes, row_of)?;
+        if more && let Some(last) = out.last().map(|(rev, ..)| *rev) {
+            out.retain(|(rev, ..)| *rev != last);
+            let mut rest = self.prepare(sql::FEED_INBOX_AT)?;
+            self.run(&mut rest, &[seq(last)], |r| {
+                out.push(row_of(r)?);
+                Ok(())
+            })?;
+        }
+        Ok((out, more))
     }
 
     /// The epoch this store has for `session` (0: none yet).
@@ -1195,6 +1285,15 @@ impl Turso {
             // A page cut short may have more after its last.
             if n >= COMPACT_ROWS || bytes >= budget {
                 bound = bound.min(last);
+                // An inbox commit's rows share its number: the rest of the last one read, so none of it is left behind.
+                if table == "inbox" {
+                    all.retain(|(rev, t, _)| !(*t == "inbox" && *rev == last));
+                    let mut rest = self.prepare(sql::INBOX_AT)?;
+                    self.run(&mut rest, &[seq(last)], |r| {
+                        all.push((last, table, r.get_values().skip(1).cloned().collect()));
+                        Ok(())
+                    })?;
+                }
             }
         }
         all.retain(|(rev, ..)| *rev <= bound);
@@ -1348,6 +1447,67 @@ impl Engine for Turso {
         self.id.clone()
     }
 
+    fn inbox_get(&mut self, family: &str, key: &[u8]) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
+        self.link().inbox_get(family, key)
+    }
+
+    fn inbox_scan(&mut self, family: &str, prefix: &[u8], after: Option<&[u8]>, limit: usize) -> anyhow::Result<InboxPage> {
+        self.link().inbox_scan(family, prefix, after, limit)
+    }
+
+    fn inbox_commit_batch(&mut self, batch: &[(&kiln_seams::records::Tx, &[String])]) -> anyhow::Result<Vec<Result<u64, kiln_seams::records::Refusal>>> {
+        use kiln_seams::records::{Cond, Refusal, Write};
+        // What's answered is on disk past the drive's cache on Apple's systems (F_FULLFSYNC), as the inbox's own store
+        // had it (`crate::records::turso`); only for these commits: the conversation's own writes keep their sync.
+        self.conn.set_sync_type(turso_core::io::FileSyncType::FullFsync);
+        let done = self.transaction(|t| {
+            let mut out = Vec::with_capacity(batch.len());
+            let mut put = t.prepare(sql::INBOX_PUT)?;
+            let mut delete = t.prepare(sql::INBOX_DELETE)?;
+            'commit: for (tx, sessions) in batch {
+                // Each read as the commits before it in this batch left it.
+                for c in &tx.conds {
+                    let (family, key, want) = match c {
+                        Cond::Absent { family, key } => (family, key, None),
+                        Cond::At { family, key, rev } => (family, key, Some(*rev)),
+                    };
+                    let at = t.link().inbox_get(family, key)?.map(|(_, rev)| rev);
+                    if at != want {
+                        out.push(Err(Refusal::Conflict { family: family.clone(), key: key.clone(), at }));
+                        continue 'commit;
+                    }
+                }
+                if tx.writes.is_empty() {
+                    out.push(Ok(t.rev));
+                    continue;
+                }
+                t.rev += 1;
+                let rev = t.rev;
+                for (i, w) in tx.writes.iter().enumerate() {
+                    let session = sessions.get(i).map_or("", String::as_str);
+                    match w {
+                        Write::Put { family, key, value } => t.run(&mut put, &[txt(family), bytes(key)?, txt(session), bytes(value)?, seq(rev)], |_| Ok(()))?,
+                        Write::Delete { family, key } => t.run(&mut delete, &[txt(family), bytes(key)?, seq(rev)], |_| Ok(()))?,
+                    }
+                }
+                out.push(Ok(rev));
+            }
+            Ok(out)
+        });
+        self.conn.set_sync_type(turso_core::io::FileSyncType::Fsync);
+        done
+    }
+
+    fn inbox_floor(&mut self, rev: u64) -> anyhow::Result<()> {
+        if rev <= self.rev {
+            return Ok(());
+        }
+        self.transaction(|t| {
+            t.rev = rev;
+            Ok(())
+        })
+    }
+
     fn apply(&mut self, rows: &[Row]) -> anyhow::Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1364,7 +1524,7 @@ impl Engine for Turso {
         })
     }
 
-    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool) -> anyhow::Result<Changes> {
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
         if from >= self.rev {
             return Ok(Changes { rows: Vec::new(), upto: from });
         }
@@ -1398,6 +1558,8 @@ impl Engine for Turso {
                 let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line, kept: as_kept };
                 Ok((u(r, 5), rec.session.clone(), vec![Row::Record(Box::new(rec))], None))
             })?,
+            // The sessions' inboxes, to a taker that takes them: others read on past their numbers.
+            if inbox { self.feed_inbox(from, max_bytes)? } else { (Vec::new(), false) },
             self.feed_page(sql::FEED_DROPS, from, max_bytes, |r| {
                 let session = s(r, 1).unwrap_or_default();
                 let at = r.get::<i64>(5).unwrap_or(0);
@@ -1422,7 +1584,8 @@ impl Engine for Turso {
         let mut out = Changes { rows: Vec::new(), upto: bound };
         let mut bytes = 0usize;
         for (rev, session, rows, epoch) in all {
-            if bytes >= max_bytes && !out.rows.is_empty() {
+            // Never between rows of one number (an inbox commit's): its rows go together.
+            if bytes >= max_bytes && out.rows.last().is_some_and(|c| c.rev != rev) {
                 // The rest next time: read through the last one taken.
                 out.upto = out.rows.last().map_or(from, |c| c.rev);
                 break;
@@ -2025,7 +2188,7 @@ mod tests {
         }
         let mut t = Turso::open(&path)?;
         assert!(!t.id().is_empty());
-        let all = t.changes(0, 1 << 20, false)?;
+        let all = t.changes(0, 1 << 20, false, true)?;
         let mut kinds: Vec<String> = all.rows.iter().map(|c| format!("{}:{}", c.row.session(), match &c.row { Row::Session { .. } => "session", Row::Closed { .. } => "closed", Row::Event(_) => "event", _ => "other" })).collect();
         kinds.sort();
         assert_eq!(kinds, vec!["a1:event", "a1:event", "a1:session", "a2:closed", "a2:session"]);
@@ -2035,7 +2198,7 @@ mod tests {
         assert_eq!(revs.len(), 4);
         let top = all.upto;
         t.apply(&[Row::Event(Box::new(super::super::rows::event("a1", &Event { id: "m3".into(), seq: 3, at: 9, parent: None, by: None, body: Body::Assistant { text: "new".into(), streaming: false } }).ok_or_else(|| anyhow::anyhow!("no row"))?))])?;
-        let next = t.changes(top, 1 << 20, false)?;
+        let next = t.changes(top, 1 << 20, false, true)?;
         assert_eq!(next.rows.len(), 1);
         assert!(next.rows.iter().all(|c| c.rev > top));
         // Reopened: the same id, and numbering goes on.
@@ -2065,14 +2228,14 @@ mod tests {
         // nothing changes, and nothing gets a number for a feed to send.
         runner.apply(&rows)?;
         assert_eq!(runner.top(), top);
-        assert!(runner.changes(top, 1 << 20, false)?.rows.is_empty());
+        assert!(runner.changes(top, 1 << 20, false, true)?.rows.is_empty());
         // What changed is written, and only that.
         runner.apply(&super::super::rows::of("s1", &said("m2", 2, "second, revised"), 5))?;
         assert_eq!(runner.top(), top + 1);
         // The server, sent what it has by a new store of the same machine (a new runner process
         // that took the sessions over): nothing written, nothing numbered, nothing for a mirror.
         let mut server = Turso::open(&dir.path().join("s.db"))?;
-        let all = runner.changes(0, 1 << 20, true)?;
+        let all = runner.changes(0, 1 << 20, true, true)?;
         let first = server.take("box/old", Some("box"), 0, &all)?;
         assert_eq!((first.applied, first.same), (all.rows.len(), 0));
         let at = server.top();
@@ -2522,7 +2685,7 @@ mod tests {
         assert!(t.one_int("SELECT length(line) FROM records WHERE n = 0", &[])?.is_some_and(|b| (b as usize) < long.len() / 3));
         assert_eq!(t.record("s1", "cc", 0, 10)?, vec![(0, long.clone()), (1, short.to_owned())]);
         assert_eq!(t.marks("s1")?.first().map(|m| m.line.clone()), Some(short.to_owned()));
-        let fed: Vec<String> = t.changes(before, 1 << 20, false)?.rows.into_iter().filter_map(|c| if let Row::Record(r) = c.row { Some(r.line) } else { None }).collect();
+        let fed: Vec<String> = t.changes(before, 1 << 20, false, true)?.rows.into_iter().filter_map(|c| if let Row::Record(r) = c.row { Some(r.line) } else { None }).collect();
         assert_eq!(fed, vec![long, short.to_owned()]);
         Ok(())
     }
@@ -2621,7 +2784,7 @@ mod tests {
         a.apply(&rows)?;
         let (mut from, mut seen) = (0u64, Vec::new());
         loop {
-            let batch = a.changes(from, 2_000, true)?;
+            let batch = a.changes(from, 2_000, true, true)?;
             if batch.rows.is_empty() {
                 break;
             }

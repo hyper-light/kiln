@@ -3358,6 +3358,8 @@ impl Hub {
             tracing::warn!(agent = name, reason, "agent disconnected");
         }
         let lost_at = Instant::now();
+        // Its runs hold their agents back no more (`harness::told`, on the goal driver).
+        crate::goals::stir();
         let Some((away, snapshot)) = self.change_agent(name, |a| {
             a.connected = false;
             a.lost_at = Some(lost_at);
@@ -3831,6 +3833,12 @@ impl Hub {
             AgentMsg::RunnerRole { serial } => crate::api::boxed(|| crate::identities::runner_role_said(self, &agent, peer, &serial)).await,
             // Hand-overs between a machine's runner processes (`crate::handovers`).
             AgentMsg::HarnessMailTransfer { json } => crate::api::boxed(|| crate::harness::mail_transfer::heard(self, peer, json)).await,
+            // A message this server routed to the runner for a session it doesn't hold (it moved on, or was never there):
+            // sent on to where the session is now, off this loop's way (docs/sends.md, "Routed to its session").
+            AgentMsg::HarnessForward { session, epoch: _, json } => {
+                let (hub, from) = (Arc::clone(self), String::from(&*agent));
+                drop(crate::rt::spawn(async move { hub.harness.forward(&hub, &from, &session, &json).await }));
+            }
             AgentMsg::HarnessHandOver { session, offset, data, done } => crate::api::boxed(|| self.handover_piece(&agent, peer, session, offset, data, done)).await,
             AgentMsg::HarnessAdopted { session, error } => crate::api::boxed(|| self.handover_adopted(&agent, peer, session, error)).await,
             // A frame of the server's this runner couldn't read: noted against it, and on the page

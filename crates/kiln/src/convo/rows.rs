@@ -55,6 +55,36 @@ pub enum Row {
     /// The machine the session runs on, as the store it came from has it (a mirror of the
     /// server's store keeps where each session runs).
     Machine { session: String, machine: String },
+    /// A row of a session's inbox and journal (`super::inbox`) as its store has it now: a taker keeps it as it comes,
+    /// and feeds it on (Ada, 2026-11-20: each runner's conversations, inboxes included, replicated across). Only to a
+    /// taker that says it takes them (`inbox` in [`From`](super::feed::Msg::From)): one from before can't read it.
+    Inbox(Box<InboxRow>),
+}
+
+/// A row of a session's inbox and journal in a feed ([`Row::Inbox`]): its family and key, and its value (None: it was
+/// deleted, and the taker deletes it too), bytes as base64 in the feed's JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboxRow {
+    pub session: String,
+    pub family: String,
+    #[serde(with = "key_bytes")]
+    pub key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "kept_bytes")]
+    pub value: Option<Vec<u8>>,
+}
+
+/// A key's bytes in a feed's JSON: base64.
+mod key_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        base64::engine::general_purpose::STANDARD.decode(String::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
 }
 
 /// A line of the harness's record: Claude Code's transcript, a Codex rollout.
@@ -128,6 +158,7 @@ impl Row {
             Row::Session { session, .. } | Row::Reset { session, .. } | Row::Closed { session, .. } | Row::RecordReset { session, .. } | Row::Machine { session, .. } => session,
             Row::Event(e) => &e.session,
             Row::Record(r) => &r.session,
+            Row::Inbox(i) => &i.session,
         }
     }
 
@@ -138,6 +169,7 @@ impl Row {
             Row::Event(e) => 128 + e.text.len() + e.body.len(),
             Row::Record(r) => 64 + r.source.len() + r.line.len() + r.kept.as_ref().map_or(0, |k| k.len() / 3 * 4),
             Row::Reset { .. } | Row::Closed { .. } | Row::RecordReset { .. } | Row::Machine { .. } => 64,
+            Row::Inbox(i) => 64 + i.family.len() + i.key.len() / 3 * 4 + i.value.as_ref().map_or(0, |v| v.len() / 3 * 4),
         }
     }
 }
@@ -282,6 +314,8 @@ pub fn coalesce(rows: Vec<Row>) -> Vec<Row> {
                 last.insert(key, out.len());
                 out.push(Some(row));
             }
+            // An inbox row keeps its place: its commits come through the inbox's own way, not a batch of these.
+            Row::Inbox(_) => out.push(Some(row)),
             Row::Record(r) => {
                 let key = (r.session.clone(), format!("r:{}:{}", r.source, r.n));
                 if let Some(i) = last.get(&key).copied()

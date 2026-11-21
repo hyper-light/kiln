@@ -228,6 +228,25 @@ where
     }
 }
 
+/// When an agent's turn end has settled (`SETTLE_MS` after kiln saw it, or saw it start again under
+/// it), the soonest of those not decided on yet (G9 step 3: what wakes the goal driver for
+/// keep-going). The rest of what holds one back (at work, approvals, its queue, its tasks, a pause)
+/// is its agent's news when it ends.
+pub fn due() -> Option<i64> {
+    due_in(&SEEN.lock())
+}
+
+/// [`due`] over `seen`.
+fn due_in(seen: &HashMap<String, Seen>) -> Option<i64> {
+    seen.values()
+        .filter_map(|s| {
+            let restarted = s.end > 0 && s.busy_at > s.end_seen;
+            let at = if restarted { s.busy_at } else { s.end_seen };
+            (at > 0 && at > s.handled).then(|| at.saturating_add(SETTLE_MS))
+        })
+        .min()
+}
+
 /// Forget agents that are gone: those not among `ids` (every agent known now). Each looked up in a
 /// set of the ids, made before `SEEN` is held, not by a scan of them (goal 9, plan 01a1a87b2cec
 /// step 3: O(N²) in one poll of the goal driver).
@@ -263,6 +282,23 @@ mod tests {
         (i.todos_done, i.todos_total) = todos;
         assert_eq!(decide(&i, &mut seen, now - 10_000), Next::Wait, "it settles first");
         decide(&i, &mut seen, now)
+    }
+
+    /// G9 step 3: a turn's end not decided on yet comes due as it settles, and once decided on it
+    /// holds no deadline (the goal driver isn't woken for it again).
+    #[test]
+    fn g9_s3_a_turn_end_comes_due_as_it_settles_and_once() {
+        let now = 1_792_000_000_000;
+        let mut seen = Seen::default();
+        assert_eq!(decide(&agent(Status::Running, None), &mut seen, now - 20_000), Next::Wait);
+        let i = agent(Status::Idle, Some(ended("cut", now - 1_000)));
+        assert_eq!(decide(&i, &mut seen, now), Next::Wait, "it settles first");
+        let mut all = HashMap::new();
+        all.insert("a".to_owned(), seen);
+        assert_eq!(due_in(&all), Some(now + SETTLE_MS), "due as its end settles");
+        let Some(s) = all.get_mut("a") else { return };
+        assert!(matches!(decide(&i, s, now + SETTLE_MS), Next::Keep { .. }));
+        assert_eq!(due_in(&all), None, "decided on: no deadline left");
     }
 
     #[test]

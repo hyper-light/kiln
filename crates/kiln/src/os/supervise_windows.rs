@@ -127,6 +127,12 @@ pub fn stop(pids: &[u32]) {
     }
 }
 
+/// Nothing on Windows: a service's job ends what it holds, and Slates' anchor left it as it started
+/// (`spawn_detached`'s `CREATE_BREAKAWAY_FROM_JOB`). Unix's says what's swept there.
+pub fn sweep_unit() -> usize {
+    0
+}
+
 /// In a supervised child, treat EOF on stdin (the supervisor closed it, or died) as a shutdown
 /// request.
 pub fn watch_supervisor(shutdown: crate::rt::Shutdown) {

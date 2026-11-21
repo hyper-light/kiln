@@ -367,7 +367,7 @@ pub fn known(target: &str, kind: &str) -> Option<Account> {
     KNOWN.lock().get(target).and_then(|(_, accounts)| accounts.iter().find(|a| a.kind == kind).cloned())
 }
 
-/// Every few seconds (`goals::run`): each connected machine never checked, or whose installed
+/// At each look of the goal driver's (`goals::run`; woken by a harness offered, `goals::stir`): each connected machine never checked, or whose installed
 /// harnesses changed since its last check, has its accounts checked in the background, one check
 /// at a time on each. A machine signed out by hand is seen at its next check (its accounts page,
 /// a move at a usage limit, a harness installed or updated).

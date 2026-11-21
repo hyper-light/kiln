@@ -525,11 +525,15 @@ pub(super) fn have_of(own: crate::wire::channel::Frame, shared: &Shared) -> crat
 
 /// A message for agent session `session`, sent for its epoch `epoch` (CP-T3.2): down its lane, through its inbox, which
 /// answers it. Another agent's words kiln relayed (`raw`, as the server sent it) are checked end to end before the session
-/// takes them: refused otherwise, its inbox's answer saying why (docs/ci.md W27-R08's relays). One for a session not here
-/// is refused, and the session said gone.
+/// takes them: refused otherwise, its inbox's answer saying why (docs/ci.md W27-R08's relays). One that came with its
+/// route (docs/sends.md, "Routed to its session") is taken into custody by the session's own inbox here
+/// (`Host::command_routed`), or, for a session not here, sent on to where it is now, a hop further
+/// (`AgentMsg::HarnessForward`), in place of a refusal. Any other for a session not here is refused, and the session
+/// said gone.
 pub(super) async fn send(shared: &Shared, session: String, epoch: u64, command: crate::harness::model::Command, raw: Option<&str>) {
     let known = shared.harness.as_ref().is_some_and(|h| h.get(&session).is_some());
     let relayed = if known { crate::runner::custody::relayed_words(&session, raw.unwrap_or_default(), &shared.root, &shared.name, &shared.instance_id) } else { Ok(()) };
+    let route = raw.and_then(crate::harness::route::Route::of);
     match command {
         c if relayed.is_err() => {
             let why = relayed.err().unwrap_or_default();
@@ -543,13 +547,24 @@ pub(super) async fn send(shared: &Shared, session: String, epoch: u64, command: 
         }
         c if known => {
             if let Some(h) = &shared.harness {
-                h.command_at(&session, c, Some(epoch));
+                match route {
+                    Some(route) => {
+                        h.command_routed(&session, c, Some(epoch), route);
+                    }
+                    None => {
+                        h.command_at(&session, c, Some(epoch));
+                    }
+                }
             }
         }
         c => {
-            // Gone here: the message is refused, and the session said gone.
+            // Gone here: a routed message goes on to where the session is now, a hop further, rather than being refused
+            // (only a server that routes sends one with its route); any other is refused. The session is said gone.
             let mut said = Vec::new();
-            if let Some(message) = crate::harness::registry::message_id(&c) {
+            let onward = route.as_ref().zip(raw).and_then(|(route, raw)| route.onward(route.target.clone()).and_then(|on| on.replace_in(raw)));
+            if let Some(json) = onward.filter(|_| crate::harness::registry::message_id(&c).is_some()) {
+                shared.own.0.send(Up::Term(AgentMsg::HarnessForward { session: session.clone(), epoch, json })).await.ok();
+            } else if let Some(message) = crate::harness::registry::message_id(&c) {
                 let refused = crate::harness::inbox::Said { message, answer: Err(crate::harness::inbox::Refusal::NoSession { session: session.clone() }) };
                 said.push(crate::harness::core::Update::Inbox { said: Box::new(refused) });
             }

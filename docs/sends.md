@@ -38,10 +38,20 @@ its sender was renamed or moved is the same message.
 ## The inbox
 
 Each session's inbox is on the host it runs on: the server for its own sessions, else its runner.
-It keeps its records in the host's `records.db`, beside its record of its sessions, through
-kiln-seams' `Records` (docs/seams.md): kiln's embedded Turso until Amphora's (CP-T1.5), each commit
-synced before it's answered. What's sent to a session goes down its lane, in the order it came; a
-message goes through its inbox before the session gets it:
+Each session keeps its own inbox and its own journal of the messages in its custody, in its
+machine's conversation store (`conversations.db`, docs/conversations.md), beside its conversation
+(Ada, 2026-11-20): rows of the store's `inbox` table, by session, written by the store's one writer
+and numbered as its other writes are, so the store's feed carries them with the rest. It's
+kiln-seams' `Records` (docs/seams.md) over that table (`crate::convo::inbox`): each commit synced
+past the drive's cache before it's answered, the commits that come together in one transaction,
+one sync. The store's feed carries them to the server's store, and from it to the mirrors, with the
+conversation (docs/conversations.md, "Replication"). A host without a conversation store
+(`KILN_CONVERSATIONS=off`) keeps them in a file of
+their own, `records.db`, as before. A host that kept them there brings its rows into its store the
+first time it's asked anything, before it answers anything, sets the file aside
+(`records.db.brought`), and numbers on past it, so a take's `seq` still rises. What's sent to a
+session goes down its lane, in the order it came; a message goes through its inbox before the
+session gets it:
 
 - **The first time,** the inbox takes it (a synced commit) and the session gets it.
 - **Every time after,** the sender gets the first time's answer, marked `repeat`, and the session
@@ -94,7 +104,19 @@ here, so a restart before they're in brings them again (an upgrade in place too,
 running), and they go with it if it moves on. A session resumed on another machine from the server's
 store (its own machine gone, and its inbox with it) brings the ids of the last 4,096 messages the
 server's copy of its timeline shows. A session that went on elsewhere and is restored on its old
-machine (a stale copy) takes nothing there.
+machine (a stale copy) takes nothing there. What a machine it left still holds of it, never seen to
+an end there (a message its harness was given), stays at the epoch it left at: a move carries its
+queue and its conversation, not that. Back on that machine at a higher epoch, it lets that go before
+anything is restored, as none of it can be restored at another epoch: restoring it refused all it
+was sent, for good (Slates, 2026-11-20: back on a Mac it had left, it took none of its person's
+messages or its 23 agents' there all night, each held in kiln). What came to an end there stays
+until the server acknowledges it, as each does.
+
+**A reset** (docs/agents.md, "Reset") ends all of a session's messages that never came to an end:
+what kiln holds for it and hasn't handed out is cancelled first, then its runner cancels what it was
+handed (each record ended in its journal, its sender told), then what kiln handed out before the
+reset that its runner didn't hold. Each original stays in kiln's history; a message sent after the
+reset was asked goes to the fresh harness.
 
 **Blue/green.** A session handed to the new build of its runner (another runner process of the same
 machine, at the same epoch) brings its inbox's newest ids the same way, and refuses messages while
@@ -138,7 +160,14 @@ message for one Claude Code never got and gave it again; Claude Code said it bac
 kiln held it in flight for good: the agent read as working, its queue never went, its usage limit's
 pause could never go on, and a move waited for a turn that wasn't under way (Quiver, 2026-11-13:
 three messages held so for ten hours, and "Go on now" from its usage limit said it was moving and
-never went).
+never went). A move asked while no turn is under way, with only messages in flight that Claude
+Code never started, doesn't wait either, "now" or not: it asks Claude Code what it holds (an
+interrupt, which cuts nothing then), and what it never started leaves the session, which comes to
+rest and goes. Slates, 2026-11-20: resumed at its stop point on an account at 100% of its five-hour
+window, it was written kiln's "Continue where you left off", which Claude Code 2.1.327 never took
+(the message is in none of its transcript's lines); kiln's usage-limit move came 26 s later and
+waited for the turn to end, and the session took no message for 2.5 minutes, until its person's own
+message stopped it.
 
 **One runner a machine.** A session an older runner process hands to its machine's newest
 (docs/releases.md, "One runner a machine") goes as a move does: it takes no messages as it's handed
@@ -204,6 +233,51 @@ too, saying why. Its answer says so (`unchecked`): sent again, a message there i
 drive's cache (`F_FULLFSYNC`), which costs more there. Its check seeks the message's id by its key
 in the records store, so it costs the same however many ids the host's sessions keep (a test reads
 the store's query plans: `records/turso.rs`).
+
+## Routed to its session
+
+A message goes to the runner its session is on and is taken into custody there, by the session's
+own inbox, never by whichever node it reached first (Ada, 2026-11-20). It carries its route
+(`crate::harness::route::Route`): the runner it's for, who sent it (a person, an agent, or kiln
+itself), how many times it was sent on, and, for an explicitly replaceable status (news), its status
+key.
+
+- **The server routes, and keeps nothing.** A person's message (the conversation's composer, Mission
+  Control's message box, the API's command) and an agent's (`agents.send`) to a session on a runner
+  that names `mail-route` (docs/wire.md, "Named features") go there at once, the route beside the
+  command in `HarnessSend`'s JSON, and the server waits for the inbox's answer as for any message
+  (`Answers`, below). Nothing of it is written to the server's store: no ledger row, no pump, no
+  round trip for room. Its sender hears `accepted` as soon as the session's inbox has it synced.
+- **Sent on by whoever isn't its holder.** A runner that gets one for a session it doesn't hold
+  (it moved on, or was never there) sends it on (`AgentMsg::HarnessForward`), one hop further, and the
+  server sends it where the session is now; whoever takes it answers the sender, who waits for that
+  one answer. A message is sent on at most 4 times after it was first routed: past that it's refused
+  `no_session`. A runner that refuses one `moved` or `no_session` anyway (a session on its way out)
+  has it sent once more, by the server, where the session is now.
+- **Admitted where it waits.** The session's inbox takes a routed message in one synced commit,
+  original and all, and its admission (W20's learned depth, held by the session itself) decides at
+  once: a person's goes to the session (held to no depth, as ever); an agent's or kiln's goes in its
+  sender's turn while the session has room under its depth, and otherwise waits in the session's own
+  journal (stage `waiting`, holding no room) and goes on the next change of the session's room (a
+  message consumed, a pause lifted, a restore done), never on a timer and never by a round trip to the
+  server. A sender's messages reach the session in the order they came: one never overtakes its
+  sender's still waiting. A newer status from the same sender under the same key replaces one of
+  theirs still waiting; one handed on already stays as it went. A routed message's journal row goes
+  once its message ends (consumed, cancelled), since no server holds its custody to acknowledge it.
+- **A burst in one commit.** Messages routed to a session that wait one behind another in its lane
+  (at most 64 at once, none of them a replaceable status) are taken together: each is decided in the
+  order it came, their takes go to the conversation store's writer at once, which commits them in one
+  transaction, one sync, and each is then handed on and answered in the order it came. Takes for
+  other sessions that come meanwhile share that commit too.
+- **Carried with its session.** What waits in a session's journal moves with it: a move's, a
+  blue/green upgrade's and a hand-over's journal transfer (W20's) carries every row, and the machine it
+  goes to admits what waits there. A machine from before routing can't read such a row, so the
+  transfer fails and the session stays where it is.
+- **Server custody where routing can't go yet.** A runner from before `mail-route`, or one that's away,
+  gets W20's path: the server takes the message into its custody and hands it over as the session's
+  admission allows once the runner is back. So do kiln's own messages (the goal driver's words, a
+  plan's steps, a program's notices, an agent's news of its children), another agent's words kiln
+  relays, and every message to a session on the server's own host ("What's open", below).
 
 ## Answers
 
@@ -364,6 +438,19 @@ host's.
 
 ## What's open
 
+- **Kiln's own messages and the server's own sessions.** What keeps the place of kiln's own messages
+  (a goal's word, a plan run's key, a program's notice, the news `told` edits) reads W20's custody
+  receipts, which a routed message doesn't have: routed, they'd wait for receipts that never come.
+  They stay in the server's custody, as do relayed words and every message to a session on the
+  server's own host (whose goals, plans and programs are those same readers), until those readers
+  take the routed answer and the session's own progress instead.
+- **Routing at the front door.** A runner's front door still pipes a browser's socket to the server
+  (docs/p2p.md, P2), so a message sent through it is routed by the server; nodes routing messages
+  themselves, over links of their own, are P5's.
+- **A message waiting in its session's journal** (routed, its depth full) shows sent to its sender,
+  as its inbox took it, and isn't listed above the composer until it's handed to the session.
+- **A rollback past routing.** A build from before can't read a journal row of a routed message
+  (`routed`, `waiting`): its session's admission says it's unavailable until the newer build is back.
 - **CP-T3.1, the session journal.** A session's queue is still kept in its host's JSON record,
   written half a second after it changes: a message taken and then lost to a crash before that stays
   taken, so its retry is answered, not delivered. And the other way: a message handed to its harness

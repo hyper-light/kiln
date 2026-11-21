@@ -30,7 +30,10 @@ test("each step out on a subagent shows its agent live: who, how long and what i
   const steps = await plan(page);
   const election = steps.locator(".gp-row", { hasText: "Leader election over QUIC" });
   await expect(election.locator(".gp-who")).toContainText("Claude Code · metal-ryzen-01 · ");
-  await expect(election.locator(".gp-live")).toHaveText("Running cargo test -p hyper-raft election");
+  await expect(election.locator(".gp-doing")).toHaveText("Running cargo test -p hyper-raft election");
+  // Its words keep the row's width: the line under them is cut to fit, never a column of its own.
+  const [title, text] = await Promise.all([election.locator(".gp-title").boundingBox(), election.locator(".gp-text").boundingBox()]);
+  expect(title?.width).toBe(text?.width);
   await election.locator(".gp-who").click();
   await expect(page).toHaveURL(/\/agents\/tree-lead\?task=tree-s1$/);
 });
@@ -39,7 +42,7 @@ test("the step that needs you: its request under it, answered there, and its str
   const steps = await plan(page);
   const catchUp = steps.locator(".gp-row", { hasText: "Follower catch-up" });
   await expect(catchUp).toHaveAttribute("data-stand", "needs_you");
-  await expect(catchUp.locator(".gp-live[data-ask]")).toHaveText("Bash: kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up");
+  await expect(catchUp.locator(".gp-doing[data-ask]")).toHaveText("Bash: kiln run --on linux/amd64 -- cargo test -p hyper-raft catch_up");
   expect(await stretch(catchUp)).toBe("rgb(198, 176, 142)");
   // The other steps keep the path's own colour.
   expect(await stretch(steps.locator(".gp-row", { hasText: "Snapshot transfer" }))).not.toBe("rgb(198, 176, 142)");
