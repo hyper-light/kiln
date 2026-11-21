@@ -803,8 +803,9 @@ impl Inbox {
     /// Every communication of session `session`'s at `epoch` its journal holds and that never came to an end, ended as
     /// `disposition` now (a reset, docs/agents.md "Reset": cancelled for whoever asked), a page at a time, each as it
     /// was read (one written since is read again). Its original stays, as every terminal record's does, until its
-    /// server acknowledges the end; one that came to an end already is left as it is. Each one ended, with its lease,
-    /// for its sender to be told.
+    /// server acknowledges the end, but a routed message's goes now (no server holds its custody to acknowledge it,
+    /// as at [`Self::dispose_pending`]); one that came to an end already is left as it is. Each one ended, with its
+    /// lease, for its sender to be told.
     pub async fn end_pending(&self, session: &str, epoch: u64, disposition: &super::admission::Disposition) -> Result<Vec<Disposed>, Refusal> {
         check_session(session)?;
         let mut ended = Vec::new();
@@ -823,7 +824,11 @@ impl Inbox {
                 pending.disposition = Some(disposition.clone());
                 pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
                 tx.conds.push(Cond::At { family: PENDING.into(), key: row.key.clone(), rev: row.rev });
-                tx.writes.push(Write::Put { family: PENDING.into(), key: row.key, value: json(session, &pending)? });
+                if pending.origin == Origin::Routed {
+                    tx.writes.push(Write::Delete { family: PENDING.into(), key: row.key });
+                } else {
+                    tx.writes.push(Write::Put { family: PENDING.into(), key: row.key, value: json(session, &pending)? });
+                }
                 these.push(Disposed { lease: pending.lease, disposition: disposition.clone() });
             }
             if !tx.writes.is_empty() {
@@ -1362,13 +1367,18 @@ mod tests {
             block(i.accept_pending("s1", message, &digest(message, &[]), Some(3), 10, &at_epoch(message, 3, stage)))?;
         }
         block(i.dispose_pending("s1", "done", 3, Disposition::Consumed { boundary: Consumption::ProviderAccepted }))?;
+        // One routed to it here and still waiting in its journal on its depth: no server holds it to acknowledge its end.
+        let mut routed = at_epoch("routed", 3, Stage::Waiting);
+        routed.origin = Origin::Routed;
+        block(i.accept_pending("s1", "routed", &digest("routed", &[]), Some(3), 10, &routed))?;
         let cancelled = Disposition::Cancelled { reason: CancelReason::User };
         let mut ended: Vec<String> = block(i.end_pending("s1", 3, &cancelled))?.into_iter().map(|d| d.lease.message).collect();
         ended.sort();
-        assert_eq!(ended, ["given", "queued"]);
+        assert_eq!(ended, ["given", "queued", "routed"]);
         for message in ["given", "queued"] {
             assert_eq!(block(i.pending("s1", message))?.and_then(|p| p.disposition), Some(cancelled.clone()), "{message} kept, cancelled, for its acknowledgement");
         }
+        assert!(block(i.pending("s1", "routed"))?.is_none(), "a routed message's row goes as it ends");
         assert!(matches!(block(i.pending("s1", "done"))?.and_then(|p| p.disposition), Some(Disposition::Consumed { .. })), "what came to an end keeps its end");
         assert!(block(i.end_pending("s1", 3, &cancelled))?.is_empty(), "ended once");
         assert!(block(i.end_pending("s1", 4, &cancelled))?.is_empty(), "another epoch's are another stay's");
