@@ -251,12 +251,32 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # One at a time: kiln's crate compiled twice at once (the library, and the library as its tests) ran a 16 GB
       # runner out (the linux job).
-      - name: Build kiln with vendor/slates
-        run: cargo build -p kiln --locked
-      - name: kiln's Slates tests (library)
-        run: cargo test -p kiln --locked --lib -- workspace::slates
-      - name: kiln's Slates tests (vendored, slates_roles)
-        run: cargo test -p kiln --locked --test vendored --test slates_roles
+      - id: build
+        name: Build kiln with vendor/slates
+        run: cargo build -p kiln --locked 2>&1 | tee "$RUNNER_TEMP/build.txt"
+      - id: lib
+        name: kiln's Slates tests (library)
+        run: cargo test -p kiln --locked --lib -- workspace::slates 2>&1 | tee "$RUNNER_TEMP/lib.txt"
+      - id: roles
+        name: kiln's Slates tests (vendored, slates_roles)
+        run: cargo test -p kiln --locked --test vendored --test slates_roles 2>&1 | tee "$RUNNER_TEMP/roles.txt"
+      # A run's logs take a GitHub sign-in to read; its annotations don't (the `build` job's Report). Run
+      # 44841298533's windows-11-arm leg failed its integration tests with exit 101 and nothing else to read.
+      - name: Report
+        if: ${{ failure() }}
+        env:
+          OUTCOMES: build=${{ steps.build.outcome }} lib=${{ steps.lib.outcome }} roles=${{ steps.roles.outcome }}
+        run: |
+          set +e +o pipefail
+          for said in $OUTCOMES; do
+            step=${said%%=*} outcome=${said#*=}
+            out="$RUNNER_TEMP/$step.txt"
+            if [ "$outcome" = success ] || [ ! -s "$out" ]; then continue; fi
+            # The failed tests' own output (cargo's `---- name stdout ----` sections) and the summary; else the end.
+            text=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | awk '/^---- / { f = 1 } /^(failures:|test result:|error)/ { f = 1 } f' | head -n 200)
+            [ -n "$text" ] || text=$(sed -e 's/\r$//' "$out" | tail -n 60)
+            echo "::error title=${{ matrix.os }} $step $outcome::$(printf '%s\n' "$text" | sed -e 's/%/%25/g' | awk 'BEGIN { ORS = "%0A" } { print }')"
+          done
 
   # Goal 3 step 1 and goal 8 step 4, on Windows itself (the `build` job only builds there, and the
   # release's Windows binary is cross-built with zig): the compute pool's threads run below normal,
@@ -395,7 +415,9 @@ jobs:
             out="$RUNNER_TEMP/$step.txt"
             if [ ! -s "$out" ]; then continue; fi
             plain=$(sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' -e 's/\r$//' "$out" | grep -v -E '^ *(Compiling|Blocking|Downloaded|Downloading|Updating|Locking) ')
-            summary=$(printf '%s\n' "$plain" | grep -E '^(test result:|test .* \.\.\. (ok|FAILED|ignored)$|SKIP:|PROVEN:)' | tail -n 60)
+            # What failed first (an annotation keeps its first 4096 characters): each failed test, its panic or error
+            # lines, and the result line; then what passed and was proven.
+            summary=$( { printf '%s\n' "$plain" | grep -E '^test result:|FAILED$|^---- |panicked at|^Error: |^Caused by:|^ +[0-9]+: [^ ]' | grep -v -E '^ +[0-9]+: (std|core|alloc|tokio|futures|hyper_rt)::' | head -n 60; printf '%s\n' "$plain" | grep -E '^(SKIP:|PROVEN:)|\.\.\. ok$' | tail -n 40; } )
             text=$(printf '%s\n' "$plain" | tail -n 150)
             if ! printf '%s\n' "$plain" | grep -q -E '^running [0-9]+ tests?$'; then
               first=$(printf '%s\n' "$plain" | sed -n '/^error/,$p' | head -n 150)

@@ -21,11 +21,11 @@
 //!
 //! It judges what holds, not how fast: no latency is judged. Each flow waits on the fleet's own failover delay as its
 //! nodes report it (`daemon_status`), never a number of its own. Gated by `SLATES_FLEET_FAULTS=1`, since each flow starts
-//! three Slates instances and their anchors; without it each skips, saying so. The flow that signals a daemon under its live
-//! mounts (a move's target cut) runs on Linux alone, where a workspace is a FUSE mount: on macOS it's a
-//! kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount has panicked the Mac (Slates'
-//! record of 2026-10-06). The link faults (A-708) signal no daemon, and the killed, partitioned and restarted runners' flows let every
-//! mount under the runner go before its signal (A-750), so they run on macOS too ([`Fault`]); there, as
+//! three Slates instances and their anchors; without it each skips, saying so. No flow signals a daemon under a live
+//! mount: on macOS a workspace is a kernel NFS mount over loopback, and a daemon killed or stopped under a live NFS mount
+//! has panicked the Mac (Slates' record of 2026-10-06). The link faults (A-708, the move's target cut among them) signal
+//! no daemon, and the killed, partitioned and restarted runners' flows let every mount under the runner go before its
+//! signal (A-750), so every flow runs on macOS and Linux alike ([`Fault`]); there, as
 //! everywhere, the lab's end stops its runners and unmounts every Slates mount under its folder before it ends an
 //! instance, and leaves the instances running, saying so, where a mount won't go (as `slates_e2e`'s drives do).
 //!
@@ -426,8 +426,8 @@ impl Lab {
     fn start_agent(&self, i: usize) -> anyhow::Result<(String, slates_api::VolumeId)> {
         let on = self.node(i)?.machine.clone();
         let spec = json!({"kind": "claude", "on": on, "cwd": self.project, "prompt": "wait", "workspace": "volume", "isolation": "none"});
-        // Asked again while kiln says the runner hasn't yet said what it has ("try again"): a runner's facts come a
-        // moment after it connects, and a start before them is refused, not failed.
+        // Asked again while kiln says the runner hasn't yet said what it has ("try again"), or went away while placing it:
+        // a runner's facts come a moment after it connects, and a start before them is refused, not failed.
         let began = Instant::now();
         let started = loop {
             let (code, body) = self.fleet.request("POST", "/api/ops/agents.start", Some(&spec))?;
@@ -435,7 +435,10 @@ impl Lab {
             if (200..300).contains(&code) {
                 break serde_json::from_str::<Value>(&text)?;
             }
-            anyhow::ensure!(code == 409 && text.contains("try again") && began.elapsed() < WITHIN, "POST /api/ops/agents.start: {code} {text}");
+            // Also a start whose runner went away while placing it (its link to the server dropped, as on a loaded host:
+            // adacachy, 2026-11-20): asked again once it is back.
+            let again = text.contains("try again") || text.contains("went away before it was placed");
+            anyhow::ensure!(code == 409 && again && began.elapsed() < WITHIN, "POST /api/ops/agents.start: {code} {text}");
             std::thread::sleep(LOOK);
         };
         // `agents.start` answers `{"agents": [brief], "parent"}` (harness/ops.rs `start_ask`).
@@ -763,24 +766,31 @@ fn w7_a_restarted_runner_rejoins_and_loses_no_acknowledged_change() -> anyhow::R
     no_acknowledged_change_lost(&lab, volume, &acknowledged, "a runner restarted")
 }
 
-/// W7, A-580: a link lost mid-move. Do: write acknowledged files on the first runner; ask kiln to move the agent to the
-/// second (`agents.move`), and stop the second's node once the move has begun; hold it past the failover delay; let it go
-/// on; wait for the move to settle. Expect the move moved or refused by kind ([`slates_faults::judge_move`]), every
-/// acknowledged file served byte for byte, and the fleet re-formed.
+/// W7, A-580, A-708: a link lost mid-move. Do: with the relay between the nodes, write acknowledged files on the first
+/// runner; ask kiln to move the agent to the second (`agents.move`), and once the move has begun cut every path into and
+/// out of the second's node, its processes running on, past the failover delay; heal; wait for the move to settle.
+/// Expect the move moved or refused by kind ([`slates_faults::judge_move`]), every acknowledged file served byte for
+/// byte, and the fleet re-formed. A cut link, not a stopped process: the target may be mounting the moved workspace,
+/// and no daemon stops under a mount, so it runs on macOS too.
 #[test]
 fn w7_a_move_whose_target_is_cut_off_midway_ends_moved_or_refused_by_kind() -> anyhow::Result<()> {
-    if !enabled(Fault::Signal) {
+    if !enabled(Fault::Link) {
         return Ok(());
     }
-    let lab = Lab::start()?;
+    let lab = Lab::start_relayed()?;
     let (agent, volume) = lab.start_agent(0)?;
     let acknowledged = write_acknowledged(&lab, 0, volume, "moved")?;
+    no_acknowledged_change_lost_through(&lab, &[1, 2], volume, &acknowledged, "read through the other runners before the move")?;
+    lab.crossed_the_relay()?;
     let (from, to) = (lab.node(0)?.machine.clone(), lab.node(1)?.machine.clone());
     let held = lab.failover(2)?;
     let (code, body) = lab.fleet.request("POST", "/api/ops/agents.move", Some(&json!({"agent": agent, "to": to, "now": true})))?;
-    lab.signal(1, "STOP")?;
+    eprintln!("MOVE: agents.move answered {code} {}", String::from_utf8_lossy(&body));
+    lab.relay()?.isolate(1);
+    eprintln!("FAULT: {} cut off from its peers mid-move, its processes running", lab.node(1)?.name);
     std::thread::sleep(held.saturating_add(held));
-    lab.signal(1, "CONT")?;
+    lab.relay()?.heal();
+    eprintln!("RELAY: {}", lab.relay()?.report().summary());
     let refused = (!(200..300).contains(&code)).then(|| String::from_utf8_lossy(&body).into_owned());
     move_settles(&lab, &agent, &from, &to, refused.as_deref())?;
     no_acknowledged_change_lost(&lab, volume, &acknowledged, "a link lost mid-move")?;

@@ -380,10 +380,9 @@ pub fn reach(a: ReachArgs) -> anyhow::Result<()> {
             }
             other => anyhow::bail!("unexpected answer {other:?}"),
         },
-        #[cfg(unix)]
+        // On Unix over the runner's reach socket; elsewhere over the loopback its runner gave its harness
+        // (`super::loopback`).
         ReachCmd::Mcp => super::mcp::serve(),
-        #[cfg(not(unix))]
-        ReachCmd::Mcp => anyhow::bail!("reach needs a Unix machine for now"),
         ReachCmd::Forget { runner } => match ask(&Req::Forget { runner: runner.clone() })? {
             Ev::Forgot(true) => {
                 println!("Forgot {runner}'s key; the next one it presents is trusted.");

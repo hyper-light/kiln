@@ -235,8 +235,12 @@ async fn gate_threads(hub: &Hub, d: &Diff) -> Result<Vec<kiln_ci::review::Thread
 /// publishes them), or for no one, as merging and any automatic merge ask it. Each conflict of its
 /// replay onto where it lands holds it until Commit resolution makes a revision of it (W26-R12).
 pub async fn gate_of(hub: &Hub, d: &Diff, asking: Option<&str>) -> Result<Gate, Fail> {
-    let conflicts = super::conflicts::for_gate(hub, d).await;
-    let gate = kiln_ci::review::gate(&gate_threads(hub, d).await?, &conflicts, asking);
+    gate_with(hub, d, asking, &super::conflicts::for_gate(hub, d).await).await
+}
+
+/// [`gate_of`], with the conflicts of `d`'s replay onto where it lands already read.
+async fn gate_with(hub: &Hub, d: &Diff, asking: Option<&str>, conflicts: &[kiln_ci::review::Conflict]) -> Result<Gate, Fail> {
+    let gate = kiln_ci::review::gate(&gate_threads(hub, d).await?, conflicts, asking);
     // A change that turns automatic pushes on warns, in plain words, before it's approved (W26-R16).
     Ok(match turns_auto_push_on(hub, d).await {
         true => kiln_ci::fresh::warn(gate, &kiln_ci::fresh::auto_push_warning(&d.trunk)),
@@ -784,6 +788,7 @@ pub async fn readiness_of(hub: &Hub, chain: &[Diff]) -> Result<Vec<Readiness>, F
     let (policy, owners) = policy(hub, &path, &first.trunk).await;
     let mut each = Vec::new();
     let mut picks = Vec::new();
+    let mut replayed = Vec::new();
     for d in chain {
         let versions = super::diffs::versions(hub, d).await.map_err(fail)?;
         let f = facts(hub, d, &versions).await?;
@@ -791,7 +796,12 @@ pub async fn readiness_of(hub: &Hub, chain: &[Diff]) -> Result<Vec<Readiness>, F
         // A blocking thread holds landing, and any automatic land, until its author resolves it
         // (W26-R11): the gate's hold, as accepting and Ship read it. The change stays out of the queue
         // until its review clears (W26-R02).
-        blockers.extend(gate_of(hub, d, None).await?.reasons());
+        let kept = super::conflicts::for_gate(hub, d).await;
+        blockers.extend(gate_with(hub, d, None, &kept).await?.reasons());
+        // Its replay onto the trunk conflicts where it keeps conflicts (W26-R12, R16): a conflict with the trunk
+        // (R107), its latest version a kept conflicted replay too, which applies to the trunk's tip with its
+        // conflicts in it.
+        replayed.push(kept.into_iter().map(|c| c.file).collect::<std::collections::BTreeSet<String>>());
         match State::parse(&d.state) {
             Some(State::Draft) => blockers.insert(0, "it's a draft".into()),
             Some(State::Landed) => blockers = vec!["it landed".into()],
@@ -804,7 +814,9 @@ pub async fn readiness_of(hub: &Hub, chain: &[Diff]) -> Result<Vec<Readiness>, F
     let conflicts = super::land::conflicts_on(hub, &path, &first.trunk, &picks).await;
     let mut out = Vec::new();
     for (i, (d, (f, blockers))) in chain.iter().zip(each).enumerate() {
-        let gate = LandGate::of(blockers.clone(), conflicts.get(i).cloned().unwrap_or_default());
+        let mut files: std::collections::BTreeSet<String> = conflicts.get(i).cloned().unwrap_or_default().into_iter().collect();
+        files.extend(replayed.get(i).cloned().unwrap_or_default());
+        let gate = LandGate::of(blockers.clone(), files.into_iter().collect());
         // Shown, a diff in the land queue says so: the queue asks the gate of its own entries.
         let shown = if d.state == State::Landing.as_str() { vec!["it's in the land queue".to_owned()] } else { blockers };
         let queue = super::land::entry_of(hub, &d.id).await.map(|(entry, state, reason)| json!({ "entry": entry, "state": state, "reason": reason }));

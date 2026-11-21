@@ -44,6 +44,7 @@ branch, and Slates' agent is told of it; a vendoring change alone (the first bel
 | File | Change | Why | Recorded as |
 |---|---|---|---|
 | `Cargo.toml` | each of hyper-raft's crates taken by path from kiln's copy (`../hyper-raft/crates/hyper-*`), not from `vendor/hyper-raft/*`; the root's `[patch.crates-io]` points aws-lc-rs at kiln's copy (`../aws-lc-rs/aws-lc-rs`) and leaves aws-lc-sys crates.io's | kiln holds one copy of each: two linked copies of hyper-raft fail CP-M1's one-revision test, and Slates' own copies (its `vendor/`) aren't here. A path dependency can't be patched, so the paths change | `0001-its-crates-on-kiln-s-one-hyper-raft-and-aws-lc-rs.patch` |
+| `crates/server/src/moves.rs`, `carry.rs`, `fleet.rs`, `forward_lane.rs` | a planned move prepared unfrozen and frozen only once ready to hand over (`moves::freeze`), the failover bound running from the freeze; a prepared move lasts while its mover asks, the healer passes it by, and each move logs its hops (upstream's A-784, slates main `3f4fadda`) | kiln's live move (goal 91): most first move asks were refused `unplaced` (asks 1-3 at 3.2 s, the 4th reported 120 ms after it), every ask for five minutes once across two Macs | `0002-a-planned-move-is-prepared-unfrozen-and-frozen-only-once.patch` |
 
 ## Taking a newer upstream
 

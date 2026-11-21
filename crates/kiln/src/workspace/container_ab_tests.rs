@@ -255,8 +255,7 @@ async fn ab(program: &str, engine: slates_api::container_engine::Engine, made: M
     for (workload, image) in workloads() {
         for round in 0..rounds {
             // Interleaved: each round starts on another route.
-            for k in 0..Route::ALL.len() {
-                let route = Route::ALL[(round + k) % Route::ALL.len()];
+            for route in Route::ALL.iter().copied().cycle().skip(round % Route::ALL.len()).take(Route::ALL.len()) {
                 // A route that didn't answer once isn't asked again.
                 if results.iter().any(|(w, r, _, ran)| w == workload && *r == route && ran.as_ref().is_err_and(|e| e.starts_with("no answer"))) {
                     continue;
