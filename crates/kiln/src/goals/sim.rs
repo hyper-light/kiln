@@ -642,7 +642,10 @@ impl Sim {
             }
             let sent = a.sent.last().map_or(Duration::ZERO, |(t, _)| *t);
             let since = sent.max(a.freed_at).max(self.crashed_at.unwrap_or(Duration::ZERO));
-            if now.saturating_sub(since) > longest {
+            // Reckoned in the grain kiln keeps times in, whole milliseconds: a reminder is due the
+            // first whole millisecond surely past its gap from the millisecond it was sent in
+            // (`reminder_due`), so it may come up to that millisecond's end past the gap itself.
+            if now.as_millis() > since.as_millis().saturating_add(longest.as_millis()).saturating_add(1) {
                 self.counts.lost += 1;
                 return Err(format!("{now:?}: {} was left free with its goal open since {since:?}, past the longest reminder gap: a lost reminder ({:?})", a.id, stacks.get(&a.id)));
             }

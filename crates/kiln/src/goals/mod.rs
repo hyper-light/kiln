@@ -2402,6 +2402,15 @@ fn gap(reminders: i64) -> i64 {
     REMIND_MS.saturating_mul(1_i64 << doublings).min(REMIND_MAX_MS)
 }
 
+/// When the goal under way is due to be sent again (T-T1.5.1: no duplicate reminder): the first
+/// whole millisecond surely past its [`gap`] since it was last sent. `reminded_at` is the send's
+/// time rounded down to the millisecond (unix ms, the grain goals' times are kept in), so the send
+/// itself came up to a millisecond after it: `reminded_at + gap` can fall short of the gap, one
+/// millisecond past it never does. Rounded up, never down.
+fn reminder_due(reminded_at: i64, reminders: i64) -> i64 {
+    reminded_at.saturating_add(gap(reminders)).saturating_add(1)
+}
+
 /// Clears the stack's goal in the agent's harness, where it has goals of its own: the one under
 /// way, or one it stopped pursuing while still set (Claude Code's after its checks gave up), so
 /// the agent doesn't go on chasing it. Said at `now`, as the stack's word (`say`).
@@ -2751,7 +2760,7 @@ where
                 let mut st = c.prepare("SELECT i.reminded_at, i.reminders FROM goal_items i JOIN goal_stacks s ON s.agent = i.agent WHERE s.state = 'running' AND i.status = 'active' AND i.reminded_at > 0")?;
                 for r in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))? {
                     let (at, n) = r?;
-                    soonest = sooner(soonest, at.saturating_add(gap(n)), now);
+                    soonest = sooner(soonest, reminder_due(at, n), now);
                 }
                 Ok(soonest)
             })
@@ -3367,8 +3376,8 @@ fn decide_on(stack: &Stack, plans: &subagents::Graph, info: Option<&Info>, now: 
         if !fresh && item.how.as_deref() == Some("goal") && info.tasks_running > 0 {
             return Next::Wait;
         }
-        // Since it was last sent (never, for a fresh one: at once).
-        if now.saturating_sub(item.reminded_at) < gap(item.reminders) {
+        // Since it was last sent (never, for a fresh one: at once), surely past its gap.
+        if now < reminder_due(item.reminded_at, item.reminders) {
             return Next::Wait;
         }
         let how = item.how.clone().unwrap_or_else(|| "message".into());
@@ -3790,8 +3799,9 @@ mod tests {
         Objective { text: "tests  pass".into(), status: status.into(), reason: Some("why".into()), at }
     }
 
-    /// Past the first pause after the goal was sent.
-    const LATER: i64 = 1_000 + REMIND_MS;
+    /// Past the first pause after the goal was sent: the first millisecond surely past it
+    /// ([`reminder_due`]).
+    const LATER: i64 = 1_000 + REMIND_MS + 1;
 
     /// The id of a message a command sends, if it sends one.
     fn sent_id(c: &Command) -> Option<String> {
@@ -4133,15 +4143,15 @@ mod tests {
         thrice.reminders = 3;
         thrice.reminded_at = 10_000;
         let s = stack(vec![thrice]);
-        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS - 1, false, false), Next::Wait));
-        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS, false, false), Next::Remind { worked: false, .. }));
+        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS, false, false), Next::Wait));
+        assert!(matches!(decide(&s, Some(&info(Status::Idle, None)), 10_000 + 8 * REMIND_MS + 1, false, false), Next::Remind { worked: false, .. }));
         // It worked on it a good while since it was last sent: real work.
         let mut worked = item("active", Some("goal"));
         worked.reminded_at = 10_000;
         worked.busy_at = 11_000;
         let mut after = info(Status::Idle, None);
         after.last_activity = 11_000 + WORKED_MS;
-        assert!(matches!(decide(&stack(vec![worked]), Some(&after), 10_000 + REMIND_MS, false, false), Next::Remind { worked: true, .. }));
+        assert!(matches!(decide(&stack(vec![worked]), Some(&after), 10_000 + REMIND_MS + 1, false, false), Next::Remind { worked: true, .. }));
     }
 
     /// CP-M2's counters move (a non-vacuity check; docs/agents.md, "Metrics"): a goal's first send
@@ -4179,8 +4189,8 @@ mod tests {
             // The first goal goes to the agent, idle: a start.
             step(&driver, id, false).await?;
             assert_eq!(counts(), (1, 0, 0, 0));
-            // It stops short of it: 30 s on, the goal goes again.
-            clock.advance(std::time::Duration::from_secs(30));
+            // It stops short of it: the first millisecond past 30 s on, the goal goes again.
+            clock.advance(std::time::Duration::from_millis(30_001));
             step(&driver, id, false).await?;
             assert_eq!(counts(), (1, 1, 0, 0));
             // Its harness says it's met: it ended, met; the second one starts.
@@ -4261,12 +4271,18 @@ mod tests {
             anyhow::ensure!(before_quiet != before, "sending wrote nothing");
             driver.round(&gate).await;
             anyhow::ensure!(feed.at() == at && all() == before_quiet, "an idle round wrote");
-            // At work on it, past the reminder's gap: nothing to do either.
+            // It goes to work on it: the round after notes when (`busy_at`, what tells real work from
+            // a reminder that brought none), news, so one write.
             anyhow::ensure!(port.update(id, |i| i.status = Status::Running), "not updated");
-            clock.advance(Duration::from_millis(u64::try_from(gap(0)).unwrap_or(u64::MAX)));
+            driver.round(&gate).await;
+            let busy_at = stack_of(&store, id).await?.items.first().map_or(0, |i| i.busy_at);
+            anyhow::ensure!(busy_at > 0 && feed.at() != at, "the round didn't note the agent at work: busy_at {busy_at}");
+            // Still at work on it, past the reminder's gap: nothing to do.
+            let (at, before_busy) = (feed.at(), all());
+            clock.advance(Duration::from_millis(u64::try_from(reminder_due(0, 0)).unwrap_or(u64::MAX)));
             driver.round(&gate).await;
             driver.round(&gate).await;
-            anyhow::ensure!(feed.at() == at && all() == before_quiet && port.heard(id).len() == 1, "a round with the agent at work wrote or sent");
+            anyhow::ensure!(feed.at() == at && all() == before_busy && port.heard(id).len() == 1, "a round with the agent at work wrote or sent");
             Ok(())
         })
     }
@@ -4376,8 +4392,12 @@ mod tests {
                 let mut last = clock.unix_ms();
                 let mut gaps = Vec::new();
                 for secs in [30, 60, 120, 240, 480, 900, 900] {
-                    clock.advance_and_settle(Duration::from_secs(secs).saturating_sub(STEP)).await;
-                    anyhow::ensure!(sent().len() == gaps.len(), "a reminder went a millisecond before {secs} s: {:?}", sent());
+                    // The gap itself: nothing is due, so nothing wakes the driver (no news, no write;
+                    // a settle would wait for a sleep it has no cause to start). A reminder sent
+                    // there would show as one a millisecond before its time, below.
+                    clock.advance(Duration::from_secs(secs));
+                    anyhow::ensure!(sent().len() == gaps.len(), "a reminder went at {secs} s, not past it: {:?}", sent());
+                    // The first millisecond past it: the reminder goes, and the driver sleeps again.
                     clock.advance_and_settle(STEP).await;
                     let at = sent().last().copied().unwrap_or_default();
                     anyhow::ensure!(sent().len() == gaps.len() + 1 && at == clock.unix_ms(), "no reminder at {secs} s: {:?}", sent());
@@ -4390,7 +4410,8 @@ mod tests {
             };
             let (driven, gaps) = futures::join!(driver.drive(), test);
             driven?;
-            assert_eq!(gaps?, [30_000, 60_000, 120_000, 240_000, 480_000, 900_000, 900_000]);
+            // Each the first millisecond surely past its gap (`reminder_due`).
+            assert_eq!(gaps?, [30_001, 60_001, 120_001, 240_001, 480_001, 900_001, 900_001]);
             // Each was the goal again, as its harness takes it.
             let again = format!("/goal {goal}");
             assert!(port.heard(id).iter().all(|d| matches!(&d.command, Command::Send { text, .. } if *text == again)), "{:?}", port.heard(id));
@@ -5083,14 +5104,17 @@ mod tests {
             let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
             let test = async {
                 clock.sleeping_since(0, 1).await;
-                clock.advance_and_settle(Duration::from_secs(60).saturating_sub(STEP)).await;
+                // A millisecond short: nothing is due, so nothing wakes the driver (a settle would wait
+                // for a sleep it has no cause to start). A resume there would show in its goal's
+                // send a millisecond early, below.
+                clock.advance(Duration::from_secs(60).saturating_sub(STEP));
                 let s = stack_of(&store, id).await?;
                 anyhow::ensure!(s.state == "paused" && port.heard(id).is_empty(), "resumed a millisecond early: {s:?}");
                 clock.advance_and_settle(STEP).await;
                 let s = stack_of(&store, id).await?;
                 anyhow::ensure!(s.state == "running" && s.resume_at == 0 && s.reason.is_none(), "{s:?}");
                 let heard = port.heard(id);
-                anyhow::ensure!(matches!(heard.as_slice(), [d] if matches!(&d.command, Command::Send { text, .. } if text == "/goal deploy is green")), "{heard:?}");
+                anyhow::ensure!(matches!(heard.as_slice(), [d] if d.at_ms == until && matches!(&d.command, Command::Send { text, .. } if text == "/goal deploy is green")), "{heard:?}");
                 // The message that took it is noted, to withdraw if the goal ends before the agent takes it.
                 let sent = heard.first().and_then(|d| sent_id(&d.command));
                 anyhow::ensure!(sent.is_some() && s.items.first().is_some_and(|i| i.sent_id == sent), "{:?} {sent:?}", s.items.first().map(|i| &i.sent_id));
@@ -5137,21 +5161,24 @@ mod tests {
             let news = crate::rt::Notify::new();
             let feed = StoreFeed::new(&store);
             let test = async {
+                // Its rounds done, the driver sleeps until its reminder's due.
                 clock.sleeping_since(0, 1).await;
-                clock.advance_and_settle(STEP).await;
                 let s = stack_of(&store, id).await?;
                 let w: Vec<String> = s.items.iter().map(|i| format!("{}:{}", i.status, i.text)).collect();
                 anyhow::ensure!(w == ["met:tests pass", "active:docs build"], "{w:?}");
                 // Set in the agent anew (`/goal tests pass` again): it joins, as the goal under way.
                 port.update(id, |i| i.objective = Some(Objective { text: "tests pass".into(), status: "active".into(), reason: None, at: later + 20_000 }));
+                // The news wakes the driver; its round done, it sleeps again.
+                let since = clock.registrations();
                 news.notify();
-                clock.advance_and_settle(STEP).await;
+                clock.sleeping_since(since, 1).await;
                 let s = stack_of(&store, id).await?;
                 anyhow::ensure!(s.items.iter().any(|i| i.status == "active" && i.text == "tests pass"), "{s:?}");
                 // Its harness giving up on the goal that went back among the others (split, moved): it stays where it is.
                 port.update(id, |i| i.objective = Some(Objective { text: "docs build".into(), status: "unmet".into(), reason: None, at: later + 40_000 }));
+                let since = clock.registrations();
                 news.notify();
-                clock.advance_and_settle(STEP).await;
+                clock.sleeping_since(since, 1).await;
                 let s = stack_of(&store, id).await?;
                 let w: Vec<String> = s.items.iter().filter(|i| i.status != "met").map(|i| format!("{}:{}", i.status, i.text)).collect();
                 anyhow::ensure!(w.first().map(String::as_str) == Some("active:tests pass") && w.contains(&"pending:docs build".to_owned()), "{w:?}");
