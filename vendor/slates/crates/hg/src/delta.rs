@@ -1,5 +1,5 @@
 //! A delta: the hunks that rewrite a base text into a revision's text (A-514; `internals.changegroups` "Delta
-//! Groups" [B]; `mercurial/mpatch.c` [C]).
+//! Groups" \[B\]; `mercurial/mpatch.c` \[C\]).
 //!
 //! A delta is a run of hunks with no separator. Each is a header of three big-endian signed 32-bit integers, `start`,
 //! `end` and the new data's `length`, then that many bytes: the base's bytes `start..end` are replaced by the data.
@@ -144,10 +144,28 @@ pub fn patched_len(base: u64, delta: &[u8]) -> Result<u64, Refusal> {
 /// The text `delta` makes of `base`: its length checked and charged to `admission` first, then built in one vector of
 /// exactly that length.
 pub fn apply(base: &[u8], delta: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
+  let mut out = Vec::new();
+  apply_into(base, delta, &mut out, admission)?;
+  Ok(out)
+}
+
+/// The text `delta` makes of `base`, written over `out`: its length checked first, then `out` emptied and filled, grown
+/// only where its capacity falls short of the text, and only that growth charged to `admission`. A chain read alternating
+/// between two buffers is so charged each buffer's longest text once, not a text a link (main's order of 2026-11-20 on
+/// the hg import's memory). Refused, `out` holds no text of this delta's, which its caller drops or writes over.
+pub fn apply_into(
+  base: &[u8],
+  delta: &[u8],
+  out: &mut Vec<u8>,
+  admission: &mut Admission,
+) -> Result<(), Refusal> {
   let len = patched_len(to_u64(base.len()), delta)?;
-  admission.charge(len).map_err(Refusal::PastAdmission)?;
   let capacity = usize::try_from(len).map_err(|_| Refusal::TooLong { value: len })?;
-  let mut out = Vec::with_capacity(capacity);
+  admission
+    .charge(to_u64(capacity.saturating_sub(out.capacity())))
+    .map_err(Refusal::PastAdmission)?;
+  out.clear();
+  out.reserve_exact(capacity);
   let mut last: usize = 0;
   for hunk in hunks(delta) {
     let hunk = hunk?;
@@ -157,7 +175,7 @@ pub fn apply(base: &[u8], delta: &[u8], admission: &mut Admission) -> Result<Vec
     last = index(hunk.end)?;
   }
   out.extend_from_slice(base_range(base, last, base.len())?);
-  Ok(out)
+  Ok(())
 }
 
 /// A hunk's position as an index.
@@ -199,9 +217,95 @@ pub fn encode_full_text(text: &[u8], out: &mut Vec<u8>) -> Result<(), Refusal> {
   )
 }
 
+/// Appends a delta rewriting `base` into `text` by whole lines (A-729: a manifest kept as its change against the one
+/// before it). The two texts' lines are walked together, a line's key its bytes up to a NUL (a manifest line's path) or
+/// the whole line: a line equal in both is kept; at any other pair the line of smaller key is passed over (dropped from
+/// the base or put from the text), and both where the keys are equal. Each run between kept lines becomes one hunk: the
+/// base's bytes it passed over replaced by the text's. Every line of `text` is either kept or in a hunk, in order, so
+/// applying the delta to `base` gives `text` for any two texts; over two manifests, sorted by path, the walk is one pass
+/// and each hunk one stretch of changed paths.
+pub fn encode_lines(base: &[u8], text: &[u8], out: &mut Vec<u8>) -> Result<(), Refusal> {
+  let (old, new) = (lines_of(base), lines_of(text));
+  let (mut at_old, mut at_new) = (0_usize, 0_usize);
+  let mut open: Option<(usize, usize)> = None;
+  while at_old < old.len() || at_new < new.len() {
+    let (left, right) = (old.get(at_old).copied(), new.get(at_new).copied());
+    if let (Some((kept, line)), Some((put, same))) = (left, right)
+      && line == same
+    {
+      if let Some(run) = open.take() {
+        hunk_of(run, (kept, put), text, out)?;
+      }
+      at_old = at_old.saturating_add(1);
+      at_new = at_new.saturating_add(1);
+      continue;
+    }
+    let from_base = left.map_or(base.len(), |(at, _)| at);
+    let from_text = right.map_or(text.len(), |(at, _)| at);
+    open.get_or_insert((from_base, from_text));
+    match (left, right) {
+      (Some((_, line)), Some((_, other))) => match key(line).cmp(key(other)) {
+        core::cmp::Ordering::Less => at_old = at_old.saturating_add(1),
+        core::cmp::Ordering::Greater => at_new = at_new.saturating_add(1),
+        core::cmp::Ordering::Equal => {
+          at_old = at_old.saturating_add(1);
+          at_new = at_new.saturating_add(1);
+        }
+      },
+      (Some(_), None) => at_old = at_old.saturating_add(1),
+      _ => at_new = at_new.saturating_add(1),
+    }
+  }
+  match open {
+    Some(run) => hunk_of(run, (base.len(), text.len()), text, out),
+    None => Ok(()),
+  }
+}
+
+/// Each line of `text` and where it begins, its end of line included.
+fn lines_of(text: &[u8]) -> Vec<(usize, &[u8])> {
+  let mut lines = Vec::new();
+  let mut at = 0_usize;
+  for line in text.split_inclusive(|byte| *byte == b'\n') {
+    lines.push((at, line));
+    at = at.saturating_add(line.len());
+  }
+  lines
+}
+
+/// A line's key: its bytes up to a NUL, or the whole line.
+fn key(line: &[u8]) -> &[u8] {
+  line.split(|byte| *byte == 0).next().unwrap_or(line)
+}
+
+/// One hunk: the base's bytes from the run's start to `end` replaced by the text's from the run's start to `until`.
+fn hunk_of(
+  (start, from): (usize, usize),
+  (end, until): (usize, usize),
+  text: &[u8],
+  out: &mut Vec<u8>,
+) -> Result<(), Refusal> {
+  let field = |value: usize| {
+    u32::try_from(value).map_err(|_| Refusal::TooLong {
+      value: crate::read::to_u64(value),
+    })
+  };
+  let data = text.get(from..until).unwrap_or_default();
+  encode_hunk(
+    &Hunk {
+      start: field(start)?,
+      end: field(end)?,
+      data,
+    },
+    out,
+  )
+}
+
 #[cfg(test)]
 mod tests {
-  use super::{Hunk, Refusal, apply, check, encode_full_text, encode_hunk, hunks, patched_len};
+  use super::{
+    Hunk, Refusal, apply, check, encode_full_text, encode_hunk, encode_lines, hunks, patched_len,
+  };
   use crate::Admission;
   use proptest::prelude::*;
 
@@ -376,5 +480,52 @@ mod tests {
       let applied = apply(&base, &d, &mut Admission::new(4096));
       prop_assert!(checked.is_ok() || applied.is_err());
     }
+  }
+
+  /// A-729 (the manifest's delta). Do: encode a delta by lines between pairs of texts (manifests with paths added,
+  /// changed and removed; unsorted lines; empty texts; a last line with no end), and apply each to its base. Expect each
+  /// applied delta the text, and a manifest's one changed path a delta far smaller than the text.
+  #[test]
+  fn a_delta_by_lines_rewrites_its_base_into_its_text() {
+    let manifest = |paths: &[(&str, char)]| -> Vec<u8> {
+      paths
+        .iter()
+        .flat_map(|(path, node)| format!("{path}\0{}\n", node.to_string().repeat(40)).into_bytes())
+        .collect()
+    };
+    let base = manifest(&[("a", '1'), ("b", '2'), ("c", '3'), ("e", '5')]);
+    let text = manifest(&[("a", '1'), ("b", '9'), ("d", '4'), ("e", '5'), ("f", '6')]);
+    let pairs: [(&[u8], &[u8]); 6] = [
+      (&base, &text),
+      (&text, &base),
+      (b"", &text),
+      (&base, b""),
+      (b"z\ny\nx", b"y\nq\nx\nw"),
+      (b"same\n", b"same\n"),
+    ];
+    for (old, new) in pairs {
+      let mut delta = Vec::new();
+      encode_lines(old, new, &mut delta).unwrap();
+      assert_eq!(
+        apply(old, &delta, &mut Admission::new(u64::MAX)).unwrap(),
+        new
+      );
+    }
+    let many: Vec<(String, char)> = (0..200).map(|at| (format!("path{at:03}"), 'a')).collect();
+    let named: Vec<(&str, char)> = many
+      .iter()
+      .map(|(path, node)| (path.as_str(), *node))
+      .collect();
+    let mut changed = named.clone();
+    changed[100].1 = 'b';
+    let (old, new) = (manifest(&named), manifest(&changed));
+    let mut delta = Vec::new();
+    encode_lines(&old, &new, &mut delta).unwrap();
+    assert!(
+      delta.len() < new.len() / 50,
+      "{} bytes for one path of {}",
+      delta.len(),
+      new.len()
+    );
   }
 }

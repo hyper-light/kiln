@@ -59,8 +59,8 @@ pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_NEVER_SERVED: u8 = 5;
 
 /// Format: the role arguments [`Role::parse`] takes, for its usage message.
-pub const ROLE_USAGE: &str =
-  "[--instance NAME] (anchor | daemon) [--shards N] [--quick] [--fleet PATH --node NAME]";
+pub const ROLE_USAGE: &str = "[--instance NAME] (anchor | daemon) [--shards N] [--quick] [--fleet PATH --node NAME] \
+   [--vcs-http ADDRESS] [--vcs-ssh ADDRESS] [--vcs-svn ADDRESS]";
 
 /// Options of the anchor and the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +73,18 @@ pub struct ProcessOptions {
   pub shards: Option<u16>,
   /// The fleet to join, when this daemon is a fleet node (§2.6 boot step 6); a laptop has none.
   pub fleet: Option<FleetSelection>,
+  /// Where the version-control servers' shared HTTP edge listens, when the operator starts one (`--vcs-http ADDRESS`,
+  /// §4.17.2 "Transports" item 1; A-625 part 3): HTTPS presenting a fleet node's own identity, or cleartext on a
+  /// loopback address for a daemon that is no fleet node ([`vcs_address`]). None starts no edge.
+  pub vcs_http: Option<slates_rt::tcp::SocketAddrV4>,
+  /// Where the version-control servers' SSH edge listens, when the operator starts one (`--vcs-ssh ADDRESS`, §4.17.2
+  /// "Transports" item 2; A-684): its host key the fleet node's own, or one the anchor makes at its start and keeps
+  /// across its daemons' restarts ([`vcs_ssh_address`]). None starts no edge.
+  pub vcs_ssh: Option<slates_rt::tcp::SocketAddrV4>,
+  /// Where the svn:// listener listens, when the operator starts one (`--vcs-svn ADDRESS`, §4.17.4 piece 7; A-656 part
+  /// 2): A-656's connection on each connection, ra_svn being cleartext, on a loopback address alone for a daemon that
+  /// is no fleet node ([`vcs_address`]). None starts no listener.
+  pub vcs_svn: Option<slates_rt::tcp::SocketAddrV4>,
 }
 
 /// Which fleet node this process is: the operator's shared manifest and this node's name in it
@@ -180,6 +192,9 @@ struct Given {
   shards: Option<String>,
   fleet: Option<String>,
   node: Option<String>,
+  vcs_http: Option<String>,
+  vcs_ssh: Option<String>,
+  vcs_svn: Option<String>,
   quick: bool,
   word: Option<String>,
 }
@@ -192,6 +207,9 @@ impl Given {
       "--shards" => &mut self.shards,
       "--fleet" => &mut self.fleet,
       "--node" => &mut self.node,
+      "--vcs-http" => &mut self.vcs_http,
+      "--vcs-ssh" => &mut self.vcs_ssh,
+      "--vcs-svn" => &mut self.vcs_svn,
       other => return Err(RoleArgsError::UnknownFlag(other.to_owned())),
     };
     *slot = Some(value);
@@ -214,13 +232,40 @@ impl Given {
       (None, None) => None,
       _ => return Err(RoleArgsError::HalfAFleet),
     };
+    let vcs_http = edge_address(self.vcs_http, "--vcs-http", fleet.is_some())?;
+    let vcs_ssh = self
+      .vcs_ssh
+      .map(|text| {
+        vcs_ssh_address(&text).map_err(|reason| RoleArgsError::BadValue {
+          flag: "--vcs-ssh",
+          reason,
+        })
+      })
+      .transpose()?;
+    let vcs_svn = edge_address(self.vcs_svn, "--vcs-svn", fleet.is_some())?;
     Ok(ProcessOptions {
       instance: self.instance.unwrap_or_else(slates_ipc::instance_from_env),
       quick: self.quick,
       shards,
       fleet,
+      vcs_http,
+      vcs_ssh,
+      vcs_svn,
     })
   }
+}
+
+/// The address a version-control flag `flag` gave, `text`, read by [`vcs_address`]: none where the flag was not given.
+fn edge_address(
+  text: Option<String>,
+  flag: &'static str,
+  fleet_node: bool,
+) -> Result<Option<slates_rt::tcp::SocketAddrV4>, RoleArgsError> {
+  text
+    .map(|text| {
+      vcs_address(&text, fleet_node).map_err(|reason| RoleArgsError::BadValue { flag, reason })
+    })
+    .transpose()
 }
 
 /// Reads a `--shards` count: a number no larger than the most shards one process registers
@@ -240,9 +285,50 @@ pub fn shard_count(text: &str) -> Result<u16, String> {
   Ok(shards)
 }
 
+/// Reads the address of a version-control listener, `--vcs-http`'s (the servers' shared HTTP edge, §4.17.2 "Transports"
+/// item 1; A-625 part 3) or `--vcs-svn`'s (the svn:// listener, §4.17.4 piece 7; A-656 part 2): an IPv4 address and
+/// port, `127.0.0.1:8080`, port 0 taking one the system picks, which the daemon logs; or why it is not one. A daemon
+/// that is no fleet node (`fleet_node` false) serves either in cleartext, which it does on a loopback address alone:
+/// its HTTP edge has no identity to present (Basic's password and a bearer token would cross in the clear, RFC 7617 §4
+/// and RFC 6750 §5.3), and ra_svn has no TLS at all. Any other address is refused here, before anything starts, as a
+/// shard count past the registry is ([`shard_count`]), rather than by a daemon that would start without the listener.
+/// A fleet node's HTTP edge presents the node's own identity, the one its RPC-with-TLS export presents, and its
+/// operator may publish either at any address. The roles here and the `slates` command read both flags with this.
+pub fn vcs_address(text: &str, fleet_node: bool) -> Result<slates_rt::tcp::SocketAddrV4, String> {
+  let address = text
+    .parse::<slates_rt::tcp::SocketAddrV4>()
+    .map_err(|error| {
+      format!("{text}: {error}; an IPv4 address and port, such as 127.0.0.1:8080")
+    })?;
+  if !fleet_node && !address.ip().is_loopback() {
+    return Err(format!(
+      "{address}: a daemon that is no fleet node serves version control in cleartext, on a loopback address alone; a \
+       fleet node (--fleet PATH --node NAME) serves HTTPS with its own identity, and svn:// where its operator says"
+    ));
+  }
+  Ok(address)
+}
+
+/// Reads a `--vcs-ssh` address, the version-control servers' SSH edge's (§4.17.2 "Transports" item 2; A-684): an IPv4
+/// address and port, `127.0.0.1:2222`, port 0 taking one the system picks, which the daemon logs with its host key's
+/// fingerprint; or why it is not one. Any address is taken, on a fleet node or not: SSH encrypts every connection and
+/// proves the server by its host key before a client sends anything of its own (RFC 4253 §7-§8), and authenticates a
+/// client by a signature, never a secret sent (RFC 4252 §7), so no address is left to cleartext as `--vcs-http`'s
+/// off loopback would be. The edge listens on an unprivileged port (R10): a privileged one is refused by the system
+/// where it is privileged, which ends the anchor's start by name. The roles here and the `slates` command read the flag
+/// with this.
+pub fn vcs_ssh_address(text: &str) -> Result<slates_rt::tcp::SocketAddrV4, String> {
+  text
+    .parse::<slates_rt::tcp::SocketAddrV4>()
+    .map_err(|error| format!("{text}: {error}; an IPv4 address and port, such as 127.0.0.1:2222"))
+}
+
 /// Whether `flag` takes a value.
 fn takes_value(flag: &str) -> bool {
-  matches!(flag, "--instance" | "--shards" | "--fleet" | "--node")
+  matches!(
+    flag,
+    "--instance" | "--shards" | "--fleet" | "--node" | "--vcs-http" | "--vcs-ssh" | "--vcs-svn"
+  )
 }
 
 impl Role {
@@ -312,6 +398,21 @@ impl Role {
       args.push(fleet.manifest.clone());
       args.push("--node".to_owned());
       args.push(fleet.node.clone());
+    }
+    // The shared HTTP edge is the daemon's; the anchor passes the address through to the daemon it starts.
+    if let Some(address) = options.vcs_http {
+      args.push("--vcs-http".to_owned());
+      args.push(address.to_string());
+    }
+    // So is the SSH edge (A-684): the anchor holds its listener and host key, and passes the address on.
+    if let Some(address) = options.vcs_ssh {
+      args.push("--vcs-ssh".to_owned());
+      args.push(address.to_string());
+    }
+    // So is the svn:// listener (A-656 part 2).
+    if let Some(address) = options.vcs_svn {
+      args.push("--vcs-svn".to_owned());
+      args.push(address.to_string());
     }
     args
   }
@@ -418,6 +519,9 @@ mod tests {
         quick: true,
         shards: Some(2),
         fleet: None,
+        vcs_http: None,
+        vcs_ssh: None,
+        vcs_svn: None,
       })
     );
     let daemon = Role::parse(&words("daemon --instance a --fleet /f.json --node a")).unwrap();
@@ -431,6 +535,9 @@ mod tests {
           manifest: "/f.json".into(),
           node: "a".into(),
         }),
+        vcs_http: None,
+        vcs_ssh: None,
+        vcs_svn: None,
       })
     );
     for role in [anchor, daemon] {
@@ -470,6 +577,132 @@ mod tests {
     assert_eq!(
       Role::parse(&words("daemon --node a")),
       Err(RoleArgsError::HalfAFleet)
+    );
+  }
+
+  /// A-684 (§4.17.2 "Transports" item 2). Do: parse a daemon asked for the version-control SSH edge on a loopback
+  /// address (its value joined by `=`), and an anchor that is no fleet node asked for one on an address any interface
+  /// reaches, beside the HTTP edge; make each role's arguments and parse them back. Then give the flag a name where an
+  /// address belongs, and an address with no port. Expect: each address read, and carried back whole through the
+  /// arguments an anchor starts its daemon with (SSH encrypts every connection, so any address is taken without a
+  /// fleet); the name and the bare address refused as a bad `--vcs-ssh` that says what an address is, before anything
+  /// starts.
+  #[test]
+  fn a_roles_vcs_ssh_edge_reads_back_on_any_address_and_a_name_is_refused() {
+    let daemon = Role::parse(&words("daemon --vcs-ssh=127.0.0.1:2222")).unwrap();
+    assert_eq!(
+      daemon.options().vcs_ssh,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::LOCALHOST,
+        2222
+      ))
+    );
+    let anchor = Role::parse(&words(
+      "anchor --vcs-http 127.0.0.1:8080 --vcs-ssh 0.0.0.0:2222",
+    ))
+    .unwrap();
+    assert_eq!(
+      anchor.options().vcs_ssh,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::UNSPECIFIED,
+        2222
+      ))
+    );
+    for role in [daemon, anchor] {
+      assert_eq!(Role::parse(&role.args()), Ok(role.clone()));
+    }
+    for refused in [
+      "daemon --vcs-ssh localhost:2222",
+      "anchor --vcs-ssh 127.0.0.1",
+    ] {
+      let parsed = Role::parse(&words(refused));
+      assert!(
+        matches!(&parsed, Err(RoleArgsError::BadValue { flag: "--vcs-ssh", reason }) if reason.contains("IPv4 address and port")),
+        "{refused}: {parsed:?}"
+      );
+    }
+  }
+
+  /// A-625 part 3 (§4.17.2 "Transports" item 1). Do: parse a daemon asked for the version-control HTTP edge on a
+  /// loopback address (its value joined by `=`), and a fleet node's anchor asked for one on an address any interface
+  /// reaches; make each role's arguments and parse them back. Then ask a daemon that is no fleet node for an edge off
+  /// loopback, and give the flag a name where an address belongs. Expect: each address read, and carried back whole
+  /// through the arguments an anchor starts its daemon with; the edge off loopback without a fleet refused as a bad
+  /// `--vcs-http` that names loopback (it would serve cleartext there), and the name refused as a bad `--vcs-http`,
+  /// both before anything starts.
+  #[test]
+  fn a_roles_vcs_http_edge_reads_back_and_cleartext_off_loopback_is_refused() {
+    let daemon = Role::parse(&words("daemon --vcs-http=127.0.0.1:8080")).unwrap();
+    assert_eq!(
+      daemon.options().vcs_http,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::LOCALHOST,
+        8080
+      ))
+    );
+    let anchor = Role::parse(&words(
+      "anchor --fleet /f.json --node b --vcs-http 0.0.0.0:443",
+    ))
+    .unwrap();
+    assert_eq!(
+      anchor.options().vcs_http,
+      Some(slates_rt::tcp::SocketAddrV4::new(
+        slates_rt::tcp::Ipv4Addr::UNSPECIFIED,
+        443
+      ))
+    );
+    for role in [daemon, anchor] {
+      assert_eq!(Role::parse(&role.args()), Ok(role.clone()));
+    }
+    let cleartext = Role::parse(&words("daemon --vcs-http 10.0.0.7:8080"));
+    assert!(
+      matches!(&cleartext, Err(RoleArgsError::BadValue { flag: "--vcs-http", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
+    );
+    let named = Role::parse(&words("daemon --vcs-http localhost:8080"));
+    assert!(
+      matches!(
+        &named,
+        Err(RoleArgsError::BadValue {
+          flag: "--vcs-http",
+          ..
+        })
+      ),
+      "{named:?}"
+    );
+  }
+
+  /// A-656 part 2 (§4.17.4 piece 7). Do: parse a daemon asked for the svn:// listener on loopback (its value joined by
+  /// `=`) beside the HTTP edge, and a fleet node's anchor asked for one on an address any interface reaches; make each
+  /// role's arguments and parse them back; then ask a daemon that is no fleet node for the listener off loopback. Expect:
+  /// each address read, and carried back whole through the arguments an anchor starts its daemon with; the listener off
+  /// loopback without a fleet refused as a bad `--vcs-svn` naming loopback (ra_svn is cleartext), before anything starts.
+  #[test]
+  fn a_roles_svn_listener_reads_back_and_off_loopback_without_a_fleet_is_refused() {
+    let svn = |ip, port| Some(slates_rt::tcp::SocketAddrV4::new(ip, port));
+    let daemon = Role::parse(&words(
+      "daemon --vcs-http 127.0.0.1:8080 --vcs-svn=127.0.0.1:3690",
+    ))
+    .unwrap();
+    assert_eq!(
+      daemon.options().vcs_svn,
+      svn(slates_rt::tcp::Ipv4Addr::LOCALHOST, 3690)
+    );
+    let anchor = Role::parse(&words(
+      "anchor --fleet /f.json --node b --vcs-svn 0.0.0.0:3690",
+    ))
+    .unwrap();
+    assert_eq!(
+      anchor.options().vcs_svn,
+      svn(slates_rt::tcp::Ipv4Addr::UNSPECIFIED, 3690)
+    );
+    for role in [daemon, anchor] {
+      assert_eq!(Role::parse(&role.args()), Ok(role.clone()));
+    }
+    let cleartext = Role::parse(&words("daemon --vcs-svn 10.0.0.7:3690"));
+    assert!(
+      matches!(&cleartext, Err(RoleArgsError::BadValue { flag: "--vcs-svn", reason }) if reason.contains("loopback")),
+      "{cleartext:?}"
     );
   }
 

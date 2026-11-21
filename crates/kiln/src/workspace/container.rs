@@ -684,7 +684,7 @@ mod tests {
         assert_eq!((by_runtime.available, by_runtime.missing, by_runtime.program.as_deref(), by_runtime.engine), (false, Some(ContainerMissing::Profile), Some(DOCKER), None));
         assert!(by_runtime.why_not.as_deref().is_some_and(|w| w.starts_with("Slates refused this machine's container engine: ")), "{:?}", by_runtime.why_not);
         let untested = judged(Engine::DockerEngine, false);
-        let by_profile = refused(EngineFault::Untested { endpoint: untested.endpoint.clone(), profile: untested.profile, refusal: ProfileRefusal::UserNamespaceUntested });
+        let by_profile = refused(EngineFault::Untested { endpoint: untested.endpoint.clone(), profile: Box::new(untested.profile), refusal: ProfileRefusal::UserNamespaceUntested });
         assert_eq!((by_profile.missing, by_profile.engine.as_deref(), by_profile.version.as_deref()), (Some(ContainerMissing::Profile), Some("docker-engine"), Some("29.3.1")));
         let windows = refused(EngineFault::Unsupported { platform: "windows" });
         assert_eq!((windows.available, windows.missing), (false, Some(ContainerMissing::Platform)));

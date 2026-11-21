@@ -9,8 +9,9 @@ use crate::catalog::{
   AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, BranchRecord, CompletionRecord,
   ConsumerRecord, GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState,
   LeaseRecord, LineageEdge, NameAliasRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
-  NfsOpenRecord, PlacementState, RepositoryId, RepositoryRecord, SizeClass, SnapshotId,
-  SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
+  NfsOpenRecord, PlacementState, Principal, RepositoryId, RepositoryRecord, ReviewApprovalRecord,
+  ReviewCommentRecord, SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  VolumeState,
 };
 
 /// One mutation.
@@ -655,6 +656,131 @@ pub enum Op {
     /// The membership.
     record: crate::catalog::MemberRecord,
   },
+  /// A review comment was written on a request (§4.17.1 shared piece 6, A-596): anchored to a path, the whole lines a
+  /// byte range covers, and the version of the request's work it stands on. Appended.
+  ReviewCommented {
+    /// The comment.
+    record: ReviewCommentRecord,
+  },
+  /// A review comment moved with its request's work to a later version, its lines unchanged: now `len` bytes at `start`
+  /// of `version` (A-596). Appended.
+  ReviewCommentMoved {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+    /// The comment's number.
+    id: u64,
+    /// Its lines' first byte at `version`.
+    start: u64,
+    /// The bytes they cover there.
+    len: u64,
+    /// The version it now stands on.
+    version: u64,
+  },
+  /// A change at `version` met a review comment's lines (A-596): it is outdated, where it last stood, never moved again.
+  /// Appended.
+  ReviewCommentOutdated {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+    /// The comment's number.
+    id: u64,
+    /// The version whose change met its lines.
+    version: u64,
+  },
+  /// A request was approved at the version its approver saw; the approver's earlier approval, if any, is replaced
+  /// (A-596). Appended.
+  ReviewApproved {
+    /// The approval.
+    record: ReviewApprovalRecord,
+  },
+  /// A change at `version` met what the repository's policy says an approval covers: the approval is stale (A-596).
+  /// Appended.
+  ReviewApprovalStaled {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+    /// Who approved.
+    approver: Principal,
+    /// The version whose change made it stale.
+    version: u64,
+  },
+  /// A request's review records left with it, its review merged or closed (A-596). Appended.
+  ReviewClosed {
+    /// The repository.
+    repository: RepositoryId,
+    /// The request.
+    request: VolumeId,
+  },
+  /// An entry of a repository's register (§4.17.1 item 2, shared piece 2; A-603): one durable step committing several of
+  /// its greens' versions, greens joining its lineage, its namespace's changes and its own state's (Mercurial's phase
+  /// roots and obsolescence markers), its checks read at its position first; all of it or none. Every other operation
+  /// that changes a repository is an entry of one change and takes a position too. Appended.
+  RepositoryAdvanced {
+    /// The entry.
+    entry: crate::catalog::RepositoryEntry,
+  },
+  /// A repository's policy was set whole by its owner (§4.17.1 "Policy", A-622): its rules and hooks replaced, its
+  /// version the one after the version its setter read. An entry of the repository's register of this one change, so
+  /// it takes the register's next position (A-603). Appended.
+  RepositoryPolicySet {
+    /// The repository.
+    repository: RepositoryId,
+    /// The policy, its version the next.
+    policy: crate::catalog::RepositoryPolicy,
+  },
+  /// A principal's tool identities were set whole by its owner on the control channel (§4.13; §4.17.1 "A push is a
+  /// work" item 4; A-664), as the version after the one its setter read. Appended.
+  IdentitiesSet {
+    /// The record, its version the next.
+    record: crate::catalog::IdentityRecord,
+  },
+  /// A version-control credential was enrolled by the human surface (§4.13, §4.17.2 "Access"; A-625 part 3), on the
+  /// partition its id routes to. Appended.
+  CredentialEnrolled {
+    /// The record.
+    record: crate::catalog::CredentialRecord,
+  },
+  /// A version-control credential was revoked by the human surface: its record leaves (A-625 part 3). Appended.
+  CredentialRevoked {
+    /// The credential's id.
+    id: [u8; 32],
+  },
+  /// A repository taken over was recorded whole by its successor (A-636 part 2c-2): its adopted record and the parts of
+  /// its four state logs the successor kept by A-636 part 1's rule, each log's from its start, in log order
+  /// (`crate::repository::whole_parts`). Applied as if each part's changes were made again, taking no position a record
+  /// ships from, since every holder already holds them. Appended.
+  RepositoryRebuilt {
+    /// The record, as its own register held it (A-636 part 2c-1).
+    record: RepositoryRecord,
+    /// The kept parts, by log and then position.
+    parts: Vec<crate::catalog::StateLogRecord>,
+  },
+  /// A repository's index cut moved one bit (A-724 piece 9, §4.17.5): `bits` is its record's `index_bits` one more or
+  /// one fewer than now, at most an id's 32 leading bits a range names. Appended.
+  RepositoryIndexCut {
+    /// The repository.
+    repository: RepositoryId,
+    /// The cut's bits after the change.
+    bits: u8,
+  },
+  /// A version-control credential was revoked elsewhere in the region (A-764): its record leaves if held, and its id is
+  /// held as revoked, so it is never enrolled again. Appended.
+  CredentialTombstoned {
+    /// The credential's id.
+    id: [u8; 32],
+  },
+  /// A landing awaiting its grant was superseded by a newer presentation of the same volume into the same target
+  /// (A-779): it leaves `AwaitingGrant` for `Superseded`, naming the newer. Appended.
+  LandingSuperseded {
+    /// The older landing.
+    id: u64,
+    /// The newer presentation.
+    by: u64,
+  },
 }
 
 impl Op {
@@ -688,6 +814,15 @@ impl Op {
       Op::AttachmentBound { .. } => "attachment_bound",
       Op::AttachmentMountSeen { .. } => "attachment_mount_seen",
       Op::RepositoryGreenJoined { .. } => "repository_green_joined",
+      Op::ReviewCommented { .. } => "review_commented",
+      Op::ReviewCommentMoved { .. } => "review_comment_moved",
+      Op::ReviewCommentOutdated { .. } => "review_comment_outdated",
+      Op::ReviewApproved { .. } => "review_approved",
+      Op::ReviewApprovalStaled { .. } => "review_approval_staled",
+      Op::ReviewClosed { .. } => "review_closed",
+      Op::RepositoryAdvanced { .. } => "repository_advanced",
+      Op::RepositoryPolicySet { .. } => "repository_policy_set",
+      Op::RepositoryIndexCut { .. } => "repository_index_cut",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",
@@ -751,6 +886,12 @@ impl Op {
       Op::RepositoryBranchRetired { .. } => "repository_branch_retired",
       Op::RepositoryDefaultSet { .. } => "repository_default_set",
       Op::RepositoryDestroyed { .. } => "repository_destroyed",
+      Op::IdentitiesSet { .. } => "identities_set",
+      Op::CredentialEnrolled { .. } => "credential_enrolled",
+      Op::CredentialRevoked { .. } => "credential_revoked",
+      Op::CredentialTombstoned { .. } => "credential_tombstoned",
+      Op::LandingSuperseded { .. } => "landing_superseded",
+      Op::RepositoryRebuilt { .. } => "repository_rebuilt",
     }
   }
 }

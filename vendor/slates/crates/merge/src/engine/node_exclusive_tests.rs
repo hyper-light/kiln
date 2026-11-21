@@ -73,7 +73,7 @@ impl Work {
   }
 
   fn set_xattr(&mut self, path: &str, name: &str, value: &[u8]) -> &mut Work {
-    let name = u64::from(self.doc.paths.intern(name));
+    let name = self.doc.paths.intern(name);
     let src = self.stash(value);
     self.push(
       OpKind::SetXattr,
@@ -85,7 +85,7 @@ impl Work {
   }
 
   fn rename(&mut self, from: &str, to: &str) -> &mut Work {
-    let from = u64::from(self.doc.paths.intern(from));
+    let from = self.doc.paths.intern(from);
     self.push(OpKind::Rename, to, 0, 0, from)
   }
 
@@ -104,6 +104,7 @@ impl Work {
       doc: self.doc.clone(),
       post_state: self.post.clone(),
       evidence: Vec::new(),
+      named: Default::default(),
     }
   }
 }
@@ -130,7 +131,10 @@ fn conflicted(outcome: &Outcome) -> Option<BTreeSet<String>> {
     Outcome::Conflict { windows } => {
       Some(windows.iter().map(|window| window.path.clone()).collect())
     }
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } => None,
+    Outcome::Accepted { .. }
+    | Outcome::BaseUnavailable { .. }
+    | Outcome::CopyRefused { .. }
+    | Outcome::ContentUnread { .. } => None,
   }
 }
 
@@ -142,7 +146,10 @@ fn classes_on(outcome: &Outcome, path: &str) -> Vec<MergeConflictClass> {
       .filter(|window| window.path == path)
       .map(|window| window.class)
       .collect(),
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } => Vec::new(),
+    Outcome::Accepted { .. }
+    | Outcome::BaseUnavailable { .. }
+    | Outcome::CopyRefused { .. }
+    | Outcome::ContentUnread { .. } => Vec::new(),
   }
 }
 

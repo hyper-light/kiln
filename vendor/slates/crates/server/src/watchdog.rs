@@ -83,6 +83,14 @@
 //! so before, an 18-core Mac, 2026-11-07). Under Miri, which has no thread clock, the wall window stands
 //! alone, as it does for observations.
 //!
+//! **A stuck shard's line names its task (A-740).** Every task carries a label (`slates_rt::label`): where it was
+//! spawned, taken by `#[track_caller]` at each spawn entry, or the work it names itself while it runs
+//! (`slates_rt::futures::doing`, as a push's landing does inside its connection's task). The shard stores the label and
+//! the task's poll count in its pulse before each poll, one store, and the wedged and spinning lines and the end's line
+//! name it ([`polling_words`]). Before the beat is withheld the watchdog records it in the anchor's segment
+//! (`slates_anchor::AnchorSegment::record_stuck_task`), and the anchor's kill line names it too. Before, a report named
+//! the shard alone, and which task spun was guessed.
+//!
 //! **A daemon nobody supervises ends itself (A-232).** Withholding the beat ends a daemon only when an anchor reads the
 //! beat. A daemon run alone (`slates daemon` with no anchor, [`crate::SegmentSource::Create`]) is read by nobody, so
 //! before A-232 a stuck one sat with its beat withheld for good, and its clients waited on a daemon that would never
@@ -177,6 +185,23 @@ impl MemoryStallSource {
 pub struct Turns {
   looks: std::sync::atomic::AtomicU64,
   withheld: std::sync::atomic::AtomicU64,
+  /// The beat before the latest withheld episode began, on the watchdog's clock; zero before any.
+  episode_beat_ns: std::sync::atomic::AtomicU64,
+  /// How late the looks of that episode ran, up to its first withheld look: the term past a window and a beat its
+  /// verdict may come (A-232 step 5).
+  episode_late_ns: std::sync::atomic::AtomicU64,
+}
+
+/// The latest episode in which the watchdog withheld the beat for a stuck shard ([`Turns::episode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Withheld {
+  /// The last beat before it, on the watchdog's clock (`slates_vfs::clock::HostClock`'s monotonic time).
+  pub last_beat_ns: u64,
+  /// How late the watchdog's looks ran from that beat to its first withheld look. A stuck shard's beat stops within its
+  /// window, a beat and this of the moment it stuck, by the rule's own measure: the look before the one that last saw
+  /// it move came no later than that moment, and the verdict's look a window after it, each look up to a beat and this
+  /// late.
+  pub late_ns: u64,
 }
 
 impl Turns {
@@ -184,6 +209,26 @@ impl Turns {
   pub fn read(&self) -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (self.looks.load(Relaxed), self.withheld.load(Relaxed))
+  }
+
+  /// The latest withheld episode, none before the first (A-232 step 5's bound, for a test to hold the beat's stop to).
+  pub fn episode(&self) -> Option<Withheld> {
+    use std::sync::atomic::Ordering::Acquire;
+    let last_beat_ns = self.episode_beat_ns.load(Acquire);
+    (last_beat_ns != 0).then(|| Withheld {
+      last_beat_ns,
+      late_ns: self.episode_late_ns.load(Acquire),
+    })
+  }
+
+  /// Records a withheld look of the episode after the beat at `last_beat_ns`, its looks `late_ns` late so far: the
+  /// episode's first withheld look alone, whose lateness is the verdict's.
+  fn withheld_after(&self, last_beat_ns: u64, late_ns: u64) {
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    if self.episode_beat_ns.load(Acquire) != last_beat_ns {
+      self.episode_late_ns.store(late_ns, Release);
+      self.episode_beat_ns.store(last_beat_ns, Release);
+    }
   }
 
   fn looked(&self, withheld: bool) {
@@ -791,6 +836,7 @@ fn run(
   let mut said_control_ended = false;
   let mut stopping = false;
   let mut lateness = Lateness::default();
+  let mut last_beat_ns = 0_u64;
   loop {
     match stop.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS)) {
       Err(RecvTimeoutError::Timeout) => {}
@@ -832,6 +878,10 @@ fn run(
       .position(|found| found.is_some_and(|(_, verdict)| !verdict.beats()));
     let stuck = stuck_at.and_then(|index| verdicts.get(index).copied().flatten());
     let turn = decide(supervision, stuck, control_ended, stopping);
+    if let Turn::Withhold(Cause::Stuck { shard, .. }) | Turn::End(Cause::Stuck { shard, .. }) = turn
+    {
+      record_stuck(segment, shard);
+    }
     if let Turn::End(cause) = turn {
       turns.looked(stuck.is_some());
       // The stuck shard's window and its verdict's lateness, which the end's line names; none for an ended control loop.
@@ -862,21 +912,44 @@ fn run(
       }
     }
     turns.looked(stuck.is_some());
-    lateness.since_beat(turn == Turn::Beat, late_ns);
+    let episode_late_ns = lateness.since_beat(turn == Turn::Beat, late_ns);
+    count_turn(turns, turn, (&mut last_beat_ns, now), episode_late_ns);
     mark(segment, turn, now);
-    match turn {
-      Turn::Beat => {}
-      Turn::Withhold(Cause::ControlEnded) => {
-        if !stopping && !said_control_ended {
-          said_control_ended = true;
-          slates_machine::log_line!(
-            "slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon"
-          );
-        }
-      }
-      // Ended above, before any line that takes the log's lock.
-      Turn::Withhold(Cause::Stuck { .. }) | Turn::End(_) => {}
+    say_control_ended(turn, stopping, &mut said_control_ended);
+  }
+}
+
+/// Counts `turn` taken at `now`: a beat is the last beat's time; a withholding for a stuck shard after a beat counts
+/// the episode, `episode_late_ns` its lateness.
+fn count_turn(
+  turns: &Turns,
+  turn: Turn,
+  (last_beat_ns, now): (&mut u64, u64),
+  episode_late_ns: u64,
+) {
+  match turn {
+    Turn::Beat => *last_beat_ns = now.max(1),
+    Turn::Withhold(Cause::Stuck { .. }) if *last_beat_ns != 0 => {
+      turns.withheld_after(*last_beat_ns, episode_late_ns);
     }
+    Turn::Withhold(_) | Turn::End(_) => {}
+  }
+}
+
+/// Says once, unless the daemon is stopping, that the control loop ended and the beat is withheld for it.
+fn say_control_ended(turn: Turn, stopping: bool, said: &mut bool) {
+  match turn {
+    Turn::Beat => {}
+    Turn::Withhold(Cause::ControlEnded) => {
+      if !stopping && !*said {
+        *said = true;
+        slates_machine::log_line!(
+          "slates daemon: the control loop ended; the watchdog withholds the beat so the anchor restarts the daemon"
+        );
+      }
+    }
+    // Ended above, before any line that takes the log's lock.
+    Turn::Withhold(Cause::Stuck { .. }) | Turn::End(_) => {}
   }
 }
 
@@ -1005,8 +1078,9 @@ fn end_process(cause: Cause, late_ns: u64, judged: Option<(Option<u64>, u64)>) -
   let line = match cause {
     Cause::Stuck { shard, verdict } => format!(
       "slates daemon: no anchor reads the beat, so the watchdog ends the daemon's process (exit {FAILED_EXIT_CODE}): \
-       shard {shard} is {}; {}; the watchdog's looks ran at most {} us late since its last beat",
+       shard {shard} is {}, in {}; {}; the watchdog's looks ran at most {} us late since its last beat",
       describe(verdict, judged.map(|(_, window_ns)| window_ns)),
+      polling_words(shard),
       judged.and_then(|(late, _)| late).map_or_else(
         || "the shard last moved at the watchdog's first look of it, so the verdict's lateness is not known".to_owned(),
         |late| format!(
@@ -1214,6 +1288,7 @@ fn report(
   (watch, now_ns, window_ns): (&ShardWatch, u64, u64),
   waiting: impl FnOnce() -> String,
 ) {
+  let task = || polling_words(shard);
   if verdict == Verdict::Alive {
     *said = None;
     return;
@@ -1226,8 +1301,34 @@ fn report(
       (verdict, turn),
       || stuck_lateness_words(watch, now_ns, window_ns),
       waiting,
+      task,
     );
   }
+}
+
+/// The task shard `shard` is polling, or polled last, in a stuck shard's line (A-740): its label (where it was spawned,
+/// or the work it named, `slates_rt::futures::doing`) and its poll count, read from the shard's pulse.
+pub fn polling_words(shard: u16) -> String {
+  slates_rt::registry::with_entry(shard, |entry| entry.pulse.polling().to_string())
+    .unwrap_or_else(|| "a task its pulse no longer names".to_owned())
+}
+
+/// Records the task stuck shard `shard` is polling in the anchor's segment before the beat is withheld or the process
+/// ended (A-740, `slates_anchor::AnchorSegment::record_stuck_task`), so the anchor's kill line names it.
+fn record_stuck(segment: &AnchorSegment, shard: u16) {
+  let Some(polling) = slates_rt::registry::with_entry(shard, |entry| entry.pulse.polling()) else {
+    return;
+  };
+  let label = polling.label.map_or_else(
+    || "an unlabelled task".to_owned(),
+    |label| label.to_string(),
+  );
+  let _ = segment.record_stuck_task(&slates_anchor::StuckTask {
+    pid: u64::from(std::process::id()),
+    shard,
+    polls: polling.polls,
+    label,
+  });
 }
 
 /// A shard starved for memory in its log line's words: the kernel wait its thread is in, where the platform names one
@@ -1259,6 +1360,7 @@ fn log_verdict(
   (verdict, turn): (Verdict, Turn),
   late: impl FnOnce() -> String,
   waiting: impl FnOnce() -> String,
+  task: impl FnOnce() -> String,
 ) {
   match verdict {
     Verdict::Starved {
@@ -1283,9 +1385,10 @@ fn log_verdict(
     ),
     Verdict::Wedged { for_ns } => slates_machine::log_line!(
       "slates daemon: shard {shard} is wedged: no step, no CPU progress and no wait for a CPU for {} ms, past its {} ms \
-       window; {}; {}",
+       window, in {}; {}; {}",
       for_ns / NS_PER_MS,
       window_ns / NS_PER_MS,
+      task(),
       consequence(turn),
       late()
     ),
@@ -1294,9 +1397,10 @@ fn log_verdict(
       cpu_ns,
       window_ns: spin_window_ns,
     } => slates_machine::log_line!(
-      "slates daemon: shard {shard} is spinning: {} ms of CPU without a step, past its {} ms window of CPU; {}; {}",
+      "slates daemon: shard {shard} is spinning: {} ms of CPU without a step, past its {} ms window of CPU, in {}; {}; {}",
       cpu_ns / NS_PER_MS,
       spin_window_ns / NS_PER_MS,
+      task(),
       consequence(turn),
       late()
     ),

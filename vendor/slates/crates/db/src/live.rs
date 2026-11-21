@@ -231,9 +231,30 @@ impl Entry {
     ENTRY_PREFIX_BYTES.saturating_add(self.payload.len())
   }
 
-  /// The entry's identity: the BLAKE3 of its canonical bytes, binding its place in the chain and its payload.
+  /// The entry's identity: the BLAKE3 of its canonical bytes ([`Entry::encode`]), binding its place in the chain and its
+  /// payload. Hashed as they stream, not from a copy of them: an append of a 2.4 MB payload copied it into the canonical
+  /// bytes once for each identity asked (w-forming, 2026-11-20).
   pub fn identity(&self) -> Identity {
-    *blake3::hash(&self.encode()).as_bytes()
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&self.owner.0.to_le_bytes());
+    hasher.update(&self.object.0);
+    hasher.update(&self.position.to_le_bytes());
+    hasher.update(&self.epoch.0.to_le_bytes());
+    hasher.update(&self.previous);
+    let length = u32::try_from(self.payload.len()).unwrap_or(u32::MAX);
+    hasher.update(&length.to_le_bytes());
+    hasher.update(&self.payload);
+    *hasher.finalize().as_bytes()
+  }
+
+  /// The head a holder holds once it has applied this entry, its identity `identity` hashed ahead
+  /// ([`EntryHasher::of`], A-757 part 4: a holder hashes a large entry in its turns, not in the one that applies it).
+  pub fn head_with(&self, identity: Identity) -> Head {
+    Head {
+      epoch: self.epoch,
+      position: self.position,
+      identity,
+    }
   }
 
   /// The head a holder holds once it has applied this entry.
@@ -916,6 +937,13 @@ impl Replica {
 
   /// The guard for an entry: whether it extends the held head, is already held, or is refused.
   pub fn check(&self, entry: &Entry) -> Result<Admitted, LiveError> {
+    self.check_identified(entry, entry.identity())
+  }
+
+  /// [`Replica::check`] with the entry's identity hashed ahead ([`EntryHasher::of`]): the same guard, no hash here. The
+  /// caller hashes exactly this entry's canonical bytes: an identity of other bytes is one the chain refuses or a later
+  /// entry's `previous` does not meet.
+  pub fn check_identified(&self, entry: &Entry, identity: Identity) -> Result<Admitted, LiveError> {
     self.admit_sender(entry.owner, entry.object, entry.epoch)?;
     let extends = match self.head {
       None => entry.position == 0 && entry.previous == GENESIS,
@@ -923,16 +951,16 @@ impl Replica {
         head.position.checked_add(1) == Some(entry.position) && head.identity == entry.previous
       }
     };
+    let entry_head = entry.head_with(identity);
     if extends {
-      return Ok(Admitted::Apply(entry.head()));
+      return Ok(Admitted::Apply(entry_head));
     }
     match self.head {
       // The same entry again (a duplicate), or an older one of the same epoch's stream re-delivered: what the holder
       // holds already answers it. An older entry can only be judged as held when its epoch is the head's and its
       // position below, since one owner makes one chain per epoch and the head extends it.
       Some(head)
-        if head == entry.head()
-          || (entry.epoch == head.epoch && entry.position < head.position) =>
+        if head == entry_head || (entry.epoch == head.epoch && entry.position < head.position) =>
       {
         Ok(Admitted::Held)
       }
@@ -1101,6 +1129,18 @@ pub enum Next {
   Fenced(HostEpoch),
 }
 
+/// What a holder's answer leaves it lacking, as the owner's fold names it ([`Shipper::on_reply`] builds it).
+enum Folded {
+  /// Nothing, or nothing to send it (a refusal, a host it does not ship to).
+  Nothing,
+  /// The retained entries after this position (all of them when `None`).
+  After(Option<u64>),
+  /// An install: it is off the chain or behind the retained tail.
+  Install,
+  /// A later epoch has superseded this owner.
+  Fenced(HostEpoch),
+}
+
 /// The owner's side of one live-shipped volume: its chain, the entries it retains, what each holder holds of it, and
 /// the durable position.
 #[derive(Clone, Debug)]
@@ -1131,6 +1171,10 @@ pub struct Shipper {
   head: Option<Head>,
   /// The retained entries, oldest first, dense in position.
   retained: VecDeque<Entry>,
+  /// The position whose payload the owner keeps as its last whole state ([`Shipper::keep`]), and that entry once the
+  /// retained tail let it go: the one copy of the whole state, lent to the owner ([`Shipper::payload_at`]) whether the
+  /// tail still holds it or not (A-757 part 3).
+  keep: (Option<u64>, Option<Entry>),
   /// What each holder holds on this chain, as last reported.
   /// One head a host, for hosts it ships to only: a reply from any other is dropped ([`Shipper::on_reply`]) and a host
   /// leaving the holder set is forgotten ([`Shipper::activate`]), so at most the holders and the transition's target.
@@ -1145,6 +1189,87 @@ pub struct Shipper {
   owed_install: std::collections::BTreeSet<HostId>,
   /// The holder set it is moving to ([`Shipper::begin_transition`]), sorted, until the record names it.
   transition: Option<Vec<HostId>>,
+}
+
+/// The identity of the entry a [`Shipper`] will append next, hashed a slice of its payload at a time
+/// ([`Shipper::entry_hasher`]): BLAKE3 hashes incrementally, and the entry's place in the chain is fixed while the owner
+/// feeds it, so an owner shard hashes a whole state across its turns instead of in one (A-757 part 2, w-forming,
+/// 2026-11-20: 0.94 ms of release CPU for 2.4 MB in one turn, against seal quanta of 14 to 784 us).
+#[derive(Clone, Debug)]
+pub struct EntryHasher {
+  hasher: blake3::Hasher,
+  position: u64,
+  previous: Identity,
+  epoch: HostEpoch,
+  length: usize,
+  fed: usize,
+}
+
+impl EntryHasher {
+  /// A hasher seeded with an entry's place, made by `owner` for `object`, and a payload of `payload_len` bytes.
+  fn seeded(
+    (owner, object): (HostId, ObjectId),
+    (position, epoch, previous): (u64, HostEpoch, Identity),
+    payload_len: usize,
+  ) -> Result<EntryHasher, LiveError> {
+    let length = u32::try_from(payload_len).map_err(|_| LiveError::Malformed)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&owner.0.to_le_bytes());
+    hasher.update(&object.0);
+    hasher.update(&position.to_le_bytes());
+    hasher.update(&epoch.0.to_le_bytes());
+    hasher.update(&previous);
+    hasher.update(&length.to_le_bytes());
+    Ok(EntryHasher {
+      hasher,
+      position,
+      previous,
+      epoch,
+      length: payload_len,
+      fed: 0,
+    })
+  }
+
+  /// A hasher of a received `entry`'s identity, seeded with its place, for a holder that feeds its payload a slice a
+  /// turn and checks it with [`Replica::check_identified`] (A-757 part 4).
+  pub fn of(entry: &Entry) -> Result<EntryHasher, LiveError> {
+    EntryHasher::seeded(
+      (entry.owner, entry.object),
+      (entry.position, entry.epoch, entry.previous),
+      entry.payload.len(),
+    )
+  }
+
+  /// The identity once every payload byte was fed in order; `None` before.
+  pub fn finish(self) -> Option<Identity> {
+    (self.fed == self.length).then(|| *self.hasher.finalize().as_bytes())
+  }
+
+  /// Feeds the next `bytes` of the payload, in order.
+  pub fn feed(&mut self, bytes: &[u8]) {
+    self.hasher.update(bytes);
+    self.fed = self.fed.saturating_add(bytes.len());
+  }
+
+  /// The payload bytes fed so far.
+  pub fn fed(&self) -> usize {
+    self.fed
+  }
+
+  /// The payload's length the hasher was seeded with.
+  pub fn length(&self) -> usize {
+    self.length
+  }
+}
+
+/// Whether an append returns its entry to the caller as well as keeping it in the retained tail
+/// ([`Shipper::append_kept`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kept {
+  /// Kept and returned: a copy of the entry back.
+  Returned,
+  /// Kept alone: its head back.
+  Retained,
 }
 
 impl Shipper {
@@ -1178,6 +1303,7 @@ impl Shipper {
       first: 0,
       head: start,
       retained: VecDeque::new(),
+      keep: (None, None),
       held: BTreeMap::new(),
       durable: None,
       checkpoint: None,
@@ -1412,7 +1538,14 @@ impl Shipper {
   /// ([`Shipper::append_checkpoint`], A-371). With no delta in flight it is admitted whatever its size, so the log always
   /// moves.
   pub fn append(&mut self, payload: Vec<u8>) -> Result<Entry, LiveError> {
-    let bytes = ENTRY_PREFIX_BYTES.saturating_add(payload.len());
+    self.admit(payload.len())?;
+    let (_, entry) = self.append_unchecked(payload, false, Kept::Returned)?;
+    entry.ok_or(LiveError::Malformed)
+  }
+
+  /// Whether a delta of `payload_len` bytes is admitted now ([`Shipper::append`]'s credit).
+  fn admit(&self, payload_len: usize) -> Result<(), LiveError> {
+    let bytes = ENTRY_PREFIX_BYTES.saturating_add(payload_len);
     // The deltas in flight, a whole state's bytes left out: a whole state rides one past the credit (A-371). Counted
     // with it, the whole entry the daemon has just appended filled the credit it sets from that entry's size, and every
     // delta after it was refused until the whole state was durable.
@@ -1424,7 +1557,7 @@ impl Shipper {
         durable: self.durable,
       });
     }
-    self.append_unchecked(payload, false)
+    Ok(())
   }
 
   /// Whether a whole state would be admitted now ([`Shipper::append_checkpoint`]): what is in flight is within the
@@ -1444,17 +1577,131 @@ impl Shipper {
         durable: self.durable,
       });
     }
-    self.append_unchecked(payload, true)
+    let (_, entry) = self.append_unchecked(payload, true, Kept::Returned)?;
+    entry.ok_or(LiveError::Malformed)
   }
 
-  /// Appends `payload` at the next position, kept unsettled as a whole state when `whole`.
-  fn append_unchecked(&mut self, payload: Vec<u8>, whole: bool) -> Result<Entry, LiveError> {
-    let (position, previous) = match self.head {
+  /// [`Shipper::append`] for an owner that needs only the head it appended: the entry goes into the retained tail, not
+  /// also back to the caller, and its identity is hashed once. `live_ship` appended through [`Shipper::append`] and asked
+  /// the entry's head twice more, each a copy and a hash of the payload: 3.3 to 4.4 ms for 2.4 MB in release, against
+  /// seal quanta of 14 to 784 us (w-forming, 2026-11-20).
+  pub fn append_kept(&mut self, payload: Vec<u8>) -> Result<Head, LiveError> {
+    self.admit(payload.len())?;
+    self
+      .append_unchecked(payload, false, Kept::Retained)
+      .map(|(head, _)| head)
+  }
+
+  /// [`Shipper::append_checkpoint`] as [`Shipper::append_kept`] appends: the head alone back.
+  pub fn append_checkpoint_kept(&mut self, payload: Vec<u8>) -> Result<Head, LiveError> {
+    if !self.admits_checkpoint() {
+      return Err(LiveError::NoCredit {
+        durable: self.durable,
+      });
+    }
+    self
+      .append_unchecked(payload, true, Kept::Retained)
+      .map(|(head, _)| head)
+  }
+
+  /// Appends `payload` at the next position, kept unsettled as a whole state when `whole`: its head, and the entry too
+  /// when `kept` returns it.
+  fn append_unchecked(
+    &mut self,
+    payload: Vec<u8>,
+    whole: bool,
+    kept: Kept,
+  ) -> Result<(Head, Option<Entry>), LiveError> {
+    let (position, previous) = self.next_link()?;
+    let entry = Entry {
+      owner: self.owner,
+      object: self.object,
+      position,
+      epoch: self.epoch,
+      previous,
+      payload,
+    };
+    let head = entry.head();
+    Ok(self.push_entry(entry, head, whole, kept))
+  }
+
+  /// The position and previous identity the next entry takes.
+  fn next_link(&self) -> Result<(u64, Identity), LiveError> {
+    Ok(match self.head {
       Some(head) => (
         head.position.checked_add(1).ok_or(LiveError::Malformed)?,
         head.identity,
       ),
       None => (self.first, GENESIS),
+    })
+  }
+
+  /// A hasher of the next entry's identity, seeded with its place in the chain and a payload of `payload_len` bytes,
+  /// for an owner that feeds the payload a slice a turn ([`EntryHasher`]) and appends it with
+  /// [`Shipper::append_checkpoint_hashed`]. `Malformed` past the last position or for a payload whose length the
+  /// canonical bytes cannot carry.
+  pub fn entry_hasher(&self, payload_len: usize) -> Result<EntryHasher, LiveError> {
+    let (position, previous) = self.next_link()?;
+    EntryHasher::seeded(
+      (self.owner, self.object),
+      (position, self.epoch, previous),
+      payload_len,
+    )
+  }
+
+  /// [`Shipper::append_checkpoint_kept`] with the identity `hashed` hashed over `payload` in turns: no hash here. Refused
+  /// `Behind` when the hasher was seeded for another place than the next one (the chain moved since) or fed other than
+  /// `payload`'s length, so the owner hashes again; `NoCredit` as a checkpoint is. The owner feeds `hashed` exactly
+  /// `payload`, in order: an identity over other bytes is one no holder's chain admits.
+  pub fn append_checkpoint_hashed(
+    &mut self,
+    payload: Vec<u8>,
+    hashed: EntryHasher,
+  ) -> Result<Head, LiveError> {
+    if !self.admits_checkpoint() {
+      return Err(LiveError::NoCredit {
+        durable: self.durable,
+      });
+    }
+    self.append_hashed_as(payload, hashed, true)
+  }
+
+  /// [`Shipper::append_kept`] with the identity `hashed` hashed over `payload` in turns (A-757 part 2b: a large delta built
+  /// in turns of its own); refused as [`Shipper::append_checkpoint_hashed`] is, and for credit as a delta is.
+  pub fn append_hashed(
+    &mut self,
+    payload: Vec<u8>,
+    hashed: EntryHasher,
+  ) -> Result<Head, LiveError> {
+    self.admit(payload.len())?;
+    self.append_hashed_as(payload, hashed, false)
+  }
+
+  /// Whether a delta of `payload_len` bytes would be admitted now ([`Shipper::append`]'s credit).
+  pub fn admits_delta(&self, payload_len: usize) -> bool {
+    self.admit(payload_len).is_ok()
+  }
+
+  /// The append both hashed appends share, a whole state when `whole`.
+  fn append_hashed_as(
+    &mut self,
+    payload: Vec<u8>,
+    hashed: EntryHasher,
+    whole: bool,
+  ) -> Result<Head, LiveError> {
+    let (position, previous) = self.next_link()?;
+    if hashed.position != position
+      || hashed.previous != previous
+      || hashed.epoch != self.epoch
+      || hashed.length != payload.len()
+      || hashed.fed != payload.len()
+    {
+      return Err(LiveError::Behind { head: self.head });
+    }
+    let head = Head {
+      epoch: self.epoch,
+      position,
+      identity: *hashed.hasher.finalize().as_bytes(),
     };
     let entry = Entry {
       owner: self.owner,
@@ -1464,17 +1711,34 @@ impl Shipper {
       previous,
       payload,
     };
-    self.head = Some(entry.head());
+    Ok(self.push_entry(entry, head, whole, Kept::Retained).0)
+  }
+
+  /// Keeps `entry`, whose head is `head`, at the end of the chain, unsettled as a whole state when `whole`: its head,
+  /// and the entry too when `kept` returns it.
+  fn push_entry(
+    &mut self,
+    entry: Entry,
+    head: Head,
+    whole: bool,
+    kept: Kept,
+  ) -> (Head, Option<Entry>) {
+    let position = entry.position;
+    self.head = Some(head);
     let bytes = entry.wire_bytes();
     self.unsettled.push_back((position, bytes, whole));
     self.unsettled_bytes = self.unsettled_bytes.saturating_add(bytes);
     if whole {
       self.unsettled_whole_bytes = self.unsettled_whole_bytes.saturating_add(bytes);
     }
-    self.retained.push_back(entry.clone());
+    let returned = match kept {
+      Kept::Returned => Some(entry.clone()),
+      Kept::Retained => None,
+    };
+    self.retained.push_back(entry);
     self.trim();
     self.refresh_durable();
-    Ok(entry)
+    (head, returned)
   }
 
   /// Recomputes the durable position and settles the entries it now covers, giving their bytes back to the credit.
@@ -1506,34 +1770,62 @@ impl Shipper {
     })
   }
 
+  /// Folds a holder's answer as [`Shipper::on_reply`] does, building nothing to send: for a caller that sends from
+  /// [`Shipper::pending`] when it sends. `Some(epoch)` when a later epoch has superseded this owner. Through
+  /// `on_reply`, every answer of a holder far behind cloned each retained entry it lacked, for the daemon to drop: 1.4 ms
+  /// a reply 1,000 entries behind, so the owner shard spent itself on one resumed holder's replies, writes fell to about
+  /// 210 a second, and the holder never came within 50 entries of the head in 6 of 24 x86 runs
+  /// (diag-live-durability-73).
+  pub fn fold_reply(
+    &mut self,
+    holder: HostId,
+    reply: Result<Option<Head>, LiveError>,
+  ) -> Option<HostEpoch> {
+    match self.fold(holder, reply) {
+      Folded::Fenced(current) => Some(current),
+      Folded::Nothing | Folded::After(_) | Folded::Install => None,
+    }
+  }
+
   /// Folds a holder's answer (to an entry or an install) and says what to send it next. A head on this chain is an
   /// acknowledgement of every position up to it; a head off the chain or behind the retained tail draws an install; a
   /// fence above this epoch means the owner has been superseded.
   pub fn on_reply(&mut self, holder: HostId, reply: Result<Option<Head>, LiveError>) -> Next {
+    match self.fold(holder, reply) {
+      Folded::Fenced(current) => Next::Fenced(current),
+      Folded::Nothing => Next::Nothing,
+      Folded::Install => Next::Install,
+      Folded::After(position) => self.entries_after(position),
+    }
+  }
+
+  /// The fold of [`Shipper::on_reply`] and [`Shipper::fold_reply`]: what the holder's answer leaves it lacking, named
+  /// and not built.
+  fn fold(&mut self, holder: HostId, reply: Result<Option<Head>, LiveError>) -> Folded {
     if !self.ships_to(holder) {
-      return Next::Nothing;
+      return Folded::Nothing;
     }
     let held = match reply {
       Err(LiveError::StaleEpoch { current }) if current > self.epoch => {
-        return Next::Fenced(current);
+        return Folded::Fenced(current);
       }
       Err(LiveError::Behind { head }) | Ok(head) => head,
-      Err(_) => return Next::Nothing,
+      Err(_) => return Folded::Nothing,
     };
     if let Some(head) = held
       && head.epoch > self.epoch
     {
-      return Next::Fenced(head.epoch);
+      return Folded::Fenced(head.epoch);
     }
     let Some(own) = self.head else {
-      return Next::Nothing;
+      return Folded::Nothing;
     };
     let Some(head) = held else {
-      return self.owe(holder, self.entries_after(None));
+      return self.owe_after(holder, None);
     };
     if !self.on_chain(holder, &head) {
       self.owed_install.insert(holder);
-      return Next::Install;
+      return Folded::Install;
     }
     self.owed_install.remove(&holder);
     let newer = self
@@ -1546,20 +1838,38 @@ impl Shipper {
       self.refresh_durable();
     }
     if head == own {
-      Next::Nothing
+      Folded::Nothing
     } else {
-      let next = self.entries_after(Some(head.position));
-      self.owe(holder, next)
+      self.owe_after(holder, Some(head.position))
     }
   }
 
-  /// Notes an `Install` answer as owed to `holder`, so [`Shipper::pending`] keeps answering it until the holder is back
-  /// on the chain.
-  fn owe(&mut self, holder: HostId, next: Next) -> Next {
-    if next == Next::Install {
-      self.owed_install.insert(holder);
+  /// What `holder` lacks after `position`, named: an install is noted owed to it, so [`Shipper::pending`] keeps answering
+  /// it until the holder is back on the chain.
+  fn owe_after(&mut self, holder: HostId, position: Option<u64>) -> Folded {
+    match self.reaches(position) {
+      None => Folded::Nothing,
+      Some(false) => {
+        self.owed_install.insert(holder);
+        Folded::Install
+      }
+      Some(true) => Folded::After(position),
     }
-    next
+  }
+
+  /// Whether the retained tail reaches the entry after `position` (from position 0 when `None`): `None` when there is no
+  /// position after it.
+  fn reaches(&self, position: Option<u64>) -> Option<bool> {
+    let first = match position {
+      Some(position) => position.checked_add(1)?,
+      None => 0,
+    };
+    Some(
+      self
+        .retained
+        .front()
+        .is_some_and(|oldest| oldest.position <= first),
+    )
   }
 
   /// What `holder` lacks by the head it last reported (everything, when it has reported none; an install when its last
@@ -1623,9 +1933,11 @@ impl Shipper {
 
   /// Whether the retained tail still holds every entry after `position` (A-428): a holder installed from a whole state at
   /// `position` then catches up by those entries alone, so [`Shipper::pending`] answers it entries, never a second
-  /// install. The owner owes an install image at its head only for a whole state the tail no longer reaches past.
+  /// install. The owner owes an install image at its head only for a whole state the tail no longer reaches past. Asked
+  /// without building the entries ([`Shipper::fold_reply`]'s sibling): through `entries_after` it cloned every entry a
+  /// lagging holder lacked on each write's sends.
   pub fn retains_after(&self, position: u64) -> bool {
-    !matches!(self.entries_after(Some(position)), Next::Install)
+    self.reaches(Some(position)) != Some(false)
   }
 
   /// The retained entries after `position` (all of them from position 0 when `None`), or an install when the tail no
@@ -1672,8 +1984,40 @@ impl Shipper {
         break;
       }
       bytes = bytes.saturating_sub(oldest.wire_bytes());
-      self.retained.pop_front();
+      // The entry the owner keeps as its whole state moves to the kept slot, not away: still its one copy.
+      if let Some(left) = self.retained.pop_front()
+        && self.keep.0 == Some(left.position)
+      {
+        self.keep.1 = Some(left);
+      }
     }
+  }
+
+  /// Keeps the payload of the entry at `position` (a whole state the owner appended) past the retained tail, as the
+  /// owner's last whole state, lent through [`Shipper::payload_at`]; `None` keeps none (the owner's whole state is an
+  /// image it holds itself). An entry kept before for another position is let go. Before A-757 part 3 the owner held its
+  /// own copy of every whole state beside the entry it appended: two copies of the volume, three during the append.
+  pub fn keep(&mut self, position: Option<u64>) {
+    self.keep.0 = position;
+    if self.keep.1.as_ref().map(|entry| entry.position) != position {
+      self.keep.1 = None;
+    }
+  }
+
+  /// The payload of the entry at `position`, lent: from the retained tail, or the entry kept past it ([`Shipper::keep`]).
+  pub fn payload_at(&self, position: u64) -> Option<&[u8]> {
+    self
+      .retained
+      .iter()
+      .find(|entry| entry.position == position)
+      .or(
+        self
+          .keep
+          .1
+          .as_ref()
+          .filter(|entry| entry.position == position),
+      )
+      .map(|entry| entry.payload.as_slice())
   }
 
   /// Moves its bounds (the caller's derivation, [`Bounds::of_whole`] in the daemon: the size of the whole state an

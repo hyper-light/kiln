@@ -14,15 +14,15 @@ use std::time::Instant;
 use slates_anchor::{AnchorError, AnchorSegment, RegionKind};
 use slates_wire::Wire;
 
+use crate::catalog::StateLogRecord;
 use crate::error::DbError;
 use crate::op::Op;
 use crate::partition::{Partition, PartitionCaps, PartitionSnapshot};
 use crate::record::{LogEntry, LogRing, Replayed};
 
-/// Shape: the recovery budget, RAMCloud's target of about a second for a crashed node
-/// [A: Ongaro et al., SOSP'11: 35 GB in 1.6 s]; an operator input in Phase 2's CLI, ratified
-/// here as the default (GAPS §5).
-pub const RECOVERY_BUDGET_NS: u64 = 1_000_000_000;
+/// The recovery budget: `slates_machine::budgets::RECOVERY_BUDGET_NS` (RAMCloud's target of about a second for a crashed
+/// node, ratified as the default, GAPS §5), held there so the daemon and the workspace's tools derive from one source.
+pub const RECOVERY_BUDGET_NS: u64 = slates_machine::budgets::RECOVERY_BUDGET_NS;
 /// Format: nanoseconds per microsecond.
 const NS_PER_US: u64 = 1_000;
 
@@ -75,6 +75,87 @@ pub struct DbStats {
   pub recovery_budget_ns: u64,
   /// The floor: the last snapshot's size, which the tail must reach before the next one.
   pub snapshot_floor_bytes: u64,
+  /// The log since the last snapshot, by what its records carry (A-745).
+  pub tail_split: RegisterSplit,
+  /// The last snapshot, by what it holds (A-745).
+  pub snapshot_split: RegisterSplit,
+}
+
+/// A partition's register bytes by what they carry (A-745, main's ruling of 2026-11-20: split the log ring and the
+/// snapshot slots by record kind before choosing the next content-once step): repository records (a repository entry's
+/// objects, a Subversion revision's texts among them; in a snapshot the repository registers), green chain entries
+/// (an increment's file bytes: an advance, an origin, and the chain entries a repository entry carries for its greens;
+/// in a snapshot the chains), checkpoints, and the rest (records' framing and every other kind).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegisterSplit {
+  /// Repository records: objects (texts) and, in a snapshot, the repository registers.
+  pub repository_records: u64,
+  /// Green chain entries: increments' bytes.
+  pub chain_entries: u64,
+  /// Green checkpoints.
+  pub checkpoints: u64,
+  /// Everything else.
+  pub rest: u64,
+}
+
+impl RegisterSplit {
+  /// Adds a record of `bytes` appended for `entry`: what its operations carry, by kind, and the rest of its bytes.
+  fn add_entry(&mut self, entry: &LogEntry, bytes: u64) {
+    let wide = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+    let mut carried = RegisterSplit::default();
+    for op in entry.ops() {
+      match op {
+        Op::GreenAdvanced { increment, .. } => {
+          carried.chain_entries = carried.chain_entries.saturating_add(wide(increment.len()));
+        }
+        Op::GreenOriginated { origin, .. } => {
+          carried.chain_entries = carried.chain_entries.saturating_add(wide(origin.len()));
+        }
+        Op::GreenCheckpointed { checkpoint, .. } => {
+          carried.checkpoints = carried.checkpoints.saturating_add(wide(checkpoint.len()));
+        }
+        Op::RepositoryAdvanced { entry } => {
+          carried.repository_records = carried
+            .repository_records
+            .saturating_add(wide(entry.objects.len()));
+          let versions = entry
+            .versions
+            .iter()
+            .map(|version| version.entry.len())
+            .fold(0usize, usize::saturating_add);
+          carried.chain_entries = carried.chain_entries.saturating_add(wide(versions));
+        }
+        _ => {}
+      }
+    }
+    let known = carried
+      .repository_records
+      .saturating_add(carried.chain_entries)
+      .saturating_add(carried.checkpoints);
+    self.repository_records = self
+      .repository_records
+      .saturating_add(carried.repository_records);
+    self.chain_entries = self.chain_entries.saturating_add(carried.chain_entries);
+    self.checkpoints = self.checkpoints.saturating_add(carried.checkpoints);
+    self.rest = self.rest.saturating_add(bytes.saturating_sub(known));
+  }
+
+  /// A snapshot of `total` bytes by what it holds: each kind's field encoded length, the rest the remainder.
+  fn of_snapshot(snapshot: &PartitionSnapshot, total: u64) -> RegisterSplit {
+    let wide = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+    let repository_records = wide(snapshot.repository_registers.encoded_len());
+    let chain_entries = wide(snapshot.green_chains.encoded_len());
+    let checkpoints = wide(snapshot.green_checkpoints.encoded_len());
+    RegisterSplit {
+      repository_records,
+      chain_entries,
+      checkpoints,
+      rest: total
+        .saturating_sub(repository_records)
+        .saturating_sub(chain_entries)
+        .saturating_sub(checkpoints),
+    }
+  }
 }
 
 /// What recovery found.
@@ -134,6 +215,8 @@ pub struct Db {
   /// ([`Db::set_recovery_budget`]; GAPS §5).
   recovery_budget_ns: u64,
   /// The last snapshot's size (the recovered one's after a boot, zero with none): the doubling rule's floor.
+  /// Snapshots or records refused for the slot's room (A-724 piece 8, [`DbError::SnapshotRoom`]).
+  snapshot_room_refusals: u64,
   snapshot_floor_bytes: u64,
   /// Operations applied since `begin`, waiting to go into one record at `commit`.
   pending: Option<Vec<Op>>,
@@ -147,6 +230,16 @@ pub struct Db {
   maintenance_failures: u64,
   /// Test support (never reachable from the wire): the next publication fails as named, once.
   publication_fault: Option<PublicationFault>,
+  /// The state logs' records of the operations made durable since their owner last took them (A-636 part 2b;
+  /// [`Db::take_state_log_records`]), in the order they were applied: what the owner ships to each log's holders.
+  /// Bounded by what is applied between two takes: the owner takes them before it admits a repository's change and on
+  /// every period of its record plane, and admits no change while the records it holds are at their bound
+  /// (`slates_server::state_log`); between those, only a member green's destroy adds one, which the partition's volume
+  /// capacity bounds.
+  logged: Vec<StateLogRecord>,
+  /// The records of the open transaction's operations: handed on at its commit, dropped at its rollback, so no record of
+  /// an operation that was never durable is shipped.
+  logged_in_transaction: Vec<StateLogRecord>,
 }
 
 /// Test support: where the next publication is made to fail, once (`Db::inject_publication_fault`),
@@ -243,11 +336,14 @@ pub fn recover(
     replay_work_ns_since_snapshot: replay_ns,
     recovery_budget_ns: RECOVERY_BUDGET_NS,
     snapshot_floor_bytes: snapshot_bytes,
+    snapshot_room_refusals: 0,
     pending: None,
     last_now_ns: now_ns,
     rollbacks: 0,
     maintenance_failures: 0,
     publication_fault: None,
+    logged: Vec::new(),
+    logged_in_transaction: Vec::new(),
   };
   Ok((db, recovered))
 }
@@ -336,6 +432,11 @@ fn append_record(
   })
 }
 
+/// One snapshot slot's bytes in `segment` (its geometry's, derived at boot: `snapshot_bytes_per_partition`).
+fn slot_bytes(segment: &AnchorSegment) -> u64 {
+  segment.geometry().snapshot_bytes
+}
+
 impl Db {
   /// The partition.
   pub fn partition(&self) -> &Partition {
@@ -350,6 +451,32 @@ impl Db {
   /// The next sequence.
   pub fn next_seq(&self) -> u64 {
     self.next_seq
+  }
+
+  /// The counter the `offset`-th volume id minted now takes (A-694): the next sequence or, past it, one past the highest
+  /// counter of any volume created here (`Partition::volume_counter`), plus `offset`. A verb that creates several volumes
+  /// before any is recorded (an append's new branches) mints them at offsets 0, 1, ...; each creation's apply moves the
+  /// partition's counter past its own, so no later mint repeats one, and a recovery, which applies the same records,
+  /// mints what the live database would. `None` past the counters an id may hold
+  /// (`crate::register::MAX_OBJECT_COUNTER`).
+  pub fn volume_counter_at(&self, offset: u64) -> Option<u64> {
+    self
+      .next_seq
+      .max(self.partition.volume_counter())
+      .checked_add(offset)
+      .filter(|counter| *counter <= crate::register::MAX_OBJECT_COUNTER)
+  }
+
+  /// The number the `offset`-th family id minted now takes (A-636 part 2b-2): one past the highest number of any family
+  /// id created here (`Partition::family_counter`), plus `offset`, as [`Db::volume_counter_at`] mints the counters of
+  /// ids of no family. A family's numbers move only at a creation, never with the log's sequence, so the four billion a
+  /// number holds are the partition's repositories and greens, not its records. `None` past the largest number.
+  pub fn family_number_at(&self, offset: u64) -> Option<u32> {
+    self
+      .partition
+      .family_counter()
+      .checked_add(offset)
+      .and_then(|number| u32::try_from(number).ok())
   }
 
   /// Pins a fixed cadence: the snapshots after it come every `policy.bytes_between_snapshots` of log, whatever the
@@ -424,20 +551,44 @@ impl Db {
     op: &Op,
     now_ns: u64,
   ) -> Result<u64, DbError> {
-    self.partition.check(op, now_ns)?;
+    self.mutate_owned(segment, op.clone(), now_ns)
+  }
+
+  /// [`Db::mutate`] of an operation the caller gives up: it moves into the log entry (or the transaction) instead of
+  /// being copied, so a large one (a repository entry carrying a revision, a green's checkpoint) is held once while it is
+  /// logged and applied (A-742: the copy was 202 MiB of large temporaries in a 1,000-revision import).
+  pub fn mutate_owned(
+    &mut self,
+    segment: &mut AnchorSegment,
+    op: Op,
+    now_ns: u64,
+  ) -> Result<u64, DbError> {
+    self.partition.check(&op, now_ns)?;
     self.last_now_ns = now_ns;
     if self.pending.is_some() {
       // Inside a transaction: applied now (later operations see it), logged at the commit.
-      self.apply_timed(op)?;
+      self.apply_timed(&op)?;
       if let Some(pending) = self.pending.as_mut() {
-        pending.push(op.clone());
+        pending.push(op);
       }
+      let made = self.partition.take_state_log_records();
+      self.logged_in_transaction.extend(made);
       return Ok(self.next_seq);
     }
     let seq = self.next_seq;
-    let entry = LogEntry {
-      ops: vec![op.clone()],
-    };
+    let entry = LogEntry { ops: vec![op] };
+    // A-724 piece 8: past the slot's projected room, the state so far is snapshotted now, measured exactly; if the
+    // record still would not fit beside it, the mutation is refused, typed, with nothing applied.
+    if self.past_snapshot_room(segment, &entry) {
+      self.snapshot(segment)?;
+      if self.past_snapshot_room(segment, &entry) {
+        self.snapshot_room_refusals = self.snapshot_room_refusals.saturating_add(1);
+        return Err(DbError::SnapshotRoom {
+          needed: self.projected_snapshot_bytes(&entry),
+          room: slot_bytes(segment),
+        });
+      }
+    }
     // The work a replay repeats for this record, timed step by step: the append's ([`append_record`]), then the apply.
     let mut work_ns = 0;
     let bytes = match append_record(&self.log, segment, seq, &entry, &mut work_ns) {
@@ -450,11 +601,17 @@ impl Db {
       }
       Err(e) => return Err(e),
     };
-    let applied = timed(&mut work_ns, || self.partition.apply(op));
+    let applied = match entry.ops.first() {
+      Some(op) => timed(&mut work_ns, || self.partition.apply(op)),
+      None => Ok(()),
+    };
     self.charge_replay_work(work_ns);
     applied?;
+    let made = self.partition.take_state_log_records();
+    self.logged.extend(made);
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.stats.tail_split.add_entry(&entry, bytes);
     self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(seq)
@@ -468,6 +625,7 @@ impl Db {
   pub fn begin(&mut self) {
     if self.pending.is_none() {
       self.pending = Some(Vec::new());
+      self.logged_in_transaction.clear();
     }
   }
 
@@ -489,11 +647,25 @@ impl Db {
     let Some(ops) = self.pending.take() else {
       return Ok(None);
     };
+    // The transaction's state-log records go on only once it is durable (A-636 part 2b).
+    let made = std::mem::take(&mut self.logged_in_transaction);
     if ops.is_empty() {
       return Ok(None);
     }
     let entry = LogEntry { ops };
     let seq = self.next_seq;
+    // A-724 piece 8: past the slot's projected room, the applied effects go into a snapshot now, measured exactly (as
+    // a full log's do); one that cannot fit the slot rolls the transaction back, typed, before anything is written.
+    if self.past_snapshot_room(segment, &entry) {
+      return match self.snapshot_or_fault(segment) {
+        Ok(()) => {
+          self.next_seq = seq.saturating_add(1);
+          self.logged.extend(made);
+          Ok(Some(seq))
+        }
+        Err(cause) => Err(self.rollback(segment, seq, cause)),
+      };
+    }
     let appended = if self
       .publication_fault
       .take_if(|f| *f == PublicationFault::BeforeAppend)
@@ -512,6 +684,7 @@ impl Db {
         return match self.snapshot_or_fault(segment) {
           Ok(()) => {
             self.next_seq = seq.saturating_add(1);
+            self.logged.extend(made);
             Ok(Some(seq))
           }
           Err(cause) => Err(self.rollback(segment, seq, cause)),
@@ -519,8 +692,10 @@ impl Db {
       }
       Err(cause) => return Err(self.rollback(segment, seq, cause)),
     };
+    self.logged.extend(made);
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.stats.tail_split.add_entry(&entry, bytes);
     self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(Some(seq))
@@ -614,14 +789,29 @@ impl Db {
     self.pending.is_some()
   }
 
+  /// The state logs' records of every operation made durable since the last take, in the order they were applied
+  /// (A-636 part 2b), leaving none: what their owner ships to each log's holders, one record a log an operation moved.
+  /// An operation of a transaction is here only once the transaction committed; one rolled back never is.
+  pub fn take_state_log_records(&mut self) -> Vec<StateLogRecord> {
+    std::mem::take(&mut self.logged)
+  }
+
   /// Publishes the partition into the alternate snapshot slot and releases the log behind it.
   pub fn snapshot(&mut self, segment: &mut AnchorSegment) -> Result<(), DbError> {
     let seq = self.next_seq.saturating_sub(1);
     let started = Instant::now();
     let snapshot = self.partition.to_snapshot(seq);
     let bytes = snapshot.to_bytes();
+    let needed = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let room = slot_bytes(segment);
+    if needed > room {
+      self.snapshot_room_refusals = self.snapshot_room_refusals.saturating_add(1);
+      return Err(DbError::SnapshotRoom { needed, room });
+    }
     segment.publish(RegionKind::Snapshot(self.index, self.next_slot), &bytes)?;
     let snapshot_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    self.stats.snapshot_split = RegisterSplit::of_snapshot(&snapshot, snapshot_bytes);
+    self.stats.tail_split = RegisterSplit::default();
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     // The next snapshot's floor (A-243): the tail must reach this one's size first.
     self.snapshot_floor_bytes = snapshot_bytes;
@@ -637,6 +827,37 @@ impl Db {
       .snapshot_bytes_written
       .saturating_add(snapshot_bytes);
     Ok(())
+  }
+
+  /// What the partition's next snapshot would take after `entry` is recorded, at most (A-724 piece 8): the last
+  /// snapshot's exact bytes, every record's bytes since, and `entry`'s. An upper bound: a record that removes state
+  /// counts as growth until a snapshot measures it.
+  fn projected_snapshot_bytes(&self, entry: &LogEntry) -> u64 {
+    let entry_bytes = u64::try_from(LogRing::encode(entry).body_len()).unwrap_or(u64::MAX);
+    self
+      .snapshot_floor_bytes
+      .saturating_add(self.since_snapshot_bytes)
+      .saturating_add(entry_bytes)
+  }
+
+  /// Whether recording `entry` could pass the snapshot slot ([`projected_snapshot_bytes`]).
+  fn past_snapshot_room(&self, segment: &AnchorSegment, entry: &LogEntry) -> bool {
+    self.projected_snapshot_bytes(entry) > slot_bytes(segment)
+  }
+
+  /// The bytes the partition's next snapshot may still grow by before it passes its slot, at most (A-724 piece 8,
+  /// what admission reads): the slot less the last snapshot's bytes and every record's since.
+  pub fn snapshot_room(&self, segment: &AnchorSegment) -> u64 {
+    slot_bytes(segment).saturating_sub(
+      self
+        .snapshot_floor_bytes
+        .saturating_add(self.since_snapshot_bytes),
+    )
+  }
+
+  /// Snapshots or records refused for the slot's room ([`DbError::SnapshotRoom`]).
+  pub fn snapshot_room_refusals(&self) -> u64 {
+    self.snapshot_room_refusals
   }
 
   /// The log's bytes used, free and capacity.
@@ -655,6 +876,59 @@ mod tests {
   };
   use slates_anchor::Geometry;
   use slates_machine::facts::Identity;
+
+  /// A-745. Do: split a record of a green's advance (100 bytes), a checkpoint (300) and a repository entry carrying
+  /// 500 bytes of objects and two chain entries (70 and 30 bytes), appended as `extra` bytes more than they carry; then
+  /// another such record. Expect: the chain entries 200 a record, the checkpoints 300, the repository records 500, the
+  /// rest the record's other bytes, summed over both records; a record carrying less than its bytes leaves nothing out.
+  #[test]
+  fn a_records_bytes_split_by_what_its_operations_carry() {
+    let green = VolumeId::default();
+    let entry = LogEntry {
+      ops: vec![
+        Op::GreenAdvanced {
+          green,
+          increment: vec![0; 100],
+        },
+        Op::GreenCheckpointed {
+          green,
+          version: 1,
+          checkpoint: vec![0; 300],
+        },
+        Op::RepositoryAdvanced {
+          entry: crate::catalog::RepositoryEntry {
+            objects: vec![0; 500],
+            versions: vec![
+              crate::catalog::GreenVersion {
+                green,
+                version: 2,
+                entry: vec![0; 70],
+              },
+              crate::catalog::GreenVersion {
+                green,
+                version: 3,
+                entry: vec![0; 30],
+              },
+            ],
+            ..crate::catalog::RepositoryEntry::default()
+          },
+        },
+      ],
+    };
+    let extra = 64u64;
+    let mut split = RegisterSplit::default();
+    split.add_entry(&entry, 1_000 + extra);
+    split.add_entry(&entry, 1_000 + extra);
+    assert_eq!(
+      split,
+      RegisterSplit {
+        repository_records: 1_000,
+        chain_entries: 400,
+        checkpoints: 600,
+        rest: 2 * extra,
+      }
+    );
+  }
 
   /// Shape: the segment page.
   const PAGE: u64 = 4096;
@@ -844,6 +1118,133 @@ mod tests {
       replay_ns <= measured_ns + noise_ns,
       "a tail the commits measured at {measured_ns} ns of replay work replayed in {replay_ns} ns past the baseline \
        ({noise_ns} ns of noise): the trigger would let it run past its budget"
+    );
+  }
+
+  /// Shape: one signer key's bytes in the snapshot-room tests: a list of `SIGNERS_SMALL` of them is a fifth of the test
+  /// slot, `SIGNERS_LARGE` of them a slot and a half.
+  const SIGNER_BYTES: usize = 1 << 10;
+  /// Shape: signer keys a small list holds (about 200 KiB, a fifth of [`SNAPSHOT_BYTES`]).
+  const SIGNERS_SMALL: usize = 200;
+  /// Shape: signer keys a large list holds (about 1.5 MiB, past [`SNAPSHOT_BYTES`]).
+  const SIGNERS_LARGE: usize = 1_536;
+
+  /// `count` signer keys of [`SIGNER_BYTES`] each, distinct by their first bytes.
+  fn signer_keys(count: usize) -> Vec<Vec<u8>> {
+    (0..count)
+      .map(|n| {
+        let mut key = vec![u8::try_from(n % 251).unwrap(); SIGNER_BYTES];
+        key[1] = u8::try_from(n / 251).unwrap();
+        key
+      })
+      .collect()
+  }
+
+  /// A-724 piece 8 (§4.17.5 "The partition's snapshot, sized by its data"). Do: on a 1 MiB snapshot slot, set a
+  /// volume's signers to a list a fifth of the slot fifteen times over (records three slots long, the state still a
+  /// fifth), then to a list a slot and a half long; recover. Expect: no record refused while the state fits, however
+  /// far its records pass the slot (the projection's crossing measured exactly by a snapshot); the long list refused
+  /// `SnapshotRoom`, typed, its bytes past the slot named, with nothing applied and counted; the room read before it
+  /// within the slot; the recovered partition holding the short list.
+  #[test]
+  fn a_record_whose_state_would_pass_the_snapshot_slot_is_refused_typed_and_one_that_fits_never_is()
+  {
+    let mut segment = segment_named("slates-db-snapshot-room");
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    let record = volume();
+    let id = record.id;
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+    let small = signer_keys(SIGNERS_SMALL);
+    for _ in 0..15 {
+      db.mutate(
+        &mut segment,
+        &Op::VolumeSignersSet {
+          id,
+          keys: small.clone(),
+        },
+        0,
+      )
+      .expect("a state within the slot is never refused");
+    }
+    assert!(db.snapshot_room(&segment) <= SNAPSHOT_BYTES);
+    let refused = db.mutate(
+      &mut segment,
+      &Op::VolumeSignersSet {
+        id,
+        keys: signer_keys(SIGNERS_LARGE),
+      },
+      0,
+    );
+    match refused {
+      Err(DbError::SnapshotRoom { needed, room }) => {
+        assert_eq!(room, SNAPSHOT_BYTES);
+        assert!(needed > room, "named {needed} bytes against {room}");
+      }
+      other => panic!("not refused SnapshotRoom: {other:?}"),
+    }
+    assert_eq!(db.snapshot_room_refusals(), 1);
+    assert_eq!(
+      db.partition().volume(id).unwrap().policy.signers.len(),
+      SIGNERS_SMALL,
+      "nothing applied"
+    );
+    drop(db);
+    let recovered = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    assert_eq!(
+      recovered
+        .partition()
+        .volume(id)
+        .unwrap()
+        .policy
+        .signers
+        .len(),
+      SIGNERS_SMALL
+    );
+  }
+
+  /// A-724 piece 8. Do: inside a transaction, set a volume's signers to a list a slot and a half long, and commit.
+  /// Expect: the commit refused `Unpublished` with `SnapshotRoom` its cause, the transaction rolled back to the short list
+  /// a recovery would build, and nothing written past the slot.
+  #[test]
+  fn a_transaction_whose_state_would_pass_the_snapshot_slot_rolls_back_typed() {
+    let mut segment = segment_named("slates-db-snapshot-room-tx");
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    let record = volume();
+    let id = record.id;
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+    db.mutate(
+      &mut segment,
+      &Op::VolumeSignersSet {
+        id,
+        keys: signer_keys(SIGNERS_SMALL),
+      },
+      0,
+    )
+    .unwrap();
+    db.begin();
+    db.mutate(
+      &mut segment,
+      &Op::VolumeSignersSet {
+        id,
+        keys: signer_keys(SIGNERS_LARGE),
+      },
+      0,
+    )
+    .unwrap();
+    match db.commit(&mut segment) {
+      Err(DbError::Unpublished { cause, .. }) => {
+        assert!(
+          matches!(*cause, DbError::SnapshotRoom { .. }),
+          "cause {cause:?}"
+        );
+      }
+      other => panic!("not rolled back for the slot: {other:?}"),
+    }
+    assert_eq!(
+      db.partition().volume(id).unwrap().policy.signers.len(),
+      SIGNERS_SMALL
     );
   }
 

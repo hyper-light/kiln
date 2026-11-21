@@ -17,7 +17,9 @@
 //! borrow of a stored key: a stored whole key would be wrong after a graft.
 //!
 //! **Files hold blocks.** A file's bytes are a block of [`Blocks`], counted by the map nodes naming it, so copying a node
-//! on a path costs a count, never the file's bytes; a block is freed with its last holder.
+//! on a path costs a count, never the file's bytes; a block is freed with its last holder. The other holders are the
+//! green's identity table ([`crate::held`], A-716) and its content history ([`crate::history`], A-728), whose latest
+//! value of a file is the file's block, so a changed file's bytes are held once.
 //!
 //! **Attributes keep their order.** An attribute's key is its path with every NUL escaped ([`NUL_ESCAPED`]), then
 //! [`PATH_END`], then its name: escaping keeps byte order, and the path's end sorts before any continuation of it, so a
@@ -35,8 +37,12 @@
 //! ([`crate::ptrie::Nodes::visited`] does not move). A file's copy is one more holder of its block, never its bytes.
 //! An attribute's tree is two prefixes, the path's own attributes and its descendants' ([`Xattrs::copy_tree`]). The
 //! destination must be absent with nothing beneath it, as Subversion's copy needs (§4.17.4 item 3.2), and the subtree
-//! is held before anything is grafted, so a copy into the source's own subtree sees the source as it was. The root is
-//! refused here: its tree is every key, which no one prefix names apart from its own; the engine decides its copy.
+//! is held before anything is grafted, so a copy into the source's own subtree sees the source as it was. The root's
+//! tree is every key (A-586: a stock client copies `^/` into a child of itself): the whole map is held and grafted
+//! beneath the destination, and the root's own key, which came with it, is moved to the destination's own key (for
+//! attributes, its own prefix is cut away from beneath the destination, [`crate::ptrie::Ptrie::cut`]). The root is never
+//! a destination: it is always present. A tree is taken away again by [`Dim::cut_tree`], a copy's inverse, which a green
+//! made at a version before a copy runs.
 
 use std::collections::BTreeSet;
 
@@ -44,6 +50,8 @@ use crate::ptrie::{Holders, Nodes, Plain, Ptrie, Releasing};
 use crate::special::SpecialNode;
 
 mod copy;
+
+pub(crate) use copy::{Held, HeldAttributes};
 
 /// A path's key bytes as the string they were made from. Keys enter only as strings and a walk reassembles one whole,
 /// so the lossy arm never runs; it keeps the conversion total, as the no-panic rule asks.
@@ -147,6 +155,11 @@ impl<V: Clone> Dim<V> {
   pub(crate) fn releasing(&mut self) -> Releasing {
     self.root.releasing()
   }
+
+  /// The nodes walks of this map's arena visited, while it holds its arena ([`Nodes::visited`]).
+  pub(crate) fn visited(&self) -> u64 {
+    self.nodes.visited()
+  }
 }
 
 /// A file's bytes: its place in [`Blocks`].
@@ -177,7 +190,7 @@ impl Blocks {
   }
 
   /// A block's bytes; none for a block that is gone (never, while a node names it).
-  fn bytes(&self, block: Block) -> &[u8] {
+  pub(crate) fn bytes(&self, block: Block) -> &[u8] {
     self
       .slots
       .get(block.0)
@@ -187,14 +200,30 @@ impl Blocks {
   }
 
   /// One more holder of `block`.
-  fn hold(&mut self, block: Block) {
+  pub(crate) fn hold(&mut self, block: Block) {
     if let Some(Some((_, holders))) = self.slots.get_mut(block.0) {
       *holders = holders.saturating_add(1);
     }
   }
 
+  /// How many hold `block`: map nodes, the identity table and the content history (zero for a block that is gone).
+  pub(crate) fn holders(&self, block: Block) -> u64 {
+    match self.slots.get(block.0) {
+      Some(Some((_, holders))) => *holders,
+      _ => 0,
+    }
+  }
+
+  /// Appends `bytes` to `block`'s bytes: a staged text's next piece (A-716, [`crate::held::Staged`]), whose block no
+  /// other holder shares while it is staged.
+  pub(crate) fn append(&mut self, block: Block, bytes: &[u8]) {
+    if let Some(Some((held, _))) = self.slots.get_mut(block.0) {
+      held.extend_from_slice(bytes);
+    }
+  }
+
   /// One holder of `block` fewer; the block is freed with its last.
-  fn release(&mut self, block: Block) {
+  pub(crate) fn release(&mut self, block: Block) {
     let Some(place) = self.slots.get_mut(block.0) else {
       return;
     };
@@ -312,6 +341,50 @@ impl Files {
       .map(|(path, block)| (path, self.blocks.bytes(*block)))
   }
 
+  /// The block `path`'s file holds, with no holder added: what a reader that holds it later names (A-728).
+  pub(crate) fn block_of(&self, path: impl AsRef<[u8]>) -> Option<Block> {
+    self.map.get(path).copied()
+  }
+
+  /// The block `path`'s file holds, given one more holder: what a held text shares with the file (A-716, the green's
+  /// identity table), so holding a file's text copies no byte. None for no file at `path`.
+  pub(crate) fn hold_block_of(&mut self, path: impl AsRef<[u8]>) -> Option<Block> {
+    let block = *self.map.get(path)?;
+    self.blocks.hold(block);
+    Some(block)
+  }
+
+  /// A new block holding `bytes`, with one holder and named by no path (A-716: a text held before any file names it).
+  pub(crate) fn add_unnamed_block(&mut self, bytes: Vec<u8>) -> Block {
+    self.blocks.add(bytes)
+  }
+
+  /// Appends `bytes` to a staged text's block (A-716, [`crate::held::Staged`]).
+  pub(crate) fn append_to_block(&mut self, block: Block, bytes: &[u8]) {
+    self.blocks.append(block, bytes);
+  }
+
+  /// A held block's bytes; none for a block that is gone (never, while the table holds it).
+  pub(crate) fn block_bytes(&self, block: Block) -> &[u8] {
+    self.blocks.bytes(block)
+  }
+
+  /// One holder of a held block fewer; the block is freed with its last.
+  pub(crate) fn release_block(&mut self, block: Block) {
+    self.blocks.release(block);
+  }
+
+  /// The blocks, for a reader of a block a green's content history names (A-728: the history's latest value is the
+  /// file's block).
+  pub(crate) fn blocks(&self) -> &Blocks {
+    &self.blocks
+  }
+
+  /// The blocks, for the history to hold or let go of a block it names (A-728).
+  pub(crate) fn blocks_mut(&mut self) -> &mut Blocks {
+    &mut self.blocks
+  }
+
   /// [`Dim::fork`]: the blocks stay with the arena.
   pub(crate) fn fork(&mut self) -> Files {
     Files {
@@ -335,6 +408,11 @@ impl Files {
   /// [`Dim::releasing`]: the blocks are let go as their nodes are freed.
   pub(crate) fn releasing(&mut self) -> Releasing {
     self.map.releasing()
+  }
+
+  /// [`Dim::visited`].
+  pub(crate) fn visited(&self) -> u64 {
+    self.map.visited()
   }
 }
 
@@ -431,6 +509,16 @@ impl Xattrs {
       .map(|(key, value)| (split_key(&key), value))
   }
 
+  /// Every attribute of `path`'s tree, `(path, name)`: its own and its descendants', two descents and the keys they
+  /// answer (A-626: what a replace takes away).
+  pub(crate) fn iter_tree(&self, path: &str) -> impl Iterator<Item = (String, String)> + '_ {
+    let own = self.map.root.prefix(&self.map.nodes, &path_key(path));
+    let mut beneath = escaped(path);
+    beneath.push(b'/');
+    let below = self.map.root.prefix(&self.map.nodes, &beneath);
+    own.chain(below).map(|(key, _)| split_key(&key))
+  }
+
   /// `path`'s attributes, names in order, with their values: one descent, then its own keys.
   pub(crate) fn of(&self, path: &str) -> impl Iterator<Item = (String, &Vec<u8>)> + '_ {
     self
@@ -460,6 +548,11 @@ impl Xattrs {
   /// [`Dim::releasing`].
   pub(crate) fn releasing(&mut self) -> Releasing {
     self.map.releasing()
+  }
+
+  /// [`Dim::visited`].
+  pub(crate) fn visited(&self) -> u64 {
+    self.map.visited()
   }
 }
 
@@ -643,6 +736,16 @@ mod tests {
     }
   }
 
+  /// Give `files`' hold back a node a step until nothing is left of it.
+  fn release_a_node_a_step(files: &mut Files) {
+    let mut releasing = files.releasing();
+    while files
+      .map
+      .nodes
+      .release_step(&mut releasing, &mut files.blocks)
+    {}
+  }
+
   /// A-534, A-575. Do: put a file, fork the map, change the file in the fork and remove another, then release both
   /// maps a node a step. Expect: each map reads its own bytes, the original's blocks are untouched by the fork's changes
   /// and by the fork's release, and once both are released every node and every block is gone.
@@ -661,20 +764,10 @@ mod tests {
     files.lend(&mut fork);
     assert_eq!(fork.get("a"), Some(b"changed".as_slice()));
     assert_eq!(fork.get("b"), None);
-    let mut releasing = fork.releasing();
-    while fork
-      .map
-      .nodes
-      .release_step(&mut releasing, &mut fork.blocks)
-    {}
+    release_a_node_a_step(&mut fork);
     fork.lend(&mut files);
     assert_eq!(files.get("a"), Some(b"one".as_slice()));
-    let mut releasing = files.releasing();
-    while files
-      .map
-      .nodes
-      .release_step(&mut releasing, &mut files.blocks)
-    {}
+    release_a_node_a_step(&mut files);
     assert_eq!(files.map.nodes.live(), 0, "every node freed");
     assert_eq!(files.blocks.live(), 0, "every block freed");
   }

@@ -78,10 +78,10 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// asynchronous one is bounded by its ring's credit, which the ring's slots cap), and the watch
 /// on its hang-up for its whole seat (A-475, `crate::reap::watch`).
 const TASKS_PER_CLIENT: usize = 3;
-/// Shape: the shard's own perpetual tasks: the server loop, the reap loop, the client reaper
-/// (A-475), the deadline keeper (A-522), the pressure sampler (A-570), the control loop and the
-/// heartbeat, plus a spare for a shutdown message.
-const LOOP_TASKS_PER_SHARD: usize = 8;
+/// Shape: the shard's own perpetual tasks: the server loop, the idle sweep (A-715), the client reaper
+/// (A-475), the deadline keeper (A-522), the pressure sampler (A-570), the hint watcher (A-709),
+/// the control loop and the heartbeat, plus a spare for a shutdown message.
+const LOOP_TASKS_PER_SHARD: usize = 9;
 /// Shape: the fleet's perpetual tasks per peer on the control shard: the probe loop and the record
 /// link (`fleet::probe_peer`, `fleet::establish_record_link`).
 const FLEET_LOOPS_PER_PEER: usize = 2;
@@ -412,14 +412,15 @@ pub struct DaemonConfig {
   /// Measured: the machine's BLAKE3 throughput, bytes per second, which sizes an archive-walk slice against
   /// the shard's live step quantum ([`DaemonConfig::archive_slice_bytes`]).
   pub blake3_bytes_per_second: u64,
+  /// Measured: the machine's MD5 and SHA-1 throughput together, bytes per second, through aws-lc-rs as Subversion's dump
+  /// writer digests a text it writes (`slates_svn::dump::digest`), which sizes a dump export's whole-text piece against
+  /// the shard's live step quantum ([`DaemonConfig::svn_text_piece_bytes`]). Measured here, since the boot profile's
+  /// crate builds where aws-lc-rs cannot.
+  pub svn_digest_bytes_per_second: u64,
   /// Measured: the machine's memcpy throughput at the largest copy size the boot profile measured, bytes per
   /// second. A §4.6 L2 shift is a block copy, so this is what sizes its slice against the shard's live step
   /// quantum ([`DaemonConfig::copy_slice_bytes`]) — the hash rate would be the wrong question for it.
   pub memcpy_bytes_per_second: u64,
-  /// Measured: the boot profile's base-page fault cost in nanoseconds, at least one: what an idle shard's pre-fault of
-  /// its reserve (A-214) slices by, as §4.2's pre-fault batch is `idle window / fault_ns`
-  /// ([`DaemonConfig::prefault_slice_pages`]).
-  pub page_fault_ns: u64,
   /// Derived: the compress-or-not cost model each sealed chunk is stored under (§4.11, D-17): the boot
   /// profile's measured codec points (LZ4 and each zstd level's compress and decompress throughput and
   /// ratio over the probe corpus) as the policy's candidates; a byte's neutral worth = its measured
@@ -433,6 +434,12 @@ pub struct DaemonConfig {
   /// per copy — "archived volumes compress once") and the live memory-pressure and load signals. Raw-only
   /// when the profile measured no codec.
   pub codec: slates_archive::CodecPolicy,
+  /// Derived: what git's pack encoder's work costs on this machine (main's ruling, 2026-11-20: the zlib level and the
+  /// delta window chosen from the bytes they save and these fixed rates, never a clock's per-object time, so one input
+  /// gives one output): each zlib level's nanoseconds a KiB and a delta search's, measured once a process on the
+  /// machine's clock over a seeded text corpus (`slates_git::store::learn::Rates::measure`), logged with the boot's
+  /// derivations.
+  pub git_rates: slates_git::store::learn::Rates,
   /// Derived: the spans one `Telemetry` reply carries (§4.14; `crate::telemetry::spans_per_reply`): what
   /// one bulk chunk of a client's region holds past the report's fixed part, measured from the wire
   /// encoding at boot.
@@ -476,8 +483,107 @@ pub struct DaemonConfig {
   /// Derived (A-150): the inode numbers each publication reserves ahead of a volume's counter, so a reply may hand one
   /// out with no barrier of its own while a successor still starts past it ([`inode_reserve`]).
   pub inode_reserve: u64,
+  /// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3), when the operator starts one:
+  /// none from [`DaemonConfig::derive`].
+  pub vcs_http: Option<VcsHttpConfig>,
+  /// How long a git push's answer over the HTTP edge may write nothing before the edge writes git's keepalive (A-722):
+  /// [`GIT_KEEPALIVE_NS`] from [`DaemonConfig::derive`].
+  pub git_keepalive_ns: u64,
+  /// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684), when the operator starts one: none from
+  /// [`DaemonConfig::derive`].
+  pub vcs_ssh: Option<VcsSshConfig>,
+  /// Where the svn:// listener listens, when the operator starts one (`--vcs-svn ADDRESS`; §4.17.4 piece 7, A-656 part
+  /// 2): A-656's connection on every connection it accepts, on a loopback address alone for a daemon that is no fleet
+  /// node, since ra_svn is cleartext; none from [`DaemonConfig::derive`].
+  pub vcs_svn: Option<slates_rt::tcp::SocketAddrV4>,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
+}
+
+/// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3): where it listens and the identity
+/// its HTTPS presents. Its connections, seats and request room are derived from each shard's budget, never configured
+/// (`crate::vcs_http::Bounds::of_shard`).
+#[derive(Clone, Debug)]
+pub struct VcsHttpConfig {
+  /// Where the edge listens. Without an identity it serves cleartext, which it does only on a loopback address (RFC 7617
+  /// §4, RFC 6750 §5.3).
+  pub address: slates_rt::tcp::SocketAddrV4,
+  /// The certificate chain and key its HTTPS presents: the node's own, the identity its RPC-with-TLS export presents
+  /// (§4.6, AUD-29-75), handed in by the command that read the operator's files (R1: the daemon reads none).
+  pub identity: Option<EdgeIdentity>,
+}
+
+/// Derived: git's own interval for a push's keepalive (`receive.keepAlive`, 5 seconds by default, git-config(1);
+/// `receive-pack.c` writes it while a push is processed once its pack is in, so neither the client nor a proxy between
+/// waits past it on a silent answer).
+pub const GIT_KEEPALIVE_NS: u64 = 5_000_000_000;
+
+/// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684): where it listens and whose key it presents.
+/// Its connections, seats and channel window are derived from the shard's budget, as the HTTP edge's are, never
+/// configured (`crate::vcs_http::Bounds::of_shard`).
+#[derive(Clone, Debug)]
+pub struct VcsSshConfig {
+  /// Where the edge listens: any address, since SSH encrypts every connection and proves the server by its host key.
+  pub address: slates_rt::tcp::SocketAddrV4,
+  /// A fleet node's own identity, whose key the edge presents as its host key when it is Ed25519
+  /// (`EdgeIdentity::ed25519_seed`); none for any other daemon, which serves with the key its anchor made at its start
+  /// and keeps in the segment (`slates_anchor::layout::SUP_SSH_HOST_SEED`), or, run alone, one it makes itself.
+  pub identity: Option<EdgeIdentity>,
+}
+
+/// An HTTPS identity as the operator's command hands it in: the certificate chain, leaf first, and the leaf's private
+/// key, each DER. Its `Debug` never shows the key.
+#[derive(Clone)]
+pub struct EdgeIdentity {
+  /// The chain, leaf first.
+  chain: Vec<Vec<u8>>,
+  /// The leaf's private key (PKCS#8, PKCS#1 or SEC1).
+  key: Vec<u8>,
+}
+
+impl EdgeIdentity {
+  /// The identity presenting `chain`, leaf first, with the leaf's private key `key`, each DER.
+  pub fn new(chain: Vec<Vec<u8>>, key: Vec<u8>) -> EdgeIdentity {
+    EdgeIdentity { chain, key }
+  }
+
+  /// The edge's serving identity, refused when the key is no key rustls reads or the chain and key make no server
+  /// configuration.
+  pub(crate) fn serving(
+    &self,
+  ) -> Result<slates_http_edge::tls::ServingIdentity, slates_http_edge::tls::TlsRefused> {
+    let chain = self
+      .chain
+      .iter()
+      .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
+      .collect();
+    let key = rustls::pki_types::PrivateKeyDer::try_from(self.key.clone()).map_err(|reason| {
+      slates_http_edge::tls::TlsRefused::Setup(rustls::Error::General(reason.to_owned()))
+    })?;
+    slates_http_edge::tls::ServingIdentity::new(chain, key)
+  }
+
+  /// The key's seed as the SSH edge's host key takes it (A-684): the key's own 32 bytes (RFC 8032 §5.1.5) when it is an
+  /// Ed25519 key, which RFC 8410 §7 writes as a PKCS#8 document, read by AWS-LC; none for a key of any other algorithm,
+  /// which no `ssh-ed25519` host key can be (RFC 8709), the one host key algorithm the edge presents.
+  pub(crate) fn ed25519_seed(&self) -> Option<[u8; slates_ssh::hostkey::ED25519_SEED_LEN]> {
+    use aws_lc_rs::encoding::AsBigEndian;
+    let pair = aws_lc_rs::signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(&self.key).ok()?;
+    // AWS-LC's buffer wipes its bytes when dropped.
+    let seed = pair.seed().ok()?.as_be_bytes().ok()?;
+    let bytes: &[u8] = seed.as_ref();
+    <[u8; slates_ssh::hostkey::ED25519_SEED_LEN]>::try_from(bytes).ok()
+  }
+}
+
+impl std::fmt::Debug for EdgeIdentity {
+  /// The chain's length, never the key.
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("EdgeIdentity")
+      .field("certificates", &self.chain.len())
+      .finish_non_exhaustive()
+  }
 }
 
 /// The liveness window on this machine ([`liveness_window`]): the derived window and the floor the machine measured.
@@ -830,6 +936,14 @@ impl DaemonConfig {
       ["hash.blake3_bytes_per_second", "rt.step_budget_ns"]
     );
     derivations.push(note("archive_slice_bytes", &archive_slice_bytes));
+    let svn_digest_bytes_per_second = svn_digest_rate(runtime.step_budget_ns);
+    // The boot value, for the record: an export sizes each piece by the live quantum, as an archive's slice is.
+    let svn_text_piece_bytes: Derived<u64> = derived!(
+      copy_bound_bytes(svn_digest_bytes_per_second, runtime.step_budget_ns),
+      "svn_digest_bytes_per_second × step_quantum_ns / 1e9 × COPY_SLICE_PERMILLE / 1000",
+      ["svn.digest_bytes_per_second", "rt.step_budget_ns"]
+    );
+    derivations.push(note("svn_text_piece_bytes", &svn_text_piece_bytes));
     // A §4.6 L2 shift copies a content block, so its slice is sized by the measured copy rate rather than the
     // hash rate; the largest measured copy size is the one a whole-block copy behaves like.
     let memcpy_bytes_per_second: Derived<u64> = derived!(
@@ -849,18 +963,11 @@ impl DaemonConfig {
       ["memcpy", "rt.step_budget_ns"]
     );
     derivations.push(note("copy_slice_bytes", &copy_slice_bytes));
-    let page_fault_ns: Derived<u64> = derived!(
-      profile.faults.base_ns.max(1),
-      "the profile's measured base-page fault cost (at least one)",
-      ["faults.base_ns"]
-    );
-    derivations.push(note("page_fault_ns", &page_fault_ns));
-    // The reserve an idle shard keeps pre-faulted (A-214): its bound is known at boot, its burst only at run time.
+    let git_rates = git_rates();
     derivations.push(format!(
-      "prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = {}, the arena's free bytes): the \
-       free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors \
-       [\"reserve_per_shard\", \"content.allocated_bytes\"])",
-      reserve.get()
+      "git_rates = deflate ns a KiB by level {:?}, delta search {} ns a KiB: measured once a process over a seeded \
+       text corpus of two deflate windows on the machine's monotonic clock (anchors [\"zlib\", \"deltas\"])",
+      git_rates.deflate_ns_per_kib, git_rates.search_ns_per_kib
     ));
     let codec = codec_policy(profile);
     derivations.push(format!(
@@ -1116,9 +1223,10 @@ impl DaemonConfig {
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
       rereplication_bytes_per_second: 0,
       blake3_bytes_per_second: profile.hash.blake3_bytes_per_second,
+      svn_digest_bytes_per_second,
       memcpy_bytes_per_second: memcpy_bytes_per_second.get(),
-      page_fault_ns: page_fault_ns.get(),
       codec,
+      git_rates,
       telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
@@ -1134,6 +1242,10 @@ impl DaemonConfig {
       guest_credits,
       nfs_v4,
       inode_reserve,
+      vcs_http: None,
+      git_keepalive_ns: GIT_KEEPALIVE_NS,
+      vcs_ssh: None,
+      vcs_svn: None,
       derivations,
     }
     .with_control_shard_noted()
@@ -1430,6 +1542,44 @@ fn guest_credits(
   credits
 }
 
+/// The bytes work at `bytes_per_second` may take within a copy slice of `quantum_ns`: half the quantum
+/// (`COPY_SLICE_PERMILLE`), the slice `crate::image::sliced` judges each unit of an export by.
+fn copy_bound_bytes(bytes_per_second: u64, quantum_ns: u64) -> u64 {
+  (bytes_per_second.saturating_mul(quantum_ns) / NANOS_PER_SECOND)
+    .saturating_mul(COPY_SLICE_PERMILLE)
+    / PERMILLE
+}
+
+/// Measures the machine's MD5 and SHA-1 throughput together, bytes per second, as Subversion's dump writer digests a
+/// text (aws-lc-rs's legacy digests): one Subversion window's bytes (`SVN_DELTA_WINDOW_SIZE`, the most a delta window
+/// makes) digested by both, within a step budget of `step_budget_ns`. Zero where the digests cannot be made, which no
+/// build of aws-lc-rs answers; an export then writes a byte a piece.
+fn svn_digest_rate(step_budget_ns: u64) -> u64 {
+  use aws_lc_rs::digest::{Context, MD5_FOR_LEGACY_USE_ONLY, SHA1_FOR_LEGACY_USE_ONLY};
+  let len = usize::try_from(slates_svn::svndiff::WINDOW_LIMIT).unwrap_or(0);
+  let buffer: Vec<u8> = (0..len)
+    .map(|at| u8::try_from(at.checked_rem(usize::from(u8::MAX)).unwrap_or(0)).unwrap_or(0))
+    .collect();
+  let measured = slates_machine::bench::measure(
+    || {
+      if let (Ok(mut md5), Ok(mut sha1)) = (
+        Context::try_new(&MD5_FOR_LEGACY_USE_ONLY),
+        Context::try_new(&SHA1_FOR_LEGACY_USE_ONLY),
+      ) {
+        md5.update(&buffer);
+        sha1.update(&buffer);
+        std::hint::black_box((md5.finish(), sha1.finish()));
+      }
+    },
+    std::time::Duration::from_nanos(step_budget_ns),
+  );
+  let bytes = u64::try_from(buffer.len()).unwrap_or(0);
+  bytes
+    .saturating_mul(NANOS_PER_SECOND)
+    .checked_div(measured.median_ns())
+    .unwrap_or(0)
+}
+
 /// The bytes one archive-walk slice may hash within `quantum_ns`: half the quantum at `blake3_bytes_per_second`,
 /// so a seal (§4.10) is archived in bounded slices (§4.3) that never take the whole step from the clients.
 fn archive_slice_bytes(blake3_bytes_per_second: u64, quantum_ns: u64) -> u64 {
@@ -1494,7 +1644,20 @@ impl DaemonConfig {
   /// The bytes one archive-walk slice may hash on the calling shard now: half its live step quantum at the
   /// machine's measured BLAKE3 throughput.
   pub fn archive_slice_bytes(&self) -> u64 {
-    archive_slice_bytes(self.blake3_bytes_per_second, self.step_quantum_ns())
+    self.archive_slice_bytes_within(self.step_quantum_ns())
+  }
+
+  /// The bytes of a whole text one dump export call writes on the calling shard now (A-652, `Exporter::with_text_piece`):
+  /// what the dump's writer digests within the copy slice its units are judged by, at the machine's measured MD5 and
+  /// SHA-1 throughput; at least one.
+  pub fn svn_text_piece_bytes(&self) -> u64 {
+    copy_bound_bytes(self.svn_digest_bytes_per_second, self.step_quantum_ns()).max(1)
+  }
+
+  /// [`DaemonConfig::archive_slice_bytes`] for a turn of `quantum_ns` (a git record's replay, whose quantum a test may
+  /// cut, A-722 part 4): half of it at the machine's measured BLAKE3 throughput.
+  pub fn archive_slice_bytes_within(&self, quantum_ns: u64) -> u64 {
+    archive_slice_bytes(self.blake3_bytes_per_second, quantum_ns)
   }
 
   /// The content bytes one slice of copy-bound work (a DAX backing's fill, an image's build) may move on the calling
@@ -1507,20 +1670,6 @@ impl DaemonConfig {
   /// `fleet::seal_quantum_ns`): half of it at the machine's measured memcpy rate.
   pub fn copy_slice_bytes_within(&self, quantum_ns: u64) -> u64 {
     copy_slice_bytes(self.memcpy_bytes_per_second, quantum_ns)
-  }
-
-  /// Derived: the pages an idle shard pre-faults in one slice of its reserve's refill now (A-214): its step quantum
-  /// over the measured base-page fault cost, `step_quantum_ns / page_fault_ns`, at least one (§4.2's pre-fault batch,
-  /// "idle window / fault_ns").
-  pub fn prefault_slice_pages(&self) -> usize {
-    usize::try_from(
-      self
-        .step_quantum_ns()
-        .checked_div(self.page_fault_ns.max(1))
-        .unwrap_or(0),
-    )
-    .unwrap_or(usize::MAX)
-    .max(1)
   }
 
   /// Derived: the bytes the calling shard can copy in one whole step quantum now, at the measured memcpy rate
@@ -1676,6 +1825,24 @@ impl DaemonConfig {
     self.fleet = Some(membership);
     self.with_control_shard_noted()
   }
+}
+
+/// The machine's monotonic clock, for measuring once at boot.
+struct BootClock(std::time::Instant);
+
+impl slates_git::store::learn::Clock for BootClock {
+  fn now_ns(&mut self) -> u64 {
+    u64::try_from(self.0.elapsed().as_nanos()).unwrap_or(u64::MAX)
+  }
+}
+
+/// [`DaemonConfig::git_rates`]: measured on the first derivation of the process and kept, so every configuration the
+/// process derives (a daemon's, a test's) prices the encoder alike.
+fn git_rates() -> slates_git::store::learn::Rates {
+  static RATES: std::sync::OnceLock<slates_git::store::learn::Rates> = std::sync::OnceLock::new();
+  *RATES.get_or_init(|| {
+    slates_git::store::learn::Rates::measure(&mut BootClock(std::time::Instant::now()))
+  })
 }
 
 /// The cost model's policy from the profile's measured codec points (§4.11, D-17): the `lz4` point

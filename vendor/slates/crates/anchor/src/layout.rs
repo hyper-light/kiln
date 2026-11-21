@@ -12,10 +12,15 @@ pub const MAGIC: u32 = 0x4E41_4C53;
 /// snapshots held (A-265), 10 the audit's crossing durable: a partition's snapshot carries the records it owes the
 /// control partition and the control partition's marks of what each delivered (A-265, 2026-11-18), 11 a recorded reply's
 /// host code typed by its numbering: a completion record keeps its reply's bytes, whose errno fields a Windows daemon of
-/// layout 10 filled with Win32 error codes, now an errno alone beside an appended Win32 variant (A-539, 2026-11-19). An
-/// older segment is refused, never misread.
+/// layout 10 filled with Win32 error codes, now an errno alone beside an appended Win32 variant (A-539, 2026-11-19), 12
+/// a green's checkpoint carries its copies' records, their trees' keys and the identity's sum (version 4, A-626 part 3,
+/// 2026-11-19), so a version 3 checkpoint is never read: its segment is refused at adoption, before anything is served,
+/// 13 the copies' section and the sum each behind a presence byte, written beside a copy's record alone (checkpoint
+/// version 5, A-626 part 3, continued (1), 2026-11-19), 14 a work's logged journal may hold a copy (`LoggedOp::Copy`,
+/// A-626 part 4, 2026-11-19), 15 a token's credential record keeps its CRAM-MD5 keyed contexts beside its hash
+/// (`CredentialKind::HttpToken`'s field, A-692, 2026-11-19). An older segment is refused, never misread.
 /// Format: this layout's number in the history above.
-pub const LAYOUT_VERSION: u32 = 11;
+pub const LAYOUT_VERSION: u32 = 15;
 /// Format: the layout before A-237's host-scoped principals, refused with what to do about it.
 pub const LAYOUT_BEFORE_HOST_SCOPED_PRINCIPALS: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
@@ -187,6 +192,41 @@ pub const SUP_LAUNCHER_SECRET: usize = 328;
 /// Format: the launcher secret's width, a 256-bit random value: the BLAKE3 key the launcher-class proofs are keyed by,
 /// the width of the issuer secret's (`ISSUER_SECRET_BYTES`), so the same proof formulas take either.
 pub const LAUNCHER_SECRET_BYTES: usize = 32;
+/// The **SSH host key** published word (A-684): `1` once the anchor has published the seed of the version-control
+/// servers' SSH edge's host key after it, `0` before (an anchor asked for no SSH edge; a fleet node's anchor, whose edge
+/// presents the node's own key from its deployment plan; or an older anchor). The anchor makes the key from the system's
+/// generator at its start, before it starts any daemon, and every daemon under it serves its SSH edge with that key, so
+/// a daemon restart keeps the key a client pinned (its `known_hosts` line) beside the port the anchor holds. The key
+/// lives as long as the anchor, as the RAM the edge serves does; the page is the one the anchor locks for the sealing
+/// root (`AnchorSegment::protect_seal_page`), and the anchor's process is excluded from core dumps before it holds a
+/// byte. A daemon run alone, with no anchor, makes its own for its own life. Zero in a block an older anchor wrote.
+/// Format: the byte offset inside the supervision block, the first cache line past the launcher secret (328 + 32 = 360,
+/// so 384).
+pub const SUP_SSH_HOST_PRESENT: usize = 384;
+/// Format: the SSH host key's seed's offset, the word after its published word.
+pub const SUP_SSH_HOST_SEED: usize = 392;
+/// Format: the SSH host key's seed's width: an Ed25519 private key (RFC 8032 §5.1.5, 32 bytes), the one host key
+/// algorithm the SSH edge presents (`ssh-ed25519`, RFC 8709; §4.17.2 "Transports" item 2).
+pub const SSH_HOST_SEED_BYTES: usize = 32;
+/// The **stuck task** record (A-740): what the daemon's watchdog found its stuck shard polling when it withheld the beat,
+/// so the anchor that then kills the daemon names the task in its kill line, not the shard alone. The record's written
+/// word holds the pid of the daemon that wrote it, `0` while it is being written or never was; the shard, the task's
+/// poll count, its label's length and the label's bytes follow, the label in whole words. A reader takes the record
+/// only when the written word reads the same nonzero pid before and after it copies the rest.
+/// Format: the byte offset inside the supervision block, the first cache line past the SSH host key's seed (392 + 32 =
+/// 424, so 448).
+pub const SUP_STUCK_WRITTEN: usize = 448;
+/// Format: the stuck shard's registry id, the word after the written word.
+pub const SUP_STUCK_SHARD: usize = 456;
+/// Format: the task's polls begun when the watchdog looked, the word after the shard.
+pub const SUP_STUCK_POLLS: usize = 464;
+/// Format: the label's length in bytes, the word after the polls.
+pub const SUP_STUCK_LABEL_LEN: usize = 472;
+/// Format: the label's bytes, UTF-8, from the word after its length, in [`STUCK_LABEL_WORDS`] little-endian words.
+pub const SUP_STUCK_LABEL: usize = 480;
+/// Shape: the label's room in words: 128 bytes, past a spawn site's `spawned at <workspace path>:<line>` and any named
+/// step; a longer label is cut at a character boundary.
+pub const STUCK_LABEL_WORDS: usize = 16;
 
 /// Format: a published payload's words (the profile, a snapshot slot, a landing slot): the
 /// generation (odd while a writer is inside) then the length, then the bytes.

@@ -644,6 +644,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "bzip2"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a53fac24f34a81bc9954b5d6cfce0c21e18ec6959f44f56e8e90e4bb7c346c"
+dependencies = [
+ "libbz2-rs-sys",
+]
+
+[[package]]
 name = "cap"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2738,6 +2747,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "libbz2-rs-sys"
+version = "0.2.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5314d1d545fce0307c770d791adf20d997e0b63b64e1ffeed8a920e290eabe4"
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4272,6 +4287,17 @@ dependencies = [
 
 [[package]]
 name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha1"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
@@ -4279,6 +4305,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "sha1-checked"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89f599ac0c323ebb1c6082821a54962b839832b03984598375bff3975b804423"
+dependencies = [
+ "digest 0.10.7",
+ "sha1 0.10.7",
 ]
 
 [[package]]
@@ -4530,6 +4566,7 @@ dependencies = [
  "slates-ipc",
  "slates-machine",
  "slates-mem",
+ "slates-rt",
  "slates-wire",
  "windows-sys 0.60.2",
 ]
@@ -4702,6 +4739,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-git"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "crc32fast",
+ "flate2",
+ "sha1-checked",
+ "slates-http",
+ "slates-merge",
+ "slates-vcs",
+]
+
+[[package]]
+name = "slates-hg"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bzip2",
+ "flate2",
+ "sha1-checked",
+ "slates-merge",
+ "slates-vcs",
+ "zstd",
+]
+
+[[package]]
+name = "slates-http"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+]
+
+[[package]]
+name = "slates-http-edge"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "slates-http",
+]
+
+[[package]]
 name = "slates-image"
 version = "0.1.0"
 
@@ -4809,6 +4887,10 @@ dependencies = [
  "slates-bridge-winfsp",
  "slates-cluster",
  "slates-db",
+ "slates-git",
+ "slates-hg",
+ "slates-http",
+ "slates-http-edge",
  "slates-image",
  "slates-ipc",
  "slates-land",
@@ -4817,10 +4899,30 @@ dependencies = [
  "slates-merge",
  "slates-rt",
  "slates-seal",
+ "slates-ssh",
+ "slates-svn",
  "slates-transport",
+ "slates-vcs",
  "slates-vfs",
  "slates-wire",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "slates-ssh"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+]
+
+[[package]]
+name = "slates-svn"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "blake3",
+ "lz4_flex 0.11.7",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -4831,6 +4933,13 @@ dependencies = [
  "rustls",
  "slates-machine",
  "slates-rt",
+]
+
+[[package]]
+name = "slates-vcs"
+version = "0.1.0"
+dependencies = [
+ "blake3",
 ]
 
 [[package]]
@@ -5560,7 +5669,7 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.10.3",
- "sha1",
+ "sha1 0.11.0",
  "thiserror 2.0.21",
 ]
 

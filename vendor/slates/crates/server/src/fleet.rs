@@ -96,7 +96,7 @@ use slates_db::catalog::{
 };
 use slates_db::register::{
   Acceptor, Authority, DomainId, HostEpoch, HostId, ObjectId, Placement, Quorum, Record, RegionId,
-  RegisterError, encode_refusal,
+  RegisterClass, RegisterError, encode_refusal,
 };
 use slates_rt::futures;
 use slates_rt::shard::Kept;
@@ -1573,6 +1573,84 @@ async fn next_or_end(
   }
 }
 
+/// A discovery exchange's reply to the peer of `certificate`, the peer it names started on `driver`; nothing (counted)
+/// for a refused or unanswered one.
+async fn served_discovery(
+  certificate: &CertificateDer<'static>,
+  request: &[u8],
+  driver: &PeerDriver,
+) -> Vec<u8> {
+  // Test support: a fault holds this reply after the request arrived (never reachable from the
+  // wire), so a peer's exchange is pending — its endpoint borrowed — while this node is then
+  // stopped: the interrupted-discovery restart the replacement-voter regression forces.
+  while state::with_state(|state| state.discovery_withhold_replies).unwrap_or(false) {
+    crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
+  }
+  let outcome = state::with_state(|state| crate::discovery::serve(state, certificate, request));
+  match outcome {
+    Some(Ok((reply, peer))) => {
+      if let Some(peer) = peer {
+        driver.start(peer);
+      }
+      reply
+    }
+    Some(Err(refusal)) => {
+      count_refusal(refusal.counter());
+      Vec::new()
+    }
+    None => Vec::new(),
+  }
+}
+
+/// Whether a request of `kind` is a takeover's fetch of a live log (g251).
+fn is_live_fetch(kind: u64, request: &[u8]) -> bool {
+  kind == slates_cluster::live::LIVE_STATE_STREAM && slates_db::live::is_fetch(request)
+}
+
+/// Whether a request of `kind` is a live message large enough to be hashed in turns of its own (A-757 part 4).
+fn is_large_live_message(kind: u64, request: &[u8]) -> bool {
+  (kind == slates_cluster::live::LIVE_ENTRY_STREAM
+    || kind == slates_cluster::live::LIVE_ENTRIES_STREAM)
+    && crate::live_ship::hashed_in_turns(request.len())
+}
+
+/// Where a peer's request is served: on a task of its own (its stream id, and its reply when the task answered at once),
+/// or here, one at a time (its stream id, kind and bytes).
+enum PeerRequestServed {
+  Spawned(u64, Option<Vec<u8>>),
+  Here(u64, u64, Vec<u8>),
+}
+
+/// Whether the session still holds after a spawned request's reply, `served` when its task answered at once: the
+/// reply sent on `stream_id`, or none yet to send.
+fn replied(endpoint: &mut Endpoint, stream_id: u64, served: Option<Vec<u8>>) -> bool {
+  served.is_none_or(|reply| endpoint.reply(stream_id, reply).is_ok())
+}
+
+/// The member id currently learned for `peer_anchor`, or its `seed` until it announces itself.
+fn learned_host(peer_anchor: HostId, seed: HostId) -> HostId {
+  state::with_state(|s| {
+    s.learned_members
+      .get(&peer_anchor)
+      .map_or(seed, |learned| learned.host)
+  })
+  .unwrap_or(seed)
+}
+
+/// The record session `endpoint` holds, established: the certificate its peer presented, or none (counted) where the
+/// handshake failed or the peer presented none.
+async fn established_peer(endpoint: &mut Endpoint) -> Option<CertificateDer<'static>> {
+  if let Err(e) = endpoint.establish().await {
+    count_accept_failure(&e, endpoint.handshake_stall(), "record");
+    return None;
+  }
+  let certificate = endpoint.peer_certificate();
+  if certificate.is_none() {
+    count_refusal(ACCEPT_REFUSED);
+  }
+  certificate
+}
+
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
 /// the accepted session's handshake and loop answering the peer over this node's per-object holds — a
 /// **record** commit is accepted into the object's durable acceptor (this node backs the peer as a
@@ -1591,10 +1669,9 @@ async fn serve_peer_records(
   roster: Vec<Rostered>,
   driver: PeerDriver,
 ) {
-  if let Err(e) = endpoint.establish().await {
-    count_accept_failure(&e, endpoint.handshake_stall(), "record");
+  let Some(certificate) = established_peer(&mut endpoint).await else {
     return;
-  }
+  };
   // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** anchor — the
   // one the roster holds for the certificate it presented, the same anchor its member ids derive from and its
   // announcements are validated against, so every plane names the node by one id. The RIFL completion origin
@@ -1602,10 +1679,6 @@ async fn serve_peer_records(
   // member id — what records and ownership key on — is whatever is currently learned for that anchor (its
   // seed until it announces itself; a restart moves it), resolved per request so a node that restarted
   // mid-session is served under the id it now writes as.
-  let Some(certificate) = endpoint.peer_certificate() else {
-    count_refusal(ACCEPT_REFUSED);
-    return;
-  };
   let peer_anchor = rostered_anchor(&roster, &certificate);
   let seed = crate::deploy::member_id(peer_anchor, 0);
   // The peer dialed this session and keeps it only while it keeps direct contact with this node (A-337).
@@ -1632,12 +1705,9 @@ async fn serve_peer_records(
     let Some(next) = next_or_end(&mut endpoint, &mut forwards).await else {
       return;
     };
-    let (stream_id, stream, request) = match next {
+    let dispatched = match next {
       crate::forward_lane::Next::Forwarded { stream_id, reply } => {
-        if endpoint.reply(stream_id, reply).is_err() {
-          return;
-        }
-        continue;
+        PeerRequestServed::Spawned(stream_id, Some(reply))
       }
       crate::forward_lane::Next::Request {
         stream_id,
@@ -1649,12 +1719,7 @@ async fn serve_peer_records(
           verbs::injected_forward_silence(&request).await;
           verbs::serve_forward(control, peer_anchor, &request).await
         });
-        if let Some(reply) = served
-          && endpoint.reply(stream_id, reply).is_err()
-        {
-          return;
-        }
-        continue;
+        PeerRequestServed::Spawned(stream_id, served)
       }
       // A takeover's fetch of a live log is laid out in turns of this shard (g251), so it too runs on its own task: a
       // long log's answer holds no other request of the peer.
@@ -1662,26 +1727,35 @@ async fn serve_peer_records(
         stream_id,
         kind,
         request,
-      } if kind == slates_cluster::live::LIVE_STATE_STREAM
-        && enrolled
-        && slates_db::live::is_fetch(&request) =>
-      {
-        let peer_host = state::with_state(|s| {
-          s.learned_members
-            .get(&peer_anchor)
-            .map_or(seed, |learned| learned.host)
-        })
-        .unwrap_or(seed);
+      } if enrolled && is_live_fetch(kind, &request) => {
+        let peer_host = learned_host(peer_anchor, seed);
         let served = forwards.spawn(stream_id, async move {
           withheld_live_state().await;
           crate::live_ship::serve_fetch(local, peer_host, request).await
         });
-        if let Some(reply) = served
-          && endpoint.reply(stream_id, reply).is_err()
-        {
-          return;
-        }
-        continue;
+        PeerRequestServed::Spawned(stream_id, served)
+      }
+      // A large live message is taken in turns of its own (A-757 part 4): its entries' identities are hashed a slice a
+      // turn before they are taken, so it holds no other request of the peer and no poll of this shard long. The owner
+      // sends a holder's next message only once this one is answered, so its entries stay in order.
+      crate::forward_lane::Next::Request {
+        stream_id,
+        kind,
+        request,
+      } if enrolled && is_large_live_message(kind, &request) => {
+        let peer_host = learned_host(peer_anchor, seed);
+        let served = forwards.spawn(stream_id, async move {
+          let object = slates_db::live::object_of(&request);
+          let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
+          match admission.refusal() {
+            Some(refusal) => refusal,
+            None => {
+              let batch = kind == slates_cluster::live::LIVE_ENTRIES_STREAM;
+              crate::live_ship::serve_entries_hashed(local, peer_host, batch, request).await
+            }
+          }
+        });
+        PeerRequestServed::Spawned(stream_id, served)
       }
       // A work route's question (A-288) is answered on the green's shard, so it too runs on its own task.
       crate::forward_lane::Next::Request {
@@ -1692,44 +1766,28 @@ async fn serve_peer_records(
         let served = forwards.spawn(stream_id, async move {
           crate::work_route::serve(control, &request).await
         });
-        if let Some(reply) = served
-          && endpoint.reply(stream_id, reply).is_err()
-        {
-          return;
-        }
-        continue;
+        PeerRequestServed::Spawned(stream_id, served)
       }
       crate::forward_lane::Next::Request {
         stream_id,
         kind,
         request,
-      } => (stream_id, kind, request),
+      } => PeerRequestServed::Here(stream_id, kind, request),
+    };
+    let (stream_id, stream, request) = match dispatched {
+      PeerRequestServed::Spawned(stream_id, served) => {
+        if !replied(&mut endpoint, stream_id, served) {
+          return;
+        }
+        continue;
+      }
+      PeerRequestServed::Here(stream_id, stream, request) => (stream_id, stream, request),
     };
     let reply = {
       let certificate = certificate.clone();
       async move {
         if stream == crate::discovery::STREAM {
-          // Test support: a fault holds this reply after the request arrived (never reachable from the
-          // wire), so a peer's exchange is pending — its endpoint borrowed — while this node is then
-          // stopped: the interrupted-discovery restart the replacement-voter regression forces.
-          while state::with_state(|state| state.discovery_withhold_replies).unwrap_or(false) {
-            crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
-          }
-          let outcome =
-            state::with_state(|state| crate::discovery::serve(state, &certificate, &request));
-          return match outcome {
-            Some(Ok((reply, peer))) => {
-              if let Some(peer) = peer {
-                driver.start(peer);
-              }
-              reply
-            }
-            Some(Err(refusal)) => {
-              count_refusal(refusal.counter());
-              Vec::new()
-            }
-            None => Vec::new(),
-          };
+          return served_discovery(&certificate, &request, &driver).await;
         }
         if !enrolled {
           count_refusal(ACCEPT_REFUSED);
@@ -1769,12 +1827,7 @@ async fn serve_peer_records(
           // A message that puts a live log's entries in a copy first has the volume's claim admitted on this node
           // (§4.2, g229: `live_ship::admit_claim`), answered `NoRoom` when it cannot be.
           slates_cluster::live::LIVE_ENTRY_STREAM | slates_cluster::live::LIVE_ENTRIES_STREAM => {
-            let peer_host = state::with_state(|s| {
-              s.learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |learned| learned.host)
-            })
-            .unwrap_or(seed);
+            let peer_host = learned_host(peer_anchor, seed);
             let object = slates_db::live::object_of(&request);
             let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
             match admission.refusal() {
@@ -1790,12 +1843,7 @@ async fn serve_peer_records(
             }
           }
           slates_cluster::live::LIVE_STATE_STREAM => {
-            let peer_host = state::with_state(|s| {
-              s.learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |learned| learned.host)
-            })
-            .unwrap_or(seed);
+            let peer_host = learned_host(peer_anchor, seed);
             // An owner's ask that this candidate make a volume's admission before it turns live shipping on (§4.2, A-401).
             if slates_db::live::is_admit(&request) {
               return crate::live_ship::serve_admit(control, local, peer_host, &request).await;
@@ -1848,6 +1896,22 @@ async fn serve_peer_records(
             crate::moves::serve_move_prepare(s, local, peer_host, &request)
           })
           .unwrap_or_default(),
+          // A window homed by its identity (A-724 piece 6, `slates_cluster::homes`): kept on this node's home shard
+          // for it, apart from the content plane's holds, and answered once its image is published.
+          slates_cluster::homes::HOME_STREAM => {
+            crate::vcs_store::homes::serve_remote(
+              control,
+              &request,
+              crate::daemon::LIVENESS_BUDGET_NS,
+            )
+            .await
+          }
+          // A credential enrolled or revoked elsewhere in the region (A-764, `slates_cluster::credentials`): applied to
+          // the partition its id routes to and answered whether it is held as asked.
+          slates_cluster::credentials::CREDENTIAL_STREAM => {
+            crate::credentials::serve_remote(control, &request, crate::daemon::LIVENESS_BUDGET_NS)
+              .await
+          }
           stream if is_content_stream(stream) => {
             let reply = state::with_state(|s| {
               let peer_host = s
@@ -2171,6 +2235,11 @@ pub(crate) fn hold_checked_record(
 /// tombstone releases the destroyed volume's content, or at its retirement the volume's records
 /// ([`crate::tombstone::on_held`]).
 fn after_held_record(state: &mut ShardState, record: &Record) {
+  // A state log's part is a ledger position of a repository's own state: nothing to compact, no content to judge, and
+  // never a tombstone (A-636 part 2b).
+  if let RegisterClass::State(_) = record.object.class() {
+    return;
+  }
   if crate::catalog::is_single_value(&record.value)
     && let Some(acceptor) = state.holder_records.get_mut(&record.object)
   {
@@ -2386,7 +2455,12 @@ pub(crate) fn check_held_record(
       },
     )
     .check(record),
+  }?;
+  // A state log's part is held only where it continues this holder's copy of its log (A-636 part 2b).
+  if let RegisterClass::State(log) = record.object.class() {
+    crate::state_log::check_held(state, record, log)?;
   }
+  Ok(())
 }
 
 /// A volume head this node owns that is not yet held by every candidate, with everything the register commit
@@ -2479,6 +2553,98 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
   heads.extend(owed_adopted_work_catalogs(state, config, local));
   for tombstone in state.db.partition().tombstones() {
     heads.extend(owed_tombstone(state, config, tombstone, local));
+  }
+  heads.extend(owed_state_log_parts(state, config, local));
+  heads.extend(owed_repositories(state, config, local));
+  heads
+}
+
+/// The repositories' own registers this owner shard still owes some candidate (A-636 part 2c-1): each repository's
+/// record (`crate::catalog::repository_value`) at its sequence (`crate::catalog::repository_sequence`), to the
+/// candidates its family places it on, its state logs' and its greens' (A-636 part 2b-2), as a volume's catalog ships to
+/// its volume's. A repository this node lost to a successor ships nothing, as a lost volume does: its successor owns its
+/// registers.
+fn owed_repositories(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  local: HostId,
+) -> Vec<Head> {
+  let repositories = state.db.partition().repositories();
+  repositories
+    .repositories()
+    .filter(|record| {
+      !crate::verbs::lost_to_a_successor(
+        state,
+        DbVolumeId {
+          bytes: record.id.bytes,
+        },
+      )
+    })
+    .filter_map(|record| {
+      let names = repositories
+        .log_position(record.id, slates_db::catalog::StateLog::Names)
+        .unwrap_or(0);
+      owed_record(
+        state,
+        config,
+        (
+          ObjectId(record.id.bytes),
+          crate::catalog::repository_sequence(record, names),
+        ),
+        crate::catalog::repository_value(record),
+        local,
+      )
+    })
+    .collect()
+}
+
+/// The parts of the repositories' state logs this owner shard still owes some candidate (A-636 part 2b;
+/// `crate::state_log`), each log's in position order, so a holder meets each part after its predecessor: a log's
+/// register at each part's position, to the log's candidates (its repository's), with the candidates that hold it
+/// already (their highest acknowledgement at or past it). A part every remote candidate holds is let go when its last
+/// acknowledgement comes, so none is owed here.
+fn owed_state_log_parts(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  local: HostId,
+) -> Vec<Head> {
+  let mut heads = Vec::new();
+  for (register, parts, acked) in state.state_logs.owed() {
+    let placement = config.place(register);
+    for (sequence, value) in parts {
+      let holding: Vec<HostId> = placement
+        .candidates
+        .iter()
+        .copied()
+        .filter(|candidate| acked.get(candidate).is_some_and(|held| held >= sequence))
+        .collect();
+      let owed = placement
+        .candidates
+        .iter()
+        .any(|candidate| *candidate != local && !holding.contains(candidate));
+      if !owed {
+        continue;
+      }
+      heads.push(Head {
+        shard: state.shard,
+        object: register,
+        record: Record {
+          owner: local,
+          object: register,
+          sequence: *sequence,
+          epoch: config.host_epoch,
+          generation: config.version,
+          value: value.clone(),
+        },
+        shape: Placement {
+          acked: Vec::new(),
+          ..placement.clone()
+        },
+        acked: holding,
+        quorum: config.quorum,
+        live: false,
+      });
+    }
   }
   heads
 }
@@ -4612,6 +4778,7 @@ const MATERIALIZE_REFUSED: &str = "fleet.materialize";
 /// stands still. Before, each wait (`fleet.materialize.waits.*`, a fetch that never completed, a refused or unanswered
 /// materialization) retried every period without end.
 async fn materialize_pending(origin: u16, local: HostId, budget: CommitBudget) {
+  judge_given_up_afresh(origin).await;
   let pending: Vec<(ObjectId, HeadValue, Option<HostId>)> = state::with_state(|s| {
     s.pending_materializations
       .iter()
@@ -4667,7 +4834,7 @@ async fn materialize_pending(origin: u16, local: HostId, budget: CommitBudget) {
         origin,
         local,
         (object, TakenOver::Volume),
-        waited.named(),
+        (waited.named(), waited.waits_on_members()),
         attempts,
       )
       .await;
@@ -4873,6 +5040,40 @@ async fn materialize_adopted_objects(
   adopt_pending_tombstones(origin).await;
   materialize_pending(origin, local, budget).await;
   materialize_pending_greens(origin, local, budget, in_flight).await;
+  rebuild_adopted_repositories(origin).await;
+}
+
+/// Rebuilds each repository this node took over once its logs and greens are in (A-636 part 2c-2,
+/// [`crate::takeover::repositories_ready`]), on the shard its id routes to ([`crate::takeover::rebuild_repository`]):
+/// one that stands there, or that the database refused (logged and counted there), is pending no more; one whose
+/// partition has no shard here, or whose shard does not answer within the period, is attempted again next period.
+async fn rebuild_adopted_repositories(origin: u16) {
+  let ready: Vec<(crate::takeover::ReadyRepository, Option<u16>)> = state::with_state(|s| {
+    crate::takeover::repositories_ready(s)
+      .into_iter()
+      .map(|ready| {
+        let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: ready.0.0 });
+        let target = s.shards.get(usize::from(partition)).copied();
+        (ready, target)
+      })
+      .collect()
+  })
+  .unwrap_or_default();
+  for ((object, record, parts), target) in ready {
+    let Some(target) = target else {
+      continue;
+    };
+    let answered = call_within(
+      origin,
+      target,
+      move |s| crate::takeover::rebuild_repository(s, record, parts),
+      HEARTBEAT_NS,
+    )
+    .await;
+    if answered.is_some() {
+      state::with_state(|s| s.pending_repositories.remove(&object));
+    }
+  }
 }
 
 /// Records each adopted tombstone (AUD-29-43) on the shard the destroyed volume's id routes to, with the
@@ -5056,7 +5257,7 @@ async fn materialize_pending_greens(
         origin,
         local,
         (object, TakenOver::Green),
-        waited.named(),
+        (waited.named(), false),
         attempts,
       )
       .await;
@@ -5480,6 +5681,87 @@ enum TakenOver {
   Green,
 }
 
+/// Judges afresh each taken-over volume given up on while it waited on its takeover cohorts' members
+/// ([`ShardState::given_up_volumes`], A-775) once one of them is heard again: alive at a later incarnation than when it was
+/// given up, back from a pause or a partition the failover SLO's worth of attempts did not outlast. Its owner shard's
+/// unrecovered record goes, so the verbs on it wait for its materialization again (A-548), and it is pending again with
+/// its attempts from zero, counted [`MATERIALIZE_JUDGED_AFRESH`]. Bounded as the takeover round's own fresh judgement is
+/// (`takeover::HostTakeover::heard_since`): once per member's later incarnation, each with the failover SLO's worth of
+/// attempts. Before, a give-up was final until a new configuration: a live volume whose log's holder was stopped about
+/// the failover SLO (`live_chaos`'s fresh-member flow stops it 3 s, its successor's bound 30 periods) answered
+/// `NotRecovered` for good once the holder came back with every acknowledged write (w-forming's anchor log,
+/// `takeover-stall-pr15-run1.log`: `fleet.materialize.given_up` 1 after 22 catalog and 11 quorum waits, the holder left at
+/// fence 1).
+async fn judge_given_up_afresh(origin: u16) {
+  let heard: Vec<ObjectId> = state::with_state(|s| {
+    let membership = s.fleet.membership();
+    s.given_up_volumes
+      .iter()
+      .filter(|(_, given_up)| {
+        given_up.heard.iter().any(|(host, incarnation)| {
+          membership
+            .state(*host)
+            .is_some_and(|held| held.liveness == Liveness::Alive && held.incarnation > *incarnation)
+        })
+      })
+      .map(|(object, _)| *object)
+      .collect()
+  })
+  .unwrap_or_default();
+  for object in heard {
+    let id = DbVolumeId { bytes: object.0 };
+    let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+    let Some(target) =
+      state::with_state(|s| s.shards.get(usize::from(partition)).copied()).flatten()
+    else {
+      continue;
+    };
+    let cleared = call_within(
+      origin,
+      target,
+      move |s| {
+        let given_up = matches!(
+          s.unrecovered.get(&id),
+          Some(slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { .. })
+        );
+        if given_up {
+          s.unrecovered.remove(&id);
+        }
+        given_up
+      },
+      HEARTBEAT_NS,
+    )
+    .await;
+    let Some(still_given_up) = cleared else {
+      // The owner shard did not answer this period: judged again next period.
+      continue;
+    };
+    state::with_state(|s| {
+      let given_up = s.given_up_volumes.remove(&object)?;
+      // Its record gone another way (the volume destroyed, or recorded unrecovered for another cause): not taken up.
+      if !still_given_up || s.pending_materializations.contains_key(&object) {
+        // Adopted again meanwhile (a new configuration's round): that record stands.
+        return None;
+      }
+      if let Some(catalog) = given_up.catalog {
+        s.pending_catalogs.entry(object).or_insert(catalog);
+      }
+      let mut pending = given_up.pending;
+      pending.attempts = 0;
+      pending.round_seen = None;
+      pending.turns_seen = None;
+      pending.live_adopted = None;
+      s.pending_materializations.insert(object, pending);
+      s.count(MATERIALIZE_JUDGED_AFRESH, 1);
+      Some(())
+    });
+  }
+}
+
+/// Counter: a taken-over volume given up on, judged afresh once a member of its cohorts was heard again
+/// ([`judge_given_up_afresh`]).
+const MATERIALIZE_JUDGED_AFRESH: &str = "fleet.materialize.judged_afresh";
+
 /// Gives up on the taken-over `object` of its kind after `attempts` without progress, the last of which waited on
 /// `waited` ([`materialize_pending`], [`materialize_pending_greens`]): its owner shard records it unrecovered with that
 /// cause, so every verb on it answers `Refusal::NotRecovered`; this node stops attempting it and claims it to lookups
@@ -5491,7 +5773,7 @@ async fn give_up_taken_over(
   origin: u16,
   local: HostId,
   (object, kind): (ObjectId, TakenOver),
-  waited: &'static str,
+  (waited, on_members): (&'static str, bool),
   attempts: u32,
 ) {
   let id = DbVolumeId { bytes: object.0 };
@@ -5525,16 +5807,39 @@ async fn give_up_taken_over(
     TakenOver::Green => ("green", GREEN_TAKEOVER_GIVEN_UP),
   };
   state::with_state(|s| {
+    let catalog = s.pending_catalogs.remove(&object);
     match kind {
       TakenOver::Volume => {
-        s.pending_materializations.remove(&object);
+        let given_up = s.pending_materializations.remove(&object);
+        // A volume that waited on its cohorts' members is judged afresh once one is heard again
+        // ([`judge_given_up_afresh`]).
+        if let Some(pending) =
+          given_up.filter(|pending| on_members && !pending.cohort_hosts.is_empty())
+        {
+          let membership = s.fleet.membership();
+          let heard = pending
+            .cohort_hosts
+            .iter()
+            .map(|host| {
+              let incarnation = membership.state(*host).map_or(0, |held| held.incarnation);
+              (*host, incarnation)
+            })
+            .collect();
+          s.given_up_volumes.insert(
+            object,
+            crate::state::GivenUpVolume {
+              pending,
+              catalog,
+              heard,
+            },
+          );
+        }
       }
       TakenOver::Green => {
         s.pending_green_materializations.remove(&object);
         crate::green_adopt::forget_completions(s, object);
       }
     }
-    s.pending_catalogs.remove(&object);
     if target.is_some() {
       crate::takeover::track_owner_on_every_shard(s, object, local);
     }
@@ -6406,9 +6711,10 @@ async fn restore_and_begin(
   Ok(())
 }
 
-/// A live log's rebuild on its owner shard, its payloads opened and applied a slice a turn, each held to the turn's
-/// share of the seal quantum (`config::wrap_slice_ns`, a payload at least: [`crate::live_ship::Rebuilding`]), counted
-/// [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a turn. The archive, and the head the
+/// A live log's rebuild on its owner shard, its payloads opened and applied and its archive's content hashed a slice a
+/// turn, each held to the turn's share of the seal quantum (`config::wrap_slice_ns`, a step at least: a sealed page opened
+/// or hashed, a record applied, a run laid over, a page of content hashed: [`crate::live_ship::Rebuilding`], A-771),
+/// counted [`LIVE_REBUILD_SLICES`]; then the rebuilt volume laid out as an archive, a turn, its content hashed already. The archive, and the head the
 /// takeover adopted. Before, all of it ran in one owner-shard turn: on a Mac Studio the nemesis's successors took 0.68
 /// to 1.08 s to rebuild 152 to 306 MB of log, past the watchdog's spin window, which ended the successor's process.
 async fn rebuild_in_turns(
@@ -6621,6 +6927,15 @@ impl VolumeWait {
   /// catalog register or that register's placement ([`paging_round`]).
   const fn waits_on_the_round(self) -> bool {
     matches!(self, VolumeWait::Catalog | VolumeWait::CatalogPlacement)
+  }
+
+  /// Whether it waits on members of the volume's takeover cohorts, which a member heard again may clear: its live log's
+  /// holders, its catalog register's (or that register's placement's), or its content's ([`judge_given_up_afresh`]).
+  const fn waits_on_members(self) -> bool {
+    matches!(
+      self,
+      VolumeWait::Live | VolumeWait::Catalog | VolumeWait::CatalogPlacement | VolumeWait::Content
+    )
   }
 
   /// Its name in a refusal's cause (`RecoveryCause::TakeoverIncomplete`).
@@ -6889,6 +7204,9 @@ const LOOP_SPAWN_REFUSED: &str = "fleet.loop_spawn";
 /// would hold the shard's shutdown); a spawn the arena refuses is counted under `refused` — a refusal is
 /// counted, never swallowed (§4.14, banned item 9). Before this every fleet loop's spawn was `if let Ok`,
 /// so a refused loop left a node silently without a plane, a peer link or its coordinator.
+/// The loop is labelled with the line that called this (A-740: `#[track_caller]` carries the caller's site into
+/// `futures::spawn`), so a shard found stuck in a fleet loop names that loop, not this helper.
+#[track_caller]
 fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static, refused: &'static str) {
   match futures::spawn(future) {
     Ok(task) => {
@@ -7454,7 +7772,10 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       // loop sees it back in the neighbourhood and re-establishes. A believed-dead peer is never dialed
       // (that establish would block on a peer that will not answer, `docs/bugs/2026-09-10-*`), so idling
       // costs nothing until the peer is alive again.
-      state::with_state(|s| s.record_sessions.remove(&peer_host));
+      state::with_state(|s| {
+        s.record_sessions.remove(&peer_host);
+        sessions_changed(s, peer_host);
+      });
       dial_settled(peer_host);
       crate::daemon::pace(HEARTBEAT_NS).await;
       continue;
@@ -7690,6 +8011,7 @@ fn refresh_record_identity_in(
     .map_or(previous, |learned| learned.host);
   if current != previous {
     state.record_sessions.remove(&previous);
+    sessions_changed(state, previous);
     // The dial's record is the previous id's: the link's dial under the new id starts afresh.
     state.record_dials.remove(&previous);
     let previous_was_a_live_incarnation = previous != crate::deploy::member_id(anchor, 0);
@@ -7721,6 +8043,7 @@ async fn enroll_record_session(
       state
         .record_sessions
         .insert(peer_host, crate::state::RecordLink::up(session));
+      sessions_changed(state, peer_host);
     });
     crate::live_ship::holder_reached(peer_host);
   }
@@ -7749,8 +8072,10 @@ async fn refresh_discovery(
         if let Some(link) = state.record_sessions.get_mut(&peer_host) {
           link.endpoint = Some(session);
         }
+        sessions_changed(state, peer_host);
       } else {
         state.record_sessions.remove(&peer_host);
+        sessions_changed(state, peer_host);
         // A discovery page can be the first exchange to meet the restarted peer's reset (A-261): counted as a reset,
         // as a borrower's return counts it, not left to read as an unexplained drop.
         if session.peer_reset() {
@@ -8081,6 +8406,7 @@ impl Dispatch {
       state::with_state(|s| {
         for host in &lost {
           s.record_sessions.remove(host);
+          sessions_changed(s, *host);
         }
       });
     }
@@ -8772,8 +9098,16 @@ async fn take_campaign_sessions(
       count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
       return taken;
     }
-    // A refused sleep (off a shard) ends the wait with what was taken, never a spin.
-    if futures::sleep(budget.poll_interval_ns).await.is_err() {
+    // Waits for one of the voters' sessions to come back (or its link to change) within what is left, then takes
+    // again; it slept the fleet's poll interval between looks before 2026-11-20. A test's campaign hold ends at its
+    // instant, not at an event, so while one holds the wait ends there too. No wait possible (off a shard) ends the wait
+    // with what was taken, never a spin.
+    let now = futures::now_ns();
+    let mut left = budget.deadline_ns.saturating_sub(now.saturating_sub(began));
+    if out.iter().any(|voter| withheld.contains(voter)) && now < withheld_until {
+      left = left.min(withheld_until.saturating_sub(now));
+    }
+    if session_returned(&out, left).await.is_none() {
       count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
       return taken;
     }
@@ -10522,6 +10856,12 @@ async fn follow_configuration(
   // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
   // version-gated, so an unchanged configuration is a no-op there (see `fan_configs_to_shards`).
   fan_configs_to_shards(origin, shards);
+  // Windows homed by identity in the region (A-724 piece 6): at a new configuration, offered to their homes and let go
+  // here once every home holds them, a turn a period (`vcs_store::homes::heal_region`).
+  crate::vcs_store::homes::heal_region(origin, shards, budget).await;
+  // Credentials as fleet state (A-764): at a new configuration, every credential this node holds offered to every other
+  // member, so one that joined or came back with nothing holds what the region holds (`credentials::heal_region`).
+  crate::credentials::heal_region(origin, shards, budget).await;
   // Planned moves (A-291): each move this node's shards began is reported until the switch, routed to its new owner
   // from then on, and released once adopted; a destroyed moved volume's exception is reported forgotten.
   crate::moves::drive_outgoing(origin, local, owner_acceptor, budget, in_flight).await;
@@ -11079,7 +11419,11 @@ async fn ship_shard_heads(
   let work = call_within(
     origin,
     shard,
-    move |s| unplaced_heads(s, local),
+    move |s| {
+      // The state logs' records the partition handed on since the last pass become parts owed (A-636 part 2b).
+      crate::state_log::take_made(s);
+      unplaced_heads(s, local)
+    },
     HEARTBEAT_NS,
   )
   .await
@@ -11154,13 +11498,9 @@ async fn ship_head(
   let holders = take_sessions("fleet.lent_to.ship_head", |host| {
     head.shape.candidates.contains(&host) && !head.acked.contains(&host)
   });
-  let catalog = head.object.is_catalog();
+  let counters = ship_counters(head.object.class());
   if holders.is_empty() {
-    count_refusal(if catalog {
-      SHIP_CATALOG_NO_SESSION
-    } else {
-      SHIP_HEAD_NO_SESSION
-    });
+    count_refusal(counters.no_session);
     // No live session to a candidate that still needs the head; retry next period.
     return HeadShipped {
       dispatch: None,
@@ -11200,7 +11540,7 @@ async fn ship_head(
     });
   }
   count_refusal(ship_outcome_counter(
-    catalog,
+    counters,
     &committed.outcome,
     head.quorum,
   ));
@@ -11237,22 +11577,71 @@ async fn ship_head(
   }
 }
 
-/// The counter naming one head or catalog commit's outcome: placed at `f + 1`, acknowledged short of it, uncertain, or
-/// refused before anything was dispatched.
+/// The counters one register class's shipments are counted under: a volume's own register (its head or tombstone), its
+/// catalog, or a repository's state log (A-636 part 2b), each its own, so a state log's part is never counted as its
+/// repository's head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShipCounters {
+  /// Committed at `f + 1` by one ship.
+  placed: &'static str,
+  /// Acknowledged by fewer than `f + 1` candidates.
+  short: &'static str,
+  /// Its outcome uncertain (the dispatch's budget ran out).
+  uncertain: &'static str,
+  /// Refused by the runtime before anything was dispatched.
+  failed: &'static str,
+  /// Owed to candidates none of which had a session to ride.
+  no_session: &'static str,
+}
+
+/// The counters of a volume's own register (its head, or its tombstone).
+const HEAD_SHIPS: ShipCounters = ShipCounters {
+  placed: SHIP_HEAD_PLACED,
+  short: SHIP_HEAD_SHORT,
+  uncertain: SHIP_HEAD_UNCERTAIN,
+  failed: SHIP_HEAD_FAILED,
+  no_session: SHIP_HEAD_NO_SESSION,
+};
+
+/// The counters of a catalog register.
+const CATALOG_SHIPS: ShipCounters = ShipCounters {
+  placed: SHIP_CATALOG_PLACED,
+  short: SHIP_CATALOG_SHORT,
+  uncertain: SHIP_CATALOG_UNCERTAIN,
+  failed: SHIP_CATALOG_FAILED,
+  no_session: SHIP_CATALOG_NO_SESSION,
+};
+
+/// The counters of a state log's part (A-636 part 2b).
+const STATE_LOG_SHIPS: ShipCounters = ShipCounters {
+  placed: "fleet.ship.state_log.placed",
+  short: "fleet.ship.state_log.short",
+  uncertain: "fleet.ship.state_log.uncertain",
+  failed: "fleet.ship.state_log.failed",
+  no_session: "fleet.ship.state_log.no_session",
+};
+
+/// The counters a register of `class` ships under, read from its id's class (A-636 part 2a), never from its value.
+fn ship_counters(class: RegisterClass) -> ShipCounters {
+  match class {
+    RegisterClass::Own => HEAD_SHIPS,
+    RegisterClass::Catalog => CATALOG_SHIPS,
+    RegisterClass::State(_) => STATE_LOG_SHIPS,
+  }
+}
+
+/// The counter naming one shipment's outcome among `counters`: placed at `f + 1`, acknowledged short of it, uncertain,
+/// or refused before anything was dispatched.
 fn ship_outcome_counter(
-  catalog: bool,
+  counters: ShipCounters,
   outcome: &Result<Placement, ClusterError>,
   quorum: Quorum,
 ) -> &'static str {
-  match (catalog, outcome) {
-    (true, Ok(placement)) if placement.placed(quorum) => SHIP_CATALOG_PLACED,
-    (false, Ok(placement)) if placement.placed(quorum) => SHIP_HEAD_PLACED,
-    (true, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_CATALOG_SHORT,
-    (false, Ok(_) | Err(ClusterError::NotPlaced { .. })) => SHIP_HEAD_SHORT,
-    (true, Err(ClusterError::Uncertain { .. })) => SHIP_CATALOG_UNCERTAIN,
-    (false, Err(ClusterError::Uncertain { .. })) => SHIP_HEAD_UNCERTAIN,
-    (true, Err(_)) => SHIP_CATALOG_FAILED,
-    (false, Err(_)) => SHIP_HEAD_FAILED,
+  match outcome {
+    Ok(placement) if placement.placed(quorum) => counters.placed,
+    Ok(_) | Err(ClusterError::NotPlaced { .. }) => counters.short,
+    Err(ClusterError::Uncertain { .. }) => counters.uncertain,
+    Err(_) => counters.failed,
   }
 }
 
@@ -11291,6 +11680,12 @@ fn record_acks_in(
   epoch: HostEpoch,
   placement: Placement,
 ) {
+  // A state log's part is a ledger position, its candidates' acknowledgements kept per log (A-636 part 2b): never the
+  // one sequence a head's placement keeps, and never a live volume's.
+  if let RegisterClass::State(_) = object.class() {
+    crate::state_log::acknowledged(state, object, sequence, &placement);
+    return;
+  }
   let entry = state
     .placed_heads
     .entry(object)
@@ -11366,6 +11761,127 @@ const NS_PER_MS: u64 = 1_000_000;
 /// ([`return_sessions`]), for the link to dial again.
 const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
 
+/// Format: a wait for a record session out on loan woken by its return or its link's change ([`session_returned`]),
+/// the non-vacuity count of the woken wait.
+pub(crate) const SESSION_WAIT_WOKEN: &str = "fleet.session_wait.woken";
+/// Format: such a wait that met its deadline unwoken.
+pub(crate) const SESSION_WAIT_ELAPSED: &str = "fleet.session_wait.elapsed";
+/// Format: such waits woken by the session's own return to its link ([`return_sessions`]), the count that tells a wake
+/// at the return from one by any other change of the link.
+pub(crate) const SESSION_WAIT_RETURNED: &str = "fleet.session_wait.returned";
+
+/// Waits, on the control shard, for a record session to one of `hosts` to come back from its loan, or for its link to
+/// change (installed or dropped), for at most `left_ns`: `Some(true)` when such a change woke it, `Some(false)` at the
+/// deadline, `None` when no wait could be made (off a shard, as a refused sleep was): the caller ends its wait then, never
+/// spins. A borrower that finds a session out waits here for the event and looks again at once; before
+/// 2026-11-20 each slept a pace (a timer tick, a tenth of a period, the fleet's poll interval) and looked again, so a
+/// session handed back just after a look waited out the rest of the pace (main's sweep after A-697's release bench).
+pub(crate) async fn session_returned(hosts: &[HostId], left_ns: u64) -> Option<bool> {
+  let woken = match futures::within(
+    left_ns,
+    SessionChange {
+      hosts: hosts.to_vec(),
+      token: None,
+    },
+  )
+  .await
+  {
+    Ok(Some(Some(()))) => true,
+    Ok(Some(None)) | Err(_) => return None,
+    Ok(None) => false,
+  };
+  let _ = state::with_state(|s| {
+    s.count(
+      if woken {
+        SESSION_WAIT_WOKEN
+      } else {
+        SESSION_WAIT_ELAPSED
+      },
+      1,
+    );
+  });
+  Some(woken)
+}
+
+/// The wait of [`session_returned`]: registered with its waker under each of `hosts` at its first poll, on the shard it
+/// runs on (the control shard, where the sessions are), and ready once [`sessions_changed`] woke its token; `None` when
+/// the shard's state could not be read (off a shard). Dropped, it takes its registrations away, so none outlives it.
+struct SessionChange {
+  hosts: Vec<HostId>,
+  token: Option<u64>,
+}
+
+impl std::future::Future for SessionChange {
+  type Output = Option<()>;
+
+  fn poll(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<Option<()>> {
+    let this = self.get_mut();
+    let polled = state::with_state(|s| match this.token {
+      Some(token) if s.session_woken.remove(&token) => std::task::Poll::Ready(Some(())),
+      Some(_) => std::task::Poll::Pending,
+      None => {
+        let token = s.next_session_wait;
+        s.next_session_wait = token.wrapping_add(1);
+        for host in &this.hosts {
+          s.session_waiters
+            .entry(*host)
+            .or_default()
+            .push((token, cx.waker().clone()));
+        }
+        this.token = Some(token);
+        std::task::Poll::Pending
+      }
+    });
+    polled.unwrap_or(std::task::Poll::Ready(None))
+  }
+}
+
+impl Drop for SessionChange {
+  fn drop(&mut self) {
+    let Some(token) = self.token else {
+      return;
+    };
+    let hosts = std::mem::take(&mut self.hosts);
+    let _ = state::with_state(|s| {
+      s.session_woken.remove(&token);
+      for host in hosts {
+        if let Some(waiters) = s.session_waiters.get_mut(&host) {
+          waiters.retain(|(waiting, _)| *waiting != token);
+          if waiters.is_empty() {
+            s.session_waiters.remove(&host);
+          }
+        }
+      }
+    });
+  }
+}
+
+/// Answers every wait for `host`'s record session ([`session_returned`]): its session handed back, or its link installed
+/// or dropped. Called wherever `record_sessions` changes for a host. Each wait is woken once, and leaves the lists of the
+/// other peers it waited for. Returns how many it woke.
+pub(crate) fn sessions_changed(state: &mut ShardState, host: HostId) -> u64 {
+  let Some(waiters) = state.session_waiters.remove(&host) else {
+    return 0;
+  };
+  let mut woken = 0u64;
+  for (token, waker) in waiters {
+    if state.session_woken.insert(token) {
+      for others in state.session_waiters.values_mut() {
+        others.retain(|(waiting, _)| *waiting != token);
+      }
+      waker.wake();
+      woken = woken.saturating_add(1);
+    }
+  }
+  state
+    .session_waiters
+    .retain(|_, waiters| !waiters.is_empty());
+  woken
+}
+
 /// Returns borrowed sessions to the shard state after a dispatch. A slot is refilled only by the session
 /// that left it — the entry still there, its session out, and the returning session's connection id the
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
@@ -11427,6 +11943,9 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         }
         _ => s.count(LINK_STALE_RETURN, 1),
       }
+      // Whatever became of it (handed back, dropped, or a stale return), the borrowers waiting for this peer look again.
+      let woken = sessions_changed(s, host);
+      s.count(SESSION_WAIT_RETURNED, woken);
     }
   });
 }
@@ -11486,6 +12005,48 @@ pub(crate) async fn forward_batch_over_leader_session(
   place: &mut crate::forward_lane::Place,
 ) -> Option<slates_cluster::BatchReplies> {
   crate::forward_lane::forward_batch(peer, requests, stall_ns, bound, place).await
+}
+
+#[cfg(test)]
+mod spawn_label_tests {
+  /// A-740's labels through the fleet's loop spawner (w-forming, 2026-11-20; found by use: every fleet loop's long poll
+  /// was named by the one `fleet.rs` line inside `spawn_detached`). Do: on a shard, spawn a loop through
+  /// `spawn_detached` whose future reads the task the shard's pulse says it is polling. Expect it named by the line of
+  /// this test that spawned it. Before, by the line in `spawn_detached` that called `futures::spawn`.
+  #[test]
+  // The test thread waits off-shard for what the shard's task reports.
+  #[allow(clippy::disallowed_methods)]
+  fn a_fleet_loops_label_names_the_line_that_spawned_it() {
+    /// Shape: how long the test thread waits for the report.
+    const REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+    let daemon = crate::daemon::audit_daemon();
+    let (seen, label) = std::sync::mpsc::sync_channel::<(u32, Option<u32>)>(1);
+    crate::daemon::observe_first(&daemon, move |state| {
+      let home = state.shard;
+      let spawned_at = line!() + 1;
+      super::spawn_detached(
+        async move {
+          let named = slates_rt::registry::with_entry(home, |entry| entry.pulse.polling().label)
+            .flatten()
+            .and_then(|label| match label {
+              slates_rt::label::TaskLabel::Site(site) if site.file().ends_with("fleet.rs") => {
+                Some(site.line())
+              }
+              _ => None,
+            });
+          let _ = seen.try_send((spawned_at, named));
+        },
+        "test.loop_spawn",
+      );
+    });
+    let (spawned_at, named) = label.recv_timeout(REPORT_WAIT).unwrap();
+    assert_eq!(
+      named,
+      Some(spawned_at),
+      "the loop is named by the line that spawned it"
+    );
+    daemon.stop();
+  }
 }
 
 #[cfg(test)]
@@ -11884,7 +12445,7 @@ mod tests {
   /// Installs the council's committed configuration on `state`'s fleet node as the control shard's install does
   /// (`readmission::install_placement`), then walks the held copies to it a slice at a time until the walk ends
   /// ([`super::install_slice`]), as the coordinator's period drives it ([`super::drive_install_walk`]).
-  fn walk_the_install(state: &mut crate::state::ShardState, local: super::HostId) {
+  pub(super) fn walk_the_install(state: &mut crate::state::ShardState, local: super::HostId) {
     let regional = state.council.configuration().clone();
     let Some(configuration) = regional.configuration_for(local) else {
       return;
@@ -12866,5 +13427,495 @@ mod root_learner_tests {
       vec![voter]
     );
     assert_eq!(with_shown_peer(vec![voter], None, local), vec![voter]);
+  }
+}
+
+#[cfg(test)]
+mod state_log_tests {
+  use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+  use slates_db::catalog::{LogName, LogSpan, LoggedChange, NameChange, RepositoryId, StateLog};
+  use slates_db::catalog::{StateLogRecord, VolumeId};
+  use slates_db::register::{Ack, FIRST_EPOCH, Quorum, RegisterClass};
+  use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
+
+  use super::{HostId, ObjectId, Placement, Record};
+  use crate::state::ShardState;
+
+  /// This node and two members admitted beside it, a region of three at `f = 1`, its configuration installed as the
+  /// coordinator installs it: every object's candidates are the three.
+  fn region_of_three(state: &mut ShardState) -> (HostId, [HostId; 2]) {
+    let local = state.fleet.host();
+    let others = [HostId(local.0 ^ 1), HostId(local.0 ^ 2)];
+    state.council = RegionalCouncil::new(
+      local,
+      vec![local],
+      vec![local],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    for host in others {
+      assert!(
+        state
+          .council
+          .propose(Reconfiguration::Admit { host, domain: None })
+      );
+    }
+    super::tests::walk_the_install(state, local);
+    (local, others)
+  }
+
+  /// The owning principal the verbs run as.
+  fn owner() -> slates_db::catalog::Principal {
+    slates_db::catalog::Principal::Uid {
+      host: slates_db::HostId(0),
+      uid: 1234,
+    }
+  }
+
+  /// A repository `name` made on `state`'s shard with its default branch `main`, and a branch `topic` of it: its id.
+  fn repository_and_branch(state: &mut ShardState, name: &str) -> RepositoryId {
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.to_owned(),
+        tool: VcsTool::Git,
+        format: ObjectFormat::Sha1,
+        default_branch: "main".to_owned(),
+        green: None,
+      },
+    );
+    assert!(
+      matches!(created, ReplyBody::GreenCreated { .. }),
+      "{created:?}"
+    );
+    let branched = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateBranch {
+        repository: name.to_owned(),
+        name: "topic".to_owned(),
+        from: "main".to_owned(),
+        version: None,
+      },
+    );
+    assert!(
+      matches!(branched, ReplyBody::GreenCreated { .. }),
+      "{branched:?}"
+    );
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(name)
+      .map(|record| record.id)
+      .unwrap()
+  }
+
+  /// A-636 part 2b. Do: on an owner shard in a region of three at `f = 1`, create a repository and a branch of it, ask
+  /// the record plane what it owes, then record a commit round of the first part acknowledged by one remote candidate,
+  /// and another by the other, as `ship_head`'s rounds record them. Expect: the names log's two parts owed in position
+  /// order (the root joined and the default bound, 0 to 2; the branch joined and bound, 2 to 4), each at the names
+  /// log's register, to the repository's own candidates, its value the record itself, naming one operation each; no
+  /// other state log owed anything; the first part still owed to the candidate that lacks it, then let go once both
+  /// hold it, the second still owed to both; and no acknowledgement of a part kept as a head's placement.
+  #[test]
+  fn an_owners_state_log_records_are_owed_to_the_repositorys_candidates_in_order() {
+    crate::daemon::audit_on_shard(|state| {
+      let (local, [b, c]) = region_of_three(state);
+      let repo = repository_and_branch(state, "shipped");
+      crate::state_log::take_made(state);
+      let register = LogName::State {
+        repository: repo,
+        log: StateLog::Names,
+      }
+      .register();
+      let config = state.fleet.configuration().clone();
+      let owed = super::owed_state_log_parts(state, &config, local);
+      let candidates = config.place(ObjectId(repo.bytes)).candidates;
+      assert_eq!(candidates.len(), 3, "{candidates:?}");
+      let parts: Vec<(ObjectId, u64, u64, Vec<HostId>)> = owed
+        .iter()
+        .map(|head| {
+          let part = crate::state_log::record_of(&head.record.value).unwrap();
+          assert_eq!(head.shape.candidates, candidates);
+          assert_eq!(
+            head.record.sequence, part.to,
+            "a part sits at the position it leaves"
+          );
+          (head.object, part.from, part.to, head.acked.clone())
+        })
+        .collect();
+      assert_eq!(
+        parts,
+        vec![(register, 0, 2, Vec::new()), (register, 2, 4, Vec::new())]
+      );
+      let placement = Placement {
+        acked: vec![local, b],
+        ..config.place(register)
+      };
+      super::record_acks_in(state, register, 2, FIRST_EPOCH, placement.clone());
+      let owed = super::owed_state_log_parts(state, &config, local);
+      let holding = |acked: &[HostId]| {
+        let mut acked = acked.to_vec();
+        acked.sort_unstable();
+        acked
+      };
+      assert_eq!(
+        owed
+          .iter()
+          .map(|head| (head.record.sequence, holding(&head.acked)))
+          .collect::<Vec<_>>(),
+        vec![(2, holding(&[local, b])), (4, Vec::new())],
+        "the owner's own hold and b's"
+      );
+      let placement = Placement {
+        acked: vec![c],
+        ..placement
+      };
+      super::record_acks_in(state, register, 2, FIRST_EPOCH, placement);
+      let owed = super::owed_state_log_parts(state, &config, local);
+      assert_eq!(
+        owed
+          .iter()
+          .map(|head| head.record.sequence)
+          .collect::<Vec<_>>(),
+        vec![4]
+      );
+      assert!(!state.placed_heads.contains_key(&register));
+    });
+  }
+
+  /// A-636 part 2c-1. Do: on an owner shard in a region of three at `f = 1`, create a repository and a branch of it, ask
+  /// the record plane what it owes for the repository's own register; record both remote candidates' acknowledgements as
+  /// `ship_head`'s round records them and ask again; then retire the branch's name and ask again. Expect: the
+  /// repository's record owed at its own id, to its family's candidates, at sequence 5 (policy version 0, the names log
+  /// at 4, plus one), its value the record as the database holds it; nothing owed once both candidates hold it; after
+  /// the retire, the record owed again at 6 to both.
+  #[test]
+  fn an_owners_repository_record_is_owed_to_its_familys_candidates_at_each_change() {
+    crate::daemon::audit_on_shard(|state| {
+      let (local, [b, c]) = region_of_three(state);
+      let repo = repository_and_branch(state, "recorded");
+      let object = ObjectId(repo.bytes);
+      let config = state.fleet.configuration().clone();
+      let owed_now = |state: &ShardState| {
+        super::owed_repositories(state, &config, local)
+          .into_iter()
+          .map(|head| {
+            (
+              head.object,
+              head.record.sequence,
+              head.shape.candidates,
+              head.record.value,
+            )
+          })
+          .collect::<Vec<_>>()
+      };
+      let record = state
+        .db
+        .partition()
+        .repositories()
+        .repository(repo)
+        .cloned()
+        .unwrap();
+      let candidates = config.place(object).candidates;
+      assert_eq!(
+        owed_now(state),
+        vec![(
+          object,
+          5,
+          candidates.clone(),
+          crate::catalog::repository_value(&record)
+        )]
+      );
+      assert_eq!(
+        crate::catalog::repository_of(&crate::catalog::repository_value(&record)),
+        Some(record)
+      );
+      let placement = Placement {
+        acked: vec![local, b, c],
+        ..config.place(object)
+      };
+      super::record_acks_in(state, object, 5, FIRST_EPOCH, placement);
+      assert_eq!(owed_now(state), Vec::new());
+      let retired = crate::verbs::dispatch(
+        state,
+        1,
+        &owner(),
+        RequestBody::RetireBranch {
+          repository: "recorded".to_owned(),
+          name: "topic".to_owned(),
+        },
+      );
+      assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+      let again: Vec<(u64, Vec<HostId>)> = owed_now(state)
+        .into_iter()
+        .map(|(_, sequence, candidates, _)| (sequence, candidates))
+        .collect();
+      assert_eq!(again, vec![(6, candidates)]);
+    });
+  }
+
+  /// The names log's part of `repository` from `from` to `to`, one bind a position, as one operation's.
+  fn names_part(repository: RepositoryId, (from, to): (u64, u64)) -> StateLogRecord {
+    let log = LogName::State {
+      repository,
+      log: StateLog::Names,
+    };
+    StateLogRecord {
+      repository,
+      log: StateLog::Names,
+      from,
+      to,
+      identity: [u8::try_from(to).unwrap(); 32],
+      spans: vec![LogSpan { log, from, to }],
+      changes: (from..to)
+        .map(|position| LoggedChange::Named {
+          change: NameChange::Bind {
+            name: format!("b{position}"),
+            green: VolumeId::default(),
+          },
+        })
+        .collect(),
+    }
+  }
+
+  /// A-636 part 2b. Do: on a holder in a region of three at `f = 1`, receive from a repository's owner its names log's
+  /// parts as the record plane ships them: the part from 2 to 3 before the first; the first, 0 to 2; the one from 2 to 3
+  /// again; then 3 to 5; and at that register a value that reads as a volume's head. Expect: the part past a gap
+  /// refused with no acknowledgement, counted `discontinuous`; the others acknowledged in order, every position kept (a
+  /// ledger: none compacted to the newest); the head-shaped value refused, counted malformed.
+  #[test]
+  fn a_holder_holds_a_repositorys_state_log_as_a_prefix_never_compacted() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      let (local, [owner, _]) = region_of_three(state);
+      let repo = RepositoryId {
+        bytes: ObjectId::new(owner, 5).0,
+      };
+      let register = LogName::State {
+        repository: repo,
+        log: StateLog::Names,
+      }
+      .register();
+      let generation = state.fleet.configuration().version;
+      let shipped = |part: &StateLogRecord| Record {
+        owner,
+        object: register,
+        sequence: part.to,
+        epoch: FIRST_EPOCH,
+        generation,
+        value: crate::state_log::value_of(part),
+      };
+      let mut acked = Vec::new();
+      for span in [(2, 3), (0, 2), (2, 3), (3, 5)] {
+        let reply =
+          super::accept_held_record(state, local, owner, &shipped(&names_part(repo, span)));
+        acked.push(Ack::decode(&reply).is_ok());
+      }
+      let head = crate::head::HeadValue {
+        manifest: None,
+        content_holders: Vec::new(),
+        sealing: None,
+      };
+      let headlike = Record {
+        sequence: 6,
+        value: head.to_record_bytes(),
+        ..shipped(&names_part(repo, (5, 6)))
+      };
+      acked.push(Ack::decode(&super::accept_held_record(state, local, owner, &headlike)).is_ok());
+      let kept: Vec<u64> = [2, 3, 5]
+        .into_iter()
+        .filter(|position| {
+          state
+            .holder_records
+            .get(&register)
+            .is_some_and(|copy| copy.value_at(register, *position).is_some())
+        })
+        .collect();
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        acked,
+        kept,
+        count("fleet.record.refused.state_log.discontinuous"),
+        count("fleet.record.refused.state_log.malformed"),
+      )
+    });
+    assert_eq!(seen.0, vec![false, true, true, true, false], "{seen:?}");
+    assert_eq!(seen.1, vec![2, 3, 5], "every position kept: {seen:?}");
+    assert_eq!((seen.2, seen.3), (1, 1), "{seen:?}");
+  }
+
+  /// A-636 part 2c-2. Do: on a holder in a region of three at `f = 1`, hold a departed owner's repository's names log
+  /// as its record plane ships it: its root bound `main` (0 to 1), then `topic` bound by a push of a version of
+  /// `topic`'s green that this node's head never reached (1 to 2); adopt the repository's record; rebuild it, twice.
+  /// Expect: it is ready with both parts; it stands with `main` alone, its names log at 1, the push dropped and counted
+  /// once, its store made, counted rebuilt once; the second rebuild finds it standing and changes nothing.
+  #[test]
+  fn a_successor_rebuilds_a_repository_whole_from_the_logs_it_holds() {
+    let seen = crate::daemon::audit_on_shard(|state| {
+      let (local, [departed, _]) = region_of_three(state);
+      let family = |number| ObjectId::family(departed, 0, 9, number).unwrap();
+      let green = |number| VolumeId {
+        bytes: family(number).0,
+      };
+      let repo = RepositoryId { bytes: family(1).0 };
+      let generation = state.fleet.configuration().version;
+      for held in held_names(repo, green(2), green(3)) {
+        let shipped = Record {
+          owner: departed,
+          object: held.log_name().register(),
+          sequence: held.to,
+          epoch: FIRST_EPOCH,
+          generation,
+          value: crate::state_log::value_of(&held),
+        };
+        let reply = super::accept_held_record(state, local, departed, &shipped);
+        assert!(Ack::decode(&reply).is_ok());
+      }
+      let record = slates_db::catalog::RepositoryRecord {
+        index_bits: 0,
+        id: repo,
+        name: "linux".to_owned(),
+        tool: slates_db::catalog::VcsTool::Git,
+        format: slates_db::catalog::ObjectFormat::Sha1,
+        default_branch: Some("main".to_owned()),
+        owner: owner(),
+        policy: slates_db::catalog::RepositoryPolicy::default(),
+      };
+      state.pending_repositories.insert(family(1), (2, record));
+      let ready = crate::takeover::repositories_ready(state);
+      let held: Vec<usize> = ready.iter().map(|(_, _, parts)| parts.len()).collect();
+      let rebuilt: Vec<bool> = ready
+        .into_iter()
+        .flat_map(|(_, record, parts)| {
+          let again = (record.clone(), parts.clone());
+          [
+            crate::takeover::rebuild_repository(state, record, parts),
+            crate::takeover::rebuild_repository(state, again.0, again.1),
+          ]
+        })
+        .collect();
+      let repositories = state.db.partition().repositories();
+      let names = (
+        repositories.branch(repo, "main") == Some(green(2)),
+        repositories.branch(repo, "topic"),
+        repositories.log_position(repo, StateLog::Names),
+      );
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let counted = [
+        crate::takeover::TAKEOVER_REPOSITORY_REBUILT,
+        crate::takeover::TAKEOVER_REPOSITORY_OPERATION_DROPPED,
+        crate::takeover::TAKEOVER_REPOSITORY_UNREBUILT,
+      ]
+      .map(count);
+      (held, rebuilt, names, state.vcs_stores.holds(repo), counted)
+    });
+    assert_eq!(
+      seen,
+      (
+        vec![2],
+        vec![true, true],
+        (true, None, Some(1)),
+        true,
+        [1, 1, 0]
+      )
+    );
+  }
+
+  /// A departed owner's names log of `repo`: `main` bound to `root` (0 to 1), then `topic` bound to `topic` by a push
+  /// of its version 1 (1 to 2).
+  fn held_names(repo: RepositoryId, root: VolumeId, topic: VolumeId) -> [StateLogRecord; 2] {
+    let names = LogName::State {
+      repository: repo,
+      log: StateLog::Names,
+    };
+    let part = |from: u64, (name, green): (&str, VolumeId), pushed: Option<LogSpan>| {
+      let to = from.saturating_add(1);
+      StateLogRecord {
+        repository: repo,
+        log: StateLog::Names,
+        from,
+        to,
+        identity: [u8::try_from(to).unwrap_or(u8::MAX); 32],
+        spans: std::iter::once(LogSpan {
+          log: names,
+          from,
+          to,
+        })
+        .chain(pushed)
+        .collect(),
+        changes: vec![LoggedChange::Named {
+          change: NameChange::Bind {
+            name: name.to_owned(),
+            green,
+          },
+        }],
+      }
+    };
+    let pushed = LogSpan {
+      log: LogName::Green { green: topic },
+      from: 0,
+      to: 1,
+    };
+    [
+      part(0, ("main", root), None),
+      part(1, ("topic", topic), Some(pushed)),
+    ]
+  }
+
+  /// A-636 part 2b. Do: name the counters a volume's head, its catalog and each of a repository's state logs ship
+  /// under, placed and short of placed. Expect: each class its own, a state log's never its repository's head's.
+  #[test]
+  fn a_state_logs_part_ships_under_its_own_counters_never_its_repositorys_heads() {
+    let quorum = Quorum { f: 1 };
+    let candidates = vec![HostId(1), HostId(2), HostId(3)];
+    let placed = Placement {
+      acked: vec![HostId(1), HostId(2)],
+      ..Placement::of(&candidates)
+    };
+    let short = Placement {
+      acked: vec![HostId(1)],
+      ..Placement::of(&candidates)
+    };
+    let repository = ObjectId::new(HostId(1), 5);
+    let outcome = |object: ObjectId, placement: &Placement| {
+      super::ship_outcome_counter(
+        super::ship_counters(object.class()),
+        &Ok(placement.clone()),
+        quorum,
+      )
+    };
+    assert_eq!(outcome(repository, &placed), super::SHIP_HEAD_PLACED);
+    assert_eq!(
+      outcome(repository.catalog(), &short),
+      super::SHIP_CATALOG_SHORT
+    );
+    for log in [
+      StateLog::Names,
+      StateLog::Phases,
+      StateLog::Markers,
+      StateLog::Locks,
+    ] {
+      let register = repository.in_class(RegisterClass::State(log));
+      assert_eq!(
+        outcome(register, &placed),
+        "fleet.ship.state_log.placed",
+        "{log:?}"
+      );
+      assert_eq!(
+        outcome(register, &short),
+        "fleet.ship.state_log.short",
+        "{log:?}"
+      );
+      assert_eq!(
+        super::ship_counters(register.class()).no_session,
+        "fleet.ship.state_log.no_session"
+      );
+    }
   }
 }
