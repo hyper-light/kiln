@@ -94,7 +94,13 @@ here, so a restart before they're in brings them again (an upgrade in place too,
 running), and they go with it if it moves on. A session resumed on another machine from the server's
 store (its own machine gone, and its inbox with it) brings the ids of the last 4,096 messages the
 server's copy of its timeline shows. A session that went on elsewhere and is restored on its old
-machine (a stale copy) takes nothing there.
+machine (a stale copy) takes nothing there. What a machine it left still holds of it, never seen to
+an end there (a message its harness was given), stays at the epoch it left at: a move carries its
+queue and its conversation, not that. Back on that machine at a higher epoch, it lets that go before
+anything is restored, as none of it can be restored at another epoch: restoring it refused all it
+was sent, for good (Slates, 2026-11-20: back on a Mac it had left, it took none of its person's
+messages or its 23 agents' there all night, each held in kiln). What came to an end there stays
+until the server acknowledges it, as each does.
 
 **Blue/green.** A session handed to the new build of its runner (another runner process of the same
 machine, at the same epoch) brings its inbox's newest ids the same way, and refuses messages while

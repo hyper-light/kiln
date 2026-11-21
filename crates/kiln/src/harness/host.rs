@@ -2420,7 +2420,15 @@ impl Host {
         }
         let mut after = None;
         let _ = input.controller.lock().restoring();
-        let reconciled = self.reconcile_legacy_mail(s, &input, LegacyReconciliation::Journal).await.is_ok();
+        // What an earlier stay on this machine left in its journal, at an epoch it has since left
+        // (it went on elsewhere and came back), goes first: none of it can be restored at this one,
+        // and one restored refused its admission for good (CP-T3.2, W20; Slates, 2026-11-20).
+        let epoch = input.controller.lock().capacity().epoch;
+        let left_behind = input.inbox.let_go_left_behind(&s.id, epoch).await;
+        if let Err(e) = &left_behind {
+            tracing::warn!(target: "kiln.sends", event = "left_behind_failed", session = %s.id, error = %e, "what an earlier stay left in a session's journal couldn't be let go of: it takes no messages until it can");
+        }
+        let reconciled = left_behind.is_ok() && self.reconcile_legacy_mail(s, &input, LegacyReconciliation::Journal).await.is_ok();
         if !reconciled { let _ = input.controller.lock().unavailable(); }
         loop {
             if !reconciled { break; }
