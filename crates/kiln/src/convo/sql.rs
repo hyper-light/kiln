@@ -78,7 +78,31 @@ pub const MIGRATIONS: &[&str] = &[
     // 4: a subagent's thread, its events by the call that started it ([`EVENTS_OF_PARENT`]): read
     // by an index of their own, however many other events the session has around them.
     "CREATE INDEX IF NOT EXISTS events_by_parent ON events (session, parent, seq);",
+    // 5: each session's inbox and journal (`crate::harness::inbox`: the ids of the messages it took, its head and epoch,
+    // the messages in its custody), kept here beside its conversation and fed with it (Ada, 2026-11-20): rows by family
+    // and key as kiln-seams' `Records` keeps them, the session each is of, its value (NULL: deleted, kept so a feed
+    // carries the delete), and the number of the write that last wrote it (one number for every row of one commit).
+    "CREATE TABLE IF NOT EXISTS inbox (
+        family TEXT NOT NULL,
+        key BLOB NOT NULL,
+        session TEXT NOT NULL,
+        value BLOB,
+        rev INTEGER NOT NULL,
+        PRIMARY KEY (family, key)
+    );
+    CREATE INDEX IF NOT EXISTS inbox_by_rev ON inbox (rev);",
 ];
+
+// Each session's inbox and journal (migration 5): a row as it is now, a deleted one kept empty for the feed.
+pub const INBOX_GET: &str = "SELECT value, rev FROM inbox WHERE family = ?1 AND key = ?2";
+/// A family's rows from a key on (inclusive: `?2`, the prefix; or past `after`, exclusive, `?3`), before `?4` (none: to
+/// the end), deleted ones left out.
+pub const INBOX_SCAN: &str = "SELECT key, value, rev FROM inbox WHERE family = ?1 AND key >= ?2 AND (?3 IS NULL OR key > ?3) AND (?4 IS NULL OR key < ?4) AND value IS NOT NULL ORDER BY key LIMIT ?5";
+pub const INBOX_PUT: &str = "INSERT INTO inbox (family, key, session, value, rev) VALUES (?1, ?2, ?3, ?4, ?5)
+    ON CONFLICT (family, key) DO UPDATE SET session = excluded.session, value = excluded.value, rev = excluded.rev";
+pub const INBOX_DELETE: &str = "UPDATE inbox SET value = NULL, rev = ?3 WHERE family = ?1 AND key = ?2 AND value IS NOT NULL";
+/// The rows of one commit (its number), as they are now: what a page that cut it short didn't read.
+pub const INBOX_AT: &str = "SELECT rev, * FROM inbox WHERE rev = ?1";
 
 /// Where the migrations done so far are counted.
 pub const META: &str = "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)";
@@ -241,6 +265,9 @@ pub const FEED_SESSIONS: &str = "SELECT id, info, meta, state, changes, updated_
 pub const FEED_EVENTS: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev FROM events WHERE rev > ?1 ORDER BY rev LIMIT ?2";
 pub const FEED_RECORDS: &str = "SELECT session, source, n, line_end, line, rev FROM records WHERE rev > ?1 ORDER BY rev LIMIT ?2";
 pub const FEED_DROPS: &str = "SELECT rev, session, what, source, n, at FROM drops WHERE rev > ?1 ORDER BY rev LIMIT ?2";
+pub const FEED_INBOX: &str = "SELECT session, family, key, value, rev FROM inbox WHERE rev > ?1 ORDER BY rev LIMIT ?2";
+/// The rest of one inbox commit a page of the feed cut short (its rows share its number).
+pub const FEED_INBOX_AT: &str = "SELECT session, family, key, value, rev FROM inbox WHERE rev = ?1";
 
 /// Through where a store took a peer's feed.
 pub const PEER_GET: &str = "SELECT rev FROM peers WHERE peer = ?1";

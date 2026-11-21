@@ -264,12 +264,14 @@ fn projection_on(c: &Connection, recipient: &str, token: Token, epoch: u64) -> R
 }
 
 /// Recovery preserves the original attempt token: uncertain dispatch is not permission to
-/// allocate a new generation or pretend that its source never accepted it.
-pub async fn attempts(store: &Store, recipient: String, after: u64, budget: usize) -> Result<Page<Delivery>, Error> {
+/// allocate a new generation or pretend that its source never accepted it. Only attempts last sent
+/// on another connection than `connection` (none: every one): one sent on it already needs no
+/// replay, and the pump no longer takes the store's writer to find that out, each pass, for each.
+pub async fn attempts(store: &Store, recipient: String, connection: Option<String>, after: u64, budget: usize) -> Result<Page<Delivery>, Error> {
     store.read(move |c| {
         let mut page = Page { items: Vec::new(), next: None }; let mut bytes = 0;
-        let mut q = c.prepare("SELECT revision,generation,epoch,body FROM agent_mail WHERE recipient=?1 AND revision>?2 AND disposition IN ('dispatched','admitted') ORDER BY revision")?;
-        let mut rows = q.query(params![recipient, number(after)?])?;
+        let mut q = c.prepare("SELECT revision,generation,epoch,body FROM agent_mail WHERE recipient=?1 AND revision>?2 AND disposition IN ('dispatched','admitted') AND (?3 IS NULL OR source_connection IS NOT ?3) ORDER BY revision")?;
+        let mut rows = q.query(params![recipient, number(after)?, connection])?;
         while let Some(row) = rows.next()? {
             let revision = unsigned(row.get(0)?)?;
             let token = Token { revision, generation: unsigned(row.get(1)?)? };

@@ -14,6 +14,7 @@
 
 pub mod board;
 pub mod feed;
+pub mod inbox;
 pub mod mirror;
 pub mod record;
 pub mod resume;

@@ -530,7 +530,8 @@ pub async fn create(hub: &Arc<Hub>, person: &str, draft: Draft) -> R<Agentenv> {
 
 /// Environment `id` of `person`'s changed as `patch` says, over its version `version`: one version up. Where its scope,
 /// `auto` or variables changed, the stacks of its owner's running sessions it joins or leaves on its own follow
-/// ([`rematch`]).
+/// ([`rematch`]); and where what it gives changed (its variables or base), each running session it's in, given by name
+/// or on its own, takes it too ([`resend`]: its harness starts again on it, the person's decision of 2026-11-21).
 pub async fn update(hub: &Arc<Hub>, person: &str, id: &str, version: i64, patch: Patch) -> R<Agentenv> {
     let old = get(hub, person, id).await?;
     if old.version != version {
@@ -557,6 +558,7 @@ pub async fn update(hub: &Arc<Hub>, person: &str, id: &str, version: i64, patch:
         return Ok(old);
     }
     let matched_by = (scope != old.scope, auto != old.auto, vars != old.vars);
+    let gives = vars != old.vars || base != old.base;
     let json = serde_json::to_string(&vars).map_err(anyhow::Error::from)?;
     let tags = serde_json::to_string(&tags).map_err(anyhow::Error::from)?;
     let scope = serde_json::to_string(&scope).map_err(anyhow::Error::from)?;
@@ -588,12 +590,21 @@ pub async fn update(hub: &Arc<Hub>, person: &str, id: &str, version: i64, patch:
             told(hub, &e.owner, &e.id, false);
             // Its scope or `auto` says which sessions it joins on its own; its variables, whether a microVM's may have it
             // (one with a secret never joins one on its own).
-            if matched_by.0 || matched_by.1 || (matched_by.2 && (e.auto || !e.sessions.is_empty())) {
-                let changed = rematch(hub, &e).await?;
-                resend(hub, changed, "an environment applied on its own changed");
-                return Ok(Agentenv { sessions: sessions_of(hub, id), ..e });
+            let mut changed = if matched_by.0 || matched_by.1 || (matched_by.2 && (e.auto || !e.sessions.is_empty())) { rematch(hub, &e).await? } else { Vec::new() };
+            // What it gives changed: each running session it's in takes it, as well as those it joined or left.
+            if gives {
+                for session in sessions_of(hub, id) {
+                    let Some(info) = hub.harness.info(&session).filter(|i| i.status != crate::harness::model::Status::Exited) else { continue };
+                    if !changed.iter().any(|(s, _)| *s == session) {
+                        changed.push((session, info.isolation.is_some()));
+                    }
+                }
             }
-            Ok(e)
+            if changed.is_empty() {
+                return Ok(e);
+            }
+            resend(hub, changed, "an environment it runs with changed");
+            Ok(Agentenv { sessions: sessions_of(hub, id), ..e })
         }
         Written::Missing => Err(unknown(id)),
         Written::Taken => Err(taken(&name)),
@@ -785,9 +796,11 @@ pub async fn rematch(hub: &Hub, env: &Agentenv) -> R<Vec<(String, bool)>> {
     Ok(changed)
 }
 
-/// Each of `sessions` (each with whether it's in a microVM) given its stack opened again, its harness taking it as it
-/// next starts (`restart` false), `why` saying what changed it; in the background, each failure logged (a runner that
-/// was away is given it as it announces the session again: [`resolve::opened`]).
+/// Each of `sessions` (each with whether it's in a microVM) given its stack opened again, its harness starting again on
+/// it once nothing is under way, its conversation going on, as applying one does (the person's decision, 2026-11-21: a
+/// change to the environments a running agent has reaches it; one taken only at its next start never did, since nothing
+/// started it), `why` saying what changed it; in the background, each failure logged (a runner that was away is given
+/// it as it announces the session again: [`resolve::opened`]).
 pub fn resend(hub: &Arc<Hub>, sessions: Vec<(String, bool)>, why: &'static str) {
     if sessions.is_empty() {
         return;
@@ -798,13 +811,13 @@ pub fn resend(hub: &Arc<Hub>, sessions: Vec<(String, bool)>, why: &'static str) 
             let opened = match resolve::again(&hub, &session, microvm, why).await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(target: "kiln.agentenvs", %session, error = %e, "a session's environments couldn't be opened after one applied on its own changed");
+                    tracing::warn!(target: "kiln.agentenvs", %session, error = %e, "a session's environments couldn't be opened after one it runs with changed");
                     continue;
                 }
             };
-            let sent = hub.harness.send_agentenv(&hub, &session, opened, false).await;
+            let sent = hub.harness.send_agentenv(&hub, &session, opened, true).await;
             if let Some((_, why)) = sent.failure() {
-                tracing::warn!(target: "kiln.agentenvs", %session, %why, "a session's environments couldn't be given to it after one applied on its own changed");
+                tracing::warn!(target: "kiln.agentenvs", %session, %why, "a session's environments couldn't be given to it after one it runs with changed");
             }
         }
     }));

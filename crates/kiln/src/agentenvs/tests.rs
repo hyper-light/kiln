@@ -483,3 +483,56 @@ fn applying_a_stack_replaces_it_whole() -> anyhow::Result<()> {
         Ok(())
     })
 }
+
+/// The person's decision, 2026-11-21 (docs/agents.md, "Environments"): a running agent takes every change to its
+/// environments, its harness starting again on it once nothing is under way, its conversation going on. A change to the
+/// variables of one it was given by name reaches its harness, and so does one applied on its own made to match it, which
+/// joins its stack; neither waits for a next start nothing would bring (an `ANTHROPIC_API_KEY` set in the UI never
+/// reached the running agent it was meant for). Its harness says what it started with each time it started.
+#[test]
+#[cfg(unix)]
+fn a_running_agent_takes_every_change_to_its_environments() -> anyhow::Result<()> {
+    use crate::harness::ops::end_to_end::{hub_with, recording_program, source_ready, source_until};
+    use std::os::unix::fs::PermissionsExt as _;
+    crate::harness::ops::end_to_end::run(async {
+        let hub = hub_with(|_| {}).await?;
+        let dir = tempfile::tempdir()?;
+        let (recording, _) = recording_program(&dir.path().join("harness"), true)?;
+        let seen = dir.path().join("seen");
+        let program = dir.path().join("harness").join("seeing-claude");
+        std::fs::write(&program, format!("#!/bin/sh\ncase \" $* \" in *\" --version \"*) ;; *) printf '%s/%s\\n' \"${{AGENTENV_KEY:--}}\" \"${{AGENTENV_PROBE:--}}\" >> '{}' ;; esac\nexec '{}' \"$@\"\n", seen.display(), recording.display()))?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))?;
+        let lines = || std::fs::read_to_string(&seen).unwrap_or_default().lines().map(str::to_owned).collect::<Vec<_>>();
+        let last_is = |want: &'static str| {
+            let now = lines();
+            async move { anyhow::Ok(now.last().is_some_and(|l| l == want)) }
+        };
+        let ada = person("u-ada", &["admin"]);
+        let var = |name: &str, v: &str| serde_json::from_value::<Vec<Var>>(json!([{"name": name, "from": "value", "value": v}]));
+        let env = create(&hub, "user:u-ada", Draft { name: "key".into(), vars: var("AGENTENV_KEY", "one")?, ..Draft::default() }).await?;
+        let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), program: Some(program.to_string_lossy().into_owned()), reach: Some("off".into()), ..Default::default() };
+        let id = hub.harness.open(&hub, "local", spec, 1).await?.first().map(|i| i.id.clone()).ok_or_else(|| anyhow::anyhow!("no session"))?;
+        // Its person, as a start records whom it acts for.
+        hub.store.kv_set(crate::mcp::opened_by_key(&id), "user:u-ada".to_owned()).await?;
+        source_ready(&hub, &id).await?;
+
+        // Given by name: its harness starts again with it.
+        op(&hub, &ada, "agentenvs.apply", json!({"agent": id, "agentenvs": [env.id]})).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        source_until(&hub, &id, "its harness started again with the environment it was given", || last_is("one/-")).await?;
+
+        // Its variables changed: its harness starts again with the new value.
+        update(&hub, "user:u-ada", &env.id, 1, Patch { vars: Some(var("AGENTENV_KEY", "two")?), ..Patch::default() }).await?;
+        source_until(&hub, &id, "its harness started again with its environment's new value", || last_is("two/-")).await?;
+
+        // One applied on its own, made to match it: it joins its stack under the one given by name, and its harness
+        // starts again with both.
+        let on_own = create(&hub, "user:u-ada", Draft { name: "everywhere".into(), vars: var("AGENTENV_PROBE", "joined")?, auto: true, ..Draft::default() }).await?;
+        anyhow::ensure!(stack(&hub, &id) == [Link::named(&env.id), Link { id: on_own.id.clone(), auto: true }], "{:?}", stack(&hub, &id));
+        source_until(&hub, &id, "its harness started again with the one applied on its own", || last_is("two/joined")).await?;
+        let mut each = lines();
+        each.dedup();
+        anyhow::ensure!(each == ["-/-", "one/-", "two/-", "two/joined"], "its harness started with {:?}", lines());
+        hub.harness.local.stop_all();
+        Ok(())
+    })
+}

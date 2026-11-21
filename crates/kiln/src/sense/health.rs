@@ -304,13 +304,9 @@ pub fn strained(m: &Measure, target_use: f64) -> Option<String> {
             worst = Some((v, who.to_owned()));
         }
     };
-    // Swapping is stall time, capacity lost, as memory's stall is (W05-R26): swap-ins' share of
-    // time by the utilization law (U = X·S, the device's own service time) counts where the
-    // machine's memory stall does; where the kernel's stall time has it already (Linux's PSI
-    // counts a refault's swap-in), the larger, never both.
     let (swap, device_rho, stretch) = super::pace::stand_ins();
-    let memory = m.pressure.memory.full.unwrap_or(0.0).max(swap.unwrap_or(0.0));
-    weigh(memory + m.pressure.io.full.unwrap_or(0.0), if swap.is_some_and(|s| s > m.pressure.memory.full.unwrap_or(0.0)) { "the machine (swapping)" } else { "the machine" });
+    let (memory, swapping) = machine_memory(m.pressure.memory.full, swap);
+    weigh(memory + m.pressure.io.full.unwrap_or(0.0), if swapping { "the machine (swapping)" } else { "the machine" });
     if let Some(c) = &m.cgroup {
         weigh(stall(&c.pressure), "the runner's own cgroup");
     }
@@ -333,6 +329,21 @@ pub fn strained(m: &Measure, target_use: f64) -> Option<String> {
     }
     let (v, who) = worst?;
     (v > reserve).then(|| format!("{who}'s tasks all stalled on memory and I/O {:.0}% of the time, past the {:.0}% the scheduler keeps in reserve (1 − target_use)", v * 100.0, reserve * 100.0))
+}
+
+/// The machine's memory stall, and whether swapping stands for it. Swapping is stall time,
+/// capacity lost, as memory's stall is (W05-R26), but the kernel's own stall time comes first
+/// where it keeps one: Linux's PSI counts every swap-in's wait, from whatever device the swap is
+/// on. Swap-ins' share by the utilization law (U = X·S) prices each at the work device's service
+/// time, which is no swap device's when swap is zram (compressed memory, microseconds to read
+/// back): a machine with its memory stalled 2% of the time read as stalled past 100% and took no
+/// new session. So that share stands in only where the kernel keeps no memory stall time.
+fn machine_memory(full: Option<f64>, swap: Option<f64>) -> (f64, bool) {
+    match (full, swap) {
+        (Some(full), _) => (full, false),
+        (None, Some(swap)) => (swap, true),
+        (None, None) => (0.0, false),
+    }
 }
 
 /// This runner's health, kept as its runs end and as it measures.
@@ -379,6 +390,16 @@ mod tests {
         assert!(strained(&s, 0.85).is_some_and(|w| w.starts_with("kiln.service")));
         assert_eq!(strained(&s, 0.7), None, "a 30% reserve holds 20%");
         assert!(Health::default().check(&Ask::default(), &m, 0.85).is_err_and(|r| r.kind == "strained"));
+    }
+
+    /// W05-R26: the kernel's memory stall, where it keeps one, is the machine's; swap-ins priced
+    /// at the work device's service time stand in only where it keeps none (adacachy, zram swap:
+    /// PSI's 2% read as past 100%, and no session started).
+    #[test]
+    fn w05_r26_swap_stands_in_only_without_the_kernels_stall() {
+        assert_eq!(machine_memory(Some(0.02), Some(0.99)), (0.02, false), "PSI's measure, not the estimate");
+        assert_eq!(machine_memory(None, Some(0.3)), (0.3, true));
+        assert_eq!(machine_memory(None, None), (0.0, false));
     }
 
     #[test]
