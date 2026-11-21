@@ -1584,11 +1584,12 @@ pub mod input {
         pub name: Option<String>,
         #[schemars(range(min = 1, max = 16))]
         pub count: Option<i64>,
-        /// Where it works: `volume`, a Slates volume of its own laid over the folder's repository,
-        /// where what it changes stays its own until it goes up for review (agents.change) or a
-        /// person writes it to disk (the default where its machine can make one; else its folder,
-        /// saying why), or `folder`, its folder itself. Started in another agent's folder on that
-        /// agent's machine, it works in that agent's volume.
+        /// Where it works: `folder`, its folder itself (the default), or `volume`, a Slates volume of
+        /// its own laid over the folder's repository, where what it changes stays its own until it
+        /// goes up for review (agents.change) or a person writes it to disk: only where kiln's Slates
+        /// workspaces are on (`[workspaces] enabled`, off by default) and its machine can make one,
+        /// else refused, saying why. Started in another agent's folder on that agent's machine, it
+        /// works in that agent's volume.
         pub workspace: Option<AgentsStartWorkspace>,
         /// How it's held: `none`, a process on its machine (the default); `microvm`, a microVM of
         /// its own, on a machine that starts them; or `pod`, a pod of its own on the server's Kubernetes
@@ -3286,47 +3287,55 @@ for line in sys.stdin:
         })
     }
 
-    /// Kiln goal 01a1ec34599974448aed2672bafaf9a2 (docs/agentic.md W2): what an agent works in when its start names no
-    /// workspace is the server's `[agents] workspace`: on a server that says `folder` (a test's, a lab's) its folder
-    /// itself, nothing made for it; and a person's `folder` is kept as asked on a server whose default is a volume, its
-    /// machine asked nothing about one; and where its machine can't make a volume the start is refused, naming what it
-    /// lacks (`lineage::NoWorkspace`), never run in its folder instead (the coordinator's ruling of 2026-11-18: that
-    /// fallback was a second path), one started in a person's shell like any other: it works on a volume too, its folder
-    /// and environment moved onto it, never beside it in the person's folder (I11), and so does a conversation taken up
-    /// (I12). None needs Slates, so this holds on every machine.
+    /// The person's ruling, 2026-11-21 (docs/agentic.md W2): Slates workspaces are an option kiln's owner enables
+    /// (`[workspaces] enabled`, off by default). An agent whose start names no workspace works in its folder, nothing
+    /// made for it, whether they're on or off; a person's `folder` is kept as asked; a start asking for a volume while
+    /// they're off is refused, saying how to turn them on, however it comes (`agents.start`, or a spec handed to the
+    /// registry); and with them on, a machine that can't make one refuses it, naming what it lacks
+    /// (`lineage::NoWorkspace`), one started in a person's shell and a conversation taken up alike (I11, I12), never
+    /// running it in its folder instead. None needs Slates, so this holds on every machine.
     #[test]
-    fn w2_a_start_naming_no_workspace_follows_the_servers_setting_and_a_folder_asked_for_is_kept() -> anyhow::Result<()> {
+    fn w2_the_default_workspace_is_the_folder_and_a_volume_needs_workspaces_on() -> anyhow::Result<()> {
         run(async {
             let fail = |(s, m): crate::ops::Fail| anyhow::anyhow!("{s} {m}");
             let started = |out: &Value| out.pointer("/agents/0/id").and_then(Value::as_str).unwrap_or_default().to_owned();
-            // A server whose agents work in their folders (every test server's): nothing named, nothing made.
-            let hub = hub_with(|_| {}).await?;
-            let cx = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
-            let id = started(&call(cx.clone(), "agents.start", json!({"kind": "claude", "cwd": NOWHERE, "on": "local"})).await.map_err(fail)?);
-            let info = hub.harness.info(&id).ok_or_else(|| anyhow::anyhow!("no agent {id}"))?;
-            anyhow::ensure!(info.workspace.is_none(), "{:?}", info.workspace);
-            let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
-            anyhow::ensure!(ws == json!({"workspace": null, "drift": []}), "{ws}");
-            // kiln's default, a volume where its machine can make one: a person's `folder` is kept as asked.
-            let hub = hub_with(|c| c.agents.workspace = crate::config::DefaultWorkspace::Volume).await?;
-            let cx = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
-            let id = started(&call(cx.clone(), "agents.start", json!({"kind": "claude", "cwd": NOWHERE, "on": "local", "workspace": "folder"})).await.map_err(fail)?);
-            let info = hub.harness.info(&id).ok_or_else(|| anyhow::anyhow!("no agent {id}"))?;
-            anyhow::ensure!(info.workspace == Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }), "{:?}", info.workspace);
-            // Its folder has nothing of its own to drift from, and no machine is asked.
-            let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
-            anyhow::ensure!(ws.pointer("/workspace/kind") == Some(&json!("folder")) && ws.get("drift") == Some(&json!([])), "{ws}");
-            anyhow::ensure!(ws.pointer("/workspace/volume") == Some(&Value::Null), "{ws}");
-            // A machine that can't make a volume (here its kiln is older than workspaces) refuses a start that names
-            // none, typed, naming what it lacks: it never runs the agent in its plain folder instead (no second path);
-            // one started in a person's shell there is refused alike, since it too works on a volume, and so is a
-            // conversation taken up there (I12).
-            hub.put_agent(crate::hub::tests::live_runner("old", "linux", "x86_64"));
-            for (shell, resume) in [(None, None), (Some("t1"), None), (None, Some("0e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b"))] {
-                let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: shell.map(str::to_owned), resume: resume.map(str::to_owned), ..Default::default() };
-                let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
-                let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
-                anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "shell {shell:?}, resume {resume:?}: {refused:?}");
+            let volume = || Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() });
+            for on in [false, true] {
+                let hub = hub_with(|c| c.workspaces.enabled = on).await?;
+                let cx = Cx { hub: Arc::clone(&hub), caller: crate::authz::Caller::owner() };
+                // Nothing named: its folder, nothing made, its machine asked nothing.
+                let id = started(&call(cx.clone(), "agents.start", json!({"kind": "claude", "cwd": NOWHERE, "on": "local"})).await.map_err(fail)?);
+                let info = hub.harness.info(&id).ok_or_else(|| anyhow::anyhow!("no agent {id}"))?;
+                anyhow::ensure!(info.workspace.is_none(), "on {on}: {:?}", info.workspace);
+                let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
+                anyhow::ensure!(ws == json!({"workspace": null, "drift": []}), "on {on}: {ws}");
+                // A person's `folder` is kept as asked.
+                let id = started(&call(cx.clone(), "agents.start", json!({"kind": "claude", "cwd": NOWHERE, "on": "local", "workspace": "folder"})).await.map_err(fail)?);
+                let info = hub.harness.info(&id).ok_or_else(|| anyhow::anyhow!("no agent {id}"))?;
+                anyhow::ensure!(info.workspace == Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }), "on {on}: {:?}", info.workspace);
+                let ws = call(cx.clone(), "agents.workspace", json!({"agent": id})).await.map_err(fail)?;
+                anyhow::ensure!(ws.pointer("/workspace/kind") == Some(&json!("folder")) && ws.get("drift") == Some(&json!([])) && ws.pointer("/workspace/volume") == Some(&Value::Null), "on {on}: {ws}");
+                hub.put_agent(crate::hub::tests::live_runner("old", "linux", "x86_64"));
+                if !on {
+                    // A volume asked for while they're off: refused, saying how to turn them on, by `agents.start` and by
+                    // the registry alike.
+                    let refused = call(cx.clone(), "agents.start", json!({"kind": "claude", "cwd": NOWHERE, "on": "local", "workspace": "volume"})).await.err().ok_or_else(|| anyhow::anyhow!("a volume started while workspaces are off"))?;
+                    anyhow::ensure!(refused.0 == http::StatusCode::CONFLICT && refused.1.contains("[workspaces] enabled = true"), "{refused:?}");
+                    let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), workspace: volume(), ..Default::default() };
+                    let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
+                    let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
+                    anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::Workspaces && n.said == crate::config::WORKSPACES_OFF), "{refused:?}");
+                    continue;
+                }
+                // On, a machine that can't make a volume (here its kiln is older than workspaces) refuses a start asking
+                // for one, typed, naming what it lacks; one started in a person's shell there alike, and a conversation
+                // taken up there (I12).
+                for (shell, resume) in [(None, None), (Some("t1"), None), (None, Some("0e5c9a3b-2c1d-4e8f-9a7b-6c5d4e3f2a1b"))] {
+                    let spec = crate::harness::session::Spec { kind: "claude".into(), cwd: Some(NOWHERE.into()), shell: shell.map(str::to_owned), resume: resume.map(str::to_owned), workspace: volume(), ..Default::default() };
+                    let refused = hub.harness.open(&hub, "agent:old", spec, 1).await;
+                    let no = refused.as_ref().err().and_then(|e| e.downcast_ref::<crate::harness::lineage::NoWorkspace>());
+                    anyhow::ensure!(no.is_some_and(|n| n.missing == crate::workspace::slates::WorkspaceMissing::KilnUpgrade && n.said.contains("older than workspaces")), "shell {shell:?}, resume {resume:?}: {refused:?}");
+                }
             }
             Ok(())
         })

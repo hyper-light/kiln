@@ -4,7 +4,7 @@
 //! Linux, NFS on loopback on macOS, WinFsp at a drive letter on Windows); skipped, saying so, elsewhere. No harness ever runs (each agent's program doesn't exist), so each session stays as
 //! kiln made it, its folder its workspace.
 //!
-//! - Every harness kiln runs, started naming no workspace, works in a volume of its own, mounted, its folder there.
+//! - Every harness kiln runs, started asking for a volume, works in a volume of its own, mounted, its folder there.
 //! - A child started in its parent's folder works in its parent's volume; the volume outlives the parent while the
 //!   child works in it, and goes with the child.
 //! - Review: a change request from a volume holds what changed there.
@@ -175,10 +175,10 @@ fn stop(pid: u32) {
 }
 
 async fn run() -> anyhow::Result<()> {
-    // kiln's own default (`[agents] workspace = "volume"`), which a scratch hub turns off for every other test.
+    // Slates workspaces on (`[workspaces] enabled`, off by default).
     let hub = crate::hub::tests::scratch_hub_with(|c| {
         c.terminal.enabled = true;
-        c.agents.workspace = crate::config::DefaultWorkspace::Volume;
+        c.workspaces.enabled = true;
     })
     .await?;
     let h = Arc::clone(&hub);
@@ -199,11 +199,11 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
     let cx = Cx { hub: Arc::clone(hub), caller: crate::authz::Caller::owner() };
     let fail = |(c, m): crate::ops::Fail| anyhow::anyhow!("{c}: {m}");
 
-    // Every harness, naming no workspace: a volume of its own each, mounted, its folder there.
+    // Every harness, asking for a volume: a volume of its own each, mounted, its folder there.
     let mut volumes = HashSet::new();
     let mut each = Vec::new();
     for kind in crate::harness::kinds::Kind::all().iter().filter(|k| k.structured()) {
-        let spec = Spec { kind: kind.id.into(), cwd: Some(src.to_string_lossy().into_owned()), name: Some(format!("{} on a volume", kind.name)), program: Some(missing.clone()), ..Spec::default() };
+        let spec = Spec { kind: kind.id.into(), cwd: Some(src.to_string_lossy().into_owned()), name: Some(format!("{} on a volume", kind.name)), program: Some(missing.clone()), workspace: Some(super::Workspace { kind: "volume".into(), ..Default::default() }), ..Spec::default() };
         let info = started.open(spec).await?;
         let w = info.workspace.clone().ok_or_else(|| anyhow::anyhow!("{}: no workspace", kind.id))?;
         anyhow::ensure!(w.kind == "volume" && w.owner.is_none(), "{}: {w:?}", kind.id);
@@ -296,3 +296,4 @@ async fn scenario(hub: &Arc<Hub>, started: &mut Started) -> anyhow::Result<()> {
     anyhow::ensure!(until(GONE_WITHIN, || !mounted(&parent_made.mount)).await, "the volume stayed after its last agent ended");
     Ok(())
 }
+

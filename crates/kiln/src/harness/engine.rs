@@ -7,8 +7,9 @@
 //!    `runners.engine.set`): kept in the server's `kv` table (`runner_engine/<runner>`), sent to its
 //!    runner as that names [`crate::proto::feature::RUNNER_ENGINE`] and whenever it changes
 //!    (`ServerMsg::RunnerEngine`), and kept by the runner in its state folder for its restarts;
-//! 2. `microvm` where the runner can hold agents in microVMs now ([`capable`]: the person's decision 3,
-//!    2026-11-14), else `host`, saying why.
+//! 2. `host`: the microVM engine is an option its owner enables, never a default (the person's ruling, 2026-11-21:
+//!    "Like the microVM engine, it's designed to be an option we can enable"; it was `microvm` wherever the runner
+//!    could hold microVMs, the person's decision 3 of 2026-11-14), saying why it can't hold them where it can't.
 //!
 //! `container` (docs/agentic.md W9): each in an OCI container of its own on its workspace's Slates volume, through the
 //! machine's container engine (`crate::sandbox::container`). Only ever its owner's choice, never a default: it's refused
@@ -74,7 +75,7 @@ pub fn stale(placed: Option<u64>, here: Asked) -> Option<String> {
 pub enum Source {
     /// Its owner set it on the server.
     Server,
-    /// What the runner can do now: `microvm` where it can hold agents in microVMs, else `host`.
+    /// Nothing set: `host`, the microVM engine being an option its owner enables (the person's ruling, 2026-11-21).
     Default,
 }
 
@@ -123,8 +124,8 @@ pub struct Held {
     pub why: Option<String>,
 }
 
-/// What a runner holds: what its owner set, else `microvm` where it can hold microVMs (`can`), else `host`.
-/// `microvm` set where it can't any more is held as `host`, saying why, and so is `container` set where its agents
+/// What a runner holds: what its owner set, else `host` (the person's ruling, 2026-11-21: the microVM engine is an
+/// option its owner enables), saying why it can't hold microVMs where it can't (`can`). `microvm` set where it can't any more is held as `host`, saying why, and so is `container` set where its agents
 /// can't run in containers any more (`boxed`).
 pub fn held(asked: Asked, can: &Capable, boxed: &Capable) -> Held {
     match (asked.engine, can.usable) {
@@ -133,8 +134,7 @@ pub fn held(asked: Asked, can: &Capable, boxed: &Capable) -> Held {
             Held { engine: Engine::Host, from: Source::Default, why: Some(format!("its owner set container, but its agents can't run in containers now: {}", boxed.why.as_deref().unwrap_or(CONTAINERS_NOT_SAID))) }
         }
         (Some(engine), _) => Held { engine, from: Source::Server, why: None },
-        (None, true) => Held { engine: Engine::Microvm, from: Source::Default, why: None },
-        (None, false) => Held { engine: Engine::Host, from: Source::Default, why: can.why.clone() },
+        (None, _) => Held { engine: Engine::Host, from: Source::Default, why: can.why.clone() },
     }
 }
 
@@ -591,16 +591,17 @@ mod tests {
         Isolation { available: false, hypervisor: None, why_not: Some(why.into()), engine: None, image_class: None }
     }
 
-    /// P2.3 AC2 (the person's decision 3): a runner that can hold microVMs defaults to `microvm`; one
-    /// that can't holds `host`, its facts' why beside it. What its owner set wins, but `microvm` set
-    /// where it can't any more is held as `host`, saying why.
+    /// P2.3 AC2, as the person ruled on 2026-11-21 (the microVM engine is an option its owner enables): a runner
+    /// that can hold microVMs holds `host` until its owner sets `microvm`; one that can't holds `host`, its facts' why
+    /// beside it. What its owner set wins, but `microvm` set where it can't any more is held as `host`, saying why.
     #[test]
-    fn p2_3_ac2_a_capable_runner_defaults_to_microvm_and_one_that_isnt_says_why() {
+    fn p2_3_ac2_the_default_engine_is_host_and_microvm_is_its_owners_to_set() {
         let set = |e| Asked { engine: Some(e), version: 1 };
         let yes = capable(&facts(Some(able())));
         let no = capable(&facts(Some(unable("no hypervisor"))));
         let boxed = containers(&facts(None));
-        assert_eq!(held(Asked::default(), &yes, &boxed), Held { engine: Engine::Microvm, from: Source::Default, why: None });
+        assert_eq!(held(Asked::default(), &yes, &boxed), Held { engine: Engine::Host, from: Source::Default, why: None }, "microVMs are opt-in");
+        assert_eq!(held(set(Engine::Microvm), &yes, &boxed), Held { engine: Engine::Microvm, from: Source::Server, why: None });
         assert_eq!(held(Asked::default(), &no, &boxed), Held { engine: Engine::Host, from: Source::Default, why: Some("no hypervisor".into()) });
         assert_eq!(held(set(Engine::Host), &yes, &boxed), Held { engine: Engine::Host, from: Source::Server, why: None });
         assert_eq!(held(set(Engine::Host), &no, &boxed).engine, Engine::Host);
@@ -617,13 +618,15 @@ mod tests {
     fn p2_4_a_host_runner_offers_no_microvm_in_its_facts() {
         let mut f = facts(Some(able()));
         overlay(&mut f, Asked::default());
+        assert_eq!((f.virt.microvm, of(&f)), (false, Some(Engine::Host)), "microVMs are opt-in");
+        overlay(&mut f, Asked { engine: Some(Engine::Microvm), version: 0 });
         assert_eq!((f.virt.microvm, of(&f)), (true, Some(Engine::Microvm)));
         overlay(&mut f, Asked { engine: Some(Engine::Host), version: 0 });
         assert_eq!((f.virt.microvm, of(&f)), (false, Some(Engine::Host)));
         overlay(&mut f, Asked { engine: Some(Engine::Host), version: 0 });
         assert_eq!((f.virt.microvm, of(&f)), (false, Some(Engine::Host)), "said again, the same");
-        overlay(&mut f, Asked::default());
-        assert!(f.virt.microvm, "set back to what it can do");
+        overlay(&mut f, Asked { engine: Some(Engine::Microvm), version: 0 });
+        assert!(f.virt.microvm, "set back to microvm");
         let mut g = facts(Some(unable("no hypervisor")));
         g.virt.microvm = true;
         overlay(&mut g, Asked { engine: Some(Engine::Microvm), version: 0 });
@@ -668,7 +671,7 @@ mod tests {
         assert_eq!(containers(&can), Capable { usable: true, why: None });
         assert_eq!(containers(&facts(None)), Capable { usable: false, why: Some(CONTAINERS_NOT_SAID.into()) });
         for f in [&can, &cant] {
-            assert_eq!(held(Asked::default(), &capable(f), &containers(f)).engine, Engine::Microvm, "never container unasked");
+            assert_eq!(held(Asked::default(), &capable(f), &containers(f)).engine, Engine::Host, "never container unasked");
         }
         assert_eq!(held(set, &capable(&can), &containers(&can)), Held { engine: Engine::Container, from: Source::Server, why: None });
         let lost = held(set, &capable(&cant), &containers(&cant));
@@ -708,9 +711,9 @@ mod tests {
 
     /// Decision 8 of the design (ROOT's rulings: "Draining waits for each session to end, with an explicit End them
     /// now press"), through the operations as REST, MCP and code mode call them, on a runner that holds microVMs
-    /// (`linux`) running two sessions in them, one started by the other: nothing drains, so `cancel` is refused and
+    /// (`linux`) whose owner set `microvm`, running two sessions in them, one started by the other: nothing drains, so `cancel` is refused and
     /// "End them now" ends nothing. Switched to `host`, both drain, each listed (`draining_sessions`, the child first)
-    /// with the switch they drain for; cancelled, its engine is what it was (what it can do: `microvm`), a setting of
+    /// with the switch they drain for; cancelled, its engine is what its owner had set before (`microvm`), a setting of
     /// its own, and nothing drains. Switched again, "End them now" ends both, the child before its parent, and as
     /// their runner says each closed, nothing drains and no session is left. A runner kiln doesn't know is 404 to
     /// both. Taking the switch out of what `set` keeps refuses the cancel; ending them parent first fails the order.
@@ -733,23 +736,28 @@ mod tests {
             let op = |name: &'static str, input: Value| crate::ops::call(crate::ops::Cx { hub: std::sync::Arc::clone(&hub), caller: crate::authz::Caller::owner() }, name, input);
             let ids = |v: &Value, k: &str| -> Vec<String> { v.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(|s| s.get("id").or(Some(s)).and_then(Value::as_str)).map(str::to_owned).collect() };
             let linux = json!({"runner": "linux"});
-
-            // Nothing drains: no switch to cancel, nothing to end.
-            let v = op("runners.engine", linux.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
-            anyhow::ensure!(v.get("engine") == Some(&json!("microvm")) && v.get("sessions") == Some(&json!(2)) && v.get("draining") == Some(&json!(0)) && v.get("draining_sessions") == Some(&json!([])) && v.get("switch") == Some(&Value::Null), "{v}");
+            // Never switched: nothing to cancel.
             let refused = op("runners.engine.cancel", linux.clone()).await.err().ok_or_else(|| anyhow::anyhow!("a cancel with no switch went"))?;
             anyhow::ensure!(refused.0 == StatusCode::CONFLICT && refused.1.contains("wasn't switched"), "{refused:?}");
+            // Its owner's `microvm` (the default is `host`: the person's ruling, 2026-11-21).
+            op("runners.engine.set", json!({"runner": "linux", "engine": "microvm"})).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
+
+            // Nothing drains: the owner's switch to `microvm` is done, so there's nothing to cancel or end.
+            let v = op("runners.engine", linux.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
+            anyhow::ensure!(v.get("engine") == Some(&json!("microvm")) && v.get("sessions") == Some(&json!(2)) && v.get("draining") == Some(&json!(0)) && v.get("draining_sessions") == Some(&json!([])) && v.get("switch") == Some(&Value::Null), "{v}");
+            let refused = op("runners.engine.cancel", linux.clone()).await.err().ok_or_else(|| anyhow::anyhow!("a cancel with nothing draining went"))?;
+            anyhow::ensure!(refused.0 == StatusCode::CONFLICT && refused.1.contains("nothing of"), "{refused:?}");
             let v = op("runners.engine.end_draining", linux.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
             anyhow::ensure!(v.get("ended") == Some(&json!([])) && v.get("sessions") == Some(&json!(2)), "nothing ended: {v}");
 
             // Switched to host: both drain, listed, the agent it started before the one that started it.
             let v = op("runners.engine.set", json!({"runner": "linux", "engine": "host"})).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
             anyhow::ensure!(v.get("engine") == Some(&json!("host")) && v.get("draining") == Some(&json!(2)) && ids(&v, "draining_sessions") == ["vm-child", "vm-lead"], "{v}");
-            anyhow::ensure!(v.pointer("/draining_sessions/0/engine") == Some(&json!("microvm")) && v.pointer("/switch/from") == Some(&Value::Null) && v.pointer("/switch/to") == Some(&json!("host")) && v.pointer("/switch/at").is_some_and(Value::is_i64), "{v}");
+            anyhow::ensure!(v.pointer("/draining_sessions/0/engine") == Some(&json!("microvm")) && v.pointer("/switch/from") == Some(&json!("microvm")) && v.pointer("/switch/to") == Some(&json!("host")) && v.pointer("/switch/at").is_some_and(Value::is_i64), "{v}");
 
             // Cancelled: its engine as it was, a setting of its own, and nothing drains.
             let v = op("runners.engine.cancel", linux.clone()).await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
-            anyhow::ensure!(v.get("engine") == Some(&json!("microvm")) && v.get("from") == Some(&json!("default")) && v.get("asked") == Some(&Value::Null) && v.get("version") == Some(&json!(2)), "{v}");
+            anyhow::ensure!(v.get("engine") == Some(&json!("microvm")) && v.get("from") == Some(&json!("server")) && v.get("asked") == Some(&json!("microvm")) && v.get("version") == Some(&json!(3)), "{v}");
             anyhow::ensure!(v.get("draining") == Some(&json!(0)) && v.get("sessions") == Some(&json!(2)) && v.get("switch") == Some(&Value::Null), "{v}");
             let refused = op("runners.engine.cancel", linux.clone()).await.err().ok_or_else(|| anyhow::anyhow!("a second cancel went"))?;
             anyhow::ensure!(refused.0 == StatusCode::CONFLICT && refused.1.contains("nothing of"), "{refused:?}");
