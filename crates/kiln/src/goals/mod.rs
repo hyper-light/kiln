@@ -4565,6 +4565,69 @@ mod tests {
         })
     }
 
+    /// G9 step 3 (goal a2a44298, T-T1.5.1): a goal edit wakes the goal driver on the store's change
+    /// alone. The driver asleep on its one deadline (another stack's pause, an hour off), its clock
+    /// never moved, a goal added to a running stack goes to its agent: no timer or poll brought it,
+    /// only the feed. (The wait's give-up is the test's, past which it fails.)
+    #[test]
+    fn g9_s3_a_goal_edit_wakes_the_driver_with_its_clock_still() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let clock = SimClock::new();
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let shutdown = crate::rt::Shutdown::new();
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let (id, other) = ("goals-edit-wakes", "goals-edit-paused");
+            anyhow::ensure!(port.open(id, Info { id: id.into(), status: Status::Idle, ..Info::default() }), "not opened");
+            port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
+            let until = clock.unix_ms() + 3_600_000;
+            store
+                .call(move |c| {
+                    touch(c, other, Some("paused"), Some("Paused by the agent: waiting for CI"), 0)?;
+                    c.execute("UPDATE goal_stacks SET resume_at = ?2 WHERE agent = ?1", params![other, until])?;
+                    Ok(())
+                })
+                .await?;
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
+            // The driver's feed and the test's own: a notify's permit is taken by one wait.
+            let (fed, watched) = (StoreFeed::new(&store), StoreFeed::new(&store));
+            let changing = Changing::new();
+            let test = async {
+                // Its first round done, the driver sleeps until the pause runs out.
+                clock.sleeping_since(0, 1).await;
+                anyhow::ensure!(port.heard(id).is_empty(), "sent with no goal: {:?}", port.heard(id));
+                let a = id.to_owned();
+                store
+                    .call(move |c| {
+                        c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES ('g1', ?1, 0, 'the first goal')", params![a])?;
+                        touch(c, &a, Some("running"), None, 0)
+                    })
+                    .await?;
+                // Until it's sent (its send marks the goal: a write the test hears too).
+                let sent = async {
+                    loop {
+                        let at = watched.at();
+                        if !port.heard(id).is_empty() {
+                            return;
+                        }
+                        watched.after(at).await;
+                    }
+                };
+                let given_up = crate::rt::timeout(Duration::from_secs(600), sent).await.is_err();
+                shutdown.cancel();
+                anyhow::ensure!(!given_up, "the edit never reached the agent with the driver's clock still");
+                anyhow::ensure!(port.heard(id).len() == 1, "sent once: {:?}", port.heard(id));
+                Ok(())
+            };
+            let (driven, tested) = futures::join!(driver.follow(&changing, &fed, None, false), test);
+            driven?;
+            tested
+        })
+    }
+
     /// A goal skipped through goal control counts as ended, skipped, once; a skip with no goal
     /// under way counts nothing; a goal said met counts as ended, met; one taken out while under way
     /// as ended, skipped (CP-M2's counters, a non-vacuity check).
