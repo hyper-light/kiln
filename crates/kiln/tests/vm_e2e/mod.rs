@@ -793,7 +793,7 @@ pub fn skip_reason(machine: &str, says: Option<bool>, why_not: Option<&str>) -> 
         (Some(true), _) => format!("{machine} starts microVMs"),
         (Some(false), Some(why)) => format!("SKIP: {machine} holds no isolated agents: {why}"),
         (Some(false), None) => format!(
-            "SKIP: {machine} starts no microVMs (facts.virt.microvm is false) and says no why: its kiln carries no microVM runtime until kiln plan 01a1cd8e862e7169a074db3d5fa33f3d steps 16 and 17 land (Shards and Hex vendored; the launch seam)"
+            "SKIP: {machine} starts no microVMs (facts.virt.microvm is false) and says no why, its engine microvm"
         ),
         (None, _) => format!("SKIP: {machine} hasn't said whether it starts microVMs (no facts yet)"),
     }
@@ -1258,18 +1258,47 @@ fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The gate: whether the fixture's runner starts microVMs. Ok(false) after saying why it skips;
-/// an error where `VM_E2E=1` requires it.
+/// The gate: whether the fixture's runner starts microVMs, its owner having set its engine to
+/// `microvm`, as a person enables them: a runner holds `host` until its owner does (the person's
+/// ruling, 2026-11-21). Ok(false) after saying why it skips, in kiln's words where it refuses
+/// `microvm` to a runner that can't hold microVMs; an error where `VM_E2E=1` requires it.
 pub fn isolation_ready(f: &Fixture) -> anyhow::Result<bool> {
-    let (says, why_not) = setup_on(f, &format!("{}'s facts on microVMs", f.machine), || {
-        let (code, body) = common::http(f.port, "GET", "/api/reach/runners", &f.admin, None)?;
-        if code != 200 {
-            return Ok(server_said(code, &body));
+    let facts = || {
+        setup_on(f, &format!("{}'s facts on microVMs", f.machine), || {
+            let (code, body) = common::http(f.port, "GET", "/api/reach/runners", &f.admin, None)?;
+            if code != 200 {
+                return Ok(server_said(code, &body));
+            }
+            let reach: Value = serde_json::from_str(&body)?;
+            let entry = reach.get("runners").and_then(Value::as_array).and_then(|rs| rs.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(f.machine.as_str())));
+            Ok(microvms_said(entry))
+        })
+    };
+    // Its facts first: kiln refuses `microvm` to a runner that hasn't said yet whether it can hold
+    // microVMs.
+    let (mut says, mut why_not) = facts()?;
+    if !says {
+        let path = format!("/api/runners/{}/engine", f.machine);
+        let refused = setup_on(f, &format!("{}'s engine set to microvm", f.machine), || {
+            let (code, body) = common::http(f.port, "PUT", &path, &f.admin, Some(&json!({"engine": "microvm"})))?;
+            Ok(match code {
+                200 => Setup::Ready(None),
+                // kiln's word that this runner can't hold microVMs now, and why.
+                409 => Setup::Ready(Some(serde_json::from_str::<Value>(&body).ok().and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned)).unwrap_or(body))),
+                _ => server_said(code, &body),
+            })
+        })?;
+        match refused {
+            Some(why) => (says, why_not) = (false, Some(why)),
+            None => {
+                setup_on(f, &format!("{} holding engine microvm", f.machine), || {
+                    let v = engine_of(f, &f.machine)?;
+                    Ok(if v.pointer("/isolation/engine").and_then(Value::as_str) == Some("microvm") { Setup::Ready(()) } else { Setup::Wait })
+                })?;
+                (says, why_not) = facts()?;
+            }
         }
-        let reach: Value = serde_json::from_str(&body)?;
-        let entry = reach.get("runners").and_then(Value::as_array).and_then(|rs| rs.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(f.machine.as_str())));
-        Ok(microvms_said(entry))
-    })?;
+    }
     if says {
         return Ok(true);
     }

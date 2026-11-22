@@ -12,9 +12,9 @@
 //!   each: start, steer, interrupt, stop, resume, a file written in the project, the MCP round trip,
 //!   an agent started from where it runs. It shows the drive works against kiln, and that each check
 //!   of where a harness ran says "the host" here, as it must (Unix).
-//! - `step34`: the same drive with each harness in a microVM of its own. It skips, in the runner's own
-//!   words, until the runner says it starts microVMs (kiln plan steps 16 and 17); `VM_E2E=1` makes
-//!   that a failure. ROOT runs it on each host OS: `tests/vm_e2e/README.md`.
+//! - `step34`: the same drive with each harness in a microVM of its own, its runner's engine set to
+//!   `microvm` as its owner enables it. It skips, in kiln's or the runner's own words, where the
+//!   runner can't hold microVMs; `VM_E2E=1` makes that a failure. ROOT runs it on each host OS: `tests/vm_e2e/README.md`.
 //! - `step35` (`vm_e2e/step35.rs`, `vm_e2e/mcp.rs`): every harness of steps 19 to 28 on the same drive,
 //!   through kiln's REST API, its MCP tools and code mode, from kiln's Agentfile and from a person's
 //!   own, each gap in `vm_e2e/gaps.json` with its cited reason (kiln plan step 35).
@@ -1557,14 +1557,15 @@ mod engine {
         Ok(())
     }
 
-    /// P2.3's first and second tests, and AC3: a runner that holds microVMs reports `microvm`, by
-    /// default; its owner switches it to `host`: the session in a microVM there goes on (`draining`
+    /// P2.3's first and second tests, and AC3: a runner whose owner set it to `microvm` (an option
+    /// its owner enables: `host` until then, the person's ruling of 2026-11-21) reports `microvm`
+    /// from the server; its owner switches it to `host`: the session in a microVM there goes on (`draining`
     /// 1), answering its next turn in its microVM, the next that asks nothing starts on its host with no
-    /// microVM, and one that needs a microVM is refused, the engine named. Set back, it's `microvm` again.
+    /// microVM, and one that needs a microVM is refused, the engine named. Its setting taken away, it's `host` again, the default.
     /// The microVM session answers a turn there before the switch too, so a harness that never ran in its
     /// microVM fails here, in kiln's words on it, before anything is switched.
     #[test]
-    fn p2_3_a_runner_with_microvms_defaults_to_microvm_and_a_switch_to_host_starts_the_next_on_its_host() -> anyhow::Result<()> {
+    fn p2_3_a_runner_its_owner_set_to_microvm_holds_it_and_a_switch_to_host_starts_the_next_on_its_host() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let stub = vm_e2e::stub_host_env(dir.path())?;
         let f = vm_e2e::up_own(dir.path(), "vm", &stub.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
@@ -1572,7 +1573,7 @@ mod engine {
             return Ok(());
         }
         let v = vm_e2e::engine_of(&f, &f.machine)?;
-        anyhow::ensure!(v.get("engine") == Some(&json!("microvm")) && v.get("from") == Some(&json!("default")) && v.pointer("/virt/microvm") == Some(&json!(true)), "a runner with microVMs runs microvm by default: {v}");
+        anyhow::ensure!(v.get("engine") == Some(&json!("microvm")) && v.get("from") == Some(&json!("server")) && v.pointer("/virt/microvm") == Some(&json!(true)), "a runner its owner set to microvm runs microvm: {v}");
         let project = vm_e2e::project(dir.path())?;
         let kept = vm_e2e::keep_stub(&f, "claude")?;
         let image = format!("agentfile:{}", kept.id);
@@ -1592,7 +1593,8 @@ mod engine {
             let _ = crate::common::http(f.port, "DELETE", &format!("/api/harness/agents/{id}"), &f.admin, None);
         }
         let (code, _) = crate::common::http(f.port, "PUT", &format!("/api/runners/{}/engine", f.machine), &f.admin, Some(&json!({"engine": null})))?;
-        anyhow::ensure!(code == 200 && vm_e2e::engine_of(&f, &f.machine)?.get("engine") == Some(&json!("microvm")));
+        let v = vm_e2e::engine_of(&f, &f.machine)?;
+        anyhow::ensure!(code == 200 && v.get("engine") == Some(&json!("host")) && v.get("from") == Some(&json!("default")), "its setting taken away, host by default: {code} {v}");
         Ok(())
     }
 
@@ -1627,8 +1629,8 @@ mod engine {
 }
 
 // =================================================================================================
-// Codex and Claude Code, each in a microVM of its own. Skipped until the runner starts microVMs (kiln
-// plan steps 16 and 17); ROOT runs them on each host OS (tests/vm_e2e/README.md). Both get kiln's
+// Codex and Claude Code, each in a microVM of its own. Skipped where the runner can't hold microVMs
+// (`vm_e2e::isolation_ready`); ROOT runs them on each host OS (tests/vm_e2e/README.md). Both get kiln's
 // MCP server from inside: the acceptance asks it of both.
 // =================================================================================================
 mod step34 {
