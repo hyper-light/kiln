@@ -599,6 +599,60 @@ mod tests {
         })
     }
 
+    /// CP-T1.5 (goal 0d717247): the cluster group's own tables, which no migration makes: the group
+    /// makes them in kiln.db, its state machine, as it opens (`store::group`'s `Machine::open`), so
+    /// a store the group stood carries them. Its configuration ([`crate::store::group::CONF`], its
+    /// voters and learners as JSON) is carried from a store the group made, as the records command
+    /// reads it (`Store::open_replica`), reads back as the same configuration, and a learner added
+    /// after the copy is found on its column.
+    #[test]
+    fn cp_t1_5_the_cluster_groups_configuration_is_carried_and_compared() -> anyhow::Result<()> {
+        use crate::store::group::{CONF, MARK, STATE};
+        use crate::sync::group::Conf;
+        /// The configuration with learners, as `store::group::stand` writes it when the group has them.
+        fn say(db: &std::path::Path, c: &Conf) -> anyhow::Result<()> {
+            let json = serde_json::to_string(c)?;
+            rusqlite::Connection::open(db)?.execute(&format!("INSERT INTO {CONF} (one, conf) VALUES (1, ?1) ON CONFLICT (one) DO UPDATE SET conf = excluded.conf"), [json])?;
+            Ok(())
+        }
+        let dir = tempfile::tempdir()?;
+        let (db, log) = (dir.path().join("kiln.db"), dir.path().join("cluster"));
+        {
+            // Its index migrations built, and its log flushed, before it's let go.
+            let grouped = Store::open_grouped(&db, &log)?;
+            grouped.build_now()?;
+            grouped.flush_group()?;
+        }
+        let conf = Conf { voters: vec![1], learners: vec![7, 9], ..Conf::default() };
+        say(&db, &conf)?;
+        crate::rt::block_on(async move {
+            let store = Store::open_replica(&db)?;
+            let found: Vec<String> = tables(&store).await?.into_iter().map(|t| t.name).collect();
+            for t in [STATE, CONF, MARK] {
+                anyhow::ensure!(found.iter().any(|f| f == t), "{t}, the group's, is carried: {found:?}");
+            }
+            let records = SimRecords::new();
+            carry(&store, &records).await?;
+            let same = compare(&store, &records).await?;
+            anyhow::ensure!(same.differences.is_empty(), "{:?}", same.differences);
+            let key = serde_json::to_vec(&vec![Field::Integer(1)])?;
+            let kept = records.get(&family(CONF), &key, Consistency::Linearizable).await.map_err(refused)?.ok_or_else(|| anyhow::anyhow!("the configuration's record"))?;
+            let fields: Fields = serde_json::from_slice(&kept.value)?;
+            let back: Conf = match fields.get("conf") {
+                Some(Field::Text(t)) => serde_json::from_str(t)?,
+                other => anyhow::bail!("the configuration as text: {other:?}"),
+            };
+            anyhow::ensure!(back == conf, "the same voters and learners: {back:?}");
+            drop(store);
+            say(&db, &Conf { learners: vec![7, 9, 11], ..conf })?;
+            let store = Store::open_replica(&db)?;
+            let found = compare(&store, &records).await?;
+            let what: Vec<(&str, Option<&str>)> = found.differences.iter().map(|d| (d.table.as_str(), match &d.differs { Differs::Field { column, .. } => Some(column.as_str()), _ => None })).collect();
+            anyhow::ensure!(what == vec![(CONF, Some("conf"))], "the learner added is found on its column: {what:?}");
+            Ok(())
+        })
+    }
+
     /// CP-T1.5 (goal 0d717247, every kiln record on Amphora): every table docs/records-inventory.md
     /// lists as made by kiln's store's migrations, and not dropped since, is one [`tables`] finds in
     /// a store those migrations made, so [`carry`] carries it and [`compare`] compares it; every
