@@ -324,6 +324,66 @@ unsafe extern "C" fn hook(ctx: *mut c_void, db: *mut ffi::sqlite3, op: c_int, z_
     }
 }
 
+/// What [`Tables`]' hook writes into: the tables of kiln.db the writes since the last take touched, and whether one's name
+/// couldn't be read.
+#[derive(Default)]
+struct Touched {
+    names: HashSet<String>,
+    unnamed: bool,
+}
+
+/// The tables a connection's writes touch, by name alone, as SQLite's pre-update hook names them: what a store past the
+/// cluster group (`[cluster] group = false`, `Store::open`) says of each write it commits (`super::Changes`), so what
+/// waits on some tables is told of writes to those alone (G9 step 3, goal a2a44298, T-T1.5.1: every write there moved
+/// every table's count, and woke the goal driver, the scheduler and the plans' driver for writes to none of theirs).
+/// Through the group, [`Watch`] names them with the rows.
+pub struct Tables {
+    touched: Arc<Mutex<Touched>>,
+}
+
+unsafe extern "C" fn tables_hook(ctx: *mut c_void, _db: *mut ffi::sqlite3, _op: c_int, z_db: *const c_char, z_table: *const c_char, _key1: i64, _key2: i64) {
+    // SAFETY: `ctx` is the `Mutex<Touched>` the `Tables` that installed this hook holds, alive as long as the connection
+    // (the writer drops the connection first); the hook runs on the thread running the statement.
+    let touched = unsafe { &*ctx.cast::<Mutex<Touched>>() };
+    let mut t = touched.lock();
+    if z_db.is_null() || z_table.is_null() {
+        t.unnamed = true;
+        return;
+    }
+    match (unsafe { CStr::from_ptr(z_db) }.to_str(), unsafe { CStr::from_ptr(z_table) }.to_str()) {
+        (Ok("main"), Ok(table)) => {
+            if !t.names.contains(table) {
+                t.names.insert(table.to_owned());
+            }
+        }
+        // A temporary table's, or an attached database's: none of kiln.db's.
+        (Ok(_), Ok(_)) => {}
+        _ => t.unnamed = true,
+    }
+}
+
+impl Tables {
+    /// Puts a hook on `conn` that notes the tables its writes touch. A connection has one pre-update hook: never one
+    /// with a [`Watch`].
+    pub fn install(conn: &Connection) -> Tables {
+        let touched = Arc::new(Mutex::new(Touched::default()));
+        // SAFETY: the hook reads `touched` through this pointer for as long as it's installed; the `Tables` keeps the
+        // `Arc` and must outlive the connection's statements (the writer holds both, the connection dropped first).
+        unsafe {
+            ffi::sqlite3_preupdate_hook(conn.handle(), Some(tables_hook), Arc::as_ptr(&touched).cast_mut().cast::<c_void>());
+        }
+        Tables { touched }
+    }
+
+    /// The tables the writes since the last take touched, each once; none where a table's name couldn't be read (any
+    /// table may have changed).
+    pub fn take(&self) -> Option<Vec<String>> {
+        let mut t = self.touched.lock();
+        let names = std::mem::take(&mut t.names);
+        (!std::mem::take(&mut t.unnamed)).then(|| names.into_iter().collect())
+    }
+}
+
 impl Watch {
     /// Puts a hook on `conn` that notes the rows its writes touch while a capture is on; `local`
     /// are tables this node keeps for itself.

@@ -4853,8 +4853,8 @@ mod tests {
 
     /// G9 step 3, T1.5: the goal driver's feed moves with writes to the tables that change what it
     /// does and no other's, on the store as production opens it (through the cluster group): kiln's
-    /// other writes don't run its round. (Past the group, `[cluster] group = false`, every committed
-    /// write moves every table's count: rounds there run on every write, each finding nothing new.)
+    /// other writes don't run its round. (Past the group, `[cluster] group = false`, each committed
+    /// write says its tables by their names, `store::capture::Tables`: the same holds there.)
     #[test]
     fn g9_s3_the_feed_moves_for_the_goal_tables_writes_alone() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -4900,8 +4900,8 @@ mod tests {
                 .await?;
             let gate = Changing::new();
             let feed = StoreFeed::new(&store);
-            // Every table's count: in memory, any committed write moves it; through the group, the
-            // tables' own.
+            // The count of every table the driver may write: each committed write moves its tables' own, through
+            // the group and past it (G9 step 3, goal a2a44298, T-T1.5.1).
             let all = || store.changes().of(&["goal_stacks", "goal_items", "plan_runs", "plan_run_steps", "plan_tags", "kv"]);
             let (at, before) = (feed.at(), all());
             driver.round(&gate).await;

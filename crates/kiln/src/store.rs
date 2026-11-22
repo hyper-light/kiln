@@ -272,6 +272,9 @@ struct Writing {
     // The connection first: it goes before the watch its hook writes into.
     conn: Counted,
     watch: Option<capture::Watch>,
+    /// Past the cluster group, the tables its calls touch, by name ([`capture::Tables`]): what its commits say they
+    /// changed (G9 step 3, goal a2a44298, T-T1.5.1). Through the group, `watch` names them with the rows.
+    tables: Option<capture::Tables>,
     group: Option<Arc<group::Group>>,
     changes: Arc<Changes>,
     /// Calls committed in groups (a store that writes); else each by itself as it comes, outside
@@ -305,8 +308,11 @@ struct Done {
     change: Option<capture::Change>,
     /// Taken back for this (its change couldn't be read for the log): told so whatever the commit.
     lost: Option<Arc<anyhow::Error>>,
-    /// It changed rows past the cluster group, which moves every table's count ([`Changes::anything`]).
+    /// It changed rows past the cluster group, in tables not told apart, which moves every table's count
+    /// ([`Changes::anything`]).
     moved: bool,
+    /// The tables it changed rows in past the cluster group, told apart ([`capture::Tables`]), whose counts move.
+    tables: Vec<String>,
 }
 
 impl Writing {
@@ -324,13 +330,14 @@ impl Writing {
         // The writer keeps more statements prepared than rusqlite's 16: its hot ones cycle through more than that (the DB
         // query audit, 2026-11-06: 73% of a busy mix's calls found theirs prepared, 100% with 64).
         conn.set_prepared_statement_cache_capacity(WRITER_STATEMENTS);
-        Writing { conn: Counted::new(conn, WRITER_STATEMENTS), watch, group, changes, grouped: true, bounds, checkpoints, committed: Arc::default() }
+        let tables = watch.is_none().then(|| capture::Tables::install(&conn));
+        Writing { conn: Counted::new(conn, WRITER_STATEMENTS), watch, tables, group, changes, grouped: true, bounds, checkpoints, committed: Arc::default() }
     }
 
     /// A replica's writer: each call by itself, outside any transaction (above).
     fn alone(conn: Connection, changes: Arc<Changes>) -> Self {
         conn.set_prepared_statement_cache_capacity(WRITER_STATEMENTS);
-        Writing { conn: Counted::new(conn, WRITER_STATEMENTS), watch: None, group: None, changes, grouped: false, bounds: Bounds::DEFAULT, checkpoints: None, committed: Arc::default() }
+        Writing { conn: Counted::new(conn, WRITER_STATEMENTS), watch: None, tables: None, group: None, changes, grouped: false, bounds: Bounds::DEFAULT, checkpoints: None, committed: Arc::default() }
     }
 
     fn run(mut self, rx: &std::sync::mpsc::Receiver<Sent>) {
@@ -439,13 +446,23 @@ impl Writing {
         if let Some(w) = watch {
             w.begin();
         }
-        // Past the cluster group (a store without it), a call that changed rows moves every table's
-        // count; through it, its rows say which tables (`Writing::commit`); a local one moves none.
+        // Past the cluster group (a store without it), a call that changed rows moves the counts of the tables it
+        // touched ([`capture::Tables`]), or every table's where they can't be told apart; through it, its rows say
+        // which tables (`Writing::commit`); a local one moves none.
         let counts = !local && self.watch.is_none();
+        // What a call before it touched (a local one's, which moves none) isn't this one's.
+        if let Some(t) = &self.tables {
+            let _ = t.take();
+        }
         let before = conn.total_changes();
         let ran = call.run(conn);
         let change = watch.map(|w| w.end(conn));
-        let moved = counts && conn.total_changes() != before;
+        let changed = counts && conn.total_changes() != before;
+        let (moved, tables) = match (changed, self.tables.as_ref().map(capture::Tables::take)) {
+            (false, _) => (false, Vec::new()),
+            (true, Some(Some(tables))) => (false, tables),
+            (true, _) => (true, Vec::new()),
+        };
         if conn.is_autocommit() {
             return Came::Ended(ran.tell, Arc::new(anyhow::anyhow!("kiln.db's transaction ended inside a store call grouped with this one: SQLite rolls one back itself on a few errors (the disk full, an I/O error, memory short)")));
         }
@@ -458,7 +475,7 @@ impl Writing {
         if let Err(e) = conn.execute_batch(if keep { "RELEASE kiln_call" } else { "ROLLBACK TO kiln_call; RELEASE kiln_call" }) {
             return Came::Ended(ran.tell, Arc::new(anyhow::Error::from(e).context("a store call's savepoint couldn't be closed")));
         }
-        Came::Ran(Done { tell: ran.tell, change: change.filter(|_| keep), lost, moved: keep && moved })
+        Came::Ran(Done { tell: ran.tell, change: change.filter(|_| keep), lost, moved: keep && moved, tables: if keep { tables } else { Vec::new() } })
     }
 
     /// Commits a group: through the cluster group, each changed call's change numbered in turn, the
@@ -472,9 +489,11 @@ impl Writing {
         match self.keep(&mut done, &mut numbered) {
             Ok(()) => {
                 // Committed: the tables its rows are in have changed (goal 10, plan 01a1a87b2dae step 2).
-                self.changes.touched(numbered.iter().flat_map(|(_, c): &(u64, capture::Change)| c.rows.iter()).map(|r| match r {
+                // Past the group, the tables its calls touched (G9 step 3, goal a2a44298, T-T1.5.1).
+                let rows = numbered.iter().flat_map(|(_, c): &(u64, capture::Change)| c.rows.iter()).map(|r| match r {
                     capture::Row::Gone { table, .. } | capture::Row::Kept { table, .. } => table.as_str(),
-                }));
+                });
+                self.changes.touched(rows.chain(done.iter().flat_map(|d| d.tables.iter().map(String::as_str))));
                 if done.iter().any(|d| d.moved) {
                     self.changes.anything();
                 }
@@ -1109,8 +1128,9 @@ fn counted<R>(conn: &mut Connection, changes: &Changes, f: impl FnOnce(&mut Conn
 /// 01a1a87b2dae step 2): what a read keeps in memory of some tables (`crate::reads::Kept`: the plans'
 /// list, the goal stacks) answers only while their count is the one it was made at, and is made again,
 /// off the request path, once it moves. A write through the cluster group says which tables it
-/// touched (its captured rows); any other that changed rows ([`Store::open`], a store in memory) moves
-/// every table's count. Moved by the writer's thread alone, after the write commits; read without a
+/// touched (its captured rows); one past it ([`Store::open`], a store in memory) by their names
+/// ([`capture::Tables`]; G9 step 3, goal a2a44298, T-T1.5.1), and one whose tables can't be told
+/// apart (a name not read, a replica's, a test's inline store) moves every table's count. Moved by the writer's thread alone, after the write commits; read without a
 /// lock.
 #[derive(Default)]
 pub struct Changes {
@@ -4966,7 +4986,8 @@ mod tests {
 
     /// Goal 10, plan 01a1a87b2dae step 2: a committed write through the cluster group moves the counts
     /// of the tables its rows are in and no other's; one that changed nothing (a read through `call`,
-    /// a write taken back) moves none; past the group, any write that changed rows moves them all.
+    /// a write taken back) moves none; past the group too, the tables it touched told apart by their names (G9 step 3,
+    /// goal a2a44298, T-T1.5.1: there, any write that changed rows moved them all).
     #[test]
     fn g10_s2_writes_move_the_counts_of_the_tables_they_touched() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -4988,7 +5009,11 @@ mod tests {
             let p = plain.changes();
             let (kv, plans) = (p.of(&["kv"]), p.of(&["plans"]));
             plain.kv_set("a".into(), "1".into()).await?;
-            assert!(p.of(&["kv"]) > kv && p.of(&["plans"]) > plans, "past the group, every table's");
+            assert!(p.of(&["kv"]) > kv, "past the group, kv's count moved");
+            assert_eq!(p.of(&["plans"]), plans, "past the group, the plans' didn't");
+            let kv = p.of(&["kv"]);
+            plain.call(|c| Ok(c.execute("DELETE FROM kv WHERE k = 'nothing'", [])?)).await?;
+            assert_eq!(p.of(&["kv"]), kv, "past the group, nothing changed: nothing moved");
             let plans = p.of(&["plans"]);
             plain.call(|c| Ok(c.query_row("SELECT COUNT(*) FROM kv", [], |r| r.get::<_, i64>(0))?)).await?;
             assert_eq!(p.of(&["plans"]), plans, "a read through call moves nothing");
