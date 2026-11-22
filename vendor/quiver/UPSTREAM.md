@@ -1,7 +1,8 @@
 # Quiver, vendored
 
-The topic store kiln's bus is (`docs/bus.md`), at Quiver's commit `966ea139a18d590afd64cc3e30ba3807302d42b1`, MIT
-(`LICENSE`): upstream's tree less its own copies of Focal's bus and hyper-raft (`vendor/focal-bus`,
+The topic store kiln's bus is (`docs/bus.md`), at Quiver's commit `f3034b63e49c59189eb2c6c3d9f2ed77a9309953`
+(its branch `t1/hyper-raft-0006-0007`: its `main` at `966ea139` with kiln's hyper-raft changes 0006 and 0007 recorded,
+CP-T1.1), MIT (`LICENSE`): upstream's tree less its own copies of Focal's bus and hyper-raft (`vendor/focal-bus`,
 `vendor/hyper-raft`), which are kiln's (`vendor/MANIFEST.toml`), and its benchmarks' records. Its record of what it
 vendors (`vendor/MANIFEST.toml`, `vendor/patches`) stays, so kiln's pins are checked against Quiver's as kiln's copy
 holds them (`scripts/vendor.py`'s `holds_its_pins`).

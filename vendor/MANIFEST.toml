@@ -93,7 +93,7 @@ files = { "ld-musl-aarch64.so.1" = "/lib/ld-musl-aarch64.so.1", "libstdc++.so.6"
 [projects.quiver]
 kind = "git"
 repository = "https://github.com/hyper-light/quiver"
-commit = "966ea139a18d590afd64cc3e30ba3807302d42b1"
+commit = "f3034b63e49c59189eb2c6c3d9f2ed77a9309953"
 path = "vendor/quiver"
 exclude = ["vendor/focal-bus", "vendor/hyper-raft", "bench/records"]
 own = ["UPSTREAM.md"]
