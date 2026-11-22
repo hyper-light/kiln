@@ -5,7 +5,6 @@
 use std::process::Command as Process;
 
 use super::acp::Acp;
-use super::antigravity::Agy;
 use super::claude::Claude;
 use super::codex::Codex;
 use super::core::Core;
@@ -39,8 +38,6 @@ pub enum Protocol {
     CodexAppServer,
     /// The Agent Client Protocol, started with these arguments.
     Acp(&'static [&'static str]),
-    /// Antigravity's headless multi-turn stream-json (`agy --input-format stream-json`).
-    AgyStreamJson,
     /// Pi's RPC mode (`pi --mode rpc`): JSON commands on stdin, responses and events on stdout.
     PiRpc,
     /// No structured mode: it runs as a terminal program, in a kiln terminal.
@@ -56,7 +53,8 @@ const KINDS: &[Kind] = &[
     Kind { id: "goose", name: "Goose", program: "goose", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["goose", "session"], screen_takes_command: false },
     // Amp has no ACP mode of its own; its ACP adapter (amp-acp) wraps the signed-in Amp CLI.
     Kind { id: "amp", name: "Amp", program: "amp-acp", verified: false, protocol: Protocol::Acp(&[]), screen: &["amp"], screen_takes_command: false },
-    Kind { id: "antigravity", name: "Antigravity CLI", program: "agy", verified: true, protocol: Protocol::AgyStreamJson, screen: &["agy"], screen_takes_command: false },
+    // Antigravity's own ACP server (agy 1.5 or newer), the one Zed's ACP registry lists.
+    Kind { id: "antigravity", name: "Antigravity CLI", program: "agy", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["agy"], screen_takes_command: false },
     // Cursor's CLI agent: `agent acp`, its ACP server (cursor.com/docs/cli/acp); its installer
     // puts `agent` (and the older name, `cursor-agent`) in ~/.local/bin.
     Kind { id: "cursor", name: "Cursor CLI", program: "agent", verified: false, protocol: Protocol::Acp(&["acp"]), screen: &["agent"], screen_takes_command: false },
@@ -90,8 +88,8 @@ impl Kind {
 
     /// It says what its sessions cost, in US dollars, so an agent definition's cost limit can be held to it
     /// (`crate::agentdefs::check`): Claude Code at each turn's end (its result's `total_cost_usd`, `super::claude`) and Pi
-    /// with each reply (its usage's `cost.total`, `super::pi`). Codex and Antigravity say tokens alone (kiln reads no cost
-    /// of theirs), and an ACP agent's cost is its own to give or leave out (`usage_update`'s optional `cost`, read where
+    /// with each reply (its usage's `cost.total`, `super::pi`). Codex says tokens alone (kiln reads no cost of its), and an
+    /// ACP agent's cost (the Antigravity CLI's `agy acp` among them) is its own to give or leave out (`usage_update`'s optional `cost`, read where
     /// it's in USD: `super::acp`), which none of kiln's ACP harnesses is known to give.
     pub fn says_cost(&self) -> bool {
         matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::PiRpc)
@@ -99,22 +97,24 @@ impl Kind {
 
     /// It says how many tokens its sessions use, in and out, so an agent definition's token limit can be held to it
     /// (`crate::agentdefs::check`): Claude Code at each turn's end (its result's `modelUsage`, `super::claude`), Codex as
-    /// it goes (`thread/tokenUsage/updated`, `super::codex`), Antigravity with each response (its step's `usage`,
-    /// `super::antigravity`) and Pi with each reply (its `usage`, `super::pi`). An ACP agent's tokens are its own to give
+    /// it goes (`thread/tokenUsage/updated`, `super::codex`), Antigravity with each turn (its ACP server's answer to the
+    /// prompt carries its `usage`, a cancelled turn's too: agy 1.5.14, docs/research/agy-acp/live-1.5.14-macos-arm64.log)
+    /// and Pi with each reply (its `usage`, `super::pi`). Any other ACP agent's tokens are its own to give
     /// or leave out, turn by turn: `PromptResponse.usage` is in no stable schema, its RFD a draft that hasn't settled
     /// whether it counts the turn or the session, and no capability says an agent gives it
     /// (agentclientprotocol/agent-client-protocol 4aab69b4e, `docs/rfds/end-turn-token-usage.mdx`); Gemini CLI, for
-    /// one, leaves it out of a cancelled turn. So none of kiln's ACP agents is held to a token limit.
+    /// one, leaves it out of a cancelled turn. So no other ACP agent of kiln's is held to a token limit.
     pub fn says_tokens(&self) -> bool {
-        matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer | Protocol::AgyStreamJson | Protocol::PiRpc)
+        matches!(self.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer | Protocol::PiRpc) || self.id == "antigravity"
     }
 
     pub fn adapter(&self, spec: &Spec) -> Adapter {
         match self.protocol {
             Protocol::ClaudeStreamJson => Adapter::Claude(Box::new(Claude::new(spec.allow_bypass).with_config_dir(claude_config_dir(spec)).with_speed(spec.speed.clone()).with_seen(crate::sandbox::isolated::Seen::of(spec)))),
             Protocol::CodexAppServer => Adapter::Codex(Box::new(Codex::from_spec(spec))),
-            Protocol::AgyStreamJson => Adapter::Agy(Box::new(Agy::new(spec))),
             Protocol::PiRpc => Adapter::Pi(Box::new(Pi::new(spec))),
+            // Signed in the way kiln keeps for it on this machine, where it does.
+            Protocol::Acp(_) if self.id == "antigravity" => Adapter::Acp(Box::new(Acp::from_spec(spec).with_sign_in(agy_sign_in(spec).map(|s| s.method)))),
             Protocol::Acp(_) | Protocol::Terminal => Adapter::Acp(Box::new(Acp::from_spec(spec))),
         }
     }
@@ -211,15 +211,11 @@ impl Kind {
                 if self.id == "cursor" {
                     p.env("NO_OPEN_BROWSER", "1");
                 }
-            }
-            // Model, effort, mode and the conversation are flags: a change starts it again.
-            Protocol::AgyStreamJson => {
-                p.args(super::antigravity::args(spec));
-                // kiln's MCP server, which `prepare` put in agy's own config: whom it serves is
-                // this session, by agy's environment, which agy hands on to the servers it starts.
-                #[cfg(unix)]
-                if let Some((_, sock, prefer)) = local_tools(spec) {
-                    p.envs(crate::reach::mcp::agy_env(sock, prefer, session));
+                // What the sign-in kiln keeps for Antigravity reads (its key, its project).
+                if self.id == "antigravity"
+                    && let Some(s) = agy_sign_in(spec)
+                {
+                    p.envs(s.env);
                 }
             }
             // Its session, model, thinking level and mode's tools are flags (`pi::args`).
@@ -296,7 +292,6 @@ impl Kind {
             }
             Protocol::CodexAppServer => [super::codex::args(), codex_limit(spec)].concat(),
             Protocol::Acp(args) => args.iter().map(|a| (*a).to_owned()).chain(self.dir_args(spec)).collect(),
-            Protocol::AgyStreamJson => super::antigravity::args(spec),
             Protocol::PiRpc => super::pi::args(spec),
         };
         let base = self.base_args();
@@ -337,7 +332,6 @@ impl Kind {
             Protocol::ClaudeStreamJson => super::claude::args(&Spec { allow_bypass: false, ..Spec::default() }, None),
             Protocol::CodexAppServer => super::codex::args(),
             Protocol::Acp(args) => words(args),
-            Protocol::AgyStreamJson => words(&["--input-format", "stream-json", "--output-format", "stream-json"]),
             Protocol::PiRpc => words(&["--mode", "rpc"]),
             Protocol::Terminal => Vec::new(),
         }
@@ -377,88 +371,113 @@ impl Kind {
         Ok(p)
     }
 
-    /// What a session's start needs before its harness starts: kiln's MCP server put in
-    /// Antigravity's own config, the only place agy reads one from (`crate::reach::mcp::agy_add`),
-    /// unless it's there already or a person turned it off; and its page tools allowed in agy's
-    /// settings, as agy can't ask once started (`agy_allow_in`). It names this kiln, so a runner
-    /// upgraded since puts its own. A session whose server couldn't be put there starts without it.
+    /// What a session's start needs before its harness starts: for Antigravity, kiln's own entries taken out of agy's
+    /// global config, where earlier kilns put them for its headless stream-json ([`agy_forget_kiln`]): over its ACP
+    /// server kiln gives its MCP server in each session, which that entry would start a second time, and holds none of
+    /// its calls by a hook. A session on this machine alone: an isolated one's home is its person's volume
+    /// (`sandbox::isolated`'s `offer_mcp`).
     #[cfg_attr(not(unix), allow(unused_variables))]
     pub async fn prepare(&self, spec: &Spec) {
         #[cfg(unix)]
-        if self.protocol == Protocol::AgyStreamJson
-            && let Some((kiln, _, _)) = local_tools(spec)
-        {
-            let home = crate::os::home_dir();
-            let config = home.join(".gemini/config/mcp_config.json");
-            let k = kiln.clone();
-            let has = crate::rt::blocking(move || std::fs::read(&config).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).is_some_and(|c| crate::reach::mcp::agy_has(&c, &k)));
-            if !has.await.unwrap_or(false) {
-                let added = match self.cli(spec, &crate::reach::mcp::agy_add(&kiln)) {
-                    Ok(cmd) => crate::proc::output(cmd, AGY_ADD_TIMEOUT).await.and_then(|o| if o.status.success() { Ok(()) } else { Err(anyhow::anyhow!("{}", String::from_utf8_lossy(&o.stderr).trim())) }),
-                    Err(e) => Err(e),
-                };
-                if let Err(e) = added {
-                    tracing::warn!(error = %format!("{e:#}"), "kiln's MCP server couldn't be put in Antigravity's config: its agents start without kiln's tools");
-                }
-            }
-            let settings = home.join(".gemini/antigravity-cli/settings.json");
-            if let Err(e) = crate::rt::blocking(move || agy_allow_in(&settings)).await.and_then(|r| r) {
-                tracing::warn!(error = %format!("{e:#}"), "kiln's page tools couldn't be allowed in Antigravity's settings: agy decides on them as on its other tools");
-            }
-        }
-        // kiln's hook in agy's own hooks.json, the only place agy reads hooks from: every
-        // conversation's tool calls, model calls and stops come to kiln, so a person's pause and
-        // what each subagent may do hold them (docs/agents.md). One agy runs outside kiln passes.
-        #[cfg(unix)]
-        if self.protocol == Protocol::AgyStreamJson
-            && let Ok(kiln) = crate::os::this_kiln()
-        {
-            let hooks = crate::os::home_dir().join(".gemini/config/hooks.json");
-            if let Err(e) = crate::rt::blocking(move || agy_hooks_in(&hooks, &kiln.to_string_lossy())).await.and_then(|r| r) {
-                tracing::warn!(error = %format!("{e:#}"), "kiln's hook couldn't be put in Antigravity's hooks.json: its subagents can't be paused or limited");
+        if self.id == "antigravity" && spec.isolation.is_none() && spec.container.is_none() {
+            let config = crate::os::home_dir().join(".gemini/config");
+            if let Err(e) = crate::rt::blocking(move || agy_forget_kiln(&config)).await.and_then(|r| r) {
+                tracing::warn!(error = %format!("{e:#}"), "kiln's entries from before couldn't be taken out of Antigravity's config");
             }
         }
     }
 }
 
-/// How long `agy mcp add` may take, putting kiln's MCP server in Antigravity's config.
-#[cfg(unix)]
-const AGY_ADD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Where kiln keeps how Antigravity's sessions sign in on a machine (under its home folder), past
+/// what agy keeps itself (a Google account, in the machine's keyring): written by its sign-ins
+/// from kiln (`crate::accounts`). `method` is the ACP sign-in method its sessions authenticate
+/// with (`gemini-api-key`, `agent-platform`), `gemini-api-key` the key, `project` Google Cloud's.
+pub const AGY_SIGN_IN: &str = ".gemini/antigravity-cli/kiln";
 
-/// kiln's page tools (`crate::reach::mcp::AGY_ALLOWED`) allowed in agy's settings at `path` where
-/// no rule covers them already (`crate::reach::mcp::agy_allow`): its other settings kept, written
-/// whole and readable by its user alone, as agy keeps it. Whether it wrote.
-#[cfg(unix)]
-fn agy_allow_in(path: &std::path::Path) -> anyhow::Result<bool> {
-    let settings = match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e.into()),
-    };
-    let Some(next) = crate::reach::mcp::agy_allow(&settings) else { return Ok(false) };
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    crate::runner::auth::write_private(path, &serde_json::to_vec_pretty(&next)?)?;
-    Ok(true)
+/// How an Antigravity session signs in where kiln keeps it ([`AGY_SIGN_IN`]).
+#[derive(Debug, PartialEq, Eq)]
+pub struct AgySignIn {
+    /// Its ACP sign-in method.
+    pub method: String,
+    /// What that method reads from agy's environment, where the session's own lacks it.
+    pub env: Vec<(&'static str, String)>,
 }
 
-/// kiln's hook entry for this kiln binary (`kiln`) in agy's hooks.json at `path`
-/// (`antigravity::hooks_with`): its other hooks kept, written whole and readable by its user alone,
-/// only when it differs; a file it can't read is left as it is. Whether it wrote.
-#[cfg(unix)]
-fn agy_hooks_in(path: &std::path::Path, kiln: &str) -> anyhow::Result<bool> {
-    let config = match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(e) => return Err(e.into()),
-    };
-    let Some(next) = super::antigravity::hooks_with(&config, kiln) else { return Ok(false) };
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+/// How session `spec` signs in, where kiln keeps it on this machine ([`AGY_SIGN_IN`]); its own
+/// environment's key or project stays its own. None: as agy itself does (its Google account), and
+/// for an isolated session, which has its person's own home and none of this machine's.
+fn agy_sign_in(spec: &Spec) -> Option<AgySignIn> {
+    if spec.isolation.is_some() || spec.container.is_some() {
+        return None;
     }
-    crate::runner::auth::write_private(path, &serde_json::to_vec_pretty(&next)?)?;
-    Ok(true)
+    agy_sign_in_at(&crate::os::home_dir().join(AGY_SIGN_IN), &spec.env)
+}
+
+/// Session `spec` signs in as kiln keeps it on this machine ([`AGY_SIGN_IN`]), not as agy does itself.
+pub(crate) fn agy_signs_in_as_kiln_keeps(spec: &Spec) -> bool {
+    agy_sign_in(spec).is_some()
+}
+
+fn agy_sign_in_at(dir: &std::path::Path, env: &[(String, String)]) -> Option<AgySignIn> {
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    let unset = |k: &str| !env.iter().any(|(n, _)| n == k);
+    let method = read("method")?;
+    let mut out = Vec::new();
+    match method.as_str() {
+        "gemini-api-key" => {
+            let key = read("gemini-api-key")?;
+            if unset("GEMINI_API_KEY") {
+                out.push(("GEMINI_API_KEY", key));
+            }
+        }
+        "agent-platform" => {
+            if let Some(project) = read("project").filter(|_| unset("GOOGLE_CLOUD_PROJECT")) {
+                out.push(("GOOGLE_CLOUD_PROJECT", project));
+            }
+        }
+        _ => return None,
+    }
+    Some(AgySignIn { method, env: out })
+}
+
+/// kiln's own entries taken out of agy's global config in `dir` (`~/.gemini/config`), where kilns before its ACP server
+/// put them: its MCP server in `mcp_config.json` (`mcpServers.kiln`, `<a kiln> reach mcp` as `agy mcp add` put it, on
+/// or turned off) and its hook in `hooks.json` (its `kiln` entry, each handler `… harness-hook --agy <event>`). The rest
+/// of each file is kept, written whole and readable by its user alone, and only where kiln's was there; a file it can't
+/// read is left as it is. The files it changed.
+#[cfg(unix)]
+fn agy_forget_kiln(dir: &std::path::Path) -> anyhow::Result<Vec<&'static str>> {
+    let forgets: [(&'static str, fn(&mut serde_json::Value) -> bool); 2] = [("mcp_config.json", forget_kilns_server), ("hooks.json", forget_kilns_hook)];
+    let mut changed = Vec::new();
+    for (name, forget) in forgets {
+        let path = dir.join(name);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let Ok(mut config) = serde_json::from_slice::<serde_json::Value>(&bytes) else { continue };
+        if forget(&mut config) {
+            crate::runner::auth::write_private(&path, &serde_json::to_vec_pretty(&config)?)?;
+            changed.push(name);
+        }
+    }
+    Ok(changed)
+}
+
+/// agy's `mcp_config.json` (`config`) without kiln's MCP server: `mcpServers.kiln` running `<a kiln> reach mcp`.
+/// Whether it had it.
+#[cfg(unix)]
+fn forget_kilns_server(config: &mut serde_json::Value) -> bool {
+    let Some(servers) = config.get_mut("mcpServers").and_then(serde_json::Value::as_object_mut) else { return false };
+    servers.get("kiln").is_some_and(|s| s.get("args") == Some(&serde_json::json!(["reach", "mcp"]))) && servers.remove("kiln").is_some()
+}
+
+/// agy's `hooks.json` (`config`) without kiln's entry: `kiln`, whose handlers are kiln's `harness-hook --agy`. Whether
+/// it had it.
+#[cfg(unix)]
+fn forget_kilns_hook(config: &mut serde_json::Value) -> bool {
+    config.get("kiln").is_some_and(|e| e.to_string().contains("harness-hook --agy")) && config.as_object_mut().is_some_and(|o| o.remove("kiln").is_some())
 }
 
 /// Whether a session gets the runner's own kiln MCP server (`crate::reach::mcp`), and how to
@@ -743,7 +762,6 @@ pub enum Adapter {
     Claude(Box<Claude>),
     Codex(Box<Codex>),
     Acp(Box<Acp>),
-    Agy(Box<Agy>),
     Pi(Box<Pi>),
 }
 
@@ -754,7 +772,6 @@ pub enum Frozen {
     Claude(Box<Claude>),
     Codex(Box<Codex>),
     Acp(Box<Acp>),
-    Agy(Box<Agy>),
     Pi(Box<Pi>),
 }
 
@@ -762,7 +779,7 @@ impl Adapter {
     /// Actual retained provider requests during live-process adoption. Presentation delivery
     /// maps are not evidence of a native flight, and a new provider starts with none.
     pub(crate) fn retained_input_ids(&self) -> Vec<super::admission::LegacyFlight> {
-        match self { Self::Claude(adapter) => adapter.retained_input_ids(), Self::Codex(adapter) => adapter.retained_input_ids(), Self::Acp(adapter) => adapter.retained_input_ids(), Self::Agy(adapter) => adapter.retained_input_ids(), Self::Pi(adapter) => adapter.retained_input_ids() }
+        match self { Self::Claude(adapter) => adapter.retained_input_ids(), Self::Codex(adapter) => adapter.retained_input_ids(), Self::Acp(adapter) => adapter.retained_input_ids(), Self::Pi(adapter) => adapter.retained_input_ids() }
     }
     /// The MCP servers a session it opens gets, for an adapter that gives them over its protocol
     /// (ACP); the others get theirs as they start ([`Kind::launch`]).
@@ -778,7 +795,6 @@ impl Adapter {
             Self::Claude(a) => Frozen::Claude(a),
             Self::Codex(a) => Frozen::Codex(a),
             Self::Acp(a) => Frozen::Acp(a),
-            Self::Agy(a) => Frozen::Agy(a),
             Self::Pi(a) => Frozen::Pi(a),
         }
     }
@@ -788,7 +804,6 @@ impl Adapter {
             Frozen::Claude(a) => Self::Claude(a),
             Frozen::Codex(a) => Self::Codex(a),
             Frozen::Acp(a) => Self::Acp(a),
-            Frozen::Agy(a) => Self::Agy(a),
             Frozen::Pi(a) => Self::Pi(a),
         }
     }
@@ -801,7 +816,6 @@ impl Adapter {
             Self::Claude(a) => a.start(core),
             Self::Codex(a) => a.start(core),
             Self::Acp(a) => a.start(core),
-            Self::Agy(a) => a.start(core),
             Self::Pi(a) => a.start(core),
         }
         self.settle_subagents(core);
@@ -812,7 +826,6 @@ impl Adapter {
             Self::Claude(a) => a.line(core, line),
             Self::Codex(a) => a.line(core, line),
             Self::Acp(a) => a.line(core, line),
-            Self::Agy(a) => a.line(core, line),
             Self::Pi(a) => a.line(core, line),
         }
         self.settle_subagents(core);
@@ -831,7 +844,6 @@ impl Adapter {
                 Self::Claude(a) => a.command(core, c),
                 Self::Codex(a) => a.command(core, c),
                 Self::Acp(a) => a.command(core, c),
-                Self::Agy(a) => a.command(core, c),
                 Self::Pi(a) => a.command(core, c),
             },
         }
@@ -859,7 +871,6 @@ impl Adapter {
             Self::Claude(a) => a.send_task(core, &t, m, mode),
             Self::Codex(a) => a.send_task(core, &t, m, mode),
             Self::Acp(a) => a.send_task(core, &t, m),
-            Self::Agy(a) => a.send_task(core, &t, m, mode),
             Self::Pi(a) => a.send_task(core, &t, m),
         }
     }
@@ -871,7 +882,6 @@ impl Adapter {
             Self::Claude(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Codex(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Acp(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
-            Self::Agy(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
             Self::Pi(a) => super::subagent::settle(core, |core, t| a.takes(core, t)),
         }
         // Held at its next tool call: Claude Code asks kiln before each (`claude::HOLD_HOOK`), and so
@@ -881,8 +891,6 @@ impl Adapter {
             Self::Codex(a) => a.holds_calls(),
             // At each call an ACP agent asks about, where it names its subagent (opencode's).
             Self::Acp(_) => true,
-            // And Antigravity, once kiln's hook in its hooks.json is heard (`antigravity::hooks_with`).
-            Self::Agy(a) => a.holds_calls(),
             // Pi has no subagents.
             Self::Pi(_) => false,
         };
@@ -895,7 +903,7 @@ impl Adapter {
         match self {
             Self::Codex(a) => a.held(),
             Self::Acp(a) => a.held(),
-            Self::Claude(_) | Self::Agy(_) | Self::Pi(_) => &[],
+            Self::Claude(_) | Self::Pi(_) => &[],
         }
     }
 
@@ -924,7 +932,7 @@ impl Adapter {
             Self::Claude(a) => a.drain_subagents(core),
             Self::Codex(a) => a.drain_subagents(core),
             Self::Acp(a) => a.drain_subagents(core),
-            Self::Agy(_) | Self::Pi(_) => {}
+            Self::Pi(_) => {}
         }
         self.settle_subagents(core);
     }
@@ -934,7 +942,6 @@ impl Adapter {
             Self::Claude(a) => a.exited(core, code, error),
             Self::Codex(a) => a.exited(core, code, error),
             Self::Acp(a) => a.exited(core, code, error),
-            Self::Agy(a) => a.exited(core, code, error),
             Self::Pi(a) => a.exited(core, code, error),
         }
         // Whatever the harness and whatever its adapter knew: what it ran ends with its process
@@ -957,7 +964,7 @@ impl Adapter {
         let held = match self {
             Self::Codex(a) => a.take_held(),
             Self::Acp(a) => a.take_held(),
-            Self::Claude(_) | Self::Agy(_) | Self::Pi(_) => Vec::new(),
+            Self::Claude(_) | Self::Pi(_) => Vec::new(),
         };
         let mut changed = false;
         // CP-T3.2: an older adapter and the durable queue can hold the same input after an
@@ -997,7 +1004,6 @@ impl Adapter {
             Self::Claude(a) => a.run_done(core, job, code, output),
             Self::Codex(a) => a.run_done(core, job, code, output),
             Self::Acp(a) => a.run_done(core, job, code, output),
-            Self::Agy(a) => a.run_done(core, job, code, output),
             Self::Pi(a) => a.run_done(core, job, code, output),
         }
     }
@@ -1011,7 +1017,6 @@ impl Adapter {
             Self::Claude(a) => a.drain_queue(core),
             Self::Codex(a) => a.next(core),
             Self::Acp(a) => a.next(core),
-            Self::Agy(a) => a.next(core),
             Self::Pi(a) => a.next(core),
         }
     }
@@ -1029,7 +1034,6 @@ impl Adapter {
         match self {
             Self::Claude(a) => a.tick(core),
             Self::Codex(a) => a.tick(core),
-            Self::Agy(a) => a.tick(core),
             Self::Acp(a) => a.tick(core),
             Self::Pi(a) => a.tick(core),
         }
@@ -1047,11 +1051,6 @@ impl Adapter {
                     a.go_on(core, p);
                 }
             }
-            Self::Agy(a) => {
-                if let Some(p) = super::pause::release(core, "The limit's reset time came; going on.") {
-                    a.go_on(core, p);
-                }
-            }
             Self::Pi(a) => {
                 if let Some(p) = super::pause::release(core, "The limit's reset time came; going on.") {
                     a.go_on(core, p);
@@ -1065,7 +1064,7 @@ impl Adapter {
     pub fn unstarted_only(&self, core: &Core) -> bool {
         match self {
             Self::Claude(a) => a.unstarted_only(core),
-            Self::Codex(_) | Self::Acp(_) | Self::Agy(_) | Self::Pi(_) => false,
+            Self::Codex(_) | Self::Acp(_) | Self::Pi(_) => false,
         }
     }
 
@@ -1076,7 +1075,6 @@ impl Adapter {
             Self::Claude(a) => a.go_on(core, p),
             Self::Codex(a) => a.go_on(core, p),
             Self::Acp(a) => a.go_on(core, p),
-            Self::Agy(a) => a.go_on(core, p),
             Self::Pi(a) => a.go_on(core, p),
         }
         // What waited for its subagents meanwhile goes too.
@@ -1090,7 +1088,6 @@ impl Adapter {
             Self::Claude(a) => a.room(core),
             Self::Codex(a) => a.room(core),
             Self::Acp(a) => a.room(core),
-            Self::Agy(a) => a.room(core),
             Self::Pi(a) => a.room(core),
         }
         self.drain_subagents(core);
@@ -1114,23 +1111,20 @@ impl Adapter {
             Self::Codex(_) if added.is_some_and(|d| !d.writable) => Taking::Nothing("Codex's sandbox reads outside its folder already: it holds writes alone".to_owned()),
             Self::Codex(_) => Taking::NextTurn("Codex takes the folders it may write with each turn (turn/start's sandboxPolicy.writableRoots)".to_owned()),
             Self::Acp(a) => a.dirs_changed(dirs),
-            Self::Agy(_) => Taking::NextStart("Antigravity takes more folders as it starts (`--add-dir`), as it takes its other settings".to_owned()),
             Self::Pi(_) => Taking::Nothing("Pi holds its tools to no folder: it has nothing of its own to change".to_owned()),
         }
     }
 
     /// Its harness's hook asks before a tool call (`input`): the answer goes to `reply`, at once or
-    /// once a person lets the call go (`hold`). Codex's and Antigravity's hooks ask this way; Claude
-    /// Code's comes over its own control protocol.
+    /// once a person lets the call go (`hold`). Codex's hook asks this way; Claude Code's comes over its own
+    /// control protocol.
     pub fn hook(&mut self, core: &mut Core, input: serde_json::Value, reply: futures::channel::oneshot::Sender<serde_json::Value>) {
         match self {
             Self::Codex(a) => a.hook(core, input, reply),
-            Self::Agy(a) => a.hook(core, input, reply),
             Self::Claude(_) | Self::Acp(_) | Self::Pi(_) => {
                 let _ = reply.send(serde_json::json!({}));
             }
         }
-        // What the hook told of its subagents (Antigravity's: one ended, its hook heard).
         self.settle_subagents(core);
     }
 
@@ -1140,7 +1134,7 @@ impl Adapter {
         let held = match self {
             Self::Codex(a) => a.holds(),
             Self::Acp(a) => a.holds(),
-            Self::Claude(_) | Self::Agy(_) | Self::Pi(_) => false,
+            Self::Claude(_) | Self::Pi(_) => false,
         };
         held || !core.state.queue.is_empty() || core.state.tasks.iter().any(|t| !t.queue.is_empty())
     }
@@ -1155,7 +1149,6 @@ impl Adapter {
         match self {
             Self::Codex(a) => a.seed(items),
             Self::Acp(a) => a.offer_context(words()),
-            Self::Agy(a) => a.offer_context(words()),
             Self::Pi(a) => a.offer_context(words()),
             // Its own record where kiln wrote one (its transcript, resumed); the words where it couldn't (a
             // microVM's harness, whose record is its own: kiln plan 01a1dd2e…, P6c.5).
@@ -1169,7 +1162,6 @@ impl Adapter {
         match self {
             Self::Codex(a) => a.seeded(),
             Self::Acp(a) => a.seeded(),
-            Self::Agy(a) => a.seeded(),
             Self::Pi(a) => a.seeded(),
             Self::Claude(a) => a.seeded(),
         }
@@ -1183,7 +1175,6 @@ impl Adapter {
             Self::Claude(_) => (super::claude::FEATURES, super::claude::LEARNED),
             Self::Codex(_) => (super::codex::FEATURES, super::codex::LEARNED),
             Self::Acp(_) => (super::acp::FEATURES, super::acp::LEARNED),
-            Self::Agy(_) => (super::antigravity::FEATURES, super::antigravity::LEARNED),
             Self::Pi(_) => (super::pi::FEATURES, super::pi::LEARNED),
         };
         let now = upgraded_features(features, learned, &core.meta.features);
@@ -1256,9 +1247,9 @@ impl Kind {
                 (m, "default")
             }
             Protocol::CodexAppServer => (super::codex::modes(true), "auto"),
-            Protocol::AgyStreamJson => (super::antigravity::modes(), super::antigravity::DEFAULT_MODE),
             Protocol::PiRpc => (super::pi::modes(), super::pi::DEFAULT_MODE),
             Protocol::Acp(_) if self.id == "cursor" => (cursor_modes(), CURSOR_DEFAULT_MODE),
+            Protocol::Acp(_) if self.id == "antigravity" => (agy_modes(), AGY_DEFAULT_MODE),
             Protocol::Acp(_) if self.id == "devin" => (
                 [
                     ("accept-edits", "Code", "Write and edit code", false),
@@ -1296,7 +1287,6 @@ impl Kind {
         let levels: Vec<String> = match self.protocol {
             Protocol::ClaudeStreamJson => super::claude::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
             Protocol::CodexAppServer => super::codex::default_efforts(),
-            Protocol::AgyStreamJson => super::antigravity::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
             Protocol::PiRpc => super::pi::EFFORTS.iter().map(|e| (*e).to_owned()).collect(),
             Protocol::Acp(_) if self.id == "devin" => common_efforts(&models_of("devin")),
             Protocol::Acp(_) | Protocol::Terminal => Vec::new(),
@@ -1326,6 +1316,25 @@ pub(super) fn cursor_modes() -> Vec<super::model::ModeOption> {
 
 /// A new Cursor session's mode: its own default, Agent.
 pub(super) const CURSOR_DEFAULT_MODE: &str = "agent";
+
+/// Antigravity's modes, as its ACP server offers them (agy 1.5's `agy acp` `session/new`: Default,
+/// Accept edits, Plan), and kiln's Bypass, as it has none of its own; known before a session says
+/// them.
+pub(super) fn agy_modes() -> Vec<super::model::ModeOption> {
+    let mut modes: Vec<super::model::ModeOption> = [
+        ("default", "Default", "Ask before edits and commands, per your permission settings."),
+        ("accept-edits", "Accept edits", "Approve file edits in the workspace without asking."),
+        ("plan", "Plan", "Plan carefully before executing a task."),
+    ]
+    .into_iter()
+    .map(|(id, label, description)| super::model::ModeOption { id: id.into(), label: label.into(), description: description.into(), dangerous: false })
+    .collect();
+    modes.extend(super::acp::kiln_modes().into_iter().filter(|m| m.dangerous));
+    modes
+}
+
+/// A new Antigravity session's mode: its own default, which asks (as kiln's Ask would).
+pub(super) const AGY_DEFAULT_MODE: &str = "default";
 
 fn common_efforts(models: &[super::model::ModelOption]) -> Vec<String> {
     models.first().map(|first| first.efforts.iter().filter(|e| models.iter().all(|m| m.efforts.contains(e))).cloned().collect()).unwrap_or_default()
@@ -1364,9 +1373,23 @@ struct Seen {
 
 static SEEN: std::sync::LazyLock<parking_lot::Mutex<Seen>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(Seen { file: None, models: std::collections::HashMap::new() }));
 
-/// Keep the models seen in `file` (and know the ones kept there). Blocking (reads it).
+/// Where harness `kind`'s models are kept ([`Seen`]): by its id; Antigravity's under a name of their own, as its ACP
+/// server gives them (a model, and its thinking levels), apart from those its headless stream-json listed before
+/// (`agy models`, a model for each thinking level), which its ACP session doesn't take and kiln no longer offers.
+fn catalog_key(kind: &str) -> &str {
+    if kind == "antigravity" { "antigravity-acp" } else { kind }
+}
+
+/// What a file of models seen keeps (`bytes`), but those kept for no harness of kiln's as it keeps them now
+/// ([`catalog_key`]).
+fn kept_models(bytes: &[u8]) -> std::collections::HashMap<String, Vec<super::model::ModelOption>> {
+    let kept: std::collections::HashMap<String, Vec<super::model::ModelOption>> = serde_json::from_slice(bytes).unwrap_or_default();
+    kept.into_iter().filter(|(k, _)| KINDS.iter().any(|kind| catalog_key(kind.id) == k)).collect()
+}
+
+/// Keep the models seen in `file` (and know the ones kept there, [`kept_models`]). Blocking (reads it).
 pub fn keep_models_in(file: std::path::PathBuf) {
-    let kept: std::collections::HashMap<String, Vec<super::model::ModelOption>> = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let kept = std::fs::read(&file).ok().map(|b| kept_models(&b)).unwrap_or_default();
     let mut g = SEEN.lock();
     for (k, v) in kept {
         g.models.entry(k).or_insert(v);
@@ -1380,12 +1403,13 @@ pub fn note_models(kind: &str, models: &[super::model::ModelOption]) {
     if models.is_empty() {
         return;
     }
+    let key = catalog_key(kind);
     let (file, all) = {
         let mut g = SEEN.lock();
-        if g.models.get(kind).is_some_and(|m| m.as_slice() == models) {
+        if g.models.get(key).is_some_and(|m| m.as_slice() == models) {
             return;
         }
-        g.models.insert(kind.to_owned(), models.to_vec());
+        g.models.insert(key.to_owned(), models.to_vec());
         (g.file.clone(), g.models.clone())
     };
     // What the machine offers changed: said again (`changed`).
@@ -1400,7 +1424,7 @@ pub fn note_models(kind: &str, models: &[super::model::ModelOption]) {
 /// The models harness `kind` offers on this machine: as its sessions last listed them, else the
 /// ones it is known to have.
 pub fn models_of(kind: &str) -> Vec<super::model::ModelOption> {
-    if let Some(m) = SEEN.lock().models.get(kind).filter(|m| !m.is_empty()) {
+    if let Some(m) = SEEN.lock().models.get(catalog_key(kind)).filter(|m| !m.is_empty()) {
         return m.clone();
     }
     known_models(kind)
@@ -1436,6 +1460,22 @@ fn known_models(kind: &str) -> Vec<super::model::ModelOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Antigravity's models as its headless stream-json listed them (`agy models`, a model for each thinking level),
+    /// kept from before, aren't offered: its ACP session doesn't take those ids. Those its ACP sessions list are kept
+    /// under a name of their own, which a runner reads back as it starts.
+    #[test]
+    fn antigravitys_models_from_before_its_acp_server_are_offered_no_more() -> anyhow::Result<()> {
+        let model = |id: &str| serde_json::json!([{"id": id, "label": id, "description": ""}]);
+        let file = serde_json::json!({"antigravity": model("claude-opus-4-6-thinking"), "antigravity-acp": model("gemini-4-neon"), "devin": model("swe-1"), "gone": model("x")});
+        let kept = kept_models(&serde_json::to_vec(&file)?);
+        let mut keys: Vec<&str> = kept.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["antigravity-acp", "devin"], "the stream-json list and a harness kiln has no more go");
+        assert_eq!(kept.get(catalog_key("antigravity")).and_then(|m| m.first()).map(|m| m.id.as_str()), Some("gemini-4-neon"));
+        assert_eq!(catalog_key("devin"), "devin");
+        Ok(())
+    }
 
     /// Goal 9: what a machine offers is said again as it changes, never on a clock: a harness's
     /// sessions listing new models tells `changed`'s notifier, and the same models said again
@@ -1473,78 +1513,54 @@ mod tests {
         assert_eq!(upgraded_features(super::super::acp::FEATURES, super::super::acp::LEARNED, &now), now);
     }
 
-    /// kiln's page tools go into Antigravity's settings as agy keeps them: beside its other
-    /// settings, readable by its user alone, once; settings it can't read are left as they are.
-    #[cfg(unix)]
+    /// The sign-in kiln keeps for Antigravity (`crate::accounts`) is what its sessions authenticate
+    /// with, and what that method reads goes in their environment, unless they were given it; an
+    /// isolated session has its person's own home, and none of this machine's.
     #[test]
-    fn antigravitys_settings_get_kilns_page_tools_once() -> anyhow::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn antigravitys_sign_in_kept_by_kiln_is_read_for_its_sessions() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let path = dir.path().join("antigravity-cli/settings.json");
-        let read = |p: &std::path::Path| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
-        // None yet (agy never ran here): made, with the rules alone.
-        assert!(agy_allow_in(&path)?);
-        assert_eq!(read(&path)?.pointer("/permissions/allow"), Some(&serde_json::json!(crate::reach::mcp::AGY_ALLOWED)));
-        // agy's own: kept, and as private as agy keeps them; once there, left alone.
-        std::fs::write(&path, r#"{"model":"m","trustedWorkspaces":["/w"]}"#)?;
-        assert!(agy_allow_in(&path)?);
-        let kept = read(&path)?;
-        assert_eq!((kept.get("model"), kept.get("trustedWorkspaces")), (Some(&serde_json::json!("m")), Some(&serde_json::json!(["/w"]))));
-        assert_eq!(kept.pointer("/permissions/allow"), Some(&serde_json::json!(crate::reach::mcp::AGY_ALLOWED)));
-        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
-        assert!(!agy_allow_in(&path)?);
-        std::fs::write(&path, "{not json")?;
-        assert!(agy_allow_in(&path).is_err());
-        assert_eq!(std::fs::read(&path)?, b"{not json");
+        let at = |env: &[(String, String)]| agy_sign_in_at(dir.path(), env);
+        assert_eq!(at(&[]), None, "nothing kept: agy's own sign-in");
+        std::fs::write(dir.path().join("method"), "gemini-api-key\n")?;
+        assert_eq!(at(&[]), None, "a method without its key");
+        std::fs::write(dir.path().join("gemini-api-key"), "AIza-synthetic")?;
+        assert_eq!(at(&[]), Some(AgySignIn { method: "gemini-api-key".into(), env: vec![("GEMINI_API_KEY", "AIza-synthetic".into())] }));
+        // A key the session was given itself is its own.
+        assert_eq!(at(&[("GEMINI_API_KEY".into(), "mine".into())]).map(|s| s.env), Some(Vec::new()));
+        std::fs::write(dir.path().join("method"), "agent-platform")?;
+        assert_eq!(at(&[]), Some(AgySignIn { method: "agent-platform".into(), env: Vec::new() }), "no project: Google Cloud's own default");
+        std::fs::write(dir.path().join("project"), "my-project\n")?;
+        assert_eq!(at(&[]).map(|s| s.env), Some(vec![("GOOGLE_CLOUD_PROJECT", "my-project".to_owned())]));
+        std::fs::write(dir.path().join("method"), "oauth-personal")?;
+        assert_eq!(at(&[]), None, "only the methods kiln signs in with");
+        let isolated = Spec { kind: "antigravity".into(), isolation: Some(super::super::session::Isolation::microvm()), ..Spec::default() };
+        assert_eq!(agy_sign_in(&isolated), None, "an isolated session's sign-in is its person's own");
+        assert!(!agy_signs_in_as_kiln_keeps(&isolated));
         Ok(())
     }
 
-    /// kiln's hook goes into agy's hooks.json beside the person's own, once, for this kiln binary
-    /// (another rewrites it); hooks it can't read are left as they are. Run as agy runs it (a
-    /// shell), it hands each event to this kiln, and where the binary is gone (a version pruned,
-    /// kiln uninstalled) it passes, so the person's own agy goes on as without kiln.
+    /// kiln's own entries from before (its MCP server and its hook, as kilns before agy's ACP server put them) go from
+    /// agy's global config, the person's own kept, once; files it can't read are left as they are.
     #[cfg(unix)]
     #[test]
-    fn antigravitys_hooks_get_kilns_hook_once() -> anyhow::Result<()> {
+    fn antigravitys_config_forgets_kilns_entries_from_before() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir()?;
-        let path = dir.path().join("config/hooks.json");
-        let read = |p: &std::path::Path| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_slice(&std::fs::read(p)?)?) };
-        let command = |v: &serde_json::Value, ev: &str| v.pointer(&format!("/kiln/{ev}/0/hooks/0/command")).or_else(|| v.pointer(&format!("/kiln/{ev}/0/command"))).and_then(serde_json::Value::as_str).map(str::to_owned).unwrap_or_default();
-        let run = |command: &str| -> anyhow::Result<String> { Ok(String::from_utf8(std::process::Command::new("sh").arg("-c").arg(command).output()?.stdout)?.trim().to_owned()) };
-        let gone = dir.path().join("versions/old/kiln");
-        let gone = gone.to_string_lossy();
-        assert!(agy_hooks_in(&path, &gone)?);
-        let made = read(&path)?;
-        assert_eq!(made.pointer("/kiln/PreToolUse/0/matcher"), Some(&serde_json::json!("*")));
-        assert_eq!(made.pointer("/kiln/PreToolUse/0/hooks/0/timeout"), Some(&serde_json::json!(super::super::antigravity::HOOK_FOR_S)));
-        // Its binary gone: each event passes.
-        assert_eq!(run(&command(&made, "PreToolUse"))?, r#"{"decision":"allow"}"#);
-        assert_eq!(run(&command(&made, "PreInvocation"))?, "{}");
-        assert_eq!(run(&command(&made, "Stop"))?, r#"{"decision":""}"#);
-        // There: the event goes to it (a stand-in that says what it was asked), a path with a
-        // space and a quote in it too.
-        let bin = dir.path().join("it's kiln/kiln");
-        std::fs::create_dir_all(bin.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?)?;
-        std::fs::write(&bin, "#!/bin/sh\necho \"$@\"\n")?;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
-        assert!(agy_hooks_in(&path, &bin.to_string_lossy())?);
-        let there = read(&path)?;
-        assert_eq!(run(&command(&there, "PreToolUse"))?, "harness-hook --agy PreToolUse");
-        assert_eq!(run(&command(&there, "Stop"))?, "harness-hook --agy Stop");
-        // The person's own: kept; once there, left alone; another kiln, rewritten.
-        std::fs::write(&path, r#"{"lint":{"PostToolUse":[{"matcher":"write_to_file","hooks":[{"command":"./lint.sh"}]}]}}"#)?;
-        assert!(agy_hooks_in(&path, "/k/kiln")?);
-        let kept = read(&path)?;
-        assert_eq!(kept.pointer("/lint/PostToolUse/0/hooks/0/command"), Some(&serde_json::json!("./lint.sh")));
-        assert!(command(&kept, "PreInvocation").contains("k='/k/kiln';"));
-        assert_eq!(std::fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
-        assert!(!agy_hooks_in(&path, "/k/kiln")?);
-        assert!(agy_hooks_in(&path, "/k2/kiln")?);
-        assert!(read(&path)?.get("lint").is_some());
-        std::fs::write(&path, "{not json")?;
-        assert!(agy_hooks_in(&path, "/k/kiln").is_err());
-        assert_eq!(std::fs::read(&path)?, b"{not json");
+        let read = |name: &str| -> anyhow::Result<serde_json::Value> { Ok(serde_json::from_slice(&std::fs::read(dir.path().join(name))?)?) };
+        assert!(agy_forget_kiln(dir.path())?.is_empty(), "no files: nothing to do");
+        let kilns_hook = |ev: &str| format!("k='/k/kiln'; if [ -x \"$k\" ]; then exec \"$k\" harness-hook --agy {ev}; else echo '{{}}'; fi");
+        std::fs::write(dir.path().join("mcp_config.json"), serde_json::to_vec(&serde_json::json!({"mcpServers": {"kiln": {"command": "/k/kiln", "args": ["reach", "mcp"]}, "github": {"command": "gh-mcp"}}, "theme": "dark"}))?)?;
+        std::fs::write(dir.path().join("hooks.json"), serde_json::to_vec(&serde_json::json!({"kiln": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": kilns_hook("PreToolUse"), "timeout": 604800}]}], "Stop": [{"type": "command", "command": kilns_hook("Stop")}]}, "lint": {"PostToolUse": [{"matcher": "write_to_file", "hooks": [{"command": "./lint.sh"}]}]}}))?)?;
+        assert_eq!(agy_forget_kiln(dir.path())?, ["mcp_config.json", "hooks.json"]);
+        assert_eq!(read("mcp_config.json")?, serde_json::json!({"mcpServers": {"github": {"command": "gh-mcp"}}, "theme": "dark"}));
+        assert_eq!(read("hooks.json")?, serde_json::json!({"lint": {"PostToolUse": [{"matcher": "write_to_file", "hooks": [{"command": "./lint.sh"}]}]}}));
+        assert_eq!(std::fs::metadata(dir.path().join("hooks.json"))?.permissions().mode() & 0o777, 0o600);
+        assert!(agy_forget_kiln(dir.path())?.is_empty(), "once");
+        // A server of the person's own named kiln, and a file it can't read: left as they are.
+        std::fs::write(dir.path().join("mcp_config.json"), r#"{"mcpServers":{"kiln":{"command":"my-kiln-mcp"}}}"#)?;
+        std::fs::write(dir.path().join("hooks.json"), "{not json")?;
+        assert!(agy_forget_kiln(dir.path())?.is_empty());
+        assert_eq!(std::fs::read(dir.path().join("hooks.json"))?, b"{not json");
         Ok(())
     }
 
@@ -2284,12 +2300,13 @@ mod tests {
 
     /// Step 17 (Shards' D256, `MemberSpec::args`): a harness that takes its session on its command
     /// line is given it past its image's command in a microVM as on the host: the model it runs and the
-    /// conversation it resumes, each as its own CLI reads it (Claude Code's, Antigravity's and pi's).
+    /// conversation it resumes, each as its own CLI reads it (Claude Code's and pi's; Antigravity's ACP
+    /// server takes them over ACP, as every ACP agent does).
     #[test]
     fn s17_a_harness_taking_its_session_as_flags_gets_them_past_its_images_command() -> anyhow::Result<()> {
         let resume = "0198c9a2-1c4b-7a8e-9e2d-5f3a1b2c3d4e";
         let has = |args: &[String], flag: &str, value: &str| args.windows(2).any(|w| w == [flag, value]);
-        for (id, conversation) in [("claude", "--resume"), ("antigravity", "--conversation"), ("pi", "--session-id")] {
+        for (id, conversation) in [("claude", "--resume"), ("pi", "--session-id")] {
             let kind = Kind::get(id).ok_or_else(|| anyhow::anyhow!("no harness {id}"))?;
             let args = kind.elsewhere(&Spec { kind: id.into(), model: Some("m".into()), resume: Some(resume.into()), ..Spec::default() })?.args;
             assert!(has(&args, "--model", "m") && has(&args, conversation, resume), "{id}: {args:?}");

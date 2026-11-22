@@ -387,9 +387,9 @@ mod rest {
     }
 
     /// Two Antigravity agents of one person on one machine, side by side, each in a microVM of its own
-    /// from the same Agentfile. agy takes kiln's MCP from its one config in the person's volume, the same
-    /// entry for both, and the lane names the session (gaps.json's antigravity caveat; Shards D254): each
-    /// must reach kiln's MCP as itself. The stand-in says whom kiln's answer to its `initialize` named
+    /// from the same Agentfile. agy acp takes kiln's MCP at each session's `session/new`, the lane's bridge
+    /// for both, and the lane names the session (gaps.json's antigravity caveat; Shards D254): each must
+    /// reach kiln's MCP as itself. The stand-in says whom kiln's answer to its `initialize` named
     /// ([`vm_e2e::check_named_itself`]); a real agy's calls of kiln's tools are in the runner's log under
     /// its own session ([`vm_e2e::mcp_calls_over_lane`]).
     #[test]

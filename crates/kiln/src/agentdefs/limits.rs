@@ -9,7 +9,8 @@
 //! `crate::ci::attach`): its harness says it at each turn's end, and sooner where it can (Codex's token counts, Pi's
 //! replies, an ACP agent's cost). The registry tells the limits' owner of each session whose spending changed
 //! ([`Told`]), so none runs a whole turn past its limit unseen. A token limit is held only to a harness that says how
-//! many tokens its sessions use (`Kind::says_tokens`: no ACP agent, whose tokens are its own to give or leave out), and
+//! many tokens its sessions use (`Kind::says_tokens`: no ACP agent but Antigravity, whose ACP server says each
+//! turn's; the others' tokens are their own to give or leave out), and
 //! a cost limit only to one that says what they cost (`Kind::says_cost`). Either, set for another harness, is refused
 //! as it's saved (`super::check`), and a session held to one while it runs another all the same (a harness its start
 //! chose over its definition's, `super::uses`, or a definition saved before such limits were refused) is ended as it

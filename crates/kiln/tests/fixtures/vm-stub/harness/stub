@@ -3,12 +3,13 @@
 01a1cd8e862e7169a074db3d5fa33f3d, steps 34 and 35). It calls no model and reads no account.
 
 It speaks each machine interface kiln drives, as kiln's adapters read them (crates/kiln/src/harness):
-Claude Code's stream-json and control requests, Codex's app-server, the Agent Client Protocol,
-Antigravity's headless stream-json and Pi's RPC mode. Its dialect is `VM_STUB_PROTOCOL`, else the
-name it was started as:
+Claude Code's stream-json and control requests, Codex's app-server, the Agent Client Protocol and
+Pi's RPC mode. Its dialect is `VM_STUB_PROTOCOL`, else the name it was started as:
 
-    claude -> claude    codex -> codex    agy -> agy    pi -> pi
-    agent, gemini, opencode, goose, amp-acp, devin -> acp
+    claude -> claude    codex -> codex    pi -> pi
+    agent, gemini, opencode, goose, amp-acp, devin, agy -> acp
+
+(agy is Antigravity's CLI, which kiln runs as its own ACP server, `agy acp`.)
 
 Each turn it says, a line each: `CWD <its folder>`, `WHERE <kernel name> <boot id>` (the kernel it
 runs on: a microVM's guest has its own), `HEARD <its prompt>`, the lines its prompt asks for, then
@@ -58,7 +59,7 @@ prompt asks with words:
 
 A message steered into a running turn is said as `STEERED <its words>`. A stopped turn ends where it
 was, as its harness ends one (Claude Code's interrupt, Codex's turn/interrupt, ACP's session/cancel,
-Pi's abort; Antigravity's process is ended by kiln). As Claude Code, it says the permission mode it
+Pi's abort). As Claude Code, it says the permission mode it
 was started in (`--permission-mode`, else `default`) and the one a `set_permission_mode` set.
 """
 import json
@@ -77,7 +78,7 @@ PROTO = os.environ.get("VM_STUB_PROTOCOL") or os.path.basename(sys.argv[0] or ""
 LINES = int(os.environ.get("VM_STUB_LINES", "2"))
 VERSION = os.environ.get("VM_STUB_VERSION", "9.9.9-stub")
 CONNECT_WITHIN = float(os.environ.get("VM_STUB_CONNECT_SECS", "20"))
-ACP_PROGRAMS = {"acp", "agent", "cursor-agent", "gemini", "opencode", "goose", "amp-acp", "devin"}
+ACP_PROGRAMS = {"acp", "agent", "cursor-agent", "gemini", "opencode", "goose", "amp-acp", "devin", "agy"}
 # Whom kiln's MCP server serves, as its answer to initialize says it (kiln's `mcp::you_are`).
 YOU_ARE = re.compile(r"\bYou are kiln agent ([^\s:]+)")
 
@@ -85,7 +86,7 @@ _OUT = threading.Lock()
 
 
 def dialect():
-    if PROTO in ("claude", "codex", "agy", "pi"):
+    if PROTO in ("claude", "codex", "pi"):
         return PROTO
     if PROTO in ACP_PROGRAMS:
         return "acp"
@@ -316,20 +317,6 @@ def _acp_servers(servers):
         elif s.get("command"):
             out.append({"command": [s["command"]] + list(s.get("args") or []), "env": {e.get("name", ""): e.get("value", "") for e in s.get("env") or []}})
     return out
-
-
-AGY_CONFIG = os.path.join(os.path.expanduser("~"), ".gemini", "config", "mcp_config.json")
-
-
-def _agy_servers():
-    # Antigravity reads MCP servers from its own config alone; kiln puts its own there with
-    # `agy mcp add kiln <kiln> reach mcp` (kinds.rs `prepare`) and whom it serves in agy's
-    # environment, which agy hands on to the servers it starts.
-    try:
-        with open(AGY_CONFIG) as f:
-            return _servers_in(json.load(f))
-    except (OSError, ValueError):
-        return []
 
 
 class Mcp:
@@ -869,47 +856,6 @@ def run_acp():
     worker.end()
 
 
-# --- Antigravity's CLI: headless stream-json ---------------------------------------------------------
-
-
-def run_agy():
-    args = sys.argv[1:]
-    if args[:2] == ["mcp", "add"] and len(args) >= 4:
-        # `agy mcp add <name> <command> <args>...`, as agy keeps it.
-        try:
-            with open(AGY_CONFIG) as f:
-                config = json.load(f)
-        except (OSError, ValueError):
-            config = {}
-        config.setdefault("mcpServers", {})[args[2]] = {"command": args[3], "args": args[4:]}
-        os.makedirs(os.path.dirname(AGY_CONFIG), exist_ok=True)
-        with open(AGY_CONFIG, "w") as f:
-            json.dump(config, f)
-        return
-    if args[:1] == ["mcp"]:
-        return
-    cid = flag("--conversation") or str(uuid.uuid4())
-    emit({"event": "init", "conversation_id": cid, "init": {"model": "stub", "cwd": os.getcwd(), "tools": [], "permission_mode": "accept-edits"}})
-    step = [0]
-
-    def say(text):
-        emit({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": step[0], "state": "DONE", "step_type": "agent_response", "text_delta": text + "\n", "usage": {"input_tokens": 1, "output_tokens": 1}}})
-        step[0] += 1
-
-    for line in sys.stdin:
-        try:
-            m = json.loads(line)
-        except ValueError:
-            continue
-        if m.get("event") != "user":
-            continue
-        content = (m.get("message") or {}).get("content")
-        emit({"event": "step_update", "step_update": {"conversation_id": cid, "step_index": step[0], "state": "DONE", "step_type": "user_input"}})
-        step[0] += 1
-        Turn(content if isinstance(content, str) else "", _agy_servers(), say).run()
-        emit({"event": "result", "result": {"conversation_id": cid, "status": "SUCCESS", "response": "", "num_turns": 1}})
-
-
 # --- Pi: its RPC mode ---------------------------------------------------------------------------------
 
 
@@ -977,7 +923,7 @@ def main():
     if version():
         return
     try:
-        {"claude": run_claude, "codex": run_codex, "acp": run_acp, "agy": run_agy, "pi": run_pi}[dialect()]()
+        {"claude": run_claude, "codex": run_codex, "acp": run_acp, "pi": run_pi}[dialect()]()
     except (BrokenPipeError, KeyboardInterrupt):
         pass
 

@@ -118,7 +118,7 @@ const LATITUDE: Record<string, Record<string, number>> = {
   claude: { plan: 0, dontAsk: 0, default: 1, acceptEdits: 2, auto: 3, bypassPermissions: 4 },
   codex: { "read-only": 0, untrusted: 1, auto: 2, "full-access": 4 },
   devin: { plan: 0, ask: 1, "accept-edits": 2, smart: 3, bypass: 4 },
-  antigravity: { plan: 0, default: 1, "accept-edits": 2, bypass: 4 },
+  antigravity: { plan: 0, default: 1, "accept-edits": 2, "kiln-bypass": 4 },
 };
 /** Claude Code's and Codex's mode at each latitude, as kiln names it (handoff.rs `mode_at`); another harness's is the first it offers there. */
 const AT: Record<string, string[]> = {

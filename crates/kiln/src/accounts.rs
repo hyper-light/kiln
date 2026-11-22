@@ -1,7 +1,8 @@
-//! Signing a machine's harnesses in and out from kiln (Claude Code, Codex, Devin, Cursor, Pi), so
-//! `/login` and `/logout` work from the console: each harness's own CLI (`claude auth …`, `codex
-//! login …`, `devin auth …`, Cursor's `agent login`, `pi auth …`) runs in a terminal kiln opens on
-//! that machine for the purpose (never listed as anyone's), and
+//! Signing a machine's harnesses in and out from kiln (Claude Code, Codex, Devin, Cursor, Pi,
+//! Antigravity), so `/login` and `/logout` work from the console: each harness's own CLI (`claude
+//! auth …`, `codex login …`, `devin auth …`, Cursor's `agent login`, `pi auth …`, `agy acp
+//! --login`) runs in a terminal kiln opens on that machine for the purpose (never listed as
+//! anyone's), and
 //! what a sign-in asks for (a page to open, a code to enter there, a code or an API key to give
 //! back) is read from its output and shown in the console. What is typed in goes to the CLI only:
 //! it is never logged, kept once the sign-in ends, or shown again.
@@ -40,6 +41,13 @@ const DEVIN_PASTE: &str = "Paste the code from the sign-in page";
 /// Pi's Claude sign-in without a browser (`pi auth login anthropic --no-browser`, its "Copy code
 /// login") waits for the code Anthropic's page shows.
 const PI_PASTE: &str = "Paste the code Anthropic shows after you sign in";
+/// Antigravity's terminal sign-in (`agy acp --login`) waits for the code its page shows.
+const AGY_PASTE: &str = "paste the authorization code, or the full URL of the page you land on, and press Enter:";
+/// gcloud's application-default sign-in (`--no-launch-browser`) waits for the code its page shows.
+const GCLOUD_PASTE: &str = "enter the verification code provided in your browser:";
+/// What the prompts that wait for a code say: counted, and kept out of the output shown (the
+/// console asks for the code instead).
+const PASTES: [&str; 5] = [CLAUDE_PASTE, DEVIN_PASTE, PI_PASTE, AGY_PASTE, GCLOUD_PASTE];
 
 /// A way to sign in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -64,6 +72,8 @@ struct Cli {
     program: &'static str,
     /// What its CLI runs with besides its user's environment (`NAME=value`), else nothing.
     env: &'static str,
+    /// `status`, `logout`'s steps and its methods' `args` are whole scripts, not its CLI's arguments.
+    shell: bool,
     status: &'static str,
     /// Signing out: each run in turn.
     logout: &'static [&'static str],
@@ -71,12 +81,25 @@ struct Cli {
     read: fn(&str) -> Account,
 }
 
+/// A script of Antigravity's, in the folder where kiln keeps how its sessions sign in on the
+/// machine past what agy keeps itself (`crate::harness::kinds::AGY_SIGN_IN`: the ACP method, a
+/// Gemini API key, the Google Cloud project), as `$D`.
+macro_rules! agy {
+    ($body:literal) => {
+        concat!("D=$HOME/.gemini/antigravity-cli/kiln\n", $body)
+    };
+}
+
+/// What Antigravity's status script says of a sign-in kiln keeps (else it's agy's own: `agy models`).
+const AGY_SAYS: &str = "kiln-agy:";
+
 const CLIS: &[Cli] = &[
     Cli {
         kind: "claude",
         name: "Claude Code",
         program: "claude",
         env: "",
+        shell: false,
         status: "auth status --json",
         logout: &["auth logout"],
         methods: &[
@@ -91,6 +114,7 @@ const CLIS: &[Cli] = &[
         name: "Codex",
         program: "codex",
         env: "",
+        shell: false,
         status: "login status",
         logout: &["logout"],
         methods: &[
@@ -104,6 +128,7 @@ const CLIS: &[Cli] = &[
         name: "Devin",
         program: "devin",
         env: "",
+        shell: false,
         status: "auth status",
         logout: &["auth logout"],
         methods: &[Method { id: "devin", label: "Devin account", asks: Some("code"), args: "auth login --force-manual-token-flow" }],
@@ -117,6 +142,7 @@ const CLIS: &[Cli] = &[
         name: "Cursor CLI",
         program: "agent",
         env: "NO_OPEN_BROWSER=1",
+        shell: false,
         status: "status --format json",
         logout: &["logout"],
         methods: &[Method { id: "cursor", label: "Cursor account", asks: None, args: "login" }],
@@ -132,6 +158,7 @@ const CLIS: &[Cli] = &[
         name: "Pi",
         program: "pi",
         env: "",
+        shell: false,
         status: "--offline --list-models",
         logout: &["auth logout anthropic", "auth logout openai-codex"],
         methods: &[
@@ -139,6 +166,55 @@ const CLIS: &[Cli] = &[
             Method { id: "openai-codex", label: "ChatGPT Plus or Pro", asks: None, args: "auth login openai-codex --no-browser" },
         ],
         read: read_pi,
+    },
+    // agy has no status or sign-out of its own outside its interface: `agy models` says whether a
+    // Google account is signed in, and its ACP server's `logout` signs it out. A Gemini API key or
+    // Google Cloud's application-default credentials are ACP sign-in methods kiln keeps for its
+    // sessions (`crate::harness::kinds::agy_sign_in`): a sign-in with one replaces the other.
+    Cli {
+        kind: "antigravity",
+        name: "Antigravity CLI",
+        program: "agy",
+        env: "",
+        shell: true,
+        status: agy!(
+            "case $(cat $D/method 2>/dev/null) in\n\
+             gemini-api-key) if [ -s $D/gemini-api-key ]; then echo kiln-agy: gemini-api-key; else echo kiln-agy: none; fi;;\n\
+             agent-platform) if [ -s ${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/.config/gcloud/application_default_credentials.json} ]; then echo kiln-agy: agent-platform $(cat $D/project 2>/dev/null); else echo kiln-agy: none; fi;;\n\
+             *) exec agy models;;\n\
+             esac"
+        ),
+        logout: &[agy!(
+            "rm -f $D/method $D/gemini-api-key $D/project\n\
+             { cat <<EOF\n\
+             {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{}}}\n\
+             {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"logout\",\"params\":{}}\n\
+             EOF\n\
+             sleep 3; } | agy acp >/dev/null 2>&1\n\
+             exit 0"
+        )],
+        methods: &[
+            Method { id: "google", label: "Google account", asks: Some("code"), args: agy!("agy acp --login && rm -f $D/method $D/gemini-api-key $D/project") },
+            Method {
+                id: "api_key",
+                label: "Gemini API key",
+                asks: Some("api_key"),
+                args: agy!(
+                    "if command -v curl >/dev/null 2>&1 && ! printf %s \"x-goog-api-key: $secret\" | curl -fsS -o /dev/null -H @- https://generativelanguage.googleapis.com/v1beta/models; then echo Error: Google turned that API key down; exit 1; fi\n\
+                     mkdir -p $D && chmod 700 $D && rm -f $D/project && (umask 077 && printf %s \"$secret\" > $D/gemini-api-key) && echo gemini-api-key > $D/method && echo Signed in with a Gemini API key."
+                ),
+            },
+            Method {
+                id: "adc",
+                label: "Google Cloud (ADC)",
+                asks: Some("code"),
+                args: agy!(
+                    "gcloud auth application-default login --no-launch-browser || exit $?\n\
+                     mkdir -p $D && chmod 700 $D && rm -f $D/gemini-api-key && gcloud config get-value project 2>/dev/null > $D/project; echo agent-platform > $D/method"
+                ),
+            },
+        ],
+        read: read_agy,
     },
 ];
 
@@ -149,6 +225,13 @@ fn cli(kind: &str) -> anyhow::Result<&'static Cli> {
 /// How its CLI is run: the program, with what it runs with first.
 fn invocation(cli: &Cli) -> String {
     if cli.env.is_empty() { cli.program.to_owned() } else { format!("env {} {}", cli.env, cli.program) }
+}
+
+impl Cli {
+    /// The command a flow's terminal runs for `args`: its CLI's arguments, or its script (`shell`).
+    fn script(&self, id: &str, args: &str, secret: bool) -> String {
+        if self.shell { shell_script(id, args, secret) } else { script(id, &invocation(self), args, secret) }
+    }
 }
 
 /// A harness's account on a machine.
@@ -258,6 +341,30 @@ fn read_pi(out: &str) -> Account {
         return Account { signed_in: Some(false), ..Account::default() };
     }
     Account { signed_in: Some(true), method: Some(providers.join(", ")), ..Account::default() }
+}
+
+/// Antigravity's status script: a sign-in kiln keeps (`kiln-agy: <method> [project]`), else
+/// `agy models` (its models, one "id<TAB>label" a line, or that nobody is signed in).
+fn read_agy(out: &str) -> Account {
+    let text = plain(out);
+    if let Some(said) = text.lines().find_map(|l| l.trim().strip_prefix(AGY_SAYS)) {
+        let mut words = said.split_whitespace();
+        return match words.next() {
+            Some("gemini-api-key") => Account { signed_in: Some(true), method: Some("Gemini API key".to_owned()), ..Account::default() },
+            Some("agent-platform") => Account { signed_in: Some(true), method: Some("Google Cloud (ADC)".to_owned()), org: words.next().map(str::to_owned), ..Account::default() },
+            _ => Account { signed_in: Some(false), ..Account::default() },
+        };
+    }
+    if let Some(error) = text.lines().map(str::trim).find(|l| l.starts_with("Error:")) {
+        if error.to_ascii_lowercase().contains("sign in") {
+            return Account { signed_in: Some(false), ..Account::default() };
+        }
+        return Account { error: Some(error.to_owned()), ..Account::default() };
+    }
+    if text.lines().any(|l| l.contains('\t')) {
+        return Account { signed_in: Some(true), method: Some("Google account".to_owned()), ..Account::default() };
+    }
+    Account { error: Some(last_words(&text).unwrap_or_else(|| "it gave no status".to_owned())), ..Account::default() }
 }
 
 /// `devin auth status`: its sign-in method, then the user and account fields.
@@ -405,7 +512,7 @@ pub async fn status(hub: &Arc<Hub>, target: &str) -> anyhow::Result<Vec<Account>
 /// One harness's account on `target`.
 async fn account(hub: &Arc<Hub>, target: &str, cli: &'static Cli) -> Account {
     let id = crate::util::new_id();
-    let mut a = match run(hub, target, script(&id, &invocation(cli), cli.status, false), QUICK_TIMEOUT).await {
+    let mut a = match run(hub, target, cli.script(&id, cli.status, false), QUICK_TIMEOUT).await {
         Ok((Some(127), _)) => Account { error: Some(format!("{} isn't installed there", cli.program)), ..Account::default() },
         Ok((_, out)) => (cli.read)(&out),
         Err(e) => Account { error: Some(format!("{e:#}")), ..Account::default() },
@@ -427,7 +534,7 @@ pub async fn login(hub: &Arc<Hub>, target: &str, kind: &str, method: Option<&str
     reachable(hub, target)?;
     let id = crate::util::new_id();
     let key = m.asks == Some("api_key");
-    let session = open(hub, target, script(&id, &invocation(cli), m.args, key))?;
+    let session = open(hub, target, cli.script(&id, m.args, key))?;
     let flow = Flow {
         id: id.clone(),
         target: target.to_owned(),
@@ -660,7 +767,7 @@ pub async fn logout(hub: &Arc<Hub>, target: &str, kind: &str) -> anyhow::Result<
     // Each step in turn, its output after the one before; the first that fails says how it went.
     let mut ran: anyhow::Result<(Option<i32>, String)> = Ok((Some(0), String::new()));
     for args in cli.logout {
-        match run(hub, target, script(&id, &invocation(cli), args, false), QUICK_TIMEOUT).await {
+        match run(hub, target, cli.script(&id, args, false), QUICK_TIMEOUT).await {
             Ok((code, out)) => {
                 if let Ok((was, all)) = &mut ran {
                     all.push_str(&out);
@@ -713,7 +820,7 @@ fn reachable(hub: &Hub, target: &str) -> anyhow::Result<()> {
         anyhow::ensure!(a.terminal && !a.ephemeral, "{} has terminals (and so agents) turned off", a.shown());
         a.os == "windows"
     };
-    anyhow::ensure!(!windows, "signing in from kiln isn't available on Windows yet: run `claude auth login`, `codex login`, `devin auth login`, `agent login` or `pi auth login` on that machine");
+    anyhow::ensure!(!windows, "signing in from kiln isn't available on Windows yet: run `claude auth login`, `codex login`, `devin auth login`, `agent login`, `pi auth login` or `agy acp --login` on that machine");
     Ok(())
 }
 
@@ -779,6 +886,15 @@ fn script(id: &str, program: &str, args: &str, secret: bool) -> String {
     }
 }
 
+/// The same around a whole script (`Cli::shell`), which reads a secret into `$secret`.
+fn shell_script(id: &str, body: &str, secret: bool) -> String {
+    if secret {
+        format!("sh -c '{MARK}{id}\nstty -echo 2>/dev/null\nread -r secret\nstty echo 2>/dev/null\n{body}'")
+    } else {
+        format!("sh -c '{MARK}{id}\n{body}'")
+    }
+}
+
 /// What a CLI's output says so far.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Seen {
@@ -795,7 +911,7 @@ fn seen(out: &str, typed: &[String]) -> Seen {
     let url = links(out).into_iter().chain(urls(&text)).find(|u| u.starts_with("https://"));
     let mut lines: Vec<String> = Vec::new();
     for l in text.lines().map(str::trim) {
-        let l = l.split_once(CLAUDE_PROMPT).map_or(l, |(_, rest)| rest.trim());
+        let l = l.split_once(CLAUDE_PROMPT).or_else(|| l.split_once(AGY_PASTE)).or_else(|| l.split_once(GCLOUD_PASTE)).map_or(l, |(_, rest)| rest.trim());
         if l.is_empty() || l.contains(DEVIN_PASTE) || l.contains(PI_PASTE) || typed.iter().any(|t| l.contains(t.as_str())) || lines.last().is_some_and(|p| p == l) {
             continue;
         }
@@ -804,7 +920,7 @@ fn seen(out: &str, typed: &[String]) -> Seen {
     // On its own line (Codex), or ending one (Pi's "Open <page> and enter code: <code>").
     let code = lines.iter().find_map(|l| device_code(l).or_else(|| l.rsplit_once("code: ").and_then(|(_, c)| device_code(c.trim()))));
     let skip = lines.len().saturating_sub(LINES);
-    Seen { url, code, prompts: text.matches(CLAUDE_PASTE).count() + text.matches(DEVIN_PASTE).count() + text.matches(PI_PASTE).count(), lines: lines.split_off(skip) }
+    Seen { url, code, prompts: PASTES.iter().map(|p| text.matches(p).count()).sum(), lines: lines.split_off(skip) }
 }
 
 /// A one-time code as a device sign-in shows it on its own line ("1FYU-ZAUR8").
@@ -1035,6 +1151,62 @@ mod tests {
         assert_eq!((s.url.as_deref(), s.code.as_deref(), s.prompts), (Some("https://auth.openai.com/codex/device"), Some("1FYU-ZAUR8"), 0));
         let methods: Vec<_> = cli("pi").map(|c| c.methods.iter().map(|m| (m.id, m.asks, m.args)).collect()).unwrap_or_default();
         assert_eq!(methods, [("anthropic", Some("code"), "auth login anthropic --no-browser"), ("openai-codex", None, "auth login openai-codex --no-browser")]);
+    }
+
+    /// Antigravity's terminal sign-in (`agy acp --login`, agy 1.5.14) gives the Google page to open
+    /// and asks for the code it shows; gcloud's application-default sign-in does the same.
+    #[test]
+    fn an_antigravity_sign_in_gives_its_page_and_asks_for_the_code() {
+        let link = "https://accounts.google.com/o/oauth2/auth?access_type=offline&client_id=synthetic.apps.googleusercontent.com&code_challenge=abc&code_challenge_method=S256&prompt=consent&redirect_uri=https%3A%2F%2Fantigravity.google%2Foauth-callback&response_type=code&scope=openid&state=xyz";
+        let out = format!("Open this link in a browser to log in with Google:\r\n\r\n  {link}\r\n\r\nThen {AGY_PASTE}\r\n");
+        let s = seen(&out, &[]);
+        assert_eq!((s.url.as_deref(), s.prompts, s.code), (Some(link), 1, None));
+        assert!(s.lines.iter().all(|l| !l.contains("paste the authorization code")), "{:?}", s.lines);
+        let s = seen(&format!("{out}4/0Asynthetic-code\r\nlogin cancelled: no authorization code was entered\r\n"), &["4/0Asynthetic-code".to_owned()]);
+        assert!(s.lines.iter().all(|l| !l.contains("synthetic-code")));
+        // gcloud's application-default sign-in, for Google Cloud's credentials.
+        let out = format!("Go to the following link in your browser, and complete the sign-in prompts:\r\n\r\n    {link}\r\n\r\nOnce finished, {GCLOUD_PASTE} ");
+        let s = seen(&out, &[]);
+        assert_eq!((s.url.as_deref(), s.prompts), (Some(link), 1));
+        assert!(s.lines.iter().all(|l| !l.contains("verification code")), "{:?}", s.lines);
+    }
+
+    #[test]
+    fn antigravity_status_is_read() {
+        assert_eq!(read_agy("Fetching available models...\r\nError: Please sign in to view available models. Launch the CLI without arguments to sign in.\r\n").signed_in, Some(false));
+        let a = read_agy("Fetching available models...\r\ngemini-3.1-pro\tGemini 3.1 Pro\r\ngemini-3.8-flash\tGemini 3.8 Flash\r\n");
+        assert_eq!((a.signed_in, a.method.as_deref()), (Some(true), Some("Google account")));
+        assert_eq!(read_agy("kiln-agy: gemini-api-key\r\n").method.as_deref(), Some("Gemini API key"));
+        let a = read_agy("kiln-agy: agent-platform my-project\r\n");
+        assert_eq!((a.signed_in, a.method.as_deref(), a.org.as_deref()), (Some(true), Some("Google Cloud (ADC)"), Some("my-project")));
+        assert_eq!(read_agy("kiln-agy: none\r\n").signed_in, Some(false));
+        assert_eq!(read_agy("Error: secret keyring is locked\r\n").error.as_deref(), Some("Error: secret keyring is locked"));
+        assert_eq!(read_agy("").signed_in, None);
+    }
+
+    /// Antigravity's are whole scripts, in the folder its sessions read (`kinds::AGY_SIGN_IN`), free
+    /// of single quotes and backslashes like every other; its API key is read unechoed and goes to
+    /// no command's arguments.
+    #[test]
+    fn antigravity_s_scripts_keep_its_sign_in_where_its_sessions_read_it() -> anyhow::Result<()> {
+        let c = cli("antigravity")?;
+        let dir = format!("D=$HOME/{}\n", crate::harness::kinds::AGY_SIGN_IN);
+        let inner = |s: &str| s.strip_prefix("sh -c '").and_then(|r| r.strip_suffix('\'')).map(str::to_owned).unwrap_or_default();
+        let steps = [(c.status, false)].into_iter().chain(c.logout.iter().map(|l| (*l, false))).chain(c.methods.iter().map(|m| (m.args, m.asks == Some("api_key"))));
+        for (args, secret) in steps {
+            let s = c.script("01abc", args, secret);
+            assert!(crate::termsess::hidden(Some(&s)));
+            let body = inner(&s);
+            assert!(!body.is_empty() && !body.contains('\'') && !body.contains('\\'), "{body}");
+            assert!(body.contains(&dir), "{body}");
+        }
+        let key = c.methods.iter().find(|m| m.id == "api_key").map(|m| c.script("01abc", m.args, true)).unwrap_or_default();
+        assert!(key.contains("stty -echo") && key.contains("read -r secret") && key.contains("-H @-") && key.contains("umask 077"), "{key}");
+        assert_eq!(c.methods.iter().map(|m| (m.id, m.asks)).collect::<Vec<_>>(), [("google", Some("code")), ("api_key", Some("api_key")), ("adc", Some("code"))]);
+        assert!(c.logout.len() == 1 && c.logout.iter().all(|l| l.contains("\"method\":\"logout\"") && l.contains("agy acp")));
+        // Every other CLI's are its arguments.
+        assert!(CLIS.iter().all(|c| c.shell == (c.kind == "antigravity")));
+        Ok(())
     }
 
     #[test]

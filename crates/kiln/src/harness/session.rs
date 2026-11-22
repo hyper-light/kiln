@@ -3284,7 +3284,7 @@ enum Done {
 }
 
 /// Longest a run of the harness's CLI may take.
-const RUN_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long a session waits for its run's exit once its run was told to end, before it reads as ended: a process's ends
 /// as it's killed; a container's only once the container, its engine volume and its export are let go
@@ -4146,7 +4146,7 @@ async fn carried_in(from: &'static Kind, to: &'static Kind, env: &[(String, Stri
             crate::rt::blocking(move || match from.protocol {
                 Protocol::ClaudeStreamJson => handoff::read_claude(&env, &id),
                 Protocol::CodexAppServer => handoff::read_codex(&env, &id),
-                Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc | Protocol::Terminal => None,
+                Protocol::Acp(_) | Protocol::PiRpc | Protocol::Terminal => None,
             })
             .await
             .ok()
@@ -4174,7 +4174,7 @@ async fn carried_in(from: &'static Kind, to: &'static Kind, env: &[(String, Stri
         }
         Protocol::CodexAppServer => Record::Codex(handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>")))),
         // Fitted already (fitting it again would count what it left out anew).
-        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc => Record::Words(handoff::as_words(conv, &note, usize::MAX)),
+        Protocol::Acp(_) | Protocol::PiRpc => Record::Words(handoff::as_words(conv, &note, usize::MAX)),
         Protocol::Terminal => Record::Nothing,
     };
     Ok(Carried { record, mode, effort, dropped, empty })
@@ -4939,7 +4939,7 @@ where
         (core.events().filter(|e| !is_move_note(&e.id)).cloned().collect::<Vec<_>>(), core.state.clone(), core.state.cwd.clone())
     };
     let carry = match kind.protocol {
-        super::kinds::Protocol::Acp(_) | super::kinds::Protocol::AgyStreamJson => {
+        super::kinds::Protocol::Acp(_) => {
             let history: Vec<_> = handed_events(&events, &state.queue).into_iter().cloned().collect();
             let words = super::moving::words(&history, "This conversation went on in this machine's newer kiln runner, which took the older one's place.");
             // The newer process reads a native package, and the harness has a conversation of its own
@@ -8264,8 +8264,8 @@ sys.exit(1)
     }
 
     /// Ada, 2026-11-13: a session handed to its machine's newer runner process goes on natively,
-    /// by its own id, where that process reads a native package (new→new): an ACP agent with the
-    /// words kept for one that can't load, Antigravity without them; to one that doesn't (new→old,
+    /// by its own id, where that process reads a native package (new→new): an ACP agent (Antigravity's
+    /// `agy acp` among them) with the words kept for one that can't load; to one that doesn't (new→old,
     /// a rollback) in words, as before; and the words package an older runner sends (old→new) is
     /// one this build takes. A harness whose record kiln keeps goes on from it either way.
     #[test]
@@ -8295,8 +8295,7 @@ sys.exit(1)
                 let bytes = sent.lock().first().cloned().ok_or_else(|| anyhow::anyhow!("{kid}: nothing went"))?;
                 let pkg: Package = serde_json::from_slice(&bytes)?;
                 match (kid, native, &pkg.carry) {
-                    ("gemini", true, Carry::Native { session, words: Some(w) }) => anyhow::ensure!(session == "own-1" && w.contains("half way there") && pkg.spec.resume.as_deref() == Some("own-1"), "{kid}"),
-                    ("antigravity", true, Carry::Native { session, words: None }) => anyhow::ensure!(session == "own-1" && pkg.spec.resume.as_deref() == Some("own-1"), "{kid}"),
+                    ("gemini" | "antigravity", true, Carry::Native { session, words: Some(w) }) => anyhow::ensure!(session == "own-1" && w.contains("half way there") && pkg.spec.resume.as_deref() == Some("own-1"), "{kid}"),
                     ("gemini" | "antigravity", false, Carry::Words { text }) => anyhow::ensure!(text.contains("half way there") && pkg.version == 2, "{kid}: words for an older build"),
                     ("claude", _, Carry::Nothing) => anyhow::ensure!(pkg.spec.resume.as_deref() == Some("own-1"), "{kid}: its own record, either way"),
                     (k, n, c) => anyhow::bail!("{k} native={n}: {c:?}"),
@@ -8464,8 +8463,9 @@ sys.exit(1)
         let (mode, _, modes, _) = carried_choices(claude, devin, "auto", "", true, "");
         assert_eq!(mode.as_deref(), Some("smart"));
         assert!(modes.iter().any(|m| m.id == "bypass" && m.dangerous), "{modes:?}");
+        // Antigravity's efforts are its models' own, learned once it starts.
         let (mode, effort, modes, _) = carried_choices(devin, agy, "smart", "high", false, "");
-        assert_eq!((mode.as_deref(), effort.as_deref()), (Some("accept-edits"), Some("high")));
+        assert_eq!((mode.as_deref(), effort.as_deref()), (Some("accept-edits"), None));
         assert!(modes.iter().all(|m| !m.dangerous), "no bypass without leave to: {modes:?}");
         let (mode, effort, modes, efforts) = carried_choices(claude, gemini, "bypassPermissions", "high", true, "");
         assert_eq!(modes.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), [super::super::acp::KILN_ASK, super::super::acp::KILN_BYPASS]);

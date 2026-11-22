@@ -104,7 +104,6 @@ fn resumed_how(kind: &str) -> String {
     match Kind::get(kind).map(|k| k.protocol) {
         Some(Protocol::ClaudeStreamJson) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own conversation (--resume)."),
         Some(Protocol::CodexAppServer) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own thread (thread/resume)."),
-        Some(Protocol::AgyStreamJson) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own conversation."),
         Some(Protocol::PiRpc) => format!("It crashed and is resumed in place: a fresh {named} process going on in its own session (--session-id)."),
         Some(Protocol::Acp(_)) => format!("It crashed and is resumed in place: a fresh {named} process loading its own session (session/load), or, if it can't load sessions, given the conversation in words, as it says."),
         Some(Protocol::Terminal) | None => format!("It crashed and can't be resumed in its own conversation: {named} keeps none kiln can continue."),
@@ -405,7 +404,6 @@ mod tests {
                 Protocol::ClaudeStreamJson => assert!(said.contains("--resume"), "{said}"),
                 Protocol::CodexAppServer => assert!(said.contains("thread/resume"), "{said}"),
                 Protocol::PiRpc => assert!(said.contains("--session-id"), "{said}"),
-                Protocol::AgyStreamJson => assert!(said.contains("its own conversation"), "{said}"),
                 Protocol::Acp(_) => assert!(said.contains("session/load") && said.contains("in words"), "{said}"),
                 Protocol::Terminal => assert!(said.contains("can't be resumed"), "{said}"),
             }

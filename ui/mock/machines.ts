@@ -78,7 +78,7 @@ const devin: KindInfo = {
 const antigravity: KindInfo = {
   id: "antigravity",
   name: "Antigravity CLI",
-  verified: true,
+  verified: false,
   available: true,
   switch: true,
   models: [{ id: "gemini-3.8-pro", label: "Gemini 3.8 Pro", description: "" }],

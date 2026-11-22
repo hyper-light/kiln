@@ -30,7 +30,6 @@ pub mod acp;
 pub mod admission;
 pub mod agentenv;
 pub mod answers;
-pub mod antigravity;
 pub mod archive;
 pub mod attention;
 pub mod attention_hooks;
