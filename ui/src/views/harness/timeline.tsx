@@ -1575,23 +1575,29 @@ function firstInView(root: HTMLElement): RowPosition | null {
   const top = root.getBoundingClientRect().top;
   // A grouped step's actual call rows replace its enclosing rectangle in the ordered list:
   // nested overlapping rectangles would invalidate the binary search and save its first call
-  // as the anchor even while a later call is being read.
-  const all = [...root.querySelectorAll<HTMLElement>(PARTS)].filter((el) => !el.querySelector("[data-window-row]"));
+  // as the anchor even while a later call is being read. Skip querySelector on leaf rows.
+  const nodes = root.querySelectorAll<HTMLElement>(PARTS);
+  const all: HTMLElement[] = [];
+  for (let i = 0; i < nodes.length; i++) {
+    const el = nodes[i]!;
+    if (el.hasAttribute("data-window-row") || !el.querySelector("[data-window-row]")) all.push(el);
+  }
   let lo = 0;
   let hi = all.length - 1;
   let found: HTMLElement | null = null;
+  let foundIdx = -1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     const el = all[mid];
     if (!el) break;
     if (el.getBoundingClientRect().bottom > top + 1) {
       found = el;
+      foundIdx = mid;
       hi = mid - 1;
     } else lo = mid + 1;
   }
   const id = found ? partId(found) : "";
-  const index = found ? all.indexOf(found) : -1;
-  const neighbors = [all[index + 1], all[index - 1]].flatMap((el) => (el && partId(el) ? [{ id: partId(el), ...(el.hasAttribute("data-window-row") ? { row: true as const } : {}) }] : []));
+  const neighbors = [all[foundIdx + 1], all[foundIdx - 1]].flatMap((el) => (el && partId(el) ? [{ id: partId(el), ...(el.hasAttribute("data-window-row") ? { row: true as const } : {}) }] : []));
   return found && id ? { id, offset: found.getBoundingClientRect().top - top, ...(found.hasAttribute("data-window-row") ? { row: true as const } : {}), neighbors } : null;
 }
 

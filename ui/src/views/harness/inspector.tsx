@@ -143,7 +143,7 @@ export function Inspector({
   onOpenTask?: (toolId: string) => void;
   className?: string;
 }) {
-  const events = useSession(store, (s) => (tab === "changes" && s.changes ? NO_EVENTS : s.events));
+  const events = useSession(store, (s) => (tab === "changes" ? (s.changes ? NO_EVENTS : s.events) : tab === "plan" || tab === "tools" ? s.events : NO_EVENTS));
   const changes = useSession(store, (s) => s.changes);
   // The folder its workspace of its own is laid over, once made (a string: Changes stays memoized).
   const volumeOver = useSession(store, (s) => (s.info?.workspace?.made ? (s.info.workspace.over ?? "") : undefined));

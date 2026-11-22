@@ -865,13 +865,21 @@ pub fn born() -> u64 {
     *BORN.get_or_init(|| rand::random::<u64>() >> 11)
 }
 
-/// `value` kept in `dir`'s `file`, whole (written beside it, then moved over it).
+/// `value` kept in `dir`'s `file`, whole and synced (written beside it, fsynced, then renamed over
+/// it, and the parent directory synced).
 fn keep_json_in(dir: &std::path::Path, file: &str, value: &impl serde::Serialize) -> anyhow::Result<()> {
+    use std::io::Write as _;
     let path = dir.join(file);
     std::fs::create_dir_all(dir)?;
     let tmp = path.with_extension("json.part");
-    std::fs::write(&tmp, serde_json::to_vec(value)?)?;
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&serde_json::to_vec(value)?)?;
+    f.sync_all()?;
+    drop(f);
     std::fs::rename(&tmp, &path)?;
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
@@ -2700,11 +2708,20 @@ impl Registry {
         let now = crate::util::now_ms();
         let since = now - AWAY_DAYS * 24 * 3600 * 1000;
         let away = crate::rt::blocking(move || -> anyhow::Result<Vec<(crate::convo::store::Unended, Vec<crate::convo::rows::EventRow>)>> {
+            const HYDRATE_CAP: usize = 256;
             let recent: std::collections::HashSet<String> = st.unended_committed(now - RECENT)?.into_iter().map(|u| u.id).collect();
-            let mut out = Vec::new();
-            for u in st.unended_committed(since)? {
-                let keep = if recent.contains(&u.id) { MAX_EVENTS } else { AWAY_EVENTS };
-                let events = cut(st.events(&u.id, None, keep)?, keep);
+            // `SESSIONS_UNENDED` returns rows ordered by `updated_at` ascending: at 10k+ sessions,
+            // pre-hydrate events only for the newest 256 sessions; older sessions load on demand.
+            let unended = st.unended_committed(since)?;
+            let hydrate_from = unended.len().saturating_sub(HYDRATE_CAP);
+            let mut out = Vec::with_capacity(unended.len());
+            for (idx, u) in unended.into_iter().enumerate() {
+                let events = if idx >= hydrate_from {
+                    let keep = if recent.contains(&u.id) { MAX_EVENTS } else { AWAY_EVENTS };
+                    cut(st.events_committed(&u.id, None, keep)?, keep)
+                } else {
+                    Vec::new()
+                };
                 out.push((u, events));
             }
             Ok(out)
@@ -2948,6 +2965,30 @@ impl Registry {
         self.sessions.each(|_, view| v.push(Arc::clone(&view.info)));
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
         v
+    }
+
+    /// Flushes any queued conversation-store writes to disk before server shutdown.
+    pub async fn flush_convo(&self) {
+        let Some(st) = self.convo.clone() else { return };
+        let res = crate::rt::timeout(
+            std::time::Duration::from_secs(5),
+            crate::rt::blocking(move || st.sync()),
+        )
+        .await;
+        if let Err(e) = res {
+            tracing::warn!(error = %e, "conversation store shutdown flush timed out");
+        }
+    }
+
+    /// Map of `harness_session` -> kiln session `id` across all listed sessions without cloning `Info`.
+    pub fn managed_ids(&self) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        self.sessions.each(|id, view| {
+            if let Some(hs) = &view.info.harness_session {
+                out.insert(hs.clone(), id.to_owned());
+            }
+        });
+        out
     }
 
     /// The ids of the sessions whose target is `target` (`agent:<machine>`), in no order, none of their infos copied:
@@ -3332,11 +3373,17 @@ impl Registry {
             }
             None => (None, None),
         };
+        // A session held closed (its close came before its announcement) gets no copy again (HARNESS-4);
+        // evaluate BEFORE writing to the conversation store so a stale Open never clears `closed_at`
+        // on disk and resurrects a closed session.
+        let held = s.closed_open(id, &from, &u);
         // Its row's writing, timed: a state's and a meta's part of what writing them out takes (learned below). What's learned
         // here is timed on the CPU where the shard's thread says, as a turn's hold is (`super::copies::Timer`; goal 9, plan
         // 01a1a87b2cec step 3).
         let row_began = super::copies::Timer::start();
-        if let Some(store) = store.filter(|_| !matches!(u, Update::ChangesPatch { .. } | Update::Events { .. })) {
+        if !held
+            && let Some(store) = store.filter(|_| !matches!(u, Update::ChangesPatch { .. } | Update::Events { .. }))
+        {
             match written_off.as_mut() {
                 Some(made) => store.put(made.take_rows()),
                 None => store.send(id, &u),
@@ -3380,9 +3427,6 @@ impl Registry {
         let mut stored_changes: Option<Files> = None;
         // An Open taken: its copy, published once it's taken, is what an attach may wait for as the server starts.
         let opened = matches!(u, Update::Open { .. });
-        // A session held closed (its close came before its announcement) gets no copy again (HARNESS-4); what the store keeps
-        // of it is kept as before.
-        let held = s.closed_open(id, &from, &u);
         if let Update::Open { info, since } = &u
             && !held
         {

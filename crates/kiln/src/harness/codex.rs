@@ -2182,10 +2182,11 @@ impl Codex {
         }
     }
 
-    /// Between turns: the next message in kiln's queue.
+    /// Between turns: apply pending control reloads first, then the next message in kiln's queue.
     pub(crate) fn next(&mut self, core: &mut Core) {
         self.restore_waiting(core);
-        if !self.accepting(core) || self.busy(core) || core.state.queue.is_empty() {
+        self.reload_when_idle(core);
+        if self.reload.is_some() || !self.accepting(core) || self.busy(core) || core.state.queue.is_empty() {
             return;
         }
         // A pause (or a switch) holds what waits, and the stop point may start one here.
@@ -3709,6 +3710,7 @@ impl Codex {
                     super::pause::continue_later(core, &text);
                 }
                 self.settle(core);
+                self.reload_when_idle(core);
                 self.next(core);
             }
             "item/started" | "item/completed" => {

@@ -3,7 +3,7 @@
  * head), before its code is in: lib/early.ts hands those answers to the app's own reads.
  */
 
-import { AGENTS_READ, KINDS_READ, REACH_READ, SESSIONS_READ } from "@/api/launch-reads";
+import { AGENTS_READ, KINDS_READ, REACH_READ, SESSIONS_READ, WAITING_READ } from "@/api/launch-reads";
 import { SIGNED_OUT } from "@/api/client";
 import { SHIP_FIRST_READ } from "@/api/ship-first";
 
@@ -11,15 +11,11 @@ import { SHIP_FIRST_READ } from "@/api/ship-first";
 const SHELL = ["/api/me", "/api/peers/open"];
 
 /**
- * What every page reads first once someone is signed in: the shell around each page shows the
- * agents that wait for you (views/harness/waiting.ts), and an agent's page, Mission control and
- * most others read the agents themselves, so every page reads them. They were asked only once all
- * the code was in and who this is was known, a round trip or two after the document could have
- * asked. (Not the marks of notices put away, which the shell reads too: a page's first change, such
- * as Mission control's visit, comes before its shell reads them, and a change lets go of what the
- * document asked.)
+ * What every page reads first once someone is signed in: only the compact waiting-cards endpoint
+ * (~300 B even at 10k sessions), so `/ship`, `/runners`, and `/agents/:id` never download all 10k
+ * sessions on cold load. Mission Control requests `SESSIONS_READ` in `EARLY["/agents"]`.
  */
-export const SIGNED = [SESSIONS_READ];
+export const SIGNED = [WAITING_READ];
 
 /**
  * What a page reads as it opens, by its path (after a peer's base): what its first render waits on,
@@ -27,7 +23,7 @@ export const SIGNED = [SESSIONS_READ];
  * would only take the connections its code needs.
  */
 export const EARLY: Record<string, readonly string[]> = {
-  "/agents": [KINDS_READ, AGENTS_READ, "/api/terminal/sessions", REACH_READ, "/api/harness/workspaces", "/api/push", "/api/push/subscriptions", "/api/voice"],
+  "/agents": [SESSIONS_READ, KINDS_READ, AGENTS_READ, "/api/terminal/sessions", REACH_READ, "/api/harness/workspaces", "/api/push", "/api/push/subscriptions", "/api/voice"],
   // Ship's rows, each repository's newest commit: what its list waits on (a facet chosen in the
   // address reads another URL, and the app reads that itself).
   "/ship": [SHIP_FIRST_READ],

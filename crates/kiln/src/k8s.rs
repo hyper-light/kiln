@@ -12,12 +12,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use k8s_openapi::api::core::v1::{
-    Affinity, Container, ContainerPort, EnvVar, EnvVarSource, ExecAction, HostAlias, HostPathVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
-    ObjectFieldSelector, PersistentVolumeClaimVolumeSource, Pod, PodSpec, PreferredSchedulingTerm, Probe, ResourceRequirements, SecurityContext, Volume, VolumeMount,
+use crate::kubeapi::types::{
+    Affinity, Container, ContainerPort, EnvVar, EnvVarSource, ExecAction, HostAlias, HostPathVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector,
+    ObjectMeta, PersistentVolumeClaimVolumeSource, Pod, PodSpec, PreferredSchedulingTerm, Probe, Quantity, ResourceRequirements, SecurityContext, Volume, VolumeMount,
 };
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use crate::kubeapi::KubeApi;
 
 pub mod agent;
@@ -309,7 +307,7 @@ fn worker_affinity(required: bool) -> Affinity {
     } else {
         NodeAffinity { preferred_during_scheduling_ignored_during_execution: Some(vec![PreferredSchedulingTerm { weight: 100, preference: worker }]), ..Default::default() }
     };
-    Affinity { node_affinity: Some(nodes), ..Default::default() }
+    Affinity { node_affinity: Some(nodes) }
 }
 
 /// The init container that copies the static `kiln` into the pod. Explicit requests: a namespace
@@ -325,7 +323,6 @@ fn kiln_bin(cfg: &KCfg) -> Container {
         resources: Some(ResourceRequirements {
             requests: Some(BTreeMap::from([("cpu".to_owned(), q("50m")), ("memory".to_owned(), q("32Mi"))])),
             limits: Some(BTreeMap::from([("memory".to_owned(), q("128Mi"))])),
-            ..Default::default()
         }),
         ..Default::default()
     }
@@ -357,7 +354,6 @@ fn job_pod(cfg: &KCfg, job: &Job, spec: &crate::pipeline::PlannedJob, run: &Run,
     let resources = ResourceRequirements {
         requests: Some(BTreeMap::from([("cpu".to_owned(), q(&cpu)), ("memory".to_owned(), q(&mem))])),
         limits: Some(BTreeMap::from([("memory".to_owned(), q(&mem))])),
-        ..Default::default()
     };
     Pod {
         metadata: ObjectMeta {
@@ -458,7 +454,7 @@ pub(crate) fn pool_pod(cfg: &KCfg, executor: &str, name: &str, token: &str, (ser
             image: Some(s.image.clone()),
             image_pull_policy: Some("IfNotPresent".into()),
             env: Some(s.env.iter().map(|(k, v)| env_var(k, v)).collect()),
-            ports: Some(s.ports.iter().map(|p| ContainerPort { container_port: i32::from(*p), ..Default::default() }).collect()),
+            ports: Some(s.ports.iter().map(|p| ContainerPort { container_port: i32::from(*p) }).collect()),
             // A native sidecar: started before the job container, kept running beside it.
             restart_policy: Some("Always".into()),
             resources: Some(ResourceRequirements {
@@ -492,7 +488,7 @@ pub(crate) fn pool_pod(cfg: &KCfg, executor: &str, name: &str, token: &str, (ser
     if let Some(disk) = &r.disk {
         requests.insert("ephemeral-storage".to_owned(), q(disk));
     }
-    let resources = ResourceRequirements { requests: Some(requests), limits: Some(BTreeMap::from([("memory".to_owned(), q(&mem))])), ..Default::default() };
+    let resources = ResourceRequirements { requests: Some(requests), limits: Some(BTreeMap::from([("memory".to_owned(), q(&mem))])) };
     Pod {
         metadata: ObjectMeta {
             name: Some(name.to_owned()),
@@ -583,7 +579,6 @@ fn pod_docker(d: &kiln_ci::sched::pools::PodDocker) -> [Container; 2] {
             exec: Some(ExecAction { command: Some(vec!["sh".into(), "-c".into(), format!("test -S {POD_DOCKER_DIR}/docker.sock")]) }),
             period_seconds: Some(1),
             failure_threshold: Some(300),
-            ..Default::default()
         }),
         volume_mounts: Some(vec![mount("docker-sock", POD_DOCKER_DIR), mount("work", "/work"), mount("docker-data", data)]),
         resources: Some(small("100m", "256Mi")),
@@ -673,8 +668,8 @@ fn env_var(k: &str, v: &str) -> EnvVar {
 
 /// A variable Kubernetes fills from the pod itself (`path`, the Downward API).
 fn field_env(k: &str, path: &str) -> EnvVar {
-    let field_ref = ObjectFieldSelector { field_path: path.to_owned(), ..Default::default() };
-    EnvVar { name: k.to_owned(), value_from: Some(EnvVarSource { field_ref: Some(field_ref), ..Default::default() }), ..Default::default() }
+    let field_ref = ObjectFieldSelector { field_path: path.to_owned() };
+    EnvVar { name: k.to_owned(), value_from: Some(EnvVarSource { field_ref: Some(field_ref) }), ..Default::default() }
 }
 
 fn mount(name: &str, path: &str) -> VolumeMount {
@@ -954,7 +949,7 @@ mod tests {
         let mut held = executor();
         if let Some(spec) = held.spec.as_mut() {
             let zone = NodeSelectorTerm { match_expressions: Some(vec![NodeSelectorRequirement { key: "zone".into(), operator: "In".into(), values: Some(vec!["a".into()]) }]), ..Default::default() };
-            spec.affinity = Some(Affinity { node_affinity: Some(NodeAffinity { required_during_scheduling_ignored_during_execution: Some(NodeSelector { node_selector_terms: vec![zone] }), ..Default::default() }), ..Default::default() });
+            spec.affinity = Some(Affinity { node_affinity: Some(NodeAffinity { required_during_scheduling_ignored_during_execution: Some(NodeSelector { node_selector_terms: vec![zone] }), ..Default::default() }) });
         }
         apply_warm(&mut held, &label);
         let v = serde_json::to_value(&held)?;

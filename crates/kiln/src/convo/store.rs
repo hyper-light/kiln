@@ -280,6 +280,11 @@ pub trait Engine: Send + 'static {
     /// Let go of up to `limit` record lines of sessions that ended before `before` (unix ms):
     /// how many went (0: none are left). Their events stay.
     fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize>;
+    /// Whether the next `compact_some` step is ready to swap the compacted file into place (so the
+    /// writer can quiesce the reader connection before `finish_compact` removes `-wal`/`-shm`).
+    fn compact_ready(&self) -> bool {
+        false
+    }
     /// A step of making the database's file compact, once compressing and letting go left
     /// `min_free` bytes of it free, and a third of it: a copy, `step_bytes` at a time, under the
     /// same numbers, then what was written meanwhile, then the copy takes the file's place. The
@@ -347,6 +352,12 @@ pub trait Read {
     /// (`sql::EVENTS_NEWEST`, an index's order, no sort of the session's events), oldest first. Cheap whatever the
     /// session's or the store's size.
     fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
+    /// As [`Engine::search_some`], read beside the writer so HTTP search never stalls writes.
+    fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)>;
+    /// As [`Engine::marks`].
+    fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>>;
+    /// As [`Engine::record`].
+    fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>>;
 }
 
 /// The writer's engine as a [`Read`]: a store whose engine has no reader (or whose reader stopped) reads on its writer,
@@ -377,6 +388,18 @@ impl Read for OnWriter<'_> {
     fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
         self.0.restorable(session, last)
     }
+
+    fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
+        self.0.search_some(q, from, rows, want)
+    }
+
+    fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>> {
+        self.0.marks(session)
+    }
+
+    fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        self.0.record(session, source, from, limit)
+    }
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Engine) + Send>;
@@ -386,6 +409,9 @@ type ReadJob = Box<dyn FnOnce(&mut dyn Read) + Send>;
 enum ReadMsg {
     /// Run on the reader, at the last commit.
     Run(ReadJob),
+    /// Drop the current reader connection before a compaction file swap so `-wal`/`-shm` have no
+    /// open readers; replies once dropped, and buffers incoming `Run` jobs until `Use` arrives.
+    Detach(mpsc::Sender<()>),
     /// Read with this one from now on: its engine's file is new (a compaction's copy took the old one's place).
     Use(Box<dyn Read + Send>),
     /// Let go of the file and stop: the writer lets go of it next ([`Store::close`]).
@@ -393,13 +419,28 @@ enum ReadMsg {
 }
 
 /// The reader thread: what's asked of the reader beside the writer, in turn.
-fn read_on(mut reader: Box<dyn Read + Send>, rx: &mpsc::Receiver<ReadMsg>) {
+fn read_on(reader: Box<dyn Read + Send>, rx: &mpsc::Receiver<ReadMsg>) {
+    let mut reader = Some(reader);
+    let mut deferred: Vec<ReadJob> = Vec::new();
     while let Ok(msg) = rx.recv() {
         match msg {
-            ReadMsg::Run(job) => job(&mut *reader),
-            ReadMsg::Use(next) => reader = next,
+            ReadMsg::Run(job) => match reader.as_mut() {
+                Some(r) => job(&mut **r),
+                None => deferred.push(job),
+            },
+            ReadMsg::Detach(done) => {
+                reader = None;
+                let _ = done.send(());
+            }
+            ReadMsg::Use(mut next) => {
+                for job in deferred.drain(..) {
+                    job(&mut *next);
+                }
+                reader = Some(next);
+            }
             ReadMsg::Stop(done) => {
                 drop(reader);
+                drop(deferred);
                 let _ = done.send(());
                 return;
             }
@@ -455,6 +496,9 @@ pub struct Queue {
     /// with it ([`Store::put_wait`]).
     sent: AtomicU64,
     gone: AtomicU64,
+    /// Incremented whenever a write batch fails to commit so `put_wait` reports failure instead of
+    /// letting callers advance past uncommitted lines.
+    failed: AtomicU64,
     /// Bytes of feeds' batches taken in ([`Store::take`], [`Store::take_copy`]): with `written`, what this store's own
     /// feeds have to ship ([`Store::grown`]).
     taken: AtomicU64,
@@ -518,6 +562,8 @@ impl Queue {
         let n = u64::try_from(bytes).unwrap_or(u64::MAX);
         if committed {
             self.written.fetch_add(n, Ordering::Relaxed);
+        } else {
+            self.failed.fetch_add(1, Ordering::Release);
         }
         let mut now = self.bytes.load(Ordering::Relaxed);
         while let Err(seen) = self.bytes.compare_exchange_weak(now, now.saturating_sub(bytes), Ordering::Relaxed, Ordering::Relaxed) {
@@ -643,6 +689,7 @@ impl Store {
             return true;
         }
         let bytes = rows.iter().map(Row::bytes).sum();
+        let failed_before = self.queue.failed.load(Ordering::Acquire);
         let at = self.queue.took(bytes);
         if self.tx.send(Msg::Rows(rows, bytes)).is_err() {
             self.queue.let_go(bytes, false);
@@ -656,7 +703,7 @@ impl Store {
             }
             let _ = listener.wait_deadline(until);
         }
-        true
+        self.queue.taken_in(at) && self.queue.failed.load(Ordering::Acquire) == failed_before
     }
 
     /// Waits while anything waits for the writer ([`Queue`]): whoever sent rows waits here after, so a burst waits
@@ -838,6 +885,47 @@ impl Store {
     pub fn kept_committed(&self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
         let s = session.to_owned();
         self.read(move |r| r.kept(&s, last))
+    }
+
+    /// [`Store::marks`], read beside the writer at the last commit. Blocking.
+    pub fn marks_committed(&self, session: &str) -> anyhow::Result<Vec<Mark>> {
+        let s = session.to_owned();
+        self.read(move |r| r.marks(&s))
+    }
+
+    /// [`Store::record`], read beside the writer at the last commit. Blocking.
+    pub fn record_committed(&self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        let (s, src) = (session.to_owned(), source.to_owned());
+        self.read(move |r| r.record(&s, &src, from, limit))
+    }
+
+    /// [`Store::search`], read beside the writer on `TursoRead` so full-text scans over 100k+
+    /// events never stall the conversation writer or inbox commits. Blocking.
+    pub fn search_committed(&self, q: Query) -> anyhow::Result<Vec<EventRow>> {
+        let limit = q.limit.unwrap_or(100).min(SEARCH_MAX);
+        let (q, until) = (Arc::new(q), Instant::now() + SEARCH_WAIT);
+        let (mut found, mut from, mut rows) = (Vec::new(), None, SEARCH_SLICE_FIRST);
+        while found.len() < limit {
+            let (q, want) = (q.clone(), limit - found.len());
+            let (more, next, took) = self.read(move |r| {
+                let began = Instant::now();
+                let (more, next) = r.search_some(&q, from, rows, want)?;
+                Ok((more, next, began.elapsed()))
+            })?;
+            found.extend(more);
+            rows = if took > SEARCH_SLICE_TIME {
+                (rows / 2).max(SEARCH_SLICE_MIN)
+            } else if took < SEARCH_SLICE_TIME / 2 {
+                (rows * 2).min(SEARCH_SLICE)
+            } else {
+                rows
+            };
+            match next {
+                Some(next) if Instant::now() < until => from = Some(next),
+                _ => break,
+            }
+        }
+        Ok(found)
     }
 
     /// What is kept of `session`, with at most its last `last` events. Blocking.
@@ -1032,7 +1120,16 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
             return;
         }
         let rows = rows::coalesce(std::mem::take(pending));
-        let applied = engine.apply(&rows);
+        // Retry transient I/O or lock hiccups up to 3 times before giving up so bursts never
+        // silently drop conversation rows.
+        let mut applied = engine.apply(&rows);
+        for wait_ms in [10u64, 50, 150] {
+            if applied.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(wait_ms));
+            applied = engine.apply(&rows);
+        }
         #[cfg(test)]
         queue.committed_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
         // Counted before anyone is told (as `crate::store`'s writer counts a group: a caller that reads the count once
@@ -1054,6 +1151,14 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
             return;
         }
         let taken = std::mem::take(jobs);
+        let inbox_bytes: u64 = taken
+            .iter()
+            .flat_map(|j| j.tx.writes.iter())
+            .map(|w| match w {
+                kiln_seams::records::Write::Put { family, key, value } => (family.len() + key.len() + value.len()) as u64,
+                kiln_seams::records::Write::Delete { family, key } => (family.len() + key.len()) as u64,
+            })
+            .sum();
         let done = {
             let batch: Vec<(&kiln_seams::records::Tx, &[String])> = taken.iter().map(|j| (&j.tx, j.sessions.as_slice())).collect();
             engine.inbox_commit_batch(&batch)
@@ -1078,10 +1183,16 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
             }
         }
         if wrote {
+            // Advance `queue.written` so `Store::grown()` reflects inbox-only commits and `Shipper`
+            // replicates them immediately instead of skipping when no event rows accompanied them.
+            queue.written.fetch_add(inbox_bytes.max(1), Ordering::Relaxed);
+            queue.room.notify();
             notify(watchers);
         }
     };
     let mut inbox: Vec<Box<InboxJob>> = Vec::new();
+    const DRAIN_MSGS_MAX: usize = 64;
+    const DRAIN_BYTES_MAX: usize = 256 << 10;
     loop {
         let idle = if squeezing || looking || compacting.is_some() { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY).min(LOOK_FILE) };
         // Nothing waits here between commits (each takes all there is), so the writer waits on its channel: the first of
@@ -1094,10 +1205,12 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         let began = Instant::now();
         match got {
             Ok(first) => {
-                // What came since the last commit, as one: the first, and all the channel holds behind it, committed at
-                // once (consts-audit B3); a job's rows committed before it runs.
+                // Drain a bounded slice of what waits so a large event burst never starves inbox
+                // commits or control reads behind unbounded `Msg::Rows` draining.
                 let mut next = Some(first);
+                let mut drained = 0usize;
                 while let Some(m) = next.take() {
+                    drained += 1;
                     match m {
                         Msg::Rows(rows, bytes) => {
                             pending.extend(rows);
@@ -1129,6 +1242,9 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             return;
                         }
                     }
+                    if (!inbox.is_empty() && drained >= 16) || drained >= DRAIN_MSGS_MAX || pending_bytes >= DRAIN_BYTES_MAX {
+                        break;
+                    }
                     next = rx.try_recv().ok();
                 }
                 commit_inbox(&mut engine, &mut inbox);
@@ -1146,14 +1262,31 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                         }
                     }
                 } else if let Some(compact_began) = compacting {
+                    let swapping = engine.compact_ready();
+                    if swapping
+                        && let Some(reads) = reads
+                    {
+                        let (done, detached) = mpsc::channel();
+                        if reads.send(ReadMsg::Detach(done)).is_ok() {
+                            let _ = detached.recv_timeout(READ_WAIT);
+                        }
+                    }
                     engine = match engine.compact_some(upkeep.compact.unwrap_or(COMPACT_MIN_FREE), COMPACT_STEP) {
-                        Ok((e, Compacting::Going)) => e,
+                        Ok((e, Compacting::Going)) => {
+                            if swapping
+                                && let (Some(reads), Some(reader)) = (reads, e.reader())
+                            {
+                                let _ = reads.send(ReadMsg::Use(reader));
+                            }
+                            e
+                        }
                         Ok((e, done)) => {
+                            if (swapping || matches!(done, Compacting::Done { .. }))
+                                && let (Some(reads), Some(reader)) = (reads, e.reader())
+                            {
+                                let _ = reads.send(ReadMsg::Use(reader));
+                            }
                             if let Compacting::Done { before, after } = done {
-                                // The file is the compact copy now: its reader reads that one.
-                                if let (Some(reads), Some(reader)) = (reads, e.reader()) {
-                                    let _ = reads.send(ReadMsg::Use(reader));
-                                }
                                 tracing::info!(before, after, "conversation store: its file was made compact");
                                 let ms = u64::try_from(compact_began.elapsed().as_millis()).unwrap_or(u64::MAX);
                                 meter.saw(|f| f.compacted = Some(Compacted { at: crate::util::now_ms(), before, after, ms }));
@@ -1259,16 +1392,17 @@ impl std::fmt::Debug for Tee {
 }
 
 impl Tee {
-    /// `t` kept, under the lock a taker waits on; then, the lock let go, a store over its bound holds it back once its
-    /// rows are as many as this runner's streams keep unanswered (goal 11, plan 01a1a87b2e56 step 3).
+    /// `t` kept, under the lock a taker waits on; rows are serialized BEFORE acquiring the lock so
+    /// concurrent sessions never contend on JSON serialization under `Mutex<Keeping>`.
     pub async fn keep(&self, t: &Taken) {
+        let built = rows::of(&t.session, &t.update, crate::util::now_ms());
         let kept_in = match &mut *self.keeping.lock().unwrap_or_else(PoisonError::into_inner) {
             Keeping::Waiting(rows) => {
-                rows.extend(rows::of(&t.session, &t.update, crate::util::now_ms()));
+                rows.extend(built);
                 None
             }
             Keeping::Store(st) => {
-                st.send(&t.session, &t.update);
+                st.put(built);
                 Some(st.clone())
             }
             Keeping::Gone => None,
@@ -2067,5 +2201,62 @@ mod tests {
             assert_eq!(store.kept("a1", 10)?.map(|k| k.events.len()), Some(3));
             Ok(())
         })
+    }
+
+    #[test]
+    fn inbox_commit_advances_grown_and_notifies_watchers_and_failed_apply_returns_false() -> anyhow::Result<()> {
+        let (_dir, store) = scratch()?;
+        anyhow::ensure!(store.grown() == 0, "fresh store starts at 0 grown bytes");
+        let watch = store.watch();
+        let tx = kiln_seams::records::Tx {
+            conds: Vec::new(),
+            writes: vec![kiln_seams::records::Write::Put {
+                family: "inbox".into(),
+                key: b"sess-1/msg-1".to_vec(),
+                value: b"durable-inbox-payload".to_vec(),
+            }],
+        };
+        let store_c = store.clone();
+        let committed = crate::rt::block_on(async move { store_c.inbox_commit(tx, vec!["sess-1".into()], None).await })?;
+        anyhow::ensure!(committed.is_ok(), "inbox_commit must succeed: {committed:?}");
+        anyhow::ensure!(store.grown() > 0, "inbox-only commit must advance Store::grown() so Shipper replicates it");
+        // The watcher must be notified by the inbox-only commit (one stored permit).
+        let notified = crate::rt::block_on(async move { Ok(crate::rt::timeout(Duration::from_millis(200), watch.notified()).await.is_ok()) })?;
+        anyhow::ensure!(notified, "inbox-only commit must notify store watchers");
+
+        // A failing engine must surface failure from put_wait rather than silently claiming success.
+        struct FailingApply {
+            inner: Box<dyn Engine>,
+        }
+        impl Engine for FailingApply {
+            fn id(&self) -> String { self.inner.id() }
+            fn restorable(&mut self, s: &str, l: usize) -> anyhow::Result<Option<Kept>> { self.inner.restorable(s, l) }
+            fn apply(&mut self, _rows: &[Row]) -> anyhow::Result<()> { anyhow::bail!("injected disk error") }
+            fn kept(&mut self, s: &str, l: usize) -> anyhow::Result<Option<Kept>> { self.inner.kept(s, l) }
+            fn events(&mut self, s: &str, b: Option<u64>, l: usize) -> anyhow::Result<Vec<EventRow>> { self.inner.events(s, b, l) }
+            fn thread(&mut self, s: &str, p: &str, b: Option<u64>, l: usize) -> anyhow::Result<Vec<EventRow>> { self.inner.thread(s, p, b, l) }
+            fn search_some(&mut self, q: &Query, f: Option<SearchFrom>, r: usize, w: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> { self.inner.search_some(q, f, r, w) }
+            fn changes(&mut self, f: u64, m: usize, k: bool, i: bool) -> anyhow::Result<Changes> { self.inner.changes(f, m, k, i) }
+            fn take(&mut self, p: &str, m: Option<&str>, f: u64, b: &Changes) -> anyhow::Result<Took> { self.inner.take(p, m, f, b) }
+            fn peer(&mut self, p: &str) -> anyhow::Result<u64> { self.inner.peer(p) }
+            fn peers(&mut self) -> anyhow::Result<Vec<(String, u64, i64)>> { self.inner.peers() }
+            fn marks(&mut self, s: &str) -> anyhow::Result<Vec<Mark>> { self.inner.marks(s) }
+            fn record(&mut self, s: &str, src: &str, f: u64, l: usize) -> anyhow::Result<Vec<(u64, String)>> { self.inner.record(s, src, f, l) }
+            fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> { self.inner.unended(since) }
+            fn ended(&mut self, after: (i64, &str), l: usize) -> anyhow::Result<Vec<(String, i64)>> { self.inner.ended(after, l) }
+            fn squeeze_some(&mut self, l: usize) -> anyhow::Result<bool> { self.inner.squeeze_some(l) }
+            fn take_copy(&mut self, p: &str, f: u64, b: &Changes) -> anyhow::Result<Took> { self.inner.take_copy(p, f, b) }
+            fn end_copy(&mut self) -> anyhow::Result<usize> { self.inner.end_copy() }
+            fn is_empty(&mut self) -> anyhow::Result<bool> { self.inner.is_empty() }
+            fn top(&mut self) -> u64 { self.inner.top() }
+            fn prune_some(&mut self, b: i64, l: usize) -> anyhow::Result<usize> { self.inner.prune_some(b, l) }
+            fn compact_some(self: Box<Self>, _mf: u64, _sb: usize) -> anyhow::Result<(Box<dyn Engine>, Compacting)> { Ok((self, Compacting::Done { before: 0, after: 0 })) }
+            fn look(&mut self, c: bool) -> anyhow::Result<Look> { self.inner.look(c) }
+        }
+        let dir2 = tempfile::tempdir()?;
+        let failing = Store::start(Box::new(FailingApply { inner: Box::new(super::super::turso::Turso::open(&dir2.path().join(super::super::FILE))?) }), Upkeep::default())?;
+        let ok = failing.put_wait(rows::of("a1", &said("m1", 1, "cannot drop silently"), crate::util::now_ms()));
+        anyhow::ensure!(!ok, "put_wait must return false when engine.apply fails");
+        Ok(())
     }
 }

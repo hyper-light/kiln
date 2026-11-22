@@ -17,7 +17,8 @@ import { useSaid } from "@/api/last-words";
 import { heldCommand, useHeld } from "@/api/held";
 import { holdManyWith } from "./state";
 import type { AgentInfo, Approval, Command, FileChange, HEvent, Meta, SendMode, SessionStore, Task, Todo } from "@/api/harness";
-import { harnessSessionsRes, useRes } from "@/lib/data";
+import { harnessFamilyRes } from "@/lib/data";
+import { useResourceData } from "@/lib/resource";
 import { kilnSubagentsOf } from "./tasks";
 import { Button } from "@/components/ui/button";
 import { useAction } from "@/lib/action";
@@ -66,6 +67,7 @@ type PhoneTab = "work" | InspectorTab;
 
 const NO_EVENTS: HEvent[] = [];
 const NO_TODOS: Todo[] = [];
+const NO_AGENTS: AgentInfo[] = [];
 
 /** The composer's field, to type in: the field itself, not the marked copy drawn under it (compose-field.tsx), which has its class too. */
 const composerField = () => document.querySelector<HTMLTextAreaElement>("textarea.hx-compose-input");
@@ -104,7 +106,7 @@ function AgentConsole({ id }: { id: string }) {
       {start?.state === "starting" ? (
         <Started start={start} />
       ) : (
-        <InItsAgentsChat id={id}>
+        <InItsAgentsChat id={id} store={store}>
           <Agent id={id} store={store} />
         </InItsAgentsChat>
       )}
@@ -121,13 +123,16 @@ function Started({ start }: { start: Start }): React.ReactNode {
 /**
  * A subagent kiln started for an agent's goal or plan step opens in that agent's chat, its thread
  * shown there, as its harness's own subagents' are (`?own=1`: its page of its own, for what's only
- * there). One whose agent has gone is a page of its own.
+ * there). One whose agent has gone is a page of its own. Reads the session's own info + compact
+ * family endpoint instead of blocking on all 10k sessions.
  */
-function InItsAgentsChat({ id, children }: { id: string; children: React.ReactNode }) {
+function InItsAgentsChat({ id, store, children }: { id: string; store: SessionStore; children: React.ReactNode }) {
   const [params] = useSearchParams();
-  const all = useRes(harnessSessionsRes).data;
-  const me = all.find((a) => a.id === id);
-  const main = me?.subagent && me.parent && params.get("own") !== "1" ? all.find((a) => a.id === me.parent) : undefined;
+  const info = useSession(store, (s) => s.info);
+  const familyRes = React.useMemo(() => harnessFamilyRes(id), [id]);
+  const family = useResourceData(familyRes) ?? NO_AGENTS;
+  const me = info ?? family.find((a) => a.id === id);
+  const main = me?.subagent && me.parent && params.get("own") !== "1" ? family.find((a) => a.id === me.parent) : undefined;
   return main ? <Navigate to={`/agents/${main.id}?task=${encodeURIComponent(id)}`} replace /> : <>{children}</>;
 }
 
@@ -145,8 +150,9 @@ function Agent({ id, store }: { id: string; store: SessionStore }) {
   const [params, setParams] = useSearchParams();
   const taskId = params.get("task");
   const taskInfo = useSession(store, (s) => (taskId ? s.state?.tasks.find((t) => t.id === taskId || t.tool_id === taskId) : undefined));
-  // The subagents kiln started for its goals or plan steps: its, as its harness's own are.
-  const everyone = useRes(harnessSessionsRes).data;
+  // The subagents kiln started for its goals or plan steps: its, as its harness's own are (compact family read, never all 10k sessions).
+  const familyRes = React.useMemo(() => harnessFamilyRes(id), [id]);
+  const everyone = useResourceData(familyRes) ?? NO_AGENTS;
   const kiln = React.useMemo(() => kilnSubagentsOf(everyone, id), [everyone, id]);
   // Every agent it started through kiln (its goals' and plan steps' too): the Changes tab's By lists them.
   const started = React.useMemo(() => everyone.filter((a) => a.parent === id).map((a): Sub => ({ id: a.id, label: a.name, kind: a.target.replace(/^agent:/, "") })), [everyone, id]);
@@ -616,7 +622,8 @@ function useThreadPath(
   name: string | undefined,
 ): { crumbs: Crumb[]; here?: SubagentNode } | null {
   const open = sub !== null || task !== null;
-  const everyone = useRes(harnessSessionsRes).data;
+  const familyRes = React.useMemo(() => harnessFamilyRes(id), [id]);
+  const everyone = useResourceData(familyRes) ?? NO_AGENTS;
   const done = useAnswered();
   // Read only while a thread is open: the main thread's page doesn't render again for its tasks.
   const tasks = useSession(store, (s) => (open ? (s.state?.tasks ?? NO_TASKS) : NO_TASKS));
@@ -793,12 +800,17 @@ interface SentTo {
  * queued (or its session paused), not sent when that failed. Nothing goes to the agent itself.
  */
 function useSubagentPicks(store: SessionStore, id: string, info: AgentInfo | undefined, task: string | null) {
-  const everyone = useRes(harnessSessionsRes).data;
+  const familyRes = React.useMemo(() => harnessFamilyRes(id), [id]);
+  const everyone = useResourceData(familyRes) ?? NO_AGENTS;
   const done = useAnswered();
+  const [picks, setPicks] = React.useState<ReadonlySet<string>>(() => new Set());
+  const [sent, setSent] = React.useState<readonly SentTo[]>([]);
   const tasks = useSession(store, (s) => s.state?.tasks ?? NO_TASKS);
   const asks = useSession(store, (s) => s.state?.approvals ?? NO_ASKS);
   const delivery = useSession(store, (s) => s.state?.delivery);
-  const events = useSession(store, (s) => s.events);
+  // Only subscribe to `s.events` while checking delivery of a message sent to a subagent;
+  // otherwise Dock & Composer would re-render on every single streaming token.
+  const events = useSession(store, (s) => (sent.length > 0 ? s.events : NO_EVENTS));
   const list = React.useMemo(() => everyone.map((a) => asAnswered(a, done)), [everyone, done]);
   // Made again as a subagent's last words are told: one that's done shows them (W21-R02, api/last-words.ts).
   const said = useSaid();
@@ -807,8 +819,6 @@ function useSubagentPicks(store: SessionStore, id: string, info: AgentInfo | und
     const base = list.find((a) => a.id === id) ?? info;
     return base ? subagentRows(liveRoot(base, tasks, asks, done), list) : [];
   }, [list, id, info, tasks, asks, done, said]);
-  const [picks, setPicks] = React.useState<ReadonlySet<string>>(() => new Set());
-  const [sent, setSent] = React.useState<readonly SentTo[]>([]);
   const pick = React.useCallback(
     (keys: string[], on: boolean) =>
       setPicks((p) => {

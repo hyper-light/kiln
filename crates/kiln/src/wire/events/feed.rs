@@ -711,9 +711,22 @@ impl Outbox {
             (Some(had), Some(now)) => now.difference(had).cloned().collect(),
             _ => HashSet::new(),
         };
-        self.topics = topics;
-        self.last.clear();
-        if let Some(agents) = &mut self.agents {
+        let kept_harness = self.topics.as_ref().is_none_or(|t| t.contains("harness"))
+            && topics.as_ref().is_none_or(|t| t.contains("harness"));
+        let prev = std::mem::replace(&mut self.topics, topics);
+        // Keep last-sent diff state for topics that stayed continuously subscribed (e.g. `harness`
+        // across SPA route transitions) so we don't blow away 10k sessions of diff baselines on
+        // every navigation; forget only topics that were dropped or newly added.
+        self.last.retain(|key, _| {
+            let s = match key {
+                Key::State(s) | Key::Latest(s) => s.as_str(),
+            };
+            let kind = s.split(':').next().unwrap_or(s);
+            prev.as_ref().is_none_or(|p| p.contains(kind)) && self.topics.as_ref().is_none_or(|n| n.contains(kind))
+        });
+        if !kept_harness
+            && let Some(agents) = &mut self.agents
+        {
             agents.forget();
         }
         added

@@ -25,12 +25,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use k8s_openapi::api::core::v1::{
-    Container, NFSVolumeSource, ObjectReference, PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeSpec, Pod,
-    PodSecurityContext, PodSpec, ResourceRequirements, Volume, VolumeMount, VolumeResourceRequirements,
+use crate::kubeapi::types::{
+    Container, NFSVolumeSource, ObjectMeta, ObjectReference, PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PersistentVolumeSpec, Pod,
+    PodSecurityContext, PodSpec, Quantity, ResourceRequirements, Volume, VolumeMount, VolumeResourceRequirements,
 };
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
 /// Format: the label every object kiln makes for an agent's workspace carries, naming the agent.
 pub const AGENT_LABEL: &str = "kiln.dev/agent";
@@ -147,14 +145,12 @@ pub fn objects(name: &str, namespace: &str, agent: &str, export: &PodExport) -> 
         spec: Some(PersistentVolumeSpec {
             access_modes: Some(vec![ACCESS.to_owned()]),
             capacity: Some(capacity.clone()),
-            claim_ref: Some(ObjectReference { kind: Some("PersistentVolumeClaim".to_owned()), namespace: Some(namespace.to_owned()), name: Some(name.to_owned()), ..ObjectReference::default() }),
+            claim_ref: Some(ObjectReference { kind: Some("PersistentVolumeClaim".to_owned()), namespace: Some(namespace.to_owned()), name: Some(name.to_owned()) }),
             mount_options: Some(["nfsvers=4.2".to_owned(), "xprtsec=mtls".to_owned(), format!("port={}", export.port), "nosuid".to_owned(), "nodev".to_owned()].to_vec()),
             nfs: Some(NFSVolumeSource { server: export.host.trim().to_owned(), path: export.path.clone(), read_only: Some(export.read_only) }),
             persistent_volume_reclaim_policy: Some("Retain".to_owned()),
             storage_class_name: Some(String::new()),
-            ..PersistentVolumeSpec::default()
         }),
-        ..PersistentVolume::default()
     };
     let claim = PersistentVolumeClaim {
         metadata: ObjectMeta { name: Some(name.to_owned()), namespace: Some(namespace.to_owned()), labels: Some(labels), ..ObjectMeta::default() },
@@ -163,16 +159,14 @@ pub fn objects(name: &str, namespace: &str, agent: &str, export: &PodExport) -> 
             resources: Some(VolumeResourceRequirements { requests: Some(capacity), ..VolumeResourceRequirements::default() }),
             storage_class_name: Some(String::new()),
             volume_name: Some(name.to_owned()),
-            ..PersistentVolumeClaimSpec::default()
         }),
-        ..PersistentVolumeClaim::default()
     };
     let pod_volume = Volume {
         name: POD_VOLUME.to_owned(),
         persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource { claim_name: name.to_owned(), read_only: Some(export.read_only) }),
         ..Volume::default()
     };
-    let mount = VolumeMount { name: POD_VOLUME.to_owned(), mount_path: export.folder.clone(), read_only: Some(export.read_only), ..VolumeMount::default() };
+    let mount = VolumeMount { name: POD_VOLUME.to_owned(), mount_path: export.folder.clone(), read_only: Some(export.read_only) };
     let security = PodSecurityContext { run_as_user: Some(i64::from(export.uid)), run_as_group: Some(i64::from(export.gid)), ..PodSecurityContext::default() };
     Ok(Objects { volume, claim, pod_volume, mount, security })
 }
@@ -192,7 +186,6 @@ pub fn agent_pod(cfg: &crate::config::Kubernetes, session: &str, name: &str, ima
     let resources = ResourceRequirements {
         requests: Some(BTreeMap::from([("cpu".to_owned(), q(&cfg.default_cpu)), ("memory".to_owned(), q(&cfg.default_memory))])),
         limits: Some(BTreeMap::from([("memory".to_owned(), q(&cfg.default_memory))])),
-        ..ResourceRequirements::default()
     };
     let labels = BTreeMap::from([("app.kubernetes.io/managed-by".to_owned(), "kiln".to_owned()), ("app.kubernetes.io/name".to_owned(), AGENT_POD.to_owned()), (AGENT_LABEL.to_owned(), session.to_owned())]);
     Pod {

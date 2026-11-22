@@ -94,6 +94,7 @@ fn shards_carried() -> Result<(), String> {
             std::fs::write(&f, []).map_err(|e| format!("{}: {e}", f.display()))?;
             println!("cargo:rustc-env={var}={}", f.display());
         }
+        println!("cargo:rustc-env=KILN_SHARDS_HASH=000000000000");
         println!("cargo:rustc-cfg=kiln_lint");
         return Ok(());
     }
@@ -108,9 +109,57 @@ fn shards_carried() -> Result<(), String> {
     if let Some((_, missing)) = files.iter().find(|(_, f)| !f.is_file()) {
         return Err(format!("kiln for {target} carries Shards, and {} isn't there (docs/shards.md)", missing.display()));
     }
+    // Compress carried Shards binaries at Brotli Q11 (window 24) in parallel, cached by SHA-256
+    // under OUT_DIR/shards-packed so rebuilds reuse packed blobs when Shards hasn't changed.
+    // KILN_SHARDS_HASH records the exact uncompressed hash (`shards::hash_of`) so runtime
+    // startup checks `.ready` in O(1) without decompressing.
+    let packed_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap_or_default()).join("shards-packed");
+    std::fs::create_dir_all(&packed_dir).map_err(|e| format!("{}: {e}", packed_dir.display()))?;
+    let mut raw_hasher = <sha2::Sha256 as sha2::Digest>::new();
+    let mut items: Vec<(&str, PathBuf, Vec<u8>, String)> = Vec::with_capacity(files.len());
     for (var, f) in &files {
         println!("cargo:rerun-if-changed={}", f.display());
-        println!("cargo:rustc-env={var}={}", f.display());
+        let data = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        sha2::Digest::update(&mut raw_hasher, (data.len() as u64).to_le_bytes());
+        sha2::Digest::update(&mut raw_hasher, &data);
+        let sha = ui_pack::sha256(&data);
+        let mut hex = String::with_capacity(64);
+        for b in sha {
+            let _ = write!(hex, "{b:02x}");
+        }
+        items.push((*var, f.clone(), data, hex));
+    }
+    let raw_hash: String = sha2::Digest::finalize(raw_hasher).iter().take(6).map(|b| format!("{b:02x}")).collect();
+    println!("cargo:rustc-env=KILN_SHARDS_HASH={raw_hash}");
+    let results: Vec<Result<(&str, PathBuf), String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .into_iter()
+            .map(|(var, orig, data, hex)| {
+                let packed_dir = &packed_dir;
+                s.spawn(move || -> Result<(&str, PathBuf), String> {
+                    let dest = packed_dir.join(format!("{hex}.br"));
+                    if !dest.is_file() {
+                        let packed = ui_pack::brotli_with(&data, 11, 24).ok_or_else(|| format!("brotli compression failed for {}", orig.display()))?;
+                        let part = packed_dir.join(format!("{hex}.br.part"));
+                        std::fs::write(&part, &packed).map_err(|e| format!("{}: {e}", part.display()))?;
+                        std::fs::rename(&part, &dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+                    }
+                    Ok((var, dest))
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("shards compression thread panicked".into()))).collect()
+    });
+    let mut kept_packed = std::collections::HashSet::new();
+    for res in results {
+        let (var, dest) = res?;
+        kept_packed.insert(dest.clone());
+        println!("cargo:rustc-env={var}={}", dest.display());
+    }
+    for e in std::fs::read_dir(&packed_dir).into_iter().flatten().flatten() {
+        if !kept_packed.contains(&e.path()) {
+            let _ = std::fs::remove_file(e.path());
+        }
     }
     Ok(())
 }
@@ -191,13 +240,10 @@ fn bash() -> PathBuf {
     PathBuf::from("bash")
 }
 
-/// The UI's files worth packing (`ui/dist/client`, which rust-embed embeds), packed here with brotli and with gzip
-/// at their best, into `OUT_DIR/ui-packed/<the file's SHA-256>.br` and `.gz`, and the tables of them that the server
-/// serves from (`OUT_DIR/ui_packed.rs`, `crate::ui`'s `PACKED` and `PACKED_GZ`): no server compresses them as it
-/// starts or as they're asked for, nor keeps the copies on its heap (goal 11, plan 01a1a87b2e56 step 5; goal 11's
-/// audit, row B15: a client that takes gzip alone got each file as it is the first time). A file an earlier build
-/// packed is taken as it was, so a new UI build packs only what changed, and a packed file no file has now goes; the
-/// packing is spread over the jobs cargo gives this script (`NUM_JOBS`). Without the UI built, the tables are empty.
+/// Every file under `ui/dist/client`, SHA-256 deduplicated and brotli-Q11 packed where smaller,
+/// into ONE contiguous `OUT_DIR/ui_blob.bin` plus `OUT_DIR/ui_packed.rs` (`UI_BLOB`, `UI_FILES`).
+/// Eliminates duplicate raw (`rust-embed`) and `.gz` copies from the binary while serving `br`
+/// zero-copy from static pages and caching per-file `.br` results in `OUT_DIR/ui-packed/`.
 fn ui_packed() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
     let root = manifest.join("../../ui/dist/client");
@@ -216,13 +262,15 @@ fn ui_packed() {
     files.sort();
     let jobs = std::env::var("NUM_JOBS").ok().and_then(|n| n.parse::<usize>().ok()).unwrap_or(1).clamp(1, files.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let entries: Vec<(Coding, (String, [u8; 32], String))> = std::thread::scope(|s| {
+    let mut prepared: Vec<PreparedUiFile> = std::thread::scope(|s| {
         let workers: Vec<_> = (0..jobs)
             .map(|_| {
                 s.spawn(|| {
                     let mut mine = Vec::new();
                     while let Some((name, path)) = files.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-                        mine.extend(pack(name, path, &dir));
+                        if let Some(p) = prepare_ui_file(name, path, &dir) {
+                            mine.push(p);
+                        }
                     }
                     mine
                 })
@@ -230,45 +278,56 @@ fn ui_packed() {
             .collect();
         workers.into_iter().flat_map(|w| w.join().unwrap_or_default()).collect()
     });
-    // What no file has now: an earlier UI build's.
-    let kept: std::collections::HashSet<&str> = entries.iter().map(|(_, (_, _, p))| p.as_str()).collect();
+    prepared.sort_by(|a, b| a.name.cmp(&b.name));
+    // Clean stale cached `.br` files from earlier UI builds.
+    let kept_cache: std::collections::HashSet<&Path> = prepared.iter().filter_map(|p| p.cache_file.as_deref()).collect();
     for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-        if !kept.contains(e.path().display().to_string().as_str()) {
+        if !kept_cache.contains(e.path().as_path()) {
             let _ = std::fs::remove_file(e.path());
         }
     }
-    let of = |coding: Coding| entries.iter().filter(|(c, _)| *c == coding).map(|(_, e)| e.clone()).collect::<Vec<_>>();
-    let src = ui_pack::table("PACKED", "brotli", &of(Coding::Brotli)) + &ui_pack::table("PACKED_GZ", "gzip", &of(Coding::Gzip));
+    // Deduplicate identical payloads by (sha, brotli) into a single contiguous UI_BLOB.
+    let mut blob = Vec::new();
+    let mut offsets: std::collections::HashMap<([u8; 32], bool), (usize, usize)> = std::collections::HashMap::new();
+    let mut entries = Vec::with_capacity(prepared.len());
+    for item in prepared {
+        let (start, len) = *offsets.entry((item.sha, item.brotli)).or_insert_with(|| {
+            let start = blob.len();
+            blob.extend_from_slice(&item.payload);
+            (start, item.payload.len())
+        });
+        entries.push(ui_pack::BlobEntry {
+            name: item.name,
+            sha: item.sha,
+            start,
+            len,
+            orig_len: item.orig_len,
+            brotli: item.brotli,
+        });
+    }
+    let blob_path = out.join("ui_blob.bin");
+    let write_blob = std::fs::read(&blob_path).ok().is_none_or(|prev| prev != blob);
+    if write_blob && let Err(e) = std::fs::write(&blob_path, &blob) {
+        println!("cargo:warning=could not write {}: {e}", blob_path.display());
+    }
+    let src = ui_pack::blob_table(&blob_path.display().to_string(), &entries);
     let dest = out.join("ui_packed.rs");
-    if let Err(e) = std::fs::write(&dest, src) {
+    let write_src = std::fs::read_to_string(&dest).ok().is_none_or(|prev| prev != src);
+    if write_src && let Err(e) = std::fs::write(&dest, src) {
         println!("cargo:warning=could not write {}: {e}", dest.display());
     }
 }
 
-/// A coding the build packs the UI's files with.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Coding {
-    Brotli,
-    Gzip,
+struct PreparedUiFile {
+    name: String,
+    sha: [u8; 32],
+    orig_len: usize,
+    brotli: bool,
+    payload: Vec<u8>,
+    cache_file: Option<PathBuf>,
 }
 
-impl Coding {
-    fn suffix(self) -> &'static str {
-        match self {
-            Self::Brotli => "br",
-            Self::Gzip => "gz",
-        }
-    }
-
-    fn pack(self, data: &[u8]) -> Option<Vec<u8>> {
-        match self {
-            Self::Brotli => ui_pack::brotli(data),
-            Self::Gzip => ui_pack::gzip(data),
-        }
-    }
-}
-
-/// Every file under `dir`, by its name under `root` as rust-embed names it (its parts joined with `/`).
+/// Every file under `dir`, by its name under `root` (its parts joined with `/`).
 fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let path = e.path();
@@ -285,32 +344,30 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     }
 }
 
-/// `name`'s file at `path`, packed into `dir` each way if it's worth it and comes out smaller (as the server kept a
-/// copy only then), or as an earlier build packed it: its table entries, a coding each.
-fn pack(name: &str, path: &Path, dir: &Path) -> Vec<(Coding, (String, [u8; 32], String))> {
-    let Ok(data) = std::fs::read(path) else { return Vec::new() };
-    if !ui_pack::worth(&ui_pack::mime_of(name), data.len()) {
-        return Vec::new();
-    }
+/// Prepares `name` at `path`: computes its SHA-256 and, when compressible and smaller, packs it
+/// with Brotli Q11 (cached in `dir/<sha>.br`). Otherwise keeps the raw bytes.
+fn prepare_ui_file(name: &str, path: &Path, dir: &Path) -> Option<PreparedUiFile> {
+    let data = std::fs::read(path).ok()?;
+    let orig_len = data.len();
     let sha = ui_pack::sha256(&data);
-    let mut hex = String::with_capacity(64);
-    for b in sha {
-        let _ = write!(hex, "{b:02x}");
-    }
-    let mut out = Vec::new();
-    for coding in [Coding::Brotli, Coding::Gzip] {
-        let file = dir.join(format!("{hex}.{}", coding.suffix()));
-        if !file.is_file() {
-            let Some(packed) = coding.pack(&data).filter(|p| p.len() < data.len()) else { continue };
-            // Written whole or not at all: a build stopped halfway leaves no short file for the next to take.
-            let part = dir.join(format!("{hex}.{}.part", coding.suffix()));
-            if std::fs::write(&part, &packed).and_then(|()| std::fs::rename(&part, &file)).is_err() {
-                continue;
-            }
+    if ui_pack::worth(&ui_pack::mime_of(name), orig_len) {
+        let mut hex = String::with_capacity(64);
+        for b in sha {
+            let _ = write!(hex, "{b:02x}");
         }
-        out.push((coding, (name.to_owned(), sha, file.display().to_string())));
+        let file = dir.join(format!("{hex}.br"));
+        if let Ok(packed) = std::fs::read(&file)
+            && packed.len() < orig_len
+        {
+            return Some(PreparedUiFile { name: name.to_owned(), sha, orig_len, brotli: true, payload: packed, cache_file: Some(file) });
+        }
+        if let Some(packed) = ui_pack::brotli(&data).filter(|p| p.len() < orig_len) {
+            let part = dir.join(format!("{hex}.br.part"));
+            let _ = std::fs::write(&part, &packed).and_then(|()| std::fs::rename(&part, &file));
+            return Some(PreparedUiFile { name: name.to_owned(), sha, orig_len, brotli: true, payload: packed, cache_file: Some(file) });
+        }
     }
-    out
+    Some(PreparedUiFile { name: name.to_owned(), sha, orig_len, brotli: false, payload: data, cache_file: None })
 }
 
 /// The UI server this kiln carries: the packs for the platform it's built for, from

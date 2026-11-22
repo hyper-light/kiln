@@ -32,7 +32,7 @@ import { Stands } from "@/views/harness/stands";
 import { Shimmer } from "@/views/harness/signals";
 import { whoSaid } from "@/api/review";
 import { SelectField } from "@/components/ui/misc";
-import { useGlide, useListHold } from "@/views/harness/list-tools";
+import { useGlide, useListHold } from "@/lib/list-hold";
 import { ShipCommitsSlot, type Narrow } from "./commits";
 import { warmReview } from "./review/warm";
 import { sectionsRes } from "./sections-load";
@@ -52,6 +52,16 @@ function warmRow(item: ShipCommit) {
   warm(sectionsRes);
   warmReview(item);
   void dropdown().catch(() => undefined);
+}
+
+/** Compact structural signature for a Ship row avoiding full `JSON.stringify(it)` on every render. */
+function itemSig(it: Item): string {
+  const c = it.head;
+  const acts = c.actions?.map((a) => `${a.name}:${a.path}`).join(",") ?? "";
+  const envs = c.environments?.map((e) => `${e.environment}:${e.production ? 1 : 0}`).join(",") ?? "";
+  const tags = c.tags?.join(",") ?? "";
+  const pips = c.pips.map((p) => `${p.stage}:${p.state}:${p.p ?? ""}`).join(",");
+  return `${c.repo}\u0000${c.sha}\u0000${c.stand}\u0000${c.line}\u0000${c.message}\u0000${c.at}\u0000${c.author}\u0000${c.change?.name ?? ""}\u0000${c.change?.title ?? ""}\u0000${acts}\u0000${envs}\u0000${tags}\u0000${pips}\u0000${it.riders.length}`;
 }
 
 /** A row's key: its repository, the same as its newest commit changes (docs/ci.md W26-R29). */
@@ -126,7 +136,7 @@ function ShipList() {
   // patched in place, never remounted.
   const stable = items.map((it) => {
     const k = rowKey(it);
-    const sig = JSON.stringify(it);
+    const sig = itemSig(it);
     const was = kept.last.get(k);
     // Held, a row keeps the commit it shows: a newer one in its repository waits for the release, as
     // a new row does, so the line you're reading never turns into another's (docs/ci.md W26-R29).
@@ -140,7 +150,7 @@ function ShipList() {
     kept.view = view;
   }
   const shown = hold.held ? kept.order.flatMap((k) => kept.last.get(k)?.it ?? []) : stable;
-  if (!hold.held) kept.last = new Map(stable.map((it) => [rowKey(it), { it, sig: JSON.stringify(it) }]));
+  if (!hold.held) kept.last = new Map(stable.map((it) => [rowKey(it), { it, sig: itemSig(it) }]));
   // The pace line holds with the rows: what it counts waits for the release too, so nothing beside
   // the row you're reading moves (plan 01a1856fe81375b1bd1d1d86f270a45b, step 5).
   if (!hold.held || kept.pace === undefined) kept.pace = page.data.pace;
@@ -268,9 +278,24 @@ const Row = React.memo(
     const [reveal, setReveal] = React.useState(0);
     // One environment flag: production when it runs there, else the first it runs in.
     const env = c.environments?.find((e) => e.production) ?? c.environments?.[0];
+    // Hover-intent gate (150ms) so fast cursor sweeps across rows don't flood low-bandwidth links.
+    const warmTimer = React.useRef<number | undefined>(undefined);
+    const scheduleWarm = () => {
+      if (warmTimer.current !== undefined) window.clearTimeout(warmTimer.current);
+      warmTimer.current = window.setTimeout(() => {
+        warmTimer.current = undefined;
+        warmRow(c);
+      }, 150);
+    };
+    const cancelWarm = () => {
+      if (warmTimer.current !== undefined) {
+        window.clearTimeout(warmTimer.current);
+        warmTimer.current = undefined;
+      }
+    };
     return (
-      // Its review starts loading as the pointer comes onto the row or the focus into it (W26-R15).
-      <li className="ship-row" data-stand={c.stand} data-glide={rowKey(item)} onPointerEnter={() => warmRow(c)} onFocus={() => warmRow(c)}>
+      // Its review starts loading on deliberate hover or focus into the row (W26-R15).
+      <li className="ship-row" data-stand={c.stand} data-glide={rowKey(item)} onPointerEnter={scheduleWarm} onPointerLeave={cancelWarm} onFocus={() => warmRow(c)}>
         <div className="ship-r">
           <button type="button" className="ship-main" aria-expanded={open} onClick={() => onOpen(!open)}>
             <span className="ship-name">{c.repo}</span>

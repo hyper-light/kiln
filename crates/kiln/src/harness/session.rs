@@ -6172,6 +6172,16 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             adapter.command(&mut core, Command::Interrupt);
                         }
                     }
+                    if forcing {
+                        // Terminate stuck child processes immediately BEFORE flushing stdout/stdin
+                        // so a blocked stdin pipe or slow sink never delays ForceStop / Reset.
+                        p.terminate(Duration::from_secs(2));
+                        let within = ended_within(s.spec.lock().container.is_some());
+                        let _ = crate::rt::timeout(within, &mut p.exit).await;
+                        let _ = flush(&s, &sink, None).await;
+                        ending = true;
+                        break;
+                    }
                     jobs = flush(&s, &sink, Some(&p.stdin)).await;
                     let listed = {
                         let core = s.core.lock();
@@ -6188,13 +6198,6 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         p.terminate(Duration::from_secs(2));
                         let within = ended_within(s.spec.lock().container.is_some());
                         let _ = crate::rt::timeout(within, &mut p.exit).await;
-                        break;
-                    }
-                    if forcing {
-                        p.terminate(Duration::from_secs(2));
-                        let within = ended_within(s.spec.lock().container.is_some());
-                        let _ = crate::rt::timeout(within, &mut p.exit).await;
-                        ending = true;
                         break;
                     }
                     // A switch, now that nothing is under way: the harness ends by itself once its

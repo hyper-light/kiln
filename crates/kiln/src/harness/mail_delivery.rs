@@ -106,8 +106,7 @@ pub async fn publish(hub: &Hub, publication: Publish) -> Result<Receipt, Error> 
     // 2026-11-12: "Messages cannot and should never be dropped").
     let physical = {
         let floor = storage_floor(hub)?;
-        let data = hub.cfg.server.data_dir.clone();
-        let free = crate::rt::blocking(move || crate::os::disk_available(&data)).await.map_err(|_| unavailable("data-volume free space could not be read"))?.ok_or_else(|| unavailable("data-volume free space is unknown"))?;
+        let free = cached_disk_available(&hub.cfg.server.data_dir).await?;
         let reserve = hub.store.storage_reserve(super::state_view::FRAME as u64).await.map_err(|_| unavailable("SQLite/WAL storage reserve is unknown"))?;
         // The room on disk for this one original: what's retained already is on disk, so
         // nothing is counted across conversations.
@@ -123,6 +122,28 @@ pub async fn publish(hub: &Hub, publication: Publish) -> Result<Receipt, Error> 
     let proof = publication.provenance.as_ref().and_then(|p| p.get("relayed"));
     let _ = encode_wire(envelope, proof)?;
     mail::publish(&hub.store, publication, physical).await
+}
+
+/// Cached free-space reading (2 s TTL per data directory) so high-rate agent↔agent messaging
+/// avoids spawning a blocking `statvfs` syscall on every single message.
+async fn cached_disk_available(data: &std::path::Path) -> Result<u64, Error> {
+    use std::time::{Duration, Instant};
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<Option<(Instant, std::path::PathBuf, u64)>>> = std::sync::OnceLock::new();
+    const TTL: Duration = Duration::from_secs(2);
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(None));
+    if let Some((at, path, free)) = cache.lock().as_ref()
+        && path == data
+        && at.elapsed() < TTL
+    {
+        return Ok(*free);
+    }
+    let dir = data.to_path_buf();
+    let free = crate::rt::blocking(move || crate::os::disk_available(&dir))
+        .await
+        .map_err(|_| unavailable("data-volume free space could not be read"))?
+        .ok_or_else(|| unavailable("data-volume free space is unknown"))?;
+    *cache.lock() = Some((Instant::now(), data.to_path_buf(), free));
+    Ok(free)
 }
 
 /// One bounded protocol write, with no request waiter/body task. Only source FlowEvent proves

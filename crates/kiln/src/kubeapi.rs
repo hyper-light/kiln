@@ -1,7 +1,8 @@
 //! A minimal Kubernetes REST client: exactly what the pod executor needs (create, get, list by
 //! label, delete pods, read their logs) and restarting kiln's own Deployment (Settings →
-//! Updates), over kiln's own HTTPS client on hyper-rt + hyper-tls. Object types come from
-//! `k8s-openapi` (plain serde types, no runtime).
+//! Updates), over kiln's own HTTPS client on hyper-rt + hyper-tls. Object types live in [`types`]
+//! (plain serde structs covering the fields kiln reads and writes, without pulling all of
+//! `k8s-openapi`).
 //!
 //! Credentials, in order:
 //! 1. **In-cluster**: `KUBERNETES_SERVICE_HOST`/`_PORT` and the mounted service-account token
@@ -14,10 +15,426 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use k8s_openapi::api::core::v1::{PersistentVolume, PersistentVolumeClaim, Pod};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::http::client::{Client, Identity, Method, Roots};
+use self::types::{PersistentVolume, PersistentVolumeClaim, Pod};
+
+/// Minimal Kubernetes core/v1 serde types for the Pod, PersistentVolume and PersistentVolumeClaim
+/// objects kiln constructs and inspects.
+pub mod types {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct Quantity(pub String);
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ObjectMeta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub namespace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub labels: Option<BTreeMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub annotations: Option<BTreeMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub deletion_timestamp: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Pod {
+        #[serde(default)]
+        pub metadata: ObjectMeta,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub spec: Option<PodSpec>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub status: Option<PodStatus>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PodSpec {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub restart_policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub priority_class_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub affinity: Option<Affinity>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub service_account_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub automount_service_account_token: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub active_deadline_seconds: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub termination_grace_period_seconds: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub node_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub node_selector: Option<BTreeMap<String, String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub host_aliases: Option<Vec<HostAlias>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub security_context: Option<PodSecurityContext>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub init_containers: Option<Vec<Container>>,
+        #[serde(default)]
+        pub containers: Vec<Container>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub volumes: Option<Vec<Volume>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PodStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub phase: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub container_statuses: Option<Vec<ContainerStatus>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub init_container_statuses: Option<Vec<ContainerStatus>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ContainerStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state: Option<ContainerState>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ContainerState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub waiting: Option<ContainerStateWaiting>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ContainerStateWaiting {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub message: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Container {
+        #[serde(default)]
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub image: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub image_pull_policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub command: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub env: Option<Vec<EnvVar>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ports: Option<Vec<ContainerPort>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub restart_policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub resources: Option<ResourceRequirements>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub security_context: Option<SecurityContext>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub startup_probe: Option<Probe>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub volume_mounts: Option<Vec<VolumeMount>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub working_dir: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ContainerPort {
+        pub container_port: i32,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct EnvVar {
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub value: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub value_from: Option<EnvVarSource>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct EnvVarSource {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub field_ref: Option<ObjectFieldSelector>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ObjectFieldSelector {
+        pub field_path: String,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ResourceRequirements {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub requests: Option<BTreeMap<String, Quantity>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limits: Option<BTreeMap<String, Quantity>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VolumeResourceRequirements {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub requests: Option<BTreeMap<String, Quantity>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub limits: Option<BTreeMap<String, Quantity>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Capabilities {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub drop: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SecurityContext {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub privileged: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allow_privilege_escalation: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub read_only_root_filesystem: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub capabilities: Option<Capabilities>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct SeccompProfile {
+        #[serde(rename = "type")]
+        pub type_: String,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PodSecurityContext {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub run_as_user: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub run_as_group: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub run_as_non_root: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub seccomp_profile: Option<SeccompProfile>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Probe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub exec: Option<ExecAction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub period_seconds: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub failure_threshold: Option<i32>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ExecAction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub command: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Volume {
+        pub name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub empty_dir: Option<EmptyDirVolumeSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub host_path: Option<HostPathVolumeSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub persistent_volume_claim: Option<PersistentVolumeClaimVolumeSource>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct EmptyDirVolumeSource {}
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HostPathVolumeSource {
+        pub path: String,
+        #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+        pub type_: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PersistentVolumeClaimVolumeSource {
+        pub claim_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub read_only: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct VolumeMount {
+        pub name: String,
+        pub mount_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub read_only: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct HostAlias {
+        pub ip: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hostnames: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Affinity {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub node_affinity: Option<NodeAffinity>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct NodeAffinity {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub required_during_scheduling_ignored_during_execution: Option<NodeSelector>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub preferred_during_scheduling_ignored_during_execution: Option<Vec<PreferredSchedulingTerm>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct NodeSelector {
+        #[serde(default)]
+        pub node_selector_terms: Vec<NodeSelectorTerm>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PreferredSchedulingTerm {
+        pub weight: i32,
+        pub preference: NodeSelectorTerm,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct NodeSelectorTerm {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub match_expressions: Option<Vec<NodeSelectorRequirement>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub match_fields: Option<Vec<NodeSelectorRequirement>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct NodeSelectorRequirement {
+        pub key: String,
+        pub operator: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub values: Option<Vec<String>>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ObjectReference {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub namespace: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct NFSVolumeSource {
+        pub server: String,
+        pub path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub read_only: Option<bool>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PersistentVolumeSpec {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub access_modes: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub capacity: Option<BTreeMap<String, Quantity>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub claim_ref: Option<ObjectReference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mount_options: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub nfs: Option<NFSVolumeSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub persistent_volume_reclaim_policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub storage_class_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PersistentVolume {
+        #[serde(default)]
+        pub metadata: ObjectMeta,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub spec: Option<PersistentVolumeSpec>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PersistentVolumeClaimSpec {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub access_modes: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub resources: Option<VolumeResourceRequirements>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub storage_class_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub volume_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct PersistentVolumeClaim {
+        #[serde(default)]
+        pub metadata: ObjectMeta,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub spec: Option<PersistentVolumeClaimSpec>,
+    }
+}
+
+#[derive(Serialize)]
+struct WithKind<'a, T: Serialize> {
+    #[serde(rename = "apiVersion")]
+    api_version: &'static str,
+    kind: &'static str,
+    #[serde(flatten)]
+    inner: &'a T,
+}
 
 const SA_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 
@@ -259,7 +676,7 @@ impl KubeApi {
     }
 
     pub async fn create_pod(&self, pod: &Pod) -> anyhow::Result<()> {
-        let body = serde_json::to_vec(pod)?;
+        let body = serde_json::to_vec(&WithKind { api_version: "v1", kind: "Pod", inner: pod })?;
         let (code, resp) = self.call(Method::Post, &self.pods_path(), Some(body)).await?;
         if (200..300).contains(&code) { Ok(()) } else { Err(Self::api_error(code, &resp)) }
     }
@@ -311,7 +728,8 @@ impl KubeApi {
 
     /// Creates PersistentVolume `v` (docs/agentic.md W10: an agent's pod's workspace, `k8s::volume`).
     pub async fn create_persistent_volume(&self, v: &PersistentVolume) -> anyhow::Result<()> {
-        let (code, resp) = self.call(Method::Post, Self::VOLUMES_PATH, Some(serde_json::to_vec(v)?)).await?;
+        let body = serde_json::to_vec(&WithKind { api_version: "v1", kind: "PersistentVolume", inner: v })?;
+        let (code, resp) = self.call(Method::Post, Self::VOLUMES_PATH, Some(body)).await?;
         if (200..300).contains(&code) { Ok(()) } else { Err(Self::api_error(code, &resp)) }
     }
 
@@ -323,7 +741,8 @@ impl KubeApi {
 
     /// Creates PersistentVolumeClaim `c` in the jobs namespace.
     pub async fn create_claim(&self, c: &PersistentVolumeClaim) -> anyhow::Result<()> {
-        let (code, resp) = self.call(Method::Post, &self.claims_path(), Some(serde_json::to_vec(c)?)).await?;
+        let body = serde_json::to_vec(&WithKind { api_version: "v1", kind: "PersistentVolumeClaim", inner: c })?;
+        let (code, resp) = self.call(Method::Post, &self.claims_path(), Some(body)).await?;
         if (200..300).contains(&code) { Ok(()) } else { Err(Self::api_error(code, &resp)) }
     }
 

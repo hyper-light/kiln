@@ -2978,9 +2978,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             () = sleep_until_opt(have_soon.map(|(at, _)| at)).fuse() => Ev::HaveSoon,
             d = recv_opt(delayed.as_ref()).fuse() => match d { Some(due) => Ev::Delayed(due), None => Ev::Watchdog },
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
+            h = harness_rx.recv().fuse() => match h { Ok(t) => Ev::Harness(t.session, t.update, t.at), Err(_) => Ev::Watchdog },
             up = own_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
-            h = harness_rx.recv().fuse() => match h { Ok(t) => Ev::Harness(t.session, t.update, t.at), Err(_) => Ev::Watchdog },
             () = front_door_changed(front_door.as_ref()).fuse() => Ev::FrontDoor,
             () = headroom_changed(headroom.as_ref()).fuse() => Ev::Headroom,
             b = bg_rx.recv().fuse() => match b {

@@ -637,9 +637,9 @@ impl Claude {
             }
             "compact" => {
                 let t = text();
-                self.slash(core, &format!("/compact {t}"));
+                self.slash_priority(core, &format!("/compact {t}"));
             }
-            "clear" => self.slash(core, "/clear"),
+            "clear" => self.slash_priority(core, "/clear"),
             "context_usage" => self.request(core, Pending::ContextUsage, json!({"subtype": "get_context_usage"})),
             "rename" => {
                 let t = text();
@@ -727,6 +727,18 @@ impl Claude {
     fn slash(&mut self, core: &mut Core, text: &str) {
         let id = crate::util::new_id();
         self.send(core, QueueItem { id, text: text.trim().to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None }, SendMode::Queue);
+    }
+
+    /// A system control slash command (`/compact`, `/clear`) placed at the front of the queue when
+    /// busy so queued user/agent messages never starve system maintenance commands.
+    fn slash_priority(&mut self, core: &mut Core, text: &str) {
+        let item = QueueItem { id: crate::util::new_id(), text: text.trim().to_owned(), at: Core::now(), attachments: Vec::new(), overrides: None, reply_to: None };
+        if self.busy(core) {
+            core.state.queue.insert(0, item);
+            core.touch_state();
+        } else {
+            self.send(core, item, SendMode::Queue);
+        }
     }
 
     fn request(&mut self, core: &mut Core, kind: Pending, body: Value) {
@@ -1722,10 +1734,10 @@ impl Claude {
         self.settle(core);
     }
 
-    /// The turn is over: the next message waiting in kiln's queue goes out (unless a pause or a
-    /// switch holds it).
+    /// The turn is over: the next message waiting in kiln's queue goes out (unless a pause, a
+    /// pending control reload, or a switch holds it).
     pub(crate) fn drain_queue(&mut self, core: &mut Core) {
-        if self.busy(core) || core.state.queue.is_empty() || core.state.status == Status::Exited || !super::pause::open(core) {
+        if self.reload.is_some() || self.busy(core) || core.state.queue.is_empty() || core.state.status == Status::Exited || !super::pause::open(core) {
             return;
         }
         let item = core.state.queue.remove(0);
@@ -2538,8 +2550,8 @@ impl Claude {
                     core.state.turn_started = None;
                     core.touch_state();
                     self.settle(core);
-                    self.drain_queue(core);
                     self.reload_when_idle(core);
+                    self.drain_queue(core);
                 }
                 _ => {}
             },
@@ -3312,8 +3324,8 @@ impl Claude {
         if Core::now() - self.usage_at > 60_000 {
             self.ask_usage(core);
         }
-        self.drain_queue(core);
         self.reload_when_idle(core);
+        self.drain_queue(core);
     }
 
     /// Status lines kiln puts together itself, for a CLI that has no /status rows to give.
@@ -3367,8 +3379,8 @@ impl Claude {
         core.state.delivery.insert(id.to_owned(), Delivery::Completed);
         core.touch_state();
         self.settle(core);
-        self.drain_queue(core);
         self.reload_when_idle(core);
+        self.drain_queue(core);
     }
 
     /// An interrupt was answered: its answer names the messages Claude Code still holds in its queue
@@ -3399,8 +3411,8 @@ impl Claude {
         if gone {
             core.touch_state();
             self.settle(core);
-            self.drain_queue(core);
             self.reload_when_idle(core);
+            self.drain_queue(core);
         }
     }
 

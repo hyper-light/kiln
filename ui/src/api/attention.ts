@@ -437,18 +437,18 @@ function pick(scope: Scope, agent: string) {
   const { frame, selection } = scope.presentation.choose(agent);
   if (frame) sendFrame(frame);
   picked = agent;
-  void post({ action: "visit", agent, source: "list", key: clientId(), mode: "refresh", ...selection }).catch(() => undefined);
+  void post({ action: "visit", agent, source: "list", key: clientId(), mode: "refresh", lean: true, ...selection }).catch(() => undefined);
 }
 
 /** An agent's page opened: a visit of its own unless the list's pick already said so (however often its page subscribes again), until another is opened or the list comes back. */
 export function attentionVisit(agent: string) {
   if (picked === agent) return;
   picked = undefined;
-  void post({ action: "visit", agent, source: "direct", key: clientId(), mode: "refresh" }).catch(() => undefined);
+  void post({ action: "visit", agent, source: "direct", key: clientId(), mode: "refresh", lean: true }).catch(() => undefined);
 }
 /** What came back while its page was open is seen. */
 export function attentionSeen(agent: string) {
-  void post({ action: "seen", agent, key: clientId(), mode: "refresh" }).catch(() => undefined);
+  void post({ action: "seen", agent, key: clientId(), mode: "refresh", lean: true }).catch(() => undefined);
 }
 
 /**
@@ -534,10 +534,15 @@ export function useAttention(controls = "", rows = 0) {
 
 /** Re-render only when a park expires, rather than ticking every row once a second. */
 export function useParkTime(agents: AttentionSnapshot["agents"]): number {
-  const deadlines = Object.values(agents)
-    .flatMap((m) => (m.parked_until === undefined ? [] : [m.parked_until]))
-    .sort((a, b) => a - b);
-  const identity = deadlines.join(",");
+  const identity = React.useMemo(() => {
+    const deadlines: number[] = [];
+    for (const key in agents) {
+      const until = agents[key]?.parked_until;
+      if (until !== undefined) deadlines.push(until);
+    }
+    deadlines.sort((a, b) => a - b);
+    return deadlines.join(",");
+  }, [agents]);
   const store = React.useMemo(() => ({ now: Date.now(), identity }), [identity]);
   const subscribe = React.useCallback(
     (changed: () => void) => {

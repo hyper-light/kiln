@@ -9,8 +9,6 @@ import geist from "@fontsource-variable/geist?url";
 import geistMono from "@fontsource-variable/geist-mono?url";
 import { Splash } from "@/components/shell/splash";
 import { EARLY_SCRIPT } from "@/lib/early-script";
-import geistLatin from "@fontsource-variable/geist/files/geist-latin-wght-normal.woff2?url";
-import geistMonoLatin from "@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2?url";
 import { privatePage } from "@/lib/private-bootstrap";
 import { PrivateBootstrapContext } from "@/lib/private-bootstrap-context";
 import { getPrivateBootstrap } from "@/server/private-bootstrap";
@@ -60,20 +58,6 @@ export const Route = createRootRoute({
       { title: "kiln" },
     ],
     links: [
-      {
-        rel: "preload",
-        href: geistLatin,
-        as: "font",
-        type: "font/woff2",
-        crossOrigin: "anonymous",
-      },
-      {
-        rel: "preload",
-        href: geistMonoLatin,
-        as: "font",
-        type: "font/woff2",
-        crossOrigin: "anonymous",
-      },
       { rel: "stylesheet", href: geist },
       { rel: "stylesheet", href: geistMono },
       { rel: "stylesheet", href: appCss },

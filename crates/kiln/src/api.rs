@@ -1586,9 +1586,14 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         }
         (&Method::GET, ["api", "harness", "kinds"]) => Ok(harness_kinds(&hub, &q)),
         (&Method::GET, ["api", "harness", "workspaces"]) => Ok(boxed(|| harness_workspaces(&hub)).await),
+        (&Method::GET, ["api", "harness", "waiting"]) => Ok(boxed(|| harness_waiting(&hub, &caller)).await),
         (_, ["api", "harness", "attention", rest @ ..]) => boxed(|| crate::harness::attention::route(&hub, &caller, &method, rest, req)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "harness", "sessions"]) => match q.get("summaries") {
             Some(ids) => Ok(boxed(|| harness_summaries(&hub, &caller, ids)).await),
+            None if q.get("family").is_some_and(|id| !id.is_empty()) => {
+                let id = q.get("family").cloned().unwrap_or_default();
+                Ok(boxed(|| harness_family(&hub, &caller, &id)).await)
+            }
             None if q.get("lean").is_some_and(|lean| lean == "1") => Ok(boxed(|| harness_sessions_lean(&hub, &caller)).await),
             None => Ok(boxed(|| harness_sessions(&hub, &caller)).await),
         },
@@ -1772,7 +1777,10 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             boxed(|| harness_terminal(&hub, &id, req)).await
         }
         (&Method::GET, ["api", "harness", "history"]) => boxed(|| harness_history(&hub, &caller, &q)).await,
-        (&Method::GET, ["api", "harness", "sessions", id, "events"]) => boxed(|| conversation_events_for(&hub, &caller, id, &q)).await,
+        (&Method::GET, ["api", "harness", "sessions", id, "events"]) => {
+            let coding = crate::http::compress::Coding::pick(srv::header_str(&req, &header::ACCEPT_ENCODING));
+            boxed(|| conversation_events_encoded(&hub, &caller, id, &q, coding)).await
+        }
         (&Method::GET, ["api", "harness", "sessions", id, "events", event]) => boxed(|| harness_event(&hub, id, event, &q)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "timeline"]) => boxed(|| harness_timeline(&hub, id, &q)).await,
         (&Method::GET, ["api", "harness", "sessions", id, "thread"]) => boxed(|| harness_thread(&hub, &caller, id, &q)).await,
@@ -2228,7 +2236,7 @@ fn front_door(a: crate::frontdoor::control::Answer) -> R {
 /// The AI coding sessions running on every connected machine, most recently active first.
 fn ai_sessions(hub: &Hub, caller: &crate::authz::Caller) -> Response {
     // Conversations kiln already runs as agent sessions (taken over, or resumed by hand there too).
-    let managed: HashMap<String, String> = hub.harness.list().into_iter().filter_map(|i| Some((i.harness_session?, i.id))).collect();
+    let managed = hub.harness.managed_ids();
     let mut out: Vec<serde_json::Value> = Vec::new();
     for (machine, sessions) in hub.ai_sessions.load().iter() {
         // Only the machines whose terminal the caller may use (docs/agents.md, "Whose agents").
@@ -6615,10 +6623,81 @@ async fn harness_summaries(hub: &Arc<Hub>, caller: &crate::authz::Caller, ids: &
     srv::json(StatusCode::OK, &said)
 }
 
+/// `GET /api/harness/sessions?family=<id>`: only session `id`, its immediate parent (if any), and
+/// its descendants, so cold-loading an Agent Chat page never downloads all 10k sessions over 3G.
+async fn harness_family(hub: &Arc<Hub>, caller: &crate::authz::Caller, id: &str) -> Response {
+    use std::collections::{HashMap, HashSet};
+    let all = hub.harness.list_shared();
+    let mut by_id: HashMap<&str, &Arc<crate::harness::session::Info>> = HashMap::with_capacity(all.len());
+    let mut by_parent: HashMap<&str, Vec<&Arc<crate::harness::session::Info>>> = HashMap::new();
+    for info in &all {
+        if info.helper.is_some() {
+            continue;
+        }
+        by_id.insert(info.id.as_str(), info);
+        if let Some(p) = info.parent.as_deref() {
+            by_parent.entry(p).or_default().push(info);
+        }
+    }
+    let mut keep: Vec<crate::harness::session::Info> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    if let Some(me) = by_id.get(id).copied() {
+        if seen.insert(me.id.as_str()) {
+            keep.push(crate::harness::session::Info::clone(me));
+        }
+        if let Some(p) = me.parent.as_deref()
+            && let Some(parent) = by_id.get(p).copied()
+            && seen.insert(parent.id.as_str())
+        {
+            keep.push(crate::harness::session::Info::clone(parent));
+        }
+    }
+    let mut queue = vec![id];
+    while let Some(cur) = queue.pop() {
+        if let Some(children) = by_parent.get(cur) {
+            for child in children {
+                if seen.insert(child.id.as_str()) {
+                    keep.push(crate::harness::session::Info::clone(child));
+                    queue.push(child.id.as_str());
+                }
+            }
+        }
+    }
+    let visible = crate::harness::lineage::seen(hub, caller, keep).await;
+    srv::json(StatusCode::OK, &visible)
+}
+
+/// `GET /api/harness/waiting`: only the agents currently showing a shell card (open approvals,
+/// held goals, stopped with error, or paused at a usage limit), so non-Mission-Control pages
+/// (`/ship`, `/runners`, `/agents/:id`) never download 10k sessions just to render shell toasts.
+async fn harness_waiting(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
+    use crate::harness::model::Status;
+    let mut notable = Vec::new();
+    for info in hub.harness.list_shared() {
+        if info.helper.is_some() {
+            continue;
+        }
+        let has_approval = !info.approvals.is_empty();
+        let has_held = info.held.is_some();
+        let stopped_err = info.status == Status::Exited && info.exit.as_ref().is_some_and(|e| e.error.is_some());
+        let at_limit = info.pause.is_some() && !matches!(info.status, Status::Running | Status::Exited | Status::Disconnected);
+        if has_approval || has_held || stopped_err || at_limit {
+            notable.push(crate::harness::session::Info::clone(&info));
+        }
+    }
+    let visible = crate::harness::lineage::seen(hub, caller, notable).await;
+    srv::json(StatusCode::OK, &visible)
+}
+
 /// A cursor reader asks for a bounded canonical page; legacy callers retain their pre-encoded
 /// read-model path below. The cursor and lineage are checked on both sides of durable IO.
+#[cfg(test)]
 async fn conversation_events_for(hub: &Hub, caller: &crate::authz::Caller, id: &str, q: &HashMap<String, String>) -> R {
-    let Some(cursor) = q.get("cursor") else { return conversation_events(hub, id, q).await };
+    conversation_events_encoded(hub, caller, id, q, None).await
+}
+
+async fn conversation_events_encoded(hub: &Hub, caller: &crate::authz::Caller, id: &str, q: &HashMap<String, String>, coding: Option<crate::http::compress::Coding>) -> R {
+    let Some(cursor) = q.get("cursor") else { return conversation_events(hub, id, q, coding).await };
     let before = q.get("before").and_then(|v| v.parse::<u64>().ok()).ok_or_else(|| err(StatusCode::BAD_REQUEST, "history needs a numeric before cursor"))?;
     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(100).clamp(1, 1000);
     let bytes = q.get("bytes").and_then(|v| v.parse::<usize>().ok()).unwrap_or(256 * 1024).clamp(16 * 1024, 1024 * 1024);
@@ -6656,7 +6735,30 @@ async fn conversation_events_for(hub: &Hub, caller: &crate::authz::Caller, id: &
     Ok(srv::with_header(srv::with_header(response, header::CACHE_CONTROL, "private, no-store"), header::VARY, "Cookie, Authorization"))
 }
 
-async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R {
+async fn events_pieces_response(events: Vec<bytes::Bytes>, coding: Option<crate::http::compress::Coding>) -> Response {
+    let total: usize = events.iter().map(bytes::Bytes::len).sum();
+    if let Some(c) = coding
+        && total >= crate::http::compress::MIN_BODY
+    {
+        let compressed = crate::rt::compute(move || {
+            c.encode_pieces(&events).map(|packed| (packed, events))
+        })
+        .await;
+        if let Ok(Ok((packed, original))) = compressed {
+            if packed.len() < total {
+                let mut r = srv::response(StatusCode::OK, "application/json", srv::full(packed));
+                r.headers_mut().insert(header::CONTENT_ENCODING, header::HeaderValue::from_static(c.token()));
+                r.headers_mut().append(header::VARY, header::HeaderValue::from_static("Accept-Encoding"));
+                return r;
+            }
+            return srv::response(StatusCode::OK, "application/json", srv::pieces(original));
+        }
+        return srv::response(StatusCode::OK, "application/json", srv::full(bytes::Bytes::from_static(b"[]")));
+    }
+    srv::response(StatusCode::OK, "application/json", srv::pieces(events))
+}
+
+async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>, coding: Option<crate::http::compress::Coding>) -> R {
     let Some(store) = hub.harness.convo.clone() else { return Err(err(StatusCode::NOT_FOUND, "this server keeps no conversations (KILN_CONVERSATIONS is off)")) };
     let before = q.get("before").and_then(|b| b.parse::<u64>().ok());
     // The page asked for without a `limit` is what each session's copy keeps in memory, whatever else of it is
@@ -6671,11 +6773,11 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>) -
     // spilled chunk's are read from its spill file there, the same bytes (goal 11 audit A3): the store
     // answered a range that touched one, its rows read and each one's JSON written out again.
     match hub.harness.events_page_kept(id, before, limit) {
-        Ok(events) => return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events))),
+        Ok(events) => return Ok(events_pieces_response(events, coding).await),
         Err(crate::harness::copies::Unread::Unkept) => {
             if let Some(view) = hub.harness.view_held(id) {
                 match crate::rt::blocking(move || view.events_page(before, limit)).await {
-                    Ok(Some(events)) => return Ok(srv::response(StatusCode::OK, "application/json", srv::pieces(events))),
+                    Ok(Some(events)) => return Ok(events_pieces_response(events, coding).await),
                     // The copy can't say it after all (a spill file that didn't give its chunk back): the store's.
                     Ok(None) => {}
                     Err(e) => tracing::debug!(session = id, error = %format!("{e:#}"), "a page's texts weren't made off the shard: the store answers"),
@@ -6824,15 +6926,20 @@ async fn conversation_search(hub: &Hub, q: &HashMap<String, String>) -> R {
         limit: q.get("limit").and_then(|v| v.parse::<usize>().ok()),
         before_seq,
     };
-    let rows = crate::rt::blocking(move || store.search(query)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let rows = crate::rt::blocking(move || store.search_committed(query)).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     let rows = rows.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
-    let infos: HashMap<String, crate::harness::session::Info> = hub.harness.list().into_iter().map(|i| (i.id.clone(), i)).collect();
+    let mut infos: HashMap<String, Option<(String, String)>> = HashMap::new();
     let hits: Vec<serde_json::Value> = rows
         .iter()
         .filter_map(|r| {
             let event: serde_json::Value = serde_json::from_str(&r.body).ok()?;
-            let info = infos.get(&r.session);
-            Some(json!({ "agent": r.session, "name": info.map(|i| i.name.clone()), "machine": info.map(|i| i.target.clone()), "event": event }))
+            let entry = infos.entry(r.session.clone()).or_insert_with(|| hub.harness.info(&r.session).map(|i| (i.name, i.target)));
+            Some(json!({
+                "agent": r.session,
+                "name": entry.as_ref().map(|(n, _)| n.as_str()),
+                "machine": entry.as_ref().map(|(_, m)| m.as_str()),
+                "event": event,
+            }))
         })
         .collect();
     Ok(srv::json(StatusCode::OK, &json!({ "hits": hits })))
@@ -7972,7 +8079,7 @@ fn audits(store: &crate::store::Store, who: String) -> crate::memory::queue::Sen
 /// so the command goes on without waiting for the store; should that writer be gone, it's written
 /// here.
 async fn audit_command(hub: &Hub, audit: &mut Option<crate::memory::queue::Sender<String>>, who: &str, id: &str, c: &crate::harness::model::Command) {
-    let kind = serde_json::to_value(c).ok().and_then(|v| v.get("type").and_then(serde_json::Value::as_str).map(str::to_owned)).unwrap_or_default();
+    let kind = c.audit_kind();
     let writer = audit.get_or_insert_with(|| audits(&hub.store, who.to_owned()));
     if let Err(async_channel::SendError(row)) = writer.send(format!("{id}: {kind}")).await {
         hub.store.audit(who.to_owned(), "agent.command".into(), row).await;
@@ -8390,51 +8497,6 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     tx.send(ws::text(frame)).await?;
                 }
             }
-            (w, fresh) = live.fuse() => match w {
-                // This task's poll took its feed's word now: each frame's wait for it is the viewer's wake (goal 10, plan
-                // 01a1a87b2dae step 5).
-                Live::Ready => match (crate::harness::live::now_us(), crate::rt::labeled(&VIEWER_LIVE, hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ)).await) {
-                    (woke, Ok(batch)) => {
-                        if fresh {
-                            turns = crate::rt::Turns::new();
-                        }
-                        // Read now: each frame's delivery, from its publish on this process's
-                        // microsecond clock (the bus's own stamps are milliseconds).
-                        let (read, next) = (Read::now(woke, own), batch.next);
-                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes, &topic, read, &mut turns)).await? {
-                            Fed::Written => {}
-                            Fed::StartOver => start_over = true,
-                            Fed::Closed => return Ok(()),
-                        }
-                        at = Some(next);
-                        // A viewer behind its feed reads batch after batch, each ready at once: its turn ends once its
-                        // next would pass the quantum, whether or not anything else wants the shard then.
-                        turns.end().await;
-                    }
-                    (_, Err(Refusal::Behind { .. })) => {
-                        crate::metrics::bus().lag_notices.inc();
-                        start_over = true;
-                    }
-                    (_, Err(Refusal::NoTopic(_))) => {
-                        tx.send(closed()).await?;
-                        return Ok(());
-                    }
-                    (_, Err(e)) => {
-                        tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's read of its session's feed was refused: it starts over");
-                        start_over = true;
-                    }
-                },
-                Live::Refused(Refusal::NoTopic(_)) => {
-                    tx.send(closed()).await?;
-                    return Ok(());
-                }
-                Live::Refused(e) => {
-                    tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's wait on its session's feed was refused: it starts over");
-                    start_over = true;
-                }
-                Live::Feedless => start_over = true,
-                Live::Quiet => start_over = viewer.refusals() != refusals,
-            },
             m = rx.next().fuse() => match ui::came(m) {
                 Came::Text(t) => match ui::session_up(t.as_str()) {
                     // A frame that came down that the page couldn't read: the server, which sent it,
@@ -8510,6 +8572,51 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     let _ = tx.close(Some(close)).await;
                     return Ok(());
                 }
+            },
+            (w, fresh) = live.fuse() => match w {
+                // This task's poll took its feed's word now: each frame's wait for it is the viewer's wake (goal 10, plan
+                // 01a1a87b2dae step 5).
+                Live::Ready => match (crate::harness::live::now_us(), crate::rt::labeled(&VIEWER_LIVE, hub.bus.read(&topic, at.unwrap_or_default(), FEED_READ)).await) {
+                    (woke, Ok(batch)) => {
+                        if fresh {
+                            turns = crate::rt::Turns::new();
+                        }
+                        // Read now: each frame's delivery, from its publish on this process's
+                        // microsecond clock (the bus's own stamps are milliseconds).
+                        let (read, next) = (Read::now(woke, own), batch.next);
+                        match crate::rt::labeled(&VIEWER_LIVE, write_live_batch(&mut tx, batch.messages, &mut have, takes, &topic, read, &mut turns)).await? {
+                            Fed::Written => {}
+                            Fed::StartOver => start_over = true,
+                            Fed::Closed => return Ok(()),
+                        }
+                        at = Some(next);
+                        // A viewer behind its feed reads batch after batch, each ready at once: its turn ends once its
+                        // next would pass the quantum, whether or not anything else wants the shard then.
+                        turns.end().await;
+                    }
+                    (_, Err(Refusal::Behind { .. })) => {
+                        crate::metrics::bus().lag_notices.inc();
+                        start_over = true;
+                    }
+                    (_, Err(Refusal::NoTopic(_))) => {
+                        tx.send(closed()).await?;
+                        return Ok(());
+                    }
+                    (_, Err(e)) => {
+                        tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's read of its session's feed was refused: it starts over");
+                        start_over = true;
+                    }
+                },
+                Live::Refused(Refusal::NoTopic(_)) => {
+                    tx.send(closed()).await?;
+                    return Ok(());
+                }
+                Live::Refused(e) => {
+                    tracing::warn!(target: "kiln.bus", event = "feed.refused", topic = %topic, error = %e, "a viewer's wait on its session's feed was refused: it starts over");
+                    start_over = true;
+                }
+                Live::Feedless => start_over = true,
+                Live::Quiet => start_over = viewer.refusals() != refusals,
             },
         }
         if start_over {
@@ -9920,7 +10027,7 @@ mod tests {
                 crate::harness::lineage::may_see(&hub, &crate::authz::Caller::owner(), "a").await.map_err(|(c, m)| anyhow::anyhow!("{c} {m}"))?;
                 let list = body_of(harness_sessions(&hub, &crate::authz::Caller::owner()).await).await?;
                 let one = hub.harness.info_json("a").ok_or_else(|| anyhow::anyhow!("no session a"))?;
-                let events = body_of(conversation_events(&hub, "a", &q(&[("limit", "50")])).await.map_err(api)?).await?;
+                let events = body_of(conversation_events(&hub, "a", &q(&[("limit", "50")]), None).await.map_err(api)?).await?;
                 let mut plans = Vec::new();
                 for query in &queries {
                     plans.push(body_of(plans_list(&hub, query).await.map_err(api)?).await?);

@@ -100,6 +100,31 @@ async fn write_each(rx: crate::memory::queue::Receiver<PathBuf>) {
     }
 }
 
+/// Flushes every pending kept file synchronously to disk (fsync + directory sync) on graceful
+/// shutdown so the newest metadata (`names.json`, `holders.json`, mirrors, etc.) is never lost.
+pub async fn flush() {
+    let Some(keeper) = KEEPER.get() else { return };
+    let pending: Vec<(PathBuf, Arc<Vec<u8>>)> = keeper
+        .places
+        .load()
+        .iter()
+        .filter_map(|(path, place)| place.newest.swap(None).map(|bytes| (path.clone(), bytes)))
+        .collect();
+    if pending.is_empty() {
+        return;
+    }
+    let _ = crate::rt::blocking(move || {
+        for (path, bytes) in pending {
+            let len = bytes.len();
+            if let Err(e) = crate::sync::group::save_atomic(&path, &bytes) {
+                tracing::warn!(path = %path.display(), error = %format!("{e:#}"), "couldn't flush a kept file on shutdown");
+            }
+            crate::memory::owners::KEEP_WAITING.sub(len);
+        }
+    })
+    .await;
+}
+
 /// Tests: whether the file at `path` has a place with the writer (it was kept through it), and whether that
 /// writes it synced.
 #[cfg(test)]
@@ -107,15 +132,20 @@ pub(crate) fn kept_through(path: &Path) -> Option<bool> {
     KEEPER.get().and_then(|k| k.places.load().get(path).map(|p| p.synced))
 }
 
-/// `bytes` as the file at `path`, whole or not at all.
+/// `bytes` as the file at `path`, whole or not at all, synced before rename so a power loss never
+/// leaves a zero-byte file behind.
 fn write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let mut part = path.as_os_str().to_owned();
     part.push(".part");
     let part = PathBuf::from(part);
-    std::fs::write(&part, bytes)?;
+    let mut file = std::fs::File::create(&part)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&part, path)?;
     Ok(())
 }

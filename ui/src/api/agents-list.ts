@@ -3,7 +3,7 @@
  * agents, the palette), while the session store and the rest of harness.ts load only with the pages
  * that show a conversation (goal 8: what a page doesn't show stays out of its first load).
  */
-import { SESSIONS_READ } from "./launch-reads";
+import { SESSIONS_READ, WAITING_READ } from "./launch-reads";
 import { fromColumns, isColumns, type Columns } from "./columns";
 import { listAsked, listedAgain } from "./last-words";
 import { ApiError } from "./client";
@@ -45,4 +45,25 @@ export function listAgents(signal?: AbortSignal): Promise<AgentInfo[]> {
     listedAgain(since);
     return (isColumns(read) ? fromColumns<AgentInfo>(read) : read).filter(listed);
   });
+}
+
+/** Compact waiting-cards list (~300 B even at 10k sessions), falling back to full list on older servers. */
+export function listWaiting(signal?: AbortSignal): Promise<AgentInfo[]> {
+  return call<unknown>("GET", WAITING_READ, undefined, signal)
+    .then((read) => (Array.isArray(read) ? (read as AgentInfo[]).filter(listed) : listAgents(signal)))
+    .catch((error: unknown) => {
+      if (signal?.aborted) throw error;
+      if (error instanceof ApiError && error.status === 404) return listAgents(signal);
+      return [];
+    });
+}
+
+/** Only one session, its parent, and its descendants (~400 B even at 10k sessions). */
+export function listAgentFamily(id: string, signal?: AbortSignal): Promise<AgentInfo[]> {
+  return call<AgentInfo[]>("GET", `/api/harness/sessions?family=${encodeURIComponent(id)}`, undefined, signal)
+    .then((read) => read.filter(listed))
+    .catch((error: unknown) => {
+      if (signal?.aborted) throw error;
+      return [];
+    });
 }

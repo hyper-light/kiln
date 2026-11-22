@@ -9,7 +9,7 @@
 import { create } from "zustand";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import { listAgents, listed } from "@/api/agents-list";
+import { listAgentFamily, listAgents, listed, listWaiting } from "@/api/agents-list";
 import type { AgentInfo } from "@/api/wire";
 import type { Agent, AiSession, HostSample, LeanAgent, MetricsHistory, Overview, Repo, Run, ServerEvent, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
 import { loaded, preload, recent, useSuspenseResource, type ResourceOptions, type ResourceFetcher } from "./resource";
@@ -213,6 +213,32 @@ export function mergeJobs(data: UpdatesOverview, live: Record<string, UpdateJob>
   for (const j of data.jobs) all[j.id] = fuller(all[j.id], j);
   return Object.values(all).sort((a, b) => b.started_at - a.started_at);
 }
+
+/** Only the agents currently showing shell-level cards (approvals, held goals, stops, usage limits). */
+export const harnessWaitingRes: Res<AgentInfo[]> = {
+  key: "harness/waiting",
+  fetch: (signal) => {
+    const kept = recent<AgentInfo[]>("harness/sessions", 5_000) ?? recent<AgentInfo[]>("harness/agents", 5_000);
+    return kept ? Promise.resolve(kept) : listWaiting(signal);
+  },
+  opts: {
+    on: ["harness", "harness_closed"],
+    applyMany: agentsWith,
+  },
+};
+
+/** One session, its immediate parent, and its descendants, kept live without fetching all 10k sessions. */
+export const harnessFamilyRes = (id: string): Res<AgentInfo[]> => ({
+  key: `harness/family/${id}`,
+  fetch: (signal) => {
+    const kept = recent<AgentInfo[]>("harness/sessions", 5_000) ?? recent<AgentInfo[]>("harness/agents", 5_000);
+    return kept ? Promise.resolve(kept) : listAgentFamily(id, signal);
+  },
+  opts: {
+    on: ["harness", "harness_closed"],
+    applyMany: agentsWith,
+  },
+});
 
 /** The agents kiln runs (an older server without them: none), as their events change them. */
 export const harnessSessionsRes: Res<AgentInfo[]> = {

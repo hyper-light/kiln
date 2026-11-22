@@ -45,9 +45,14 @@ pub fn window_bits(len: usize) -> u32 {
 
 /// `data` packed with brotli at its best, in the window that holds it; none if the writer refused it.
 pub fn brotli(data: &[u8]) -> Option<Vec<u8>> {
+    brotli_with(data, QUALITY, window_bits(data.len()))
+}
+
+/// `data` packed with brotli at `quality` and `lgwin` window bits; none if the writer refused it.
+pub fn brotli_with(data: &[u8], quality: u32, lgwin: u32) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 3);
     {
-        let mut w = brotli::CompressorWriter::new(&mut out, BUFFER, QUALITY, window_bits(data.len()));
+        let mut w = brotli::CompressorWriter::new(&mut out, BUFFER, quality, lgwin);
         w.write_all(data).ok()?;
         w.flush().ok()?;
         // Dropped here, which ends the stream.
@@ -83,6 +88,52 @@ pub fn table(name: &str, coding: &str, entries: &[(String, [u8; 32], String)]) -
     );
     for (name, sha, path) in sorted {
         let _ = writeln!(out, "    ({name:?}, {sha:?}, include_bytes!({path:?})),");
+    }
+    out.push_str("];\n");
+    out
+}
+
+/// One embedded UI file's metadata inside the single deduplicated [`blob_table`] blob: its name,
+/// SHA-256 of the original uncompressed bytes, byte range `[start..start+len]` in `UI_BLOB`,
+/// original uncompressed byte length, and whether its slice in `UI_BLOB` is brotli-compressed.
+#[derive(Clone)]
+pub struct BlobEntry {
+    pub name: String,
+    pub sha: [u8; 32],
+    pub start: usize,
+    pub len: usize,
+    pub orig_len: usize,
+    pub brotli: bool,
+}
+
+/// Generates `OUT_DIR/ui_packed.rs`: one contiguous `UI_BLOB` (`include_bytes!(blob_path)`) plus a
+/// sorted `UI_FILES` slice indexing into `UI_BLOB`. Each unique file payload is stored once,
+/// brotli-Q11 compressed when compressible and smaller, eliminating duplicate raw and `.gz` copies
+/// from the binary.
+pub fn blob_table(blob_path: &str, entries: &[BlobEntry]) -> String {
+    let mut sorted: Vec<&BlobEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut out = format!(
+        "/// Every embedded UI file's payload, SHA-256 deduplicated and brotli-Q11 packed where smaller.\n\
+         pub static UI_BLOB: &[u8] = include_bytes!({blob_path:?});\n\n\
+         #[derive(Clone, Copy)]\n\
+         pub struct EmbeddedFile {{\n\
+             pub name: &'static str,\n\
+             pub sha: [u8; 32],\n\
+             pub start: usize,\n\
+             pub len: usize,\n\
+             pub orig_len: usize,\n\
+             pub brotli: bool,\n\
+         }}\n\n\
+         /// Embedded UI files in name order for binary search.\n\
+         pub static UI_FILES: &[EmbeddedFile] = &[\n"
+    );
+    for e in sorted {
+        let _ = writeln!(
+            out,
+            "    EmbeddedFile {{ name: {:?}, sha: {:?}, start: {}, len: {}, orig_len: {}, brotli: {} }},",
+            e.name, e.sha, e.start, e.len, e.orig_len, e.brotli
+        );
     }
     out.push_str("];\n");
     out

@@ -217,7 +217,7 @@ impl super::K8s {
     /// Reaps the agents' pods whose end has come ([`agent_pod_ends`]), from the cluster's pods now (`pods`, by name):
     /// the pod deleted, then its claim and PersistentVolume, then its home asked to let the workspace go, and its record
     /// taken. `pending_since` keeps when each first couldn't start, as the job pods' reaper keeps it.
-    pub async fn reap_agents(&self, hub: &Hub, pods: &HashMap<String, k8s_openapi::api::core::v1::Pod>, pending_since: &mut HashMap<String, Instant>) {
+    pub async fn reap_agents(&self, hub: &Hub, pods: &HashMap<String, crate::kubeapi::types::Pod>, pending_since: &mut HashMap<String, Instant>) {
         for (name, rec) in hub.agent_pods.all() {
             let pod = pods.get(&name);
             let phase = pod.and_then(|p| p.status.as_ref()).and_then(|s| s.phase.clone());

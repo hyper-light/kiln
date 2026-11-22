@@ -77,7 +77,7 @@ impl Host {
     pub fn command_routed(&self, id: &str, c: Command, epoch: Option<u64>, route: Route) -> bool {
         let operation = self.archive_lock(id);
         let Some(_guard) = operation.try_lock() else { return false };
-        let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
+        let Some(lane) = self.lanes.lock().get(id).map(|l| l.data.clone()) else { return false };
         match lane.try_send(Lane::Routed { c: Box::new(c), epoch, at: std::time::Instant::now(), route: Box::new(route) }) {
             Ok(()) => true,
             Err(async_channel::TrySendError::Full(Lane::Routed { c, .. })) => {
@@ -423,7 +423,7 @@ impl Host {
             }
             w.queued = true;
         }
-        let lane = self.lanes.lock().get(id).map(|(lane, _)| lane.clone());
+        let lane = self.lanes.lock().get(id).map(|l| l.data.clone());
         let sent = lane.is_some_and(|lane| lane.try_send(Lane::Admit).is_ok());
         if !sent && let Some(w) = self.waiting.lock().get_mut(id) {
             // Its lane is full or gone: the next change of its room tries again.

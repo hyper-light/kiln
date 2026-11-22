@@ -71,6 +71,8 @@
   padding: 16px 8px 16px 6px;
   border-bottom: 1px solid #25272c;
   transition: background-color 0.2s;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 84px;
 }
 .ms-row:hover,
 .ms-row:focus-within {

@@ -64,6 +64,23 @@ fn display_row(id:&str,visible:&[Info],known:&BTreeMap<String,RowLineage>)->Stri
         if !ids.contains(parent.as_str()){break;}row=parent;
     }row
 }
+/// O(depth) display row lookup avoiding `hub.harness.list()` (10k session clones) on hot `visit`/`seen` actions.
+async fn display_row_for(hub:&Hub,caller:&Caller,id:&str)->String{
+    let all_seen=super::lineage::sees_all(caller);
+    let mut row=id.to_owned();
+    let mut visited=HashSet::new();
+    while visited.insert(row.clone()){
+        let relation=hub.harness.info_shared(&row)
+            .map(|i|RowLineage{parent:i.parent.clone(),subagent:i.subagent})
+            .or_else(||ROW_LINEAGE.lock().get(&row).cloned());
+        let Some(RowLineage{parent:Some(parent),subagent:true})=relation else{break;};
+        let parent_visible=hub.harness.info_shared(&parent).is_some()
+            && (all_seen || super::lineage::may_see(hub,caller,&parent).await.is_ok());
+        if !parent_visible{break;}
+        row=parent;
+    }
+    row
+}
 fn row_event_key(actual:&str,row:&str,kind:&str,key:&str)->String{if actual==row{key.to_owned()}else{crate::util::derive_id(&["row-use",actual,kind,key])}}
 fn row_candidates(all:&[Info])->Vec<String>{let ids:HashSet<_>=all.iter().map(|i|i.id.as_str()).collect();all.iter().filter(|i|i.helper.is_none() && !(i.subagent && i.parent.as_deref().is_some_and(|p|ids.contains(p)))).map(|i|i.id.clone()).collect()}
 
@@ -212,6 +229,7 @@ struct Action{
     mode:Option<String>,visit:Option<String>,frame_revision:Option<i64>,context:Option<String>,
     #[serde(default)]order_a:Vec<String>,#[serde(default)]order_b:Vec<String>,#[serde(default)]shown:Vec<String>,
     model_order:Option<bool>,chosen_position:Option<usize>,source:Option<String>,
+    #[serde(default)]lean:bool,
 }
 
 fn visible_archive(caller:&Caller,owner:&str)->bool{
@@ -219,7 +237,7 @@ fn visible_archive(caller:&Caller,owner:&str)->bool{
 }
 
 async fn archive_rows(hub:&Hub,caller:&Caller)->Result<Vec<(String,Archived)>,Fail>{
-    let rows:Vec<(String,String,String,String)>=hub.store.call(|c|{
+    let rows:Vec<(String,String,String,String)>=hub.store.read(|c|{
         let mut q=c.prepare("SELECT agent,principal,value,status FROM attention_archive ORDER BY at DESC,agent")?;
         Ok(q.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<Result<_,_>>()?)
     }).await.map_err(failed)?;
@@ -242,7 +260,7 @@ async fn snapshot_mode(hub:&Arc<Hub>,caller:&Caller,mode:SnapshotMode)->Result<V
     let candidates=row_candidates(&all);
     let saved=archive_rows(hub,caller).await?;
     let mut accessible=visible.clone();accessible.extend(saved.iter().map(|(id,_)|id.clone()));
-    let p=who.clone();let settings=hub.store.call(move|c|store::settings(c,&p)).await.map_err(failed)?;
+    let p=who.clone();let settings=hub.store.read(move|c|store::settings(c,&p)).await.map_err(failed)?;
     let mut placements=refresh_placements(hub,&who,&all,&settings,now).await.map_err(failed)?;
     placements.retain(|id,_|visible.contains(id));
     let archive_ids:HashSet<String>=saved.iter().map(|(id,_)|id.clone()).collect();
@@ -250,7 +268,7 @@ async fn snapshot_mode(hub:&Arc<Hub>,caller:&Caller,mode:SnapshotMode)->Result<V
     let key=match &mode{SnapshotMode::Arrival(key)=>Some(key.clone()),SnapshotMode::Refresh(key)=>key.clone()};
     let operation=visit_lock(&who);
     let _held=if matches!(&mode,SnapshotMode::Arrival(_)){Some(operation.lock().await)}else{None};
-    let cached=if let Some(key)=&key{let(p,key)=(who.clone(),key.clone());hub.store.call(move|c|examination::visit(c,&p,&key)).await.map_err(failed)?}else{None};
+    let cached=if let Some(key)=&key{let(p,key)=(who.clone(),key.clone());hub.store.read(move|c|examination::visit(c,&p,&key)).await.map_err(failed)?}else{None};
     let shared=learned::refresh(hub,&who).await.map_err(failed)?;
     let visit=if cached.is_some() || matches!(&mode,SnapshotMode::Refresh(_)){cached}else{
         let key=key.clone().unwrap_or_else(crate::util::new_id);
@@ -264,8 +282,10 @@ async fn snapshot_mode(hub:&Arc<Hub>,caller:&Caller,mode:SnapshotMode)->Result<V
         Some(v)=>learned::after_own_actions(std::sync::Arc::clone(&shared),v.ranks().to_vec(),v.drawn().cloned(),v.at,now).await.map_err(failed)?,
         None=>Vec::new(),
     };
-    ranks.retain(|r|candidates.contains(&r.agent));
-    for id in &candidates{if !ranks.iter().any(|r|&r.agent==id){ranks.push(kiln_ci::attention::Ranked{agent:id.clone(),score:None,reason:"Added during this visit".into()});}}
+    let candidate_set:HashSet<&str>=candidates.iter().map(String::as_str).collect();
+    ranks.retain(|r|candidate_set.contains(r.agent.as_str()));
+    let mut ranked_ids:HashSet<String>=ranks.iter().map(|r|r.agent.clone()).collect();
+    for id in &candidates{if ranked_ids.insert(id.clone()){ranks.push(kiln_ci::attention::Ranked{agent:id.clone(),score:None,reason:"Added during this visit".into()});}}
     let model=visit.as_ref().map(|v|v.report.clone()).unwrap_or(Value::Null);
     let mut agents:BTreeMap<String,Value>=placements.into_iter().map(|(id,p)|Ok((id,serde_json::to_value(p)?))).collect::<anyhow::Result<_>>().map_err(failed)?;
     let order:Vec<String>=ranks.iter().map(|r|r.agent.clone()).collect();
@@ -317,10 +337,12 @@ async fn request_snapshot(hub:&Hub,who:&str,all:&[Info],accessible:&HashSet<Stri
     let mut order=Vec::new();let mut included=HashSet::new();
     for request in &report.requests{if included.insert(request.agent.clone()){order.push(request.agent.clone());}}
     for id in baseline.iter().filter(|id|unknown.contains(*id)){if included.insert(id.clone()){order.push(id.clone());}}
+    let mut by_agent=HashMap::with_capacity(report.requests.len());
+    for r in &report.requests{
+        by_agent.entry(r.agent.as_str()).and_modify(|(_,stale)|*stale|=r.stale).or_insert((r,r.stale));
+    }
     for id in &order{
-        let first=report.requests.iter().find(|r|&r.agent==id);
-        let stale=report.requests.iter().any(|r|&r.agent==id && r.stale);
-        let data=if let Some(r)=first{json!({"score":r.urgency,"stale":stale,"known":r.expected_wait.is_some(),"since":r.at,"waited":r.waited,"expected_wait":r.expected_wait,"observations":r.observations,"reason":report.reason})}else{json!({"score":null,"stale":false,"known":false,"since":null,"waited":null,"expected_wait":null,"observations":0,"reason":"The provider did not supply a request time."})};
+        let data=if let Some((r,stale))=by_agent.get(id.as_str()).copied(){json!({"score":r.urgency,"stale":stale,"known":r.expected_wait.is_some(),"since":r.at,"waited":r.waited,"expected_wait":r.expected_wait,"observations":r.observations,"reason":report.reason})}else{json!({"score":null,"stale":false,"known":false,"since":null,"waited":null,"expected_wait":null,"observations":0,"reason":"The provider did not supply a request time."})};
         if let Some(o)=agents.entry(id.clone()).or_insert_with(||json!({"revision":0})).as_object_mut(){o.insert("urgency".into(),data);}
     }
     Ok((order,report))
@@ -447,9 +469,14 @@ async fn act(hub:&Arc<Hub>,caller:&Caller,who:String,action:Action,now:i64)->Res
         else if matches!(action.action.as_str(),"visit"|"seen"){
             let p=who.clone();let id=id.to_owned();let key=action.key.clone().unwrap_or_else(crate::util::new_id);let exposure=action.exposure;let revision=action.frame_revision;let position=action.chosen_position;let source=action.source;
             let is_visit=action.action=="visit";
-            let visible=super::lineage::seen(hub,caller,hub.harness.list()).await;
-            let row=display_row(&id,&visible,&ROW_LINEAGE.lock());let use_key=row_event_key(&id,&row,"open",&key);
-            let direct=if is_visit && source.as_deref()!=Some("list"){row_candidates(&visible)}else{Vec::new()};
+            let (row,direct)=if is_visit && source.as_deref()!=Some("list"){
+                let visible=super::lineage::seen(hub,caller,hub.harness.list()).await;
+                let row=display_row(&id,&visible,&ROW_LINEAGE.lock());
+                (row,row_candidates(&visible))
+            }else{
+                (display_row_for(hub,caller,&id).await,Vec::new())
+            };
+            let use_key=row_event_key(&id,&row,"open",&key);
             // The position weight from every finished visit before this one (the person's learned examination).
             let prior=if is_visit && source.as_deref()==Some("list"){
                 let shared=learned::refresh(hub,&who).await.map_err(failed)?;
@@ -490,11 +517,15 @@ async fn act(hub:&Arc<Hub>,caller:&Caller,who:String,action:Action,now:i64)->Res
         }
     }
     signal();
-    if matches!(action.action.as_str(),"seen"|"visit") && let Some(id)=&action.agent{
+    let is_light=matches!(action.action.as_str(),"seen"|"visit");
+    if is_light && let Some(id)=&action.agent{
         hub.emit(&crate::wire::events::ServerEvent::Notices(crate::wire::events::Notices{principal:who.clone(),keys:vec![format!("seen:{id}")],how:"seen".into(),at:now,tags:vec![id.clone()]}));
     }
-    hub.emit(&crate::wire::events::ServerEvent::Attention{principal:who});
+    hub.emit(&crate::wire::events::ServerEvent::Attention{principal:who.clone()});
     hub.store.audit(caller.name.clone(),"agent.attention".into(),action.action).await;
+    if action.lean && is_light{
+        return Ok(json!({"ok":true,"you":who,"agent":action.agent,"updated_seen":now}));
+    }
     let mut result=snapshot_mode(hub,caller,result_mode).await?;
     if let Some(o)=result.as_object_mut(){o.insert("undo".into(),json!(undo));}
     Ok(result)
@@ -503,7 +534,7 @@ async fn act(hub:&Arc<Hub>,caller:&Caller,who:String,action:Action,now:i64)->Res
 /// Whether automation must leave an agent alone, including an archive not yet acknowledged.
 pub async fn is_archived(hub:&Hub,id:&str)->anyhow::Result<bool>{
     let id=id.to_owned();
-    hub.store.call(move|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM attention_archive WHERE agent=?1)",[id],|r|r.get(0))?)).await
+    hub.store.read(move|c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM attention_archive WHERE agent=?1)",[id],|r|r.get(0))?)).await
 }
 
 type ArchiveLock=Arc<futures::lock::Mutex<()>>;
@@ -529,7 +560,7 @@ async fn archive_target(hub:&Hub,caller:&Caller,saved:&Archived,what:&str)->Resu
 }
 
 async fn archive_group(hub:&Hub,id:&str)->Result<Option<(Vec<String>,String)>,Fail>{
-    let id=id.to_owned();hub.store.call(move|c|store::archive_members(c,&id)).await.map_err(failed)
+    let id=id.to_owned();hub.store.read(move|c|store::archive_members(c,&id)).await.map_err(failed)
 }
 
 async fn archive(hub:&Arc<Hub>,caller:&Caller,id:&str)->Result<(),Fail>{
@@ -704,6 +735,35 @@ fn used_by_another(c:&rusqlite::Connection,principal:&str,members:&[&Info],since
 /// `auto_park_days` pass with nothing between the person and it since its last use or its last park's end
 /// (`store::idle_since`), until `store::automatic_park_ends`.
 async fn refresh_placements(hub:&Hub,who:&str,all:&[Info],settings:&Settings,now:i64)->anyhow::Result<BTreeMap<String,Placement>>{
+    // Check read-only first: in the steady state (no park waking or auto-park due), return without
+    // acquiring the SQLite writer lock.
+    let (p_read,a_read,settings_read)=(who.to_owned(),all.to_vec(),settings.clone());
+    let (rows,needs_write)=hub.store.read(move|c|{
+        let rows=store::placements(c,&p_read)?;
+        let archived:HashSet<String>=c.prepare("SELECT agent FROM attention_archive")?.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?;
+        let families=Families::of(&a_read);
+        let listed:HashSet<&str>=a_read.iter().map(|i|i.id.as_str()).collect();
+        let mut dirty=false;
+        for info in &a_read{
+            if archived.contains(&info.id) || (info.subagent && info.parent.as_deref().is_some_and(|parent|listed.contains(parent))){continue;}
+            let before=rows.get(&info.id).cloned().unwrap_or_default();
+            let members=families.family(info);
+            let row_quiet=members.iter().all(|i|quiet(i));
+            if let Some(until)=before.parked_until{
+                let asks=members.iter().find_map(|i|park_wake(i,&before,false));
+                let stopped=members.iter().find_map(|i|park_wake(i,&before,true));
+                let ended=until<=now;
+                let to_archive=before.parked_at.is_some_and(|at|until>=at.saturating_add(i64::from(settings_read.archive_after_days).saturating_mul(store::DAY_MS)));
+                let archiving=ended && to_archive && kiln_ci::attention_lifecycle::archive_due(settings_read.auto_archive,settings_read.archive_after_days,before.parked_at,now,row_quiet,false) && !used_by_another(c,&p_read,&members,before.parked_at)?;
+                if asks.or(stopped).or((ended && !archiving).then_some("Its park time ended")).is_some(){dirty=true;break;}
+            }else if let Some(days)=settings_read.auto_park_days && before.pinned.is_none() && row_quiet{
+                let since=store::idle_since(c,&p_read,&info.id,&before)?;
+                if kiln_ci::attention_lifecycle::park_due(Some(days),since,now,row_quiet,false,false){dirty=true;break;}
+            }
+        }
+        Ok((rows,dirty))
+    }).await?;
+    if !needs_write{return Ok(rows);}
     let p=who.to_owned();let a=all.to_vec();let settings=settings.clone();
     hub.store.call(move|c|{
         let mut rows=store::placements(c,&p)?;
@@ -766,15 +826,15 @@ pub async fn run(hub:Arc<Hub>)->anyhow::Result<()>{
 }
 
 async fn maintain(hub:&Arc<Hub>)->anyhow::Result<Option<i64>>{
-    let people:Vec<String>=hub.store.call(|c|{let mut q=c.prepare("SELECT principal FROM attention_settings UNION SELECT principal FROM attention_placement")?;Ok(q.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?)}).await?;
+    let people:Vec<String>=hub.store.read(|c|{let mut q=c.prepare("SELECT principal FROM attention_settings UNION SELECT principal FROM attention_placement")?;Ok(q.query_map([],|r|r.get(0))?.collect::<Result<_,_>>()?)}).await?;
     let mut next:Option<i64>=None;
     for who in people{
         let caller=if who=="owner"{Some(Caller::owner())}else if let Some(user)=who.strip_prefix("user:"){crate::authz::gate::user_caller(hub,user).await}else{None};
         let Some(caller)=caller else{continue;};
         let all=super::lineage::seen(hub,&caller,hub.harness.list()).await;
-        let p=who.clone();let settings=hub.store.call(move|c|store::settings(c,&p)).await?;
+        let p=who.clone();let settings=hub.store.read(move|c|store::settings(c,&p)).await?;
         let now=crate::util::now_ms();
-        let p=who.clone();let before=hub.store.call(move|c|store::placements(c,&p)).await?;
+        let p=who.clone();let before=hub.store.read(move|c|store::placements(c,&p)).await?;
         let rows=refresh_placements(hub,&who,&all,&settings,now).await?;
         if rows!=before{hub.emit(&crate::wire::events::ServerEvent::Attention{principal:who.clone()});}
         let families=Families::of(&all);
@@ -782,7 +842,7 @@ async fn maintain(hub:&Arc<Hub>)->anyhow::Result<Option<i64>>{
             let Some(placed)=rows.get(&info.id) else{continue;};
             if !settings.auto_archive || placed.parked_at.is_none(){continue;}
             let members=family_ids(&info.id,&all);let ids=members.clone();let person=who.clone();let parked_at=placed.parked_at;
-            let(other_used,usage)=hub.store.call(move|c|Ok((c.query_row("SELECT EXISTS(SELECT 1 FROM attention_uses WHERE agent IN (SELECT value FROM json_each(?1)) AND principal<>'' AND principal<>?2 AND at>=?3)",params![serde_json::to_string(&ids)?,person,parked_at],|r|r.get::<_,bool>(0))?,use_revision(c,&ids)?))).await?;
+            let(other_used,usage)=hub.store.read(move|c|Ok((c.query_row("SELECT EXISTS(SELECT 1 FROM attention_uses WHERE agent IN (SELECT value FROM json_each(?1)) AND principal<>'' AND principal<>?2 AND at>=?3)",params![serde_json::to_string(&ids)?,person,parked_at],|r|r.get::<_,bool>(0))?,use_revision(c,&ids)?))).await?;
             if kiln_ci::attention_lifecycle::archive_due(settings.auto_archive,settings.archive_after_days,placed.parked_at,now,families.quiet(info),other_used){
                 // Permission is re-evaluated on every attempt; no park grants command authority.
                 if super::lineage::may_steer(hub,&caller,&info.id).await.is_ok() && let Some(parked_at)=placed.parked_at{
@@ -795,6 +855,7 @@ async fn maintain(hub:&Arc<Hub>)->anyhow::Result<Option<i64>>{
         let rows=refresh_placements(hub,&who,&fresh,&settings,crate::util::now_ms()).await?;
         let families=Families::of(&fresh);
         let listed:HashSet<&str>=fresh.iter().map(|i|i.id.as_str()).collect();
+        let mut idle_check:Vec<(String,Placement)>=Vec::new();
         for info in fresh.iter().filter(|i|!(i.subagent && i.parent.as_deref().is_some_and(|parent|listed.contains(parent)))){
             let p=rows.get(&info.id).cloned().unwrap_or_default();
             if let Some(until)=p.parked_until && until>now{next=Some(next.map_or(until,|t|t.min(until)));}
@@ -803,13 +864,23 @@ async fn maintain(hub:&Arc<Hub>)->anyhow::Result<Option<i64>>{
                 let due=at.saturating_add(i64::from(settings.archive_after_days).saturating_mul(store::DAY_MS));
                 if due>now{next=Some(next.map_or(due,|t|t.min(due)));}
             }
-            if quiet && p.pinned.is_none() && p.parked_until.is_none() && let Some(days)=settings.auto_park_days{
-                let (id,person)=(info.id.clone(),who.clone());
-                if let Some(since)=hub.store.read(move|c|store::idle_since(c,&person,&id,&p)).await?{
-                    let due=since.saturating_add(i64::from(days).saturating_mul(store::DAY_MS));
-                    if due>now{next=Some(next.map_or(due,|t|t.min(due)));}
-                }
+            if quiet && p.pinned.is_none() && p.parked_until.is_none() && settings.auto_park_days.is_some(){
+                idle_check.push((info.id.clone(),p));
             }
+        }
+        if !idle_check.is_empty() && let Some(days)=settings.auto_park_days{
+            let person=who.clone();
+            let earliest:Option<i64>=hub.store.read(move|c|{
+                let mut soonest:Option<i64>=None;
+                for (id,p) in &idle_check{
+                    if let Some(since)=store::idle_since(c,&person,id,p)?{
+                        let due=since.saturating_add(i64::from(days).saturating_mul(store::DAY_MS));
+                        if due>now{soonest=Some(soonest.map_or(due,|t|t.min(due)));}
+                    }
+                }
+                Ok(soonest)
+            }).await?;
+            if let Some(due)=earliest{next=Some(next.map_or(due,|t|t.min(due)));}
         }
     }
     Ok(next)
@@ -821,6 +892,22 @@ async fn backfill(hub:&Hub,caller:&Caller,agents:&[Info])->anyhow::Result<()>{
     let audit=if who=="owner"{"admin".to_owned()}else{caller.name.clone()};
     if audit.starts_with("agent:") || audit.starts_with("job:") || audit.starts_with("peer:"){return Ok(());}
     let ids:HashSet<String>=agents.iter().map(|a|a.id.clone()).collect();
+    // Fast read-only check: skip acquiring the SQLite writer lock when backfill already ran and
+    // no seen-mark advances any placement watermark.
+    let (who_r,ids_r)=(who.clone(),ids.clone());
+    let needs_write=hub.store.read(move|c|{
+        let imported:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM attention_meta WHERE key=?1)",[format!("backfilled:{who_r}")],|r|r.get(0))?;
+        if !imported{return Ok(true);}
+        let marks=crate::push::store::marks(c,&who_r)?;
+        for m in marks{
+            if m.how!="seen"{continue;}
+            let Some(id)=m.key.strip_prefix("seen:") else{continue;};if !ids_r.contains(id){continue;}
+            let before=store::placement(c,&who_r,id)?;
+            if before.updated_seen.is_none_or(|t|t<m.at){return Ok(true);}
+        }
+        Ok(false)
+    }).await?;
+    if !needs_write{return Ok(());}
     hub.store.call(move|c|{
         let imported:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM attention_meta WHERE key=?1)",[format!("backfilled:{who}")],|r|r.get(0))?;
         let mut q=c.prepare("SELECT id,ts,detail FROM audit2 WHERE action='agent.command' AND principal=?1 AND on_behalf_of IS NULL AND id <= (SELECT value FROM attention_meta WHERE key='audit_fence') AND NOT ?2 ORDER BY id")?;
@@ -853,7 +940,7 @@ async fn replay(hub:&Arc<Hub>,caller:&Caller,req:&Request)->Result<Value,Fail>{
     let shared=learned::refresh(hub,&who).await.map_err(failed)?;
     let mut value=learned::replay(hub,shared,&who,at,rows).await.map_err(failed)?;
     let accessible:HashSet<String>=all.iter().map(|i|i.id.clone()).collect();
-    let p=who.clone();let (open,responses)=hub.store.call(move|c|requests::history(c,&p,&accessible,at)).await.map_err(failed)?;
+    let p=who.clone();let (open,responses)=hub.store.read(move|c|requests::history(c,&p,&accessible,at)).await.map_err(failed)?;
     let visible=all.iter().map(|i|i.id.clone()).collect();
     if let Some(o)=value.as_object_mut(){o.insert("urgency".into(),json!(kiln_ci::attention::urgency(&requests::waits(&open,&visible),&responses,at)));}
     Ok(value)

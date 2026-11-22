@@ -142,13 +142,6 @@ export function useAgentActions(
     toast({ title: `Restarting ${name}`, tone: "running" });
     return command({ type: "restart" }, "restart it");
   });
-  // Ending it ends the agents it started too, unless the dialog says otherwise; the dialog says
-  // meanwhile that it's on its way, and why if it couldn't.
-  const ending = useEndWithChildren(a.id);
-  const end = async () => {
-    await ending.end();
-    after?.onGone?.();
-  };
   // Reset (docs/agents.md, "Reset"): its line closes once it's taken, and the toast says what kiln held for it that ended.
   const [reset, resetting] = useAction(async (why: string) => {
     const r = await harnessApi.reset(a.id, why.trim() || undefined);
@@ -169,112 +162,114 @@ export function useAgentActions(
     },
     after?.onFailed ? (e: unknown) => after.onFailed?.(errorMessage(e)) : "Couldn't remove the agent",
   );
-  const items: { label: string; onSelect: () => void; danger?: boolean; hidden?: boolean; going?: boolean }[] = [
-    {
-      label: "Rename…",
-      onSelect: () => {
-        renameNext.current = true;
-        setAct("rename");
+  const wholeMenu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = [], organize: OrganizeItem[] = []) => {
+    const items: { label: string; onSelect: () => void; danger?: boolean; hidden?: boolean; going?: boolean }[] = [
+      {
+        label: "Rename…",
+        onSelect: () => {
+          renameNext.current = true;
+          setAct("rename");
+        },
+        going: naming,
       },
-      going: naming,
-    },
-    { label: "Stop the current turn", onSelect: stopTurn, hidden: a.status !== "running" && a.status !== "waiting", going: stoppingTurn },
-    { label: "Restart", onSelect: restart, hidden: live, going: restarting },
-    // Mission control's composer, filled in as it runs: its harness, machine, folder, permissions and model (new-agent-draft.ts).
-    {
-      label: "Duplicate",
-      onSelect: () => startFrom(navigate, { from: `Like ${agentLabel(a)}`, kind: a.kind, target: a.target, cwd: a.cwd || undefined, mode: a.mode || undefined, model: a.model || undefined }),
-    },
-    // Agents the kiln server itself runs stay there once they've started; an ended one goes nowhere.
-    { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !movable(a) },
-    { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
-    { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
-    // Asked in a line under its page's head, whose field takes the focus (the menu doesn't hand it back to its button).
-    {
-      label: "Reset…",
-      onSelect: () => {
-        renameNext.current = true;
-        setAct("reset");
+      { label: "Stop the current turn", onSelect: stopTurn, hidden: a.status !== "running" && a.status !== "waiting", going: stoppingTurn },
+      { label: "Restart", onSelect: restart, hidden: live, going: restarting },
+      // Mission control's composer, filled in as it runs: its harness, machine, folder, permissions and model (new-agent-draft.ts).
+      {
+        label: "Duplicate",
+        onSelect: () => startFrom(navigate, { from: `Like ${agentLabel(a)}`, kind: a.kind, target: a.target, cwd: a.cwd || undefined, mode: a.mode || undefined, model: a.model || undefined }),
       },
-      hidden: !after?.reset,
-      going: resetting,
-    },
-    { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : remove()), danger: true, going: removing },
-  ];
-  const wholeMenu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = [], organize: OrganizeItem[] = []) => (
-    // A row's menu in Mission control (with where it's kept) doesn't lock the page's scroll: in WebKit that lock moved the list it opens over.
-    <DropdownMenu.Root modal={organize.length === 0}>
-      <DropdownMenu.Trigger asChild>
-        {trigger ?? (
-          <button ref={button} type="button" className="hx-icon" aria-label={`Actions for ${a.name}`}>
-            <MoreHorizontal size={16} />
-          </button>
-        )}
-      </DropdownMenu.Trigger>
-      <DropdownMenu.Portal>
-        <DropdownMenu.Content
-          className="popover w-56"
-          sideOffset={6}
-          align="end"
-          collisionPadding={12}
-          // Never taller than the room it has (a phone's row mid-screen): what doesn't fit scrolls within it.
-          style={{ maxHeight: "var(--radix-dropdown-menu-content-available-height)", overflowY: "auto" }}
-          onCloseAutoFocus={(e) => {
-            if (renameNext.current) {
-              renameNext.current = false;
-              e.preventDefault();
-            } else if (stayNext.current) {
-              stayNext.current = false;
-              e.preventDefault();
-              button.current?.focus({ preventScroll: true });
-            }
-          }}
-        >
-          {[...extra, ...items]
-            .filter((i) => !("hidden" in i && i.hidden))
-            .map((i) => {
-              const going = "going" in i && Boolean(i.going);
-              return (
-                <DropdownMenu.Item
-                  key={i.label}
-                  className="menu-item"
-                  {...sendingProps(going)}
-                  onSelect={(e) => (going ? e.preventDefault() : i.onSelect())}
-                  style={"danger" in i && i.danger ? { color: "var(--color-fail)" } : undefined}
-                >
-                  <span className="flex-1">{i.label}</span>
-                </DropdownMenu.Item>
-              );
-            })}
-          {organize.length > 0 && <DropdownMenu.Separator className="my-1 h-px bg-white/10" />}
-          {organize.map((i) => (
-            <DropdownMenu.Item
-              key={i.label}
-              className="menu-item"
-              disabled={i.disabled}
-              onSelect={() => {
-                if (i.opens) renameNext.current = true;
-                else stayNext.current = true;
-                i.onSelect();
-              }}
-            >
-              <span className="flex-1">{i.label}</span>
-            </DropdownMenu.Item>
-          ))}
-          <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
-          <React.Suspense fallback={null}>
-            <MuteItem id={a.id} />
-          </React.Suspense>
-          <DropdownMenu.CheckboxItem className="menu-item" checked={keeping} {...sendingProps(keepGoing)} onSelect={(e) => e.preventDefault()} onCheckedChange={keep}>
-            <span className="flex-1">Keep it going when it stops part-way</span>
-            <DropdownMenu.ItemIndicator>
-              <Check size={14} aria-hidden="true" />
-            </DropdownMenu.ItemIndicator>
-          </DropdownMenu.CheckboxItem>
-        </DropdownMenu.Content>
-      </DropdownMenu.Portal>
-    </DropdownMenu.Root>
-  );
+      // Agents the kiln server itself runs stay there once they've started; an ended one goes nowhere.
+      { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !movable(a) },
+      { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
+      { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
+      // Asked in a line under its page's head, whose field takes the focus (the menu doesn't hand it back to its button).
+      {
+        label: "Reset…",
+        onSelect: () => {
+          renameNext.current = true;
+          setAct("reset");
+        },
+        hidden: !after?.reset,
+        going: resetting,
+      },
+      { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : remove()), danger: true, going: removing },
+    ];
+    return (
+      // A row's menu in Mission control (with where it's kept) doesn't lock the page's scroll: in WebKit that lock moved the list it opens over.
+      <DropdownMenu.Root modal={organize.length === 0}>
+        <DropdownMenu.Trigger asChild>
+          {trigger ?? (
+            <button ref={button} type="button" className="hx-icon" aria-label={`Actions for ${a.name}`}>
+              <MoreHorizontal size={16} />
+            </button>
+          )}
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Portal>
+          <DropdownMenu.Content
+            className="popover w-56"
+            sideOffset={6}
+            align="end"
+            collisionPadding={12}
+            // Never taller than the room it has (a phone's row mid-screen): what doesn't fit scrolls within it.
+            style={{ maxHeight: "var(--radix-dropdown-menu-content-available-height)", overflowY: "auto" }}
+            onCloseAutoFocus={(e) => {
+              if (renameNext.current) {
+                renameNext.current = false;
+                e.preventDefault();
+              } else if (stayNext.current) {
+                stayNext.current = false;
+                e.preventDefault();
+                button.current?.focus({ preventScroll: true });
+              }
+            }}
+          >
+            {[...extra, ...items]
+              .filter((i) => !("hidden" in i && i.hidden))
+              .map((i) => {
+                const going = "going" in i && Boolean(i.going);
+                return (
+                  <DropdownMenu.Item
+                    key={i.label}
+                    className="menu-item"
+                    {...sendingProps(going)}
+                    onSelect={(e) => (going ? e.preventDefault() : i.onSelect())}
+                    style={"danger" in i && i.danger ? { color: "var(--color-fail)" } : undefined}
+                  >
+                    <span className="flex-1">{i.label}</span>
+                  </DropdownMenu.Item>
+                );
+              })}
+            {organize.length > 0 && <DropdownMenu.Separator className="my-1 h-px bg-white/10" />}
+            {organize.map((i) => (
+              <DropdownMenu.Item
+                key={i.label}
+                className="menu-item"
+                disabled={i.disabled}
+                onSelect={() => {
+                  if (i.opens) renameNext.current = true;
+                  else stayNext.current = true;
+                  i.onSelect();
+                }}
+              >
+                <span className="flex-1">{i.label}</span>
+              </DropdownMenu.Item>
+            ))}
+            <DropdownMenu.Separator className="my-1 h-px bg-white/10" />
+            <React.Suspense fallback={null}>
+              <MuteItem id={a.id} />
+            </React.Suspense>
+            <DropdownMenu.CheckboxItem className="menu-item" checked={keeping} {...sendingProps(keepGoing)} onSelect={(e) => e.preventDefault()} onCheckedChange={keep}>
+              <span className="flex-1">Keep it going when it stops part-way</span>
+              <DropdownMenu.ItemIndicator>
+                <Check size={14} aria-hidden="true" />
+              </DropdownMenu.ItemIndicator>
+            </DropdownMenu.CheckboxItem>
+          </DropdownMenu.Content>
+        </DropdownMenu.Portal>
+      </DropdownMenu.Root>
+    );
+  };
   /** The menu; until its own button is first pressed, that button alone, as the closed menu draws it (what its trigger says of itself, closed), opening on what opens that one. */
   const menu = (trigger?: React.ReactNode, extra: { label: string; onSelect: () => void }[] = [], organize: OrganizeItem[] = []) =>
     trigger || menuAsked ? (
@@ -300,22 +295,7 @@ export function useAgentActions(
     );
   const dialogs = (
     <>
-      {endAsked && (
-        <ConfirmDialog
-          open={act === "end"}
-          onOpenChange={(o) => !o && setAct(null)}
-          title={`End ${a.name}?`}
-          description={
-            <>
-              {`Its process stops on the machine and it leaves the board${a.left_behind ? `, along with the ${a.left_behind === 1 ? "shell or monitor" : `${a.left_behind} shells and monitors`} it left running` : ""}. Its changes stay on disk, and its conversation can be resumed from the harness later.`}
-              {act === "end" && ending.note}
-            </>
-          }
-          confirmLabel="End agent"
-          danger
-          onConfirm={end}
-        />
-      )}
+      {endAsked && <EndAgentDialog a={a} open={act === "end"} onClose={() => setAct(null)} onGone={after?.onGone} />}
       {act === "move" && <MoveDialog agent={a} onClose={() => setAct(null)} />}
       <React.Suspense fallback={null}>{act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}</React.Suspense>
     </>
@@ -341,6 +321,31 @@ export function useAgentActions(
     /** Names it in kiln (and in its harness, which names conversations too); "" gives it back its harness's name. */
     rename,
   };
+}
+
+/** Mounted only once End is actually opened, keeping `useEndWithChildren` off every idle Mission Control row. */
+function EndAgentDialog({ a, open, onClose, onGone }: { a: Pick<AgentInfo, "id" | "name" | "left_behind">; open: boolean; onClose: () => void; onGone?: () => void }) {
+  const ending = useEndWithChildren(a.id);
+  const end = async () => {
+    await ending.end();
+    onGone?.();
+  };
+  return (
+    <ConfirmDialog
+      open={open}
+      onOpenChange={(o) => !o && onClose()}
+      title={`End ${a.name}?`}
+      description={
+        <>
+          {`Its process stops on the machine and it leaves the board${a.left_behind ? `, along with the ${a.left_behind === 1 ? "shell or monitor" : `${a.left_behind} shells and monitors`} it left running` : ""}. Its changes stay on disk, and its conversation can be resumed from the harness later.`}
+          {open && ending.note}
+        </>
+      }
+      confirmLabel="End agent"
+      danger
+      onConfirm={end}
+    />
+  );
 }
 
 /** Mute an agent's notifications for you, on every device (and unmute): where push is on here. */

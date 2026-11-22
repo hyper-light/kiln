@@ -742,11 +742,10 @@ pub struct Host {
     waiting: Mutex<HashMap<String, routed::Waiting>>,
     /// What the server last said it holds for each session in its own custody ([`routed::ServerMail`]).
     server_mail: Mutex<routed::ServerMail>,
-    /// Each session's lane: what it's told, in order, a command at a time; and what says it's done. Each a
-    /// lock-free queue (goal 5, plan 01a1a59c2aae, its top goal): an async-channel's wait took
-    /// event-listener's `Mutex`, the runner's loop sending each command on its shard and the lane's task
-    /// waiting on its own.
-    lanes: Mutex<HashMap<String, (crate::memory::queue::Sender<Lane>, crate::memory::queue::Receiver<()>)>>,
+    /// Each session's lane: a high-priority control queue (stops, approvals, effort/model/mode
+    /// changes) that preempts queued prompts/mail bursts on the data queue, plus a completion
+    /// handle. Each is a lock-free queue (goal 5, plan 01a1a59c2aae).
+    lanes: Mutex<HashMap<String, SessionLane>>,
     /// Lanes on their way out, each done once what it holds is done: a session's next lane waits for
     /// its last (a session taken back right after it went: its fence first, then its opening).
     ending: Mutex<HashMap<String, crate::memory::queue::Receiver<()>>>,
@@ -769,8 +768,18 @@ pub struct Host {
     homes: std::sync::OnceLock<PathBuf>,
 }
 
+/// Per-session lane handles: priority control commands take `high` and preempt `data`.
+struct SessionLane {
+    high: crate::memory::queue::Sender<Lane>,
+    data: crate::memory::queue::Sender<Lane>,
+    ended: crate::memory::queue::Receiver<()>,
+}
+
 /// Most of what waits in one session's lane: past it, what's sent is refused (a message, `Full`).
 pub const LANE: usize = 1024;
+
+/// Capacity of each session's priority control channel (stops, approvals, settings changes).
+const CONTROL_LANE: usize = 256;
 
 impl crate::memory::room::ShareFollower for Host {
     fn resize(&self, bytes: usize) { self.set_input_budget(bytes); }
@@ -1971,7 +1980,7 @@ impl Host {
     pub fn unreadable_at(&self, id: &str, message: String, epoch: Option<u64>, why: String) -> bool {
         let operation = self.archive_lock(id);
         let Some(_guard) = operation.try_lock() else { return false };
-        let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
+        let Some(lane) = self.lanes.lock().get(id).map(|l| l.data.clone()) else { return false };
         match lane.try_send(Lane::Unread { message, epoch, why }) {
             Ok(()) => true,
             Err(async_channel::TrySendError::Full(Lane::Unread { message, .. })) => {
@@ -1996,7 +2005,7 @@ impl Host {
         // accepted after the captured state and then silently lost when its lane disappears.
         let operation = self.archive_lock(id);
         let Some(_guard) = operation.try_lock() else { return false };
-        let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return false };
+        let Some(lane) = self.lanes.lock().get(id).map(|l| if c.is_priority_control() { l.high.clone() } else { l.data.clone() }) else { return false };
         if !self.prepare_admit(id, &c) { return true; }
         match lane.try_send(Lane::Cmd { c: Box::new(c), epoch, at: std::time::Instant::now() }) {
             Ok(()) => true,
@@ -2094,34 +2103,66 @@ impl Host {
 
     /// Opens session `id`'s lane (with `lanes` held), its first word that the session is here at
     /// `epoch` (`back`: taken back). It goes once its last lane is done.
-    fn open_lane(&self, lanes: &mut HashMap<String, (crate::memory::queue::Sender<Lane>, crate::memory::queue::Receiver<()>)>, id: &str, epoch: u64, back: bool) {
+    fn open_lane(&self, lanes: &mut HashMap<String, SessionLane>, id: &str, epoch: u64, back: bool) {
         if let (Some(s), Some(inbox)) = (self.get(id), self.inbox.clone()) {
             let mut core = s.core.lock();
             let depth = super::admission::learned_depth(&core.state);
             let input = core.input.get_or_insert_with(|| self.learned_input(epoch, inbox, depth));
             let _ = input.controller.lock().restoring();
         }
-        // At most `LANE` waiting, whatever each carries, as the channel it was held.
+        // High-priority control commands (stops, approvals, effort/model/mode changes) ride `high`
+        // so they preempt queued prompts and bulk mail bursts on `data`. `Open` enters `high` first
+        // so it is always processed before any command on either channel.
+        let (high_tx, high_rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, CONTROL_LANE);
         let (tx, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, LANE);
-        let _ = tx.try_send(Lane::Open { epoch, back });
+        let _ = high_tx.try_send(Lane::Open { epoch, back });
         // Dropped as the lane ends: what waits on it goes on.
         let (done, ended) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
-        lanes.insert(id.to_owned(), (tx, ended.clone()));
+        lanes.insert(id.to_owned(), SessionLane { high: high_tx, data: tx, ended: ended.clone() });
         let before = self.ending.lock().remove(id);
         let (me, id) = (self.me.clone(), id.to_owned());
         // On its session's own shard, beside its harness's task and the loop that takes its frames (runner-fan).
         crate::rt::spawn_owner(owner_shard(&id), async move {
+            use futures::FutureExt as _;
             if let Some(before) = before {
                 let _ = before.recv().await;
             }
             let mut next: Option<Lane> = None;
+            let mut high_open = true;
+            let mut data_open = true;
             loop {
-                let item = match next.take() {
-                    Some(item) => item,
-                    None => match rx.recv().await {
+                let item = if let Some(item) = next.take() {
+                    item
+                } else if high_open
+                    && let Ok(item) = high_rx.try_recv()
+                {
+                    item
+                } else if high_open && data_open {
+                    let hi = high_rx.recv();
+                    let lo = rx.recv();
+                    futures::pin_mut!(hi, lo);
+                    futures::select_biased! {
+                        r = hi.fuse() => match r {
+                            Ok(item) => item,
+                            Err(_) => { high_open = false; continue; }
+                        },
+                        r = lo.fuse() => match r {
+                            Ok(item) => item,
+                            Err(_) => { data_open = false; continue; }
+                        },
+                    }
+                } else if high_open {
+                    match high_rx.recv().await {
                         Ok(item) => item,
                         Err(_) => break,
-                    },
+                    }
+                } else if data_open {
+                    match rx.recv().await {
+                        Ok(item) => item,
+                        Err(_) => break,
+                    }
+                } else {
+                    break;
                 };
                 let Some(h) = me.upgrade() else { return };
                 match item {
@@ -2131,6 +2172,12 @@ impl Host {
                         crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
                         let mut burst = vec![(*c, epoch, *route)];
                         while burst.len() < routed::BURST_MAX {
+                            if high_open
+                                && let Ok(urgent) = high_rx.try_recv()
+                            {
+                                next = Some(urgent);
+                                break;
+                            }
                             match rx.try_recv() {
                                 Ok(Lane::Routed { c, epoch, at, route }) if route.status.is_none() => {
                                     crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
@@ -2161,17 +2208,20 @@ impl Host {
     /// Session `id`'s lane ends with `last` (its inbox fenced, or forgotten), once what's ahead of
     /// it is done.
     fn end_lane(&self, id: &str, last: Lane) {
-        let Some((lane, ended)) = self.lanes.lock().remove(id) else { return };
-        self.ending.lock().insert(id.to_owned(), ended);
+        let Some(lane) = self.lanes.lock().remove(id) else { return };
+        self.ending.lock().insert(id.to_owned(), lane.ended);
+        let data = lane.data;
+        let high = lane.high;
         crate::rt::spawn(async move {
-            let _ = lane.send(last).await;
+            let _ = data.send(last).await;
+            drop(high);
         });
     }
 
     /// Once everything session `id`'s lane holds now is done (a message its inbox took and its
     /// session then refused is taken back by then).
     async fn settled(&self, id: &str) {
-        let Some(lane) = self.lanes.lock().get(id).map(|(lane, _)| lane.clone()) else { return };
+        let Some(lane) = self.lanes.lock().get(id).map(|l| l.data.clone()) else { return };
         let (tx, rx) = futures::channel::oneshot::channel();
         if lane.send(Lane::Mark(tx)).await.is_ok() {
             let _ = rx.await;
@@ -3195,11 +3245,11 @@ impl Host {
         }
         // Their lanes end as what they hold is done, and each session's next lane waits for its
         // last: what it was sent before goes first.
-        let lanes: Vec<(String, (crate::memory::queue::Sender<Lane>, crate::memory::queue::Receiver<()>))> = self.lanes.lock().drain().collect();
+        let lanes: Vec<(String, SessionLane)> = self.lanes.lock().drain().collect();
         {
             let mut ending = self.ending.lock();
-            for (id, (_, ended)) in lanes {
-                ending.insert(id, ended);
+            for (id, lane) in lanes {
+                ending.insert(id, lane.ended);
             }
         }
         self.restore();
@@ -7390,6 +7440,48 @@ while True:
             for id in ["main", "sub"] {
                 let _ = host.close(id);
             }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn priority_control_bypasses_full_data_lane() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (tx, _rx) = async_channel::unbounded();
+            let host = sim(tx, None, Limits::default());
+            // Install an undrained SessionLane whose data channel is 100% full to verify control
+            // commands take the separate `high` lane without ever being blocked or refused by data bursts.
+            let (high_tx, high_rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, CONTROL_LANE);
+            let (data_tx, data_rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, LANE);
+            let (_done, ended) = crate::memory::queue::places::<()>(&crate::memory::owners::CHANNELS, 1);
+            for _ in 0..LANE {
+                data_tx.try_send(Lane::Admit).map_err(|e| anyhow::anyhow!("fill data lane: {e:?}"))?;
+            }
+            anyhow::ensure!(data_tx.try_send(Lane::Admit).is_err(), "data lane must be full");
+            host.lanes.lock().insert("prio".into(), SessionLane { high: high_tx, data: data_tx, ended });
+
+            let overflow_send = Command::Send { id: "m-overflow".into(), text: "queued".into(), mode: crate::harness::model::SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None };
+            anyhow::ensure!(!host.command("prio", overflow_send), "data command must be rejected when data lane is full");
+            anyhow::ensure!(host.command("prio", Command::Interrupt), "Interrupt must succeed even when data lane is full");
+            anyhow::ensure!(host.command("prio", Command::ForceStop), "ForceStop must succeed even when data lane is full");
+            anyhow::ensure!(host.command("prio", Command::SetEffort { effort: "high".into() }), "SetEffort must succeed even when data lane is full");
+
+            let mut kinds = Vec::new();
+            while let Ok(Lane::Cmd { c, .. }) = high_rx.try_recv() {
+                kinds.push(c.audit_kind());
+            }
+            anyhow::ensure!(kinds == ["interrupt", "force_stop", "set_effort"], "unexpected high-lane order: {kinds:?}");
+            anyhow::ensure!(data_rx.len() == LANE, "data lane items remain intact: {}", data_rx.len());
+            host.lanes.lock().remove("prio");
+
+            // Also verify a live session lane processes priority control commands cleanly.
+            host.open(Some("prio-live".into()), no_harness(dir.path()))?;
+            host.settled("prio-live").await;
+            anyhow::ensure!(host.command("prio-live", Command::SetEffort { effort: "high".into() }));
+            anyhow::ensure!(host.command("prio-live", Command::Interrupt));
+            host.settled("prio-live").await;
+            let _ = host.close("prio-live");
             Ok(())
         })
     }

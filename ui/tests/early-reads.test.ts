@@ -90,14 +90,15 @@ test("the document asks every page's first reads and its own page's, under a pee
     );
     return asked;
   };
-  // Signed in, every page asks the agents its shell shows (once: Mission control's list reads the same).
-  // The agents lean (W21-R02): the URL the app's own list reads (api/harness.ts `list`), so the document's answer is its.
-  assert.deepEqual(SIGNED, ["/api/harness/sessions?lean=1"]);
+  // Signed in, every page asks the compact waiting-cards endpoint (~300 B even at 10k sessions),
+  // while Mission Control (`/agents`) asks for the full lean list (W21-R02) in `EARLY["/agents"]`.
+  assert.deepEqual(SIGNED, ["/api/harness/waiting"]);
+  assert.ok(EARLY["/agents"]!.includes("/api/harness/sessions?lean=1"));
   assert.ok(!EARLY["/agents"]!.includes("/api/harness/sessions"));
   assert.deepEqual(run("/agents/", null), ["/api/me", "/api/peers/open", ...SIGNED, ...EARLY["/agents"]!]);
   assert.deepEqual(run("/ship", null), ["/api/me", "/api/peers/open", ...SIGNED, "/api/ship/commits?by=repo&limit=100"]);
   assert.deepEqual(run("/ship/deploys", null), ["/api/me", "/api/peers/open", ...SIGNED]);
-  assert.deepEqual(run("/agents/0123abcd", null), ["/api/me", "/api/peers/open", ...SIGNED], "an agent's page: its agents asked with the document");
+  assert.deepEqual(run("/agents/0123abcd", null), ["/api/me", "/api/peers/open", ...SIGNED], "an agent's page: compact waiting cards asked with the document");
   assert.deepEqual(run("/.kiln-peer/lab/agents", "1"), ["/.kiln-peer/lab/api/me", "/.kiln-peer/lab/api/peers/open"]);
 });
 

@@ -428,13 +428,27 @@ pub fn answers(segments: &[&str]) -> bool {
 pub async fn runs(store: &Store, q: &HashMap<String, String>, among: Option<Vec<String>>) -> anyhow::Result<Vec<Value>> {
     let limit = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(RUNS_LIMIT);
     let before = q.get("before").and_then(|v| v.parse().ok());
-    let list = match q.get("sort").filter(|s| matches!(s.as_str(), "oldest" | "longest" | "shortest")) {
-        // Another order than newest first pages by `offset` (W21-R03's sort).
-        Some(sort) => store.runs_sorted(among, q.get("repo").cloned(), sort, limit, q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0)).await?,
-        None => match among {
-            None => store.runs(q.get("repo").cloned(), limit, before).await?,
-            Some(names) => store.runs_among(names, q.get("repo").cloned(), limit, before).await?,
-        },
+    let repo = q.get("repo").cloned();
+    let sort = q.get("sort").filter(|s| matches!(s.as_str(), "oldest" | "longest" | "shortest")).cloned();
+    if let Some(sort) = sort {
+        let offset = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let list = store.runs_sorted(among, repo, &sort, limit, offset).await?;
+        return with_hosts(store, &list).await;
+    }
+    if among.is_none() {
+        let (list, hosts) = store
+            .read(move |c| {
+                let list = crate::store::runs_on(c, repo.as_deref(), limit, before)?;
+                let ids: Vec<String> = list.iter().map(|r| r.id.clone()).collect();
+                let hosts = crate::store::run_hosts_on(c, &ids)?;
+                Ok((list, hosts))
+            })
+            .await?;
+        return hosted(&list, &hosts);
+    }
+    let list = match among {
+        None => store.runs(repo, limit, before).await?,
+        Some(names) => store.runs_among(names, repo, limit, before).await?,
     };
     with_hosts(store, &list).await
 }
@@ -462,9 +476,8 @@ fn hosted(runs: &[Run], hosts: &HashMap<String, (Vec<String>, Vec<String>)>) -> 
 /// A run and its jobs: a CI run's `attempt`, the current one by default (W05-R17). `None`: no such
 /// run.
 pub async fn run(store: &Store, id: &str, q: &HashMap<String, String>) -> anyhow::Result<Option<Value>> {
-    let Some(run) = store.run(id.to_owned()).await? else { return Ok(None) };
     let attempt = q.get("attempt").and_then(|a| a.parse().ok());
-    let jobs = store.jobs_at(id.to_owned(), false, attempt).await?;
+    let Some((run, jobs)) = store.run_with_jobs_at(id.to_owned(), false, attempt).await? else { return Ok(None) };
     Ok(Some(json!({ "run": run, "jobs": jobs })))
 }
 

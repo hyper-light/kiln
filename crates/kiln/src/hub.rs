@@ -73,7 +73,7 @@ const STALE_GRACE: Duration = Duration::from_secs(15);
 /// The events ([`Hub::events`]) kept for their slowest subscriber, at the most: their texts are bounded in
 /// bytes too, at [`crate::net::EVENTS_BYTES`] (goal 11, plan 01a1a87b2e56 step 3:
 /// `crate::memory::owners::UI_EVENTS`).
-pub const EVENTS: usize = 4096;
+pub const EVENTS: usize = 32_768;
 
 /// Where a Kubernetes job's pod stands until its agent connects.
 #[derive(Debug, Clone, Copy)]

@@ -1241,12 +1241,15 @@ export class SessionStore {
 
   /** Reconstruct original outgoing bodies from the same Held storage after a real reload. */
   private restoreMail() {
+    let changed = false;
     for (const message of this.originals()) {
       if (!message.custody || message.uploading?.length) continue;
       const known = this.out.get(message.id);
       if (known) {
-        if (known.o.state === "sending" && message.custody === "retained")
+        if (known.o.state === "sending" && message.custody === "retained") {
           this.out.set(message.id, { ...known, publication: message.publication, o: { ...known.o, state: "retained", why: message.why } });
+          changed = true;
+        }
         continue;
       }
       if (this.shows(message.id)) {
@@ -1261,8 +1264,11 @@ export class SessionStore {
         o: { id: c.id, text: c.text, attachments: (c.attachments ?? []).map((file) => file.name), reply_to: c.reply_to, task: c.task, mode: c.mode, at: message.at, state, why: message.why },
       });
       this.asked.set(message.id, { id: message.id, command: c, at: message.at, state: "pending", mail: true, waiting: true, why: message.why });
+      changed = true;
     }
-    this.snap = { ...this.snap, outgoing: [...this.out.values()].map((message) => message.o), asked: [...this.asked.values()] };
+    if (changed) {
+      this.snap = { ...this.snap, outgoing: [...this.out.values()].map((message) => message.o), asked: [...this.asked.values()] };
+    }
   }
 
   /** A concrete connection and pushed source generation, not elapsed time, authorize a retry. */
@@ -1413,6 +1419,7 @@ export class SessionStore {
       if (this.bySeq.has(e.seq)) continue;
       this.byId.set(e.id, e);
       this.bySeq.set(e.seq, e.id);
+      this.prepended.push(e);
       if (page.revision !== undefined) this.pageThrough.set(e.id, page.revision);
     }
     this.reorder = true;
@@ -1431,6 +1438,7 @@ export class SessionStore {
       if (this.byId.has(e.id) || this.bySeq.has(e.seq)) continue;
       this.byId.set(e.id, e);
       this.bySeq.set(e.seq, e.id);
+      this.prepended.push(e);
     }
     this.reorder = true;
     if (this.floor !== null) this.floor = u.before ?? this.floor;
@@ -1930,8 +1938,14 @@ export class SessionStore {
     const epoch = this.epoch;
     const generation = this.snapshotGeneration;
     const current = () => !this.disposed && this.epoch === epoch && epoch === sessionEpoch && this.snapshotGeneration === generation;
-    const low = Math.min(...lean);
-    let before = Math.max(...lean) + 1;
+    let low = Infinity;
+    let high = -Infinity;
+    for (let i = 0; i < lean.length; i++) {
+      const seq = lean[i]!;
+      if (seq < low) low = seq;
+      if (seq > high) high = seq;
+    }
+    let before = high + 1;
     const go = async () => {
       while (before > low && current()) {
         const page = await harnessApi.timeline(this.id, before, false);
@@ -2685,10 +2699,14 @@ export class SessionStore {
     w?.resolve();
   }
 
+  /** Older events staged by `takeHistory` / `takeEarlier` for O(K log K + N) prepend instead of O(N log N) full re-sort. */
+  private prepended: HEvent[] = [];
+
   /**
    * The events in timeline order: the same array while they are, and the same objects. What's new
    * almost always comes after the last one, and joins at the end as it is (sorting thousands of
-   * events for each new one stalled long conversations); only one that doesn't sorts them all.
+   * events for each new one stalled long conversations); older history pages prepend without a full
+   * re-sort; only an out-of-order insertion sorts them all.
    */
   private ordered(): HEvent[] {
     const was = this.snap.events;
@@ -2713,11 +2731,31 @@ export class SessionStore {
         return next;
       }
     }
+    if (this.reorder && !this.grew && this.prepended.length > 0 && was.length > 0) {
+      const pre = this.prepended.filter((e) => this.byId.get(e.id) === e);
+      pre.sort((a, b) => a.seq - b.seq);
+      const firstSeq = was[0]?.seq ?? Infinity;
+      const lastPre = pre[pre.length - 1]?.seq ?? -Infinity;
+      if (pre.length > 0 && lastPre < firstSeq && pre.length + was.length === this.byId.size) {
+        const next = pre.concat(was);
+        for (const id of this.touched) {
+          const i = this.pos.get(id);
+          const e = this.byId.get(id);
+          if (i !== undefined && e) next[i + pre.length] = e;
+        }
+        this.reorder = false;
+        this.prepended = [];
+        this.touched.clear();
+        this.pos = new Map(next.map((e, i) => [e.id, i]));
+        return next;
+      }
+    }
     if (this.reorder || this.grew) {
       const next = [...this.byId.values()].sort((a, b) => a.seq - b.seq);
       this.reorder = false;
       this.grew = false;
       this.fresh = [];
+      this.prepended = [];
       this.touched.clear();
       const out = next.length === was.length && next.every((e, i) => e === was[i]) ? was : next;
       this.pos = new Map(out.map((e, i) => [e.id, i]));

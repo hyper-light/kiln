@@ -48,17 +48,38 @@ const columnsOf = (groups: readonly (readonly [Shown, number])[], rows: number) 
   return shown.reduce((s, [, n]) => s + Math.ceil(n / rows), 0) + Math.max(0, shown.length - 1) + (rows - 1) / 2;
 };
 
+/** Maximum dots painted on the Stands rule canvas so 10k sessions remain 60fps instead of drawing 180k grains/frame. */
+const MAX_RULE_DOTS = 600;
+
+/** Proportionally scale `groups` to fit within `limit` dots while keeping at least 1 dot per non-zero stand. */
+function scaleGroups(groups: readonly (readonly [Shown, number])[], limit: number): readonly (readonly [Shown, number])[] {
+  let total = 0;
+  let nonZero = 0;
+  for (const [, n] of groups) {
+    if (n > 0) {
+      total += n;
+      nonZero++;
+    }
+  }
+  if (total <= limit || nonZero === 0) return groups;
+  const budget = Math.max(nonZero, limit);
+  const scale = (budget - nonZero) / Math.max(1, total - nonZero);
+  return groups.map(([stand, n]) => [stand, n > 0 ? Math.max(1, Math.round(1 + (n - 1) * scale)) : 0] as const);
+}
+
 /** The dots of `groups` (each state and how many, in the order they read) across `w` points. */
 export function layout(groups: readonly (readonly [Shown, number])[], w: number): Layout {
+  const maxCols = Math.max(12, Math.floor((Math.max(w, 120) - 2 * MARGIN) / PITCH));
+  const scaled = scaleGroups(groups, Math.min(MAX_RULE_DOTS, maxCols * MOST_ROWS));
   let rows = LEAST_ROWS;
-  while (rows < MOST_ROWS && MARGIN * 2 + (columnsOf(groups, rows) - 1) * PITCH > w) rows += 2;
-  const columns = columnsOf(groups, rows);
+  while (rows < MOST_ROWS && MARGIN * 2 + (columnsOf(scaled, rows) - 1) * PITCH > w) rows += 2;
+  const columns = columnsOf(scaled, rows);
   const pitch = columns > 1 ? Math.min(MOST_PITCH, Math.max(PITCH, (w - 2 * MARGIN) / (columns - 1))) : PITCH;
   const mid = (rows - 1) / 2;
   const order = orderOf(rows);
   const slots: Slot[] = [];
   let at = 0;
-  for (const [stand, n] of groups) {
+  for (const [stand, n] of scaled) {
     if (n <= 0) continue;
     for (let i = 0; i < n; i++) {
       const col = Math.floor(i / rows);

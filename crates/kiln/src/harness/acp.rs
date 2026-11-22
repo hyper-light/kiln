@@ -1096,6 +1096,13 @@ impl Acp {
             self.next(core);
             return;
         }
+        // Apply pending control/mode/model/effort changes or account refreshes BEFORE launching
+        // an immediate prompt so system state changes are never starved behind messages.
+        if self.account_refresh(core) || self.next_change(core) {
+            core.state.queue.insert(0, m);
+            core.touch_state();
+            return;
+        }
         self.prompt(core, m);
     }
 

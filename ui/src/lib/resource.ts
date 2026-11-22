@@ -504,6 +504,21 @@ export function resourceData<T>(source: ResourceSource<T>): T | undefined {
   return e?.snap.has ? (e.snap.data as T) : undefined;
 }
 
+/**
+ * Subscribe to a resource without suspending or throwing: returns `undefined` while loading or failed,
+ * and starts loading if not yet present (avoiding per-row `<Suspense>` cascades in 10k-row lists).
+ */
+export function useResourceData<T>(source: ResourceSource<T>): T | undefined {
+  const e = entry(source.key, source.fetch as Fetcher<unknown>, source.opts ?? {});
+  const snap = useSyncExternalStore(
+    e.sub,
+    () => e.snap,
+    () => e.snap,
+  );
+  if (!snap.has && !snap.failed && !e.promise) void load(e);
+  return snap.has ? (snap.data as T) : undefined;
+}
+
 /** W21-R02: actual navigation owns a canonical read until it settles or is canceled. Shared/view reads survive. */
 export function acquireResource<T>(source: ResourceSource<T>, signal?: AbortSignal): Promise<T> {
   if (signal?.aborted) return Promise.reject(new DOMException("Navigation canceled", "AbortError"));

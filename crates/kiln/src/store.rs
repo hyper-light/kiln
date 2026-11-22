@@ -841,7 +841,7 @@ impl Reads {
 
     fn open(&self) -> anyhow::Result<Counted> {
         let c = Connection::open(&self.path).with_context(|| format!("open {}", self.path.display()))?;
-        c.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;")?;
+        c.execute_batch("PRAGMA query_only = ON; PRAGMA busy_timeout = 5000; PRAGMA temp_store = MEMORY;")?;
         self.opened.fetch_add(1, Ordering::Relaxed);
         c.set_prepared_statement_cache_capacity(READER_STATEMENTS);
         Ok(Counted::new(c, READER_STATEMENTS))
@@ -1424,6 +1424,8 @@ pub struct AgentRow {
 pub(crate) const SCHEMA: &str = r#"
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+PRAGMA checkpoint_fullfsync = ON;
+PRAGMA temp_store = MEMORY;
 PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 CREATE TABLE IF NOT EXISTS repos (
@@ -2209,17 +2211,26 @@ impl Store {
     /// A run's jobs; for a CI run, the legs of `attempt` (the current one when `None`, docs/ci.md
     /// W05-R17). v1's jobs have no job_id and no attempts.
     pub async fn jobs_at(&self, run_id: String, with_spec: bool, attempt: Option<i64>) -> anyhow::Result<Vec<Job>> {
+        self.read(move |c| jobs_at_on(c, &run_id, with_spec, attempt)).await
+    }
+
+    /// A run and its jobs read in one consistent read-pool snapshot (`reads::run`).
+    pub async fn run_with_jobs_at(&self, run_id: String, with_spec: bool, attempt: Option<i64>) -> anyhow::Result<Option<(Run, Vec<Job>)>> {
         self.read(move |c| {
-            let mut st = c.prepare(&format!("{JOB_SELECT} WHERE run_id = ?1 AND (job_id IS NULL OR run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1))) ORDER BY rowid"))?;
-            let mut jobs: Vec<Job> =
-                st.query_map(params![run_id, attempt], row_job)?.collect::<Result<Vec<_>, _>>()?;
-            for j in &mut jobs {
-                j.steps = steps_of(c, &j.id)?;
-                if !with_spec {
-                    j.spec = None;
-                }
-            }
-            Ok(jobs)
+            let Some(run) = c
+                .prepare_cached(
+                    "SELECT r.id, r.repo_id, p.name, r.number, r.pipeline, r.event, r.branch, r.sha,
+                            r.message, r.author, r.status, r.created_at, r.started_at, r.finished_at,
+                            r.error, r.concurrency_group
+                     FROM runs r JOIN repos p ON p.id = r.repo_id WHERE r.id = ?1",
+                )?
+                .query_row([&run_id], row_run)
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            let jobs = jobs_at_on(c, &run_id, with_spec, attempt)?;
+            Ok(Some((run, jobs)))
         })
         .await
     }
@@ -2323,14 +2334,10 @@ impl Store {
             return Ok(std::collections::HashSet::new());
         }
         self.read(move |c| {
-            let mut st = c.prepare("SELECT 1 FROM jobs WHERE id = ?1 AND job_id IS NOT NULL")?;
-            let mut out = std::collections::HashSet::new();
-            for id in ids {
-                if st.exists([&id])? {
-                    out.insert(id);
-                }
-            }
-            Ok(out)
+            let json = serde_json::to_string(&ids)?;
+            let mut st = c.prepare_cached("SELECT id FROM jobs WHERE id IN (SELECT value FROM json_each(?1)) AND job_id IS NOT NULL")?;
+            let rows = st.query_map([json], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<Result<_, _>>()?)
         })
         .await
     }
@@ -2561,18 +2568,34 @@ impl Store {
     /// Jobs of run `run_id` as Pause and Resume see them (docs/ci.md W26-R22), either engine's: each
     /// named, and what it is, `None` for one that isn't the run's.
     pub async fn pause_targets(&self, run_id: String, jobs: Vec<String>) -> anyhow::Result<Vec<(String, Option<PauseTarget>)>> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
         self.read(move |c| {
-            let mut st = c.prepare_cached("SELECT key, status, agent, paused_at, job_id IS NOT NULL FROM jobs WHERE id = ?1 AND run_id = ?2")?;
-            let mut out = Vec::with_capacity(jobs.len());
-            for id in jobs {
-                let t = st
-                    .query_row(params![id, run_id], |r| {
-                        Ok(PauseTarget { id: id.clone(), key: r.get(0)?, status: Status::parse(&r.get::<_, String>(1)?), agent: r.get::<_, Option<String>>(2)?.filter(|a| !a.is_empty() && a != "-"), paused_at: r.get(3)?, engine: r.get(4)? })
-                    })
-                    .optional()?;
-                out.push((id, t));
-            }
-            Ok(out)
+            let json = serde_json::to_string(&jobs)?;
+            let mut st = c.prepare_cached(
+                "SELECT id, key, status, agent, paused_at, job_id IS NOT NULL FROM jobs WHERE run_id = ?1 AND id IN (SELECT value FROM json_each(?2))",
+            )?;
+            let mut found: std::collections::HashMap<String, PauseTarget> = st
+                .query_map(params![run_id, json], |r| {
+                    let id: String = r.get(0)?;
+                    Ok((
+                        id.clone(),
+                        PauseTarget {
+                            id,
+                            key: r.get(1)?,
+                            status: Status::parse(&r.get::<_, String>(2)?),
+                            agent: r.get::<_, Option<String>>(3)?.filter(|a| !a.is_empty() && a != "-"),
+                            paused_at: r.get(4)?,
+                            engine: r.get(5)?,
+                        },
+                    ))
+                })?
+                .collect::<Result<_, _>>()?;
+            Ok(jobs.into_iter().map(|id| {
+                let t = found.remove(&id);
+                (id, t)
+            }).collect())
         })
         .await
     }
@@ -2803,8 +2826,8 @@ impl Store {
     /// The names machines' certificates carried before kiln knew them by their ids, each with its
     /// machine id (docs/machines.md, "One record a machine").
     pub async fn machine_names(&self) -> anyhow::Result<std::collections::HashMap<String, String>> {
-        self.call(|c| {
-            let mut st = c.prepare("SELECT name, machine_id FROM machine_names")?;
+        self.read(|c| {
+            let mut st = c.prepare_cached("SELECT name, machine_id FROM machine_names")?;
             let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
@@ -3144,6 +3167,54 @@ fn queued_on(c: &Connection, limit: u32) -> rusqlite::Result<Vec<Job>> {
          ORDER BY queued_at, rowid LIMIT +?1"
     ))?;
     st.query_map([limit], row_job)?.collect()
+}
+
+fn jobs_at_on(c: &Connection, run_id: &str, with_spec: bool, attempt: Option<i64>) -> anyhow::Result<Vec<Job>> {
+    let mut st = c.prepare_cached(&format!(
+        "{JOB_SELECT} WHERE run_id = ?1 AND (job_id IS NULL OR run_attempt = COALESCE(?2, (SELECT attempt FROM runs WHERE id = ?1))) ORDER BY rowid"
+    ))?;
+    let mut jobs: Vec<Job> = st.query_map(params![run_id, attempt], row_job)?.collect::<Result<Vec<_>, _>>()?;
+    if !jobs.is_empty() {
+        let mut by_job = steps_of_many(c, &jobs.iter().map(|j| j.id.as_str()).collect::<Vec<_>>())?;
+        for j in &mut jobs {
+            j.steps = by_job.remove(&j.id).unwrap_or_default();
+            if !with_spec {
+                j.spec = None;
+            }
+        }
+    }
+    Ok(jobs)
+}
+
+fn steps_of_many(c: &Connection, job_ids: &[&str]) -> anyhow::Result<std::collections::HashMap<String, Vec<Step>>> {
+    let mut out: std::collections::HashMap<String, Vec<Step>> = std::collections::HashMap::with_capacity(job_ids.len());
+    if job_ids.is_empty() {
+        return Ok(out);
+    }
+    let json = serde_json::to_string(job_ids)?;
+    let mut st = c.prepare_cached(
+        "SELECT job_id, idx, name, status, started_at, finished_at, exit_code, started_seq FROM steps
+         WHERE job_id IN (SELECT value FROM json_each(?1)) ORDER BY job_id, idx",
+    )?;
+    let rows = st.query_map([json], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Step {
+                idx: r.get(1)?,
+                name: r.get(2)?,
+                status: Status::parse(&r.get::<_, String>(3)?),
+                started_at: r.get(4)?,
+                finished_at: r.get(5)?,
+                exit_code: r.get(6)?,
+                seq: r.get(7)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (job_id, step) = row?;
+        out.entry(job_id).or_default().push(step);
+    }
+    Ok(out)
 }
 
 fn steps_of(c: &Connection, job_id: &str) -> rusqlite::Result<Vec<Step>> {

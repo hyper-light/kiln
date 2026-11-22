@@ -91,6 +91,10 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (family, key)
     );
     CREATE INDEX IF NOT EXISTS inbox_by_rev ON inbox (rev);",
+    // 6: scale indexes for 10k+ sessions: accelerate unended hydration (`closed_at IS NULL ORDER BY updated_at`)
+    // and ended keyset pagination (`closed_at IS NOT NULL ORDER BY closed_at, id`).
+    "CREATE INDEX IF NOT EXISTS sessions_closed_updated ON sessions (closed_at, updated_at);
+    CREATE INDEX IF NOT EXISTS sessions_closed_id ON sessions (closed_at, id);",
 ];
 
 // Each session's inbox and journal (migration 5): a row as it is now, a deleted one kept empty for the feed.

@@ -9,8 +9,8 @@
  * agents for the composer and for the machines' names) share one request.
  */
 
-/** An early answer is taken only this soon after the page opened (ms): later, it's read afresh. */
-const EARLY_MS = 10_000;
+/** An early answer is taken only this soon after the page opened (ms): later, it's read afresh (60s so slow 3G never discards completed early reads). */
+const EARLY_MS = 60_000;
 /** Taken, it's there for the other reads of the same render this long (ms). */
 const SHARED_MS = 1_000;
 

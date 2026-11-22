@@ -27,6 +27,9 @@ export interface AttentionClose {
 }
 export const sameOrder = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((id, i) => id === b[i]);
 
+/** Cap rendered exposure frames to the top visible window so 10k-session lists never POST 1+ MB or overflow localStorage. */
+const FRAME_CAP = 200;
+
 /** Only the learned rest can move. Needs, pins and other sections retain their actual slots. */
 export function displayedPair(pair: AttentionPair, shown: readonly string[], eligible: ReadonlySet<string>, automatic: boolean) {
   const selected = pair.arm === 0 ? pair.order_a : pair.order_b;
@@ -91,14 +94,22 @@ export class AttentionPresentation {
     }
     if (this.closed) return;
     if (this.controls !== input.controls || !input.allowed) this.invalid = true;
-    const projected = displayedPair(pair, input.shown, input.eligible, input.automatic);
+    const shown = input.shown.length > FRAME_CAP ? input.shown.slice(0, FRAME_CAP) : input.shown;
+    const scopedPair =
+      shown.length < input.shown.length
+        ? (() => {
+            const keep = new Set(shown);
+            return { ...pair, order_a: pair.order_a.filter((id) => keep.has(id)), order_b: pair.order_b.filter((id) => keep.has(id)) };
+          })()
+        : pair;
+    const projected = displayedPair(scopedPair, shown, input.eligible, input.automatic);
     if (!projected.consistent) this.invalid = true;
     this.body = {
       exposure: pair.key,
       context: input.context,
       order_a: projected.order_a,
       order_b: projected.order_b,
-      shown: [...input.shown],
+      shown: [...shown],
       model_order: projected.model_order && !this.invalid,
     };
   }

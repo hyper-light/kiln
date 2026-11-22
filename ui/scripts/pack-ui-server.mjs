@@ -31,8 +31,8 @@ import { brotliCompressSync, constants, inflateRawSync } from "node:zlib";
 const UI = join(dirname(fileURLToPath(import.meta.url)), "..");
 const VENDOR = join(UI, "..", "vendor", "bun");
 const OUT = join(UI, "dist", "embed");
-/** Brotli 9: 33 MB for Bun in 8 s; 11 saves 3 MB for two minutes more. */
-const QUALITY = 9;
+/** Brotli 11: saves ~3.4 MB in the carried kiln binary, cached per Bun version/hash under ~/.cache/kiln/bun. */
+const QUALITY = 11;
 
 const say = (m) => console.log(`pack-ui-server: ${m}`);
 
@@ -226,7 +226,7 @@ async function runtime(manifest, platform) {
     ...licenses(),
   );
   const key = sha256(Buffer.concat(files.flatMap((f) => [Buffer.from(f.path), Buffer.from(sha256(f.data))]))).slice(0, 16);
-  const cached = join(cacheDir(), manifest.version, `runtime-${platform}-${key}.br`);
+  const cached = join(cacheDir(), manifest.version, `runtime-${platform}-q${QUALITY}-${key}.br`);
   if (existsSync(cached)) return readFileSync(cached);
   say(`packing Bun ${manifest.version} for ${platform}`);
   const packed = brotli(tar(files));

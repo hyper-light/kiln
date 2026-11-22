@@ -1217,22 +1217,34 @@ where
     outbox.release_late(Instant::now());
     let mut sent_any = false;
     let mut dead = Vec::new();
-    for ((peer, lane), q) in &mut outbox.queues {
+    // Flush control & interactive terminal lanes ahead of bulk CI log/convo/file lanes so stops,
+    // interrupts, effort changes, and agent messages are never delayed behind noisy bulk traffic.
+    let mut keys: Vec<(PeerId, u32)> = outbox.queues.keys().copied().collect();
+    keys.sort_by_key(|(peer, lane)| {
+        let prio: u8 = match *lane {
+            crate::proto::LANE_CONTROL => 0,
+            crate::proto::LANE_TERM => 1,
+            _ => 2,
+        };
+        (prio, *lane, *peer)
+    });
+    for key @ (peer, lane) in keys {
+        let Some(q) = outbox.queues.get_mut(&key) else { continue };
         while let Some((kind, data)) = q.front() {
-            match ep.send_frame(*peer, *lane, *kind, data) {
+            match ep.send_frame(peer, lane, *kind, data) {
                 Ok(()) => {
                     q.pop_front();
                     sent_any = true;
                 }
                 Err(Refusal::LaneFull) => break,
                 Err(Refusal::NotConnected | Refusal::Closed) => {
-                    dead.push(*peer);
+                    dead.push(peer);
                     break;
                 }
                 Err(r) => {
                     tracing::warn!(peer, lane, refusal = %r, "frame refused; dropping");
                     q.pop_front();
-                    crate::metrics::net().dropped(*peer, *lane, "refused", 1);
+                    crate::metrics::net().dropped(peer, lane, "refused", 1);
                 }
             }
         }

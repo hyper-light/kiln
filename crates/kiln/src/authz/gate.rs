@@ -369,24 +369,48 @@ pub async fn user_may(hub: &Hub, id: &str, capability: &str, target: &Scope) -> 
     hub.store.read(move |c| Ok(user_rights(c, &id)?.is_some_and(|(_, r)| r.allows(&capability, &target)))).await.unwrap_or(false)
 }
 
+/// Cached authz state invalidated immediately whenever `users`, `tokens`, `grants` or `roles`
+/// commit a write (`Store::changes()`), plus per-token debounced `last_used_at` tracking.
+struct HasUsersCache {
+    store_ptr: usize,
+    rev: u64,
+    value: bool,
+}
+
+fn has_users_cache() -> &'static crate::rcu::Rcu<Option<HasUsersCache>> {
+    static C: std::sync::OnceLock<crate::rcu::Rcu<Option<HasUsersCache>>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
 /// Whether anyone but the owner can sign in here.
 pub async fn has_users(hub: &Hub) -> bool {
-    hub.store.read(|c| Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE disabled_at IS NULL)", [], |r| r.get::<_, bool>(0))?)).await.unwrap_or(true)
+    let store_ptr = std::ptr::from_ref(hub.store.changes()) as usize;
+    let rev = hub.store.changes().of(&["users"]);
+    if let Some(hit) = has_users_cache().load().as_ref().as_ref().filter(|c| c.store_ptr == store_ptr && c.rev == rev) {
+        return hit.value;
+    }
+    let val = hub
+        .store
+        .read(|c| Ok(c.prepare_cached("SELECT EXISTS(SELECT 1 FROM users WHERE disabled_at IS NULL)")?.query_row([], |r| r.get::<_, bool>(0))?))
+        .await
+        .unwrap_or(true);
+    has_users_cache().set(Some(HasUsersCache { store_ptr, rev, value: val }));
+    val
 }
 
 /// Custom roles, by name.
 fn custom_roles(c: &Connection) -> rusqlite::Result<HashMap<String, Vec<String>>> {
-    let mut st = c.prepare("SELECT name, capabilities FROM roles")?;
+    let mut st = c.prepare_cached("SELECT name, capabilities FROM roles")?;
     let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
     Ok(rows.filter_map(Result::ok).map(|(n, caps)| (n, serde_json::from_str(&caps).unwrap_or_default())).collect())
 }
 
 /// A live user's name and grants (`None`: no such user, or disabled).
 pub(super) fn user_rights(c: &Connection, id: &str) -> rusqlite::Result<Option<(String, Rights)>> {
-    let Some(name) = c.query_row("SELECT name FROM users WHERE id = ?1 AND disabled_at IS NULL", [id], |r| r.get::<_, String>(0)).optional()? else {
+    let Some(name) = c.prepare_cached("SELECT name FROM users WHERE id = ?1 AND disabled_at IS NULL")?.query_row([id], |r| r.get::<_, String>(0)).optional()? else {
         return Ok(None);
     };
-    let mut st = c.prepare("SELECT what, scope, deny FROM grants WHERE principal = ?1 ORDER BY id")?;
+    let mut st = c.prepare_cached("SELECT what, scope, deny FROM grants WHERE principal = ?1 ORDER BY id")?;
     let grants = st
         .query_map([format!("user:{id}")], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))?
         .filter_map(Result::ok)
@@ -404,21 +428,71 @@ pub(super) fn token_grants(scopes: &str) -> Vec<Grant> {
         .unwrap_or_default()
 }
 
+/// Verified PAT/agent token cache entry: invalidated immediately on any commit touching
+/// `tokens`, `users`, `grants`, or `roles`, and bounded by `expires_at`.
+#[derive(Clone)]
+struct CachedToken {
+    caller: Caller,
+    expires_at: Option<i64>,
+    last_used_recorded: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+#[derive(Default, Clone)]
+struct TokenCache {
+    store_ptr: usize,
+    rev: u64,
+    entries: HashMap<String, CachedToken>,
+}
+
+const TOKEN_CACHE_MAX: usize = 4096;
+const LAST_USED_DEBOUNCE_S: i64 = 60;
+
+fn token_cache() -> &'static crate::rcu::Rcu<TokenCache> {
+    static C: std::sync::OnceLock<crate::rcu::Rcu<TokenCache>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
 /// A personal access token's or an agent token's caller.
 async fn token(hub: &Hub, t: &str) -> Option<Caller> {
     let hash = crate::util::sha256_hex(t.as_bytes());
-    hub.store
-        .call(move |c| {
-            let now = crate::util::now_unix();
-            let row: Option<(String, String, String, Option<String>, String)> = c
-                .query_row(
-                    "SELECT id, kind, principal, on_behalf_of, scopes FROM tokens WHERE hash = ?1 AND kind IN ('pat', 'agent') AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)",
-                    params![hash, now],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-                )
+    let now = crate::util::now_unix();
+    let store_ptr = std::ptr::from_ref(hub.store.changes()) as usize;
+    let rev = hub.store.changes().of(&["tokens", "users", "grants", "roles"]);
+    if let Some(hit) = {
+        let guard = token_cache().load();
+        if guard.store_ptr == store_ptr && guard.rev == rev {
+            guard.entries.get(&hash).cloned()
+        } else {
+            None
+        }
+    } && hit.expires_at.is_none_or(|exp| exp > now)
+    {
+        let prev = hit.last_used_recorded.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(prev) >= LAST_USED_DEBOUNCE_S
+            && hit.last_used_recorded.compare_exchange(prev, now, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok()
+            && let Some(id) = hit.caller.token.clone()
+        {
+            let store = hub.store.clone();
+            drop(crate::rt::spawn(async move {
+                let _ = store.call(move |c| {
+                    c.prepare_cached("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1")?.execute(params![id, now])?;
+                    Ok(())
+                }).await;
+            }));
+        }
+        return Some(hit.caller);
+    }
+    let hash_q = hash.clone();
+    let loaded = hub
+        .store
+        .read(move |c| {
+            let row: Option<(String, String, String, Option<String>, String, Option<i64>)> = c
+                .prepare_cached(
+                    "SELECT id, kind, principal, on_behalf_of, scopes, expires_at FROM tokens WHERE hash = ?1 AND kind IN ('pat', 'agent') AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)",
+                )?
+                .query_row(params![hash_q, now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
                 .optional()?;
-            let Some((id, kind, principal, behalf, scopes)) = row else { return Ok(None) };
-            c.execute("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1", params![id, now])?;
+            let Some((id, kind, principal, behalf, scopes, expires_at)) = row else { return Ok(None) };
             let agent = kind == "agent";
             // Whom it acts for: a personal token's owner; the user an agent acts for.
             let whose = if agent { behalf.unwrap_or_default() } else { principal.clone() };
@@ -433,10 +507,40 @@ async fn token(hub: &Hub, t: &str) -> Option<Caller> {
             let limit = Rights { grants: token_grants(&scopes), custom: custom_roles(c)? };
             let short: String = id.chars().take(12).collect();
             let name = if agent { format!("{principal} for {who}") } else { format!("pat:{short} of {who}") };
-            Ok(Some(Caller { kind: if agent { Kind::Agent } else { Kind::Pat }, name, user, token: Some(id), agent: None, rights, limit: Some(limit), turn: None }))
+            Ok(Some((Caller { kind: if agent { Kind::Agent } else { Kind::Pat }, name, user, token: Some(id), agent: None, rights, limit: Some(limit), turn: None }, expires_at)))
         })
         .await
-        .unwrap_or_else(store_err)
+        .unwrap_or_else(|e| {
+            let _ = store_err(e);
+            None
+        })?;
+    let (caller, expires_at) = loaded;
+    // Record first-use `last_used_at` synchronously so immediate audits/tests observe it, then
+    // capture the post-write authz rev so subsequent requests hit the lockless RCU cache.
+    if let Some(id) = caller.token.clone() {
+        let _ = hub
+            .store
+            .call(move |c| {
+                c.prepare_cached("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1")?.execute(params![id, now])?;
+                Ok(())
+            })
+            .await;
+    }
+    let rev_after = hub.store.changes().of(&["tokens", "users", "grants", "roles"]);
+    let entry = CachedToken {
+        caller: caller.clone(),
+        expires_at,
+        last_used_recorded: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(now)),
+    };
+    token_cache().update(|cache| {
+        if cache.store_ptr != store_ptr || cache.rev != rev_after || cache.entries.len() >= TOKEN_CACHE_MAX {
+            cache.store_ptr = store_ptr;
+            cache.rev = rev_after;
+            cache.entries.clear();
+        }
+        cache.entries.insert(hash.clone(), entry.clone());
+    });
+    Some(caller)
 }
 
 /// A job token's caller: what its job's `permissions` give (W10-R04), in its repository.

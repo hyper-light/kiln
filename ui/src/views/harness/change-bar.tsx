@@ -13,7 +13,7 @@ import { useAction } from "@/lib/action";
 import { useRes } from "@/lib/data";
 import { changeState } from "./change-state";
 import { errorMessage } from "@/lib/hooks";
-import { invalidate } from "@/lib/resource";
+import { invalidate, useResourceData } from "@/lib/resource";
 
 /** Its page: kiln's own review for a change kiln hosts, else the host's. */
 export function ChangeLink({ c, children, className }: { c: Pick<AgentChange, "provider" | "change" | "url">; children: React.ReactNode; className?: string }) {
@@ -45,12 +45,36 @@ export class Quiet extends React.Component<{ children: React.ReactNode }, { fail
   }
 }
 
-function useChangeOf(agentId: string): AgentChange | undefined {
-  return useRes(changesRes).data.find((x) => x.agent === agentId);
+const EMPTY_CHANGES: ReadonlyMap<string, AgentChange> = new Map();
+const ChangesContext = React.createContext<ReadonlyMap<string, AgentChange> | null>(null);
+
+/**
+ * Provides an O(1) `agentId -> AgentChange` map for Mission Control rows without suspending
+ * (eliminates `2N` per-row `<Quiet><Suspense>` boundaries and O(N) scans at 10k rows).
+ */
+export function ChangesProvider({ children }: { children: React.ReactNode }) {
+  const list = useResourceData(changesRes);
+  const byAgent = React.useMemo(() => {
+    if (!list || list.length === 0) return EMPTY_CHANGES;
+    const map = new Map<string, AgentChange>();
+    for (let i = 0; i < list.length; i++) {
+      const c = list[i]!;
+      if (!map.has(c.agent)) map.set(c.agent, c);
+    }
+    return map;
+  }, [list]);
+  return <ChangesContext.Provider value={byAgent}>{children}</ChangesContext.Provider>;
 }
 
-/** In a row's narrow meta line: its name, and whether it landed; the rest when pointed at. */
-function RowChangeIn({ agentId }: { agentId: string }) {
+function useChangeOf(agentId: string): AgentChange | undefined {
+  const map = React.useContext(ChangesContext);
+  const fallback = useResourceData(changesRes);
+  if (map) return map.get(agentId);
+  return fallback?.find((x) => x.agent === agentId);
+}
+
+/** Mission Control's word on an agent's change request (C4): where it stands, linked. */
+export function RowChange({ agentId }: { agentId: string }) {
   const c = useChangeOf(agentId);
   if (!c) return null;
   return (
@@ -63,35 +87,14 @@ function RowChangeIn({ agentId }: { agentId: string }) {
   );
 }
 
-function RowReviewIn({ agentId }: { agentId: string }) {
+/** A finished agent's open change request, to review from its row (C4). */
+export function RowReview({ agentId }: { agentId: string }) {
   const c = useChangeOf(agentId);
   if (!c || c.state !== "open") return null;
   return (
     <ChangeLink c={c} className="ms-link">
       Review
     </ChangeLink>
-  );
-}
-
-/** Mission Control's word on an agent's change request (C4): where it stands, linked. */
-export function RowChange({ agentId }: { agentId: string }) {
-  return (
-    <Quiet>
-      <React.Suspense fallback={null}>
-        <RowChangeIn agentId={agentId} />
-      </React.Suspense>
-    </Quiet>
-  );
-}
-
-/** A finished agent's open change request, to review from its row (C4). */
-export function RowReview({ agentId }: { agentId: string }) {
-  return (
-    <Quiet>
-      <React.Suspense fallback={null}>
-        <RowReviewIn agentId={agentId} />
-      </React.Suspense>
-    </Quiet>
   );
 }
 

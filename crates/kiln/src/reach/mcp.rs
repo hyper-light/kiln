@@ -220,6 +220,7 @@ fn agent_tools_of(registry: &[Value], names: Option<&[String]>) -> Option<Vec<Va
 }
 
 /// The operation a tool is, by its name (`agents_start` is `agents.start`), among `tools`.
+#[cfg(test)]
 fn op_of(tools: &[Value], tool: &str) -> Option<String> {
     tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(tool)).and_then(|t| t.get("title")?.as_str().map(str::to_owned))
 }
@@ -589,6 +590,9 @@ struct Server {
     registry: Mutex<Option<Registry>>,
     /// The agent tools as the server last listed them: kept while it's out of reach.
     agent_tools: Mutex<Option<Vec<Value>>>,
+    /// Cached lookup tables (tool_name -> op_name for server ops, plus base tool names) refreshed
+    /// alongside `registry` so `has()` and `call()` stay O(1) without deep-cloning 100+ tool schemas.
+    tool_ops: Mutex<Option<(Instant, HashMap<String, String>)>>,
     /// What the agent was last given as the tools (`fingerprint`): when the server's change, it's
     /// told to ask again (`notifications/tools/list_changed`).
     listed: Mutex<Option<u64>>,
@@ -878,7 +882,44 @@ impl Server {
         if let Ok(mut g) = self.registry.lock() {
             *g = Some((Instant::now(), reg.clone(), why.clone(), tools.clone()));
         }
+        if let Ok(mut g) = self.tool_ops.lock() {
+            *g = None;
+        }
         (reg, why, tools)
+    }
+
+    /// Cached map of agent tool name -> operation name (refreshed within `REGISTRY_TTL`), avoiding
+    /// cloning all ~100 JSON tool schemas on every MCP `tools/call` (such as `agents_send`).
+    fn tool_op_map(&self) -> HashMap<String, String> {
+        if let Ok(g) = self.tool_ops.lock()
+            && let Some((at, map)) = g.as_ref()
+            && at.elapsed() < REGISTRY_TTL
+        {
+            return map.clone();
+        }
+        let mut map = HashMap::new();
+        if let Some(list) = self.tools().as_array() {
+            for t in list {
+                if let (Some(name), Some(op)) = (t.get("name").and_then(Value::as_str), t.get("title").and_then(Value::as_str)) {
+                    map.insert(name.to_owned(), op.to_owned());
+                }
+            }
+        }
+        if let Ok(mut g) = self.tool_ops.lock() {
+            *g = Some((Instant::now(), map.clone()));
+        }
+        map
+    }
+
+    /// Fast lookup of a single agent tool's operation name without cloning the map.
+    fn lookup_op(&self, tool: &str) -> Option<String> {
+        if let Ok(g) = self.tool_ops.lock()
+            && let Some((at, map)) = g.as_ref()
+            && at.elapsed() < REGISTRY_TTL
+        {
+            return map.get(tool).cloned();
+        }
+        self.tool_op_map().get(tool).cloned()
     }
 
     /// The tools to offer: this server's own, then kiln's operations an agent has as tools, as
@@ -905,7 +946,10 @@ impl Server {
 
     /// Whether it offers a tool `name` (`tools`).
     fn has(&self, name: &str) -> bool {
-        self.tools().as_array().is_some_and(|t| t.iter().any(|t| t.get("name").and_then(Value::as_str) == Some(name)))
+        if matches!(name, "code_run" | "code_search" | "runners" | "run" | "output" | "stop" | "preview_page" | "show_page" | "show_live" | "use_live") {
+            return true;
+        }
+        self.lookup_op(name).is_some()
     }
 
     fn call(self: &Arc<Self>, name: &str, args: &Value) -> Value {
@@ -986,7 +1030,7 @@ impl Server {
                 text_result(&v, failed)
             }
             // kiln's agents, goals and plans operations, asked of the server for this session.
-            other => match op_of(self.tools().as_array().map_or(&[][..], Vec::as_slice), other) {
+            other => match self.lookup_op(other) {
                 Some(op) => match self.ask(json!({"op": "call", "name": op, "input": args})) {
                     Ok(a) => match a.get("ok") {
                         Some(v) => text_result(v, false),
@@ -1129,7 +1173,7 @@ fn rpc_ok(id: Value, result: Value) -> Value {
 /// placement (docs/ci.md W05-R03).
 #[cfg(all(test, unix))]
 pub(super) fn tools_on(sock: &std::path::Path, session: &str) -> impl Fn(&str, &Value) -> Value + Send + Sync + 'static {
-    let server = Arc::new(Server { link: Link::Socket(sock.to_path_buf()), prefer: None, cwd: String::new(), session: session.to_owned(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
+    let server = Arc::new(Server { link: Link::Socket(sock.to_path_buf()), prefer: None, cwd: String::new(), session: session.to_owned(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), tool_ops: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
     move |name: &str, args: &Value| server.call(name, args)
 }
 
@@ -1177,7 +1221,7 @@ pub fn serve_lane(here: super::local::Here, cwd: String, input: &mut impl BufRea
 fn serve_over(link: Link, prefer: Option<String>, cwd: String, session: String, input: &mut impl BufRead, output: Box<dyn std::io::Write + Send>) -> anyhow::Result<()> {
     let lane = link.is_lane();
     let machines = machines(&link);
-    let server = Arc::new(Server { link, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
+    let server = Arc::new(Server { link, prefer, cwd, session, runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), tool_ops: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
     let out: Out = Arc::new(Mutex::new(output));
     // The tools the server offers change (a deploy): the agent is told to ask for them again,
     // once it has asked for them at all, until its stream ends.
@@ -1736,7 +1780,7 @@ mod tests {
     /// notification isn't answered.
     #[test]
     fn what_the_agent_sends_is_read_as_json_rpc_says() {
-        let server = Arc::new(Server { link: Link::Socket("/nonexistent/kiln-reach.sock".into()), prefer: None, cwd: String::new(), session: String::new(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
+        let server = Arc::new(Server { link: Link::Socket("/nonexistent/kiln-reach.sock".into()), prefer: None, cwd: String::new(), session: String::new(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), tool_ops: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() });
         let ask = |line: &str| {
             let body = crate::mcp::rpc::body(line.as_bytes());
             let answers = body.messages.into_iter().filter_map(|m| answer(&server, "", m, None)).collect();
@@ -1890,7 +1934,7 @@ mod tests {
     /// A server of its own on `sock`, for session `session` (none: it tells the kiln server
     /// nothing).
     fn server_on(sock: &str, session: &str) -> Arc<Server> {
-        Arc::new(Server { link: Link::Socket(sock.into()), prefer: None, cwd: String::new(), session: session.into(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() })
+        Arc::new(Server { link: Link::Socket(sock.into()), prefer: None, cwd: String::new(), session: session.into(), runs: Arc::default(), next: Mutex::new(0), registry: Mutex::new(None), agent_tools: Mutex::new(None), tool_ops: Mutex::new(None), listed: Mutex::new(None), noting: Default::default() })
     }
 
     /// Each of its own tools and of `kiln.machines.*`, with the schema it publishes: the tool's

@@ -980,10 +980,19 @@ fn load_with(c: &rusqlite::Connection, ctx: &RepoCtx, sha: &str, first_row: i64)
             ))
         })?
         .collect::<Result<_, _>>()?;
-    let mut at = c.prepare("SELECT status, conclusion, failure_class FROM ci_attempts WHERE leg_id = ?1 ORDER BY number")?;
-    for (id, mut leg) in legs {
-        leg.attempts = at.query_map([&id], |r| Ok(AttemptRec { status: r.get(0)?, conclusion: r.get(1)?, class: r.get(2)? }))?.collect::<Result<_, _>>()?;
-        rec.legs.push(leg);
+    if !legs.is_empty() {
+        let ids: Vec<&str> = legs.iter().map(|(id, _)| id.as_str()).collect();
+        let json = serde_json::to_string(&ids)?;
+        let mut at = c.prepare_cached("SELECT leg_id, status, conclusion, failure_class FROM ci_attempts WHERE leg_id IN (SELECT value FROM json_each(?1)) ORDER BY leg_id, number")?;
+        let mut by_leg: HashMap<String, Vec<AttemptRec>> = HashMap::new();
+        for row in at.query_map([json], |r| Ok((r.get::<_, String>(0)?, AttemptRec { status: r.get(1)?, conclusion: r.get(2)?, class: r.get(3)? })))? {
+            let (leg_id, attempt) = row?;
+            by_leg.entry(leg_id).or_default().push(attempt);
+        }
+        for (id, mut leg) in legs {
+            leg.attempts = by_leg.remove(&id).unwrap_or_default();
+            rec.legs.push(leg);
+        }
     }
 
     let mut st = c.prepare("SELECT i.digest FROM ci_images i JOIN runs r ON r.id = i.run_id WHERE r.repo_id = ?1 AND r.sha = ?2 ORDER BY i.id")?;
@@ -1683,22 +1692,27 @@ pub async fn list_in(store: &crate::store::Store, q: &HashMap<String, String>, o
     let repo = q.get("repo").filter(|v| !v.is_empty()).cloned();
     let f = Facets::from_query(q);
     let recs = store
-        .call(move |c| {
+        .read(move |c| {
             let (kind, host) = facet_sql();
             // `LIMIT +?3`: SQLite plans by a bare `?3` there, preparing this statement again each call (the DB query
             // audit, 2026-11-06: 376 us a page of the list, 162).
-            let mut st = c.prepare(&format!(
+            let mut st = c.prepare_cached(&format!(
                 "SELECT p.name, o.item, o.seq FROM ship_order o JOIN repos p ON p.id = o.repo_id
                  WHERE (?1 IS NULL OR p.name = ?1 OR p.id = ?1) AND (?4 IS NULL OR p.name IN (SELECT value FROM json_each(?4)))
                    AND o.seq < ?2 AND {IS_ITEM}
                    AND (?5 IS NULL OR {kind} = ?5) AND (?6 IS NULL OR {host} = ?6) AND (?7 = 0 OR {kind} <> 'commit')
                  ORDER BY o.seq DESC LIMIT +?3",
             ))?;
-            let keys: Vec<(String, String)> = st.query_map(params![repo, cursor, limit + 1, only, f.kind, f.host, f.review], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
-            let mut out = Vec::new();
-            for (repo, sha) in keys {
-                if let Some(rec) = load(c, &repo, &sha, &deploys)? {
-                    out.push(rec);
+            let keys: Vec<(String, String, i64)> = st.query_map(params![repo, cursor, limit + 1, only, f.kind, f.host, f.review], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<Result<_, _>>()?;
+            let mut ctxs: HashMap<String, Option<RepoCtx>> = HashMap::new();
+            let mut out = Vec::with_capacity(keys.len());
+            for (repo, sha, seq) in keys {
+                if !ctxs.contains_key(&repo) {
+                    let loaded = repo_ctx(c, &repo, &deploys)?;
+                    ctxs.insert(repo.clone(), loaded);
+                }
+                if let Some(Some(ctx)) = ctxs.get(&repo) {
+                    out.push(load_with(c, ctx, &sha, seq)?);
                 }
             }
             Ok(out)
@@ -1762,7 +1776,7 @@ fn page_body(page: &[(i64, &str)], next: Option<i64>) -> String {
 /// One commit of a repository, with the records its stand came from.
 pub async fn get_in(store: &crate::store::Store, repo: &str, sha: &str, viewer: Option<&HashSet<String>>, runners: Vec<RunnerSeen>, deploys: &[CdDeploy], now: i64) -> Result<Value, Fail> {
     let (repo, sha, deploys) = (repo.to_owned(), sha.to_owned(), deploys.to_vec());
-    let rec = store.call(move |c| load(c, &repo, &sha, &deploys)).await.map_err(internal)?;
+    let rec = store.read(move |c| load(c, &repo, &sha, &deploys)).await.map_err(internal)?;
     rec.map(|r| detail(&r, &runners, now, viewer)).ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))
 }
 
@@ -2046,21 +2060,24 @@ impl ShipCache {
             let tracked = h.repos.values().flat_map(|r| r.rows.iter().filter(|(_, row)| row.tracked.get().is_some()).map(|(s, _)| (r.ctx.id.clone(), s.clone()))).collect();
             (waiting, tracked)
         };
-        let read = store
-            .call(move |c| -> anyhow::Result<Read> {
-                // One snapshot: the seq read and every record loaded agree.
-                let tx = c.savepoint()?;
-                let top: i64 = tx.query_row("SELECT n FROM ship_seq", [], |r| r.get(0))?;
+        let (read, had_changes) = store
+            .read(move |c| -> anyhow::Result<(Read, bool)> {
+                // `store.read` already runs inside a single read transaction snapshot: `top` and
+                // every record loaded agree without blocking the writer thread.
+                let top: i64 = c.prepare_cached("SELECT n FROM ship_seq")?.query_row([], |r| r.get(0))?;
                 let mut want: HashMap<String, (bool, std::collections::HashSet<String>)> = HashMap::new();
+                let mut had_changes = false;
                 if !built {
-                    let mut st = tx.prepare("SELECT id FROM repos")?;
+                    let mut st = c.prepare_cached("SELECT id FROM repos")?;
                     for id in st.query_map([], |r| r.get::<_, String>(0))? {
                         want.insert(id?, (true, Default::default()));
                     }
+                    had_changes = top > 0;
                 } else {
-                    let mut st = tx.prepare("SELECT repo_id, item FROM ship_changes WHERE seq > ?1 AND seq <= ?2")?;
+                    let mut st = c.prepare_cached("SELECT repo_id, item FROM ship_changes WHERE seq > ?1 AND seq <= ?2")?;
                     for row in st.query_map(params![seq, top], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
                         let (repo, sha) = row?;
+                        had_changes = true;
                         let e = want.entry(repo).or_default();
                         if sha.is_empty() {
                             e.0 = true;
@@ -2071,7 +2088,7 @@ impl ShipCache {
                 }
                 let mut read = Read { top, loaded: Vec::new(), gone_repos: Vec::new() };
                 for (repo, (mut all, mut shas)) in want {
-                    let Some(ctx) = repo_ctx(&tx, &repo, &deploys)? else {
+                    let Some(ctx) = repo_ctx(c, &repo, &deploys)? else {
                         read.gone_repos.push(repo);
                         continue;
                     };
@@ -2083,19 +2100,25 @@ impl ShipCache {
                     let newest: std::collections::HashSet<&str> = ctx.commits.iter().take(cap).map(|(s, _, _)| s.as_str()).collect();
                     let mut recs = Vec::new();
                     for (sha, first_row, _) in ctx.commits.iter().take(cap).filter(|(s, _, _)| all || shas.contains(s)) {
-                        recs.push(load_with(&tx, &ctx, sha, *first_row)?);
+                        recs.push(load_with(c, &ctx, sha, *first_row)?);
                     }
                     // A commit noted but no longer among the newest held (or gone): dropped.
                     let drop: Vec<String> = shas.into_iter().filter(|s| !newest.contains(s.as_str())).collect();
                     read.loaded.push((ctx, recs, all, drop));
                 }
-                tx.commit()?;
-                // What this read has seen may go: a row changed since has a later seq and stays.
-                c.execute("DELETE FROM ship_changes WHERE seq <= ?1", [top])?;
-                Ok(read)
+                Ok((read, had_changes))
             })
             .await
             .map_err(internal)?;
+        if had_changes {
+            let prune_top = read.top;
+            let _ = store
+                .call(move |c| {
+                    c.prepare_cached("DELETE FROM ship_changes WHERE seq <= ?1")?.execute([prune_top])?;
+                    Ok(())
+                })
+                .await;
+        }
         // Each loaded commit's row drawn on the compute pool, before the model's lock is taken (a
         // render and its JSON each): every page that reads the model waits on its write lock, on
         // every shard, and the drawing on the request's shard held up every request on it.
@@ -2512,8 +2535,8 @@ async fn principals(hub: &Hub, c: &crate::authz::Caller) -> HashSet<String> {
     if let Some(user) = c.user.clone() {
         let linked: Vec<String> = hub
             .store
-            .call(move |db| {
-                let mut q = db.prepare("SELECT provider, login FROM user_identities WHERE user_id = ?1")?;
+            .read(move |db| {
+                let mut q = db.prepare_cached("SELECT provider, login FROM user_identities WHERE user_id = ?1")?;
                 let rows = q.query_map([&user], |r| Ok(format!("{}:{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
                 Ok(rows.collect::<Result<Vec<_>, _>>()?)
             })
@@ -2590,7 +2613,7 @@ async fn jobs_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body:
         return Err((StatusCode::BAD_REQUEST, "name the `jobs`, or a `scope`: failed, running, waiting or all".to_string()));
     }
     let (r, s, deploys) = (repo.clone(), sha.clone(), cd_deploys());
-    let rec = hub.store.call(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let rec = hub.store.read(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
     let mut out: Vec<Value> = Vec::new();
     // The jobs it's for, by run, in the commit's order.
     let picked: Vec<&LegRec> = match (named.filter(|n| !n.is_empty()), scope.as_deref()) {
@@ -2662,7 +2685,7 @@ async fn ready_in(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body
         return Err((StatusCode::BAD_REQUEST, "`repo` and `sha`: the draft to mark ready".to_string()));
     };
     let (r, s, deploys) = (repo.clone(), sha.clone(), cd_deploys());
-    let rec = hub.store.call(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let rec = hub.store.read(move |c| load(c, &r, &s, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
     let j = journey_of(&rec, &runners_seen(hub).await, crate::util::now_ms());
     let draft = j.review.as_ref().is_some_and(|r| r.superseded_by.is_none() && r.state == ReviewState::Draft);
     let Some(ch) = rec.change.as_ref().filter(|_| draft) else {
@@ -2762,7 +2785,7 @@ async fn handing(hub: &std::sync::Arc<Hub>, caller: &crate::authz::Caller, body:
         return Err((StatusCode::FORBIDDEN, format!("handing off needs `runs.rerun` on {repo}")));
     }
     let deploys = cd_deploys();
-    let rec = hub.store.call(move |c| load(c, &repo, &sha, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
+    let rec = hub.store.read(move |c| load(c, &repo, &sha, &deploys)).await.map_err(internal)?.ok_or_else(|| (StatusCode::NOT_FOUND, "no such commit".to_string()))?;
     let j = journey_of(&rec, &runners_seen(hub).await, crate::util::now_ms());
     // Its maker's agent, from the one place Ship reads it (made_by: Chain of Ownership fills it in time).
     let author = made_by(&rec).agent;

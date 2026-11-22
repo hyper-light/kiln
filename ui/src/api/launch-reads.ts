@@ -15,6 +15,9 @@ export const AGENTS_READ = "/api/agents?lean=1";
 
 /**
  * The agents kiln runs, each without what a list of them doesn't read (where it started, and its last words when it has
- * some: api/last-words.ts), written as columns (`?lean=1`, docs/agents.md). Every page reads them, so the document asks.
+ * some: api/last-words.ts), written as columns (`?lean=1`, docs/agents.md). Asked on Mission Control.
  */
 export const SESSIONS_READ = "/api/harness/sessions?lean=1";
+
+/** Only the agents currently needing shell-level attention cards (approvals, held goals, error stops, usage limits). */
+export const WAITING_READ = "/api/harness/waiting";

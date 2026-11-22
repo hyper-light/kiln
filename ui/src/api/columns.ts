@@ -33,8 +33,22 @@ export function isColumns(read: unknown): read is Columns {
   return typeof c === "object" && c !== null && !Array.isArray(c) && typeof c.rows === "number" && Array.isArray(c.cols);
 }
 
-/** A value said once for several rows, as each row's own: an object or a list is copied, so no two rows share one. */
-const own = (value: unknown): unknown => (typeof value === "object" && value !== null ? structuredClone(value) : value);
+/** Fast pure-JS deep clone for JSON values (avoids 50k+ C++ `structuredClone` crossings at 10k rows). */
+function own(value: unknown): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return [];
+    const out = new Array<unknown>(value.length);
+    for (let i = 0; i < value.length; i++) out[i] = own(value[i]);
+    return out;
+  }
+  const src = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const k in src) {
+    if (Object.hasOwn(src, k)) out[k] = own(src[k]);
+  }
+  return out;
+}
 
 /** A column's `n` values, in its rows' order. */
 function values(column: Column, n: number): unknown[] {

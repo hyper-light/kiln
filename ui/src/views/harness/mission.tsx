@@ -13,7 +13,18 @@ import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { ArrowUpRight, Pin, ChevronDown, ChevronRight, ChevronUp, GitFork, ListChecks, X } from "lucide-react";
 import { api } from "@/api/client";
 import { harnessApi, type AgentInfo, type ApprovalBrief } from "@/api/harness";
-import { commandAgents, useAttention, useParkTime, type AttentionCommand, type AttentionMark, type AttentionSettings, type AttentionSnapshot, type AttentionUrgency } from "@/api/attention";
+import {
+  commandAgents,
+  preloadAttention,
+  useAttention,
+  useParkTime,
+  type AttentionCommand,
+  type AttentionMark,
+  type AttentionSettings,
+  type AttentionSnapshot,
+  type AttentionUrgency,
+} from "@/api/attention";
+import { changesRes } from "@/api/changes";
 import { ownAgentAction } from "@/lib/own-agent-action";
 import { ArchiveAsk, CopyAsk, ParkAsk, UndoLine } from "./attention-controls";
 import { attentionRows, isParked, organizedLocally, untilWords, urgencyWords } from "./attention-state";
@@ -57,7 +68,7 @@ import { agentsAnswered, answer, heldKey, resumeHeld, tried, tryKey, useAnswered
 import { PushOffer } from "./push-offer";
 import { isMarked, markNotices, useMarks } from "./notices";
 import { swipeAway, swipeRow } from "./swipe-away";
-import { RowChange, RowReview } from "./change-bar";
+import { ChangesProvider, RowChange, RowReview } from "./change-bar";
 import { Shimmer } from "./signals";
 import { subagentsAtWork, throughSubagents } from "./tasks";
 import { Stands } from "./stands";
@@ -789,6 +800,8 @@ function OverTheRows() {
 export default function Mission() {
   // All of it asked for at once: each read would otherwise wait for the one before it.
   preloadAgents();
+  preloadAttention(undefined, firstRows());
+  ask(changesRes);
   ask(machinesRes);
   ask(agentfileChoicesRes);
   ask(agentenvChoicesRes);
@@ -805,7 +818,9 @@ export default function Mission() {
       <Loadable label="Loading agents" fallback={<PageLoading />}>
         <OverTheRows />
         <StandsNow />
-        <Agents />
+        <ChangesProvider>
+          <Agents />
+        </ChangesProvider>
       </Loadable>
     </div>
   );
@@ -864,30 +879,18 @@ const goneKey = (machine: string, since: number) => `machine-gone:${machine}:${M
  * elsewhere from kiln's copy of their conversations, each on the machine that suits it, or all on
  * one. A machine only restarting doesn't show here.
  */
-function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
-  const runners = useAgentsLive().data;
+/** Only subscribes to the 1s clock while at least one offline machine exists, avoiding 10k-row scans every second. */
+function OfflineRecover({ offline, runners }: { offline: ReadonlyMap<string, number>; runners: ReturnType<typeof useAgentsLive>["data"] }) {
   const nowS = useNow() / 1000;
   const marks = useMarks();
-  const offline = new Map<string, number>();
-  for (const { a, stand } of rows) {
-    if (stand !== "offline" || a.target === "local") continue;
-    const m = machineName(a.target);
-    offline.set(m, (offline.get(m) ?? 0) + 1);
-  }
   const gone = [...offline].flatMap(([machine, count]) => {
     const r = runners.find((x) => x.name === machine);
     return r && !r.connected && nowS - r.last_seen > GONE_AFTER_S && !isMarked(marks, goneKey(machine, r.last_seen)) ? [{ machine, count, since: r.last_seen }] : [];
   });
+  if (gone.length === 0) return null;
   const others = runners.filter((r) => r.connected && !r.ephemeral && !r.outpost).map((r) => r.name);
-  // A machine on battery that is low: its agents stop when it sleeps.
-  const agentsOn = (m: string) => {
-    const n = rows.filter(({ a, stand }) => stand !== "ended" && a.target !== "local" && machineName(a.target) === m).length;
-    return n > 0 ? `its ${n} agent${n === 1 ? "" : "s"}` : "";
-  };
-  if (gone.length === 0) return <LowBattery agents={runners} what={agentsOn} />;
   return (
     <>
-      <LowBattery agents={runners} what={agentsOn} />
       {gone.map((g) => (
         <RecoverMachine key={g.machine} {...g} others={others} />
       ))}
@@ -895,9 +898,40 @@ function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
   );
 }
 
+function Recover({ rows }: { rows: { a: AgentInfo; stand: Stand }[] }) {
+  const runners = useAgentsLive().data;
+  const { offline, liveByMachine } = React.useMemo(() => {
+    const off = new Map<string, number>();
+    const live = new Map<string, number>();
+    for (let i = 0; i < rows.length; i++) {
+      const { a, stand } = rows[i]!;
+      if (a.target === "local") continue;
+      const m = machineName(a.target);
+      if (stand === "offline") off.set(m, (off.get(m) ?? 0) + 1);
+      if (stand !== "ended") live.set(m, (live.get(m) ?? 0) + 1);
+    }
+    return { offline: off, liveByMachine: live };
+  }, [rows]);
+  // A machine on battery that is low: its agents stop when it sleeps.
+  const agentsOn = React.useCallback(
+    (m: string) => {
+      const n = liveByMachine.get(m) ?? 0;
+      return n > 0 ? `its ${n} agent${n === 1 ? "" : "s"}` : "";
+    },
+    [liveByMachine],
+  );
+  return (
+    <>
+      <LowBattery agents={runners} what={agentsOn} />
+      {offline.size > 0 && <OfflineRecover offline={offline} runners={runners} />}
+    </>
+  );
+}
+
 /** The ended agents cleared: gone from the list at once (W21-R15); any the server kept are back once it's read again, with why on each (`failed`). */
 function clearEnded(ids: string[], reload: () => void, failed: (id: string, why: string) => void) {
-  setData<AgentInfo[]>("harness/agents", (l) => l.filter((a) => !ids.includes(a.id)));
+  const drop = new Set(ids);
+  setData<AgentInfo[]>("harness/agents", (l) => l.filter((a) => !drop.has(a.id)));
   void Promise.allSettled(ids.map((id) => harnessApi.stop(id))).then((done) => {
     done.forEach((d, i) => {
       const id = ids[i];
@@ -1255,7 +1289,7 @@ function Agents() {
       ),
     };
   });
-  const archivedIds = new Set(archived.map((r) => r.a.id));
+  const archivedIds = React.useMemo(() => new Set(archived.map((r) => r.a.id)), [archived]);
   // A swipe left offers to park it, in a line under the row (a phone's own way to Park until…).
   touch.now.s = {
     isSelected: (id) => selected.has(id),
@@ -1271,16 +1305,35 @@ function Agents() {
     const here = new Set(shownIds.split(","));
     if (![...selected].every((id) => here.has(id))) setSelected(new Set([...selected].filter((id) => here.has(id))));
   }
-  const checked = selectable.filter((r) => selected.has(r.a.id));
+  const checked = React.useMemo(() => (selected.size === 0 ? [] : selectable.filter((r) => selected.has(r.a.id))), [selectable, selected]);
   // In the order they were picked: the composer's To line and the bulk bar add each one picked at the
   // end, and nothing picked before it moves (the list's own order changes as they work).
-  const shownById = new Map(checked.map((r) => [r.a.id, r.a]));
-  const picked = [...selected].flatMap((id) => {
-    const a = shownById.get(id);
-    return a ? [a] : [];
-  });
-  const liveSelectable = live.filter((r) => r.stand !== "archived");
-  const liveChecked = liveSelectable.filter((r) => selected.has(r.a.id)).length;
+  const picked = React.useMemo(() => {
+    if (selected.size === 0) return [];
+    const shownById = new Map(checked.map((r) => [r.a.id, r.a]));
+    return [...selected].flatMap((id) => {
+      const a = shownById.get(id);
+      return a ? [a] : [];
+    });
+  }, [checked, selected]);
+  const liveSelectable = React.useMemo(() => live.filter((r) => r.stand !== "archived"), [live]);
+  const liveChecked = React.useMemo(() => {
+    if (selected.size === 0) return 0;
+    let n = 0;
+    for (let i = 0; i < liveSelectable.length; i++) if (selected.has(liveSelectable[i]!.a.id)) n++;
+    return n;
+  }, [liveSelectable, selected]);
+  const toggleAllLive = React.useCallback(
+    (on: boolean) => {
+      if (on) {
+        setSelected((s) => new Set([...s, ...liveSelectable.map((r) => r.a.id)]));
+      } else {
+        const liveIds = new Set(liveSelectable.map((r) => r.a.id));
+        setSelected((s) => new Set([...s].filter((id) => !liveIds.has(id))));
+      }
+    },
+    [liveSelectable],
+  );
   const some = liveChecked > 0 && liveChecked < liveSelectable.length;
   const allBox = React.useCallback(
     (el: HTMLInputElement | null) => {
@@ -1535,18 +1588,26 @@ function Agents() {
   const everyone = React.useMemo(() => list.map((a) => ({ a })), [list]);
   const sectioned = view.sort === "priority" || view.sort === "yours";
   // Each list's lines: its rows, the Pinned section's head and end, the Undo where a row was, and each open tree under its row.
-  const entries = withTrees(withUndo(entriesOf(live, sectioned), undoShown, "live"), trees);
-  const parkedEntries = withTrees(
-    withUndo(
-      parked.map((row) => ({ key: `row:${row.a.id}`, row })),
-      undoShown,
-      "parked",
-    ),
-    trees,
+  const entries = React.useMemo(() => withTrees(withUndo(entriesOf(live, sectioned), undoShown, "live"), trees), [live, sectioned, undoShown, trees]);
+  const parkedEntries = React.useMemo(
+    () =>
+      withTrees(
+        withUndo(
+          parked.map((row) => ({ key: `row:${row.a.id}`, row })),
+          undoShown,
+          "parked",
+        ),
+        trees,
+      ),
+    [parked, undoShown, trees],
   );
-  const endedEntries = withTrees(
-    ended.map((row) => ({ key: `row:${row.a.id}`, row })),
-    trees,
+  const endedEntries = React.useMemo(
+    () =>
+      withTrees(
+        ended.map((row) => ({ key: `row:${row.a.id}`, row })),
+        trees,
+      ),
+    [ended, trees],
   );
   const liveShown = everyRow.length > 0 && (live.length > 0 || undoShown?.list === "live");
   const parkedShown = showParked && (parked.length > 0 || undoShown?.list === "parked");
@@ -1607,9 +1668,7 @@ function Agents() {
                   aria-hidden={selecting ? undefined : true}
                   disabled={!selecting || liveSelectable.length === 0}
                   checked={liveSelectable.length > 0 && liveChecked === liveSelectable.length}
-                  onChange={(e) =>
-                    setSelected(e.target.checked ? new Set([...selected, ...liveSelectable.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !liveSelectable.some((r) => r.a.id === id))))
-                  }
+                  onChange={(e) => toggleAllLive(e.target.checked)}
                   aria-label={filtered ? `Select the ${liveSelectable.length} agents shown` : `Select all ${liveSelectable.length} agents`}
                 />
                 <span className="ms-count" aria-live="polite">
@@ -1626,9 +1685,7 @@ function Agents() {
                   className="check"
                   disabled={liveSelectable.length === 0}
                   checked={liveSelectable.length > 0 && liveChecked === liveSelectable.length}
-                  onChange={(e) =>
-                    setSelected(e.target.checked ? new Set([...selected, ...liveSelectable.map((r) => r.a.id)]) : new Set([...selected].filter((id) => !liveSelectable.some((r) => r.a.id === id))))
-                  }
+                  onChange={(e) => toggleAllLive(e.target.checked)}
                   aria-label={filtered ? `Select the ${liveSelectable.length} agents shown` : `Select all ${liveSelectable.length} agents`}
                 />
                 <span key={checked.length > 0 ? "picked" : "all"} className="ms-swap">

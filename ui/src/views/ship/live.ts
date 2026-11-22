@@ -185,7 +185,7 @@ export function applyShipDetail(data: ShipDetail, ev: ServerEvent): ShipDetail |
 
 /** A commit's detail resource's options, one for every section that reads it (they share its key). */
 export const DETAIL_OPTS = {
-  pollMs: 15_000,
+  pollMs: 120_000,
   get on() {
     return shipOn();
   },
@@ -194,7 +194,7 @@ export const DETAIL_OPTS = {
 
 /** A page's options for query `q`. */
 export const pageOpts = (q: ShipQuery) => ({
-  pollMs: 15_000,
+  pollMs: 120_000,
   get on() {
     return shipOn();
   },

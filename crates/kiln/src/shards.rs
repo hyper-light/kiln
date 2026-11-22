@@ -23,6 +23,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+#[cfg(test)]
 use sha2::{Digest as _, Sha256};
 
 use crate::os::macsign::{self, Signer};
@@ -30,6 +31,7 @@ use crate::os::macsign::{self, Signer};
 const SHARDS: &[u8] = include_bytes!(env!("KILN_SHARDS_BIN"));
 const VM: &[u8] = include_bytes!(env!("KILN_SHARDS_VM"));
 const NET: &[u8] = include_bytes!(env!("KILN_SHARDS_NET"));
+const CARRIED_HASH: &str = env!("KILN_SHARDS_HASH");
 
 /// Shards' entitlements, as its build signs its VM and network processes with them (its
 /// `resources/vm.entitlements` and `net.entitlements`).
@@ -41,20 +43,22 @@ const READY: &str = ".ready";
 /// The lock file of the folders' root, and of each folder.
 const LOCK: &str = "lock";
 
-/// One executable carried: its name (the platform's suffix added), its bytes, and the entitlements it is
-/// signed with on a Mac.
+/// One executable carried: its name (the platform's suffix added), its bytes (brotli-compressed
+/// when carried in the binary), and the entitlements it is signed with on a Mac.
 #[derive(Clone, Copy)]
 struct Carried {
     name: &'static str,
     bytes: &'static [u8],
     entitlements: Option<&'static [u8]>,
+    compressed: bool,
 }
 
 fn carried_binaries() -> [Carried; 3] {
+    let compressed = !cfg!(kiln_lint);
     [
-        Carried { name: "shards", bytes: SHARDS, entitlements: None },
-        Carried { name: "shards-vm", bytes: VM, entitlements: Some(VM_ENTITLEMENTS) },
-        Carried { name: "shards-net", bytes: NET, entitlements: Some(NET_ENTITLEMENTS) },
+        Carried { name: "shards", bytes: SHARDS, entitlements: None, compressed },
+        Carried { name: "shards-vm", bytes: VM, entitlements: Some(VM_ENTITLEMENTS), compressed },
+        Carried { name: "shards-net", bytes: NET, entitlements: Some(NET_ENTITLEMENTS), compressed },
     ]
 }
 
@@ -74,13 +78,19 @@ pub struct Held {
 
 /// The carried Shards, written out under `base` if it isn't there yet, and held while the answer is kept.
 pub fn write_out(base: &Path) -> anyhow::Result<Held> {
-    write_out_of(base, &carried_binaries(), &macsign::signer())
+    write_out_with_hash(base, &carried_binaries(), CARRIED_HASH, &macsign::signer())
 }
 
+#[cfg(test)]
 fn write_out_of(base: &Path, carried: &[Carried], signer: &Signer) -> anyhow::Result<Held> {
+    let hash = hash_of(carried);
+    write_out_with_hash(base, carried, &hash, signer)
+}
+
+fn write_out_with_hash(base: &Path, carried: &[Carried], hash: &str, signer: &Signer) -> anyhow::Result<Held> {
     let root = base.join("shards");
     private_dir(&root)?;
-    let id = format!("{}{}", hash_of(carried), signer.tag());
+    let id = format!("{hash}{}", signer.tag());
     let dir = root.join(&id);
     // Writing and holding take the root's lock shared, a collection takes it alone: no folder is
     // collected between being placed and being held.
@@ -104,13 +114,23 @@ fn write_out_of(base: &Path, carried: &[Carried], signer: &Signer) -> anyhow::Re
     Ok(held)
 }
 
-/// What's carried, named: the SHA-256 of each executable's length and bytes, its first 12 hex digits, as Shards
-/// names its own helpers' folder by theirs (its `helpers.rs`, D182) and moby its IDs (`stringid.TruncateID`).
+/// What's carried, named: the SHA-256 of each executable's uncompressed length and bytes, its first
+/// 12 hex digits, as Shards names its own helpers' folder by theirs (its `helpers.rs`, D182) and
+/// moby its IDs (`stringid.TruncateID`).
+#[cfg(test)]
 fn hash_of(carried: &[Carried]) -> String {
     let mut h = Sha256::new();
     for c in carried {
-        h.update((c.bytes.len() as u64).to_le_bytes());
-        h.update(c.bytes);
+        if c.compressed {
+            let mut raw = Vec::new();
+            let mut from = c.bytes;
+            let _ = brotli::BrotliDecompress(&mut from, &mut raw);
+            h.update((raw.len() as u64).to_le_bytes());
+            h.update(&raw);
+        } else {
+            h.update((c.bytes.len() as u64).to_le_bytes());
+            h.update(c.bytes);
+        }
     }
     h.finalize().iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
@@ -152,7 +172,14 @@ fn fill(tmp: &Path, id: &str, carried: &[Carried], signer: &Signer) -> anyhow::R
     for c in carried {
         let path = tmp.join(format!("{}{}", c.name, std::env::consts::EXE_SUFFIX));
         let mut file = executable(&path).with_context(|| path.display().to_string())?;
-        file.write_all(c.bytes)?;
+        if c.compressed {
+            let mut dec = brotli::Decompressor::new(c.bytes, 64 * 1024);
+            let mut out = std::io::BufWriter::with_capacity(64 * 1024, &mut file);
+            std::io::copy(&mut dec, &mut out).with_context(|| format!("decompressing carried {}", c.name))?;
+            out.flush()?;
+        } else {
+            file.write_all(c.bytes)?;
+        }
         file.sync_all()?;
         drop(file);
         if *signer == Signer::NotNeeded {
@@ -250,9 +277,9 @@ mod tests {
     fn fake(bytes: [&'static [u8]; 3]) -> [Carried; 3] {
         let [s, v, n] = bytes;
         [
-            Carried { name: "shards", bytes: s, entitlements: None },
-            Carried { name: "shards-vm", bytes: v, entitlements: Some(VM_ENTITLEMENTS) },
-            Carried { name: "shards-net", bytes: n, entitlements: Some(NET_ENTITLEMENTS) },
+            Carried { name: "shards", bytes: s, entitlements: None, compressed: false },
+            Carried { name: "shards-vm", bytes: v, entitlements: Some(VM_ENTITLEMENTS), compressed: false },
+            Carried { name: "shards-net", bytes: n, entitlements: Some(NET_ENTITLEMENTS), compressed: false },
         ]
     }
 
@@ -329,5 +356,31 @@ mod tests {
         assert_eq!(format!("{id}{}", Signer::AdHoc.tag()), format!("{id}-a"));
         assert_eq!(Signer::Kiln("2B69812442C0B2F687D4E3A7457F270114BB36D6".into()).tag(), "-k2b69812442c0b2f687d4e3a7457f270114bb36d6");
         assert_ne!(hash_of(&fake([b"s", b"v", b"n2"])), id);
+    }
+
+    #[test]
+    fn carried_brotli_roundtrips_and_matches_uncompressed_hash() -> anyhow::Result<()> {
+        let raw_s: &'static [u8] = Box::leak(b"#!/bin/sh\necho shards\n".repeat(128).into_boxed_slice());
+        let raw_v: &'static [u8] = Box::leak(b"#!/bin/sh\necho vm\n".repeat(128).into_boxed_slice());
+        let raw_n: &'static [u8] = Box::leak(b"#!/bin/sh\necho net\n".repeat(128).into_boxed_slice());
+        let br_s: &'static [u8] = Box::leak(crate::ui_pack::brotli(raw_s).unwrap_or_default().into_boxed_slice());
+        let br_v: &'static [u8] = Box::leak(crate::ui_pack::brotli(raw_v).unwrap_or_default().into_boxed_slice());
+        let br_n: &'static [u8] = Box::leak(crate::ui_pack::brotli(raw_n).unwrap_or_default().into_boxed_slice());
+        let raw = fake([raw_s, raw_v, raw_n]);
+        let packed = [
+            Carried { name: "shards", bytes: br_s, entitlements: None, compressed: true },
+            Carried { name: "shards-vm", bytes: br_v, entitlements: Some(VM_ENTITLEMENTS), compressed: true },
+            Carried { name: "shards-net", bytes: br_n, entitlements: Some(NET_ENTITLEMENTS), compressed: true },
+        ];
+        assert_eq!(hash_of(&packed), hash_of(&raw));
+        let base = tempfile::tempdir()?;
+        let held = write_out_of(base.path(), &packed, &unsigned())?;
+        assert_eq!(fs::read(&held.shards)?, raw_s);
+        assert_eq!(fs::read(&held.vm)?, raw_v);
+        assert_eq!(fs::read(&held.net)?, raw_n);
+        if !cfg!(kiln_lint) {
+            assert_eq!(CARRIED_HASH, hash_of(&carried_binaries()));
+        }
+        Ok(())
     }
 }

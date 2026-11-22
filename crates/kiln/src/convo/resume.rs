@@ -23,7 +23,7 @@ fn lines_of(store: &Store, session: &str, source: &str) -> anyhow::Result<Vec<St
     let mut out = Vec::new();
     loop {
         let from = out.len() as u64;
-        let page = store.record(session, source, from, PAGE)?;
+        let page = store.record_committed(session, source, from, PAGE)?;
         let n = page.len();
         for (i, (num, line)) in page.into_iter().enumerate() {
             // Numbered from 0 without gaps: a gap is a line the store never got.
@@ -45,7 +45,7 @@ fn sent_ids(store: &Store, session: &str) -> anyhow::Result<Vec<String>> {
     let most = usize::try_from(crate::harness::inbox::KEEP).unwrap_or(usize::MAX);
     let (mut ids, mut before, mut looked) = (Vec::new(), None, 0usize);
     while ids.len() < most && looked < IDS_LOOK_MAX {
-        let page = store.events(session, before, IDS_PAGE)?;
+        let page = store.events_committed(session, before, IDS_PAGE)?;
         let Some(first) = page.first() else { break };
         before = Some(first.seq);
         looked = looked.saturating_add(page.len());
@@ -95,7 +95,7 @@ fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str
         }
         Protocol::CodexAppServer => {
             let mut files = Vec::new();
-            for m in store.marks(session)? {
+            for m in store.marks_committed(session)? {
                 files.push(lines_of(store, session, &m.source)?);
             }
             let conv = crate::harness::handoff::codex_of_lines(&files, own).ok_or_else(|| anyhow::anyhow!("the server has no copy of Codex's record of this thread (its machine never sent it)"))?;
@@ -116,7 +116,10 @@ pub fn package(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&
 /// [`package`], `in_place` when it goes on on the machine it was on (a crashed session resumed
 /// there): natively, from its harness's own record there ([`Carry::Native`]).
 pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&str, &str), in_place: bool) -> anyhow::Result<Package> {
-    let kept = store.kept(id, MAX_EVENTS)?.ok_or_else(|| anyhow::anyhow!("the server's store has nothing of this session"))?;
+    // Ensure queued writes are committed once, then run all large transcript/event reads on the
+    // concurrent `TursoRead` thread so resuming a huge conversation never stalls the writer.
+    store.sync()?;
+    let kept = store.kept_committed(id, MAX_EVENTS)?.ok_or_else(|| anyhow::anyhow!("the server's store has nothing of this session"))?;
     let info: Info = kept.info.as_deref().and_then(|j| serde_json::from_str(j).ok()).ok_or_else(|| anyhow::anyhow!("the server's store doesn't say what this session is"))?;
     let state: State = kept.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
     anyhow::ensure!(

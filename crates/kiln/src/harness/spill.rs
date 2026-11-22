@@ -73,21 +73,22 @@ impl Dir {
         Ok(Arc::new(Self { path: path.to_owned(), next: AtomicU64::new(0) }))
     }
 
-    /// A new file for session `id`'s spilled segments.
+    /// A new file for session `id`'s spilled segments. Closed immediately after creation so 10,000+
+    /// spilled sessions consume 0 persistent file descriptors (`EMFILE`-proof).
     fn create(&self, id: &str) -> io::Result<Arc<File>> {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let hash = id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
         let path = self.path.join(format!("{hash:016x}-{n}.seg"));
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
-        Ok(Arc::new(File { path, file, end: AtomicU64::new(0), live: AtomicU64::new(0) }))
+        let _created = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+        Ok(Arc::new(File { path, end: AtomicU64::new(0), live: AtomicU64::new(0) }))
     }
 }
 
-/// One copy's spill file: segments written one after another, each where its [`Spilled`] says. Removed
-/// once nothing refers to it.
+/// One copy's spill file: segments written one after another, each where its [`Spilled`] says.
+/// Opened on demand for reads/writes so 10k+ sessions hold zero persistent FDs. Removed once
+/// nothing refers to it.
 pub struct File {
     path: PathBuf,
-    file: std::fs::File,
     /// Where the next write goes: what's been reserved of it.
     end: AtomicU64,
     /// The bytes of its segments still referred to.
@@ -215,9 +216,11 @@ impl Spilled {
         #[cfg(test)]
         READ_BACK.with(|n| n.set(n.get().wrapping_add(1)));
         let mut buf = vec![0u8; p.bytes];
-        let read = read_at(&p.file.file, &mut buf, p.at).and_then(|()| {
-            if crc32fast::hash(&buf) == p.sum { Ok(()) } else { Err(io::Error::new(io::ErrorKind::InvalidData, "a spilled segment didn't read back as written")) }
-        });
+        let read = std::fs::File::open(&p.file.path)
+            .and_then(|f| read_at(&f, &mut buf, p.at))
+            .and_then(|()| {
+                if crc32fast::hash(&buf) == p.sum { Ok(()) } else { Err(io::Error::new(io::ErrorKind::InvalidData, "a spilled segment didn't read back as written")) }
+            });
         if let Err(e) = read {
             READ_FAILURES.fetch_add(1, Ordering::Relaxed);
             return Err(e);
@@ -237,12 +240,13 @@ pub fn write(dir: &Dir, file: Option<Arc<File>>, id: &str, segments: &[Arc<Segme
             Some(f) => f,
             None => dir.create(id)?,
         };
+        let handle = std::fs::OpenOptions::new().write(true).open(&file.path)?;
         let mut placed = Vec::with_capacity(segments.len());
         for s in segments {
             let n = u64::try_from(s.deflated.len()).map_err(|_| io::Error::other("a segment past a file's size"))?;
             let at = file.end.fetch_add(n, Ordering::Relaxed);
             FILE_BYTES.fetch_add(s.deflated.len(), Ordering::Relaxed);
-            write_at(&file.file, &s.deflated, at)?;
+            write_at(&handle, &s.deflated, at)?;
             placed.push((at, crc32fast::hash(&s.deflated), s));
         }
         let spilled = placed

@@ -325,6 +325,9 @@ impl Turso {
         for q in sql::REV_MAX {
             rev = rev.max(t.one_int(q, &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0));
         }
+        if schema >= 5 {
+            rev = rev.max(t.one_int("SELECT MAX(rev) FROM inbox", &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0));
+        }
         t.rev = rev;
         // Where compressing the lines kept before lines were compressed is (a store that never
         // started: from its newest line down).
@@ -397,7 +400,8 @@ impl Turso {
                     // Its new writer, from here on: said before its rows (it may be new here).
                     t.rev += 1;
                     let r = t.rev;
-                    t.run(&mut w.session, &[txt(session), Value::Null, Value::Null, Value::Null, Value::Null, int(now), seq(c.epoch), seq(r)], |_| Ok(()))?;
+                    let stmt = Writes::get(&mut w.session, t, sql::SESSION_UPSERT)?;
+                    t.run(stmt, &[txt(session), Value::Null, Value::Null, Value::Null, Value::Null, int(now), seq(c.epoch), seq(r)], |_| Ok(()))?;
                     epochs.insert(session.to_owned(), c.epoch);
                 }
                 t.rev += 1;
@@ -480,7 +484,11 @@ impl Turso {
         });
         match done {
             Ok(v) => {
-                self.exec("COMMIT")?;
+                if let Err(e) = self.exec("COMMIT") {
+                    let _ = self.exec("ROLLBACK");
+                    self.rev = before;
+                    return Err(e);
+                }
                 Ok(v)
             }
             Err(e) => {
@@ -833,6 +841,42 @@ impl Link<'_> {
         }
         Ok((found, if more { last } else { None }))
     }
+
+    /// [`Engine::marks`], on this connection.
+    fn marks(&self, session: &str) -> anyhow::Result<Vec<Mark>> {
+        let mut sources = self.prepare(sql::RECORD_SOURCES)?;
+        let mut last: Vec<(String, u64)> = Vec::new();
+        self.run(&mut sources, &[txt(session)], |r| {
+            if let Ok(src) = r.get::<String>(0) {
+                last.push((src, u(r, 1)));
+            }
+            Ok(())
+        })?;
+        let mut line = self.prepare(sql::RECORD_LINE)?;
+        let mut out = Vec::new();
+        for (source, n) in last {
+            let mut found = None;
+            self.run(&mut line, &[txt(session), txt(&source), seq(n)], |r| {
+                found = Some((u(r, 0), unsqueeze(r.get_value(1))?));
+                Ok(())
+            })?;
+            if let Some((end, l)) = found {
+                out.push(Mark { source, n, end, line: l });
+            }
+        }
+        Ok(out)
+    }
+
+    /// [`Engine::record`], on this connection.
+    fn record(&self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        let mut stmt = self.prepare(sql::RECORD_LINES)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[txt(session), txt(source), seq(from), int(i64::try_from(limit).unwrap_or(i64::MAX))], |r| {
+            out.push((u(r, 0), unsqueeze(r.get_value(1))?));
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 /// A reader of a Turso store's file beside its writer ([`Read`]; plan 01a1cc09, step 2): a connection of its own to the
@@ -872,6 +916,18 @@ impl Read for TursoRead {
     fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
         self.link().restorable(session, last)
     }
+
+    fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
+        self.link().search_some(q, from, rows, want)
+    }
+
+    fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>> {
+        self.link().marks(session)
+    }
+
+    fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        self.link().record(session, source, from, limit)
+    }
 }
 
 /// An event row as `sql::EVENTS_*` select it.
@@ -893,19 +949,30 @@ fn event_of(r: &TRow) -> anyhow::Result<EventRow> {
     })
 }
 
-/// The statements a transaction writes with, prepared once for it.
+/// The statements a transaction writes with, lazily prepared on first use so a batch touching one
+/// table prepares 1 statement instead of all 10.
+#[derive(Default)]
 struct Writes {
-    /// Prepared as an inbox row is first written: a store at a schema from before the inbox has no table for it.
     inbox: Option<Statement>,
-    session: Statement,
-    machine: Statement,
-    open: Statement,
-    close: Statement,
-    event: Statement,
-    reset: Statement,
-    dropped: Statement,
-    record: Statement,
-    records_reset: Statement,
+    session: Option<Statement>,
+    machine: Option<Statement>,
+    open: Option<Statement>,
+    close: Option<Statement>,
+    event: Option<Statement>,
+    reset: Option<Statement>,
+    dropped: Option<Statement>,
+    record: Option<Statement>,
+    records_reset: Option<Statement>,
+    copied_drop: Option<Statement>,
+}
+
+impl Writes {
+    fn get<'a>(slot: &'a mut Option<Statement>, t: &Turso, sql: &str) -> anyhow::Result<&'a mut Statement> {
+        if slot.is_none() {
+            *slot = Some(t.prepare(sql)?);
+        }
+        slot.as_mut().ok_or_else(|| anyhow::anyhow!("prepared statement missing"))
+    }
 }
 
 fn txt(s: &str) -> Value {
@@ -971,18 +1038,7 @@ fn unsqueeze(v: &Value) -> anyhow::Result<String> {
 
 impl Turso {
     fn writes(&self) -> anyhow::Result<Writes> {
-        Ok(Writes {
-            inbox: None,
-            session: self.prepare(sql::SESSION_UPSERT)?,
-            machine: self.prepare(sql::SESSION_MACHINE)?,
-            open: self.prepare(sql::SESSION_OPEN)?,
-            close: self.prepare(sql::SESSION_CLOSE)?,
-            event: self.prepare(sql::EVENT_UPSERT)?,
-            reset: self.prepare(sql::EVENTS_RESET)?,
-            dropped: self.prepare(sql::DROP_ADD)?,
-            record: self.prepare(sql::RECORD_UPSERT)?,
-            records_reset: self.prepare(sql::RECORDS_RESET)?,
-        })
+        Ok(Writes::default())
     }
 
     /// One row, as write number `rev`: whether it wrote anything. An event or a record line that
@@ -993,24 +1049,27 @@ impl Turso {
         // While a copy restores this store, what else writes a session it brought (its own
         // machine's feed, come back) takes it over: the copy's later rows of it are left out.
         if self.copying && !self.filling {
-            let mut gone = self.prepare(sql::COPIED_DROP)?;
-            self.run(&mut gone, &[txt(row.session())], none)?;
+            let gone = Writes::get(&mut w.copied_drop, self, sql::COPIED_DROP)?;
+            self.run(gone, &[txt(row.session())], none)?;
         }
         match row {
             Row::Session { session, info, meta, state, changes, epoch, open, at } => {
+                let stmt = Writes::get(&mut w.session, self, sql::SESSION_UPSERT)?;
                 self.run(
-                    &mut w.session,
+                    stmt,
                     &[txt(session), text(info.as_deref()), text(meta.as_deref()), text(state.as_deref()), text(changes.as_deref()), int(*at), seq(epoch.unwrap_or(0)), r],
                     none,
                 )?;
                 if *open {
-                    self.run(&mut w.open, &[txt(session)], none)?;
+                    let open_st = Writes::get(&mut w.open, self, sql::SESSION_OPEN)?;
+                    self.run(open_st, &[txt(session)], none)?;
                     self.touch(session);
                 }
             }
             Row::Event(e) => {
+                let stmt = Writes::get(&mut w.event, self, sql::EVENT_UPSERT)?;
                 self.run(
-                    &mut w.event,
+                    stmt,
                     &[
                         txt(&e.session),
                         txt(&e.id),
@@ -1028,24 +1087,33 @@ impl Turso {
                     ],
                     none,
                 )?;
-                return Ok(w.event.n_change() > 0);
+                return Ok(stmt.n_change() > 0);
             }
             Row::Reset { session, from, at } => {
-                self.run(&mut w.reset, &[txt(session), seq(from.unwrap_or(0))], none)?;
-                self.run(&mut w.dropped, &[r, txt(session), txt("events"), Value::Null, from.map_or(Value::Null, seq), int(*at)], none)?;
+                let reset_st = Writes::get(&mut w.reset, self, sql::EVENTS_RESET)?;
+                self.run(reset_st, &[txt(session), seq(from.unwrap_or(0))], none)?;
+                let drop_st = Writes::get(&mut w.dropped, self, sql::DROP_ADD)?;
+                self.run(drop_st, &[r, txt(session), txt("events"), Value::Null, from.map_or(Value::Null, seq), int(*at)], none)?;
             }
-            Row::Closed { session, at } => self.run(&mut w.close, &[txt(session), int(*at), r], none)?,
+            Row::Closed { session, at } => {
+                let close_st = Writes::get(&mut w.close, self, sql::SESSION_CLOSE)?;
+                self.run(close_st, &[txt(session), int(*at), r], none)?;
+            }
             Row::Record(rec) => {
-                self.run(&mut w.record, &[txt(&rec.session), txt(&rec.source), seq(rec.n), seq(rec.end), record_value(rec)?, r], none)?;
-                return Ok(w.record.n_change() > 0);
+                let rec_st = Writes::get(&mut w.record, self, sql::RECORD_UPSERT)?;
+                self.run(rec_st, &[txt(&rec.session), txt(&rec.source), seq(rec.n), seq(rec.end), record_value(rec)?, r], none)?;
+                return Ok(rec_st.n_change() > 0);
             }
             Row::RecordReset { session, source, at } => {
-                self.run(&mut w.records_reset, &[txt(session), txt(source)], none)?;
-                self.run(&mut w.dropped, &[r, txt(session), txt("record"), txt(source), Value::Null, int(*at)], none)?;
+                let rr_st = Writes::get(&mut w.records_reset, self, sql::RECORDS_RESET)?;
+                self.run(rr_st, &[txt(session), txt(source)], none)?;
+                let drop_st = Writes::get(&mut w.dropped, self, sql::DROP_ADD)?;
+                self.run(drop_st, &[r, txt(session), txt("record"), txt(source), Value::Null, int(*at)], none)?;
             }
             // Where it runs isn't a write of its own: it goes with the session's row.
             Row::Machine { session, machine } => {
-                self.run(&mut w.machine, &[txt(session), txt(machine)], none)?;
+                let mach_st = Writes::get(&mut w.machine, self, sql::SESSION_MACHINE)?;
+                self.run(mach_st, &[txt(session), txt(machine)], none)?;
                 self.touch(session);
             }
             // A row of its inbox and journal as its store has it now; a deleted one kept deleted, fed on as one.
@@ -1054,10 +1122,7 @@ impl Turso {
                     Some(v) => bytes(v)?,
                     None => Value::Null,
                 };
-                if w.inbox.is_none() {
-                    w.inbox = Some(self.prepare(sql::INBOX_PUT)?);
-                }
-                let Some(put) = w.inbox.as_mut() else { return Ok(false) };
+                let put = Writes::get(&mut w.inbox, self, sql::INBOX_PUT)?;
                 self.run(put, &[txt(&i.family), bytes(&i.key)?, txt(&i.session), value, r], none)?;
             }
         }
@@ -1409,6 +1474,11 @@ impl Turso {
             }
             sync_file(&part)?;
             std::fs::rename(&part, beside(&self.path, ".compact"))?;
+            if let Some(dir) = self.path.parent()
+                && let Ok(d) = std::fs::File::open(dir)
+            {
+                let _ = d.sync_all();
+            }
             Ok(())
         });
         let placed_at = held.elapsed();
@@ -1650,37 +1720,11 @@ impl Engine for Turso {
     }
 
     fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>> {
-        let mut sources = self.prepare(sql::RECORD_SOURCES)?;
-        let mut last: Vec<(String, u64)> = Vec::new();
-        self.run(&mut sources, &[txt(session)], |r| {
-            if let Ok(src) = r.get::<String>(0) {
-                last.push((src, u(r, 1)));
-            }
-            Ok(())
-        })?;
-        let mut line = self.prepare(sql::RECORD_LINE)?;
-        let mut out = Vec::new();
-        for (source, n) in last {
-            let mut found = None;
-            self.run(&mut line, &[txt(session), txt(&source), seq(n)], |r| {
-                found = Some((u(r, 0), unsqueeze(r.get_value(1))?));
-                Ok(())
-            })?;
-            if let Some((end, l)) = found {
-                out.push(Mark { source, n, end, line: l });
-            }
-        }
-        Ok(out)
+        self.link().marks(session)
     }
 
     fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
-        let mut stmt = self.prepare(sql::RECORD_LINES)?;
-        let mut out = Vec::new();
-        self.run(&mut stmt, &[txt(session), txt(source), seq(from), int(i64::try_from(limit).unwrap_or(i64::MAX))], |r| {
-            out.push((u(r, 0), unsqueeze(r.get_value(1))?));
-            Ok(())
-        })?;
-        Ok(out)
+        self.link().record(session, source, from, limit)
     }
 
     fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool> {
@@ -1751,6 +1795,10 @@ impl Engine for Turso {
             return Ok(ns.len());
         }
         Ok(0)
+    }
+
+    fn compact_ready(&self) -> bool {
+        self.compaction.as_ref().is_some_and(|c| matches!(c.counted, Counted::Yes) && c.copier.busy() == 0)
     }
 
     fn compact_some(mut self: Box<Self>, min_free: u64, step_bytes: usize) -> anyhow::Result<(Box<dyn Engine>, Compacting)> {

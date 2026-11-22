@@ -12,7 +12,7 @@
  */
 import type { AgentInfo } from "@/api/harness";
 import { useAuth } from "@/lib/auth";
-import { harnessSessionsRes } from "@/lib/data";
+import { harnessSessionsRes, harnessWaitingRes } from "@/lib/data";
 import { resourceData, watch } from "@/lib/resource";
 import { atLimit, notable, stoppedItself } from "./cards";
 
@@ -57,9 +57,19 @@ function mayRead(): boolean {
   return !can || can["agents.run"] === "server";
 }
 
-/** The cards as the list of agents now says them: only an agent whose entry is another than it was is looked at again. */
+/** Mission Control already reads `harnessSessionsRes`, so share that one list there; other pages read compact `harnessWaitingRes`. */
+function source() {
+  if (resourceData(harnessSessionsRes) !== undefined) return harnessSessionsRes;
+  if (typeof location !== "undefined") {
+    const p = location.pathname.replace(/^\/\.kiln-peer\/[^/]+/, "").replace(/\/+$/, "") || "/";
+    if (p === "/agents") return harnessSessionsRes;
+  }
+  return harnessWaitingRes;
+}
+
+/** The cards as the active source (waiting list on non-MC pages, full list on MC) now says them. */
 function sync() {
-  const list = mayRead() ? (resourceData(harnessSessionsRes) ?? []) : [];
+  const list = mayRead() ? (resourceData(harnessSessionsRes) ?? resourceData(harnessWaitingRes) ?? []) : [];
   const gone = new Set(agents.keys());
   let any = false;
   for (const a of list) {
@@ -79,7 +89,8 @@ function start() {
   let off = () => {};
   const follow = () => {
     off();
-    off = mayRead() ? watch(harnessSessionsRes.key, harnessSessionsRes.fetch, harnessSessionsRes.opts ?? {}, sync) : () => {};
+    const res = source();
+    off = mayRead() ? watch(res.key, res.fetch, res.opts ?? {}, sync) : () => {};
     sync();
   };
   follow();

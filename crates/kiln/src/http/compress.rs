@@ -116,6 +116,31 @@ impl Coding {
             }
         }
     }
+
+    /// Encodes `parts` directly into a compressed buffer without joining them into a contiguous copy first.
+    pub fn encode_pieces(self, parts: &[Bytes]) -> io::Result<Vec<u8>> {
+        let total: usize = parts.iter().map(Bytes::len).sum();
+        match self {
+            Coding::Gzip => {
+                let mut enc = flate2::write::GzEncoder::new(Vec::with_capacity(total / 4), flate2::Compression::new(GZIP_LEVEL));
+                for p in parts {
+                    enc.write_all(p)?;
+                }
+                enc.finish()
+            }
+            Coding::Br => {
+                let mut out = Vec::with_capacity(total / 4);
+                {
+                    let mut w = brotli::CompressorWriter::new(&mut out, 4096, BROTLI_QUALITY, brotli_window(total));
+                    for p in parts {
+                        w.write_all(p)?;
+                    }
+                    w.flush()?;
+                }
+                Ok(out)
+            }
+        }
+    }
 }
 
 /// RFC 9110 §12.5.3, across every field line. Explicit identity preference and refusal

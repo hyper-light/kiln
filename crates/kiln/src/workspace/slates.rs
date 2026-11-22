@@ -267,9 +267,10 @@ pub type Facts = kiln_ci::facts::Workspaces;
 pub use kiln_ci::facts::WorkspaceMissing;
 
 /// The Slates kiln links: the revision of it vendor/MANIFEST.toml takes, which vendor/slates holds
-/// (docs/vendoring.md).
+/// (docs/vendoring.md). Parsed once and memoized.
 fn linked() -> Option<String> {
-    linked_in(include_str!("../../../../vendor/MANIFEST.toml"))
+    static LINKED: OnceLock<Option<String>> = OnceLock::new();
+    LINKED.get_or_init(|| linked_in(include_str!("../../../../vendor/MANIFEST.toml"))).clone()
 }
 
 /// The Slates revision a vendor manifest's `[projects.slates]` names.
@@ -279,24 +280,33 @@ fn linked_in(manifest: &str) -> Option<String> {
     Some(format!("slates {commit}"))
 }
 
-/// This machine's workspace facts, looked at now: whether Slates' library can mount here, and why
-/// not, as the library says. A kiln that keeps no workspaces says so before what mount it lacks: it
-/// makes none, mounted or served to a microVM (whose instance starts in that place too), so a lack
-/// of a host mount alone means the rest a served volume needs is here (`harness::lineage::WorkspaceUse`).
+/// This machine's workspace facts, looked at now (cached for 5 s to avoid repeated mount probes
+/// and TOML parses on `/api/harness/workspaces` bursts).
 pub async fn facts() -> Facts {
+    static CACHE: OnceLock<parking_lot::Mutex<Option<(std::time::Instant, bool, Facts)>>> = OnceLock::new();
+    let here_set = HERE.get().is_some();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(None));
+    if let Some((at, was_set, cached)) = cache.lock().as_ref()
+        && *was_set == here_set
+        && at.elapsed() < std::time::Duration::from_secs(5)
+    {
+        return cached.clone();
+    }
     let slates = linked();
     let mount = slates_api::mount::available();
-    if HERE.get().is_none() {
-        return Facts { slates, mount: mount.ok().and_then(mount_word).map(str::to_owned), why_not: Some("this kiln keeps no workspaces".to_owned()), missing: Some(WorkspaceMissing::Workspaces), ..Facts::default() };
-    }
-    let mount = match mount {
-        Ok(kind) => mount_word(kind),
-        Err(fault) => return Facts { slates, why_not: Some(fault.to_string()), missing: Some(missing_of(&fault)), ..Facts::default() },
+    let out = if !here_set {
+        Facts { slates, mount: mount.ok().and_then(mount_word).map(str::to_owned), why_not: Some("this kiln keeps no workspaces".to_owned()), missing: Some(WorkspaceMissing::Workspaces), ..Facts::default() }
+    } else {
+        match mount {
+            Ok(kind) => match mount_word(kind) {
+                Some(mount) => Facts { available: true, slates, mount: Some(mount.to_owned()), running: up().await, why_not: None, missing: None },
+                None => Facts { slates, why_not: Some("Slates offers no mount here that kiln makes".to_owned()), missing: Some(WorkspaceMissing::Mount), ..Facts::default() },
+            },
+            Err(fault) => Facts { slates, why_not: Some(fault.to_string()), missing: Some(missing_of(&fault)), ..Facts::default() },
+        }
     };
-    let Some(mount) = mount else {
-        return Facts { slates, why_not: Some("Slates offers no mount here that kiln makes".to_owned()), missing: Some(WorkspaceMissing::Mount), ..Facts::default() };
-    };
-    Facts { available: true, slates, mount: Some(mount.to_owned()), running: up().await, why_not: None, missing: None }
+    *cache.lock() = Some((std::time::Instant::now(), here_set, out.clone()));
+    out
 }
 
 /// What a machine lacks for workspaces, as Slates' typed answer to whether it can mount names it (`mount::available`).

@@ -2549,6 +2549,123 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// Its serialized `type` tag, without allocating a `serde_json::Value`.
+    pub fn audit_kind(&self) -> &'static str {
+        match self {
+            Command::Send { .. } => "send",
+            Command::QueueEdit { .. } => "queue_edit",
+            Command::QueueRemove { .. } => "queue_remove",
+            Command::QueueMove { .. } => "queue_move",
+            Command::QueueSendNow { .. } => "queue_send_now",
+            Command::QueueSteer { .. } => "queue_steer",
+            Command::Approve { .. } => "approve",
+            Command::Interrupt => "interrupt",
+            Command::ForceStop => "force_stop",
+            Command::SetMode { .. } => "set_mode",
+            Command::SetModel { .. } => "set_model",
+            Command::SetEffort { .. } => "set_effort",
+            Command::SetSpeed { .. } => "set_speed",
+            Command::MoveTo { .. } => "move_to",
+            Command::Moving { .. } => "moving",
+            Command::HandedOver { .. } => "handed_over",
+            Command::Control { .. } => "control",
+            Command::StopTask { .. } => "stop_task",
+            Command::Restart => "restart",
+            Command::Suggest { .. } => "suggest",
+            Command::Snapshot => "snapshot",
+            Command::StateRead { .. } => "state_read",
+            Command::AtState { .. } => "at_state",
+            Command::McpEnable { .. } => "mcp_enable",
+            Command::McpReconnect { .. } => "mcp_reconnect",
+            Command::McpRefresh => "mcp_refresh",
+            Command::McpAuth { .. } => "mcp_auth",
+            Command::McpAdd { .. } => "mcp_add",
+            Command::McpRemove { .. } => "mcp_remove",
+            Command::SkillView { .. } => "skill_view",
+            Command::SkillRun { .. } => "skill_run",
+            Command::SkillsReload => "skills_reload",
+            Command::StopTasks => "stop_tasks",
+            Command::Resume => "resume",
+            Command::AutoResume { .. } => "auto_resume",
+            Command::PauseAt { .. } => "pause_at",
+            Command::MaxSubagents { .. } => "max_subagents",
+            Command::MoveOnLimit { .. } => "move_on_limit",
+            Command::LimitHold { .. } => "limit_hold",
+            Command::OwnEdits { .. } => "own_edits",
+            Command::Pause { .. } => "pause",
+            Command::Perms { .. } => "perms",
+            Command::Branch { .. } => "branch",
+            Command::RemoveTask { .. } => "remove_task",
+            Command::Admit { .. } => "admit",
+            Command::MailAck { .. } => "mail_ack",
+            Command::MailPeers { .. } => "mail_peers",
+            Command::MailHandoff { .. } => "mail_handoff",
+            Command::Override { .. } => "override",
+            Command::Agentenv { .. } => "agentenv",
+            Command::Reset { .. } => "reset",
+        }
+    }
+
+    /// Control-plane commands that must preempt queued prompts and bulk mail bursts on a
+    /// session's host lane (stops, approvals, reasoning/model/effort/mode changes, resets).
+    pub fn is_priority_control(&self) -> bool {
+        match self {
+            Command::Interrupt
+            | Command::ForceStop
+            | Command::Reset { .. }
+            | Command::Approve { .. }
+            | Command::SetMode { .. }
+            | Command::SetModel { .. }
+            | Command::SetEffort { .. }
+            | Command::SetSpeed { .. }
+            | Command::Control { .. }
+            | Command::StopTask { .. }
+            | Command::StopTasks
+            | Command::Pause { .. }
+            | Command::Resume
+            | Command::Perms { .. }
+            | Command::Restart
+            | Command::Snapshot
+            | Command::Agentenv { .. }
+            | Command::Override { .. }
+            | Command::RemoveTask { .. }
+            | Command::SkillsReload
+            | Command::McpRefresh
+            | Command::McpReconnect { .. }
+            | Command::McpEnable { .. }
+            | Command::LimitHold { .. }
+            | Command::AutoResume { .. }
+            | Command::PauseAt { .. }
+            | Command::MaxSubagents { .. }
+            | Command::MoveOnLimit { .. }
+            | Command::HandedOver { .. } => true,
+            Command::AtState { command, .. } => command.is_priority_control(),
+            Command::Send { .. }
+            | Command::QueueEdit { .. }
+            | Command::QueueRemove { .. }
+            | Command::QueueMove { .. }
+            | Command::QueueSendNow { .. }
+            | Command::QueueSteer { .. }
+            | Command::MoveTo { .. }
+            | Command::Moving { .. }
+            | Command::Suggest { .. }
+            | Command::StateRead { .. }
+            | Command::McpAuth { .. }
+            | Command::McpAdd { .. }
+            | Command::McpRemove { .. }
+            | Command::SkillView { .. }
+            | Command::SkillRun { .. }
+            | Command::OwnEdits { .. }
+            | Command::Branch { .. }
+            | Command::Admit { .. }
+            | Command::MailAck { .. }
+            | Command::MailPeers { .. }
+            | Command::MailHandoff { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -2937,6 +3054,44 @@ mod tests {
         assert_eq!(c, Command::McpAuth { name: "gh".into(), client: "c1".into(), redirect: None });
         let c: Command = serde_json::from_str(r#"{"type":"skill_run","name":"review","args":"src"}"#)?;
         assert_eq!(c, Command::SkillRun { name: "review".into(), args: Some("src".into()), id: None, mode: SendMode::Queue });
+        Ok(())
+    }
+
+    #[test]
+    fn command_audit_kind_matches_serde_tag_and_priority_control() -> anyhow::Result<()> {
+        let samples = vec![
+            (Command::Send { id: "m1".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None }, false),
+            (Command::QueueEdit { id: "m1".into(), text: "edit".into(), attachments: None }, false),
+            (Command::QueueRemove { id: "m1".into() }, false),
+            (Command::QueueMove { id: "m1".into(), index: 0 }, false),
+            (Command::QueueSendNow { id: "m1".into() }, false),
+            (Command::QueueSteer { id: "m1".into() }, false),
+            (Command::Approve { id: "a1".into(), decision: Decision::Allow, message: None, always: None, answers: None, choices: None }, true),
+            (Command::Interrupt, true),
+            (Command::ForceStop, true),
+            (Command::SetMode { mode: "plan".into() }, true),
+            (Command::SetModel { model: "claude".into(), kind: None }, true),
+            (Command::SetEffort { effort: "high".into() }, true),
+            (Command::SetSpeed { speed: "fast".into() }, true),
+            (Command::Control { id: "compact".into(), value: None }, true),
+            (Command::StopTask { task: "t1".into() }, true),
+            (Command::StopTasks, true),
+            (Command::Restart, true),
+            (Command::Snapshot, true),
+            (Command::Pause { on: true, task: None }, true),
+            (Command::Resume, true),
+            (Command::Reset { by: None, why: None }, true),
+            (Command::Suggest { client: "c1".into(), query: "src".into() }, false),
+            (Command::Branch { words: "try".into(), top: false, task: None }, false),
+            (Command::AtState { client: "c1".into(), revision: "r1".into(), command: Box::new(Command::Interrupt) }, true),
+            (Command::AtState { client: "c1".into(), revision: "r1".into(), command: Box::new(Command::Send { id: "m2".into(), text: "hi".into(), mode: SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None }) }, false),
+        ];
+        for (cmd, expected_priority) in samples {
+            let v = serde_json::to_value(&cmd)?;
+            let tag = v.get("type").and_then(serde_json::Value::as_str);
+            anyhow::ensure!(tag == Some(cmd.audit_kind()), "audit_kind {:?} != serde type {:?}", cmd.audit_kind(), tag);
+            anyhow::ensure!(cmd.is_priority_control() == expected_priority, "is_priority_control mismatch for {}", cmd.audit_kind());
+        }
         Ok(())
     }
 }

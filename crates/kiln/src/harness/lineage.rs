@@ -449,10 +449,36 @@ pub async fn reached(hub: &Hub, caller: &crate::authz::Caller, all: Vec<Info>, l
         Some(me) => crate::mcp::acts_for(hub, me).await,
         None => None,
     };
+    let ids: Vec<&str> = all.iter().map(|i| i.id.as_str()).collect();
+    let owners = crate::mcp::whose_many(hub, &ids).await;
+    let parents: std::collections::HashMap<&str, Option<&str>> = all.iter().map(|i| (i.id.as_str(), i.parent.as_deref())).collect();
+    let descends_fast = |id: &str, ancestor: &str| -> bool {
+        let mut at = id;
+        for _ in 0..LINE_MAX {
+            let Some(Some(p)) = parents.get(at).copied() else { return false };
+            if p == ancestor {
+                return true;
+            }
+            at = p;
+        }
+        false
+    };
     let mut out = Vec::with_capacity(all.len());
     for i in &all {
-        let theirs = crate::mcp::whose(hub, &i.id).await;
-        if access_of(caller, manager, &all, &i.id, mine.as_deref(), theirs.as_deref()) >= least {
+        let theirs = owners.get(&i.id).map(String::as_str);
+        let acc = match caller.agent.as_deref() {
+            Some(me) => {
+                if me == i.id || descends_fast(&i.id, me) {
+                    Access::Act
+                } else if mine.is_some() && mine.as_deref() == theirs {
+                    Access::See
+                } else {
+                    Access::None
+                }
+            }
+            None => access_of(caller, manager, &[], &i.id, mine.as_deref(), theirs),
+        };
+        if acc >= least {
             out.push(i.clone());
         }
     }
@@ -518,7 +544,7 @@ pub async fn may_message(hub: &Hub, caller: &crate::authz::Caller, id: &str) -> 
     let Some(me) = caller.agent.as_deref() else {
         return if access(hub, caller, id).await == Access::Act { Ok(Reach::Own) } else { Err(unseen()) };
     };
-    if me == id || descends(&hub.harness.list(), id, me) {
+    if me == id || descends(&hub.harness.lineage_of(id), id, me) {
         return Ok(Reach::Own);
     }
     match (crate::mcp::acts_for(hub, me).await, crate::mcp::acts_for(hub, id).await) {

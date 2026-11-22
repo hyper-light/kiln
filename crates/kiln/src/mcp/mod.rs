@@ -131,6 +131,57 @@ pub async fn whose(hub: &Hub, session: &str) -> Option<String> {
     }
 }
 
+/// Batched [`whose`] for a slice of sessions in one SQLite read query instead of 2N–3N individual
+/// `kv_get` calls (critical at 10k sessions for non-owner callers).
+pub async fn whose_many(hub: &Hub, sessions: &[&str]) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::with_capacity(sessions.len());
+    if sessions.is_empty() {
+        return out;
+    }
+    let has_users = crate::authz::gate::has_users(hub).await;
+    let mut keys = Vec::with_capacity(sessions.len().saturating_mul(2));
+    let mut shells: Vec<(&str, String)> = Vec::new();
+    for &id in sessions {
+        keys.push(opened_by_key(id));
+        keys.push(opener_key(id));
+        if let Some(shell) = hub.harness.info_shared(id).and_then(|i| i.shell.clone()) {
+            keys.push(terminal_opener_key(&shell));
+            shells.push((id, shell));
+        }
+    }
+    let shell_by_id: std::collections::HashMap<&str, String> = shells.into_iter().collect();
+    let json_keys = match serde_json::to_string(&keys) {
+        Ok(j) => j,
+        Err(_) => return out,
+    };
+    let found: std::collections::HashMap<String, String> = hub
+        .store
+        .read(move |c| {
+            let mut q = c.prepare_cached("SELECT k, v FROM kv WHERE k IN (SELECT value FROM json_each(?1))")?;
+            let rows = q.query_map([json_keys], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut map = std::collections::HashMap::new();
+            for row in rows {
+                let (k, v) = row?;
+                map.insert(k, v);
+            }
+            Ok(map)
+        })
+        .await
+        .unwrap_or_default();
+    for &id in sessions {
+        let owner = found
+            .get(&opened_by_key(id))
+            .or_else(|| found.get(&opener_key(id)))
+            .or_else(|| shell_by_id.get(id).and_then(|t| found.get(&terminal_opener_key(t))))
+            .cloned()
+            .or_else(|| (!has_users).then(|| "owner".to_owned()));
+        if let Some(owner) = owner {
+            out.insert(id.to_owned(), owner);
+        }
+    }
+    out
+}
+
 /// Whom agent session `session` acts for (`owner` or `user:<id>`): whoever started it, or for one
 /// started with `kiln spawn` in a kiln shell, whoever opened that shell; the owner on a kiln nobody
 /// else signs in to. `None`: kiln doesn't know.

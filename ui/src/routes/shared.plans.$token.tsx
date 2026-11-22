@@ -10,7 +10,7 @@ import { BrandMark } from "@/components/shell/brand";
 import { CopyButton } from "@/components/ui/misc";
 import { readSharedPlan, SharedPlanView } from "@/server/shared-plan";
 import { planMarkdown } from "@/views/plans/steps";
-import "@/views/plans/plans.css";
+import plansCss from "@/views/plans/plans.css?url";
 
 const getSharedPlan = createServerFn({ method: "GET" })
   .validator((token: string) => token)
@@ -26,7 +26,10 @@ const getSharedPlan = createServerFn({ method: "GET" })
 
 export const Route = createFileRoute("/shared/plans/$token")({
   loader: ({ params }) => getSharedPlan({ data: params.token }),
-  head: ({ loaderData }) => ({ meta: [{ title: loaderData ? `${loaderData.title} · a plan shared from kiln` : "A plan shared from kiln" }] }),
+  head: ({ loaderData }) => ({
+    meta: [{ title: loaderData ? `${loaderData.title} · a plan shared from kiln` : "A plan shared from kiln" }],
+    links: [{ rel: "stylesheet", href: plansCss }],
+  }),
   component: SharedPlanPage,
   errorComponent: () => (
     <Frame>

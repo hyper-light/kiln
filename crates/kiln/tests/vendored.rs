@@ -221,11 +221,15 @@ fn ac_m1_4_kiln_links_one_revision_of_each_vendored_project_and_product() -> any
         ("slates-api", "slates"),
         ("slates-client", "slates"),
         ("slates-server", "slates"),
+        // Mantle, kiln's Blobs store (CP-T10.2).
+        ("mantle-client", "mantle"),
+        ("mantle-protocol", "mantle"),
+        ("mantle-s3", "mantle"),
     ] {
         ensure!(v.crates.get(name).map(String::as_str) == Some(project), "{name} isn't among {project}'s vendored crates: {:?}", v.crates);
     }
     ensure!(
-        ["hyper-light/quiver", "hyper-light/focal", "hyper-light/hyper-raft", "hyper-light/vorpal", "hyper-light/shards", "hyper-light/hex", "hyper-light/slates"].iter().all(|r| v.repositories.contains(*r)),
+        ["hyper-light/quiver", "hyper-light/focal", "hyper-light/hyper-raft", "hyper-light/vorpal", "hyper-light/shards", "hyper-light/hex", "hyper-light/slates", "hyper-light/mantle"].iter().all(|r| v.repositories.contains(*r)),
         "{:?}",
         v.repositories
     );

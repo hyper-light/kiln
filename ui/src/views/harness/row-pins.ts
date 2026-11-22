@@ -39,19 +39,27 @@ export function useRowPins() {
       }
       setPins((previous) => (same(previous, next) ? previous : next));
     };
-    const focused = () => queueMicrotask(read);
-    const observer = new MutationObserver(read);
+    let raf = 0;
+    const schedule = () => {
+      if (!alive || raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        read();
+      });
+    };
+    const observer = new MutationObserver(schedule);
     observer.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ["aria-expanded"] });
-    document.addEventListener("selectionchange", read);
-    root.addEventListener("focusin", focused);
-    root.addEventListener("focusout", focused);
+    document.addEventListener("selectionchange", schedule);
+    root.addEventListener("focusin", schedule);
+    root.addEventListener("focusout", schedule);
     read();
     return () => {
       alive = false;
+      if (raf) cancelAnimationFrame(raf);
       observer.disconnect();
-      document.removeEventListener("selectionchange", read);
-      root.removeEventListener("focusin", focused);
-      root.removeEventListener("focusout", focused);
+      document.removeEventListener("selectionchange", schedule);
+      root.removeEventListener("focusin", schedule);
+      root.removeEventListener("focusout", schedule);
     };
   }, []);
   return { pins, ref };

@@ -105,9 +105,12 @@ impl Profile {
         Self { shards, tasks_per_shard: 8192, pool: (SERVER_DNS, SERVER_STORE.places(), SERVER_FS.places()), announce: true }
     }
 
-    /// An agent: a few jobs, their output pumps, terminals.
+    /// An agent: jobs, output pumps, terminals, and potentially hundreds/thousands of concurrent
+    /// agent harness sessions competing alongside heavy CI builds.
     pub fn agent() -> Self {
-        Self { shards: 2, tasks_per_shard: 2048, pool: (2, 1, 6), announce: true }
+        let cpus = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+        let shards = u16::try_from((cpus / 4).clamp(2, 8)).unwrap_or(2);
+        Self { shards, tasks_per_shard: 8192, pool: (2, 4, 16), announce: true }
     }
 
     /// One-shot CLI commands and tests.

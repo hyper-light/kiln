@@ -1262,7 +1262,7 @@ async fn check_image(hub: &Hub, image: &str, node: Option<&str>) -> anyhow::Resu
     }
     let id = crate::util::new_id();
     let name = format!("kiln-image-check-{}", id.get(id.len().saturating_sub(8)..).unwrap_or("x"));
-    let pod: k8s_openapi::api::core::v1::Pod = serde_json::from_value(check_pod(&name, image, &k.image_pull_policy, node, k.priority_class.as_deref()))?;
+    let pod: crate::kubeapi::types::Pod = serde_json::from_value(check_pod(&name, image, &k.image_pull_policy, node, k.priority_class.as_deref()))?;
     api.create_pod(&pod).await.context("start the image check pod")?;
     let out = async {
         let deadline = Instant::now() + Duration::from_secs(90);
@@ -3712,7 +3712,7 @@ mod tests {
     #[test]
     fn the_image_check_pod_is_not_a_job_pod() -> anyhow::Result<()> {
         let v = check_pod("kiln-image-check-x", "kiln:dev", "IfNotPresent", Some("minikube-m02"), Some("kiln-job"));
-        let pod: k8s_openapi::api::core::v1::Pod = serde_json::from_value(v.clone())?;
+        let pod: crate::kubeapi::types::Pod = serde_json::from_value(v.clone())?;
         let labels = pod.metadata.labels.unwrap_or_default();
         // The job-pod reaper deletes everything labelled managed-by=kiln that isn't a job.
         assert!(!labels.contains_key("app.kubernetes.io/managed-by"));

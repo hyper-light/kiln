@@ -57,17 +57,29 @@ const useNarrow = () =>
 
 const cleanId = (id: string) => id.replace(/[^a-zA-Z0-9_-]/g, "");
 
-/** The widest digit as the counts' tabular figures set it (Geist's 1 is narrower than its other digits even so), as `--sd-dw`, in `host`: every cell is the widest, so no count's change moves what's beside it. Empty when it can't be told. */
+/** The widest digit as the counts' tabular figures set it (Geist's 1 is narrower than its other digits even so), as `--sd-dw`, in `host`: batched into a single layout read instead of 20 forced reflows. */
 function widestDigit(host: HTMLElement): string {
-  const probe = document.createElement("span");
-  probe.className = "sd-n sd-probe";
-  host.append(probe);
-  const width = (s: string) => {
-    probe.textContent = s;
-    return probe.getBoundingClientRect().width;
-  };
-  const widest = Math.max(...[..."0123456789"].map((d) => width(d + d) - width(d)));
-  probe.remove();
+  const wrap = document.createElement("span");
+  wrap.className = "sd-n sd-probe";
+  wrap.style.cssText = "position:absolute;visibility:hidden;pointer-events:none;white-space:nowrap";
+  const singles: HTMLSpanElement[] = [];
+  const doubles: HTMLSpanElement[] = [];
+  for (let d = 0; d <= 9; d++) {
+    const s = document.createElement("span");
+    s.textContent = String(d);
+    const dd = document.createElement("span");
+    dd.textContent = `${d}${d}`;
+    wrap.append(s, dd);
+    singles.push(s);
+    doubles.push(dd);
+  }
+  host.append(wrap);
+  let widest = 0;
+  for (let d = 0; d <= 9; d++) {
+    const w = doubles[d]!.getBoundingClientRect().width - singles[d]!.getBoundingClientRect().width;
+    if (w > widest) widest = w;
+  }
+  wrap.remove();
   return widest > 0 ? `${widest}px` : "";
 }
 
@@ -110,8 +122,16 @@ function measureDigits(el: HTMLDivElement | null) {
  * shows each of those stands always, a zero dimmed, so nothing moves as counts come and go.
  */
 export function Stands({ rows = [], counts, every }: { rows?: readonly MissionRow[]; counts?: Partial<Record<Shown, number>>; every?: readonly Shown[] }) {
-  const count = (stand: Shown) => (counts ? (counts[stand] ?? 0) : rows.filter((r) => r.stand === stand).length);
-  const shown = (every ?? SHOWN).map((stand) => ({ stand, n: count(stand) }));
+  const byStand = React.useMemo(() => {
+    if (counts) return counts;
+    const tally: Partial<Record<Shown, number>> = {};
+    for (let i = 0; i < rows.length; i++) {
+      const s = rows[i]!.stand as Shown;
+      tally[s] = (tally[s] ?? 0) + 1;
+    }
+    return tally;
+  }, [counts, rows]);
+  const shown = (every ?? SHOWN).map((stand) => ({ stand, n: byStand[stand] ?? 0 }));
   const groups = shown.filter((g) => g.n > 0);
   const listed = every ? shown : groups;
   const narrow = useNarrow();
@@ -204,6 +224,7 @@ function Rule({ counts }: { counts: string }) {
         ctx.clearRect(0, 0, width, height);
         paint(ctx, dotsFrame(dots, to.rows, paused ? STILL : now / 1000, kept));
       };
+      const hasMotion = g.to.some(([stand, n]) => n > 0 && stand !== "crashed" && stand !== "offline");
       const tick = (now: number) => {
         raf = 0;
         if (!visible) return;
@@ -211,7 +232,7 @@ function Rule({ counts }: { counts: string }) {
           last = now;
           draw(now);
         }
-        if (!paused || now - g.at < GROW_MS) raf = requestAnimationFrame(tick);
+        if ((!paused && hasMotion) || now - g.at < GROW_MS) raf = requestAnimationFrame(tick);
       };
       const start = () => {
         if (!raf) raf = requestAnimationFrame(tick);
