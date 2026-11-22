@@ -415,7 +415,7 @@ a file, and why. The part after "Designed by hand" is written by hand.
 | `other-agent-other.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
 | `p.json` | `crates/kiln/src/observe/collect/files.rs` | yes |  |
 | `pace.json` | `crates/kiln/src/sense/pace.rs` |  | Records `kiln.files` |
-| `paced.json` | `crates/kiln/src/headroom/pace.rs` |  | a file: read once and deleted (headroom::pace::release_left); nothing writes it now |
+| `paced.json` | `crates/kiln/src/headroom/pace.rs` | yes |  |
 | `pacer.json` | `crates/kiln/src/headroom/pace.rs` | yes |  |
 | `package.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/inbox/faults.rs` |  | scratch: a session's package, taken by Host::adopt_package, gone with it |
 | `pins.json` | `crates/kiln/src/reach/e2e.rs` |  | Records `kiln.files` |

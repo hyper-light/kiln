@@ -81,7 +81,6 @@ const KEPT: &[(&str, &str)] = &[
     ("next.json", "Records `kiln.files`"),
     ("openapi.json", "not a file: the API's answer to GET /api/openapi.json"),
     ("pace.json", "Records `kiln.files`"),
-    ("paced.json", "a file: read once and deleted (headroom::pace::release_left); nothing writes it now"),
     ("package.json", "scratch: a session's package, taken by Host::adopt_package, gone with it"),
     ("pins.json", "Records `kiln.files`"),
     ("plugin.json", "a file: Claude Code's plugin manifest"),

@@ -145,8 +145,7 @@ process the pacer left): it waits on its pacer's end, the kernel's word (a pidfd
 `NOTE_EXIT` on macOS; on Windows the pacer's end of the pipe is its alone). Each pacer also keeps its
 list in `<state>/headroom/paced/<pid>-<start>.json`: a pacer releases every record whose pacer and
 guard have both ended, as it starts and each time a record appears or the pacer or guard of one ends
-(inotify and pidfds on Linux, kqueue on macOS; and, as it starts, the single `paced.json` older
-builds kept). A guard that ends while its pacer runs takes nothing with it: the
+(inotify and pidfds on Linux, kqueue on macOS). A guard that ends while its pacer runs takes nothing with it: the
 pacer starts everything again itself and stops nothing until a guard runs again. What was
 learned is kept in `<state>/headroom/learned.json`. Headroom runs on its own threads, from
 settings it kept, with the server away. How many agent sessions a machine has at work at once is

@@ -225,7 +225,7 @@ impl Pacer {
 
     /// The same, its guard started by `guard`.
     pub fn start_with(dir: &Path, guard: GuardCmd) -> Self {
-        release_left(dir);
+        release_ended(&dir.join(RECORDS));
         let shares: Arc<Mutex<HashMap<PathBuf, u8>>> = Arc::default();
         let period = Arc::new(Mutex::new(Duration::ZERO));
         let stopped: Arc<Mutex<HashMap<PathBuf, Stopped>>> = Arc::default();
@@ -703,21 +703,6 @@ fn read_lists(tx: &std::sync::mpsc::Sender<Word>) {
 fn pacer_of(record: &Path) -> Option<Proc> {
     let (pid, start) = record.file_stem()?.to_str()?.split_once('-')?;
     Some(Proc { pid: pid.parse().ok()?, start: start.parse().ok()? })
-}
-
-/// Starts again what pacers before this one left stopped: the old shared record's list, and each
-/// pacer's record whose pacer and guard have both ended.
-fn release_left(dir: &Path) {
-    let old = dir.join("paced.json");
-    if let Ok(raw) = std::fs::read(&old) {
-        let keys: Vec<String> = serde_json::from_slice(&raw).unwrap_or_default();
-        keys.iter().for_each(|k| imp::release(k));
-        if !keys.is_empty() {
-            tracing::info!(stopped = keys.len(), "headroom: work a previous runner left paced runs again");
-        }
-        let _ = std::fs::remove_file(&old);
-    }
-    release_ended(&dir.join(RECORDS));
 }
 
 /// Starts again what each pacer whose pacer and guard have both ended left stopped, and removes its
@@ -1375,15 +1360,18 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// CP-T1.5: no legacy kept. The single `paced.json` that builds before per-pacer records kept
+    /// is no longer read or deleted at start: nothing writes it, and its groups are left as they are.
     #[test]
-    fn a_record_left_behind_starts_its_groups_again_and_goes() -> anyhow::Result<()> {
+    fn cp_t1_5_start_leaves_an_old_paced_json_alone() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let g = group(dir.path(), "g", true)?;
-        // The record pacers before these kept, one for all of them.
-        std::fs::write(dir.path().join("paced.json"), serde_json::to_vec(&[g.display().to_string()])?)?;
+        let old = dir.path().join("paced.json");
+        let raw = serde_json::to_vec(&[g.display().to_string()])?;
+        std::fs::write(&old, &raw)?;
         let p = Pacer::start_with(dir.path(), test_guard);
-        anyhow::ensure!(!frozen(&g));
-        anyhow::ensure!(!dir.path().join("paced.json").exists());
+        anyhow::ensure!(frozen(&g), "a group the old file names is left stopped");
+        anyhow::ensure!(std::fs::read(&old)? == raw, "the old file is neither read away nor deleted");
         drop(p);
         Ok(())
     }
