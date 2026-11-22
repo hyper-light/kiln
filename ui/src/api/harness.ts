@@ -668,7 +668,7 @@ export const harnessApi = {
    * socket: a message's own (its id is its key), else `key`, one made now unless given, taken once
    * however often it's sent under it (docs/wire.md, "The UI's sockets").
    */
-  command: (id: string, c: Command, key: string = clientId()) =>
+  command: (id: string, c: Command, key: string = clientId(), target?: string) =>
     ownAgentAction(
       // An interrupt, a control and a restart are operations of their own (agents.interrupt, agents.control, agents.restart: kiln plan
       // 01a1dd2e8618733a87f2793aab1322a8 P5.6, S2); the rest go as commands.
@@ -676,7 +676,10 @@ export const harnessApi = {
         ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/${c.type}`, {})
         : c.type === "control"
           ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/control`, { control: c.id, value: c.value ?? null })
-          : call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, c.type === "send" || c.type === "skill_run" ? undefined : { "idempotency-key": key }),
+          : call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, {
+              ...(c.type === "send" || c.type === "skill_run" ? {} : { "idempotency-key": key }),
+              ...(target ? { "x-kiln-target": target } : {}),
+            }),
       [id],
     ),
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
@@ -1304,7 +1307,8 @@ export class SessionStore {
     if (this.ws?.readyState !== WebSocket.OPEN) return;
     this.asked.set(c.id, { id: c.id, command: c, at, state: "pending", mail: true, waiting: true });
     try {
-      this.ws.send(JSON.stringify({ t: "cmd", id: c.id, c } satisfies SessionUp));
+      const target = this.snap.info?.target;
+      this.ws.send(JSON.stringify({ t: "cmd", id: c.id, c, ...(target ? { target } : {}) } satisfies SessionUp));
     } catch {
       this.patch({ error: "The connection ended; the original message and files remain saved here." });
     }
@@ -1668,7 +1672,8 @@ export class SessionStore {
     if (c.type === "send") return false;
     const id = commandId(c);
     this.asked.set(id, { id, command: c, at: Date.now(), state: "pending" });
-    this.ws.send(JSON.stringify({ t: "cmd", id, c } satisfies SessionUp));
+    const target = this.snap.info?.target;
+    this.ws.send(JSON.stringify({ t: "cmd", id, c, ...(target ? { target } : {}) } satisfies SessionUp));
     this.patch({ asked: [...this.asked.values()] });
     return true;
   };
@@ -1701,7 +1706,7 @@ export class SessionStore {
     }
     // No socket: the server takes it now by its command, and holds it.
     try {
-      await harnessApi.command(this.id, c, c.id);
+      await harnessApi.command(this.id, c, c.id, this.snap.info?.target);
       if (owner) this.saveMail(useHeld.getState().settled(this.id, c.id));
       return true;
     } catch {
@@ -1746,7 +1751,8 @@ export class SessionStore {
         changed = true;
         continue;
       }
-      ws.send(JSON.stringify({ t: "cmd", id: a.id, c: a.command } satisfies SessionUp));
+      const target = this.snap.info?.target;
+      ws.send(JSON.stringify({ t: "cmd", id: a.id, c: a.command, ...(target ? { target } : {}) } satisfies SessionUp));
     }
     if (changed) this.patch({ asked: [...this.asked.values()] });
   }
@@ -1762,8 +1768,10 @@ export class SessionStore {
     window.setTimeout(
       () => {
         const now = this.asked.get(id);
-        if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && !now.mail && now.tries === tries)
-          ws.send(JSON.stringify({ t: "cmd", id, c: now.command } satisfies SessionUp));
+        if (ws && this.ws === ws && ws.readyState === WebSocket.OPEN && now?.state === "pending" && !now.mail && now.tries === tries) {
+          const target = this.snap.info?.target;
+          ws.send(JSON.stringify({ t: "cmd", id, c: now.command, ...(target ? { target } : {}) } satisfies SessionUp));
+        }
       },
       AGAIN_AFTER_MS[Math.min(tries, AGAIN_AFTER_MS.length) - 1],
     );

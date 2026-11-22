@@ -101,6 +101,12 @@ pub struct Config {
     /// named, every start here reserves its room through it and starts on its grant alone. None:
     /// it admits on its own room, as ever.
     pub capacity: Option<crate::capacity::KeeperAt>,
+    /// Direct P2P / relayed routed harness messages targeting a session owned by this runner.
+    pub harness_send: Option<crate::memory::queue::Sender<super::quic::HarnessSendAsk>>,
+    /// Per-session conversation Raft messages from peer runners (direct `hyper-quic` or relayed).
+    pub convo_raft: Option<crate::memory::queue::Sender<super::quic::ConvoRaftIn>>,
+    /// Bind a direct `hyper-quic` UDP endpoint for server-to-server / runner-to-runner forwarding.
+    pub direct_quic: bool,
 }
 
 /// Something another runner hands this one to take over, whole: `reply` says whether it was.
@@ -163,7 +169,7 @@ const ADOPT_PIECE: usize = 1 << 20;
 impl Config {
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, adopt_policy: crate::harness::moving::stream::StoragePolicy::Unknown, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new(), capacity: None }
+        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, adopt_policy: crate::harness::moving::stream::StoragePolicy::Unknown, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new(), capacity: None, harness_send: None, convo_raft: None, direct_quic: true }
     }
 }
 
@@ -194,6 +200,8 @@ pub enum In {
     Synced { key: (String, String), say: SyncSay, custody: Option<String>, tree: Option<String> },
     /// Whether this runner took over what another handed it.
     Adopted { key: (String, String), id: u64, error: Option<String> },
+    /// Reply from this runner's local session inbox for a relayed `Ask::HarnessSend`.
+    HarnessSaid { key: (String, String), id: u64, reply: wire::P2pSendReply },
     /// The time this node's own timer asked for (`Node::tick_timer`): the soonest of its own items'
     /// due times (goal 9: loops wake on what they wait for; a loop sent it each second before).
     Tick,
@@ -329,6 +337,12 @@ pub enum Local {
     SessionGrouped { claim: super::place::Claim, at: super::place::Group },
     /// Placement's records (`Handle::records`).
     Records { reply: oneshot::Sender<Option<Arc<dyn kiln_seams::Records>>> },
+    /// Forward a routed harness message to `peer` over its reach link (relayed fallback when direct `hyper-quic` is unavailable).
+    HarnessSend { peer: String, session: String, epoch: Option<u64>, json: String, reply: oneshot::Sender<anyhow::Result<wire::P2pSendReply>> },
+    /// Send a per-session conversation Raft message to `peer` over reach (relayed fallback when direct `hyper-quic` is unavailable).
+    ConvoRaft { peer: String, session: String, bytes: Vec<u8> },
+    /// Connected peer runner names known to this node.
+    KnownPeers { reply: oneshot::Sender<Vec<String>> },
 }
 
 /// How the agent and local tools reach the node. What the network and the node's own runs say
@@ -340,7 +354,7 @@ pub enum Local {
 pub struct Handle {
     net: crate::memory::queue::Sender<In>,
     tx: crate::memory::queue::Sender<In>,
-    announce: Announce,
+    announce: Arc<Announce>,
     busy: Arc<AtomicU64>,
     name: String,
     /// Where its identity and pins live, and the hashes of the trees it syncs.
@@ -349,6 +363,8 @@ pub struct Handle {
     root: Arc<Vec<u8>>,
     /// Placement's numbering of this process's boxes that reserve nothing (`Placer::numbering`).
     boxes: kiln_ci::place::holder::Numbering,
+    /// Direct server-to-server / runner-to-runner `hyper-quic` forwarding endpoint (when bound).
+    quic: Option<super::quic::PeerQuic>,
 }
 
 static GLOBAL: std::sync::OnceLock<Handle> = std::sync::OnceLock::new();
@@ -365,7 +381,7 @@ pub fn global() -> Option<&'static Handle> {
 impl Handle {
     /// The frame announcing this runner's reach identity, for every (re)connect.
     pub fn hello(&self) -> AgentMsg {
-        AgentMsg::ReachHello { json: serde_json::to_string(&self.announce).unwrap_or_default() }
+        AgentMsg::ReachHello { json: serde_json::to_string(&*self.announce).unwrap_or_default() }
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -375,6 +391,47 @@ impl Handle {
     /// This runner's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Direct `hyper-quic` UDP endpoints advertised by this runner (empty if unbound).
+    pub fn quic_addrs(&self) -> &[String] {
+        &self.announce.quic_addrs
+    }
+
+    /// Direct `hyper-quic` forwarding endpoint handle, if bound.
+    pub fn peer_quic(&self) -> Option<&super::quic::PeerQuic> {
+        self.quic.as_ref()
+    }
+
+    /// Forward a routed harness message directly to `peer`: tries direct runner-to-runner
+    /// `hyper-quic` first (multiplexed bidirectional QUIC stream, zero central-server hop),
+    /// falling back transparently to the E2E-encrypted relayed reach link if direct UDP is blocked.
+    pub async fn send_harness_message(&self, peer: &str, session: &str, epoch: Option<u64>, json: String) -> anyhow::Result<wire::P2pSendReply> {
+        if let Some(q) = &self.quic
+            && q.has_direct(peer)
+        {
+            match q.send_harness_message(peer, session, epoch, json.clone()).await {
+                Ok(reply) => return Ok(reply),
+                Err(e) => tracing::debug!(%peer, %session, error = %format!("{e:#}"), "direct hyper-quic harness forward failed; falling back to relayed reach link"),
+            }
+        }
+        self.ask(|reply| Local::HarnessSend { peer: peer.to_owned(), session: session.to_owned(), epoch, json, reply }).await?
+    }
+
+    /// Send a per-session conversation Raft message to `peer`: tries direct `hyper-quic` first,
+    /// falling back to the relayed reach link if direct UDP is unavailable.
+    pub fn send_convo_raft(&self, peer: &str, session: &str, bytes: Vec<u8>) {
+        if let Some(q) = &self.quic
+            && q.send_convo_raft(peer, session, &self.name, bytes.clone())
+        {
+            return;
+        }
+        let _ = self.tx.try_send(In::Local(Local::ConvoRaft { peer: peer.to_owned(), session: session.to_owned(), bytes }));
+    }
+
+    /// Known peer runner names (excluding self) from the reach directory and active links.
+    pub async fn known_peers(&self) -> Vec<String> {
+        self.ask(|reply| Local::KnownPeers { reply }).await.unwrap_or_default()
     }
 
     /// Runs under way: those this runner does for others and those it follows elsewhere. A
@@ -788,7 +845,22 @@ fn answer_keys(s: &Say) -> Vec<String> {
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
-    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: cfg.version, features: crate::proto::feature::all() };
+    let quic = if cfg.direct_quic {
+        match "0.0.0.0:0".parse().ok().and_then(|bind| super::quic::PeerQuic::start(bind, &identity, cfg.harness_send.clone(), cfg.convo_raft.clone()).ok()) {
+            Some(q) => {
+                tracing::info!(addr = %q.local_addr(), advertised = ?q.advertised_addrs(), "reach direct hyper-quic forwarding ready");
+                Some(q)
+            }
+            None => {
+                tracing::debug!("reach direct hyper-quic UDP socket unavailable; using relayed reach links");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let quic_addrs = quic.as_ref().map(|q| q.advertised_addrs().to_vec()).unwrap_or_default();
+    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: cfg.version, features: crate::proto::feature::all(), quic_addrs };
     let (dir, root) = (cfg.dir.clone(), Arc::new(cfg.root.clone()));
     // Each with the bound its channel had: the network's and the node's own unbounded, local tools'
     // 1,024 at most, whatever each carries.
@@ -863,6 +935,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         session_asks: Vec::new(),
         root: Arc::clone(&root),
         keeper: Keeping::default(),
+        quic: quic.clone(),
     };
     let boxes = node.place.numbering();
     let busy = Arc::new(AtomicU64::new(0));
@@ -902,7 +975,7 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
             counted.store(node.busy(), Ordering::Relaxed);
         }
     });
-    Ok((Handle { net: net_tx, tx, announce, busy, name: node_name, dir, root, boxes }, out_rx))
+    Ok((Handle { net: net_tx, tx, announce: Arc::new(announce), busy, name: node_name, dir, root, boxes, quic }, out_rx))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,6 +1054,8 @@ struct Peer {
     syncs: HashMap<String, crate::memory::queue::Sender<SyncSay>>,
     /// Hand-overs to this runner being followed, by id.
     adopts: HashMap<u64, Says>,
+    /// Relayed P2P harness sends awaiting a `Say::HarnessSaid` reply, by id.
+    harness_sends: HashMap<u64, oneshot::Sender<anyhow::Result<wire::P2pSendReply>>>,
     /// Asks waiting for the link.
     queue: VecDeque<Ask>,
     next_id: u64,
@@ -1008,6 +1083,7 @@ impl Peer {
             follows: HashMap::new(),
             syncs: HashMap::new(),
             adopts: HashMap::new(),
+            harness_sends: HashMap::new(),
             queue: VecDeque::new(),
             next_id: 1,
             host: None,
@@ -1022,7 +1098,7 @@ impl Peer {
     }
 
     fn busy(&self) -> bool {
-        !self.follows.is_empty() || !self.syncs.is_empty() || !self.adopts.is_empty() || !self.queue.is_empty() || !self.waiters.is_empty()
+        !self.follows.is_empty() || !self.syncs.is_empty() || !self.adopts.is_empty() || !self.harness_sends.is_empty() || !self.queue.is_empty() || !self.waiters.is_empty()
     }
 
     /// When the node next does something with it on its own (goal 9): with work, its retry once its
@@ -1262,6 +1338,8 @@ struct Node {
     root: Arc<Vec<u8>>,
     /// What waits on this machine's capacity keeper (docs/lb.md "A machine's keeper").
     keeper: Keeping,
+    /// Direct runner-to-runner `hyper-quic` endpoint, updated from the reach directory & pins.
+    quic: Option<super::quic::PeerQuic>,
 }
 
 /// What a node with a capacity keeper keeps for it (docs/lb.md "A machine's keeper"): the link its
@@ -1360,6 +1438,12 @@ impl Node {
             In::Adopted { key, id, error } => {
                 if let Some(link) = self.served.get(&key).and_then(|s| s.link.clone()) {
                     self.say_on(&link, &Say::Adopted { id, error }).await;
+                }
+            }
+            In::HarnessSaid { key, id, reply } => {
+                if let Some(link) = self.served.get(&key).and_then(|s| s.link.clone()) {
+                    let json = serde_json::to_string(&reply).unwrap_or_else(|_| r#"{"t":"error","why":"encode failed"}"#.into());
+                    self.say_on(&link, &Say::HarnessSaid { id, json }).await;
                 }
             }
             In::Tick => {
@@ -1875,6 +1959,12 @@ impl Node {
         self.topo.directory(server, runners.iter().map(|r| (r.name.as_str(), r.topo.as_deref())), crate::util::now_ms());
         self.topo_to_place();
         self.directory = Some((Instant::now(), runners.clone()));
+        self.sync_quic_peers();
+        // Register all connected fleet runners in this node's per-session conversation Raft manager
+        // so conversations led here replicate across every connected peer automatically.
+        if let Some(mgr) = crate::convo::raft::global() {
+            mgr.register_peers(runners.iter().filter(|r| r.connected && r.name != self.cfg.name).map(|r| r.name.clone()));
+        }
         let mut outs = self.place.directory(&runners, crate::util::now_ms());
         // The person's budgets come with it (LB08): none from a server before them.
         outs.extend(self.place.budgets(answer.get("budgets"), &runners, crate::util::now_ms()));
@@ -1891,6 +1981,23 @@ impl Node {
                 Waiting::Accept { from, link, frames } => self.accept(from, link, frames).await,
             }
         }
+    }
+
+    /// Push the latest known peer fingerprints and direct `hyper-quic` UDP addresses to [`PeerQuic`].
+    fn sync_quic_peers(&self) {
+        let Some(quic) = &self.quic else { return };
+        let mut entries = Vec::new();
+        if let Some((_, runners)) = &self.directory {
+            for r in runners {
+                if !r.connected || r.name == self.cfg.name {
+                    continue;
+                }
+                let Ok(fp) = self.expected(&r.name) else { continue };
+                let addrs: Vec<std::net::SocketAddr> = r.quic_addrs.iter().filter_map(|s| s.parse().ok()).collect();
+                entries.push(super::quic::PeerEntry { name: r.name.clone(), fingerprint: fp, addrs });
+            }
+        }
+        quic.update_peers(entries);
     }
 
     /// The key a runner must present: its pin, else the directory's. An error when the two
@@ -2032,6 +2139,9 @@ impl Node {
                     }
                     for (id, s) in p.adopts.drain() {
                         let _ = s.try_send(Say::Adopted { id, error: Some(format!("interrupted: {why}")) });
+                    }
+                    for (_, reply) in p.harness_sends.drain() {
+                        let _ = reply.send(Err(anyhow::anyhow!("reach link closed: {why}")));
                     }
                 }
             }
@@ -2234,6 +2344,9 @@ impl Node {
             // Said as a link lost: nothing there said no.
             for (id, s) in p.adopts.drain() {
                 let _ = s.send(Say::Adopted { id, error: Some(format!("interrupted: {why}")) }).await;
+            }
+            for (_, reply) in p.harness_sends.drain() {
+                let _ = reply.send(Err(anyhow::anyhow!("{why}")));
             }
         }
     }
@@ -2472,6 +2585,20 @@ impl Node {
                 tracing::warn!(peer = %name, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
                 self.drop_link(link, &format!("{name} couldn't read {what} ({}): {why}", code.name()), false).await;
             }
+            // Reply to a relayed P2P harness message forward (`proto::feature::P2P_MAIL`).
+            Say::HarnessSaid { id, json } => {
+                if let Some(tx) = self.peers.get_mut(&name).and_then(|p| p.harness_sends.remove(&id)) {
+                    let reply = serde_json::from_str::<wire::P2pSendReply>(&json).unwrap_or_else(|e| wire::P2pSendReply::Error { why: format!("malformed reply: {e}") });
+                    let _ = tx.send(Ok(reply));
+                }
+            }
+            // Per-session conversation Raft message from `name` (`proto::feature::CONVO_RAFT`).
+            Say::ConvoRaft { session, from, bytes } => {
+                if let Some(tx) = &self.cfg.convo_raft {
+                    let sender = if from.is_empty() { name.clone() } else { from };
+                    let _ = tx.try_send(super::quic::ConvoRaftIn { from: sender, session, bytes });
+                }
+            }
         }
     }
 
@@ -2697,6 +2824,33 @@ impl Node {
             Ask::Unread { what, code, why } => {
                 tracing::warn!(peer = %key.0, link, %what, code = code.name(), %why, "the other runner couldn't read a message of this one's on a reach link");
                 self.drop_link(link, &format!("{} couldn't read {what} ({}): {why}", key.0, code.name()), false).await;
+            }
+            // Relayed P2P routed harness message (`proto::feature::P2P_MAIL`).
+            Ask::HarnessSend { id, session, epoch, json } => {
+                if let Some(tx) = self.cfg.harness_send.clone() {
+                    let (rtx, rrx) = oneshot::channel();
+                    let from = key.0.clone();
+                    if tx.try_send(super::quic::HarnessSendAsk { from, session, epoch, json, reply: rtx }).is_ok() {
+                        let (node_tx, key) = (self.tx.clone(), key);
+                        crate::rt::spawn(async move {
+                            let reply = rrx.await.unwrap_or_else(|_| wire::P2pSendReply::Error { why: "target runner dropped send".into() });
+                            let _ = node_tx.send(In::HarnessSaid { key, id, reply }).await;
+                        });
+                    } else {
+                        let json = serde_json::to_string(&wire::P2pSendReply::Error { why: "target runner send queue full".into() }).unwrap_or_default();
+                        self.say_on(link, &Say::HarnessSaid { id, json }).await;
+                    }
+                } else {
+                    let json = serde_json::to_string(&wire::P2pSendReply::NoSession).unwrap_or_default();
+                    self.say_on(link, &Say::HarnessSaid { id, json }).await;
+                }
+            }
+            // Per-session conversation Raft message (`proto::feature::CONVO_RAFT`).
+            Ask::ConvoRaft { session, from, bytes } => {
+                if let Some(tx) = &self.cfg.convo_raft {
+                    let sender = if from.is_empty() { key.0 } else { from };
+                    let _ = tx.try_send(super::quic::ConvoRaftIn { from: sender, session, bytes });
+                }
             }
         }
     }
@@ -3369,6 +3523,60 @@ impl Node {
                 p.next_id += 1;
                 p.adopts.insert(id, says);
                 let _ = reply.send(id);
+            }
+            Local::HarnessSend { peer, session, epoch, json, reply } => {
+                if peer == self.cfg.name {
+                    let _ = reply.send(Err(anyhow::anyhow!("cannot forward harness message to self")));
+                    return;
+                }
+                let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
+                let id = p.next_id;
+                p.next_id += 1;
+                p.harness_sends.insert(id, reply);
+                self.send_or_queue(&peer, Ask::HarnessSend { id, session, epoch, json }).await;
+            }
+            Local::ConvoRaft { peer, session, bytes } => {
+                if peer == self.cfg.name {
+                    return;
+                }
+                let from = self.cfg.name.clone();
+                if self.peers.get(&peer).is_some_and(|p| p.state == PeerState::Ready) {
+                    self.send_or_queue(&peer, Ask::ConvoRaft { session, from, bytes }).await;
+                    return;
+                }
+                // Reuse an existing inbound link from `peer` if it speaks `convo-raft`.
+                let served_link = self
+                    .served
+                    .iter()
+                    .find(|((p, _), s)| *p == peer && s.link.is_some() && crate::proto::feature::speaks(&s.features, crate::proto::feature::CONVO_RAFT))
+                    .and_then(|(_, s)| s.link.clone());
+                if let Some(link) = served_link {
+                    self.say_on(&link, &Say::ConvoRaft { session, from, bytes }).await;
+                    return;
+                }
+                self.peers.entry(peer.clone()).or_insert_with(Peer::new);
+                self.send_or_queue(&peer, Ask::ConvoRaft { session, from, bytes }).await;
+            }
+            Local::KnownPeers { reply } => {
+                let mut set = std::collections::BTreeSet::new();
+                if let Some((_, runners)) = &self.directory {
+                    for r in runners {
+                        if r.connected && r.name != self.cfg.name {
+                            set.insert(r.name.clone());
+                        }
+                    }
+                }
+                for name in self.peers.keys() {
+                    if *name != self.cfg.name {
+                        set.insert(name.clone());
+                    }
+                }
+                for (name, _) in self.served.keys() {
+                    if *name != self.cfg.name {
+                        set.insert(name.clone());
+                    }
+                }
+                let _ = reply.send(set.into_iter().collect());
             }
         }
     }

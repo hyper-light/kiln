@@ -8,4 +8,10 @@ import type { UnreadFrame } from "./UnreadFrame";
  * What comes up an agent session's socket: a command under the id its client made, a frame that
  * came down that the page couldn't read, or a command as clients from before ids send it.
  */
-export type SessionUp = { t: Cmd, id: string, c: Command, } | UnreadFrame | Command;
+export type SessionUp = { t: Cmd, id: string, c: Command, 
+/**
+ * The session's runner target as the UI knows it (`agent:<runner>` or `local`), so any
+ * node receiving the message checks whether it owns the target before forwarding it
+ * directly to that runner without enqueueing locally.
+ */
+target?: string, } | UnreadFrame | Command;

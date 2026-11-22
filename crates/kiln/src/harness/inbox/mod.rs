@@ -44,7 +44,7 @@ pub const TRIM: u64 = 256;
 /// Longest message id.
 pub const ID_MAX: usize = 128;
 /// Times a take is tried again when its session's head changed under it, before it's refused.
-const RETRIES: usize = 3;
+const RETRIES: usize = 16;
 /// Heads a host keeps in memory, at most: past it they're forgotten, and read again as needed.
 pub const HEADS_MAX: usize = 4096;
 /// Ids let go of in one transaction: each is one write, within a transaction's most.
@@ -432,6 +432,11 @@ impl Inbox {
         &self.records
     }
 
+    /// Whether session `session`'s head row is already cached with a durable revision.
+    pub fn has_head(&self, session: &str) -> bool {
+        self.heads.lock().get(session).is_some_and(|c| c.rev.is_some())
+    }
+
     /// Session `session` is here at `epoch` (started, started again after a restart, or moved
     /// here): its inbox takes sends for that epoch from now on. An epoch never goes down, and only
     /// a higher one lifts a fence (it came back: a copy restored here at the epoch it left at is a
@@ -588,6 +593,9 @@ impl Inbox {
             if matches!(&result, Err(records::Refusal::Unavailable(_))) && let Some(input) = budget { let _ = input.controller.lock().unavailable(); }
             match self.committed(session, &c, built.head, result) {
                 Ok(rev) => {
+                    if let Some(input) = budget {
+                        let _ = input.controller.lock().recover();
+                    }
                     self.counted(session, 1);
                     return Ok(Answer { session: session.to_owned(), message: message.to_owned(), epoch: c.head.epoch, at, seq: rev, repeat: false });
                 }

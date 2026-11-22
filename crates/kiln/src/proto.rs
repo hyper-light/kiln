@@ -883,7 +883,15 @@ pub mod feature {
     /// This runner resets its agents (`harness::model::Command::Reset`, docs/agents.md "Reset"): what each has pending
     /// ends, its intake opens again and its harness starts again fresh. Only a runner that named it is asked to reset one.
     pub const RESET: &str = "harness.reset";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD, MAIL_ROUTE, RESET];
+    /// Peer-to-peer routed harness messages directly between runners over encrypted reach links (`reach::wire::Ask::HarnessSend`,
+    /// `Say::HarnessSaid`): any node receiving a message for a session owned by another runner forwards it directly to that
+    /// runner's inbox without enqueueing it locally.
+    pub const P2P_MAIL: &str = "p2p-mail";
+    /// Per-session conversation Raft replication (`convo::raft`, `reach::wire::Ask::ConvoRaft`,
+    /// `Say::ConvoRaft`, `convo::feed::Msg::Raft`): each session runs its own hyper-raft group led
+    /// by the node where the session runs and replicated across connected nodes in the fleet.
+    pub const CONVO_RAFT: &str = "convo-raft";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD, MAIL_ROUTE, RESET, P2P_MAIL, CONVO_RAFT];
 
     /// [`ALL`], as a message carries them.
     pub fn all() -> Vec<String> {
@@ -2427,7 +2435,7 @@ mod tests {
         }
         // Reach links' own (docs/wire.md, "Named features"): after main's thirteen (12 is `Custody`).
         use crate::reach::wire::{ASK_VARIANTS, Ask, SAY_VARIANTS, Say};
-        let links: [(&str, &str, u8, Vec<u8>); 6] = [
+        let links: [(&str, &str, u8, Vec<u8>); 10] = [
             ("Ask", "Features", 13, postcard::to_allocvec(&Ask::Features { names: names.clone() })?),
             ("Ask", "Place", 14, postcard::to_allocvec(&Ask::Place { json: String::new() })?),
             ("Say", "Features", 13, postcard::to_allocvec(&Say::Features { names: names.clone() })?),
@@ -2435,12 +2443,18 @@ mod tests {
             // lb/history's, after Place: a run with its sizes, and what a run used.
             ("Ask", "RunWith", 15, postcard::to_allocvec(&Ask::RunWith { spec: Box::default(), with: String::new() })?),
             ("Say", "Used", 15, postcard::to_allocvec(&Say::Used { id: 0, used: String::new() })?),
+            // Peer-to-peer routed harness messages directly between runners (`p2p-mail`).
+            ("Ask", "HarnessSend", 16, postcard::to_allocvec(&Ask::HarnessSend { id: 0, session: String::new(), epoch: None, json: String::new() })?),
+            ("Say", "HarnessSaid", 16, postcard::to_allocvec(&Say::HarnessSaid { id: 0, json: String::new() })?),
+            // Per-session conversation Raft replication (`convo-raft`).
+            ("Ask", "ConvoRaft", 17, postcard::to_allocvec(&Ask::ConvoRaft { session: String::new(), from: String::new(), bytes: Vec::new() })?),
+            ("Say", "ConvoRaft", 17, postcard::to_allocvec(&Say::ConvoRaft { session: String::new(), from: String::new(), bytes: Vec::new() })?),
         ];
         for (side, name, idx, b) in links {
             assert_eq!(b.first(), Some(&idx), "{side}::{name}");
             assert!(registry.contains(&format!("| `reach::wire::{side}` | {idx} | `{name}` |")), "the registry has no row for {side}::{name}");
         }
-        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (16, 16));
+        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (18, 18));
         // Every name is said once, each said in the doc's list of names, and a side speaks one
         // only if the other named it.
         let mut all = feature::ALL.to_vec();

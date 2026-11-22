@@ -632,6 +632,7 @@ fn install_args(a: &SetupArgs, on: On, asking: bool) -> InstallArgs {
         image: None,
         registry: None,
         port: 7070,
+        http_addr: None,
     }
 }
 
@@ -709,7 +710,7 @@ async fn take(t: Term, a: &SetupArgs, f: &Facts, secrets: &Secrets, step: &Step,
                 let args = InstallArgs { agent: true, server: Some(server.clone()), quic: a.quic.clone(), token: a.token.clone(), name: a.name.clone(), labels: a.labels.clone(), slots: a.slots, on: None, ..install_args(a, On::Machine, asking) };
                 term::unless_stopped(signals, crate::install::install(args)).await
             } else {
-                let args = crate::join::JoinArgs { server: Some(server.clone()), yes: a.yes, name: a.name.clone(), labels: a.labels.clone(), slots: a.slots, no_install: false, boot: a.boot, wait: 3 };
+                let args = crate::join::JoinArgs { server: Some(server.clone()), yes: a.yes, name: a.name.clone(), labels: a.labels.clone(), slots: a.slots, no_install: false, boot: a.boot, wait: 3, http_addr: "0.0.0.0:7070".to_owned() };
                 term::unless_stopped(signals, crate::join::cli(args, crate::rt::Shutdown::new())).await.map(|r| r.map(|_| ()))
             };
             drop(told);

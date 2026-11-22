@@ -134,13 +134,48 @@ impl Host {
             plans.push(self.plan_routed(id, s.as_ref(), input.as_ref(), c, epoch, route, &mut behind).await);
         }
         let takes = match &input {
-            Some(input) => futures::future::join_all(plans.iter().map(|plan| async move {
-                match plan {
-                    Plan::Take(take) => Some(input.inbox.accept_routed(id, &take.message, &take.digest, take.sent_for, take.at, &take.lease, &take.c, take.lease.bytes, take.route.status.as_ref(), input).await),
-                    _ => None,
+            Some(input) => {
+                let take_count = plans.iter().filter(|p| matches!(p, Plan::Take(_))).count();
+                // Materialize the session head once before a multi-message concurrent burst so
+                // parallel takes never collide on `Cond::Absent { HEADS }`.
+                if take_count > 1 && !input.inbox.has_head(id) && let Some(s) = &s {
+                    let _ = input.inbox.open(id, s.epoch()).await;
                 }
-            }))
-            .await,
+                // Run concurrent takes in physical-budget-aware sub-batches so simultaneous
+                // temporary transaction `BufferCharge`s never exceed available headroom and fail
+                // with "inbox transaction has no physical byte authority", while still group-
+                // committing the full burst in one fsync whenever headroom permits.
+                let mut out: Vec<Option<Result<inbox::Answer, inbox::Refusal>>> = Vec::with_capacity(plans.len());
+                let mut idx = 0usize;
+                while idx < plans.len() {
+                    let avail = input.physical_headroom() / 2;
+                    let mut end = idx;
+                    let mut batch_est = 0usize;
+                    let mut batch_takes = 0usize;
+                    while end < plans.len() {
+                        if let Some(Plan::Take(take)) = plans.get(end) {
+                            let est = take.lease.bytes.saturating_mul(4).saturating_add(4096);
+                            if batch_takes > 0 && batch_est.saturating_add(est) > avail {
+                                break;
+                            }
+                            batch_est = batch_est.saturating_add(est);
+                            batch_takes = batch_takes.saturating_add(1);
+                        }
+                        end = end.saturating_add(1);
+                    }
+                    let slice = plans.get(idx..end).unwrap_or_default();
+                    let batch = futures::future::join_all(slice.iter().map(|plan| async move {
+                        match plan {
+                            Plan::Take(take) => Some(input.inbox.accept_routed(id, &take.message, &take.digest, take.sent_for, take.at, &take.lease, &take.c, take.lease.bytes, take.route.status.as_ref(), input).await),
+                            _ => None,
+                        }
+                    }))
+                    .await;
+                    out.extend(batch);
+                    idx = end;
+                }
+                out
+            }
             None => plans.iter().map(|_| None).collect(),
         };
         for (plan, taken) in plans.into_iter().zip(takes) {
@@ -705,6 +740,52 @@ mod tests {
         crate::rt::block_on(async {
             let f = fixture().await?;
             anyhow::ensure!(!f.host.command_routed("not-here", send("m1", "x"), Some(1), Route::new("local", "admin")));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn burst_under_tight_physical_budget_succeeds_without_byte_authority_rejection() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let f = fixture().await?;
+            // Tight budget: enough for 1-2 simultaneous transaction encodings, far less than 12x.
+            let payload = "x".repeat(4096);
+            f.host.set_input_budget(20 * 1024);
+            let ids: Vec<String> = (0..12).map(|n| format!("tight-{n:02}")).collect();
+            for id in &ids {
+                anyhow::ensure!(f.host.command_routed(&f.id, send(id, &payload), Some(f.s.epoch()), Route::new("local", "agent:a1")), "lane rejected {id}");
+            }
+            let mut answered = std::collections::BTreeMap::new();
+            crate::rt::timeout(crate::harness::registry::ANSWER_WAIT, async {
+                while answered.len() < ids.len() {
+                    let (source, update) = f.rx.recv().await?;
+                    if source == f.id && let Update::Inbox { said } = update {
+                        answered.insert(said.message.clone(), said.answer);
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("only {} of {} answered", answered.len(), ids.len()))??;
+            anyhow::ensure!(answered.values().all(|a| a.is_ok()), "tight budget rejected burst messages: {answered:?}");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn transient_unavailable_self_heals_when_storage_recovers() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let f = fixture().await?;
+            let input = f.input()?;
+            // Simulate a transient storage hiccup latching Readiness::Unavailable.
+            input.controller.lock().unavailable().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            anyhow::ensure!(input.controller.lock().capacity().target == 0, "latched unavailable has target 0");
+            // Once storage works again and accepts a routed message, readiness recovers and the
+            // waiting message is handed to the session instead of staying bricked forever.
+            let taken = f.route(send("heal-1", "after hiccup"), Route::new("local", "user:ada")).await?.map_err(|r| anyhow::anyhow!("refused: {r}"))?;
+            anyhow::ensure!(!taken.repeat);
+            anyhow::ensure!(input.controller.lock().capacity().target > 0, "readiness did not recover after durable commit");
+            f.until_handed("heal-1").await?;
             Ok(())
         })
     }

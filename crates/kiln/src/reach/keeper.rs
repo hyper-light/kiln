@@ -797,6 +797,9 @@ mod tests {
             version: super::super::wire::VERSION,
             root: Vec::new(),
             capacity: None,
+            harness_send: None,
+            convo_raft: None,
+            direct_quic: false,
         })?;
         Ok(handle)
     }

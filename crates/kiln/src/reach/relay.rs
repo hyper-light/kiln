@@ -79,6 +79,11 @@ pub struct Announce {
     /// from a runner before them, which is never sent a link variant it doesn't know.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// Direct `hyper-quic` UDP `ip:port` endpoints this runner listens on for peer-to-peer message
+    /// forwarding and conversation Raft replication (without routing through the central server or
+    /// WebSocket). Empty on older builds, which fall back cleanly to relayed reach links.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quic_addrs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -510,7 +515,7 @@ mod tests {
     #[test]
     fn frames_go_between_the_two_ends_only() -> anyhow::Result<()> {
         let mut r = Relay::default();
-        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() });
+        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
         let peers = |n: &str| match n {
             "linux" => Some(20),
             "mac" => Some(10),
@@ -548,8 +553,8 @@ mod tests {
     #[test]
     fn w27_r08_relays_a_links_frames_are_recorded_in_runs() -> anyhow::Result<()> {
         let mut r = Relay::recording();
-        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() });
-        r.announce("mac", Announce { fingerprint: "g".into(), accept: true, version: 1, features: Vec::new() });
+        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
+        r.announce("mac", Announce { fingerprint: "g".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
         let peers = |n: &str| match n {
             "linux" => Some(20),
             "mac" => Some(10),
@@ -596,7 +601,7 @@ mod tests {
         assert_eq!(r.take_passed().into_iter().map(|p| (p.link, p.seq, p.frames.first(), p.frames.count())).collect::<Vec<_>>(), vec![("L2".to_owned(), 3, 5, 1)]);
         // Not recording: nothing.
         let mut quiet = Relay::default();
-        quiet.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() });
+        quiet.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
         quiet.forward("mac", 10, frame("linux", "L3", true, b"hello"), peers, str::to_owned);
         assert!(quiet.take_passed().is_empty() && quiet.links() == 1);
         Ok(())
@@ -612,10 +617,10 @@ mod tests {
         };
         let (code, w) = why(r.forward("mac", 1, frame("linux", "a", true, b""), none, str::to_owned));
         assert!(code == Refusal::NotOffered && w.contains("does not take reach"), "{code:?} {w}");
-        r.announce("linux", Announce { fingerprint: "f".into(), accept: false, version: 1, features: Vec::new() });
+        r.announce("linux", Announce { fingerprint: "f".into(), accept: false, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
         let (code, w) = why(r.forward("mac", 1, frame("linux", "b", true, b""), none, str::to_owned));
         assert!(code == Refusal::NotAccepted && w.contains("does not accept"), "{code:?} {w}");
-        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() });
+        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
         let (code, w) = why(r.forward("mac", 1, frame("linux", "c", true, b""), none, str::to_owned));
         assert!(code == Refusal::NotConnected && w.contains("not connected"), "{code:?} {w}");
         // A runner kiln knows by its machine id is said by the name people see (docs/machines.md).
@@ -632,8 +637,8 @@ mod tests {
     #[test]
     fn a_lost_connection_closes_its_links_and_tells_the_other_end() -> anyhow::Result<()> {
         let mut r = Relay::default();
-        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() });
-        r.announce("mac", Announce { fingerprint: "g".into(), accept: true, version: 1, features: Vec::new() });
+        r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
+        r.announce("mac", Announce { fingerprint: "g".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
         let peers = |n: &str| (n == "linux").then_some(20).or((n == "mac").then_some(10));
         r.forward("mac", 10, frame("linux", "L1", true, b""), peers, str::to_owned);
         r.forward("linux", 20, frame("mac", "L2", true, b""), peers, str::to_owned);

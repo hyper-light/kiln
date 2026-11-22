@@ -82,12 +82,22 @@ pub enum Ask {
     /// [`super::history::FEATURE`] (audit H1); a runner from before reads it as a newer peer's kind.
     /// Appended last: postcard encodes variants by index.
     RunWith { spec: Box<RunSpec>, with: String },
+    /// A routed harness message forwarded peer-to-peer directly to the runner that owns `session`
+    /// (`proto::feature::P2P_MAIL`): `json` carries the serialized `Command` with its sibling
+    /// `route` object. The receiving runner checks whether it holds `session`, enqueues it straight
+    /// into the session's inbox if so, or replies `NoSession` without enqueueing it locally.
+    /// Appended last: postcard encodes variants by index.
+    HarnessSend { id: u64, session: String, epoch: Option<u64>, json: String },
+    /// Per-session conversation Raft message (`proto::feature::CONVO_RAFT`): `bytes` is an encoded
+    /// `hyper_raft::proto::Message` for `session`'s Raft group, led by the runner where the session
+    /// runs and replicated across the fleet. Appended last: postcard encodes variants by index.
+    ConvoRaft { session: String, from: String, bytes: Vec<u8> },
 }
 
 /// How many variants [`Ask`] has: a newer peer's past them is `unknown`.
-pub const ASK_VARIANTS: usize = 16;
+pub const ASK_VARIANTS: usize = 18;
 /// How many variants [`Say`] has.
-pub const SAY_VARIANTS: usize = 16;
+pub const SAY_VARIANTS: usize = 18;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Resume {
@@ -140,6 +150,28 @@ pub enum Say {
     /// (`kiln_ci::sizes::Usage`), just before its Exit (and again with it after a dropped link).
     /// Only to an asker that asked with [`Ask::RunWith`]. Appended last.
     Used { id: u64, used: String },
+    /// Answer to [`Ask::HarnessSend`] (`proto::feature::P2P_MAIL`): `json` is a serialized
+    /// [`P2pSendReply`] saying whether the session's inbox took the message, refused it, or isn't
+    /// held on this runner (never enqueued locally on mismatch). Appended last.
+    HarnessSaid { id: u64, json: String },
+    /// Per-session conversation Raft message (`proto::feature::CONVO_RAFT`), the responder's side of
+    /// [`Ask::ConvoRaft`]: `bytes` is an encoded `hyper_raft::proto::Message` for `session`.
+    /// Appended last.
+    ConvoRaft { session: String, from: String, bytes: Vec<u8> },
+}
+
+/// Outcome of a peer-to-peer forwarded harness message ([`Ask::HarnessSend`] / [`Say::HarnessSaid`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "t", rename_all = "snake_case")]
+pub enum P2pSendReply {
+    /// The target runner owns the session and its durable inbox accepted the message.
+    Accepted { answer: crate::harness::inbox::Answer },
+    /// The target runner owns the session and its inbox refused the message.
+    Refused { refusal: crate::harness::inbox::Refusal },
+    /// The target runner does not hold this session; nothing was enqueued on its side.
+    NoSession,
+    /// Transport or decode failure on the receiving runner before acceptance.
+    Error { why: String },
 }
 
 /// The machine a link reached.
@@ -344,15 +376,20 @@ mod tests {
         for (m, idx) in says {
             assert_eq!(postcard::to_allocvec(&m)?.first(), Some(&idx), "{m:?}");
         }
-        // lb/history's `RunWith` and `Used` come after them, at 15 (docs/reach.md, "Sizes from history").
-        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (16, 16));
+        // lb/history's `RunWith` and `Used` at 15, P2P mail `HarnessSend`/`HarnessSaid` at 16,
+        // per-session conversation Raft `ConvoRaft` at 17.
+        assert_eq!(postcard::to_allocvec(&Ask::HarnessSend { id: 1, session: "s".into(), epoch: None, json: "{}".into() })?.first(), Some(&16));
+        assert_eq!(postcard::to_allocvec(&Say::HarnessSaid { id: 1, json: "{}".into() })?.first(), Some(&16));
+        assert_eq!(postcard::to_allocvec(&Ask::ConvoRaft { session: "s".into(), from: "a".into(), bytes: vec![1] })?.first(), Some(&17));
+        assert_eq!(postcard::to_allocvec(&Say::ConvoRaft { session: "s".into(), from: "a".into(), bytes: vec![1] })?.first(), Some(&17));
+        assert_eq!((ASK_VARIANTS, SAY_VARIANTS), (18, 18));
         let mut d = Deframer::default();
         d.push(&frame(&Ask::Ping { at: 1 })?);
         assert_eq!(d.read::<Ask>(ASK_VARIANTS).ok().flatten(), Some(Ask::Ping { at: 1 }));
         // A newer peer's kind, one cut short inside its length, and one too large.
         let mut d = Deframer::default();
-        d.push(&[0, 0, 0, 1, 16]);
-        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 16"));
+        d.push(&[0, 0, 0, 1, 18]);
+        assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Unknown && e.what() == "variant 18"));
         let mut d = Deframer::default();
         d.push(&[0, 0, 0, 1, 2]);
         assert!(d.read::<Ask>(ASK_VARIANTS).is_err_and(|e| e.code() == Code::Malformed));
@@ -372,8 +409,8 @@ mod tests {
         let first = |b: Vec<u8>| b.first().copied();
         let with = first(postcard::to_allocvec(&Ask::RunWith { spec: Box::new(RunSpec::default()), with: "{}".into() })?);
         let used = first(postcard::to_allocvec(&Say::Used { id: 1, used: "{}".into() })?);
-        anyhow::ensure!(with == Some(15) && with == u8::try_from(ASK_VARIANTS - 1).ok(), "Ask::RunWith comes right after Place, last");
-        anyhow::ensure!(used == Some(15) && used == u8::try_from(SAY_VARIANTS - 1).ok(), "Say::Used comes right after Place, last");
+        anyhow::ensure!(with == Some(15), "Ask::RunWith comes right after Place at 15");
+        anyhow::ensure!(used == Some(15), "Say::Used comes right after Place at 15");
         // A runner from before has 15 of each (or fewer): a variant at or past its count is a newer
         // peer's kind to it, which it reads as unknown, as a byte past this build's count is here.
         anyhow::ensure!(with.is_some_and(|i| i >= 15) && used.is_some_and(|i| i >= 15));

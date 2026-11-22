@@ -756,6 +756,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   `harness.reset`: the runner resets its agents (`Command::Reset`, docs/agents.md "Reset"): what each has
   pending ends, its intake opens again and its harness starts again fresh; a runner that didn't name it is
   asked to reset none.
+  `p2p-mail`: peer-to-peer routed harness messages forwarded directly between runners (`reach::wire::Ask::HarnessSend`,
+  `Say::HarnessSaid`, and direct `hyper-quic` runner-to-runner streams) without enqueueing locally on a non-owning node.
+  `convo-raft`: per-session conversation Raft replication (`convo::raft`, `reach::wire::Ask::ConvoRaft`, `Say::ConvoRaft`,
+  and `convo::feed::Msg::Raft`), led initially by the node where each session starts and runs and replicated across the fleet.
 
 ## Registry
 
@@ -833,11 +837,15 @@ code: each bit once, each appended variant at its index, in this order.
 | `reach::wire::Ask` | 13 | `Features` | reach links | this line (it had 12 before main's `Custody`) |
 | `reach::wire::Ask` | 14 | `Place` | reach links | this line |
 | `reach::wire::Ask` | 15 | `RunWith` | reach links | this line (lb/history: a run with its sizes from history, only where `reach.sizes` was named on the link) |
+| `reach::wire::Ask` | 16 | `HarnessSend` | reach links | this line (peer-to-peer routed harness message directly to the owning runner, only where `p2p-mail` was named) |
+| `reach::wire::Ask` | 17 | `ConvoRaft` | reach links | this line (per-session conversation Raft message, only where `convo-raft` was named) |
 | `reach::wire::Say` | 0–11 | `Welcome` … `Unread` | reach links | main |
 | `reach::wire::Say` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |
 | `reach::wire::Say` | 13 | `Features` | reach links | this line (it had 12 before main's `Custody`) |
 | `reach::wire::Say` | 14 | `Place` | reach links | this line |
 | `reach::wire::Say` | 15 | `Used` | reach links | this line (lb/history: what a run used, before its `Exit`) |
+| `reach::wire::Say` | 16 | `HarnessSaid` | reach links | this line (answer to `Ask::HarnessSend`, only where `p2p-mail` was named) |
+| `reach::wire::Say` | 17 | `ConvoRaft` | reach links | this line (per-session conversation Raft message, only where `convo-raft` was named) |
 
 A line that lands takes the indexes after the last on main then, and moves its rows here in the same
 change. This line's are numbered after main's at c9c48f77: main's `AgentMsg` 61 to 63 and `ServerMsg`

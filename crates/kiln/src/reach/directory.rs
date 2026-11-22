@@ -44,6 +44,10 @@ pub struct RunnerInfo {
     /// features"): none from a runner or a server before them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// Direct `hyper-quic` UDP `ip:port` addresses this runner listens on for peer-to-peer
+    /// forwarding without going through the central server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quic_addrs: Vec<String>,
     /// The reach version it speaks, as it announced it ([`super::wire::VERSION`]): a link to it
     /// opens at the lower of this and the asker's. None from a server from before.
     #[serde(default, skip_serializing_if = "Option::is_none")]

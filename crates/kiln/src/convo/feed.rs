@@ -169,13 +169,16 @@ pub enum Msg {
     /// copy of the server's) is doing, for the server's telemetry. A server from before takes it
     /// for nothing.
     Stats { store: String, report: Box<Report> },
+    /// Per-session conversation Raft message (`proto::feature::CONVO_RAFT`) carried between runner
+    /// and server on `LANE_CONVO` alongside the encoded `hyper_raft::proto::Message` bytes in `data`.
+    Raft { store: String, session: String, from: String },
 }
 
 impl Msg {
     /// The store it is about.
     pub fn store(&self) -> &str {
         match self {
-            Msg::Hello { store, .. } | Msg::From { store, .. } | Msg::Batch { store, .. } | Msg::Ack { store, .. } | Msg::Restore { store } | Msg::Restored { store, .. } | Msg::Stats { store, .. } => store,
+            Msg::Hello { store, .. } | Msg::From { store, .. } | Msg::Batch { store, .. } | Msg::Ack { store, .. } | Msg::Restore { store } | Msg::Restored { store, .. } | Msg::Stats { store, .. } | Msg::Raft { store, .. } => store,
         }
     }
 }
@@ -978,7 +981,7 @@ fn take(feed: &Feed<'_>, taking: &mut HashMap<(hyper_transport::PeerId, String),
                 }
             }
         }
-        Msg::From { .. } | Msg::Ack { .. } | Msg::Restore { .. } | Msg::Restored { .. } | Msg::Stats { .. } => Vec::new(),
+        Msg::From { .. } | Msg::Ack { .. } | Msg::Restore { .. } | Msg::Restored { .. } | Msg::Stats { .. } | Msg::Raft { .. } => Vec::new(),
     }
 }
 

@@ -96,6 +96,9 @@ async fn lab3() -> anyhow::Result<Lab3> {
             version: super::wire::VERSION,
             root: Vec::new(),
             capacity: None,
+            harness_send: None,
+            convo_raft: None,
+            direct_quic: false,
         };
         let (h, out) = node::start(cfg)?;
         nodes.insert(name, h);
@@ -120,7 +123,7 @@ async fn lab3() -> anyhow::Result<Lab3> {
         let mut relay = Relay::default();
         for n in NAMES {
             if let Some(h) = relay_nodes.get(n) {
-                relay.announce(n, Announce { fingerprint: h.fingerprint().into(), accept: true, version: 1, features: Vec::new() });
+                relay.announce(n, Announce { fingerprint: h.fingerprint().into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
             }
         }
         loop {

@@ -115,9 +115,12 @@ pub struct InstallArgs {
     /// OrbStack's can); without one, the registry the cluster names.
     #[arg(long)]
     pub registry: Option<String>,
-    /// Docker: the port on this machine for kiln's UI and API (QUIC takes the next one).
+    /// Port on this machine for kiln's local UI and API (default: 7070; Docker also uses port+1 for QUIC).
     #[arg(long, default_value_t = 7070)]
     pub port: u16,
+    /// Local node HTTP server address for an installed agent (default: `0.0.0.0:<port>`; pass `off` to disable).
+    #[arg(long, env = "KILN_NODE_HTTP_ADDR")]
+    pub http_addr: Option<String>,
 }
 
 impl InstallArgs {
@@ -482,6 +485,10 @@ async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &P
             say(format!("UI          {url}"));
             say(format!("login link  {} (valid 5 min; `kiln login` makes a new one)", crate::api::otp_url(&token, &url)));
         }
+    } else if let Some(addr) = agent_http_addr(a) {
+        let port = addr.rsplit_once(':').map_or("7070", |(_, p)| p);
+        say("");
+        say(format!("UI          http://localhost:{port} (runner + unified fleet server entrypoint)"));
     }
     Ok(())
 }
@@ -552,6 +559,7 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         outpost: false,
         declared: crate::runner::probe::Declared::default(),
         leasing: None,
+        node_http: agent_http_addr(a),
     };
     crate::agent::enroll_only(&opts).await?;
     say(format!("enrolled    as {} with {server}", crate::pki::sanitize_name(&name)));
@@ -572,7 +580,23 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
         args.push("--slots".to_owned());
         args.push(s.to_string());
     }
+    if let Some(addr) = agent_http_addr(a) {
+        args.push("--http-addr".to_owned());
+        args.push(addr);
+    } else if a.http_addr.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("off")) {
+        args.push("--http-addr".to_owned());
+        args.push("off".to_owned());
+    }
     Ok(args)
+}
+
+/// Resolved local HTTP server bind address for an installed runner node (enabled by default on `0.0.0.0:<port>`).
+fn agent_http_addr(a: &InstallArgs) -> Option<String> {
+    match a.http_addr.as_deref().map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("off") || v.is_empty() => None,
+        Some(v) => Some(v.to_owned()),
+        None => Some(format!("0.0.0.0:{}", a.port)),
+    }
 }
 
 /// Install and start one more service — a runner beside an existing one — with the platform's

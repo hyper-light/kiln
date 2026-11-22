@@ -102,13 +102,19 @@ impl Identity {
         Ok(Self { name: name.to_owned(), cert_der, key_der: key.serialize_der(), fingerprint })
     }
 
-    fn chain(&self) -> Vec<CertificateDer<'static>> {
+    pub(super) fn chain(&self) -> Vec<CertificateDer<'static>> {
         vec![CertificateDer::from(self.cert_der.clone())]
     }
 
-    fn key(&self) -> PrivateKeyDer<'static> {
+    pub(super) fn key(&self) -> PrivateKeyDer<'static> {
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.key_der.clone()))
     }
+}
+
+/// The hybrid post-quantum TLS 1.3 + AES-256-GCM crypto provider shared by reach links and direct
+/// `hyper-quic` peer connections.
+pub(super) fn provider() -> &'static rustls::crypto::CryptoProvider {
+    &PROVIDER
 }
 
 /// A long-lived certificate for the identity key: the key is what peers pin, not the dates.

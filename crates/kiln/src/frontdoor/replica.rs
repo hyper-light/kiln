@@ -5,19 +5,24 @@
 //! one is free), a WebSocket piped through.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use futures::{FutureExt as _, StreamExt as _};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use http_body::Body as _;
 use http_body_util::BodyExt as _;
 use kiln_http::Incoming;
 use kiln_http::client::http1::SendRequest;
+use serde_json::json;
 
-use super::proxy::Upstream;
+use super::proxy::{Listening, MAX_CONNECTIONS, Upstream};
 use crate::http::io::{RtFuturesIo, RtIo};
 use crate::http::server::{self as srv, Request, Response};
 use crate::http::tls::{ClientTls, TlsStream};
+use crate::rt::Shutdown;
 use crate::store::learner::Learner;
 
 /// How long a read waits for the replica to hold the server's writes; past it, the server answers.
@@ -33,6 +38,16 @@ const STALE_FOR: Duration = Duration::from_secs(30);
 const HOP: [&str; 8] = ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"];
 /// What an answer from the replica says: the runner, and the last write its replica held.
 pub const READ_HEADER: &str = "kiln-read";
+/// Present when a read fell back to the local replica while the upstream server was unreachable.
+pub const STALE_HEADER: &str = "kiln-read-stale";
+/// Header saying how a P2P harness command was routed (`local <machine>` or `quic <peer>`).
+pub const ROUTED_HEADER: &str = "kiln-routed";
+/// Optional request header carrying the target runner id attached by the UI.
+pub const TARGET_HEADER: &str = "x-kiln-target";
+/// Maximum request body buffered when inspecting a harness command for local/QUIC routing.
+const COMMAND_BODY_MAX: usize = 16 << 20;
+/// Timeout waiting for a local session's inbox receipt after local enqueue.
+const LOCAL_INBOX_WAIT: Duration = Duration::from_secs(8);
 /// Connections to the server kept for the requests after, at most. A page's pictures and frames
 /// go on connections earlier requests opened, as they do when a browser's connection is piped
 /// whole: one new connection each, on a busy server that takes them late, lost a phone most of
@@ -41,13 +56,132 @@ const IDLE: usize = 16;
 /// Tries at a new connection to the server before a request is answered 502.
 const DIALS: u32 = 3;
 
-/// The front door's handler with a replica here.
+/// Waiters for local session inbox receipts (`Update::Inbox { said }`), shared between the runner's
+/// harness loop and its local HTTP / `hyper-quic` P2P forwarding entrypoints.
+#[derive(Default)]
+pub struct InboxWaiters {
+    pending: parking_lot::Mutex<HashMap<(String, String), Vec<futures::channel::oneshot::Sender<crate::harness::inbox::Said>>>>,
+}
+
+impl InboxWaiters {
+    /// Register a one-shot waiter for `(session, message)`.
+    pub fn register(&self, session: &str, message: &str) -> futures::channel::oneshot::Receiver<crate::harness::inbox::Said> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.pending.lock().entry((session.to_owned(), message.to_owned())).or_default().push(tx);
+        rx
+    }
+
+    /// Resolve all waiters registered for `(session, said.message)`.
+    pub fn resolve(&self, session: &str, said: &crate::harness::inbox::Said) {
+        let waiters = self.pending.lock().remove(&(session.to_owned(), said.message.clone()));
+        if let Some(list) = waiters {
+            for tx in list {
+                let _ = tx.send(said.clone());
+            }
+        }
+    }
+
+    /// Remove any waiter for `(session, message)` on timeout or send failure.
+    pub fn cancel(&self, session: &str, message: &str) {
+        self.pending.lock().remove(&(session.to_owned(), message.to_owned()));
+    }
+}
+
+/// Local runner capabilities attached to a node's HTTP entrypoint (`localhost:7070` and HTTPS front door).
+#[derive(Clone, Default)]
+pub struct LocalNode {
+    /// This runner's identity / machine key (matches `AgentInfo::target` without `agent:` prefix).
+    pub machine: String,
+    /// Optional human-readable label / hostname alias.
+    pub label: Option<String>,
+    /// Local harness session host on this runner.
+    pub host: Option<Arc<crate::harness::host::Host>>,
+    /// Waiters resolved when a local session emits `Update::Inbox { said }`.
+    pub waiters: Arc<InboxWaiters>,
+    /// Reach handle (direct `hyper-quic` first, relayed reach link fallback) for P2P forwarding.
+    pub reach: Option<crate::reach::node::Handle>,
+    /// Local conversation store replicated via per-session Raft.
+    pub convo: Option<crate::convo::store::Store>,
+    /// Per-session conversation Raft manager on this node.
+    pub convo_raft: Option<Arc<crate::convo::raft::Manager>>,
+}
+
+impl LocalNode {
+    /// Whether `target` (with or without leading `agent:`) names THIS runner node.
+    pub fn matches_target(&self, target: &str) -> bool {
+        let Some(t) = normalize_target(target) else { return false };
+        (!self.machine.is_empty() && t == self.machine) || self.label.as_deref().is_some_and(|l| !l.is_empty() && t == l)
+    }
+
+    /// Enqueue a routed message directly into this runner's local session inbox (ONLY when this
+    /// runner actually holds `session` locally; returns `NoSession` without enqueueing otherwise).
+    pub async fn enqueue_local(&self, session: &str, epoch: Option<u64>, c: crate::harness::model::Command, route: crate::harness::route::Route) -> crate::reach::wire::P2pSendReply {
+        use crate::reach::wire::P2pSendReply;
+        let Some(host) = &self.host else { return P2pSendReply::NoSession };
+        let Some(msg_id) = crate::harness::registry::message_id(&c) else {
+            return P2pSendReply::Error { why: "message has no id".into() };
+        };
+        if host.get(session).is_none() {
+            return P2pSendReply::NoSession;
+        }
+        let rx = self.waiters.register(session, &msg_id);
+        let eff_epoch = epoch.or_else(|| host.get(session).map(|s| s.info().epoch));
+        if !host.command_routed(session, c, eff_epoch, route) {
+            self.waiters.cancel(session, &msg_id);
+            return P2pSendReply::NoSession;
+        }
+        match crate::rt::timeout(LOCAL_INBOX_WAIT, rx).await {
+            Ok(Ok(said)) => match said.answer {
+                Ok(answer) => P2pSendReply::Accepted { answer },
+                Err(refusal) => P2pSendReply::Refused { refusal },
+            },
+            Ok(Err(_)) => P2pSendReply::Error { why: "local session inbox dropped waiter".into() },
+            Err(_) => {
+                self.waiters.cancel(session, &msg_id);
+                P2pSendReply::Error { why: "local session inbox timed out".into() }
+            }
+        }
+    }
+}
+
+static GLOBAL_LOCAL: arc_swap::ArcSwapOption<LocalNode> = arc_swap::ArcSwapOption::const_empty();
+
+/// Publish this runner's [`LocalNode`] so both `localhost:7070` and the HTTPS front door share it.
+pub fn set_local_node(local: Option<LocalNode>) {
+    GLOBAL_LOCAL.store(local.map(Arc::new));
+}
+
+/// Active [`LocalNode`] on this runner process, if any.
+pub fn local_node() -> Option<Arc<LocalNode>> {
+    GLOBAL_LOCAL.load_full()
+}
+
+/// Normalize a UI/API target string (`"agent:laptop-b"` -> `Some("laptop-b")`, `"local"` / `""` -> `None`).
+pub fn normalize_target(raw: &str) -> Option<&str> {
+    let t = raw.trim();
+    let t = t.strip_prefix("agent:").unwrap_or(t).trim();
+    if t.is_empty() || t == "local" { None } else { Some(t) }
+}
+
+/// Result of attempting direct local / `hyper-quic` P2P routing on the initial recipient node.
+enum P2pRoute {
+    LocalAccepted(crate::harness::inbox::Answer),
+    LocalRefused(crate::harness::inbox::Refusal),
+    QuicAccepted { peer: String, answer: crate::harness::inbox::Answer },
+    QuicRefused { peer: String, refusal: crate::harness::inbox::Refusal },
+}
+
+/// The front door's handler with a replica and/or local P2P runner node here.
 pub struct Door {
     upstream: Upstream,
     /// For a plain-HTTP upstream, which needs none.
     plain: Arc<ClientTls>,
-    learner: Arc<Learner>,
+    /// Explicit cluster Raft learner (when constructed via [`Door::new`]); when `None`, resolved
+    /// dynamically via [`crate::store::learner::global`] so `localhost:7070` starts immediately.
+    learner: Option<Arc<Learner>>,
     machine: String,
+    /// Local runner node state for unified `localhost:7070` entrypoint + direct `hyper-quic` forwarding.
+    local: Option<LocalNode>,
     /// Which credentials are the owner's, as the server said, and when: a copy read without a lock on
     /// every read, swapped in whole as the server answers (goal 5, plan 01a1a59c2aae step 2: no lock
     /// the front door's shards share; P2, plan 01a1a283e14c).
@@ -67,14 +201,31 @@ impl Door {
     pub fn new(upstream: Upstream, learner: Arc<Learner>) -> anyhow::Result<Self> {
         let plain = Arc::new(ClientTls::new(crate::http::client::Roots::WebPki, None)?);
         let machine = learner.machine().to_owned();
+        let local = local_node().map(|l| (*l).clone());
         // At most IDLE kept: one past it is let go, as it was.
         let (idle, idle_out) = async_channel::bounded(IDLE);
-        Ok(Self { upstream, plain, learner, machine, owners: crate::rcu::Rcu::default(), born: Instant::now(), stale_until: std::sync::atomic::AtomicU64::new(0), idle, idle_out })
+        Ok(Self { upstream, plain, learner: Some(learner), machine, local, owners: crate::rcu::Rcu::default(), born: Instant::now(), stale_until: std::sync::atomic::AtomicU64::new(0), idle, idle_out })
+    }
+
+    /// Construct a `Door` for a runner's own HTTP server (`localhost:7070`): starts immediately at
+    /// boot, dynamically uses [`crate::store::learner::global`] once cluster Raft joins, serves
+    /// `/healthz`, `/healthz/server`, `/api/convo/raft`, and performs direct local / `hyper-quic`
+    /// message routing without enqueueing non-local messages on this node.
+    pub fn for_node(upstream: Upstream, local: LocalNode) -> anyhow::Result<Self> {
+        let plain = Arc::new(ClientTls::new(crate::http::client::Roots::WebPki, None)?);
+        let machine = local.machine.clone();
+        let (idle, idle_out) = async_channel::bounded(IDLE);
+        Ok(Self { upstream, plain, learner: None, machine, local: Some(local), owners: crate::rcu::Rcu::default(), born: Instant::now(), stale_until: std::sync::atomic::AtomicU64::new(0), idle, idle_out })
+    }
+
+    /// Active cluster Raft learner for this door (explicit or global).
+    fn active_learner(&self) -> Option<Arc<Learner>> {
+        self.learner.clone().or_else(crate::store::learner::global)
     }
 
     /// Whether it's the handler for this replica and this upstream.
     pub fn serves(&self, learner: &Arc<Learner>, upstream: &Upstream) -> bool {
-        Arc::ptr_eq(&self.learner, learner) && self.upstream.url == upstream.url
+        self.learner.as_ref().is_some_and(|l| Arc::ptr_eq(l, learner)) && self.upstream.url == upstream.url
     }
 
     /// `after` from now, in nanoseconds after `born`.
@@ -100,16 +251,197 @@ impl Door {
         }
         let seg: Vec<String> = req.uri().path().trim_matches('/').split('/').filter(|s| !s.is_empty()).map(srv::decode).collect();
         let s: Vec<&str> = seg.iter().map(String::as_str).collect();
+        // Node-local health and per-session conversation Raft status endpoints on `localhost:7070`.
+        if let Some(local) = &self.local {
+            match s.as_slice() {
+                ["healthz"] => return Some(srv::text(StatusCode::OK, "ok")),
+                ["healthz", "server"] => return Some(self.node_health(local)),
+                ["api", "convo", "raft"] => return Some(self.convo_raft_status(local)),
+                _ => {}
+            }
+        }
+        let learner = self.active_learner()?;
         if !crate::reads::answers(&s) || self.stale() || !self.owner(req.headers()).await {
             return None;
         }
-        if !self.learner.current(CURRENT_WITHIN).await {
+        if !learner.current(CURRENT_WITHIN).await {
             self.stale_until.store(self.since_born(STALE_FOR), std::sync::atomic::Ordering::Release);
             return None;
         }
-        let v = crate::reads::answer(self.learner.store(), &s, &srv::query(req)).await?;
+        let v = crate::reads::answer(learner.store(), &s, &srv::query(req)).await?;
         let r = srv::json(StatusCode::OK, &v);
-        Some(srv::with_header(r, HeaderName::from_static(READ_HEADER), &format!("{} {}", self.machine, self.learner.standing().0)))
+        Some(srv::with_header(r, HeaderName::from_static(READ_HEADER), &format!("{} {}", self.machine, learner.standing().0)))
+    }
+
+    fn node_health(&self, local: &LocalNode) -> Response {
+        let store = self.active_learner().map_or(json!({ "group": false }), |l| {
+            let (seq, applied) = l.standing();
+            json!({
+                "group": true,
+                "role": "learner",
+                "member": l.member(),
+                "seq": seq,
+                "applied": applied,
+                "synced": !self.stale() && l.stopped().is_none(),
+            })
+        });
+        let raft = local.convo_raft.as_ref().cloned().or_else(crate::convo::raft::global);
+        let convo_raft = raft.as_ref().map_or(json!({ "enabled": false }), |m| {
+            let (groups, leading, following) = m.summary();
+            json!({ "enabled": true, "groups": groups, "leading": leading, "following": following })
+        });
+        let quic_addrs = local.reach.as_ref().map(|r| r.quic_addrs()).unwrap_or_default();
+        srv::json(
+            StatusCode::OK,
+            &json!({
+                "role": "runner+server",
+                "machine": self.machine,
+                "label": local.label,
+                "upstream": self.upstream.url,
+                "quic_addrs": quic_addrs,
+                "store": store,
+                "convo_raft": convo_raft,
+                "version": env!("CARGO_PKG_VERSION"),
+            }),
+        )
+    }
+
+    fn convo_raft_status(&self, local: &LocalNode) -> Response {
+        let raft = local.convo_raft.as_ref().cloned().or_else(crate::convo::raft::global);
+        let groups = raft.as_ref().map_or_else(Vec::new, |m| m.all_status());
+        let quic_addrs = local.reach.as_ref().map(|r| r.quic_addrs()).unwrap_or_default();
+        srv::json(
+            StatusCode::OK,
+            &json!({
+                "node": self.machine,
+                "label": local.label,
+                "quic_addrs": quic_addrs,
+                "groups": groups,
+            }),
+        )
+    }
+
+    /// Initial-recipient routing check (Part 4): given a message command targeting `session` with
+    /// optional UI-supplied `target_hint`, check if THIS node owns the session:
+    /// - Match (local session or target == this node): enqueue directly in this node's local inbox.
+    /// - Mismatch (target == another runner): DO NOT enqueue locally — forward directly over
+    ///   `hyper-quic` (`reach.send_harness_message`, with seamless relayed reach fallback) so the
+    ///   message is enqueued ONLY on the owning runner!
+    async fn route_p2p_command(&self, session: &str, c: &crate::harness::model::Command, target_hint: Option<&str>, sender: &str) -> Option<P2pRoute> {
+        use crate::reach::wire::P2pSendReply;
+        if !crate::harness::session::is_message(c) {
+            return None;
+        }
+        crate::harness::registry::message_id(c)?;
+        let local = self.local.as_ref()?;
+        // 1. Check whether this node holds the session locally.
+        if local.host.as_ref().is_some_and(|h| h.get(session).is_some()) {
+            let route = crate::harness::route::Route::new(&local.machine, sender);
+            return match local.enqueue_local(session, None, c.clone(), route).await {
+                P2pSendReply::Accepted { answer } => Some(P2pRoute::LocalAccepted(answer)),
+                P2pSendReply::Refused { refusal } => Some(P2pRoute::LocalRefused(refusal)),
+                P2pSendReply::NoSession | P2pSendReply::Error { .. } => None,
+            };
+        }
+        // 2. Determine target runner from explicit UI hint or per-session Raft leader map.
+        let raft_leader = local.convo_raft.as_ref().cloned().or_else(crate::convo::raft::global).and_then(|m| m.leader_of(session));
+        let target_raw = target_hint.and_then(normalize_target).or_else(|| raft_leader.as_deref().and_then(normalize_target))?;
+        // 3. Target matches this node, yet session isn't in local Host: never enqueue into wrong queue.
+        if local.matches_target(target_raw) || target_raw == "server" {
+            return None;
+        }
+        // 4. Target is ANOTHER runner: forward directly over `hyper-quic` WITHOUT local enqueue!
+        let reach = local.reach.as_ref()?;
+        let route = crate::harness::route::Route::new(target_raw, sender);
+        let json = serde_json::to_value(c).ok().and_then(|v| route.attach(v, None))?;
+        match reach.send_harness_message(target_raw, session, None, json).await {
+            Ok(P2pSendReply::Accepted { answer }) => Some(P2pRoute::QuicAccepted { peer: target_raw.to_owned(), answer }),
+            Ok(P2pSendReply::Refused { refusal }) => Some(P2pRoute::QuicRefused { peer: target_raw.to_owned(), refusal }),
+            Ok(P2pSendReply::NoSession) => {
+                tracing::debug!(session, peer = %target_raw, "P2P hyper-quic forward got NoSession; falling back to upstream");
+                None
+            }
+            Ok(P2pSendReply::Error { why }) => {
+                tracing::debug!(session, peer = %target_raw, %why, "P2P hyper-quic forward returned error; falling back to upstream");
+                None
+            }
+            Err(e) => {
+                tracing::debug!(session, peer = %target_raw, error = %format!("{e:#}"), "P2P hyper-quic forward failed; falling back to upstream");
+                None
+            }
+        }
+    }
+
+    /// Intercept `POST /api/harness/sessions/:id/command` on a runner node: authenticate owner,
+    /// check initial-recipient target match, handle locally or forward over direct `hyper-quic`
+    /// without enqueueing locally on mismatch, and fall back seamlessly to upstream HTTP with the
+    /// buffered body untouched if needed.
+    async fn maybe_route_http_command(&self, req: Request) -> Result<Response, Box<Request>> {
+        if self.local.is_none() || req.method() != Method::POST {
+            return Err(Box::new(req));
+        }
+        let seg: Vec<String> = req.uri().path().trim_matches('/').split('/').filter(|s| !s.is_empty()).map(srv::decode).collect();
+        let s: Vec<&str> = seg.iter().map(String::as_str).collect();
+        let ["api", "harness", "sessions", session, "command"] = s.as_slice() else {
+            return Err(Box::new(req));
+        };
+        let session = (*session).to_owned();
+        if !self.owner(req.headers()).await {
+            return Err(Box::new(req));
+        }
+        let header_target = req.headers().get(TARGET_HEADER).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let (parts, body) = req.into_parts();
+        let bytes = match srv::body_bytes(body, COMMAND_BODY_MAX).await {
+            Ok(b) => b,
+            Err(e) => return Ok(srv::text(StatusCode::PAYLOAD_TOO_LARGE, &format!("{e:#}"))),
+        };
+        if let Ok(mut val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let body_target = val.as_object_mut().and_then(|o| o.remove("target")).and_then(|v| v.as_str().map(str::to_owned));
+            let target_hint = header_target.as_deref().or(body_target.as_deref());
+            if let Ok(cmd) = serde_json::from_value::<crate::harness::model::Command>(val)
+                && let Some(routed) = self.route_p2p_command(&session, &cmd, target_hint, "owner").await
+            {
+                let message = crate::harness::registry::message_id(&cmd);
+                let resp = match routed {
+                    P2pRoute::LocalAccepted(a) => {
+                        let r = srv::json(StatusCode::OK, &crate::harness::registry::accepted(&message, &a));
+                        srv::with_header(r, HeaderName::from_static(ROUTED_HEADER), &format!("local {}", self.machine))
+                    }
+                    P2pRoute::QuicAccepted { peer, answer } => {
+                        let r = srv::json(StatusCode::OK, &crate::harness::registry::accepted(&message, &answer));
+                        srv::with_header(r, HeaderName::from_static(ROUTED_HEADER), &format!("quic {peer}"))
+                    }
+                    P2pRoute::LocalRefused(refusal) => {
+                        let (code, why) = crate::harness::ops::refused(&refusal);
+                        let r = srv::json(code, &json!({ "error": why }));
+                        srv::with_header(r, HeaderName::from_static(ROUTED_HEADER), &format!("local {}", self.machine))
+                    }
+                    P2pRoute::QuicRefused { peer, refusal } => {
+                        let (code, why) = crate::harness::ops::refused(&refusal);
+                        let r = srv::json(code, &json!({ "error": why }));
+                        srv::with_header(r, HeaderName::from_static(ROUTED_HEADER), &format!("quic {peer}"))
+                    }
+                };
+                return Ok(resp);
+            }
+        }
+        // Fallback: forward the buffered request to upstream HTTP unchanged (zero local enqueue).
+        let resp = self.forward_buffered(parts, bytes).await.unwrap_or_else(|e| {
+            tracing::debug!(error = %format!("{e:#}"), "front door: kiln's server didn't answer");
+            srv::text(StatusCode::BAD_GATEWAY, &format!("kiln's server ({}) didn't answer: {e:#}", self.upstream.url))
+        });
+        Ok(resp)
+    }
+
+    async fn forward_buffered(&self, parts: http::request::Parts, body: bytes::Bytes) -> anyhow::Result<Response> {
+        let mut up = http::Request::builder().method(parts.method).uri(target(&parts.uri)).body(srv::full(body))?;
+        *up.headers_mut() = without_hops(&parts.headers);
+        let resp = self.send(up, false).await?;
+        let (mut head, body) = resp.into_parts();
+        for k in HOP {
+            head.headers.remove(k);
+        }
+        Ok(http::Response::from_parts(head, body.map_err(std::io::Error::other).boxed()))
     }
 
     /// Whether the request's credentials are the owner's, as the server says (kept a while).
@@ -228,9 +560,14 @@ impl Door {
         Ok(sender)
     }
 
-    /// `req` to the server as it came: a WebSocket piped, anything else streamed.
-    async fn forward(&self, req: Request) -> Response {
-        let r = if crate::http::ws::is_upgrade(&req) { self.forward_ws(req).await } else { self.forward_http(req).await };
+    /// `req` to the server as it came: a WebSocket piped (intercepting session message submits for
+    /// direct local / `hyper-quic` forwarding), anything else streamed.
+    async fn forward(self: Arc<Self>, req: Request) -> Response {
+        let r = if crate::http::ws::is_upgrade(&req) {
+            Arc::clone(&self).forward_ws(req).await
+        } else {
+            self.forward_http(req).await
+        };
         r.unwrap_or_else(|e| {
             tracing::debug!(error = %format!("{e:#}"), "front door: kiln's server didn't answer");
             srv::text(StatusCode::BAD_GATEWAY, &format!("kiln's server ({}) didn't answer: {e:#}", self.upstream.url))
@@ -241,9 +578,21 @@ impl Door {
         let (parts, body) = req.into_parts();
         // A read with nothing to send can go again; a write might have been done the first time.
         let again = matches!(parts.method, Method::GET | Method::HEAD) && body.is_end_stream();
-        let mut up = http::Request::builder().method(parts.method).uri(target(&parts.uri)).body(body.map_err(std::io::Error::other).boxed())?;
+        let mut up = http::Request::builder().method(parts.method.clone()).uri(target(&parts.uri)).body(body.map_err(std::io::Error::other).boxed())?;
         *up.headers_mut() = without_hops(&parts.headers);
-        let resp = self.send(up, again).await?;
+        let resp = match self.send(up, again).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Offline resilience: if upstream is unreachable on a GET route the local Raft
+                // replica can answer, serve from our local SQLite replica marked `kiln-read-stale: 1`.
+                if again
+                    && let Some(stale) = self.read_stale(&parts).await
+                {
+                    return Ok(stale);
+                }
+                return Err(e);
+            }
+        };
         let (mut head, body) = resp.into_parts();
         for k in HOP {
             head.headers.remove(k);
@@ -251,13 +600,65 @@ impl Door {
         Ok(http::Response::from_parts(head, body.map_err(std::io::Error::other).boxed()))
     }
 
+    /// Fallback read from local Raft replica when upstream is unreachable (offline resilience).
+    async fn read_stale(&self, parts: &http::request::Parts) -> Option<Response> {
+        let learner = self.active_learner()?;
+        let seg: Vec<String> = parts.uri.path().trim_matches('/').split('/').filter(|s| !s.is_empty()).map(srv::decode).collect();
+        let s: Vec<&str> = seg.iter().map(String::as_str).collect();
+        if !crate::reads::answers(&s) {
+            return None;
+        }
+        // Check cached owner verdict (no network call since upstream is down).
+        let get = |h: header::HeaderName| parts.headers.get(h).and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+        let (cookie, auth) = (get(header::COOKIE), get(header::AUTHORIZATION));
+        if cookie.is_empty() && auth.is_empty() {
+            return None;
+        }
+        let key = crate::util::sha256_hex(format!("{cookie}\n{auth}").as_bytes());
+        if !self.owners.load().get(&key).is_some_and(|(ok, _)| *ok) {
+            return None;
+        }
+        let query: HashMap<String, String> = parts
+            .uri
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .filter(|kv| !kv.is_empty())
+            .map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                (srv::decode(k), srv::decode(v))
+            })
+            .collect();
+        let v = crate::reads::answer(learner.store(), &s, &query).await?;
+        let r = srv::json(StatusCode::OK, &v);
+        let r = srv::with_header(r, HeaderName::from_static(READ_HEADER), &format!("{} {}", self.machine, learner.standing().0));
+        Some(srv::with_header(r, HeaderName::from_static(STALE_HEADER), "1"))
+    }
+
     /// A WebSocket: the upgrade asked of the server first, its answer the browser's; then both
-    /// connections piped until either ends.
-    async fn forward_ws(&self, mut req: Request) -> anyhow::Result<Response> {
+    /// connections piped until either ends. For `/api/harness/sessions/:id/ws` on a runner node,
+    /// incoming browser `SessionUp::Under` message frames are intercepted so submits to this node
+    /// enqueue locally and submits to another runner forward directly over `hyper-quic` without
+    /// bouncing through the upstream WebSocket or enqueueing on the receiving node.
+    async fn forward_ws(self: Arc<Self>, mut req: Request) -> anyhow::Result<Response> {
+        let seg: Vec<String> = req.uri().path().trim_matches('/').split('/').filter(|s| !s.is_empty()).map(srv::decode).collect();
+        let s: Vec<&str> = seg.iter().map(String::as_str).collect();
+        let intercept_session = if self.local.is_some()
+            && let ["api", "harness", "sessions", session, "ws"] = s.as_slice()
+            && self.owner(req.headers()).await
+        {
+            Some((*session).to_owned())
+        } else {
+            None
+        };
         let browser = kiln_http::upgrade::on(&mut req);
         let (parts, _) = req.into_parts();
         let mut up = http::Request::builder().method(Method::GET).uri(target(&parts.uri)).body(srv::empty())?;
         let mut headers = without_hops(&parts.headers);
+        if intercept_session.is_some() {
+            // Uncompressed RFC 6455 frames when inspecting text commands; snapshots remain `?z=gzip`.
+            headers.remove(header::SEC_WEBSOCKET_EXTENSIONS);
+        }
         headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
         headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
         *up.headers_mut() = headers;
@@ -294,19 +695,92 @@ impl Door {
         let mut out = http::Response::new(srv::empty());
         *out.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
         for k in [header::UPGRADE, header::CONNECTION, header::SEC_WEBSOCKET_ACCEPT, header::SEC_WEBSOCKET_PROTOCOL, header::SEC_WEBSOCKET_EXTENSIONS] {
+            if intercept_session.is_some() && k == header::SEC_WEBSOCKET_EXTENSIONS {
+                continue;
+            }
             if let Some(v) = resp.headers().get(&k) {
                 out.headers_mut().insert(k, v.clone());
             }
         }
+        let door = Arc::clone(&self);
         crate::rt::spawn_local(async move {
-            if let (Ok(b), Ok(s)) = (browser.await, server.await)
-                && let Err(e) = super::proxy::pipe(b, s).await
-            {
-                tracing::debug!(error = %e, "front door: a WebSocket to kiln's server ended");
+            if let (Ok(b), Ok(s)) = (browser.await, server.await) {
+                let res = match intercept_session {
+                    Some(session) => pipe_session_ws(door, session, b, s).await,
+                    None => super::proxy::pipe(b, s).await.map(|_| ()).map_err(anyhow::Error::from),
+                };
+                if let Err(e) = res {
+                    tracing::debug!(error = %e, "front door: a WebSocket to kiln's server ended");
+                }
             }
         })
         .map_err(|e| anyhow::anyhow!("spawn WebSocket pipe: {e}"))?;
         Ok(out)
+    }
+}
+
+/// Frame-aware WebSocket bridge for `/api/harness/sessions/:id/ws`: streams all server->browser
+/// events unchanged, while intercepting browser `SessionUp::Under` message submits to route
+/// directly locally or over `hyper-quic` to the session's owning runner (never enqueueing locally
+/// on a non-owning node).
+async fn pipe_session_ws(door: Arc<Door>, session: String, browser_io: kiln_http::upgrade::Upgraded, upstream_io: kiln_http::upgrade::Upgraded) -> anyhow::Result<()> {
+    use tungstenite::protocol::{Role, WebSocketConfig};
+    let cfg = WebSocketConfig::default().max_message_size(Some(COMMAND_BODY_MAX)).max_frame_size(Some(COMMAND_BODY_MAX));
+    let browser_ws = async_tungstenite::WebSocketStream::from_raw_socket(browser_io, Role::Server, Some(cfg)).await;
+    let upstream_ws = async_tungstenite::WebSocketStream::from_raw_socket(upstream_io, Role::Client, Some(cfg)).await;
+    let (mut b_tx, mut b_rx) = browser_ws.split();
+    let (mut u_tx, mut u_rx) = upstream_ws.split();
+    let (ack_tx, ack_rx) = crate::memory::queue::unbounded::<String>(&crate::memory::owners::CHANNELS);
+    let kind = crate::harness::asked::Kind { message: true, deduped: true };
+
+    loop {
+        futures::select_biased! {
+            ack = ack_rx.recv().fuse() => {
+                if let Ok(frame) = ack
+                    && b_tx.send(crate::http::ws::text(frame)).await.is_err()
+                {
+                    return Ok(());
+                }
+            }
+            from_up = u_rx.next().fuse() => match from_up {
+                Some(Ok(msg)) => {
+                    if b_tx.send(msg).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Some(Err(_)) | None => {
+                    let _ = b_tx.close(None).await;
+                    return Ok(());
+                }
+            },
+            from_browser = b_rx.next().fuse() => match from_browser {
+                Some(Ok(crate::http::ws::Message::Text(text))) => {
+                    if let Ok(crate::wire::ui::SessionUp::Under { id: cmd, c, target, .. }) = crate::wire::ui::session_up(text.as_str())
+                        && crate::harness::session::is_message(&c)
+                        && let Some(routed) = door.route_p2p_command(&session, &c, target.as_deref(), "owner").await
+                    {
+                        let sent = match routed {
+                            P2pRoute::LocalAccepted(a) | P2pRoute::QuicAccepted { answer: a, .. } => crate::harness::registry::Sent::Accepted(a),
+                            P2pRoute::LocalRefused(r) | P2pRoute::QuicRefused { refusal: r, .. } => crate::harness::registry::Sent::Refused(r),
+                        };
+                        let _ = ack_tx.try_send(crate::harness::asked::frame(&cmd, &sent, kind));
+                        continue;
+                    }
+                    if u_tx.send(crate::http::ws::Message::Text(text)).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Some(Ok(msg)) => {
+                    if u_tx.send(msg).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Some(Err(_)) | None => {
+                    let _ = u_tx.close(None).await;
+                    return Ok(());
+                }
+            },
+        }
     }
 }
 
@@ -315,8 +789,72 @@ impl srv::Handler for Door {
         if let Some(r) = self.read(&req).await {
             return r;
         }
+        let req = match self.maybe_route_http_command(req).await {
+            Ok(resp) => return resp,
+            Err(req) => *req,
+        };
         self.forward(req).await
     }
+}
+
+/// Start a runner node's own local HTTP server (`0.0.0.0:7070` by default) serving kiln's unified
+/// UI/API entrypoint backed by its cluster Raft learner, per-session conversation Raft store, and
+/// direct `hyper-quic` peer-to-peer message forwarding.
+///
+/// If `addr` is already bound (e.g., a co-located `kiln server` holds `:7070`), returns `Ok(None)`
+/// cleanly without failing the runner.
+#[allow(clippy::disallowed_methods)] // (b) accept backoff on transient OS accept failure
+pub fn listen_node_http(addr: &str, upstream: Upstream, local: LocalNode, shutdown: Shutdown) -> anyhow::Result<Option<Listening>> {
+    let parsed: SocketAddr = addr.parse().map_err(|e| anyhow::anyhow!("invalid node HTTP address {addr:?}: {e}"))?;
+    let std_listener = match std::net::TcpListener::bind(parsed) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            tracing::info!(%addr, "node HTTP address is already bound (co-located server); skipping duplicate listener");
+            return Ok(None);
+        }
+        Err(e) => return Err(anyhow::anyhow!("bind node HTTP listener {addr}: {e}")),
+    };
+    let bound = std_listener.local_addr()?;
+    let door = Arc::new(Door::for_node(upstream, local)?);
+    let stop = Shutdown::new();
+    let (sd, parent) = (stop.clone(), shutdown);
+    let open = Arc::new(AtomicUsize::new(0));
+    crate::rt::spawn(async move {
+        let listener = match hyper_rt::tcp::TcpListener::from_owned(hyper_rt::tcp::OwnedStream::from(std_listener), 256) {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(%bound, error = %e, "node HTTP: cannot hand listener to runtime");
+                return;
+            }
+        };
+        tracing::info!(%bound, "node HTTP server listening (unified fleet entrypoint + direct hyper-quic forwarding)");
+        loop {
+            let accepted = futures::select_biased! {
+                () = sd.cancelled().fuse() => return,
+                () = parent.cancelled().fuse() => return,
+                r = listener.accept().fuse() => r,
+            };
+            let stream = match accepted {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = %e, "node HTTP: accept failed");
+                    crate::rt::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            if open.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                continue;
+            }
+            open.fetch_add(1, Ordering::Relaxed);
+            let (door, sd, n) = (Arc::clone(&door), sd.clone(), Arc::clone(&open));
+            crate::rt::spawn_spread(async move {
+                let remote = stream.peer_addr().ok();
+                let _ = crate::discovery::until_stopped(&sd, srv::serve_connection(RtIo::new(stream), door, remote)).await;
+                n.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
+    });
+    Ok(Some(Listening { stop, bound }))
 }
 
 fn target(uri: &http::Uri) -> String {
@@ -694,6 +1232,114 @@ mod tests {
 
         done.store(true, Ordering::SeqCst);
         link.join().ok();
+        Ok(())
+    }
+
+    /// Part 4: initial-recipient routing check on `Door` (`localhost:7070`). When the browser posts
+    /// a message to node A (`laptop-a`) for a session owned by node B (`laptop-b`), node A checks
+    /// target != self, does ZERO local enqueue on node A, and forwards directly to node B over
+    /// `hyper-quic` (`kiln-routed: quic laptop-b`), returning node B's inbox receipt.
+    #[test]
+    fn p2p_door_routes_remote_session_directly_over_hyper_quic_without_local_enqueue() -> anyhow::Result<()> {
+        let dir_a = tempfile::tempdir()?;
+        let dir_b = tempfile::tempdir()?;
+        let up_url = upstream()?;
+
+        let (b_send_tx, b_send_rx) = crate::memory::queue::unbounded::<crate::reach::quic::HarnessSendAsk>(&crate::memory::owners::CHANNELS);
+        let (a_send_tx, a_send_rx) = crate::memory::queue::unbounded::<crate::reach::quic::HarnessSendAsk>(&crate::memory::owners::CHANNELS);
+
+        // Start two real reach nodes with direct `hyper-quic` endpoints enabled on loopback.
+        let cfg_a = crate::reach::node::Config {
+            harness_send: Some(a_send_tx),
+            sense: false,
+            direct_quic: true,
+            ..crate::reach::node::Config::for_runner("laptop-a", dir_a.path(), true)
+        };
+        let cfg_b = crate::reach::node::Config {
+            harness_send: Some(b_send_tx),
+            sense: false,
+            direct_quic: true,
+            ..crate::reach::node::Config::for_runner("laptop-b", dir_b.path(), true)
+        };
+        let (handle_a, _out_a) = crate::reach::node::start(cfg_a)?;
+        let (handle_b, _out_b) = crate::reach::node::start(cfg_b)?;
+
+        let quic_a = handle_a.peer_quic().context("laptop-a hyper-quic")?.clone();
+        let quic_b = handle_b.peer_quic().context("laptop-b hyper-quic")?.clone();
+        let addr_a = SocketAddr::from(([127, 0, 0, 1], quic_a.local_addr().port()));
+        let addr_b = SocketAddr::from(([127, 0, 0, 1], quic_b.local_addr().port()));
+        quic_a.update_peers(vec![crate::reach::quic::PeerEntry {
+            name: "laptop-b".into(),
+            fingerprint: handle_b.fingerprint().to_owned(),
+            addrs: vec![addr_b],
+        }]);
+        quic_b.update_peers(vec![crate::reach::quic::PeerEntry {
+            name: "laptop-a".into(),
+            fingerprint: handle_a.fingerprint().to_owned(),
+            addrs: vec![addr_a],
+        }]);
+
+        // Track deliveries on both nodes: laptop-a must receive 0, laptop-b must receive 1!
+        let b_received = Arc::new(AtomicUsize::new(0));
+        let b_cnt = Arc::clone(&b_received);
+        crate::rt::block_on(async move {
+            crate::rt::spawn(async move {
+                while let Ok(ask) = b_send_rx.recv().await {
+                    b_cnt.fetch_add(1, Ordering::SeqCst);
+                    let reply = crate::reach::wire::P2pSendReply::Accepted {
+                        answer: crate::harness::inbox::Answer {
+                            session: ask.session,
+                            message: "m-quic-1".into(),
+                            epoch: 1,
+                            at: 1000,
+                            seq: 1,
+                            repeat: false,
+                        },
+                    };
+                    let _ = ask.reply.send(reply);
+                }
+            });
+            Ok(())
+        })?;
+
+        // Build laptop-a's per-session Raft manager and LocalNode (laptop-a does NOT own sess-b).
+        let raft_a = crate::convo::raft::Manager::new("laptop-a", None);
+        let local_a = LocalNode {
+            machine: "laptop-a".into(),
+            label: Some("Laptop A".into()),
+            host: None,
+            waiters: Arc::default(),
+            reach: Some(handle_a),
+            convo: None,
+            convo_raft: Some(Arc::clone(&raft_a)),
+        };
+        let door_a = Arc::new(Door::for_node(Upstream::parse(&up_url, &[])?, local_a)?);
+        let at_a = serve(door_a)?;
+
+        // 1. Check /healthz and /healthz/server on laptop-a's local HTTP server.
+        let (st, _, h_body) = get(at_a, "/healthz/server", None)?;
+        assert_eq!(st, 200, "{h_body}");
+        assert!(h_body.contains("\"role\":\"runner+server\"") && h_body.contains("\"machine\":\"laptop-a\""), "{h_body}");
+
+        // 2. Submit a message to laptop-a targeting laptop-b (with owner cookie + x-kiln-target).
+        let mut s = std::net::TcpStream::connect(at_a)?;
+        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let payload = r#"{"type":"send","id":"m-quic-1","text":"hello laptop-b","mode":"queue"}"#;
+        write!(
+            s,
+            "POST /api/harness/sessions/sess-b/command HTTP/1.1\r\nhost: localhost:7070\r\ncookie: kiln_session=owner\r\nx-kiln-target: agent:laptop-b\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+            payload.len()
+        )?;
+        let mut raw = String::new();
+        s.read_to_string(&mut raw)?;
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+        let head_lc = head.to_ascii_lowercase();
+        let status = head.split_whitespace().nth(1).and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
+        assert_eq!(status, 200, "{head}\n{body}");
+        assert!(head_lc.contains("kiln-routed: quic laptop-b"), "expected direct hyper-quic routing header: {head}");
+        assert!(body.contains("\"message\":\"m-quic-1\""), "{body}");
+        assert_eq!(b_received.load(Ordering::SeqCst), 1, "laptop-b must receive the message once over hyper-quic");
+        assert!(a_send_rx.try_recv().is_err(), "laptop-a must NOT enqueue a remote session's message locally");
         Ok(())
     }
 }

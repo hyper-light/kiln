@@ -1002,6 +1002,7 @@ pub async fn offer_instead_of_server(config_path: &Path, cfg: &crate::config::Co
         no_install: false,
         boot: crate::install::Boot::Auto,
         wait: 3,
+        http_addr: "0.0.0.0:7070".to_owned(),
     };
     cli(args, shutdown).await?;
     Ok(true)
@@ -1039,6 +1040,9 @@ pub struct JoinArgs {
     /// Seconds to look for servers on the network.
     #[arg(long, default_value_t = 3)]
     pub wait: u64,
+    /// Local HTTP server address for this runner node (default: 0.0.0.0:7070; pass `off` to disable).
+    #[arg(long, env = "KILN_NODE_HTTP_ADDR", default_value = "0.0.0.0:7070")]
+    pub http_addr: String,
 }
 
 /// `kiln join`. Returns the agent to run in the foreground with `--no-install`.
@@ -1121,6 +1125,7 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
             outpost: false,
             declared: crate::runner::probe::Declared::default(),
             leasing: None,
+            node_http: (!a.http_addr.eq_ignore_ascii_case("off") && !a.http_addr.trim().is_empty()).then_some(a.http_addr),
         }));
     }
     crate::install::install(crate::install::InstallArgs {
@@ -1144,10 +1149,17 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
         image: None,
         registry: None,
         port: 7070,
+        http_addr: Some(a.http_addr.clone()),
     })
     .await?;
     // When it starts (at boot, or at sign-in) is the install's to say: it's the `boot` line above.
-    say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}.", joined.label.as_deref().unwrap_or(&joined.name), joined.server));
+    let local_ui = if !a.http_addr.eq_ignore_ascii_case("off") && !a.http_addr.trim().is_empty() {
+        let port = a.http_addr.rsplit_once(':').map_or("7070", |(_, p)| p);
+        format!("\nLocal UI: http://localhost:{port} (runner + unified fleet server entrypoint)")
+    } else {
+        String::new()
+    };
+    say_stderr(&format!("\nJoined: this machine is agent \"{}\" of {}.{local_ui}", joined.label.as_deref().unwrap_or(&joined.name), joined.server));
     Ok(None)
 }
 

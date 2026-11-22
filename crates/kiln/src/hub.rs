@@ -1167,6 +1167,9 @@ impl Hub {
         if let Ok(b) = say(&crate::store::learner::Msg::Join { member, token }) {
             self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
         }
+        // Prompt the Raft leader immediately so a connecting/reconnecting learner catches up
+        // without waiting up to a full 1s beat interval.
+        g.beat_now();
     }
 
     /// The runners that could keep a copy of the conversation store, as they are now: the
@@ -2846,6 +2849,7 @@ impl Hub {
                     reach: a.connected && ann.is_some_and(|x| x.accept),
                     fingerprint: ann.map(|x| x.fingerprint.clone()),
                     features: ann.map(|x| x.features.clone()).unwrap_or_default(),
+                    quic_addrs: ann.map(|x| x.quic_addrs.clone()).unwrap_or_default(),
                     reach_version: ann.map(|x| x.version).filter(|v| *v > 0),
                     cpus: s.map_or(0, |s| s.cpus),
                     speed: speeds.speed(&a.name),
@@ -3761,6 +3765,11 @@ impl Hub {
             AgentMsg::Features { names } => {
                 let skills = proto::feature::speaks(&names, crate::skills::FEATURE);
                 self.instances.update(|i| i.set_features(peer, names.clone()));
+                if proto::feature::speaks(&names, proto::feature::CONVO_RAFT)
+                    && let Some(mgr) = crate::convo::raft::global()
+                {
+                    mgr.register_peers([agent.as_ref()]);
+                }
                 // One that takes its engine is told what its owner set (`crate::harness::engine`).
                 crate::harness::engine::on_features(self, &agent, peer, &names).await;
                 // An agent pod's runner is given the session it was made for (docs/agentic.md W10).
@@ -4205,9 +4214,13 @@ impl Hub {
                     if let Some(holds) = checks {
                         self.cluster.checks(g, agent, peer, holds);
                     }
-                    let at = crate::store::learner::Msg::At { id, seq: g.standing().0 };
-                    if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&at), raft: Vec::new() }) {
-                        self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
+                    // Wake the Raft leader right away so any pending entries reach this learner before ReadIndex waits.
+                    g.beat_now();
+                    if id != 0 {
+                        let at = crate::store::learner::Msg::At { id, seq: g.standing().0 };
+                        if let Ok(b) = proto::encode(&ServerMsg::Cluster { json: crate::store::learner::encode(&at), raft: Vec::new() }) {
+                            self.net.send(peer, proto::LANE_SYNC, Kind::Control, b).await;
+                        }
                     }
                 }
                 (Some(g), msg) => self.cluster.heard(g, agent, &msg, raft),
@@ -4215,8 +4228,18 @@ impl Hub {
             },
             FromRunner::Convo { msg, data } => {
                 // About the server's own store: a mirror's answer. A mirror's copy sent back to
-                // restore it from, when asked for. Else the runner's own store's feed.
+                // restore it from, when asked for. Per-session Raft replication frames. Else the
+                // runner's own store's feed.
                 match (&self.harness.copies, *msg) {
+                    // Per-session conversation Raft message from a runner (`proto::feature::CONVO_RAFT`).
+                    (_, crate::convo::feed::Msg::Raft { session, from, .. }) => {
+                        if let Some(mgr) = crate::convo::raft::global() {
+                            let sender = if from.is_empty() { agent } else { from.as_str() };
+                            if let Err(e) = mgr.step(sender, &session, &data) {
+                                tracing::debug!(%session, from = %sender, error = %format!("{e:#}"), "convo Raft step from runner failed");
+                            }
+                        }
+                    }
                     // What a runner's store is doing, for the board.
                     (_, crate::convo::feed::Msg::Stats { store, report }) => self.harness.board.heard(agent, &store, *report, crate::util::now_ms()),
                     (_, crate::convo::feed::Msg::Hello { store, restore: true }) => {

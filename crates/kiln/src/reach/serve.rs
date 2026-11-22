@@ -436,6 +436,20 @@ pub fn start(spec: RunSpec, cwd: PathBuf, shell_state: Option<PathBuf>, extra_en
         let name = format!("{}{}", crate::os::RUN_GROUP, uuid::Uuid::now_v7().simple());
         let agents = spec.env.iter().any(|(k, _)| k == super::keeper::AGENT_ENV);
         let group = if agents { crate::os::contain::Group::of(&name) } else { crate::os::contain::Group::of_person(&name) };
+        struct PersonGuard(Option<String>);
+        impl Drop for PersonGuard {
+            fn drop(&mut self) {
+                if let Some(n) = &self.0 {
+                    crate::headroom::mark_person_group(n, false);
+                }
+            }
+        }
+        let _person_guard = if !agents {
+            crate::headroom::mark_person_group(&name, true);
+            Some(PersonGuard(Some(name.clone())))
+        } else {
+            None
+        };
         // An agent's run keeps off the cores of a server beside it, as the agent does (docs/priority.md).
         if agents {
             crate::os::onto_work_cpus(&mut cmd);

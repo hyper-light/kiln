@@ -89,7 +89,7 @@ const CHECKS_QUEUED: usize = 64;
 /// How long a learner starting waits for its process to sign custody records (its identity
 /// certified, kiln's word that it takes them) before it fetches a copy or says it checks: without
 /// it, the copy goes as before, unsigned.
-const SIGNER_WAIT: Duration = Duration::from_secs(20);
+const SIGNER_WAIT: Duration = Duration::from_secs(2);
 /// How many copies a learner fetches while each isn't what kiln handed on, before it gives up.
 const COPY_TRIES: u32 = 3;
 
@@ -181,6 +181,8 @@ pub struct Learner {
     checkpoints: async_channel::Sender<Checkpoint>,
     /// A checkpoint didn't match: the replica is being copied again, and answers nothing meanwhile.
     diverged: Arc<AtomicBool>,
+    /// Live copy-fetch bearer token shared with the snapshot fetcher, refreshed on reconnect (`Msg::Join`).
+    token: Arc<parking_lot::Mutex<String>>,
 }
 
 /// A checkpoint of the log the server sent ([`Msg::Checkpoint`]).
@@ -199,8 +201,11 @@ impl Learner {
     pub fn start(state_dir: &Path, me: &str, member: u64, http: Arc<Client>, server: &str, token: &str) -> anyhow::Result<(Learner, async_channel::Receiver<AgentMsg>)> {
         let d = dir(state_dir);
         let db = d.join("kiln.db");
-        let group = Arc::new(Group::learner(&db, &d.join("log"), member, fetcher(http, copy_url(server, me), token.to_owned()))?);
-        Self::around(group, db, me)
+        let live_token = Arc::new(parking_lot::Mutex::new(token.to_owned()));
+        let group = Arc::new(Group::learner(&db, &d.join("log"), member, fetcher(http, copy_url(server, me), Arc::clone(&live_token)))?);
+        let (mut learner, rx) = Self::around(group, db, me)?;
+        learner.token = live_token;
+        Ok((learner, rx))
     }
 
     /// A learner around its member of the group, on its replica at `db`.
@@ -234,8 +239,27 @@ impl Learner {
             next_ask: std::sync::atomic::AtomicU64::new(1),
             checkpoints,
             diverged,
+            token: Arc::new(parking_lot::Mutex::new(String::new())),
         };
         Ok((learner, say_rx))
+    }
+
+    /// Refresh the snapshot copy bearer token (called on every reconnect `Msg::Join`) so future
+    /// snapshot installs never fail with 401 after a token rotation.
+    pub fn update_token(&self, token: String) {
+        *self.token.lock() = token;
+    }
+
+    /// Send a lightweight `Msg::Ask { id: 0 }` wake-up to the Raft leader on reconnect so the
+    /// leader clears any prior `report_unreachable` state and beats immediately.
+    pub fn ping(&self) {
+        let checks = checks(&self.group);
+        let _ = self.say.try_send(AgentMsg::Cluster { json: encode(&Msg::Ask { id: 0, checks }), raft: Vec::new() });
+    }
+
+    /// This learner's Raft member id.
+    pub fn member(&self) -> u64 {
+        super::group::member_of(&self.me)
     }
 
     /// The replica, to read.
@@ -250,7 +274,6 @@ impl Learner {
 
     /// Waits until the replica holds every write kiln.db held when asked (the server says which),
     /// within `within`: whether it does. A read answered after it is as current as the server's.
-    #[allow(clippy::disallowed_methods)] // (e) polls the learner's catch-up; its applied index could tell
     pub async fn current(&self, within: Duration) -> bool {
         // Copied again over entries that came changed: until it's in, the server answers.
         if self.diverged.load(Ordering::SeqCst) {
@@ -260,11 +283,12 @@ impl Learner {
         let (tx, rx) = async_channel::bounded(1);
         self.asks.put(id, tx);
         let checks = checks(&self.group);
+        let notify = self.group.wait_applied();
         let asked = async {
             self.say.send(AgentMsg::Cluster { json: encode(&Msg::Ask { id, checks }), raft: Vec::new() }).await.ok()?;
             let seq = rx.recv().await.ok()?;
             while self.standing().0 < seq {
-                crate::rt::sleep(Duration::from_millis(2)).await;
+                notify.notified().await;
             }
             Some(())
         };
@@ -634,9 +658,9 @@ fn escaped(s: &str) -> String {
 /// to it by its SHA-256 (docs/ci.md W27-R08): hashed as it comes, a copy that isn't what kiln handed
 /// on is refused, its receipt of what came the break kiln records, and another fetched, [`COPY_TRIES`]
 /// in all.
-fn fetcher(http: Arc<Client>, url: String, token: String) -> Fetch {
+fn fetcher(http: Arc<Client>, url: String, token: Arc<parking_lot::Mutex<String>>) -> Fetch {
     Arc::new(move |dest: &Path| {
-        let (http, url, token, dest) = (http.clone(), url.clone(), token.clone(), dest.to_path_buf());
+        let (http, url, token, dest) = (http.clone(), url.clone(), token.lock().clone(), dest.to_path_buf());
         crate::rt::block_on(async move {
             let url = match crate::runner::custody::cluster_signer_within(SIGNER_WAIT).await {
                 Some(instance) => format!("{url}&instance={}", escaped(&instance)),

@@ -124,6 +124,9 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
         version: super::wire::VERSION,
         root: Vec::new(),
         capacity: None,
+        harness_send: None,
+        convo_raft: None,
+        direct_quic: false,
     };
     let (mac, mac_out) = node::start(Config { objects: mac_objects, version: mac_version, place: mac_place, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;
     let (linux, linux_out) = node::start(Config { objects: linux_objects, version: linux_version, place: linux_place, ..cfg("linux", dirs.get(1).ok_or_else(|| anyhow::anyhow!("dir"))?, Some(adopt_tx)) })?;
@@ -140,8 +143,8 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
     let (m, l, e) = (mac.clone(), linux.clone(), Arc::clone(&ended));
     crate::rt::spawn(async move {
         let mut relay = Relay::default();
-        relay.announce("mac", Announce { fingerprint: m.fingerprint().into(), accept: true, version: 1, features: Vec::new() });
-        relay.announce("linux", Announce { fingerprint: l.fingerprint().into(), accept: true, version: 1, features: Vec::new() });
+        relay.announce("mac", Announce { fingerprint: m.fingerprint().into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
+        relay.announce("linux", Announce { fingerprint: l.fingerprint().into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
         let handle_of = |n: &str| if n == "mac" { m.clone() } else { l.clone() };
         loop {
             use futures::FutureExt as _;
@@ -1060,7 +1063,7 @@ fn a_message_a_runner_cant_read_in_a_link_is_answered_unread_and_only_its_link_e
         let hub = scratch_hub_on(Arc::new(kiln_seams::clock::SimClock::new()), |_| {}).await?;
         join_runner(&hub, 1, "mac", CAP_UNREAD);
         join_runner(&hub, 2, "linux", CAP_UNREAD);
-        hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() })? }).await?;
+        hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() })? }).await?;
         let link = garbled.clone().unwrap_or_default();
         hear(&hub, 1, LANE_REACH, &AgentMsg::Reach { to: "linux".into(), link: link.clone(), open: true, data: Vec::new(), close: None }).await?;
         hear(&hub, 2, LANE_REACH, &said).await?;
@@ -1099,7 +1102,7 @@ fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::R
         for (peer, name) in [(1, "mac"), (2, "linux"), (3, "intruder")] {
             join_runner(&hub, peer, name, CAP_UNREAD | CAP_WIRE);
         }
-        let hello = AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() })? };
+        let hello = AgentMsg::ReachHello { json: serde_json::to_string(&Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() })? };
         hear(&hub, 1, LANE_CONTROL, &hello).await?;
         hear(&hub, 2, LANE_CONTROL, &hello).await?;
         let frame = |to: &str, open: bool| AgentMsg::Reach { to: to.into(), link: "L1".into(), open, data: b"x".to_vec(), close: None };
@@ -1176,7 +1179,7 @@ fn the_server_refuses_what_its_relay_cant_take_typed_and_notes_it() -> anyhow::R
 #[test]
 fn a_links_ends_are_known_open_and_lately_closed() {
     let mut r = Relay::default();
-    r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() });
+    r.announce("linux", Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() });
     let peers = |n: &str| (n == "linux").then_some(20).or((n == "mac").then_some(10));
     r.forward("mac", 10, Frame { to: "linux".into(), link: "L1".into(), open: true, data: Vec::new(), close: None }, peers, str::to_owned);
     assert_eq!(r.ends("L1"), Some(("mac".into(), "linux".into())));
@@ -1420,7 +1423,7 @@ fn g9_s3_a_reach_hello_is_announced_at_once_and_to_the_relay_in_its_turn() -> an
         let hub = scratch_hub().await?;
         join_runner(&hub, 1, "mac", CAP_WIRE);
         join_runner(&hub, 2, "linux", CAP_WIRE);
-        let said = Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new() };
+        let said = Announce { fingerprint: "f".into(), accept: true, version: 1, features: Vec::new(), quic_addrs: Vec::new() };
         hear(&hub, 2, LANE_CONTROL, &AgentMsg::ReachHello { json: serde_json::to_string(&said)? }).await?;
         anyhow::ensure!(hub.reach.announced().get("linux") == Some(&said), "the directory has it as soon as the hub's loop took it");
         hear(&hub, 1, LANE_REACH, &AgentMsg::Reach { to: "linux".into(), link: "L1".into(), open: true, data: b"x".to_vec(), close: None }).await?;

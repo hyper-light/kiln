@@ -165,7 +165,7 @@ impl srv::Handler for PeerDoor {
 
 /// A running listener: it stops, with its connections, when dropped.
 pub struct Listening {
-    stop: Shutdown,
+    pub(super) stop: Shutdown,
     pub bound: SocketAddr,
 }
 

@@ -292,6 +292,34 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         child!("sync", h => h.sync_loop());
         child!("cluster", h => h.cluster_loop());
+        // Part 2 & 3: per-session/conversation Raft manager on the server node ("server", id 1),
+        // replicating conversations started on any runner/server across the entire connected fleet.
+        {
+            let convo_raft = crate::convo::raft::Manager::new("server", hub.harness.convo.clone());
+            crate::convo::raft::set_global(Some(Arc::clone(&convo_raft)));
+            let (h, sd) = (hub.clone(), shutdown.clone());
+            crate::rt::spawn(async move {
+                let out_rx = convo_raft.outgoing();
+                loop {
+                    futures::select_biased! {
+                        () = sd.cancelled().fuse() => return,
+                        m = out_rx.recv().fuse() => {
+                            let Ok(m) = m else { return };
+                            let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Raft {
+                                store: "server".to_owned(),
+                                session: m.session,
+                                from: "server".to_owned(),
+                            });
+                            let msg = crate::proto::ServerMsg::Convo { json, data: m.bytes };
+                            let _ = h.send_to_agent(&m.to_name, crate::proto::LANE_CONVO, &msg).await;
+                        }
+                        () = crate::rt::sleep(crate::convo::raft::TICK).fuse() => {
+                            convo_raft.tick();
+                        }
+                    }
+                }
+            });
+        }
         // Checkpoints of the cluster group's log, to the learners that check them (docs/ci.md
         // W27-R08).
         child!("cluster-custody", h => crate::custody::cluster::checkpoints_loop(h));
@@ -684,6 +712,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             outpost: false,
             declared: cfg.agent.clone(),
             leasing,
+            // In-process local-agent shares the process with `kiln server`, which already holds `http_addr`.
+            node_http: None,
         };
         // `kiln workflow run`'s server stops its runner itself, once the runs it follows ended.
         let agent_down = if cfg.ci.local { shutdown.clone() } else { shutdown_child() };

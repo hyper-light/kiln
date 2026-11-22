@@ -393,6 +393,8 @@ enum Request {
     Learners(BTreeSet<u64>),
     /// A member no link reaches now: the group stops sending it entries until it answers again.
     Unreachable(u64),
+    /// Prompt the leader to heartbeat learners immediately (e.g. on runner connect/reconnect or ReadIndex Ask).
+    Beat,
     /// A learner's: a copy of the database now, over what it applied (a checkpoint of the log that
     /// didn't match what it holds).
     CopyAgain(mpsc::SyncSender<Result<(), String>>),
@@ -420,6 +422,8 @@ pub struct Group {
     seq: Arc<AtomicU64>,
     /// The last entry the group applied: how far the log has taken the writes.
     applied: Arc<AtomicU64>,
+    /// Notified whenever `seq` or `applied` advances, so `Learner::current` wakes immediately without polling.
+    applied_notify: Arc<crate::rt::Notify>,
     /// The last entry applied with its term, and the group's configuration there: where a copy of
     /// kiln.db made from now on stands.
     point: Arc<Mutex<(Point, ConfState)>>,
@@ -536,11 +540,12 @@ impl Group {
         let (out_tx, outgoing) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), Opening>>();
         let applied = Arc::new(AtomicU64::new(0));
+        let applied_notify = Arc::new(crate::rt::Notify::new());
         let log_start = Arc::new(AtomicU64::new(0));
         let stopped = Arc::new(Mutex::new(None));
         let term = Arc::new(AtomicU64::new(0));
         let (away, log_reads) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
-        let (applied2, point2, log_start2, stopped2, term2) = (applied.clone(), point.clone(), log_start.clone(), stopped.clone(), term.clone());
+        let (applied2, applied_notify2, point2, log_start2, stopped2, term2) = (applied.clone(), applied_notify.clone(), point.clone(), log_start.clone(), stopped.clone(), term.clone());
         let (away2, log_reads2) = (away.clone(), log_reads.clone());
         let join = thread::Builder::new()
             .name("kiln-cluster".into())
@@ -573,6 +578,7 @@ impl Group {
                     image: 0,
                     broken: None,
                     applied: applied2,
+                    applied_notify: applied_notify2,
                     point: point2,
                     log_start: log_start2,
                     stopped: stopped2,
@@ -596,7 +602,20 @@ impl Group {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(failed(anyhow::anyhow!("the cluster group didn't start within 60 s"))),
         }
-        Ok(Group { tx, thread, join: Some(join), seq, applied, point, log_start, outgoing, stopped, leaves, away, log_reads, term })
+        Ok(Group { tx, thread, join: Some(join), seq, applied, applied_notify, point, log_start, outgoing, stopped, leaves, away, log_reads, term })
+    }
+
+    /// Notifier woken whenever the group's applied index or `seq` advances (eliminates polling in `Learner::current`).
+    pub fn wait_applied(&self) -> Arc<crate::rt::Notify> {
+        Arc::clone(&self.applied_notify)
+    }
+
+    /// Prompt the leader to send a Raft heartbeat to learners right away (e.g. when a runner connects
+    /// or asks where `kiln.db` stands), avoiding up to a full `BEAT` (1 s) catch-up stall.
+    pub fn beat_now(&self) {
+        if self.tx.try_send(Request::Beat).is_ok() {
+            self.thread.unpark();
+        }
     }
 
     /// Where it stands: kiln.db's last write, and the last entry applied (`/healthz/server`).
@@ -857,6 +876,8 @@ struct Driver {
     broken: Option<String>,
     /// The last entry applied, for the store to say.
     applied: Arc<AtomicU64>,
+    /// Woken whenever `applied` or `seq` moves forward.
+    applied_notify: Arc<crate::rt::Notify>,
     /// The last entry applied with its term, and the configuration there (for copies).
     point: Arc<Mutex<(Point, ConfState)>>,
     /// Where the log starts, for [`Group::log_start`].
@@ -919,6 +940,12 @@ impl Driver {
                     Request::Learners(members) => self.wanted = Some(members),
                     Request::Unreachable(member) => {
                         self.replica.report_unreachable(member).ok();
+                    }
+                    Request::Beat => {
+                        if self.server && !self.replica.configuration().learners.is_empty() {
+                            self.beat = Instant::now();
+                            self.replica.beat().ok();
+                        }
                     }
                     Request::CopyAgain(reply) => {
                         let took = self.replica.machine_mut().copy_again("entries that came changed").map_err(|e| e.0.to_owned());
@@ -1179,8 +1206,11 @@ impl Driver {
             }
         }
         let at = self.replica.applied();
-        self.applied.store(at.index, Ordering::SeqCst);
+        let prev = self.applied.swap(at.index, Ordering::SeqCst);
         *self.point.lock() = (at, self.replica.configuration().clone());
+        if at.index != prev {
+            self.applied_notify.notify();
+        }
         Ok(())
     }
 }

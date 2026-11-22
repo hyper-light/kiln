@@ -2905,7 +2905,28 @@ impl Registry {
     /// before it, so the owner takes a task's end after all it said.
     pub(crate) async fn take_local(&self, said: super::session::Local) {
         match said {
-            super::session::Local::Said(id, u) => self.ingest_from(&Location::Local, &id, u, false).await,
+            super::session::Local::Said(id, u) => {
+                // Part 3: sessions started locally on the server node elect `"server"` as their
+                // initial per-session Raft leader and replicate across all connected fleet nodes.
+                if let Some(mgr) = crate::convo::raft::global() {
+                    let now_ms = crate::util::now_ms();
+                    match &u {
+                        Update::Open { info, .. } => {
+                            let rows = crate::convo::rows::of(&id, &u, now_ms);
+                            let _ = mgr.open_leader(&id, info.epoch, rows);
+                        }
+                        Update::State { .. } | Update::Meta { .. } | Update::Events { .. } | Update::Changes { .. } | Update::Reset { .. } | Update::Closed => {
+                            let rows = crate::convo::rows::of(&id, &u, now_ms);
+                            if !rows.is_empty() {
+                                let epoch = self.epoch_of(&id);
+                                let _ = mgr.propose(&id, epoch, rows);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.ingest_from(&Location::Local, &id, u, false).await
+            }
             super::session::Local::Gone(id) => {
                 let of = id.clone();
                 if !self.sessions.send(&id, Msg::Run(Box::new(move |s: &mut Shard| s.task_gone(&of)))).await {
@@ -5002,9 +5023,16 @@ impl Registry {
     /// [`Registry::send_asked`] sends one: a person's held to no depth and taking no turn, an
     /// agent's held to the recipient's, never as kiln's own (`server`).
     pub async fn command_from(&self, hub: &Hub, id: &str, sender: &str, c: Command) -> Sent {
+        self.command_from_to(hub, id, sender, None, c).await
+    }
+
+    /// [`Registry::command_from`], honoring an optional UI-supplied `target_hint` runner id
+    /// (`X-Kiln-Target` / `SessionUp::Under.target`) so messages route straight to the owning
+    /// runner without enqueueing in the central server's mail table.
+    pub async fn command_from_to(&self, hub: &Hub, id: &str, sender: &str, target_hint: Option<&str>, c: Command) -> Sent {
         // Routed to its session where its holder takes messages so (docs/sends.md, "Routed to its session"): its inbox
         // there takes it into custody, as its sender's.
-        if let Some(to) = self.routable(hub, id, &c) {
+        if let Some(to) = self.routable_to(hub, id, &c, target_hint) {
             return self.send_routed(hub, id, to, c, sender, sender, None, None).await;
         }
         if into_custody(hub, id, sender, &c) {
@@ -5112,26 +5140,38 @@ impl Registry {
     /// connected from now, when that runner names [`crate::proto::feature::MAIL_ROUTE`]. None: the server holds it in its
     /// own custody as W20 does (a runner from before routing, or one that's away).
     pub fn routed_to(&self, hub: &Hub, id: &str) -> Option<Location> {
-        match self.location(id)? {
+        self.routed_target(hub, id, None)
+    }
+
+    /// Resolve the owning runner for session `id` (honoring optional `target_hint` from the UI
+    /// before falling back to recorded `location(id)`), checking both exact session ownership and
+    /// the machine's newest active `MAIL_ROUTE`-capable runner connection so freshly opened or
+    /// reconnected sessions never fall back to the central server's mail table.
+    pub fn routed_target(&self, hub: &Hub, id: &str, target_hint: Option<&str>) -> Option<Location> {
+        let machine = match self.location(id) {
             // The server's own sessions keep its custody (W20) for now: what reads their receipts (the server's own
             // goals, plans and programs, and their tests) is W20's (docs/sends.md, "What's open").
-            Location::Local => None,
-            Location::Machine(machine) => {
-                let instances = hub.instances.load();
-                let peer = instances.owner(&crate::instances::Owned::Agent(id.to_owned()))?;
-                let owner = instances.get(peer)?;
-                let routes = owner.name == machine && instances.current_connection(peer) && crate::proto::feature::speaks(&owner.features, crate::proto::feature::MAIL_ROUTE);
-                routes.then_some(Location::Machine(machine))
-            }
-        }
+            Some(Location::Local) => return None,
+            Some(Location::Machine(m)) => m,
+            None => crate::frontdoor::replica::normalize_target(target_hint?)?.to_owned(),
+        };
+        let instances = hub.instances.load();
+        let peer = instances.owner(&crate::instances::Owned::Agent(id.to_owned())).or_else(|| instances.newest(&machine))?;
+        let owner = instances.get(peer)?;
+        let routes = owner.name == machine && instances.current_connection(peer) && crate::proto::feature::speaks(&owner.features, crate::proto::feature::MAIL_ROUTE);
+        routes.then_some(Location::Machine(machine))
     }
 
     /// [`Registry::routed_to`] for command `c`: only a message with an id is routed (its session's inbox takes it once).
     fn routable(&self, hub: &Hub, id: &str, c: &Command) -> Option<Location> {
+        self.routable_to(hub, id, c, None)
+    }
+
+    fn routable_to(&self, hub: &Hub, id: &str, c: &Command, target_hint: Option<&str>) -> Option<Location> {
         if !super::session::is_message(c) || message_id(c).is_none() {
             return None;
         }
-        self.routed_to(hub, id)
+        self.routed_target(hub, id, target_hint)
     }
 
     /// Message `c` (with an id) to session `id`, sent with its `route` to where the session is (`to`), whose own inbox
@@ -5235,11 +5275,27 @@ impl Registry {
                 None => sent,
             };
         }
-        if matches!(sent, Sent::Unreachable) && self.location(id).is_some() {
-            return match self.publish_command(hub, id, c, provenance, owner.to_owned(), sender.to_owned(), status).await {
-                Ok(receipt) => Sent::Published(receipt),
-                Err(error) => Sent::PublicationRefused(error),
+        // Only fall back to the server's legacy W20 custody table if the session is now on a
+        // runner that predates `MAIL_ROUTE` (or `Location::Local`). For `MAIL_ROUTE`-capable
+        // runners, NEVER enqueue their messages into the server node's local queue!
+        if matches!(sent, Sent::Unreachable) && self.location(id).is_some() && self.routed_to(hub, id).is_none() {
+            let legacy = match self.location(id) {
+                Some(Location::Local) => true,
+                Some(Location::Machine(m)) => {
+                    let instances = hub.instances.load();
+                    instances
+                        .newest(&m)
+                        .and_then(|p| instances.get(p))
+                        .is_some_and(|o| !crate::proto::feature::speaks(&o.features, crate::proto::feature::MAIL_ROUTE))
+                }
+                None => false,
             };
+            if legacy {
+                return match self.publish_command(hub, id, c, provenance, owner.to_owned(), sender.to_owned(), status).await {
+                    Ok(receipt) => Sent::Published(receipt),
+                    Err(error) => Sent::PublicationRefused(error),
+                };
+            }
         }
         sent
     }
@@ -5295,11 +5351,17 @@ impl Registry {
     /// it). Its answers are kept as their stand says, whether or not who sent it is still there to
     /// hear them: one parked at once, then its runner's once it's back.
     pub async fn send_asked(&self, hub: &Arc<Hub>, id: &str, scope: &str, cmd: &str, c: Command) {
+        self.send_asked_to(hub, id, scope, cmd, None, c).await;
+    }
+
+    /// [`Registry::send_asked`], honoring optional `target_hint` attached by the UI
+    /// (`SessionUp::Under.target` / `X-Kiln-Target`).
+    pub async fn send_asked_to(&self, hub: &Arc<Hub>, id: &str, scope: &str, cmd: &str, target_hint: Option<&str>, c: Command) {
         use std::time::Instant;
         // Routed to its session (docs/sends.md, "Routed to its session"; Ada, 2026-11-20): sent now to where the session
         // is, whose own inbox takes it into custody as its sender's; its answer waited for off this caller's way, so
         // what the caller sends next goes on behind it, in order.
-        if let Some(to) = self.routable(hub, id, &c) {
+        if let Some(to) = self.routable_to(hub, id, &c, target_hint) {
             let route = super::route::Route::new(route_target(&to), scope);
             let pending = self.route(hub, id, to.clone(), c.clone(), route, None).await;
             let (h, session, scope, cmd) = (Arc::clone(hub), id.to_owned(), scope.to_owned(), cmd.to_owned());

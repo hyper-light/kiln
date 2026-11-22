@@ -302,7 +302,17 @@ pub enum Outcome {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[serde(untagged)]
 pub enum SessionUp {
-    Under { t: Cmd, id: String, c: Command },
+    Under {
+        t: Cmd,
+        id: String,
+        c: Command,
+        /// The session's runner target as the UI knows it (`agent:<runner>` or `local`), so any
+        /// node receiving the message checks whether it owns the target before forwarding it
+        /// directly to that runner without enqueueing locally.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
+        target: Option<String>,
+    },
     Unread(UnreadFrame),
     Bare(Command),
 }
@@ -473,9 +483,14 @@ pub fn session_up(text: &str) -> Result<SessionUp, Unreadable> {
             let Some(id) = command_id(o.get("id")) else {
                 return Err(new(None, Refused::malformed("cmd", format!("a command's id is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX))));
             };
+            let target = match o.get("target") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) if !s.trim().is_empty() && s.len() <= crate::harness::ops::KEY_MAX && !s.chars().any(char::is_control) => Some(s.trim().to_owned()),
+                Some(_) => return Err(new(Some(id), Refused::malformed("cmd", "its `target` isn't a valid runner target string"))),
+            };
             let Some(c) = o.get("c").cloned() else { return Err(new(Some(id), Refused::malformed("cmd", "no command (`c`)"))) };
             match tagged(c, "type", "command") {
-                Ok(c) => Ok(SessionUp::Under { t: Cmd::Cmd, id, c }),
+                Ok(c) => Ok(SessionUp::Under { t: Cmd::Cmd, id, c, target }),
                 Err(refused) => Err(new(Some(id), refused)),
             }
         }
@@ -861,7 +876,11 @@ mod tests {
         assert!(!refused(session_up(r#"{"t":"cmd","id":"c4"}"#)).bare);
         // What reads: a command under its id, a bare one, an unread frame; an unknown field in a
         // known command is taken.
-        assert_eq!(session_up(r#"{"t":"cmd","id":"c1","c":{"type":"interrupt","later":1}}"#).ok(), Some(SessionUp::Under { t: Cmd::Cmd, id: "c1".into(), c: Command::Interrupt }));
+        assert_eq!(session_up(r#"{"t":"cmd","id":"c1","c":{"type":"interrupt","later":1}}"#).ok(), Some(SessionUp::Under { t: Cmd::Cmd, id: "c1".into(), c: Command::Interrupt, target: None }));
+        assert_eq!(
+            session_up(r#"{"t":"cmd","id":"c1","target":"agent:laptop-b","c":{"type":"interrupt"}}"#).ok(),
+            Some(SessionUp::Under { t: Cmd::Cmd, id: "c1".into(), c: Command::Interrupt, target: Some("agent:laptop-b".into()) })
+        );
         assert_eq!(session_up(r#"{"type":"interrupt"}"#).ok(), Some(SessionUp::Bare(Command::Interrupt)));
         let unread = UnreadFrame { t: UnreadTag::Unread, of: "hologram".into(), why: "unknown frame".into() };
         assert_eq!(session_up(r#"{"t":"unread","of":"hologram","why":"unknown frame"}"#).ok(), Some(SessionUp::Unread(unread.clone())));

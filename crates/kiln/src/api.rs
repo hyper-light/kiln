@@ -523,6 +523,7 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["__live", file]) if crate::live::lab_dir().is_some() => return Ok(boxed(|| crate::live::lab_file(file)).await),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
         (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
+        (&Method::GET, ["api", "convo", "raft"]) => return Ok(convo_raft_health()),
         (&Method::GET, ["healthz", "delay"]) => return Ok(shard_delay()),
         (&Method::GET, ["healthz", "strain"]) => return Ok(strain(&req)),
         (&Method::GET, ["dl", "kiln"]) => return boxed(download_binary).await,
@@ -7334,6 +7335,11 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
         return Err(err(StatusCode::BAD_REQUEST, format!("an Idempotency-Key is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX)));
     }
     let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
+    let target_hint = req
+        .headers()
+        .get(crate::frontdoor::replica::TARGET_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     let mut c: crate::harness::model::Command = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     // The Agents page's interrupt, controls and restart are operations (kiln plan 01a1dd2e8618733a87f2793aab1322a8
     // P5.6, S2): one way in for each, held to what every operation is held to.
@@ -7369,7 +7375,7 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
             let kind = hub.harness.kind_of(hub, id, &c);
             let rx = match hub.harness.asked.take(id, &scope, &k, kind, Instant::now()) {
                 (_, Taken::New(rx)) => {
-                    hub.harness.send_asked(hub, id, &scope, &k, c).await;
+                    hub.harness.send_asked_to(hub, id, &scope, &k, target_hint.as_deref(), c).await;
                     rx
                 }
                 (_, Taken::Waiting(rx)) => rx,
@@ -7377,7 +7383,7 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
             };
             rx.await.unwrap_or_else(|_| crate::harness::registry::Sent::Unanswered("the server let go of it before its answer came".into()))
         }
-        None => hub.harness.command_from(hub, id, &crate::harness::ops::key_scope(&caller), c).await,
+        None => hub.harness.command_from_to(hub, id, &crate::harness::ops::key_scope(&caller), target_hint.as_deref(), c).await,
     };
     if sent.kept_for_person() && let Some(attention)=attention {
         crate::harness::attention_hooks::record_prepared(hub,&caller,id,attention).await;
@@ -8518,7 +8524,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     // Sent now, in the order the viewer sent them; each answer comes later. Under
                     // its client's id (docs/wire.md, "The UI's sockets"): taken once however often
                     // it comes, and answered on this socket once, `ack` or `nack`.
-                    Ok(SessionUp::Under { id: cmd, c, .. }) => {
+                    Ok(SessionUp::Under { id: cmd, c, target, .. }) => {
                         use crate::harness::asked::{Taken, frame};
                         hyper_rt::futures::label(&VIEWER_COMMAND);
                         let kind = hub.harness.kind_of(&hub, &id, &c);
@@ -8526,7 +8532,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                             (kind, Taken::New(rx)) => {
                                 audit_command(&hub, &mut audit, &who, &id, &c).await;
                                 let attention = SocketAttention::of(&hub, caller.as_ref(), &id, &c, Some(&cmd));
-                                hub.harness.send_asked(&hub, &id, &scope, &cmd, c).await;
+                                hub.harness.send_asked_to(&hub, &id, &scope, &cmd, target.as_deref(), c).await;
                                 answers.push(answer_of(cmd, rx, kind, attention));
                             }
                             (kind, Taken::Waiting(rx)) => answers.push(answer_of(cmd, rx, kind, None)),
@@ -8885,8 +8891,18 @@ fn server_health(hub: &Hub) -> Response {
                 "away": hub.store.group().map_or(0, crate::store::group::Group::away),
                 "cache": hub.store.group().map(|g| json!({ "bytes": g.cache(), "next": g.cache(), "file_reads": g.log_reads() })),
             })),
+            "convo_raft": crate::convo::raft::global().map_or(json!({ "enabled": false }), |m| {
+                let (groups, leading, following) = m.summary();
+                json!({ "enabled": true, "groups": groups, "leading": leading, "following": following })
+            }),
         }),
     )
+}
+
+/// `GET /api/convo/raft`: per-session conversation Raft group states on this node.
+fn convo_raft_health() -> Response {
+    let groups = crate::convo::raft::global().map_or_else(Vec::new, |m| m.all_status());
+    srv::json(StatusCode::OK, &json!({ "node": "server", "groups": groups }))
 }
 
 /// The share of the runners connected before a start that are connected now, to three places:

@@ -82,6 +82,9 @@ pub struct Opts {
     /// server's own runner. None elsewhere, where its runs' asks go to the server's broker over this runner's link to it
     /// (`secrets::lessor::Remote`, its reach node's), or, with no link, are refused (`sandbox::hexvm::NO_BROKER`).
     pub leasing: Option<crate::sandbox::Leasing>,
+    /// Local HTTP server address for this runner node (default `Some("0.0.0.0:7070")`; `None` for
+    /// ephemeral pods, outposts, in-process `local-agent`, or `--http-addr off`).
+    pub node_http: Option<String>,
 }
 
 /// Probes this runner's facts and sends them (docs/ci.md W13-R01), one probe at a time.
@@ -1127,6 +1130,9 @@ struct ReplicaStart {
     starting: Arc<std::sync::atomic::AtomicBool>,
     /// The server's last word to join the group as a learner (`None` once it said Leave).
     join: Arc<parking_lot::Mutex<Option<(u64, String)>>>,
+    /// Cluster Raft frames that arrived while the learner was opening (replayed once open so the
+    /// first heartbeat/append is never dropped during snapshot startup).
+    pending: Arc<parking_lot::Mutex<VecDeque<(crate::store::learner::Msg, Vec<u8>)>>>,
     up: crate::memory::queue::Sender<Up>,
     dir: PathBuf,
     me: String,
@@ -1173,7 +1179,14 @@ impl ReplicaStart {
                     tracing::info!(member, "this machine holds a replica of kiln's records");
                     let learner = Arc::new(learner);
                     crate::store::learner::set_global(Some(Arc::clone(&learner)));
-                    *r.slot.lock() = Some(learner);
+                    *r.slot.lock() = Some(Arc::clone(&learner));
+                    // Replay any Raft messages buffered while the learner opened, then ping the
+                    // leader immediately so replication begins with zero stall.
+                    let queued: Vec<(crate::store::learner::Msg, Vec<u8>)> = r.pending.lock().drain(..).collect();
+                    for (m, raft) in queued {
+                        learner.heard(&m, raft);
+                    }
+                    learner.ping();
                     let up = r.up.clone();
                     crate::rt::spawn(async move {
                         while let Ok(m) = said.recv().await {
@@ -1914,6 +1927,18 @@ async fn recv_opt<T>(rx: Option<&async_channel::Receiver<T>>) -> Option<T> {
     }
 }
 
+/// The next item on an optional bounded memory queue, pending forever if absent or closed so
+/// `select_biased!` never spins on a closed optional channel.
+async fn recv_queue_opt<T>(rx: Option<&crate::memory::queue::Receiver<T>>) -> T {
+    match rx {
+        Some(r) => match r.recv().await {
+            Ok(v) => v,
+            Err(_) => futures::future::pending().await,
+        },
+        None => futures::future::pending().await,
+    }
+}
+
 async fn sleep_until_opt(t: Option<Instant>) {
     match t {
         Some(t) => crate::rt::sleep_until(t).await,
@@ -2205,10 +2230,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     // The server's last word to join the group as a learner (`None` once it said Leave): what a
     // replica being started goes on with.
     let cluster_join: Arc<parking_lot::Mutex<Option<(u64, String)>>> = Arc::default();
+    let cluster_pending: Arc<parking_lot::Mutex<VecDeque<(crate::store::learner::Msg, Vec<u8>)>>> = Arc::default();
     // Reach: links to other runners, and the runs this machine does for them (none in a job pod).
     // Agent sessions other runners hand this one (a session moving here) are taken over by its
     // session host, once there is one (below).
     let (adopt_tx, adopt_rx) = crate::memory::queue::places::<crate::reach::node::Adoption>(&crate::memory::owners::CHANNELS, 4);
+    // Direct runner-to-runner `hyper-quic` (and relayed reach fallback) channels for P2P routed
+    // harness sends and per-session conversation Raft messages.
+    let (p2p_send_tx, p2p_send_rx) = crate::memory::queue::unbounded::<crate::reach::quic::HarnessSendAsk>(&crate::memory::owners::CHANNELS);
+    let (convo_raft_tx, convo_raft_rx) = crate::memory::queue::unbounded::<crate::reach::quic::ConvoRaftIn>(&crate::memory::owners::CHANNELS);
     let reach = o.reach.filter(|_| !o.ephemeral).map(|accept| {
         // `[runner] on_battery` and `budget`, and `[reach]`'s placement settings of its own kiln
         // config, kiln's own without one (W05-R26; W05-R09, W05-R39, LB08; docs/needs.md §6). One it
@@ -2255,31 +2285,35 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             machine_name: name.clone(),
             machine: machine_leaf.clone(),
         });
-        let cfg = crate::reach::node::Config { adopt: Some(adopt_tx.clone()), objects: None, root: root.clone(), on_battery, place, capacity, ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept) };
+        let cfg = crate::reach::node::Config {
+            adopt: Some(adopt_tx.clone()),
+            objects: None,
+            root: root.clone(),
+            on_battery,
+            place,
+            capacity,
+            harness_send: Some(p2p_send_tx.clone()),
+            convo_raft: Some(convo_raft_tx.clone()),
+            direct_quic: !o.ephemeral && !o.outpost,
+            ..crate::reach::node::Config::for_runner(&name, &o.state_dir, accept)
+        };
         (Arc::clone(&cfg.using), cfg.mirrors.clone(), crate::reach::node::start(cfg))
     });
-    let reach = reach.and_then(|(using, mirrors, started)| match started {
-        Ok((handle, said)) => {
+    let (reach, reach_said) = match reach {
+        Some((using, mirrors, Ok((handle, said)))) => {
             crate::reach::node::set_global(handle.clone());
             // The runs this runner follows for its agents, kept across restarts (docs/reach.md §7, T3).
             crate::reach::told::start(&o.state_dir.join("reach"), take_over_pending.is_some());
             // What other runners' trees left here, kept as people's rules say (docs/reach.md §5.1).
             crate::reach::keeper::start(handle.clone(), using, mirrors);
-            let up = up_tx.clone();
-            crate::rt::spawn(async move {
-                while let Ok(m) = said.recv().await {
-                    if up.send(Up::Reach(m)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            Some(handle)
+            (Some(handle), Some(said))
         }
-        Err(e) => {
+        Some((_, _, Err(e))) => {
             tracing::warn!(error = %format!("{e:#}"), "reach is off on this runner");
-            None
+            (None, None)
         }
-    });
+        None => (None, None),
+    };
     let uplink = Uplink(up_tx);
     // What this loop says itself goes on a channel of its own, never waiting: the uplink is
     // bounded and this loop is all that drains it, so a send of its own into a full one waited
@@ -2293,7 +2327,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         slot: cluster.clone(),
         starting: cluster_starting.clone(),
         join: cluster_join.clone(),
-        up: uplink.0.clone(),
+        pending: cluster_pending.clone(),
+        // Priority unbounded channel: cluster Raft control/votes/heartbeats must never block behind
+        // bulk log/convo uplinks on the bounded `uplink` channel.
+        up: own.0.clone(),
         dir: o.state_dir.clone(),
         me: name.clone(),
         server: o.server_url.clone(),
@@ -2681,6 +2718,101 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
         });
     }
+    // Parts 1–4: per-session/conversation Raft manager + direct `hyper-quic` P2P forwarding +
+    // unified local HTTP server entrypoint (`0.0.0.0:7070` by default on every runner).
+    let inbox_waiters = Arc::new(crate::frontdoor::replica::InboxWaiters::default());
+    let convo_raft = (!o.ephemeral && !o.outpost).then(|| {
+        let mgr = crate::convo::raft::Manager::new(&name, convo.clone());
+        mgr.register_peers(["server"]);
+        crate::convo::raft::set_global(Some(Arc::clone(&mgr)));
+        // Drive outgoing per-session Raft frames (server via LANE_CONVO, peers via direct hyper-quic first).
+        let (out_rx, up_raft, reach_raft, me_name, stop_raft) = (mgr.outgoing(), own.0.clone(), reach.clone(), name.clone(), shutdown.clone());
+        crate::rt::spawn(async move {
+            loop {
+                let next = futures::select_biased! {
+                    () = stop_raft.cancelled().fuse() => return,
+                    m = out_rx.recv().fuse() => m,
+                };
+                let Ok(m) = next else { return };
+                if m.to_name == "server" {
+                    let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Raft {
+                        store: "raft".to_owned(),
+                        session: m.session,
+                        from: me_name.clone(),
+                    });
+                    let _ = up_raft.try_send(Up::Convo(AgentMsg::Convo { json, data: m.bytes }));
+                } else if let Some(r) = &reach_raft {
+                    r.send_convo_raft(&m.to_name, &m.session, m.bytes);
+                }
+            }
+        });
+        // Feed inbound per-session Raft frames from peer runners (direct hyper-quic / relayed reach) + periodic tick.
+        let (mgr_in, stop_in) = (Arc::clone(&mgr), shutdown.clone());
+        crate::rt::spawn(async move {
+            loop {
+                futures::select_biased! {
+                    () = stop_in.cancelled().fuse() => return,
+                    m = convo_raft_rx.recv().fuse() => match m {
+                        Ok(m) => {
+                            let _ = mgr_in.step(&m.from, &m.session, &m.bytes);
+                        }
+                        Err(_) => return,
+                    },
+                    () = crate::rt::sleep(crate::convo::raft::TICK).fuse() => {
+                        mgr_in.tick();
+                    }
+                }
+            }
+        });
+        mgr
+    });
+    let local_node = (!o.ephemeral && !o.outpost).then(|| {
+        let ln = crate::frontdoor::replica::LocalNode {
+            machine: name.clone(),
+            label: Some(crate::pki::sanitize_name(&o.name)),
+            host: harness.clone(),
+            waiters: Arc::clone(&inbox_waiters),
+            reach: reach.clone(),
+            convo: convo.clone(),
+            convo_raft: convo_raft.clone(),
+        };
+        crate::frontdoor::replica::set_local_node(Some(ln.clone()));
+        // Handle inbound P2P routed harness sends arriving over direct `hyper-quic` (or relayed reach).
+        // Enqueues ONLY if this runner actually owns `ask.session`; never enqueues non-local messages.
+        let ln_in = ln.clone();
+        crate::rt::spawn(async move {
+            while let Ok(ask) = p2p_send_rx.recv().await {
+                let ln = ln_in.clone();
+                crate::rt::spawn(async move {
+                    let route = crate::harness::route::Route::of(&ask.json).unwrap_or_else(|| crate::harness::route::Route::new(&ln.machine, &ask.from));
+                    let reply = match crate::wire::payload::payload::<crate::harness::model::Command>(crate::wire::unread::Wire::ReachLink, "harness.command", &ask.json) {
+                        Ok(cmd) => ln.enqueue_local(&ask.session, ask.epoch, cmd, route).await,
+                        Err(e) => crate::reach::wire::P2pSendReply::Error { why: format!("malformed command: {e}") },
+                    };
+                    let _ = ask.reply.send(reply);
+                });
+            }
+        });
+        ln
+    });
+    // Start this runner node's own local HTTP server (`0.0.0.0:7070` by default) unless disabled or
+    // taking over during blue/green upgrade. Gracefully yields on `AddrInUse` if co-located with `kiln server`.
+    let _node_http = match (&o.node_http, &local_node) {
+        (Some(addr), Some(ln)) if take_over_pending.is_none() => match crate::frontdoor::proxy::Upstream::parse(&o.server_url, &root) {
+            Ok(upstream) => match crate::frontdoor::replica::listen_node_http(addr, upstream, ln.clone(), shutdown.clone()) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::warn!(%addr, error = %format!("{e:#}"), "node HTTP server did not start");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(url = %o.server_url, error = %format!("{e:#}"), "node HTTP server skipped: invalid server_url");
+                None
+            }
+        },
+        _ => None,
+    };
     let mut harness_wait: Option<Instant> = None;
     // What it last told the server of its machine's say on upgrades, and the newer kiln it heard of.
     let mut accept_said: Option<bool> = None;
@@ -2857,7 +2989,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         // Ephemeral agents leave once their one job is done and everything is delivered: its
         // result received, or given 30 s (a server older than receipts never says).
-        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && own_rx.is_empty() && unreceived.values().all(|(at, _)| at.elapsed() >= EPHEMERAL_RECEIPT_WAIT) {
+        if o.ephemeral && served_dedicated && jobs.is_empty() && buffer.is_empty() && up_rx.is_empty() && own_rx.is_empty() && reach_said.as_ref().is_none_or(|r| r.is_empty()) && unreceived.values().all(|(at, _)| at.elapsed() >= EPHEMERAL_RECEIPT_WAIT) {
             tracing::info!("ephemeral agent finished its job; exiting");
             crate::rt::sleep(Duration::from_millis(500)).await;
             return Ok(());
@@ -2869,7 +3001,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             let holds = harness.as_ref().is_some_and(|h| h.get(id).is_some());
             session_seen |= holds;
             match session_runner_ends(session_seen, holds, started.elapsed()) {
-                Some(Ok(())) if buffer.is_empty() && up_rx.is_empty() && own_rx.is_empty() => {
+                Some(Ok(())) if buffer.is_empty() && up_rx.is_empty() && own_rx.is_empty() && reach_said.as_ref().is_none_or(|r| r.is_empty()) => {
                     tracing::info!(session = %id, "ephemeral runner's agent session ended; exiting");
                     crate::rt::sleep(Duration::from_millis(500)).await;
                     return Ok(());
@@ -2956,6 +3088,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             r = done_rx.recv().fuse() => match r { Ok(r) => Ev::Done(r), Err(_) => Ev::Watchdog },
             () = renew_alarm.rung().fuse() => Ev::Renew,
             () = stop_alarm.rung().fuse() => Ev::Lease,
+            // Control-plane replies (command ACKs/NACKs, lease renewals, session placement answers,
+            // reach offers) preempt streaming telemetry, terminal output, harness events, and bulk
+            // uplinks so moderate load never starves ACKs or saturates the server's command room.
+            up = own_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
+            m = recv_queue_opt(reach_said.as_ref()).fuse() => Ev::Up(Up::Reach(m)),
             () = crate::runner::custody::moved_since(custody_seen).fuse() => Ev::Heartbeat,
             () = sleep_until_opt(chores_due).fuse() => Ev::Heartbeat,
             () = crate::sense::pace::moved_since(moves_seen).fuse() => Ev::Sample,
@@ -2979,7 +3116,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             d = recv_opt(delayed.as_ref()).fuse() => match d { Some(due) => Ev::Delayed(due), None => Ev::Watchdog },
             t = term_rx.recv().fuse() => match t { Ok((s, out)) => Ev::Term(s, out), Err(_) => Ev::Watchdog },
             h = harness_rx.recv().fuse() => match h { Ok(t) => Ev::Harness(t.session, t.update, t.at), Err(_) => Ev::Watchdog },
-            up = own_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             up = up_rx.recv().fuse() => match up { Ok(u) => Ev::Up(u), Err(_) => Ev::Watchdog },
             () = front_door_changed(front_door.as_ref()).fuse() => Ev::FrontDoor,
             () = headroom_changed(headroom.as_ref()).fuse() => Ev::Headroom,
@@ -4401,8 +4537,11 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         match *msg {
                             Msg::Join { member, token } if !o.ephemeral && !o.outpost => {
                                 // A replica being started goes on with the newest word to join.
-                                *cluster_join.lock() = Some((member, token));
-                                if cluster.lock().is_some() {
+                                *cluster_join.lock() = Some((member, token.clone()));
+                                if let Some(l) = cluster.lock().clone() {
+                                    // Refresh snapshot token on reconnect & immediately wake leader replication.
+                                    l.update_token(token);
+                                    l.ping();
                                     continue;
                                 }
                                 replica.start();
@@ -4410,6 +4549,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             Msg::Leave => {
                                 // A replica being started stops trying.
                                 *cluster_join.lock() = None;
+                                cluster_pending.lock().clear();
                                 // Another process of this machine holds it now: its files are let go
                                 // (stopping it waits for its thread: not on this loop).
                                 if let Some(old) = cluster.lock().take() {
@@ -4423,6 +4563,12 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 let learner = cluster.lock().clone();
                                 if let Some(l) = learner {
                                     l.heard(&m, raft);
+                                } else if cluster_starting.load(std::sync::atomic::Ordering::Acquire) {
+                                    let mut q = cluster_pending.lock();
+                                    if q.len() >= 256 {
+                                        q.pop_front();
+                                    }
+                                    q.push_back((m, raft));
                                 }
                             }
                             _ => {}
@@ -4431,6 +4577,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     Carried::Read(FromServer::Convo { msg, data }) => {
                         let m = *msg;
+                        if let crate::convo::feed::Msg::Raft { session, from, .. } = &m {
+                            if let Some(mgr) = &convo_raft {
+                                let sender = if from.is_empty() { "server" } else { from.as_str() };
+                                if let Err(e) = mgr.step(sender, session, &data) {
+                                    tracing::debug!(%session, from = %sender, error = %format!("{e:#}"), "convo Raft step from server failed");
+                                }
+                            }
+                            continue;
+                        }
                         if convo.as_ref().is_some_and(|st| st.id() == m.store()) {
                             // The server's answer to this runner's own feed.
                             if let Some(f) = &shipper {
@@ -5933,6 +6088,37 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // A session's turn ending is what an upgrade waiting on its sessions waits on.
                 if upgrade_pending && jobs.is_empty() && harness.as_ref().is_some_and(|h| h.busy() == 0) {
                     taken.push_back(Ev::Watchdog);
+                }
+                // Resolve any local HTTP or direct `hyper-quic` P2P caller awaiting this inbox receipt.
+                if let crate::harness::core::Update::Inbox { said } = &u {
+                    inbox_waiters.resolve(&session, said);
+                }
+                // Part 3: per-session/conversation Raft replication — the node where the session
+                // starts and runs leads that session's Raft group and replicates all durable updates
+                // across the connected fleet.
+                if let Some(mgr) = &convo_raft {
+                    let now_ms = crate::util::now_ms();
+                    match &u {
+                        crate::harness::core::Update::Open { info, .. } => {
+                            let rows = crate::convo::rows::of(&session, &u, now_ms);
+                            if let Err(e) = mgr.open_leader(&session, info.epoch, rows) {
+                                tracing::debug!(%session, error = %format!("{e:#}"), "convo Raft open_leader failed");
+                            }
+                        }
+                        crate::harness::core::Update::State { .. }
+                        | crate::harness::core::Update::Meta { .. }
+                        | crate::harness::core::Update::Events { .. }
+                        | crate::harness::core::Update::Changes { .. }
+                        | crate::harness::core::Update::Reset { .. }
+                        | crate::harness::core::Update::Closed => {
+                            let rows = crate::convo::rows::of(&session, &u, now_ms);
+                            if !rows.is_empty() {
+                                let epoch = session_epochs.get(&session).copied().unwrap_or(0);
+                                let _ = mgr.propose(&session, epoch, rows);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 // Each session this process holds has an identity at its epoch, asked for until it
                 // has one; one that closed lets go of its keys (docs/ci.md W27-R01).

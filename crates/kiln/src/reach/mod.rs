@@ -20,6 +20,7 @@ pub mod measure;
 pub mod node;
 pub(crate) mod owned;
 pub mod place;
+pub mod quic;
 pub mod relay;
 pub mod reuse;
 pub mod serve;
