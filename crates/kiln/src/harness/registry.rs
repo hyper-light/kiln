@@ -5703,6 +5703,13 @@ impl Registry {
             let why = format!("{} runs a kiln from before signed hand-overs: it signs no receipt of kiln's take", hub.shown(to));
             unsigned(hub, id, pkg.state.epoch.saturating_add(1), &format!("runner {to}"), why);
         }
+        // What waited in its journal where it was goes in the package to a runner that takes routed messages; for one from
+        // before, the server holds it in its custody (W20's) once the session is on its way there, so none is lost.
+        let routes = {
+            let inst = hub.instances.load();
+            inst.newest(to).and_then(|p| inst.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::MAIL_ROUTE))
+        };
+        let held = if routes { Vec::new() } else { std::mem::take(&mut pkg.waiting) };
         let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
         // Its copy where it was doesn't count from now on: not here, not in the store (rows that
         // machine still sends are left out).
@@ -5730,7 +5737,15 @@ impl Registry {
         tracing::info!(session = %id, from = %from_name, %to, bytes = bytes.len(), "agent session goes on on another machine, from the server's store");
         // Given its environment in the process it goes to: announcing it with it there asks nothing more.
         crate::agentenvs::resolve::given(hub, id, &format!("agent:{to}"));
-        send_package(hub, id, to, &bytes).await
+        let sent = send_package(hub, id, to, &bytes).await;
+        if sent.is_ok() {
+            for w in held {
+                if let Err(e) = self.publish_command(hub, id, w.command, None, w.sender.clone(), w.sender, w.status).await {
+                    tracing::warn!(target: "kiln.sends", event = "resume_waiting_lost", session = %id, error = %e, "a message that waited where the session was couldn't be held for it here");
+                }
+            }
+        }
+        sent
     }
 
     pub fn never_started(&self, id: &str) -> bool {

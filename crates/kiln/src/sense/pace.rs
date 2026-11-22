@@ -151,14 +151,10 @@ pub fn between(earlier: &Raw, later: &Raw, interval_us: u64, kept: &mut Kept) ->
         if moved.is_finite() && moved > kept.peak_bps {
             kept.peak_bps = moved;
         }
-        match (kept.calibration.service_us(), latency) {
-            (Some(s0), Some(l)) => {
-                rho = device::utilization(s0, l);
-                stretch = Some(l / s0);
-            }
-            // No request in the interval: nothing waited.
-            (_, None) if ops <= 0.0 => rho = Some(0.0),
-            _ => {}
+        // Its queue's (W05-R26): none in flight, nothing waited.
+        rho = device::utilization(a.in_flight);
+        if let (Some(s0), Some(l)) = (kept.calibration.service_us(), latency) {
+            stretch = Some(l / s0);
         }
     }
     if s.io.is_none() {

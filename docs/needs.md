@@ -824,7 +824,9 @@ device would give a new run's I/O under its load now. The load-balancing kernel 
 - **The work device** (`kiln_ci::pace::device`), where the kernel keeps no I/O stall time and for
   `disk_bps` everywhere: its uncontended service time S₀ fitted from its own history (M/M/1 with
   Little's law: R = S(1 + N), least squares through the origin, weighted by requests), its
-  utilization now ρ = 1 − S₀/R, and its rate for a new run, the most it was seen to move × (1 − ρ).
+  utilization now from its own queue, ρ = N/(1 + N) (M/M/1's N = ρ/(1 − ρ); never 1 − S₀/R, which
+  read a device idle but for reads past its knee: one S₀ is fitted over writes its cache absorbs
+  and reads from flash alike), and its rate for a new run, the most it was seen to move × (1 − ρ).
   On macOS and Windows a device past its knee (ρ > 1/2, M/M/1's: `knee(1)`) is strained as Linux's
   I/O stall past the reserve is.
 - **Thermal throttling is speed now**: core-bound time goes as 1/f (Weiser et al. 1994), so speed

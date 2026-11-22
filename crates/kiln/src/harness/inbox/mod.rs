@@ -67,6 +67,48 @@ pub(crate) const FAMILIES: crate::convo::inbox::Families = crate::convo::inbox::
     all: &[HEADS, MESSAGES, PENDING, transfer::TRANSFERS, transfer::TRANSFER_ROWS],
 };
 
+/// What a session resumed from a store that keeps a copy of its inbox carries of it (the server's, fed by each runner's
+/// conversation store, `crate::convo::inbox`; docs/sends.md, "Routed to its session"): the ids it took, each with its
+/// digest, its newest [`KEEP`] the oldest of them first, those of the messages still waiting left out (they go again);
+/// and the messages still waiting in its journal, in the order they were taken. `taken` and `pending` are its rows of
+/// [`MESSAGES`] and [`PENDING`] as `(key, value, number)`.
+pub fn carried_by(session: &str, taken: Vec<(Vec<u8>, Vec<u8>, u64)>, pending: Vec<(Vec<u8>, Vec<u8>, u64)>) -> (Vec<(String, String)>, Vec<Pending>) {
+    let prefix = session_prefix(session);
+    let mut waiting: Vec<(u64, Pending)> = pending
+        .into_iter()
+        .filter_map(|(key, value, rev)| {
+            key.strip_prefix(prefix.as_slice())?;
+            let pending: Pending = serde_json::from_slice(&value).ok()?;
+            pending.waiting_here().then(|| (pending.accepted_seq.unwrap_or(rev), pending))
+        })
+        .collect();
+    waiting.sort_by_key(|(seq, _)| *seq);
+    let held: std::collections::HashSet<&str> = waiting.iter().map(|(_, p)| p.lease.message.as_str()).collect();
+    let mut ids: Vec<(u64, String, String)> = taken
+        .into_iter()
+        .filter_map(|(key, value, rev)| {
+            let message = std::str::from_utf8(key.strip_prefix(prefix.as_slice())?).ok()?;
+            if held.contains(message) {
+                return None;
+            }
+            let kept: Kept = serde_json::from_slice(&value).ok()?;
+            Some((rev, message.to_owned(), kept.digest))
+        })
+        .collect();
+    ids.sort_by_key(|(rev, ..)| *rev);
+    let past = ids.len().saturating_sub(usize::try_from(KEEP).unwrap_or(usize::MAX));
+    (ids.into_iter().skip(past).map(|(_, message, digest)| (message, digest)).collect(), waiting.into_iter().map(|(_, p)| p).collect())
+}
+
+/// [`carried_by`], read from `store`'s copy of session `session`'s inbox. Blocking.
+pub fn carried_from(store: &crate::convo::store::Store, session: &str) -> anyhow::Result<(Vec<(String, String)>, Vec<Pending>)> {
+    check_session(session).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prefix = session_prefix(session);
+    let taken = store.inbox_rows(MESSAGES, prefix.clone())?;
+    let pending = store.inbox_rows(PENDING, prefix)?;
+    Ok(carried_by(session, taken, pending))
+}
+
 /// The session a key of one of an inbox's families names: its id's bytes.
 fn session_of<'k>(family: &str, key: &'k [u8]) -> Option<&'k [u8]> {
     match family {
@@ -761,8 +803,9 @@ impl Inbox {
     /// Every communication of session `session`'s at `epoch` its journal holds and that never came to an end, ended as
     /// `disposition` now (a reset, docs/agents.md "Reset": cancelled for whoever asked), a page at a time, each as it
     /// was read (one written since is read again). Its original stays, as every terminal record's does, until its
-    /// server acknowledges the end; one that came to an end already is left as it is. Each one ended, with its lease,
-    /// for its sender to be told.
+    /// server acknowledges the end, but a routed message's goes now (no server holds its custody to acknowledge it,
+    /// as at [`Self::dispose_pending`]); one that came to an end already is left as it is. Each one ended, with its
+    /// lease, for its sender to be told.
     pub async fn end_pending(&self, session: &str, epoch: u64, disposition: &super::admission::Disposition) -> Result<Vec<Disposed>, Refusal> {
         check_session(session)?;
         let mut ended = Vec::new();
@@ -781,7 +824,11 @@ impl Inbox {
                 pending.disposition = Some(disposition.clone());
                 pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
                 tx.conds.push(Cond::At { family: PENDING.into(), key: row.key.clone(), rev: row.rev });
-                tx.writes.push(Write::Put { family: PENDING.into(), key: row.key, value: json(session, &pending)? });
+                if pending.origin == Origin::Routed {
+                    tx.writes.push(Write::Delete { family: PENDING.into(), key: row.key });
+                } else {
+                    tx.writes.push(Write::Put { family: PENDING.into(), key: row.key, value: json(session, &pending)? });
+                }
                 these.push(Disposed { lease: pending.lease, disposition: disposition.clone() });
             }
             if !tx.writes.is_empty() {
@@ -1320,13 +1367,18 @@ mod tests {
             block(i.accept_pending("s1", message, &digest(message, &[]), Some(3), 10, &at_epoch(message, 3, stage)))?;
         }
         block(i.dispose_pending("s1", "done", 3, Disposition::Consumed { boundary: Consumption::ProviderAccepted }))?;
+        // One routed to it here and still waiting in its journal on its depth: no server holds it to acknowledge its end.
+        let mut routed = at_epoch("routed", 3, Stage::Waiting);
+        routed.origin = Origin::Routed;
+        block(i.accept_pending("s1", "routed", &digest("routed", &[]), Some(3), 10, &routed))?;
         let cancelled = Disposition::Cancelled { reason: CancelReason::User };
         let mut ended: Vec<String> = block(i.end_pending("s1", 3, &cancelled))?.into_iter().map(|d| d.lease.message).collect();
         ended.sort();
-        assert_eq!(ended, ["given", "queued"]);
+        assert_eq!(ended, ["given", "queued", "routed"]);
         for message in ["given", "queued"] {
             assert_eq!(block(i.pending("s1", message))?.and_then(|p| p.disposition), Some(cancelled.clone()), "{message} kept, cancelled, for its acknowledgement");
         }
+        assert!(block(i.pending("s1", "routed"))?.is_none(), "a routed message's row goes as it ends");
         assert!(matches!(block(i.pending("s1", "done"))?.and_then(|p| p.disposition), Some(Disposition::Consumed { .. })), "what came to an end keeps its end");
         assert!(block(i.end_pending("s1", 3, &cancelled))?.is_empty(), "ended once");
         assert!(block(i.end_pending("s1", 4, &cancelled))?.is_empty(), "another epoch's are another stay's");
@@ -1677,6 +1729,28 @@ mod tests {
         assert_eq!(block(i.epoch("s1"))?, None);
         let left = |family: &str| block(r.scan(family, Scan { prefix: Vec::new(), after: None, limit: 1000, at: Consistency::Linearizable })).map(|p| p.rows.len());
         assert_eq!((left(MESSAGES).ok(), left(HEADS).ok()), (Some(1), Some(1)), "only s2's");
+        Ok(())
+    }
+
+    /// What a resumed session carries of the server's copy of its inbox: the ids it took with their digests, in the
+    /// order taken, the waiting ones left out; and what still waited, in its order.
+    #[test]
+    fn a_resumed_session_carries_its_ids_and_what_still_waited() -> Result<(), Refusal> {
+        use crate::harness::admission::{Lease, Stage};
+        let kept = |digest: &str| serde_json::to_vec(&serde_json::json!({"epoch": 1, "at": 5, "digest": digest})).map_err(|e| unavailable("s", &e.to_string()));
+        let waiting = |message: &str, seq: u64| -> Result<Vec<u8>, Refusal> {
+            let mut p = pending_message(message, "words");
+            p.origin = Origin::Routed;
+            p.lease = Lease { message: message.into(), peer: "agent:a1".into(), epoch: 1, bytes: 10, stage: Stage::Waiting, token: None, handoff: None };
+            p.accepted_seq = Some(seq);
+            json("s", &p)
+        };
+        let handed = || -> Result<Vec<u8>, Refusal> { json("s", &pending_message("m1", "handed on")) };
+        let taken = vec![(b"s/m2".to_vec(), kept("d2")?, 7), (b"s/m1".to_vec(), kept("d1")?, 3), (b"s/w1".to_vec(), kept("dw")?, 9), (b"other/m9".to_vec(), kept("x")?, 1)];
+        let pending = vec![(b"s/w2".to_vec(), waiting("w2", 12)?, 12), (b"s/w1".to_vec(), waiting("w1", 9)?, 9), (b"s/m1".to_vec(), handed()?, 3)];
+        let (ids, still) = carried_by("s", taken, pending);
+        assert_eq!(ids, vec![("m1".to_owned(), "d1".to_owned()), ("m2".to_owned(), "d2".to_owned())], "in the order taken, what waits left out");
+        assert_eq!(still.iter().map(|p| p.lease.message.as_str()).collect::<Vec<_>>(), vec!["w1", "w2"], "what waited, in its order");
         Ok(())
     }
 
