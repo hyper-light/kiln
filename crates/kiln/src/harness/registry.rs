@@ -5883,6 +5883,13 @@ impl Registry {
         self.sessions.with(id, |v| Arc::clone(&v.info))
     }
 
+    /// The sessions agent `parent` started (their `Info::parent`), each info as its owner shares it with its view, oldest
+    /// first: read through who's whose child (`super::copies::Kin`), kept as sessions come, go and change parents, not
+    /// by listing and sorting every session (G9 step 3, goal a2a44298, T-T1.5.1).
+    pub fn children_shared(&self, parent: &str) -> Vec<Arc<Info>> {
+        self.sessions.children(parent)
+    }
+
     /// What waits in session `id`'s queue, as its machine last said, the messages whole.
     pub fn queue(&self, id: &str) -> Vec<super::model::QueueItem> {
         let Some(state) = self.sessions.with(id, |v| Arc::clone(&v.state)) else { return Vec::new() };

@@ -3171,6 +3171,41 @@ where
             None => self.port.agents().into_iter().map(Arc::new).collect(),
         }
     }
+
+    /// What a step of `agent`'s stack reads of the sessions ([`step`]): its info and its children's, as the registry
+    /// shares them, through the hub found by id and through who's whose child (`Registry::children_shared`), not by a
+    /// list of every session sorted (G9 step 3, goal a2a44298, T-T1.5.1). Through the port alone (tests' and kiln-sim's),
+    /// from its list, which is kept for its members' usage ([`Driver::weekly_pct`]).
+    fn near(&self, agent: &str) -> Near {
+        match self.hub {
+            Some(hub) => Near { info: hub.harness.info_shared(agent), children: hub.harness.children_shared(agent), listed: None },
+            None => {
+                let all: Vec<Arc<Info>> = self.port.agents().into_iter().map(Arc::new).collect();
+                let info = all.iter().find(|i| i.id == agent).cloned();
+                let children = all.iter().filter(|c| c.parent.as_deref() == Some(agent)).cloned().collect();
+                Near { info, children, listed: Some(all) }
+            }
+        }
+    }
+
+    /// Session `id`'s weekly usage, its percent, as [`Driver::near`] finds it: what its program's usage rule reads of each
+    /// member (`crate::programs::rule_by`).
+    fn weekly_pct(&self, near: &Near, id: &str) -> Option<f64> {
+        let pct = |i: &Info| crate::programs::weekly(&i.limits).map(|u| u.pct);
+        match (&near.listed, self.hub) {
+            (Some(all), _) => all.iter().find(|i| i.id == id).and_then(|i| pct(i)),
+            (None, Some(hub)) => hub.harness.info_shared(id).and_then(|i| pct(&i)),
+            (None, None) => None,
+        }
+    }
+}
+
+/// What a step of a stack reads of the sessions ([`Driver::near`]): its agent's info, its children's (each whose parent is
+/// that agent), and, through the port alone, every session's as the port listed them.
+struct Near {
+    info: Option<Arc<Info>>,
+    children: Vec<Arc<Info>>,
+    listed: Option<Vec<Arc<Info>>>,
 }
 
 /// Every session as `Registry::list` has them (each info whole, oldest first), copied on the
@@ -4025,20 +4060,20 @@ where
         d.metrics.goal_ended(true);
         stack = stack_of(store, agent).await?;
     }
-    // Read here, with the stacks held, as each step reads it: each session as the registry shares it, none copied
-    // (`Driver::agents_shared`; G9 step 3, goal a2a44298, T-T1.5.1): each step copied every session's whole info,
-    // and of those it reads only its agent's, its children's and its program's members' usage.
-    let all = d.agents_shared();
+    // Read here, with the stacks held, as each step reads it: its agent's info, its children's and its program's
+    // members' usage, each session as the registry shares it, found by its id or through who's whose child
+    // (`Driver::near`; G9 step 3, goal a2a44298, T-T1.5.1): each step listed and sorted every session's info for those.
+    let near = d.near(agent);
     // Agents it started at work hold its next goal back (it ended its turn to let them), but for the
     // subagents kiln started for its plan's steps (`subagents`): its stack goes on beside those.
     let children = {
         let subs: Vec<&str> = stack.items.iter().filter_map(|i| i.subagent.as_deref()).collect();
-        all.iter().any(|c| c.parent.as_deref() == Some(agent) && !subs.contains(&c.id.as_str()) && crate::harness::wait::stand(c) == "working")
+        near.children.iter().any(|c| !subs.contains(&c.id.as_str()) && crate::harness::wait::stand(c) == "working")
     };
     // Its program's usage rule (docs/programs.md; the critical path's master plan, §5): above 95%
     // of a weekly window every stack of the program pauses, above 80% no new goal starts.
-    let rule = crate::programs::rule(store, &all, agent).await;
-    let info: Option<Arc<Info>> = all.into_iter().find(|i| i.id == agent);
+    let rule = crate::programs::rule_by(store, agent, |id| d.weekly_pct(&near, id)).await;
+    let info: Option<Arc<Info>> = near.info;
     let now = d.clock.unix_ms();
     let a = agent.to_owned();
     if let crate::programs::Rule::Pause { why } = &rule {

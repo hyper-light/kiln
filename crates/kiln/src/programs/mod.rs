@@ -544,7 +544,13 @@ async fn seeded(hub: &Hub, master: &str) -> anyhow::Result<Settings> {
 /// track's worker), or `Ok`. `agents` are every agent kiln knows, as they are now. A store that
 /// can't be read leaves it `Ok`, said in the log: the driver goes on.
 pub async fn rule<I: std::borrow::Borrow<Info> + Sync>(store: &crate::store::Store, agents: &[I], agent: &str) -> Rule {
-    match rule_of(store, agents, agent).await {
+    rule_by(store, agent, |id| agents.iter().map(<I as std::borrow::Borrow<Info>>::borrow).find(|i| i.id == id).and_then(|i| weekly(&i.limits)).map(|u| u.pct)).await
+}
+
+/// [`rule`], each member's weekly usage (its percent) read by `usage` from its id, not found among a list of every
+/// session: what a goal stack's step asks of its program's members alone (G9 step 3, goal a2a44298, T-T1.5.1).
+pub async fn rule_by(store: &crate::store::Store, agent: &str, usage: impl Fn(&str) -> Option<f64> + Send) -> Rule {
+    match rule_of(store, agent, usage).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(%agent, error = %format!("{e:#}"), "program usage rule: not read");
@@ -553,15 +559,18 @@ pub async fn rule<I: std::borrow::Borrow<Info> + Sync>(store: &crate::store::Sto
     }
 }
 
-async fn rule_of<I: std::borrow::Borrow<Info> + Sync>(store: &crate::store::Store, agents: &[I], agent: &str) -> anyhow::Result<Rule> {
+async fn rule_of(store: &crate::store::Store, agent: &str, usage: impl Fn(&str) -> Option<f64> + Send) -> anyhow::Result<Rule> {
     for m in masters(store).await? {
         let Some(coordinator) = m.coordinator else { continue };
         let workers: Vec<String> = assignments(store, &m.id).await?.into_values().map(|a| a.agent).collect();
         if agent != coordinator && !workers.iter().any(|w| w == agent) {
             continue;
         }
-        let members = agents.iter().map(<I as std::borrow::Borrow<Info>>::borrow).filter(|i| i.id == coordinator || workers.contains(&i.id));
-        let pct = members.filter_map(|i| weekly(&i.limits)).map(|u| u.pct).max_by(f64::total_cmp);
+        // Each member once (one id may be the coordinator's and a worker's, or two workers').
+        let mut members: Vec<&str> = std::iter::once(coordinator.as_str()).chain(workers.iter().map(String::as_str)).collect();
+        members.sort_unstable();
+        members.dedup();
+        let pct = members.into_iter().filter_map(&usage).max_by(f64::total_cmp);
         return Ok(Rule::at(pct));
     }
     Ok(Rule::Ok)

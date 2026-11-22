@@ -2391,6 +2391,49 @@ impl Slot {
     }
 }
 
+/// Which sessions each session is the parent of (`Info::parent`), by the parent's id: kept as each copy's info goes out
+/// with a parent it didn't have ([`Mirror::publish`]: a session made, or one given another parent) and as its copy goes
+/// ([`Shard::remove`]), so what reads one agent's children reads them alone, not every session's info listed and sorted
+/// (G9 step 3, goal a2a44298, T-T1.5.1: each step of a goal stack did, at O(N log N) a step with N sessions). Every shard's
+/// owner writes it; a reader takes the ids, then each session's view from its board ([`Copies::children`]).
+#[derive(Default)]
+pub struct Kin {
+    of: parking_lot::Mutex<crate::util::FastMap<Arc<str>, std::collections::BTreeSet<Arc<str>>>>,
+}
+
+impl Kin {
+    /// Session `child`'s parent, as its copy's info last went out, went from `was` to `now` (None: it has none, or its
+    /// copy is gone).
+    pub(super) fn moved(&self, child: &Arc<str>, was: Option<&str>, now: Option<&str>) {
+        if was == now {
+            return;
+        }
+        let mut of = self.of.lock();
+        if let Some(p) = was
+            && let Some(set) = of.get_mut(p)
+        {
+            set.remove(child);
+            if set.is_empty() {
+                of.remove(p);
+            }
+        }
+        if let Some(p) = now {
+            of.entry(Arc::from(p)).or_default().insert(Arc::clone(child));
+        }
+    }
+
+    /// The ids of the sessions whose parent is `parent`, in id order.
+    pub fn children(&self, parent: &str) -> Vec<Arc<str>> {
+        self.of.lock().get(parent).map(|set| set.iter().cloned().collect()).unwrap_or_default()
+    }
+
+    /// Every parent with its children, for the tests that hold the index to a scan of every session.
+    #[cfg(test)]
+    pub(super) fn all(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        self.of.lock().iter().map(|(p, set)| (p.to_string(), set.iter().map(|c| c.to_string()).collect())).collect()
+    }
+}
+
 /// A shard's sessions as its owner published them, by id: swapped in whole as one comes or goes. Keyed by session ids,
 /// which kiln makes (`crate::util::new_id`'s UUIDv7s, on the server or a runner's kiln): a [`crate::util::FastMap`].
 type Board = crate::util::FastMap<Arc<str>, Arc<Slot>>;
@@ -2531,6 +2574,10 @@ pub struct Mirror {
     /// Where its sealed chunks are spilled (none: they're kept in memory), the file they go to now, and
     /// whether a spill is under way (one at a time): goal 11, plan 01a1a87b2e56 step 5.
     spill: Option<Arc<super::spill::Dir>>,
+    /// Who's whose child ([`Kin`]), once its owner has it, and the parent it's under there: what its info's parent was as it
+    /// last went out there (G9 step 3, goal a2a44298, T-T1.5.1).
+    kin: Option<Arc<Kin>>,
+    kin_parent: Option<String>,
     spill_file: Option<Arc<super::spill::File>>,
     spilling: bool,
     /// Its last spill was refused (said once, until one is written again).
@@ -2711,6 +2758,8 @@ impl Mirror {
             encodings: Encodings::default(),
             owner: None,
             spill: None,
+            kin: None,
+            kin_parent: None,
             spill_file: None,
             spilling: false,
             spill_refused: false,
@@ -2843,6 +2892,13 @@ impl Mirror {
     /// each event's entry and texts were freed one by one on the owner's shard as it went, in its commit (goal 9, plan
     /// 01a1a87b2cec step 3). A reader still holding it lets go of it where it reads.
     pub fn publish(&mut self) {
+        // Its parent as it goes out, in who's whose child ([`Kin`]): one made, or given another parent, is found under it.
+        if let Some(kin) = &self.kin
+            && self.kin_parent.as_deref() != self.info.parent.as_deref()
+        {
+            kin.moved(&self.slot.id, self.kin_parent.as_deref(), self.info.parent.as_deref());
+            self.kin_parent = self.info.parent.clone();
+        }
         if !Arc::ptr_eq(&self.info_json.0, &self.info) {
             let json = info_json_after(&self.info, &self.info_json.0, &self.info_json.1);
             self.info_json = (Arc::clone(&self.info), json);
@@ -3274,6 +3330,8 @@ pub struct Shard {
     /// again, closed (HARNESS-4).
     closed: std::collections::HashSet<String>,
     boards: Arc<[ArcSwap<Board>]>,
+    /// Who's whose child, every owner's sessions' ([`Kin`]).
+    kin: Arc<Kin>,
     bus: Arc<dyn kiln_seams::Bus>,
     /// A session came or went since its board was last published.
     board_changed: bool,
@@ -3857,6 +3915,7 @@ impl Shard {
                 self.closed.remove(slot.key());
                 m.owner = Some(self.inbox.clone());
                 m.spill = self.spill.get().cloned();
+                m.kin = Some(Arc::clone(&self.kin));
                 m.publish();
                 slot.insert(m);
                 self.board_changed = true;
@@ -3874,6 +3933,7 @@ impl Shard {
                 let m = v.insert(make());
                 m.owner = Some(self.inbox.clone());
                 m.spill = self.spill.get().cloned();
+                m.kin = Some(Arc::clone(&self.kin));
                 m
             }
         }
@@ -3951,6 +4011,10 @@ impl Shard {
     pub fn remove(&mut self, id: &str) -> Option<Mirror> {
         let mut m = self.mirrors.remove(id)?;
         self.board_changed = true;
+        // No longer anyone's child ([`Kin`]): its copy is gone.
+        if let Some(kin) = m.kin.take() {
+            kin.moved(&m.slot.id, m.kin_parent.take().as_deref(), None);
+        }
         let last = m.slot.view.swap(Arc::new(View { closed: true, events: Events::default(), ..m.view() }));
         let_go((last, std::mem::take(&mut m.events), std::mem::take(&mut m.index), m.spill_file.take()));
         if let Some(generation) = m.feed.watched() {
@@ -4409,6 +4473,8 @@ impl Listed {
 pub struct Copies {
     inboxes: Vec<crate::memory::queue::Sender<Msg>>,
     boards: Arc<[ArcSwap<Board>]>,
+    /// Who's whose child, every owner's sessions' ([`Kin`]).
+    kin: Arc<Kin>,
     /// The hub the owners act through (what a change tells the rest of kiln), once made.
     hub: Arc<OnceLock<Weak<Hub>>>,
     /// Where the owners spill their copies' sealed chunks, once set.
@@ -4437,6 +4503,7 @@ impl Copies {
         let hub = Arc::new(OnceLock::new());
         let spill = Arc::new(OnceLock::new());
         let said = Arc::new(Said::default());
+        let kin = Arc::new(Kin::default());
         let mut inboxes = Vec::with_capacity(shards);
         for me in 0..shards {
             let (tx, rx) = crate::memory::queue::bounded(&crate::memory::owners::SESSION_INBOXES, inbox);
@@ -4446,6 +4513,7 @@ impl Copies {
                 mirrors: crate::util::FastMap::default(),
                 closed: std::collections::HashSet::new(),
                 boards: Arc::clone(&boards),
+                kin: Arc::clone(&kin),
                 bus: Arc::clone(&bus),
                 board_changed: false,
                 spill: Arc::clone(&spill),
@@ -4472,7 +4540,7 @@ impl Copies {
             crate::rt::spawn_owner(me, own(shard, rx, Arc::clone(&hub)));
             inboxes.push(tx);
         }
-        Self { inboxes, boards, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0) }
+        Self { inboxes, boards, kin, hub, spill, listed: ArcSwapOption::empty(), joins: AtomicU64::new(0) }
     }
 
     /// Back at once while the copies' sealed chunks' texts not yet kept compact are within their bound, a share of what the
@@ -4581,6 +4649,21 @@ impl Copies {
 
     pub fn contains(&self, id: &str) -> bool {
         self.with(id, |_| ()).is_some()
+    }
+
+    /// The sessions whose parent is `parent`, each info as its owner shares it with its view, oldest first (by when it was
+    /// made, then its id, as [`Copies::each`]'s callers sort them): read through who's whose child ([`Kin`]), not by a look
+    /// at every session (G9 step 3, goal a2a44298, T-T1.5.1). One whose copy is on its way in or out isn't listed.
+    pub fn children(&self, parent: &str) -> Vec<Arc<Info>> {
+        let mut v: Vec<Arc<Info>> = self.kin.children(parent).iter().filter_map(|id| self.with(id, |view| Arc::clone(&view.info))).filter(|i| i.parent.as_deref() == Some(parent)).collect();
+        v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        v
+    }
+
+    /// Who's whose child as the index holds it, for the tests that hold it to a scan of every session.
+    #[cfg(test)]
+    pub(super) fn kin(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        self.kin.all()
     }
 
     /// Every session's id.
@@ -8649,6 +8732,85 @@ mod tests {
             let want: Vec<String> = (1..=10).map(|q| format!("e{q}")).chain(["resync".to_owned(), "e12".to_owned()]).collect();
             anyhow::ensure!(ids == want, "every frame, in order: {ids:?}");
             anyhow::ensure!(seen.get(8).is_some_and(|(_, len)| *len == large.len()), "the large one's text whole");
+            Ok(())
+        })
+    }
+
+    /// G9 step 3 (goal a2a44298, T-T1.5.1): who's whose child ([`Kin`]) is what a scan of every session says, and each
+    /// parent's children read through it ([`Copies::children`]) are a scan's, in its order, after sessions made, closed and
+    /// given other parents (or none) in random orders, spread over several owners.
+    #[test]
+    fn g9_s3_who_s_whose_child_matches_a_scan_after_random_registers_unregisters_and_reparents() -> anyhow::Result<()> {
+        use std::collections::BTreeMap;
+        crate::rt::block_on(async {
+            let copies = Arc::new(Copies::start_with(sim_bus(), 4, 64 * MSG));
+            // splitmix64: the test's own random numbers, by seed, so a failing seed runs again the same.
+            let next = |x: &mut u64| {
+                *x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = *x;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                z ^ (z >> 31)
+            };
+            let ids: Vec<String> = (0..12).map(|k| format!("s{k}")).collect();
+            for seed in 0..24_u64 {
+                let mut x = seed;
+                for step in 0..96_i64 {
+                    let pick = |x: &mut u64| ids.get(usize::try_from(next(x) % 12).unwrap_or(0)).cloned().unwrap_or_default();
+                    let id = pick(&mut x);
+                    // A parent among the sessions (made or not, as a session's parent may be one that's gone), or none.
+                    let parent = (next(&mut x) % 4 != 0).then(|| pick(&mut x));
+                    let i = id.clone();
+                    match next(&mut x) % 3 {
+                        0 => {
+                            copies
+                                .on(&id, move |s| {
+                                    let info = Info { id: i.clone(), parent, created_at: step, ..Info::default() };
+                                    s.insert(i, Mirror::new(info, Location::Local, sim_bus()));
+                                })
+                                .await;
+                        }
+                        1 => {
+                            copies.on(&id, move |s| drop(s.remove(&i))).await;
+                        }
+                        _ => {
+                            copies
+                                .on(&id, move |s| {
+                                    if let Some(m) = s.get_mut(&i) {
+                                        Arc::make_mut(&mut m.info).parent = parent;
+                                        m.publish();
+                                    }
+                                })
+                                .await;
+                        }
+                    }
+                    let mut scan: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                    let mut order: BTreeMap<String, Vec<(i64, String)>> = BTreeMap::new();
+                    copies.each(|id, view| {
+                        if let Some(p) = &view.info.parent {
+                            scan.entry(p.clone()).or_default().push(id.to_owned());
+                            order.entry(p.clone()).or_default().push((view.info.created_at, id.to_owned()));
+                        }
+                    });
+                    for v in scan.values_mut() {
+                        v.sort();
+                    }
+                    let kin = copies.kin();
+                    anyhow::ensure!(kin == scan, "seed {seed}, step {step}: the index {kin:?}, a scan {scan:?}");
+                    for p in &ids {
+                        let mut want = order.get(p).cloned().unwrap_or_default();
+                        want.sort();
+                        let got: Vec<(i64, String)> = copies.children(p).iter().map(|i| (i.created_at, i.id.clone())).collect();
+                        anyhow::ensure!(got == want, "seed {seed}, step {step}: {p}'s children {got:?}, a scan's {want:?}");
+                    }
+                }
+                // Every session closed: no one is anyone's child.
+                for id in &ids {
+                    let i = id.clone();
+                    copies.on(id, move |s| drop(s.remove(&i))).await;
+                }
+                anyhow::ensure!(copies.kin().is_empty(), "seed {seed}: all closed, the index still holds {:?}", copies.kin());
+            }
             Ok(())
         })
     }
