@@ -231,22 +231,31 @@ impl Changing {
 
 /// The turn for a change to `$agent`'s stack, to the end of the enclosing block, from `$changing`
 /// ([`Changing`]): its own, beside other stacks' changes; or, where its change may reach another
-/// stack ([`spans`], looked at with the shared turn held, so no change that makes it so goes
-/// meanwhile), every stack's.
+/// stack ([`spans`]), every stack's. Whether it spans is looked at once the stack's own turn is
+/// held, with the shared turn held too (G9 step 3, goal a2a44298; T-T1.5.1): what makes a stack span
+/// is a change to it (what a goal waits for, set by `order`, `update` or `add_at`; its parts, by
+/// `split`; a plan, by a step that plans a big goal first), under its own turn, or a change across
+/// stacks (a goal handed to a subagent, a delegation), under every stack's; so neither goes between
+/// the look and the change, and the change goes as the stack is when it goes. Looked at before the
+/// stack's turn, a change waiting for it behind one that set what a goal waits for went on that
+/// stack, spanning by then, with its own turn alone. A change that makes its plain stack span with
+/// its own turn alone writes that stack and no other: what reaches across stacks (a goal handed to a
+/// subagent, `subagents::mark_out`; a delegation; a subagent let go) takes every stack's turn itself,
+/// so it waits for that change to end, and the next change to that stack looks at it afresh.
 macro_rules! stack_turn {
     ($changing:expr, $store:expr, $agent:expr) => {
         let changing: &Changing = $changing;
         let mut shared = Some(changing.all.read().await);
-        let every = if spans($store, $agent).await {
+        let entry = changing.each.of(&String::from($agent));
+        let mut own = Some(entry.turn().await);
+        // Spanning: its own turn and the shared one given back (a change waiting for this stack holds
+        // the shared turn as a reader, so every stack's waits for it), then every stack's taken.
+        let _every = if spans($store, $agent).await {
+            drop(own.take());
             drop(shared.take());
             Some(changing.every().await)
         } else {
             None
-        };
-        let entry = if every.is_none() { Some(changing.each.of(&String::from($agent))) } else { None };
-        let _turn = match &entry {
-            Some(e) => Some(e.turn().await),
-            None => None,
         };
     };
 }
@@ -3870,6 +3879,54 @@ mod tests {
     use super::*;
     use crate::harness::model::{Objective, ToolKind};
     use crate::harness::session::ApprovalBrief;
+
+    /// G9 step 3 (goal a2a44298; T-T1.5.1): a change that waited for a stack's turn behind one that
+    /// made the stack span (what a goal waits for set, as `order` sets it) goes with every stack's
+    /// turn, not its stack's alone. Looked at before the stack's turn was held, it went with its own.
+    #[test]
+    fn g9_s3_a_change_waiting_behind_one_that_makes_its_stack_span_takes_every_stack() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory_inline()?;
+            let a = "spans-later";
+            store
+                .call(move |c| {
+                    for (pos, g) in ["g1", "g2"].into_iter().enumerate() {
+                        c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES (?1, ?2, ?3, ?4)", params![g, a, i64::try_from(pos)?, g])?;
+                    }
+                    touch(c, a, Some("running"), None, 0)
+                })
+                .await?;
+            assert!(!spans(&store, a).await, "a plain stack");
+            let changing = Changing::new();
+            // Its first change holds the stack's turn and gives the second its chance to wait for it,
+            // then says what its second goal waits for: the stack spans from then on.
+            let first = async {
+                stack_turn!(&changing, &store, a);
+                let mut yielded = false;
+                std::future::poll_fn(|cx| {
+                    if yielded {
+                        return std::task::Poll::Ready(());
+                    }
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                })
+                .await;
+                store.call(move |c| Ok(c.execute("UPDATE goal_items SET needs = '[\"g1\"]' WHERE id = 'g2' AND agent = ?1", params![a]).map(|_| ())?)).await
+            };
+            // The second, waiting meanwhile: alone once it goes (no reader may go beside it).
+            let second = async {
+                stack_turn!(&changing, &store, a);
+                (spans(&store, a).await, changing.all.read().now_or_never().is_none())
+            };
+            let (wrote, (spanning, alone)) = futures::join!(first, second);
+            wrote?;
+            assert!(spanning, "what g2 waits for is set: the stack spans");
+            assert!(alone, "a change to a stack that spans holds every stack's turn");
+            Ok(())
+        })
+    }
 
     fn info(status: Status, objective: Option<Objective>) -> Info {
         Info { id: "a1".into(), status, objective, ..Info::default() }
