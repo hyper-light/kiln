@@ -13,8 +13,10 @@
 //!   find on the keyword's line is listed as `?`, to be read by a person.
 //! - a JSON record: a `.json` file name in a source file that both encodes JSON (`serde_json::to_`)
 //!   and writes a file (`fs::write`, `File::create`, `OpenOptions`, `write_atomic`).
-//! - test only: under a `tests` folder, in a `tests.rs`, or in an item under `#[cfg(test)]` (from
-//!   the attribute to the item's closing brace, or its `;`).
+//! - test only: under a `tests` folder, in a `tests.rs`, or in an item under a `#[cfg(..)]` that
+//!   holds only in tests (`test`, `all(test, ..)`, an `any` of those), from the attribute to the
+//!   item's closing brace, or its `;`; braces in strings, characters and comments don't count. A
+//!   drop made only in tests says so.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -53,7 +55,6 @@ const KEPT: &[(&str, &str)] = &[
     ("event.json", "a file: GitHub's event payload, for a leg's actions"),
     ("eventhubs-{name}.json", "Records `kiln.files`"),
     ("extension/manifest.json", "a file: a browser extension's manifest"),
-    ("gone.json", "tests only (headroom/pace.rs's tests: the reader takes their item as ended at a brace in a string)"),
     ("handovers-decided.json", "Records `kiln.files`"),
     ("handovers-taken.json", "Records `kiln.files`"),
     ("harness-models.json", "Records `kiln.files`"),
@@ -70,7 +71,6 @@ const KEPT: &[(&str, &str)] = &[
     ("kiln-mcp.json", "a file: the agents' MCP configuration"),
     ("kiln-{t}.json", "a file: a binary kept the old way (`<data>/binaries`), taken into kiln's blob store as the server starts"),
     ("lane.json", "Records `kiln.files`"),
-    ("live.json", "tests only (headroom/pace.rs's tests: the reader takes their item as ended at a brace in a string)"),
     ("local.json", "Records `kiln.files`"),
     ("manifest.json", "a file: a browser extension's manifest, or an image's (docker save), only read"),
     ("member.json", "Records `kiln.files`"),
@@ -130,11 +130,12 @@ const KEPT: &[(&str, &str)] = &[
     ("{}/.gemini/config/mcp_config.json", "a file: Antigravity's MCP configuration, in its guest's home"),
 ];
 
-/// Where each table is created and dropped, and whether only tests make it.
+/// Where each table is created and dropped (each file with whether only its tests drop it), and
+/// whether only tests make it.
 #[derive(Default)]
 struct Table {
     created: BTreeSet<String>,
-    dropped: BTreeSet<String>,
+    dropped: BTreeMap<String, bool>,
     test_only: bool,
 }
 
@@ -193,8 +194,135 @@ fn after_if(s: &str) -> &str {
     t
 }
 
+/// The top-level arguments of a `cfg` predicate's `all(..)` or `any(..)`.
+fn cfg_args(s: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start) = (Vec::new(), 0usize, 0usize);
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                out.push(s.get(start..i).unwrap_or(""));
+                start = i.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    out.push(s.get(start..).unwrap_or(""));
+    out.into_iter().filter(|a| !a.trim().is_empty()).collect()
+}
+
+/// Whether a `cfg` predicate holds only in tests: `test`, an `all(..)` with one such in it, or an
+/// `any(..)` of nothing else.
+fn only_in_tests(p: &str) -> bool {
+    let p = p.trim();
+    let args = |f: &str| p.strip_prefix(f).and_then(|r| r.strip_suffix(')')).map(cfg_args);
+    if p == "test" {
+        true
+    } else if let Some(a) = args("all(") {
+        a.into_iter().any(only_in_tests)
+    } else if let Some(a) = args("any(") {
+        !a.is_empty() && a.into_iter().all(only_in_tests)
+    } else {
+        false
+    }
+}
+
+/// Whether a line starts with a `#[cfg(..)]` that holds only in tests (`#[cfg(all(test, unix))]`).
+fn cfg_test(t: &str) -> bool {
+    let Some(rest) = t.strip_prefix("#[cfg(") else { return false };
+    let mut depth = 1usize;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return rest.get(..i).is_some_and(only_in_tests);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Where a line of Rust leaves off, for the next: in code, a string, a raw string (with its `#`s)
+/// or block comments (nested so deep).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Lex {
+    #[default]
+    Code,
+    Str,
+    Raw(usize),
+    Block(usize),
+}
+
+/// The `{` and `}` a line of Rust opens and closes as code: none in a string, a character or a
+/// comment. `lex` is where the line before left off, and becomes where this one does.
+fn braces(line: &str, lex: &mut Lex) -> (i64, i64) {
+    let b: Vec<char> = line.chars().collect();
+    let at = |i: usize| b.get(i).copied();
+    let (mut opens, mut closes, mut i) = (0i64, 0i64, 0usize);
+    while let Some(c) = at(i) {
+        let next = at(i.saturating_add(1));
+        match *lex {
+            Lex::Str if c == '\\' => i = i.saturating_add(1),
+            Lex::Str if c == '"' => *lex = Lex::Code,
+            Lex::Str => {}
+            Lex::Raw(n) => {
+                if c == '"' && (1..=n).all(|k| at(i.saturating_add(k)) == Some('#')) {
+                    *lex = Lex::Code;
+                    i = i.saturating_add(n);
+                }
+            }
+            Lex::Block(d) => {
+                if c == '*' && next == Some('/') {
+                    *lex = if d <= 1 { Lex::Code } else { Lex::Block(d.saturating_sub(1)) };
+                    i = i.saturating_add(1);
+                } else if c == '/' && next == Some('*') {
+                    *lex = Lex::Block(d.saturating_add(1));
+                    i = i.saturating_add(1);
+                }
+            }
+            Lex::Code => match c {
+                '/' if next == Some('/') => break,
+                '/' if next == Some('*') => {
+                    *lex = Lex::Block(1);
+                    i = i.saturating_add(1);
+                }
+                '"' => *lex = Lex::Str,
+                // A raw string's `r` (or `br`, `cr`), not the end of a longer name.
+                'r' if matches!(next, Some('"' | '#')) => {
+                    let word = b.get(..=i).unwrap_or(&[]).iter().rev().take_while(|c| c.is_alphanumeric() || **c == '_').count();
+                    let hashes = b.get(i.saturating_add(1)..).unwrap_or(&[]).iter().take_while(|c| **c == '#').count();
+                    let quote = i.saturating_add(1).saturating_add(hashes);
+                    let prefix: String = b.get(i.saturating_add(1).saturating_sub(word)..=i).unwrap_or(&[]).iter().collect();
+                    if matches!(prefix.as_str(), "r" | "br" | "cr") && at(quote) == Some('"') {
+                        *lex = Lex::Raw(hashes);
+                        i = quote;
+                    }
+                }
+                // A character (`'{'`, `'\''`, `'\u{7b}'`); a lifetime (`'a`) is left as it is.
+                '\'' => {
+                    if next == Some('\\') {
+                        i = (i.saturating_add(3)..b.len()).find(|&j| at(j) == Some('\'')).unwrap_or(b.len());
+                    } else if at(i.saturating_add(2)) == Some('\'') {
+                        i = i.saturating_add(2);
+                    }
+                }
+                '{' => opens = opens.saturating_add(1),
+                '}' => closes = closes.saturating_add(1),
+                _ => {}
+            },
+        }
+        i = i.saturating_add(1);
+    }
+    (opens, closes)
+}
+
 /// Each line's text that isn't a comment, with whether it is test code: in a test file, or in the
-/// item a `#[cfg(test)]` is on, from the attribute to the item's end (its braces closed again, its
+/// item a `#[cfg(..)]` that holds only in tests is on, from the attribute to the item's end (its braces closed again, its
 /// `;` when it has none, or the braces around it closed). Code after that item is kiln's again: an attribute on one helper near
 /// a file's top doesn't make the tables the file goes on to create (kiln's store's `SCHEMA`) a
 /// test's.
@@ -203,13 +331,14 @@ fn code_lines(text: &str, sql: bool, test_file: bool) -> Vec<(String, bool)> {
     // braces have opened yet.
     let mut item: Option<(i64, bool)> = None;
     let mut depth: i64 = 0;
+    let mut lex = Lex::Code;
     let mut out = Vec::new();
     for line in text.lines() {
         let t = line.trim_start();
-        if !sql && item.is_none() && t.starts_with("#[cfg(test)]") {
+        if !sql && item.is_none() && lex == Lex::Code && cfg_test(t) {
             item = Some((depth, false));
         }
-        let comment = t.starts_with("//") || (sql && t.starts_with("--"));
+        let comment = (lex == Lex::Code && t.starts_with("//")) || (sql && t.starts_with("--"));
         if !comment {
             let code = if sql { t.split("--").next().unwrap_or("") } else { t };
             out.push((code.to_string(), test_file || item.is_some()));
@@ -217,8 +346,7 @@ fn code_lines(text: &str, sql: bool, test_file: bool) -> Vec<(String, bool)> {
         if sql || comment {
             continue;
         }
-        let count = |c: char| i64::try_from(t.matches(c).count()).unwrap_or(i64::MAX);
-        let (opens, closes) = (count('{'), count('}'));
+        let (opens, closes) = braces(t, &mut lex);
         depth = depth.saturating_add(opens).saturating_sub(closes);
         if let Some((at, opened)) = item.as_mut() {
             *opened |= opens > 0;
@@ -328,7 +456,8 @@ fn inventory(root: &Path) -> Result<String, String> {
                 e.test_only &= *test;
             }
             for t in gone {
-                tables.entry(t).or_insert_with(|| Table { test_only: true, ..Table::default() }).dropped.insert(name.clone());
+                let by_tests = tables.entry(t).or_insert_with(|| Table { test_only: true, ..Table::default() }).dropped.entry(name.clone()).or_insert(true);
+                *by_tests &= *test;
             }
         }
         if !sql {
@@ -340,21 +469,22 @@ fn inventory(root: &Path) -> Result<String, String> {
         }
     }
     let join = |s: &BTreeSet<String>| s.iter().map(|x| format!("`{x}`")).collect::<Vec<_>>().join(", ");
+    let drops = |d: &BTreeMap<String, bool>| d.iter().map(|(x, tests)| format!("`{x}`{}", if *tests { " (tests only)" } else { "" })).collect::<Vec<_>>().join(", ");
     let mut out = String::from(
         "# Every record kiln keeps\n\n\
          CP-T1.5 to CP-T1.7 (G9 step 2): what moves to Records on Amphora. Written by\n\
          `scripts/records-inventory.sh`; `crates/kiln-seams/tests/records_inventory.rs` fails when this\n\
          file and the code differ, and says how it reads the code. A table only tests make, or one\n\
-         dropped by a later migration, is listed too, and says so. Each JSON file says how it's kept on\n\
-         Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why. The part after\n\
-         \"Designed by hand\" is written by hand.\n\n## SQLite tables\n\n\
+         dropped by a later migration, is listed too, and says so; so does a drop only tests make. Each\n\
+         JSON file says how it's kept on Amphora: as Records (`crates/kiln/src/records/files.rs`), or as\n\
+         a file, and why. The part after \"Designed by hand\" is written by hand.\n\n## SQLite tables\n\n\
          | Table | Created in | Dropped or renamed in | Tests only |\n|---|---|---|---|\n",
     );
     for (name, t) in &tables {
         if t.created.is_empty() {
             continue;
         }
-        out.push_str(&format!("| `{name}` | {} | {} | {} |\n", join(&t.created), join(&t.dropped), if t.test_only { "yes" } else { "" }));
+        out.push_str(&format!("| `{name}` | {} | {} | {} |\n", join(&t.created), drops(&t.dropped), if t.test_only { "yes" } else { "" }));
     }
     out.push_str("\n## JSON files kiln writes\n\n| File | Written in | Tests only | Kept as |\n|---|---|---|---|\n");
     let kept: BTreeMap<&str, &str> = KEPT.iter().copied().collect();
@@ -425,4 +555,45 @@ fn cp_t1_5_a_cfg_test_covers_its_item_alone() {
     let text = "struct S {\n    #[cfg(test)]\n    inline: u8,\n}\n#[cfg(test)]\nuse std::fmt;\n#[cfg(test)]\nfn helper() {\n    let t = \"CREATE TABLE a (x)\";\n}\nconst SCHEMA: &str = \"CREATE TABLE repos (id)\";\n#[cfg(test)]\nmod tests {\n    fn t() {\n        let f = format!(\"{n}\");\n    }\n    const B: &str = \"CREATE TABLE b (x)\";\n}\nconst C: &str = \"CREATE TABLE c (x)\";";
     let tests: Vec<(&str, bool)> = code_lines(text, false, false).iter().filter_map(|(l, test)| ["inline", "use std", "CREATE TABLE a", "repos", "CREATE TABLE b", "CREATE TABLE c"].into_iter().find(|w| l.contains(w)).map(|w| (w, *test))).collect();
     assert_eq!(tests, vec![("inline", true), ("use std", true), ("CREATE TABLE a", true), ("repos", false), ("CREATE TABLE b", true), ("CREATE TABLE c", false)]);
+}
+
+/// CP-T1.5: a `#[cfg(..)]` that holds only in tests makes test code of its item, whatever else it
+/// asks (`all(test, target_os = "linux")`, as headroom/pace.rs's Linux tests have it); one that
+/// also holds outside tests doesn't.
+#[test]
+fn cp_t1_5_a_cfg_that_holds_only_in_tests_makes_test_code() {
+    for (attr, tests) in [
+        ("#[cfg(test)]", true),
+        ("#[cfg(test)]mod tests{", true),
+        ("#[cfg(all(test, target_os = \"linux\"))]", true),
+        ("#[cfg(all(test, any(target_os = \"linux\", target_os = \"macos\")))]", true),
+        ("#[cfg(any(test, all(test, windows)))]", true),
+        ("#[cfg(any(unix, test))]", false),
+        ("#[cfg(all(unix, any(test, feature = \"chaos\")))]", false),
+        ("#[cfg(not(test))]", false),
+        ("#[cfg_attr(test, derive(Debug))]", false),
+    ] {
+        assert_eq!(cfg_test(attr), tests, "{attr}");
+    }
+    let text = "#[cfg(all(test, target_os = \"linux\"))]\nmod tests {\n    const B: &str = \"CREATE TABLE b (x)\";\n}\nconst C: &str = \"CREATE TABLE c (x)\";";
+    let tests: Vec<(&str, bool)> = code_lines(text, false, false).iter().filter_map(|(l, test)| ["CREATE TABLE b", "CREATE TABLE c"].into_iter().find(|w| l.contains(w)).map(|w| (w, *test))).collect();
+    assert_eq!(tests, vec![("CREATE TABLE b", true), ("CREATE TABLE c", false)]);
+}
+
+/// CP-T1.5: braces in strings, raw strings, characters and comments aren't the code's, so a test
+/// module with a `"}"` in it is test code to its end.
+#[test]
+fn cp_t1_5_braces_in_strings_characters_and_comments_dont_count() {
+    let mut lex = Lex::Code;
+    assert_eq!(braces(r#"let s = "}{}\"}"; let c = '}'; let e = '\''; let u = '\u{7d}'; f::<'a>() { // }"#, &mut lex), (1, 0));
+    assert_eq!(lex, Lex::Code);
+    assert_eq!(braces("let s = r#\"a \"} {", &mut lex), (0, 0));
+    assert_eq!(lex, Lex::Raw(1));
+    assert_eq!(braces("}\"#; x {", &mut lex), (1, 0));
+    assert_eq!(braces("/* { /* } */ } */ }", &mut lex), (0, 1));
+    assert_eq!(braces("let s = \"a {", &mut lex), (0, 0));
+    assert_eq!(braces("} b\"; }", &mut lex), (0, 1));
+    let text = "#[cfg(test)]\nmod tests {\n    fn t() {\n        let close = \"}\";\n    }\n    const B: &str = \"CREATE TABLE b (x)\";\n}\nconst C: &str = \"CREATE TABLE c (x)\";";
+    let tests: Vec<(&str, bool)> = code_lines(text, false, false).iter().filter_map(|(l, test)| ["CREATE TABLE b", "CREATE TABLE c"].into_iter().find(|w| l.contains(w)).map(|w| (w, *test))).collect();
+    assert_eq!(tests, vec![("CREATE TABLE b", true), ("CREATE TABLE c", false)]);
 }
