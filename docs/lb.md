@@ -271,6 +271,10 @@ budget (`Runner::set_budget`) or cordon it (`Runner::cordon`): it takes no new r
 no room so owners pick elsewhere, its runs run on, runs waiting in its line stay (each waits at
 another runner too) and are held when it opens again. The place core cordons its kernel while its
 runner takes no work: draining (an upgrade pending, or `[runner] on_battery`) or under strain.
+Strain holds back only what can wait, CI legs and commands: under strain alone the runner's
+admission still offers an agent session's start to the owner that probes it, saying its room is
+none, as its words do, so the owner takes a runner free of strain where one offered and this one
+where none did (Ada, 2026-11-21: kiln never keeps a person from starting a session).
 Under room tokens a cordon leaves no room to hold, so every token is cut to none and each owner
 that held some is told; the room that comes back is no owner's run's, so the first watcher's.
 
