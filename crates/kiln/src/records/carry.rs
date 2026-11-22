@@ -374,6 +374,9 @@ mod tests {
             }
         }
         let store = Store::open(path)?;
+        // Its index migrations built now, as a store in memory's are: built later, each would add
+        // its row to `migrations` while the copy ran.
+        store.build_now()?;
         let mut rows = 0;
         for table in tables(&store).await? {
             let name = table.name.clone();
