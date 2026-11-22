@@ -45,20 +45,27 @@ impl Conversations for StoreConversations {
         self.live()?;
         let now = crate::util::now_ms();
         let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+        // Sessions given their row by this append: theirs to give again if it isn't written.
+        let mut new = Vec::new();
         {
             let mut opened = self.opened.lock();
             for e in entries {
                 if opened.insert(e.conversation.clone()) {
+                    new.push(e.conversation.clone());
                     out.push(Row::Session { session: e.conversation.clone(), info: None, meta: None, state: None, changes: None, epoch: None, open: true, at: now });
                 }
                 let event = Event { id: e.id.clone(), seq: e.seq, at: i64::try_from(e.seq).unwrap_or(i64::MAX), parent: None, by: None, body: Body::Assistant { text: e.text.clone(), streaming: false } };
                 out.extend(rows::of(&e.conversation, &Update::Events { events: vec![event] }, now));
             }
         }
-        if !self.store.put_wait(out) {
-            return Err(Error::Failed("the conversation store's writer has stopped".into()));
-        }
-        self.store.sync().map_err(failed)
+        // Ok only once the commit these rows went in was written: the writer's own outcome (CP-T1.1).
+        self.store.put_committed(out).map_err(|e| {
+            let mut opened = self.opened.lock();
+            for s in &new {
+                opened.remove(s);
+            }
+            failed(e)
+        })
     }
 
     fn history(&self, conversation: &str, before: Option<u64>, limit: usize) -> Result<Vec<Entry>, Error> {
@@ -127,6 +134,34 @@ mod tests {
                 async move { Fixture { kind, dir } }
             }));
             report.into_result().map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// CP-T1.1 (seam review 1): an append whose rows the engine couldn't write answers an error, never Ok, and isn't
+    /// in what's read after; once the engine writes again, the same append goes in whole. Without the writer's outcome
+    /// carried back, the failed batch was logged and the append answered Ok.
+    #[test]
+    fn cp_t1_1_an_append_that_isnt_written_answers_an_error() -> anyhow::Result<()> {
+        for kind in super::super::Kind::ALL {
+            let dir = tempfile::tempdir()?;
+            let failing = Arc::new(AtomicBool::new(false));
+            let inner = kind.open(&dir.path().join(super::super::FILE))?;
+            let engine = Box::new(super::super::store::FailsWrites { inner, failing: Arc::clone(&failing) });
+            let c = StoreConversations::new(Store::start(engine, super::super::store::Upkeep::default())?);
+            let first = Entry { conversation: "a".into(), id: "m1".into(), seq: 1, text: "kept".into() };
+            c.append(std::slice::from_ref(&first)).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            failing.store(true, Ordering::Release);
+            let lost = [Entry { conversation: "b".into(), id: "m1".into(), seq: 1, text: "not written".into() }];
+            let answer = c.append(&lost);
+            anyhow::ensure!(matches!(answer, Err(Error::Failed(_))), "{kind:?}: an append that wasn't written answered {answer:?}");
+            failing.store(false, Ordering::Release);
+            anyhow::ensure!(c.history("b", None, 10).map_err(|e| anyhow::anyhow!("{e}"))?.is_empty(), "{kind:?}: what wasn't written was read");
+            // Its session's row goes again with it: the retry is read back whole.
+            c.append(&lost).map_err(|e| anyhow::anyhow!("{kind:?}: the retry: {e}"))?;
+            let b = c.history("b", None, 10).map_err(|e| anyhow::anyhow!("{e}"))?;
+            anyhow::ensure!(b == lost.to_vec(), "{kind:?}: the retry read back as {b:?}");
+            c.close().map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         Ok(())
     }

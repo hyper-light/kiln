@@ -419,6 +419,9 @@ struct InboxJob {
 enum Msg {
     /// Rows, and the bytes [`Queue`] counts them at.
     Rows(Vec<Row>, usize),
+    /// Rows, their bytes, and who is told whether the commit they go in was written ([`Store::put_committed`]): the
+    /// writer's outcome, never a guess (CP-T1.1: a batch that failed was logged and its sender told Ok).
+    Committed(Vec<Row>, usize, mpsc::Sender<Result<(), String>>),
     /// A commit to the sessions' inboxes: those that come together go in one transaction, one sync.
     Inbox(Box<InboxJob>),
     /// Run on the engine, between commits (whatever was sent before it is committed first).
@@ -657,6 +660,28 @@ impl Store {
             let _ = listener.wait_deadline(until);
         }
         true
+    }
+
+    /// Rows committed, with whatever else waits: Ok once the commit they went in is written, the writer's error when
+    /// it wasn't (CP-T1.1, the seam's append: Ok means in every read and through a restart). Blocking, for
+    /// `READ_WAIT` at most: past it, an error (it may yet be written, so it's no Ok).
+    pub fn put_committed(&self, rows: Vec<Row>) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let bytes = rows.iter().map(Row::bytes).sum();
+        self.queue.took(bytes);
+        let (tx, rx) = mpsc::channel();
+        if self.tx.send(Msg::Committed(rows, bytes, tx)).is_err() {
+            self.queue.let_go(bytes, false);
+            anyhow::bail!("the conversation store has stopped");
+        }
+        match rx.recv_timeout(READ_WAIT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(why)) => Err(anyhow::anyhow!("the conversation store couldn't write it: {why}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!("the conversation store didn't say in time whether it was written")),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!("the conversation store stopped before it said whether it was written")),
+        }
     }
 
     /// Waits while anything waits for the writer ([`Queue`]): whoever sent rows waits here after, so a burst waits
@@ -1045,12 +1070,17 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
     let mut compacting: Option<Instant> = None;
     // When it last looked at its file for its telemetry, and counted its sessions.
     let (mut looked, mut counted): (Option<Instant>, Option<Instant>) = (None, None);
-    let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>, pending_bytes: &mut usize| {
+    let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>, pending_bytes: &mut usize, told: &mut Vec<mpsc::Sender<Result<(), String>>>| {
         if pending.is_empty() {
             return;
         }
         let rows = rows::coalesce(std::mem::take(pending));
         let applied = engine.apply(&rows);
+        // Whoever waits on this commit hears how it went, before anyone else is told (CP-T1.1).
+        let outcome = applied.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+        for t in told.drain(..) {
+            let _ = t.send(outcome.clone());
+        }
         #[cfg(test)]
         queue.committed_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
         // Counted before anyone is told (as `crate::store`'s writer counts a group: a caller that reads the count once
@@ -1100,6 +1130,8 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         }
     };
     let mut inbox: Vec<Box<InboxJob>> = Vec::new();
+    // Who waits to hear how the rows in `pending` went ([`Msg::Committed`]).
+    let mut told: Vec<mpsc::Sender<Result<(), String>>> = Vec::new();
     loop {
         let idle = if squeezing || looking || compacting.is_some() { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY).min(LOOK_FILE) };
         // Nothing waits here between commits (each takes all there is), so the writer waits on its channel: the first of
@@ -1123,16 +1155,21 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             #[cfg(test)]
                             queue.took_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
                         }
+                        Msg::Committed(rows, bytes, reply) => {
+                            pending.extend(rows);
+                            pending_bytes += bytes;
+                            told.push(reply);
+                        }
                         Msg::Inbox(job) => inbox.push(job),
                         Msg::Run(f) => {
                             commit_inbox(&mut engine, &mut inbox);
-                            commit(&mut engine, &mut pending, &mut pending_bytes);
+                            commit(&mut engine, &mut pending, &mut pending_bytes, &mut told);
                             f(engine.as_mut());
                             meter.ran();
                         }
                         Msg::Close(reply) => {
                             commit_inbox(&mut engine, &mut inbox);
-                            commit(&mut engine, &mut pending, &mut pending_bytes);
+                            commit(&mut engine, &mut pending, &mut pending_bytes, &mut told);
                             // Its files closed before it says so, its reader's first: whoever moves them next finds them
                             // let go of.
                             if let Some(reads) = reads {
@@ -1150,7 +1187,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                     next = rx.try_recv().ok();
                 }
                 commit_inbox(&mut engine, &mut inbox);
-                commit(&mut engine, &mut pending, &mut pending_bytes);
+                commit(&mut engine, &mut pending, &mut pending_bytes, &mut told);
             }
             // Nothing waits (each commit took all there was): the file's upkeep.
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1213,7 +1250,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                commit(&mut engine, &mut pending, &mut pending_bytes);
+                commit(&mut engine, &mut pending, &mut pending_bytes, &mut told);
                 return;
             }
         }
@@ -1447,6 +1484,98 @@ impl Engine for SlowToLetGo {
     fn release(&mut self) -> anyhow::Result<()> {
         std::thread::sleep(self.hold);
         self.inner.release()
+    }
+}
+
+/// An engine whose writes fail while `failing` is set, as a full or failing disk fails them (CP-T1.1): for tests that
+/// a write that wasn't made is never answered Ok.
+#[cfg(test)]
+pub(crate) struct FailsWrites {
+    pub(crate) inner: Box<dyn Engine>,
+    pub(crate) failing: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl Engine for FailsWrites {
+    fn id(&self) -> String {
+        self.inner.id()
+    }
+    fn restorable(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.inner.restorable(session, last)
+    }
+    fn apply(&mut self, rows: &[Row]) -> anyhow::Result<()> {
+        if self.failing.load(Ordering::Acquire) {
+            anyhow::bail!("the disk refused the write (a test's)");
+        }
+        self.inner.apply(rows)
+    }
+    fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
+        self.inner.kept(session, last)
+    }
+    fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.inner.events(session, before, limit)
+    }
+    fn thread(&mut self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
+        self.inner.thread(session, parent, before, limit)
+    }
+    fn search_some(&mut self, q: &Query, from: Option<SearchFrom>, rows: usize, want: usize) -> anyhow::Result<(Vec<EventRow>, Option<SearchFrom>)> {
+        self.inner.search_some(q, from, rows, want)
+    }
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
+        self.inner.changes(from, max_bytes, kept, inbox)
+    }
+    fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+        self.inner.take(peer, machine, from, batch)
+    }
+    fn peer(&mut self, peer: &str) -> anyhow::Result<u64> {
+        self.inner.peer(peer)
+    }
+    fn peers(&mut self) -> anyhow::Result<Vec<(String, u64, i64)>> {
+        self.inner.peers()
+    }
+    fn marks(&mut self, session: &str) -> anyhow::Result<Vec<Mark>> {
+        self.inner.marks(session)
+    }
+    fn record(&mut self, session: &str, source: &str, from: u64, limit: usize) -> anyhow::Result<Vec<(u64, String)>> {
+        self.inner.record(session, source, from, limit)
+    }
+    fn unended(&mut self, since: i64) -> anyhow::Result<Vec<Unended>> {
+        self.inner.unended(since)
+    }
+    fn ended(&mut self, after: (i64, &str), limit: usize) -> anyhow::Result<Vec<(String, i64)>> {
+        self.inner.ended(after, limit)
+    }
+    fn squeeze_some(&mut self, limit: usize) -> anyhow::Result<bool> {
+        self.inner.squeeze_some(limit)
+    }
+    fn take_copy(&mut self, peer: &str, from: u64, batch: &Changes) -> anyhow::Result<Took> {
+        self.inner.take_copy(peer, from, batch)
+    }
+    fn end_copy(&mut self) -> anyhow::Result<usize> {
+        self.inner.end_copy()
+    }
+    fn is_empty(&mut self) -> anyhow::Result<bool> {
+        self.inner.is_empty()
+    }
+    fn top(&mut self) -> u64 {
+        self.inner.top()
+    }
+    fn prune_some(&mut self, before: i64, limit: usize) -> anyhow::Result<usize> {
+        self.inner.prune_some(before, limit)
+    }
+    fn compact_some(self: Box<Self>, min_free: u64, step_bytes: usize) -> anyhow::Result<(Box<dyn Engine>, Compacting)> {
+        let failing = Arc::clone(&self.failing);
+        let (inner, compacting) = self.inner.compact_some(min_free, step_bytes)?;
+        Ok((Box::new(Self { inner, failing }), compacting))
+    }
+    fn look(&mut self, count: bool) -> anyhow::Result<Look> {
+        self.inner.look(count)
+    }
+    fn release(&mut self) -> anyhow::Result<()> {
+        self.inner.release()
+    }
+    fn reader(&self) -> Option<Box<dyn Read + Send>> {
+        self.inner.reader()
     }
 }
 
