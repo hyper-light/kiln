@@ -35,6 +35,40 @@ mod subagents;
 #[cfg(test)]
 mod turn_times;
 
+/// The driver's rounds as this thread's tests count them (G9 step 3, goal a2a44298, T-T1.5.1): how many stepped every
+/// running stack and how many the stacks said changed alone, and whether one is between its take of what was said and
+/// its end, so kiln-sim's model counts the writes that land mid-round. kiln-sim runs a seed's tasks on its own thread.
+#[cfg(test)]
+pub(crate) mod rounds {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALL: Cell<u64> = const { Cell::new(0) };
+        static SAID: Cell<u64> = const { Cell::new(0) };
+        static OPEN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn began(which: &super::Which) {
+        let count = if matches!(which, super::Which::All) { &ALL } else { &SAID };
+        count.with(|c| c.set(c.get().saturating_add(1)));
+        OPEN.with(|o| o.set(true));
+    }
+
+    pub(crate) fn ended() {
+        OPEN.with(|o| o.set(false));
+    }
+
+    /// The rounds of every stack and of the stacks said, on this thread so far.
+    pub(crate) fn counted() -> (u64, u64) {
+        (ALL.with(Cell::get), SAID.with(Cell::get))
+    }
+
+    /// Whether a round is under way on this thread: past its take of what was said, not yet ended.
+    pub(crate) fn open() -> bool {
+        OPEN.with(Cell::get)
+    }
+}
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -227,6 +261,10 @@ enum Woke {
     Change,
     /// A deadline came, a stir, or news not told apart: a round of every stack.
     Every,
+    /// News on `news` (a port alone, no hub: kiln-sim's model and the driver's tests): with [`Steps::Stacks`], each agent
+    /// the port lists looked at against what the round saw, and what changed said as the hub's news is
+    /// ([`news_said`]), so the next round steps those stacks alone; with the control, a round of every stack.
+    Told,
     /// The agents' news ended (the hub is going).
     Closed,
 }
@@ -2805,6 +2843,8 @@ where
             let which = if changing.steps == Steps::Every || every || said.all { Which::All } else { Which::Said(said.keys) };
             every = false;
             #[cfg(test)]
+            rounds::began(&which);
+            #[cfg(test)]
             let round_began = std::time::Instant::now();
             // When the round began: a deadline after it wasn't due in what the round and its riders
             // looked at, so it wakes them (at once, if it passed meanwhile); one before it, they saw.
@@ -2815,6 +2855,8 @@ where
                 seen.insert(i.id.clone(), (news_of(&i), usage_of(&i)));
             }
             let (running, waiting) = crate::rt::labeled(&ROUND, self.round(changing, &which)).await;
+            #[cfg(test)]
+            rounds::ended();
             // The riders go with each round: what wakes the round (the feed, the agents' news, its
             // deadlines and theirs, a stir) is what they act on; none has a pace of its own.
             if tend {
@@ -2889,7 +2931,7 @@ where
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 _ = feed.after(at).fuse() => Woke::Change,
                 () = said.fuse() => Woke::Change,
-                () = told.fuse() => Woke::Every,
+                () = told.fuse() => Woke::Told,
                 open = heard.fuse() => if open { Woke::Change } else { Woke::Closed },
                 () = due.fuse() => if due_every { Woke::Every } else { Woke::Change },
                 () = stirred.fuse() => Woke::Every,
@@ -2897,6 +2939,16 @@ where
             match woke {
                 Woke::Change => {}
                 Woke::Every => every = true,
+                // As the hub's news is heard (`heard_news`): each agent whose news changed says its stack and its
+                // parent's, or every stack for its usage (G9 step 3, goal a2a44298, T-T1.5.1). kiln-sim's model told
+                // every round to step every stack at each of its agents' news, so it seldom stepped stacks alone.
+                Woke::Told if changing.steps == Steps::Stacks => {
+                    let changes = self.store.changes();
+                    for i in self.port.agents() {
+                        news_said(changes, &i, &mut seen);
+                    }
+                }
+                Woke::Told => every = true,
                 Woke::Closed => {
                     sessions = None;
                     every = true;

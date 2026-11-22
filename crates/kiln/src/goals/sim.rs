@@ -35,7 +35,7 @@ use kiln_sim::{Queue, Rng, Trace, World};
 use rusqlite::params;
 use serde_json::{Value, json};
 
-use super::{Driver, REMIND_MAX_MS, REMIND_MS, StoreFeed, touch};
+use super::{Driver, REMIND_MAX_MS, REMIND_MS, Steps, StoreFeed, rounds, touch};
 use crate::harness::model::{Command, Objective, Pause, Status};
 use crate::harness::session::Info;
 use crate::rt::Shutdown;
@@ -119,6 +119,13 @@ pub struct Counts {
     pub verdicts: u64,
     /// Goals sent again too soon (T-T1.5.1: exactly 0).
     pub duplicates: u64,
+    /// The driver's rounds that stepped every running stack, and those that stepped the stacks said changed alone
+    /// (G9 step 3, goal a2a44298, T-T1.5.1: `goals::Steps::Stacks`; the control's are all the former).
+    pub rounds_all: u64,
+    pub rounds_said: u64,
+    /// People's edits and agents' verdicts written while a round was under way: after its take of what was said,
+    /// before its end (G9 step 3, goal a2a44298, T-T1.5.1).
+    pub writes_mid_round: u64,
     /// Agents left free with their goal open past the longest reminder gap (T-T1.5.1: exactly 0).
     pub lost: u64,
 }
@@ -139,6 +146,9 @@ impl Counts {
         self.edits += o.edits;
         self.verdicts += o.verdicts;
         self.duplicates += o.duplicates;
+        self.rounds_all += o.rounds_all;
+        self.rounds_said += o.rounds_said;
+        self.writes_mid_round += o.writes_mid_round;
         self.lost += o.lost;
     }
 }
@@ -167,6 +177,8 @@ struct Sim {
     /// per thousand polls, while the nemesis lasts.
     crash_mid: u64,
     counts: Counts,
+    /// Which stacks the driver's rounds step: the switch's, or the one a test picks.
+    steps: Steps,
 }
 
 /// The driver's loop, as `Driver::drive` runs it: a round of the stacks whenever the store's feed,
@@ -174,11 +186,11 @@ struct Sim {
 /// process's, shared with other tests: left out, and the model's agents have it off). Its own lock
 /// for each change: `CHANGING` is the process's too. A server that comes back starts on a new feed,
 /// as a restarted server does, with a round of every stack.
-async fn driver(store: Store, clock: SimClock, port: SimHarness<Info, Command>, news: Arc<crate::rt::Notify>, shutdown: Shutdown) {
+async fn driver(store: Store, clock: SimClock, port: SimHarness<Info, Command>, news: Arc<crate::rt::Notify>, shutdown: Shutdown, steps: Steps) {
     // Its own counters and no planner, as the driver's tests have (the process's are shared).
     let metrics = crate::metrics::AgentMetrics::default();
     let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
-    let changing = super::Changing::new();
+    let changing = super::Changing::stepping(steps);
     let feed = StoreFeed::new(&store);
     let _ = d.follow(&changing, &feed, Some(&news), false).await;
 }
@@ -211,7 +223,7 @@ fn goal_of(c: &Command) -> Option<String> {
 }
 
 impl Sim {
-    fn new(seed: u64, keep: usize) -> Result<Self, String> {
+    fn new(seed: u64, keep: usize, steps: Steps) -> Result<Self, String> {
         let mut rng = Rng::new(seed);
         let clock = SimClock::new();
         let mut world = World::new(clock.clone(), rng.stream("scheduler"));
@@ -257,6 +269,7 @@ impl Sim {
             meddle,
             crash_mid,
             counts: Counts::default(),
+            steps,
             agents,
             rng,
         };
@@ -313,7 +326,7 @@ impl Sim {
 
     fn server_up(&mut self) -> Result<(), String> {
         let sp = self.world.spawner(self.server).ok_or("no server node")?;
-        spawn(sp.as_ref(), driver(self.store.clone(), self.clock.clone(), self.port.clone(), Arc::clone(&self.news), self.shutdown.clone())).map_err(|e| format!("{e}"))?;
+        spawn(sp.as_ref(), driver(self.store.clone(), self.clock.clone(), self.port.clone(), Arc::clone(&self.news), self.shutdown.clone(), self.steps)).map_err(|e| format!("{e}"))?;
         self.up = true;
         Ok(())
     }
@@ -408,6 +421,7 @@ impl Sim {
                 // in the store, its harness's goal cleared, and nothing else tells the driver.
                 if roll < 60 && self.rng.chance(300) {
                     self.counts.verdicts += 1;
+                    self.counts.writes_mid_round += u64::from(rounds::open());
                     let (a, g) = (id.clone(), goal.clone());
                     futures::executor::block_on(self.store.call(move |c| {
                         c.execute("UPDATE goal_items SET status = 'met', reason = 'said met', ended_at = ?3 WHERE agent = ?1 AND text = ?2 AND status = 'active'", params![a, g, now_ms])?;
@@ -536,6 +550,8 @@ impl Sim {
             Ev::ServerCrash => {
                 if faulty && self.up {
                     self.world.crash(self.server);
+                    // Its round, if one was under way, ended with it.
+                    rounds::ended();
                     self.up = false;
                     self.crashed_at = Some(now);
                     self.counts.server_crashes += 1;
@@ -560,6 +576,7 @@ impl Sim {
                 let said = agent.clone();
                 self.counts.edits += 1;
                 self.counts.goals += 1;
+                self.counts.writes_mid_round += u64::from(rounds::open());
                 futures::executor::block_on(self.store.call(move |c| {
                     let pos: i64 = c.query_row("SELECT COALESCE(MAX(pos), -1) + 1 FROM goal_items WHERE agent = ?1", params![agent], |r| r.get(0))?;
                     c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES (?1, ?2, ?3, ?4, 'pending')", params![format!("{agent}-g{k}"), agent, pos, text])?;
@@ -726,10 +743,20 @@ impl Sim {
 
 /// One seed's run: what it counted and its digest, or how it failed.
 pub fn run(seed: u64, keep: usize) -> Result<(Counts, u64), String> {
-    let mut sim = Sim::new(seed, keep).map_err(|why| format!("seed {seed}: {why}"))?;
+    run_stepping(seed, keep, Steps::from_env())
+}
+
+/// [`run`], the driver's rounds stepping as `steps` says, whatever the switch (`KILN_GOAL_FEED`) says.
+fn run_stepping(seed: u64, keep: usize, steps: Steps) -> Result<(Counts, u64), String> {
+    let (all_before, said_before) = rounds::counted();
+    let mut sim = Sim::new(seed, keep, steps).map_err(|why| format!("seed {seed}: {why}"))?;
     let ran = sim.run();
     sim.shutdown.cancel();
     sim.world.crash(sim.server);
+    rounds::ended();
+    let (all, said) = rounds::counted();
+    sim.counts.rounds_all = all.saturating_sub(all_before);
+    sim.counts.rounds_said = said.saturating_sub(said_before);
     match ran {
         Ok(()) => Ok((sim.counts.clone(), sim.trace.digest())),
         Err(why) => {
@@ -768,6 +795,37 @@ mod tests {
             }
             if all.duplicates != 0 || all.lost != 0 {
                 return Err(format!("duplicate reminders {}, lost {}: both must be 0", all.duplicates, all.lost));
+            }
+        }
+        Ok(())
+    }
+
+    /// G9 step 3 (goal a2a44298, T-T1.5.1): with the driver stepping only the stacks said changed
+    /// (`goals::Steps::Stacks`, whatever `KILN_GOAL_FEED` says), no reminder is lost or sent twice over
+    /// the seed budget (`KILN_SIM_SEEDS=10000` for the run of record), with people's edits and agents'
+    /// verdicts landing while rounds are under way; and the model did test that: rounds stepped stacks
+    /// alone (the agents' news says its stacks, as the hub's does, and each write says its own), and
+    /// writes landed mid-round.
+    #[test]
+    fn g9_s3_per_stack_rounds_lose_and_double_no_reminder_with_writes_mid_round() -> Result<(), String> {
+        let mut all = Counts::default();
+        let report = seeds::run_budget("goals-stacks", 50, |seed| {
+            let keep = if seeds::replay().is_some() { 400 } else { 0 };
+            let (counts, digest) = run_stepping(seed, keep, Steps::Stacks)?;
+            all.add(&counts);
+            Ok(digest)
+        });
+        eprintln!("{}\n  counted: {all:?}", report.line());
+        report.into_result()?;
+        if all.duplicates != 0 || all.lost != 0 {
+            return Err(format!("duplicate reminders {}, lost {}: both must be 0", all.duplicates, all.lost));
+        }
+        if seeds::replay().is_none() {
+            if all.rounds_said == 0 {
+                return Err(format!("no round stepped stacks alone ({} of every stack): the model didn't test per-stack rounds", all.rounds_all));
+            }
+            if all.writes_mid_round == 0 {
+                return Err("no edit or verdict landed while a round was under way: the model didn't test writes mid-round".into());
             }
         }
         Ok(())
