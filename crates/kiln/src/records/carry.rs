@@ -483,8 +483,8 @@ mod tests {
     /// CP-T1.5 (goal 0d717247, every kiln record on Amphora): every table docs/records-inventory.md
     /// lists as made by kiln's store's migrations, and not dropped since, is one [`tables`] finds in
     /// a store those migrations made, so [`carry`] carries it and [`compare`] compares it; every
-    /// table [`tables`] finds is in the inventory, so none is carried that it doesn't account for;
-    /// and Records' own tables are in the store but not carried.
+    /// table [`tables`] finds is in the inventory, and not as tests only, so none is carried that
+    /// it doesn't account for; and Records' own tables are in the store but not carried.
     #[test]
     fn cp_t1_5_every_table_of_kilns_store_in_the_inventory_is_carried() -> anyhow::Result<()> {
         let inventory = include_str!("../../../../docs/records-inventory.md");
@@ -502,6 +502,9 @@ mod tests {
         anyhow::ensure!(missing.is_empty(), "made by the store's migrations but not carried: {missing:?}");
         let unlisted: Vec<&String> = found.iter().filter(|f| !listed.contains_key(f.as_str())).collect();
         anyhow::ensure!(unlisted.is_empty(), "carried but not in the inventory: {unlisted:?}");
+        // A table kiln's store keeps is kiln's, whatever file makes it (the store's own SCHEMA too).
+        let as_tests: Vec<&String> = found.iter().filter(|f| listed.get(f.as_str()).is_some_and(|(_, _, tests)| *tests == "yes")).collect();
+        anyhow::ensure!(as_tests.is_empty(), "kept by kiln's store, but in the inventory as tests only: {as_tests:?}");
         for own in crate::records::STORE_TABLES {
             anyhow::ensure!(listed.contains_key(own) && !found.iter().any(|f| f == own), "{own}: Records' own, in the inventory and not carried");
         }
