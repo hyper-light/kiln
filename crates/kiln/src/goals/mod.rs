@@ -2849,9 +2849,13 @@ where
             // When the round began: a deadline after it wasn't due in what the round and its riders
             // looked at, so it wakes them (at once, if it passed meanwhile); one before it, they saw.
             let began = self.clock.unix_ms();
-            // What the round sees of each agent: news is what differs from it.
-            seen.clear();
-            for i in self.agents_shared() {
+            // What the round sees of each agent it steps: news is what differs from it. Only those (G9 step 3, goal
+            // a2a44298, T-T1.5.1): an agent whose stack this round doesn't step, changed since its news was last heard
+            // and before this look, would be seen as it is now, its news then found no news, and its stack not stepped.
+            if matches!(which, Which::All) {
+                seen.clear();
+            }
+            for i in self.agents_in(&which) {
                 seen.insert(i.id.clone(), (news_of(&i), usage_of(&i)));
             }
             let (running, waiting) = crate::rt::labeled(&ROUND, self.round(changing, &which)).await;
@@ -3029,7 +3033,7 @@ where
         // own to adopt takes no wait, so the loop over every agent was one poll (goal 9, plan
         // 01a1a87b2cec step 3).
         let mut turns = crate::rt::Turns::new();
-        for info in self.agents_shared() {
+        for info in self.agents_in(which) {
             turns.end().await;
             // One with no goal set in it has none to adopt: the stacks aren't held for it (goal 9, plan 01a1a87b2cec
             // step 3: the gate taken and given back for each agent, a fence each time, in the driver's first poll).
@@ -3222,6 +3226,22 @@ where
             Some(hub) => hub.harness.list_shared(),
             None => self.port.agents().into_iter().map(Arc::new).collect(),
         }
+    }
+
+    /// The agents whose stacks `which` says, oldest first, as the registry shares them: every agent's for every stack;
+    /// for those said, each found by its id, not every session listed and sorted (G9 step 3, goal a2a44298,
+    /// T-T1.5.1). Through the port alone, from its list.
+    fn agents_in(&self, which: &Which) -> Vec<Arc<Info>> {
+        let keys = match which {
+            Which::All => return self.agents_shared(),
+            Which::Said(keys) => keys,
+        };
+        let mut v: Vec<Arc<Info>> = match self.hub {
+            Some(hub) => keys.iter().filter_map(|k| hub.harness.info_shared(k)).collect(),
+            None => self.port.agents().into_iter().filter(|i| keys.contains(&i.id)).map(Arc::new).collect(),
+        };
+        v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        v
     }
 
     /// What a step of `agent`'s stack reads of the sessions ([`step`]): its info and its children's, as the registry
