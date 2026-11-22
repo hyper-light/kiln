@@ -200,25 +200,38 @@ pub fn follow(c: &dyn Conversations, from: u64, to: u64, max_bytes: usize, seen:
     Ok(at)
 }
 
-/// What the feed handed on, held to what was appended (each once, never again changed): every entry exactly once,
-/// its revisions rising.
-pub fn exactly_once(seen: &[Changed], appended: &HashSet<Entry>) -> Result<(), Failure> {
+/// What the feed handed on, held to what was appended (each entry once, never again changed; `appended` holds each
+/// writer's entries in the order it appended them, each committed before its next): every entry exactly once, its
+/// revisions rising, and each writer's entries in the order it appended them.
+pub fn exactly_once(seen: &[Changed], appended: &[Vec<Entry>]) -> Result<(), Failure> {
+    let all: HashSet<&Entry> = appended.iter().flatten().collect();
     let mut last = 0u64;
-    let mut ids = HashSet::new();
-    for c in seen {
+    let mut at: HashMap<&Entry, usize> = HashMap::with_capacity(seen.len());
+    for (i, c) in seen.iter().enumerate() {
         check(c.rev > last, || format!("revision {} came after {last}", c.rev))?;
         last = c.rev;
-        check(ids.insert(c.entry.clone()), || format!("{:?} came twice", c.entry.id))?;
-        check(appended.contains(&c.entry), || format!("{:?} was never appended", c.entry))?;
+        check(all.contains(&c.entry), || format!("{:?} was never appended", c.entry))?;
+        check(at.insert(&c.entry, i).is_none(), || format!("{:?} came twice", c.entry.id))?;
     }
-    check(ids.len() == appended.len(), || format!("{} of {} entries came", ids.len(), appended.len()))
+    check(at.len() == all.len(), || format!("{} of {} entries came", at.len(), all.len()))?;
+    for mine in appended {
+        let mut before: Option<(usize, &Entry)> = None;
+        for e in mine {
+            let Some(&i) = at.get(e) else { return Err(format!("{:?} never came", e.id)) };
+            if let Some((j, prev)) = before {
+                check(i > j, || format!("{:?} came before {:?}, appended after it", e.id, prev.id))?;
+            }
+            before = Some((i, e));
+        }
+    }
+    Ok(())
 }
 
 /// Writers appending `per` entries each, one an append, to conversations of their own, while one reader follows the
-/// feed from `from`, then catches up to the top: what the writers appended, and where the reader got to.
-fn write_and_follow(c: &Arc<dyn Conversations>, round: usize, writers: usize, per: u64, from: u64, seen: &mut Vec<Changed>) -> Result<(HashSet<Entry>, u64), Failure> {
+/// feed from `from`, then catches up to the top: what each writer appended, in order, and where the reader got to.
+fn write_and_follow(c: &Arc<dyn Conversations>, round: usize, writers: usize, per: u64, from: u64, seen: &mut Vec<Changed>) -> Result<(Vec<Vec<Entry>>, u64), Failure> {
     let done = AtomicBool::new(false);
-    let (appended, at) = std::thread::scope(|s| -> Result<(HashSet<Entry>, u64), Failure> {
+    let (appended, at) = std::thread::scope(|s| -> Result<(Vec<Vec<Entry>>, u64), Failure> {
         let handles: Vec<_> = (0..writers)
             .map(|w| {
                 let c = Arc::clone(c);
@@ -245,11 +258,11 @@ fn write_and_follow(c: &Arc<dyn Conversations>, round: usize, writers: usize, pe
             }
             Ok((got, at))
         });
-        let mut appended = HashSet::new();
+        let mut appended = Vec::with_capacity(writers);
         let mut failed = None;
         for h in handles {
             match h.join() {
-                Ok(Ok(mine)) => appended.extend(mine),
+                Ok(Ok(mine)) => appended.push(mine),
                 Ok(Err(e)) => failed = Some(e),
                 Err(_) => failed = Some("a writer stopped".to_owned()),
             }
@@ -319,14 +332,20 @@ fn c3<F: ConversationsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
 fn c4<F: ConversationsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     Box::pin(async move {
         let mut seen = Vec::new();
-        let mut appended = HashSet::new();
+        let mut appended: Vec<Vec<Entry>> = Vec::new();
         let mut at = 0u64;
         for round in 0..3 {
             let c = f.open()?;
             let top = c.top().map_err(err)?;
             check(top >= at, || format!("opened again at revision {top}, below the {at} read before"))?;
             let (more, now) = write_and_follow(&c, round, 3, 20, at, &mut seen)?;
-            appended.extend(more);
+            // Writer w of each round appends to conversation w after the round before: one writer's order across them.
+            for (w, mine) in more.into_iter().enumerate() {
+                match appended.get_mut(w) {
+                    Some(was) => was.extend(mine),
+                    None => appended.push(mine),
+                }
+            }
             at = now;
             c.close().map_err(err)?;
             check(matches!(c.top(), Err(Error::Closed)), || "a closed handle answered".to_owned())?;
@@ -381,6 +400,8 @@ pub struct Load {
     pub text_bytes: usize,
     /// The bytes a page of the feed asks for.
     pub page_bytes: usize,
+    /// The newest entries a reader asks of a conversation's history, for the last change of each page it reads.
+    pub history_entries: usize,
     /// Let go of and opened again once the writers are half way, readers mid-feed.
     pub restart: bool,
 }
@@ -439,7 +460,8 @@ fn micros(since: Instant) -> u64 {
 }
 
 struct Phase {
-    appended: Vec<Entry>,
+    /// Each writer's appends, in the order it made them.
+    appended: Vec<Vec<Entry>>,
     append_us: Vec<u64>,
     history_us: Vec<u64>,
     feed_us: Vec<u64>,
@@ -489,7 +511,7 @@ fn phase(c: &Arc<dyn Conversations>, l: &Load, from: usize, to: usize, at: &mut 
                         *at = page.upto;
                         if let Some(last) = page.changes.last() {
                             let t = Instant::now();
-                            c.history(&last.entry.conversation, None, 50).map_err(err)?;
+                            c.history(&last.entry.conversation, None, l.history_entries).map_err(err)?;
                             history_us.push(micros(t));
                         }
                         let moved = !page.changes.is_empty();
@@ -511,7 +533,7 @@ fn phase(c: &Arc<dyn Conversations>, l: &Load, from: usize, to: usize, at: &mut 
         for h in writers {
             match h.join() {
                 Ok(Ok((mine, us, last))) => {
-                    p.appended.extend(mine);
+                    p.appended.push(mine);
                     p.append_us.extend(us);
                     p.last_commit = p.last_commit.max(last);
                 }
@@ -554,7 +576,13 @@ pub fn load<F: ConversationsFixture>(f: &F, l: &Load) -> Result<LoadReport, Fail
         phases.push(phase(&c, l, half, l.appends, &mut at, &mut seen, true)?);
     }
     let caught_up = Instant::now();
-    let appended: HashSet<Entry> = phases.iter().flat_map(|p| p.appended.iter().cloned()).collect();
+    // Writer w's appends of each phase, the phases in turn: one writer's order through the restart.
+    let mut appended: Vec<Vec<Entry>> = vec![Vec::new(); l.writers];
+    for p in &phases {
+        for (mine, all) in p.appended.iter().zip(appended.iter_mut()) {
+            all.extend(mine.iter().cloned());
+        }
+    }
     for s in &seen {
         exactly_once(s, &appended)?;
     }
@@ -567,7 +595,7 @@ pub fn load<F: ConversationsFixture>(f: &F, l: &Load) -> Result<LoadReport, Fail
         feed_us: all(|p| &p.feed_us),
         feed_lag_revs: all(|p| &p.lag),
         catch_up_us: last.map_or(0, |t| u64::try_from(caught_up.saturating_duration_since(t).as_micros()).unwrap_or(u64::MAX)),
-        appended: appended.len(),
+        appended: appended.iter().map(Vec::len).sum(),
         restarts,
         rss_bytes: rss,
         rss_peak_bytes: peak,
@@ -588,9 +616,22 @@ mod tests {
 
     #[test]
     fn cp_t1_1_the_load_scenario_runs_on_the_simulator_each_entry_once() -> Result<(), String> {
-        let l = Load { conversations: 8, writers: 4, appends: 50, readers: 3, text_bytes: 64, page_bytes: 4096, restart: true };
+        let l = Load { conversations: 8, writers: 4, appends: 50, readers: 3, text_bytes: 64, page_bytes: 4096, history_entries: 50, restart: true };
         let r = load(&SimConversationsFixture::default(), &l)?;
         check(r.appended == 200 && r.restarts == 1 && r.append_us.n == 200, || format!("{r:?}"))
+    }
+
+    /// CP-T1.1: the model check refuses a feed that loses, repeats or reorders what one writer appended.
+    #[test]
+    fn cp_t1_1_the_model_check_refuses_a_lost_repeated_or_reordered_change() {
+        let (a, b, x) = (entry("c", "m1", 1, "t"), entry("c", "m2", 2, "t"), entry("d", "m1", 1, "t"));
+        let feed = |es: &[(&Entry, u64)]| es.iter().map(|(e, rev)| Changed { rev: *rev, entry: (*e).clone() }).collect::<Vec<_>>();
+        let appended = vec![vec![a.clone(), b.clone()], vec![x.clone()]];
+        assert!(exactly_once(&feed(&[(&a, 1), (&x, 2), (&b, 3)]), &appended).is_ok());
+        assert!(exactly_once(&feed(&[(&a, 1), (&x, 2)]), &appended).is_err(), "lost");
+        assert!(exactly_once(&feed(&[(&a, 1), (&x, 2), (&b, 3), (&b, 4)]), &appended).is_err(), "twice");
+        assert!(exactly_once(&feed(&[(&b, 1), (&x, 2), (&a, 3)]), &appended).is_err(), "reordered");
+        assert!(exactly_once(&feed(&[(&a, 2), (&x, 1), (&b, 3)]), &appended).is_err(), "revisions falling");
     }
 
     #[test]

@@ -150,6 +150,7 @@ mod tests {
             readers: knob("KILN_CONVO_LOAD_READERS", 3)?,
             text_bytes: knob("KILN_CONVO_LOAD_TEXT_BYTES", 600)?,
             page_bytes: knob("KILN_CONVO_LOAD_PAGE_BYTES", 1 << 16)?,
+            history_entries: knob("KILN_CONVO_LOAD_HISTORY_ENTRIES", 50)?,
             restart: knob("KILN_CONVO_LOAD_RESTART", 1)? != 0,
         };
         for kind in super::super::Kind::ALL {
