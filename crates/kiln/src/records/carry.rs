@@ -540,6 +540,32 @@ mod tests {
         Ok(())
     }
 
+    /// CP-T1.5 / CP-T1.6 on each engine `records::open` chooses: the server's Records (a deploy's
+    /// release and its fenced lease) copied into a records file of Turso's and of Amphora's read back
+    /// the same, record by record, and a value changed after is found by family and key.
+    #[test]
+    fn cp_t1_5_the_servers_records_copy_and_compare_the_same_on_each_engine() -> anyhow::Result<()> {
+        for engine in crate::records::Engine::ALL {
+            crate::rt::block_on(async move {
+                let dir = tempfile::tempdir()?;
+                let to = engine.open(&dir.path().join("records.db"))?;
+                let store = Store::in_memory()?;
+                let from = crate::records::StoreRecords::open(store.clone())?;
+                let put = |f: &str, k: &str, v: &str| Write::Put { family: f.into(), key: k.as_bytes().to_vec(), value: v.as_bytes().to_vec() };
+                from.commit(Tx { conds: Vec::new(), writes: vec![put("deploy.release", "r1", "{\"id\":1}"), put("deploy.lease", "web", "fence 7")] }).await?;
+                let fams = families(&store).await?;
+                let copied = copy_records(&from, &fams, &*to).await?;
+                let same = compare_records(&from, &fams, &*to).await?;
+                anyhow::ensure!(copied == 2 && same.is_empty(), "{engine:?}: {copied} copied, {same:?}");
+                from.commit(Tx { conds: Vec::new(), writes: vec![put("deploy.lease", "web", "fence 8")] }).await?;
+                let found: Vec<(String, Differs)> = compare_records(&from, &fams, &*to).await?.into_iter().map(|d| (d.table, d.differs)).collect();
+                anyhow::ensure!(found == vec![("deploy.lease".to_owned(), Differs::Value { from: 7, to: 7 })], "{engine:?}: {found:?}");
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     /// A WITHOUT ROWID table is paged by its primary key, a page a commit: past one page, every
     /// row is carried once and read back the same, and a row changed after the copy is found.
     #[test]
