@@ -694,9 +694,14 @@ pub struct Store {
 
 impl Store {
     /// The store, its writer thread started on `engine`, looking after its file as `upkeep` says, its readers as
-    /// [`READERS_VAR`] says.
+    /// [`READERS_VAR`] says: the control where it can't be read, said, never a store refused for it (a store that
+    /// doesn't start is set aside as a file that won't open: `super::open_or_set_aside`).
     pub fn start(engine: Box<dyn Engine>, upkeep: Upkeep) -> anyhow::Result<Self> {
-        Self::start_with(engine, upkeep, Readers::configured()?)
+        let readers = Readers::configured().unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "conversation store: one reader beside its writer, the control");
+            Readers::One
+        });
+        Self::start_with(engine, upkeep, readers)
     }
 
     /// As [`Store::start`], with `readers` reading beside the writer.
