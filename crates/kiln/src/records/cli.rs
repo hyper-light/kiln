@@ -1,6 +1,6 @@
-//! `kiln records`: kiln's goal and plan tables carried into Records and compared with them, from the
-//! command line (CP-T1.5, T-T1.5.2; kiln goal 0d717247). `kiln records carry` puts every row of
-//! [`carry::TABLES`] into its family, then compares; `kiln records compare` only compares. Each
+//! `kiln records`: every table of kiln's store (its goals and plans among them) carried into Records
+//! and compared with them, from the command line (CP-T1.5, T-T1.5.2; kiln goal 0d717247). `kiln
+//! records carry` puts every row of every table [`carry::tables`] finds into its family, then compares; `kiln records compare` only compares. Each
 //! difference is printed by table, key and column, and the command fails when there's one, so the
 //! move's switch-over can wait on it.
 //!
@@ -26,10 +26,10 @@ pub struct RecordsArgs {
 
 #[derive(clap::Subcommand)]
 enum RecordsCmd {
-    /// Put every row of kiln's goal and plan tables into Records (each row whole, so running it again
+    /// Put every row of every table of kiln's store into Records (each row whole, so running it again
     /// copies again), then compare the two.
     Carry(Where),
-    /// Compare kiln's goal and plan tables with their records: each row with no record, record with
+    /// Compare every table of kiln's store with its records: each row with no record, record with
     /// no row, and field that differs, by table, key and column. Fails when any differs.
     Compare(Where),
 }
@@ -113,10 +113,10 @@ mod tests {
             rows: 3,
             records: 3,
             differences: vec![
-                Difference { table: "goal_items", key: "[7]".into(), differs: Differs::Field { column: "pos".into(), row: Some(Field::Text("first".into())), record: Some(Field::Integer(1)) } },
-                Difference { table: "goal_items", key: "[8]".into(), differs: Differs::Field { column: "added".into(), row: None, record: Some(Field::Null) } },
-                Difference { table: "goal_stacks", key: "[\"a\"]".into(), differs: Differs::NoRecord },
-                Difference { table: "plans", key: "[\"p\"]".into(), differs: Differs::NoRow },
+                Difference { table: "goal_items".into(), key: "[7]".into(), differs: Differs::Field { column: "pos".into(), row: Some(Field::Text("first".into())), record: Some(Field::Integer(1)) } },
+                Difference { table: "goal_items".into(), key: "[8]".into(), differs: Differs::Field { column: "added".into(), row: None, record: Some(Field::Null) } },
+                Difference { table: "goal_stacks".into(), key: "[\"a\"]".into(), differs: Differs::NoRecord },
+                Difference { table: "plans".into(), key: "[\"p\"]".into(), differs: Differs::NoRow },
             ],
         };
         assert_eq!(
@@ -138,12 +138,14 @@ mod tests {
         crate::rt::block_on(async {
             let store = Store::in_memory()?;
             let records = SimRecords::new();
+            // A new store's rows are what its migrations put in (each migration's own row among them).
             let (carried, same) = carry_and_compare(&store, &records, true).await?;
-            anyhow::ensure!(carried == Some(0) && same.differences.is_empty(), "an empty store carries and compares the same: {carried:?}, {:?}", same.differences);
+            let n = carried.ok_or_else(|| anyhow::anyhow!("carried"))?;
+            anyhow::ensure!(n > 0 && same.rows == n && same.records == n && same.differences.is_empty(), "a new store carries and compares the same: {carried:?}, {:?}", same.differences);
             records.commit(Tx { conds: Vec::new(), writes: vec![Write::Put { family: carry::family("plans"), key: br#"["stray"]"#.to_vec(), value: b"{}".to_vec() }] }).await.map_err(|e| anyhow::anyhow!("{e}"))?;
             let (_, found) = carry_and_compare(&store, &records, true).await?;
             let lines = report(&found);
-            anyhow::ensure!(lines == [r#"plans ["stray"]: a record with no row"#, "0 rows, 1 records: 1 differences"], "{lines:?}");
+            anyhow::ensure!(lines == [r#"plans ["stray"]: a record with no row"#.to_owned(), format!("{n} rows, {} records: 1 differences", n + 1)], "{lines:?}");
             Ok(())
         })
     }

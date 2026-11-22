@@ -13,7 +13,8 @@
 //!   find on the keyword's line is listed as `?`, to be read by a person.
 //! - a JSON record: a `.json` file name in a source file that both encodes JSON (`serde_json::to_`)
 //!   and writes a file (`fs::write`, `File::create`, `OpenOptions`, `write_atomic`).
-//! - test only: under a `tests` folder, in a `tests.rs`, or after the file's first `#[cfg(test)]`.
+//! - test only: under a `tests` folder, in a `tests.rs`, or in an item under `#[cfg(test)]` (from
+//!   the attribute to the item's closing brace, or its `;`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -83,20 +84,41 @@ fn after_if(s: &str) -> &str {
     t
 }
 
-/// Each line's text that isn't a comment, with whether it is test code.
+/// Each line's text that isn't a comment, with whether it is test code: in a test file, or in the
+/// item a `#[cfg(test)]` is on, from the attribute to the item's end (its braces closed again, its
+/// `;` when it has none, or the braces around it closed). Code after that item is kiln's again: an attribute on one helper near
+/// a file's top doesn't make the tables the file goes on to create (kiln's store's `SCHEMA`) a
+/// test's.
 fn code_lines(text: &str, sql: bool, test_file: bool) -> Vec<(String, bool)> {
-    let mut test = test_file;
+    // The brace depth at the `#[cfg(test)]` whose item the reader is in, and whether that item's
+    // braces have opened yet.
+    let mut item: Option<(i64, bool)> = None;
+    let mut depth: i64 = 0;
     let mut out = Vec::new();
     for line in text.lines() {
-        if !sql && line.trim_start().starts_with("#[cfg(test)]") {
-            test = true;
-        }
         let t = line.trim_start();
-        if t.starts_with("//") || (sql && t.starts_with("--")) {
+        if !sql && item.is_none() && t.starts_with("#[cfg(test)]") {
+            item = Some((depth, false));
+        }
+        let comment = t.starts_with("//") || (sql && t.starts_with("--"));
+        if !comment {
+            let code = if sql { t.split("--").next().unwrap_or("") } else { t };
+            out.push((code.to_string(), test_file || item.is_some()));
+        }
+        if sql || comment {
             continue;
         }
-        let code = if sql { t.split("--").next().unwrap_or("") } else { t };
-        out.push((code.to_string(), test));
+        let count = |c: char| i64::try_from(t.matches(c).count()).unwrap_or(i64::MAX);
+        let (opens, closes) = (count('{'), count('}'));
+        depth = depth.saturating_add(opens).saturating_sub(closes);
+        if let Some((at, opened)) = item.as_mut() {
+            *opened |= opens > 0;
+            // Its braces closed again; its `;` before any brace; or, for an attribute on a field or
+            // an arm, the braces around it closed.
+            if (*opened && depth <= *at) || (!*opened && t.trim_end().ends_with(';')) || depth < *at {
+                item = None;
+            }
+        }
     }
     out
 }
@@ -262,4 +284,13 @@ fn cp_t1_5_the_reader_finds_creates_renames_and_drops() {
     assert_eq!(code_lines("// CREATE TABLE prose\nx", false, false).len(), 1);
     let lines = code_lines("serde_json::to_vec(&x); fs::write(dir.join(\"state.json\"), b);\n#[cfg(test)]\nlet p = \"t.json\";", false, false);
     assert_eq!(json_names(&lines), vec![("state.json".to_string(), false), ("t.json".to_string(), true)]);
+}
+
+/// A `#[cfg(test)]` makes test code of its item alone: a helper's attribute near a file's top
+/// leaves the tables the file creates after it kiln's, and a test module's tables stay tests'.
+#[test]
+fn cp_t1_5_a_cfg_test_covers_its_item_alone() {
+    let text = "struct S {\n    #[cfg(test)]\n    inline: u8,\n}\n#[cfg(test)]\nuse std::fmt;\n#[cfg(test)]\nfn helper() {\n    let t = \"CREATE TABLE a (x)\";\n}\nconst SCHEMA: &str = \"CREATE TABLE repos (id)\";\n#[cfg(test)]\nmod tests {\n    fn t() {\n        let f = format!(\"{n}\");\n    }\n    const B: &str = \"CREATE TABLE b (x)\";\n}\nconst C: &str = \"CREATE TABLE c (x)\";";
+    let tests: Vec<(&str, bool)> = code_lines(text, false, false).iter().filter_map(|(l, test)| ["inline", "use std", "CREATE TABLE a", "repos", "CREATE TABLE b", "CREATE TABLE c"].into_iter().find(|w| l.contains(w)).map(|w| (w, *test))).collect();
+    assert_eq!(tests, vec![("inline", true), ("use std", true), ("CREATE TABLE a", true), ("repos", false), ("CREATE TABLE b", true), ("CREATE TABLE c", false)]);
 }

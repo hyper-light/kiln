@@ -40,6 +40,11 @@ pub mod turso;
 /// conversation store; else brought into it once (`crate::convo::inbox`).
 pub const FILE: &str = "records.db";
 
+/// The tables of kiln's store that [`StoreRecords`] keeps Records in (migration
+/// `20261023-1300_p6_records.sql`): Records' own, so [`carry`] never carries them into Records (a
+/// copy of the copy, which would grow as it ran).
+pub const STORE_TABLES: [&str; 3] = ["records_versions", "records_families", "records_meta"];
+
 /// The records kept at `path`, on the engine `KILN_RECORDS_ENGINE` names ([`Engine::configured`]):
 /// Turso's, the control, unless it says Amphora's.
 pub fn open(path: &Path) -> anyhow::Result<Arc<dyn Records>> {
