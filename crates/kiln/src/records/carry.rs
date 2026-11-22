@@ -1,10 +1,11 @@
-//! Goals and plans carried from kiln's SQLite store into Records, row by row, and compared field by
-//! field (CP-T1.5, T-T1.5.2; G9 step 4; kiln goal 0d717247). Each table of [`TABLES`] becomes the
-//! family `kiln.<table>`; each row a record whose key is its primary key and whose value is every
+//! Every table of kiln's SQLite store carried into Records, row by row, and compared field by field
+//! (CP-T1.5, T-T1.5.2; G9 step 4; kiln goal 0d717247): goals and plans first, and with them every
+//! other record kind the store keeps (docs/records-inventory.md). Each table [`tables`] reads from
+//! the store as it stands becomes the family `kiln.<table>`; each row a record whose key is its primary key and whose value is every
 //! column with SQLite's storage class kept ([`Field`]), so [`compare`] tells a text `1` from an
 //! integer 1, keeps a real's every bit, and finds a text that isn't UTF-8 rather than smoothing it
 //! over. What the copy carries is what the tables hold: nothing of kiln's model is between them, so
-//! a column a later migration adds is carried and compared without a change here.
+//! a column or a table a later migration adds is carried and compared without a change here.
 //!
 //! [`carry`] puts every row (again, when it's run again: a copy is idempotent), a page of rows a
 //! commit; [`compare`] reads every row back and lists each difference: a row with no record, a
@@ -21,8 +22,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::store::Store;
 
-/// Every table of goals and plans in kiln's store (docs/records-inventory.md).
-pub const TABLES: &[&str] = &["goal_stacks", "goal_items", "plans", "plan_versions", "plan_runs", "plan_run_steps", "plan_reviews"];
+/// Every table and virtual table of a SQLite database by name, and whether it's WITHOUT ROWID.
+const TABLE_LIST: &str = "SELECT name, wr FROM pragma_table_list WHERE schema = 'main' AND type IN ('table', 'virtual') AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name";
+
+/// A table of kiln's store, as [`tables`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Table {
+    pub name: String,
+    /// A WITHOUT ROWID table: its rows are paged by its primary key, as it has no rowid.
+    without_rowid: bool,
+}
+
+/// Every table of kiln's store that keeps rows, by name: its tables and its virtual tables (a
+/// full-text index such as `ci_log_index` keeps its text itself). Not SQLite's own (`sqlite_*`), a
+/// virtual table's shadow tables (its storage, carried through it), views, or the tables Records
+/// itself is kept in ([`crate::records::STORE_TABLES`]). Read from the store as it stands
+/// (`pragma_table_list`), so a table a later migration adds is carried without a change here.
+pub async fn tables(store: &Store) -> anyhow::Result<Vec<Table>> {
+    store
+        .read(|c| {
+            let mut s = c.prepare(TABLE_LIST)?;
+            let all = s.query_map([], |r| Ok(Table { name: r.get(0)?, without_rowid: r.get::<_, i64>(1)? != 0 }))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(all.into_iter().filter(|t| !crate::records::STORE_TABLES.contains(&t.name.as_str())).collect())
+        })
+        .await
+}
 
 /// Rows read, and records written, at a time: as many as one commit takes (the Records seam's own
 /// bound, `TX_MAX`).
@@ -88,7 +112,7 @@ pub enum Differs {
 /// A difference between a table and its family.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Difference {
-    pub table: &'static str,
+    pub table: String,
     /// The row's key, as its primary key's fields in JSON.
     pub key: String,
     pub differs: Differs,
@@ -104,8 +128,55 @@ pub struct Compared {
     pub differences: Vec<Difference>,
 }
 
-/// A page of a table's rows after `after` (a rowid), in rowid order, and the last rowid read.
-async fn page(store: &Store, table: &'static str, after: i64) -> anyhow::Result<(Vec<Read>, i64)> {
+/// A field as SQLite gave it, kept to bind again: where a WITHOUT ROWID table's next page starts.
+#[derive(Debug, Clone)]
+enum Raw {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
+impl Raw {
+    fn of(v: ValueRef<'_>) -> Self {
+        match v {
+            ValueRef::Null => Raw::Null,
+            ValueRef::Integer(i) => Raw::Integer(i),
+            ValueRef::Real(f) => Raw::Real(f),
+            ValueRef::Text(t) => Raw::Text(t.to_vec()),
+            ValueRef::Blob(b) => Raw::Blob(b.to_vec()),
+        }
+    }
+}
+
+impl rusqlite::ToSql for Raw {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::Borrowed(match self {
+            Raw::Null => ValueRef::Null,
+            Raw::Integer(i) => ValueRef::Integer(*i),
+            Raw::Real(f) => ValueRef::Real(*f),
+            Raw::Text(t) => ValueRef::Text(t),
+            Raw::Blob(b) => ValueRef::Blob(b),
+        }))
+    }
+}
+
+/// Where a table's next page starts.
+#[derive(Debug, Clone)]
+enum After {
+    /// Its first row.
+    Start,
+    /// After a rowid.
+    Rowid(i64),
+    /// After a WITHOUT ROWID table's primary key, its fields in the key's order.
+    Key(Vec<Raw>),
+}
+
+/// A page of a table's rows after `after`, in rowid order (a WITHOUT ROWID table's: its primary
+/// key's), and where the next one starts.
+async fn page(store: &Store, table: &Table, after: After) -> anyhow::Result<(Vec<Read>, After)> {
+    let Table { name: table, without_rowid } = table.clone();
     store
         .read(move |c| {
             let mut info = c.prepare(&format!("SELECT name, pk FROM pragma_table_info('{table}') ORDER BY cid"))?;
@@ -113,24 +184,40 @@ async fn page(store: &Store, table: &'static str, after: i64) -> anyhow::Result<
             anyhow::ensure!(!cols.is_empty(), "kiln's store has no table {table}");
             let mut pk: Vec<(i64, usize)> = cols.iter().enumerate().filter(|(_, (_, k))| *k > 0).map(|(i, (_, k))| (*k, i)).collect();
             pk.sort_unstable();
+            anyhow::ensure!(!without_rowid || !pk.is_empty(), "{table} has no rowid and no primary key");
             let list = cols.iter().map(|(n, _)| format!("\"{n}\"")).collect::<Vec<_>>().join(", ");
-            let mut s = c.prepare(&format!("SELECT rowid, {list} FROM \"{table}\" WHERE rowid > ?1 ORDER BY rowid LIMIT ?2"))?;
+            let keys = pk.iter().filter_map(|(_, i)| cols.get(*i).map(|(n, _)| format!("\"{n}\""))).collect::<Vec<_>>().join(", ");
             let limit = i64::try_from(PAGE)?;
-            let mut rows = s.query(rusqlite::params![after, limit])?;
-            let (mut out, mut last) = (Vec::new(), after);
+            // The fields after which this page starts, bound in order, then the page's size.
+            let (from, bound): (String, Vec<Raw>) = match after {
+                After::Start => (String::new(), Vec::new()),
+                After::Rowid(r) => ("WHERE rowid > ?".to_owned(), vec![Raw::Integer(r)]),
+                After::Key(k) => {
+                    let marks = vec!["?"; k.len()].join(", ");
+                    (format!("WHERE ({keys}) > ({marks})"), k)
+                }
+            };
+            let sql = if without_rowid { format!("SELECT {list} FROM \"{table}\" {from} ORDER BY {keys} LIMIT ?") } else { format!("SELECT rowid, {list} FROM \"{table}\" {from} ORDER BY rowid LIMIT ?") };
+            let mut s = c.prepare(&sql)?;
+            let mut params: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+            params.push(&limit);
+            let mut rows = s.query(params.as_slice())?;
+            // Where a WITHOUT ROWID table's columns start in its rows: it has no rowid before them.
+            let skip = usize::from(!without_rowid);
+            let (mut out, mut next) = (Vec::new(), None);
             while let Some(r) = rows.next()? {
-                last = r.get::<_, i64>(0)?;
                 let mut fields = Fields::new();
                 for (i, (name, _)) in cols.iter().enumerate() {
-                    fields.insert(name.clone(), Field::of(r.get_ref(i + 1)?));
+                    fields.insert(name.clone(), Field::of(r.get_ref(i + skip)?));
                 }
                 // The primary key's fields in order; a table without one is keyed by its rowid.
-                let key: Vec<Field> = if pk.is_empty() { vec![Field::Integer(last)] } else { pk.iter().filter_map(|(_, i)| cols.get(*i).and_then(|(n, _)| fields.get(n)).cloned()).collect() };
+                let key: Vec<Field> = if pk.is_empty() { vec![Field::Integer(r.get::<_, i64>(0)?)] } else { pk.iter().filter_map(|(_, i)| cols.get(*i).and_then(|(n, _)| fields.get(n)).cloned()).collect() };
+                next = Some(if without_rowid { After::Key(pk.iter().map(|(_, i)| r.get_ref(i + skip).map(Raw::of)).collect::<Result<_, _>>()?) } else { After::Rowid(r.get::<_, i64>(0)?) });
                 let key = serde_json::to_vec(&key)?;
                 anyhow::ensure!(key.len() <= KEY_MAX, "a row of {table} has a primary key of {} bytes, over the Records seam's {KEY_MAX}", key.len());
                 out.push(Read { key, fields });
             }
-            Ok((out, last))
+            Ok((out, next.unwrap_or(After::Start)))
         })
         .await
 }
@@ -139,14 +226,14 @@ fn refused(r: Refusal) -> anyhow::Error {
     anyhow::anyhow!("records: {r}")
 }
 
-/// Puts every row of [`TABLES`] into its family, a page a commit. How many rows it carried.
+/// Puts every row of every table [`tables`] finds into its family, a page a commit. How many rows it carried.
 pub async fn carry(store: &Store, records: &dyn Records) -> anyhow::Result<usize> {
     let mut carried = 0;
-    for &table in TABLES {
-        let fam = family(table);
-        let mut after = i64::MIN;
+    for table in tables(store).await? {
+        let fam = family(&table.name);
+        let mut after = After::Start;
         loop {
-            let (rows, last) = page(store, table, after).await?;
+            let (rows, next) = page(store, &table, after).await?;
             if rows.is_empty() {
                 break;
             }
@@ -155,18 +242,18 @@ pub async fn carry(store: &Store, records: &dyn Records) -> anyhow::Result<usize
             for r in rows {
                 writes.push(Write::Put { family: fam.clone(), key: r.key, value: serde_json::to_vec(&r.fields)? });
             }
-            records.commit(Tx { conds: Vec::new(), writes }).await.map_err(|e| anyhow::anyhow!("carrying {table}: {}", refused(e)))?;
-            after = last;
+            records.commit(Tx { conds: Vec::new(), writes }).await.map_err(|e| anyhow::anyhow!("carrying {}: {}", table.name, refused(e)))?;
+            after = next;
         }
     }
     Ok(carried)
 }
 
-/// Reads every row of [`TABLES`] and every record of their families, and lists each difference.
+/// Reads every row of every table [`tables`] finds and every record of their families, and lists each difference.
 pub async fn compare(store: &Store, records: &dyn Records) -> anyhow::Result<Compared> {
     let mut out = Compared::default();
-    for &table in TABLES {
-        let fam = family(table);
+    for table in tables(store).await? {
+        let fam = family(&table.name);
         let at = Consistency::Snapshot(records.head().await.map_err(refused)?);
         // Every record of the family, by key.
         let mut kept: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -180,9 +267,9 @@ pub async fn compare(store: &Store, records: &dyn Records) -> anyhow::Result<Com
                 break;
             }
         }
-        let mut after = i64::MIN;
+        let mut after = After::Start;
         loop {
-            let (rows, last) = page(store, table, after).await?;
+            let (rows, next) = page(store, &table, after).await?;
             if rows.is_empty() {
                 break;
             }
@@ -190,24 +277,24 @@ pub async fn compare(store: &Store, records: &dyn Records) -> anyhow::Result<Com
             for r in rows {
                 let key = String::from_utf8_lossy(&r.key).into_owned();
                 let Some(value) = kept.remove(&r.key) else {
-                    out.differences.push(Difference { table, key, differs: Differs::NoRecord });
+                    out.differences.push(Difference { table: table.name.clone(), key, differs: Differs::NoRecord });
                     continue;
                 };
                 let have: Fields = match serde_json::from_slice(&value) {
                     Ok(f) => f,
                     Err(e) => {
-                        out.differences.push(Difference { table, key, differs: Differs::Unreadable(e.to_string()) });
+                        out.differences.push(Difference { table: table.name.clone(), key, differs: Differs::Unreadable(e.to_string()) });
                         continue;
                     }
                 };
                 for d in fields_differ(&r.fields, &have) {
-                    out.differences.push(Difference { table, key: key.clone(), differs: d });
+                    out.differences.push(Difference { table: table.name.clone(), key: key.clone(), differs: d });
                 }
             }
-            after = last;
+            after = next;
         }
         for key in kept.into_keys() {
-            out.differences.push(Difference { table, key: String::from_utf8_lossy(&key).into_owned(), differs: Differs::NoRow });
+            out.differences.push(Difference { table: table.name.clone(), key: String::from_utf8_lossy(&key).into_owned(), differs: Differs::NoRow });
         }
     }
     Ok(out)
@@ -236,54 +323,78 @@ mod tests {
 
     use super::*;
 
-    /// Two rows in every table of goals and plans, each column given a value of its declared type
-    /// (the second row's nullable columns NULL), whatever columns the migrations made.
-    async fn fill(store: &Store) -> anyhow::Result<()> {
-        store
-            .call(|c| {
-                for &table in TABLES {
-                    let mut info = c.prepare(&format!("SELECT name, type, \"notnull\", pk FROM pragma_table_info('{table}') ORDER BY cid"))?;
-                    let cols = info.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? != 0, r.get::<_, i64>(3)? > 0)))?.collect::<Result<Vec<_>, _>>()?;
-                    drop(info);
-                    for n in 0..2_i64 {
-                        let names = cols.iter().map(|(c, ..)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
-                        let values: Vec<rusqlite::types::Value> = cols
-                            .iter()
-                            .map(|(name, ty, notnull, pk)| {
-                                let ty = ty.to_ascii_uppercase();
-                                if n == 1 && !notnull && !pk {
-                                    rusqlite::types::Value::Null
-                                } else if ty.contains("INT") {
-                                    rusqlite::types::Value::Integer(1_000_000_007 * (n + 1))
-                                } else if ty.contains("REAL") || ty.contains("FLOA") || ty.contains("DOUB") {
-                                    rusqlite::types::Value::Real(if n == 0 { 0.1 } else { 1.1 })
-                                } else if ty.contains("BLOB") {
-                                    rusqlite::types::Value::Blob(vec![0, 255, u8::try_from(n).unwrap_or(0)])
-                                } else {
-                                    rusqlite::types::Value::Text(format!("{table}.{name} {n}: ünïcode, \"quoted\", 'single'"))
-                                }
-                            })
-                            .collect();
-                        let marks = (1..=values.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
-                        c.execute(&format!("INSERT INTO \"{table}\" ({names}) VALUES ({marks})"), rusqlite::params_from_iter(values))?;
-                    }
+    /// A store at `path` whose every table [`tables`] finds holds two rows, besides what its
+    /// migrations put in, each column given a value of its declared type (the second row's
+    /// nullable columns NULL), whatever columns and tables the migrations made; and how many rows
+    /// its tables hold. The rows are written on a connection of their own before the store opens,
+    /// with the store's checks put aside so each table's rows stand alone: foreign keys off, CHECK
+    /// constraints not applied, and the triggers dropped while it writes and made again after, so a
+    /// row in one table makes none in another.
+    async fn filled(path: &std::path::Path) -> anyhow::Result<(Store, usize)> {
+        {
+            // Made as the store makes itself (its schema, then its migrations), then its checks off.
+            let mut c = rusqlite::Connection::open(path)?;
+            c.execute_batch(crate::store::SCHEMA)?;
+            crate::store::migrations::apply(&mut c)?;
+            c.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA ignore_check_constraints = ON")?;
+            let triggers: Vec<(String, String)> = c.prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND sql IS NOT NULL")?.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+            for (name, _) in &triggers {
+                c.execute_batch(&format!("DROP TRIGGER \"{name}\""))?;
+            }
+            let all: Vec<String> = c.prepare(TABLE_LIST)?.query_map([], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            for table in all.iter().filter(|t| !crate::records::STORE_TABLES.contains(&t.as_str())) {
+                let mut info = c.prepare(&format!("SELECT name, type, \"notnull\", pk FROM pragma_table_info('{table}') ORDER BY cid"))?;
+                let cols = info.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? != 0, r.get::<_, i64>(3)? > 0)))?.collect::<Result<Vec<_>, _>>()?;
+                drop(info);
+                for n in 0..2_i64 {
+                    let names = cols.iter().map(|(c, ..)| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+                    let values: Vec<rusqlite::types::Value> = cols
+                        .iter()
+                        .map(|(name, ty, notnull, pk)| {
+                            let ty = ty.to_ascii_uppercase();
+                            if n == 1 && !notnull && !pk {
+                                rusqlite::types::Value::Null
+                            } else if ty.contains("INT") {
+                                rusqlite::types::Value::Integer(1_000_000_007 * (n + 1))
+                            } else if ty.contains("REAL") || ty.contains("FLOA") || ty.contains("DOUB") {
+                                rusqlite::types::Value::Real(if n == 0 { 0.1 } else { 1.1 })
+                            } else if ty.contains("BLOB") {
+                                rusqlite::types::Value::Blob(vec![0, 255, u8::try_from(n).unwrap_or(0)])
+                            } else {
+                                rusqlite::types::Value::Text(format!("{table}.{name} {n}: ünïcode, \"quoted\", 'single'"))
+                            }
+                        })
+                        .collect();
+                    let marks = (1..=values.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+                    c.execute(&format!("INSERT INTO \"{table}\" ({names}) VALUES ({marks})"), rusqlite::params_from_iter(values)).map_err(|e| anyhow::anyhow!("two rows in {table}: {e}"))?;
                 }
-                Ok(())
-            })
-            .await
+            }
+            for (_, sql) in &triggers {
+                c.execute_batch(sql)?;
+            }
+        }
+        let store = Store::open(path)?;
+        let mut rows = 0;
+        for table in tables(&store).await? {
+            let name = table.name.clone();
+            rows += store.read(move |c| Ok(c.query_row(&format!("SELECT count(*) FROM \"{name}\""), [], |r| r.get::<_, i64>(0))?)).await?;
+        }
+        Ok((store, usize::try_from(rows)?))
     }
 
-    /// T-T1.5.2 (CP-T1.5): every goal and plan carried into Records reads back the same, field by
-    /// field; a field changed, a row added or one deleted after the copy is found, each by its
-    /// table, key and column; carrying again makes the two the same again.
+    /// T-T1.5.2 (CP-T1.5): every row of every table of kiln's store carried into Records reads
+    /// back the same, field by field; a field changed, a row added or one deleted after the copy is
+    /// found, each by its table, key and column; carrying again makes the two the same again.
     #[test]
-    fn t_t1_5_2_goals_and_plans_carried_into_records_compare_field_by_field() -> anyhow::Result<()> {
-        crate::rt::block_on(async {
-            let store = Store::in_memory()?;
-            fill(&store).await?;
+    fn t_t1_5_2_every_table_carried_into_records_compares_field_by_field() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let dir = tempfile::tempdir()?;
+            let (store, rows) = filled(&dir.path().join("kiln.db")).await?;
+            let found = tables(&store).await?;
+            anyhow::ensure!(rows >= 2 * found.len(), "two rows in each of {} tables: {rows}", found.len());
             let records = SimRecords::new();
             let carried = carry(&store, &records).await?;
-            anyhow::ensure!(carried == 2 * TABLES.len(), "every row carried: {carried}");
+            anyhow::ensure!(carried == rows, "every row carried: {carried} of {rows}");
             let same = compare(&store, &records).await?;
             anyhow::ensure!(same.differences.is_empty(), "no difference: {:?}", same.differences);
             anyhow::ensure!(same.rows == carried && same.records == carried, "{} rows, {} records", same.rows, same.records);
@@ -310,7 +421,7 @@ mod tests {
                         Differs::Field { column, row: Some(Field::Text(_)), record: Some(Field::Integer(_)) } => format!("field {column} integer to text"),
                         other => format!("{other:?}"),
                     };
-                    (d.table, what)
+                    (d.table.as_str(), what)
                 })
                 .collect();
             kinds.sort();
@@ -323,10 +434,78 @@ mod tests {
             // row's record stays (a copy puts, it doesn't delete) and is still found.
             carry(&store, &records).await?;
             let again = compare(&store, &records).await?;
-            let left: Vec<(&str, &Differs)> = again.differences.iter().map(|d| (d.table, &d.differs)).collect();
+            let left: Vec<(&str, &Differs)> = again.differences.iter().map(|d| (d.table.as_str(), &d.differs)).collect();
             anyhow::ensure!(left == vec![("plans", &Differs::NoRow)], "only the deleted row's record is left: {left:?}");
             Ok(())
         })
+    }
+
+    /// A WITHOUT ROWID table is paged by its primary key, a page a commit: past one page, every
+    /// row is carried once and read back the same, and a row changed after the copy is found.
+    #[test]
+    fn t_t1_5_2_a_table_without_rowid_is_carried_page_by_page() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let store = Store::in_memory()?;
+            let found = tables(&store).await?;
+            anyhow::ensure!(found.iter().any(|t| t.name == "plan_tags" && t.without_rowid), "plan_tags is WITHOUT ROWID: {found:?}");
+            let n = PAGE + PAGE / 2;
+            store
+                .call(move |c| {
+                    for i in 0..n {
+                        c.execute("INSERT INTO plan_tags (tag, plan_id) VALUES (?1, ?2)", rusqlite::params![format!("t{}", i % 7), format!("p{i}")])?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            let records = SimRecords::new();
+            let carried = carry(&store, &records).await?;
+            let same = compare(&store, &records).await?;
+            anyhow::ensure!(same.differences.is_empty(), "{:?}", same.differences);
+            let tags = records.scan(&family("plan_tags"), Scan { prefix: Vec::new(), after: None, limit: SCAN_MAX, at: Consistency::Linearizable }).await.map_err(refused)?;
+            let mut all = tags.rows.len();
+            let mut after = tags.rows.last().map(|r| r.key.clone());
+            let mut more = tags.more;
+            while more {
+                let p = records.scan(&family("plan_tags"), Scan { prefix: Vec::new(), after: after.take(), limit: SCAN_MAX, at: Consistency::Linearizable }).await.map_err(refused)?;
+                all += p.rows.len();
+                after = p.rows.last().map(|r| r.key.clone());
+                more = p.more && after.is_some();
+            }
+            anyhow::ensure!(all == n && carried >= n, "{all} of {n} tags carried ({carried} rows in all)");
+            store.call(|c| Ok(c.execute("DELETE FROM plan_tags WHERE plan_id = 'p3'", [])?)).await?;
+            let found = compare(&store, &records).await?;
+            let what: Vec<(&str, &Differs)> = found.differences.iter().map(|d| (d.table.as_str(), &d.differs)).collect();
+            anyhow::ensure!(what == vec![("plan_tags", &Differs::NoRow)], "{what:?}");
+            Ok(())
+        })
+    }
+
+    /// CP-T1.5 (goal 0d717247, every kiln record on Amphora): every table docs/records-inventory.md
+    /// lists as made by kiln's store's migrations, and not dropped since, is one [`tables`] finds in
+    /// a store those migrations made, so [`carry`] carries it and [`compare`] compares it; every
+    /// table [`tables`] finds is in the inventory, so none is carried that it doesn't account for;
+    /// and Records' own tables are in the store but not carried.
+    #[test]
+    fn cp_t1_5_every_table_of_kilns_store_in_the_inventory_is_carried() -> anyhow::Result<()> {
+        let inventory = include_str!("../../../../docs/records-inventory.md");
+        let sqlite = inventory.split("## SQLite tables").nth(1).and_then(|s| s.split("\n## ").next()).ok_or_else(|| anyhow::anyhow!("the inventory's SQLite tables"))?;
+        // Each row: its table, where it's made, where it's dropped, and whether only tests make it.
+        let rows: Vec<Vec<&str>> = sqlite.lines().filter(|l| l.starts_with("| `")).map(|l| l.split('|').map(|c| c.trim().trim_matches('`')).collect()).collect();
+        let listed: BTreeMap<&str, (&str, &str, &str)> = rows.iter().filter_map(|r| match r.as_slice() {
+            [_, name, made, dropped, tests, ..] => Some((*name, (*made, *dropped, *tests))),
+            _ => None,
+        }).collect();
+        anyhow::ensure!(listed.len() > 100, "the inventory's tables read: {}", listed.len());
+        let found: Vec<String> = crate::rt::block_on(async move { Ok::<_, anyhow::Error>(tables(&Store::in_memory()?).await?.into_iter().map(|t| t.name).collect()) })?;
+        let mut missing: Vec<&str> = listed.iter().filter(|(_, (made, dropped, tests))| made.contains("crates/kiln/src/store/migrations/") && dropped.is_empty() && *tests != "yes").map(|(name, _)| *name).filter(|name| !crate::records::STORE_TABLES.contains(name) && !found.iter().any(|f| f == name)).collect();
+        missing.sort_unstable();
+        anyhow::ensure!(missing.is_empty(), "made by the store's migrations but not carried: {missing:?}");
+        let unlisted: Vec<&String> = found.iter().filter(|f| !listed.contains_key(f.as_str())).collect();
+        anyhow::ensure!(unlisted.is_empty(), "carried but not in the inventory: {unlisted:?}");
+        for own in crate::records::STORE_TABLES {
+            anyhow::ensure!(listed.contains_key(own) && !found.iter().any(|f| f == own), "{own}: Records' own, in the inventory and not carried");
+        }
+        Ok(())
     }
 
     /// Each storage class survives the trip: a real's bits, a text that isn't UTF-8, a blob.
