@@ -732,7 +732,11 @@ the time to catch up, appends a second, and the memory held, the store's apart f
 
 - **Implementations:** kiln's conversation store (`crates/kiln/src/convo/seam.rs`, a `convo::store::Store`
   as the seam), on Turso (`vendor/turso`, the default and the control) or on Amphora's engine
-  (`vendor/amphora`, `amphora-engine`), chosen by `KILN_CONVERSATION_ENGINE` (`turso` or `amphora`);
+  (`vendor/amphora`, `amphora-engine`), chosen by `KILN_CONVERSATION_ENGINE` (`turso` or `amphora`).
+  Two A/Bs run beside it, each with today's as the control, measured side by side up the ladder:
+  `KILN_CONVO_OPENED` (`set`, a set in memory of the conversations a handle gave their session's row, or
+  `ask`, the store asked on each append) and `KILN_CONVO_READERS` (`one` reader beside the writer, or
+  `cores`, one a core);
   `kiln_seams::conversations::SimConversations`, which keeps entries in memory, a million of them at most
   (past them an append is refused).
 - **Used by:** kiln's conversation store (`crates/kiln/src/convo`).
