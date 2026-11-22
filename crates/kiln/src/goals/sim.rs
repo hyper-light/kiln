@@ -178,7 +178,7 @@ async fn driver(store: Store, clock: SimClock, port: SimHarness<Info, Command>, 
     // Its own counters and no planner, as the driver's tests have (the process's are shared).
     let metrics = crate::metrics::AgentMetrics::default();
     let d = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
-    let changing = crate::turn::Gate::one();
+    let changing = super::Changing::new();
     let feed = StoreFeed::new(&store);
     let _ = d.follow(&changing, &feed, Some(&news), false).await;
 }

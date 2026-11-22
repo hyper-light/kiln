@@ -15,7 +15,8 @@
 //! (before its commit) to when the harness sees that row committed (woken by the store's change
 //! count of the mail's tables): an upper bound on commit-to-action, never under it. Between
 //! edits the agent takes what it was sent and goes idle, so each edit finds it free; the skip
-//! that closes a cycle (its stack done again, for the next `add`) and those waits aren't timed.
+//! that closes a cycle (its stack done again, for the next `add`), the clear that takes the
+//! cycle's goals out of it (so one agent's edits have no bound) and those waits aren't timed.
 //!
 //! The load is how many agents' stacks are edited at once, each its own session and cycle. Nothing
 //! here asserts on time: the measurement is printed as one JSON line, for the coordinator's run.
@@ -172,8 +173,12 @@ async fn agent_edits(hub: &Arc<Hub>, agent: &str, edits: usize) -> anyhow::Resul
             current = under_way(&stack).or(current);
         }
         // The cycle's last goal skipped: its stack done again, for the next cycle's `add` (not timed).
+        // Then the cycle's goals cleared from it: a stack holds at most `ITEMS` goals, and those a
+        // cycle left there stopped one agent's edits at about 660 (not timed).
         settled(hub, agent).await?;
         op(hub, "goals.control", json!({"agent": agent, "action": "skip"})).await?;
+        settled(hub, agent).await?;
+        op(hub, "goals.control", json!({"agent": agent, "action": "clear"})).await?;
         current = None;
         cycle += 1;
     }
