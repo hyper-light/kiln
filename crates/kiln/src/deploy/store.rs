@@ -481,10 +481,18 @@ pub async fn schedule(store: Recs<'_>, release: i64, due_at: i64) -> anyhow::Res
     anyhow::bail!("release {release}'s work kept moving under its schedule")
 }
 
+/// A lease [`claim`] took: the release, and the commit that took it, which fences what its holder
+/// writes ([`Fenced`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lease {
+    pub release: i64,
+    pub rev: kiln_seams::records::Rev,
+}
+
 /// Takes the releases due now that no other server holds, for `lease_secs`: each under
 /// compare-and-set on its row, so two servers never both take one, and a lease that lapses (its
 /// server gone) is another's to take.
-pub async fn claim(store: Recs<'_>, owner: &str, now: i64, lease_secs: i64, max: usize) -> anyhow::Result<Vec<i64>> {
+pub async fn claim(store: Recs<'_>, owner: &str, now: i64, lease_secs: i64, max: usize) -> anyhow::Result<Vec<Lease>> {
     let mut due: Vec<(i64, i64, kiln_seams::records::Rev, Work)> = Vec::new();
     for row in rows(store, WORK, b"", FOLLOWED).await? {
         let (Some(id), Ok(w)) = (number(&row.key, false), from_json::<Work>(&row.value)) else { continue };
@@ -501,13 +509,118 @@ pub async fn claim(store: Recs<'_>, owner: &str, now: i64, lease_secs: i64, max:
         let leased = Work { owner: owner.to_owned(), lease_until: now.saturating_add(lease_secs), ..w };
         let key = ascending(id).to_vec();
         match store.commit(Tx { conds: vec![Cond::At { family: WORK.into(), key: key.clone(), rev }], writes: vec![put(WORK, key, to_json(&leased)?)] }).await {
-            Ok(_) => taken.push(id),
+            Ok(rev) => taken.push(Lease { release: id, rev }),
             // Another server took it, or it moved: not this one's now.
             Err(Refusal::Conflict { .. }) => {}
             Err(e) => return Err(refused(e)),
         }
     }
     Ok(taken)
+}
+
+/// Where a [`Fenced`] lease stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// The work row is as the commit `Rev` left it: the lease's, or its holder's own write since.
+    Held(kiln_seams::records::Rev),
+    /// Its holder deleted the row ([`done`]): there's no lease left to fence.
+    Released,
+    /// The row changed under its holder: the lease lapsed and another server took it, or someone
+    /// changed when it's due. Its holder writes nothing more for the release.
+    Lost,
+}
+
+/// The records as a lease's holder writes them (CP-T1.6, deploys under fenced leases): every
+/// commit made through it carries a condition that the release's work row is still as the lease,
+/// or the holder's own last write to the row, left it. The revision of the commit that took the
+/// lease is the fencing token (Kleppmann's, "How to do distributed locking", 2016), checked by the
+/// store in the same commit as the write, so a server paused past its lease, whose release another
+/// server took, has every write refused instead of written over the new holder's. A server whose
+/// row changed for another reason (a person's cancel or approval rescheduling it) loses this lease
+/// too, and takes the release again at its next claim while it's still its own. Deleting the row
+/// ([`done`]) gives the lease up: what finishing a release writes after that isn't fenced. Reads
+/// go straight through.
+pub struct Fenced {
+    inner: std::sync::Arc<dyn Records>,
+    release: i64,
+    key: Vec<u8>,
+    hold: parking_lot::Mutex<Hold>,
+}
+
+impl Fenced {
+    pub fn new(inner: std::sync::Arc<dyn Records>, lease: Lease) -> Self {
+        Self { inner, release: lease.release, key: ascending(lease.release).to_vec(), hold: parking_lot::Mutex::new(Hold::Held(lease.rev)) }
+    }
+
+    fn lost(&self) -> Refusal {
+        Refusal::Unavailable(format!("release {}'s lease passed on (another server took it, or its work row changed): this server writes nothing more for it", self.release))
+    }
+
+    /// Whether a write is to this lease's work row, and whether it deletes it.
+    fn touches(&self, w: &Write) -> (bool, bool) {
+        match w {
+            Write::Put { family, key, .. } => (family == WORK && *key == self.key, false),
+            Write::Delete { family, key } => {
+                let ours = family == WORK && *key == self.key;
+                (ours, ours)
+            }
+        }
+    }
+}
+
+impl Records for Fenced {
+    fn get<'a>(&'a self, family: &'a str, key: &'a [u8], at: Consistency) -> futures::future::BoxFuture<'a, Result<Option<Row>, Refusal>> {
+        self.inner.get(family, key, at)
+    }
+
+    fn scan<'a>(&'a self, family: &'a str, scan: Scan) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Page, Refusal>> {
+        self.inner.scan(family, scan)
+    }
+
+    fn commit<'a>(&'a self, mut tx: Tx) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Rev, Refusal>> {
+        Box::pin(async move {
+            let hold = *self.hold.lock();
+            let held = match hold {
+                Hold::Held(rev) => Some(rev),
+                Hold::Released => None,
+                Hold::Lost => return Err(self.lost()),
+            };
+            let (mut ours, mut deletes) = (false, false);
+            for w in &tx.writes {
+                let (o, d) = self.touches(w);
+                ours |= o;
+                deletes |= d;
+            }
+            if let Some(rev) = held {
+                tx.conds.push(Cond::At { family: WORK.into(), key: self.key.clone(), rev });
+            }
+            match self.inner.commit(tx).await {
+                Ok(at) => {
+                    if held.is_some() && ours {
+                        *self.hold.lock() = if deletes { Hold::Released } else { Hold::Held(at) };
+                    }
+                    Ok(at)
+                }
+                Err(Refusal::Conflict { family, key, .. }) if held.is_some() && family == WORK && key == self.key => {
+                    *self.hold.lock() = Hold::Lost;
+                    Err(self.lost())
+                }
+                Err(e) => Err(e),
+            }
+        })
+    }
+
+    fn changes<'a>(&'a self, family: &'a str, after: kiln_seams::records::Rev, limit: usize) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Changes, Refusal>> {
+        self.inner.changes(family, after, limit)
+    }
+
+    fn wait<'a>(&'a self, family: &'a str, after: kiln_seams::records::Rev) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Rev, Refusal>> {
+        self.inner.wait(family, after)
+    }
+
+    fn head(&self) -> futures::future::BoxFuture<'_, Result<kiln_seams::records::Rev, Refusal>> {
+        self.inner.head()
+    }
 }
 
 /// Done following a release.
@@ -663,7 +776,7 @@ mod tests {
             anyhow::ensure!(listed == [7, 3], "each release with its number, newest first: {listed:?}");
             anyhow::ensure!(release_by_key(st, "web", "staging", "k1").await?.map(|r| r.id) == Some(3), "its idempotency key");
             anyhow::ensure!(in_flight(st, "web", "staging").await?.map(|r| r.id) == Some(7), "the release in flight");
-            anyhow::ensure!(claim(st, "server-new", 200, 60, 16).await? == [7], "its lease, lapsed, another's to take");
+            anyhow::ensure!(claim(st, "server-new", 200, 60, 16).await?.iter().map(|l| l.release).eq([7]), "its lease, lapsed, another's to take");
             anyhow::ensure!(kv_get(st, "deploy/move/staging").await?.is_some(), "deploy's key-value state");
             // The next release is numbered after the last copied.
             let next = Release { id: 0, idempotency_key: None, state: State::Waiting, ..release(st, 3).await?.ok_or_else(|| anyhow::anyhow!("release 3"))? };
@@ -723,6 +836,44 @@ mod tests {
         })
     }
 
+    /// CP-T1.6: what a lease's holder writes holds only while its lease does. The holder whose
+    /// lease lapsed and passed on has every write refused, and stays refused; the new holder's go
+    /// through, its own writes to the work row moving its fence with them; once it's done (the row
+    /// deleted), what it writes finishing the release isn't fenced.
+    #[test]
+    fn cp_t1_6_a_lease_s_writes_hold_only_while_it_does() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let recs: std::sync::Arc<dyn Records> = std::sync::Arc::new(kiln_seams::records::SimRecords::new());
+            let st: Recs<'_> = &*recs;
+            schedule(st, 5, 10).await?;
+            let &[first] = claim(st, "a", 10, 60, 16).await?.as_slice() else { anyhow::bail!("a takes it") };
+            let a = Fenced::new(std::sync::Arc::clone(&recs), first);
+            schedule(&a, 5, 20).await?;
+            kv_set(&a, "seen-by", "a").await?;
+            let &[second] = claim(st, "b", 81, 60, 16).await?.as_slice() else { anyhow::bail!("b takes it once a's lease lapses") };
+            let b = Fenced::new(std::sync::Arc::clone(&recs), second);
+            anyhow::ensure!(kv_set(&a, "seen-by", "a again").await.is_err(), "a's write past its lease is refused");
+            anyhow::ensure!(schedule(&a, 5, 1).await.is_err(), "and so is its move of b's work");
+            anyhow::ensure!(done(&a, 5).await.is_err(), "and its done");
+            anyhow::ensure!(kv_get(st, "seen-by").await?.as_deref() == Some("a"), "nothing of a's after its lease");
+            schedule(&b, 5, 100).await?;
+            kv_set(&b, "seen-by", "b").await?;
+            anyhow::ensure!(kv_get(st, "seen-by").await?.as_deref() == Some("b"), "b's writes go through, its own schedule moving its fence");
+            done(&b, 5).await?;
+            kv_set(&b, "finished-by", "b").await?;
+            anyhow::ensure!(kv_get(st, "finished-by").await?.as_deref() == Some("b"), "finishing after done isn't fenced");
+            anyhow::ensure!(kv_set(&a, "seen-by", "a, late").await.is_err(), "a stays refused");
+            // A row changed by someone else (a cancel rescheduling it) ends the lease's writes too.
+            schedule(st, 6, 10).await?;
+            let &[third] = claim(st, "c", 10, 60, 16).await?.as_slice() else { anyhow::bail!("c takes release 6") };
+            let c = Fenced::new(std::sync::Arc::clone(&recs), third);
+            schedule(st, 6, 11).await?;
+            anyhow::ensure!(kv_set(&c, "seen-by", "c").await.is_err(), "c's lease ends once its row moved under it");
+            anyhow::ensure!(claim(st, "c", 11, 60, 16).await?.iter().map(|l| l.release).eq([6]), "and c takes it again at its next claim");
+            Ok(())
+        })
+    }
+
     /// Two servers racing for one release's work: one takes it, the other doesn't, and once the
     /// lease lapses the other may.
     #[test]
@@ -736,8 +887,10 @@ mod tests {
             anyhow::ensure!(a.len() + b.len() == 1, "one of them takes it: {a:?}, {b:?}");
             let (holder, other) = if a.is_empty() { ("b", "a") } else { ("a", "b") };
             anyhow::ensure!(claim(st, other, 30, 60, 16).await?.is_empty(), "not the other's while the lease holds");
-            anyhow::ensure!(claim(st, holder, 30, 60, 16).await? == [5], "the holder renews it");
-            anyhow::ensure!(claim(st, other, 91, 60, 16).await? == [5], "the other's once it lapses");
+            let &[renewed] = claim(st, holder, 30, 60, 16).await?.as_slice() else { anyhow::bail!("the holder renews it") };
+            anyhow::ensure!(renewed.release == 5, "the holder renews it");
+            let &[taken] = claim(st, other, 91, 60, 16).await?.as_slice() else { anyhow::bail!("the other's once it lapses") };
+            anyhow::ensure!(taken.release == 5, "the other's once it lapses");
             done(st, 5).await?;
             anyhow::ensure!(claim(st, holder, 1000, 60, 16).await?.is_empty(), "done: nothing left");
             Ok(())
