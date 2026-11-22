@@ -182,9 +182,6 @@ export function useAgentActions(
       { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
       { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
       { label: "Reset", onSelect: reset, hidden: !after?.reset, going: resetting },
-        hidden: !after?.reset,
-        going: resetting,
-      },
       { label: live ? "End agent…" : "Remove", onSelect: () => (live ? setAct("end") : remove()), danger: true, going: removing },
     ];
     return (
