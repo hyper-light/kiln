@@ -1650,16 +1650,6 @@ pub enum Sent {
     Unreachable,
 }
 
-/// A message this server routed to a runner, while its answer is waited for (docs/sends.md, "Routed to its session"):
-/// where it went and what went, so a forward of it from that runner ([`Registry::forward`]) sends on the very words routed
-/// there, never what a runner says they were.
-#[derive(Clone)]
-struct Routed {
-    to: String,
-    json: String,
-    route: super::route::Route,
-}
-
 /// Where a route names a session's holder: its machine, or `local` (the server's own host).
 fn route_target(to: &Location) -> String {
     match to {
@@ -2079,11 +2069,9 @@ pub struct Registry {
     pub ports: super::opened::Tunnels,
     pub opened: super::opened::Openings,
     /// Messages waiting for their session's inbox to answer (CP-T3.2), by session and message id: one owner
-    /// of their own, no lock (`super::answers`; goal 5, plan 01a1a59c2aae, its top goal).
+    /// of their own, no lock (`super::answers`; goal 5, plan 01a1a59c2aae, its top goal). It keeps where each
+    /// routed to a runner went too (`super::answers::Routed`), with its wait.
     answers: super::answers::Answers,
-    /// Messages routed to a runner whose answers are waited for, by session and message id ([`Routed`]): at most
-    /// [`WAITING_MAX`], as the waits are.
-    routing: Mutex<HashMap<(String, String), Routed>>,
     /// The ids starts under way asked for ([`Registry::open_as`]), each until its start is done.
     opening: Rcu<std::collections::HashSet<String>>,
     /// What a viewer's attach waits for while the server starts ([`Registry::returned`]).
@@ -2284,7 +2272,6 @@ impl Registry {
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
             answers: super::answers::Answers::new(WAITING_MAX),
-            routing: Mutex::new(HashMap::new()),
             opening: Rcu::default(),
             returning: super::returning::Returning::default(),
             limits: crate::agentdefs::limits::Told::default(),
@@ -4950,9 +4937,9 @@ impl Registry {
                 Sent::Ok
             }
         };
+        // Answered, or no longer waited for: where it was routed goes with its wait, and a forward of it from there is
+        // let go of.
         self.unwait(id, message);
-        // Answered, or no longer waited for: a forward of it from where it was routed is let go of.
-        self.routing.lock().remove(&(id.to_owned(), message.to_owned()));
         sent
     }
 
@@ -5105,7 +5092,7 @@ impl Registry {
 
     /// Message `c` (with an id) to session `id`, sent with its `route` to where the session is (`to`), whose own inbox
     /// takes it into custody there and answers: that answer to wait for. Nothing of it is kept here but what a forward
-    /// of it needs while its answer is waited for ([`Routed`]). Another agent's words kiln relayed carry its record of
+    /// of it needs while its answer is waited for ([`super::answers::Routed`]). Another agent's words kiln relayed carry its record of
     /// relaying them (`relayed`, docs/ci.md W27-R08), which that runner checks before the session takes them.
     async fn route(&self, hub: &Hub, id: &str, to: Location, c: Command, route: super::route::Route, relayed: Option<&Value>) -> Pending {
         let Some(message) = message_id(&c) else { return Pending::Now(Sent::NoSession) };
@@ -5115,16 +5102,14 @@ impl Registry {
         };
         let epoch = self.epoch_of(id);
         let wait = self.wait_for(id, &message).await;
-        let key = (id.to_owned(), message.clone());
         let went = match &to {
             Location::Local => self.local.command_routed(id, c, Some(epoch), route),
             Location::Machine(machine) => match serde_json::to_value(&c).ok().and_then(|v| route.attach(v, relayed)) {
                 Some(json) => {
+                    // Kept with its wait by the waits' owner, told before the message goes (so before any forward of
+                    // it comes back): none for one not waited on.
                     if wait.is_some() {
-                        let mut routing = self.routing.lock();
-                        if routing.len() < WAITING_MAX {
-                            routing.insert(key.clone(), Routed { to: machine.clone(), json: json.clone(), route });
-                        }
+                        self.answers.route(id, &message, Some(super::answers::Routed { to: machine.clone(), json: json.clone(), route }));
                     }
                     let msg = ServerMsg::HarnessSend { session: id.to_owned(), epoch, json };
                     #[cfg(test)]
@@ -5135,9 +5120,9 @@ impl Registry {
             },
         };
         if !went {
+            // Not waited for after all: where it was to go goes with its wait.
             drop(wait);
             self.unwait(id, &message);
-            self.routing.lock().remove(&key);
             // Its session is here and its lane holds its most: refused so, as any message is.
             if to == Location::Local && self.local.get(id).is_some() {
                 return Pending::Now(Sent::Refused(inbox::Refusal::Full { session: id.to_owned(), limit: super::host::LANE }));
@@ -5224,14 +5209,13 @@ impl Registry {
     /// refused as gone (`moved`), and keeps it to send again (the UI's held copy, a keyed retry).
     pub async fn forward(&self, hub: &Hub, from: &str, id: &str, json: &str) {
         let Some(message) = serde_json::from_str::<Command>(json).ok().as_ref().and_then(message_id) else { return };
-        let key = (id.to_owned(), message.clone());
-        let Some(routed) = self.routing.lock().get(&key).cloned() else { return };
+        let Some(routed) = self.answers.routed(id, &message).await else { return };
         if routed.to != from {
             return;
         }
         let epoch = self.epoch_of(id);
         let gone = || {
-            self.routing.lock().remove(&key);
+            self.answers.route(id, &message, None);
             self.answered(id, Said { message: message.clone(), answer: Err(inbox::Refusal::Moved { session: id.to_owned(), epoch }) });
         };
         let Ok(c) = serde_json::from_str::<Command>(&routed.json) else { return gone() };
@@ -5243,12 +5227,12 @@ impl Registry {
         tracing::info!(target: "kiln.sends", event = "routed_forward", session = %id, %message, %from, to = %route.target, hops = route.hops, "a message routed to a runner that doesn't hold its session goes on to where it is now");
         let went = match &to {
             Location::Local => {
-                self.routing.lock().remove(&key);
+                self.answers.route(id, &message, None);
                 self.local.command_routed(id, c, Some(epoch), route)
             }
             Location::Machine(machine) => match route.replace_in(&routed.json) {
                 Some(json) => {
-                    self.routing.lock().insert(key.clone(), Routed { to: machine.clone(), json: json.clone(), route });
+                    self.answers.route(id, &message, Some(super::answers::Routed { to: machine.clone(), json: json.clone(), route }));
                     let msg = ServerMsg::HarnessSend { session: id.to_owned(), epoch, json };
                     #[cfg(test)]
                     self.routed_sends.lock().push((machine.clone(), msg.clone()));
