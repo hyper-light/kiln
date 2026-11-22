@@ -2784,10 +2784,7 @@ where
             let_go(all).await;
             crate::rt::labeled(&TAIL, async {
                 crate::harness::lineage::settle_settings(hub).await;
-                {
-                    let _one = CHANGING.every().await;
-                    say_held(hub).await;
-                }
+                say_held(hub).await;
                 for (agent, words) in hub.harness.take_proposed() {
                     if let Err(e) = crate::plans::keep_proposed(hub, &agent, &words).await {
                         tracing::warn!(%agent, error = %format!("{e:#}"), "keeping a proposed plan");
@@ -3620,11 +3617,20 @@ pub async fn held_stacks(store: &crate::store::Store) -> HashMap<String, Held> {
 /// What agents' goals wait on a person for, on their info now ([`held_stacks`]): each tick of the
 /// driver says it, and so does each change to a stack's hold as it's made (a plan approved, goals
 /// resumed, or paused for a person), so Needs you goes the moment it's answered rather than a
-/// round of the driver later. With the stacks held (`CHANGING`), so a read from before a change
-/// can't put back what it let go.
+/// round of the driver later. One at a time ([`SAYING_HELD`]), each reading the stacks in its own
+/// turn, so a read from before a change can't put back what it let go: the one after the change
+/// reads it, and goes after.
 async fn say_held(hub: &Hub) {
+    let _one = SAYING_HELD.turn().await;
     hub.harness.set_held(hub, &held_stacks(&hub.store).await).await;
 }
+
+/// The turn of [`say_held`]: what's said is read and said in order, each after the one before it
+/// (G9 step 3, goal a2a44298; T-T1.5.1). The driver said it with every stack's turn held, each
+/// round: every change to every stack waited for that, and for a look at every session on its
+/// owner's shard under it (`Registry::set_held`), however many agents there were. Its order is
+/// all that turn gave it, and this gives it alone.
+static SAYING_HELD: crate::turn::Gate = crate::turn::Gate::one();
 
 /// Pauses `agent`'s stack for its program's usage at `now` (`why`: what people read), as a pause of
 /// yours does: the clear kiln sends now is its own (`dropped_at`), not the agent's, so it doesn't end
