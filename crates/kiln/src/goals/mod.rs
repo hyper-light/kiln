@@ -32,6 +32,8 @@ pub mod ops;
 #[cfg(test)]
 mod sim;
 mod subagents;
+#[cfg(test)]
+mod turn_times;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
@@ -224,8 +226,32 @@ impl Changing {
     }
 
     /// A change that spans stacks: alone, after every change to a stack before it.
-    pub(crate) async fn every(&self) -> crate::turn::Writing<'_> {
-        self.all.write().await
+    pub(crate) async fn every(&self) -> Every<'_> {
+        #[cfg(test)]
+        let asked = std::time::Instant::now();
+        let writing = self.all.write().await;
+        #[cfg(test)]
+        turn_times::EVERY_WAIT.since(asked, true);
+        Every {
+            _writing: writing,
+            #[cfg(test)]
+            since: std::time::Instant::now(),
+        }
+    }
+}
+
+/// Every stack's turn, held ([`Changing::every`]); in tests, how long it was held is counted as it's
+/// given back (`turn_times`, G9 step 3's trace of an edit's time).
+pub(crate) struct Every<'a> {
+    _writing: crate::turn::Writing<'a>,
+    #[cfg(test)]
+    since: std::time::Instant,
+}
+
+#[cfg(test)]
+impl Drop for Every<'_> {
+    fn drop(&mut self) {
+        turn_times::EVERY_HELD.since(self.since, true);
     }
 }
 
@@ -255,9 +281,17 @@ macro_rules! stack_turn {
     ($changing:expr, $store:expr, $agent:expr, $reaches:expr) => {
         let changing: &Changing = $changing;
         let reaches: bool = $reaches;
+        #[cfg(test)]
+        let asked = std::time::Instant::now();
         let mut shared = if reaches { None } else { Some(changing.all.read().await) };
+        #[cfg(test)]
+        crate::goals::turn_times::SHARED.since(asked, !reaches);
         let entry = changing.each.of(&String::from($agent));
+        #[cfg(test)]
+        let asked = std::time::Instant::now();
         let mut own = if reaches { None } else { Some(entry.turn().await) };
+        #[cfg(test)]
+        crate::goals::turn_times::OWN.since(asked, !reaches);
         // Spanning, or about to: its own turn and the shared one given back (a change waiting for this
         // stack holds the shared turn as a reader, so every stack's waits for it), then every stack's taken.
         let _every = if reaches || spans($store, $agent).await {
@@ -2623,6 +2657,8 @@ where
             }
             // Where the feed stands before the round reads the stacks: a write after this is heard.
             let at = feed.at();
+            #[cfg(test)]
+            let round_began = std::time::Instant::now();
             // When the round began: a deadline after it wasn't due in what the round and its riders
             // looked at, so it wakes them (at once, if it passed meanwhile); one before it, they saw.
             let began = self.clock.unix_ms();
@@ -2638,6 +2674,8 @@ where
                 self.tend(running, waiting).await;
             }
             let deadline = self.deadline(began, tend).await;
+            #[cfg(test)]
+            turn_times::ROUNDS.since(round_began, true);
             let now = self.clock.unix_ms();
             let sleep_ms = |ms: i64| self.clock.sleep(Duration::from_millis(u64::try_from(ms.max(0)).unwrap_or(0)));
             let due = async {

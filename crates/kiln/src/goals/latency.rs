@@ -58,6 +58,9 @@ pub(crate) struct Measured {
     pub lost: usize,
     /// Each kind's own p50, p99, p99.9 and max, and how many.
     pub kinds: serde_json::Map<String, Value>,
+    /// Where the time went, while the edits ran (`turn_times`): the waits for the stacks' turns,
+    /// every stack's turn held, and the driver's rounds, each within a factor of two.
+    pub turns: serde_json::Map<String, Value>,
 }
 
 /// The `q`th quantile of `sorted` by nearest rank (`q` in 0..=1).
@@ -215,10 +218,13 @@ pub(crate) async fn measure(load: Load) -> anyhow::Result<Measured> {
         let h = Arc::clone(&hub);
         crate::rt::spawn(async move { super::run(h).await })
     };
+    // Where the time goes, from here: the sessions opened and the driver started (G9 step 3's trace).
+    super::turn_times::reset();
     // The edits shared out: the first `edits % agents` agents take one more.
     let (each, more) = (load.edits / load.agents, load.edits % load.agents);
     let runs = agents.iter().enumerate().map(|(k, a)| agent_edits(&hub, a, each + usize::from(k < more)));
     let all = futures::future::join_all(runs).await;
+    let turns = super::turn_times::summary();
     hub.shutdown.cancel();
     let _ = driver.await;
     let mut timed = Vec::with_capacity(load.edits);
@@ -233,14 +239,14 @@ pub(crate) async fn measure(load: Load) -> anyhow::Result<Measured> {
         let (p50, p99, p999, max) = summary(&of);
         kinds.insert(kind.into(), json!({"n": of.len(), "p50_us": p50, "p99_us": p99, "p999_us": p999, "max_us": max}));
     }
-    Ok(Measured { n: took.len(), agents: load.agents, p50_us, p99_us, p999_us, max_us, lost: timed.len() - took.len(), kinds })
+    Ok(Measured { n: took.len(), agents: load.agents, p50_us, p99_us, p999_us, max_us, lost: timed.len() - took.len(), kinds, turns })
 }
 
 /// The measurement as one JSON line, its times in milliseconds.
 pub(crate) fn line(m: &Measured) -> String {
     #[allow(clippy::cast_precision_loss)]
     let ms = |us: u64| us as f64 / 1000.0;
-    json!({"measure": "goal_edit_to_driver_action", "n": m.n, "agents": m.agents, "p50_ms": ms(m.p50_us), "p99_ms": ms(m.p99_us), "p999_ms": ms(m.p999_us), "max_ms": ms(m.max_us), "lost": m.lost, "kinds": m.kinds}).to_string()
+    json!({"measure": "goal_edit_to_driver_action", "n": m.n, "agents": m.agents, "p50_ms": ms(m.p50_us), "p99_ms": ms(m.p99_us), "p999_ms": ms(m.p999_us), "max_ms": ms(m.max_us), "lost": m.lost, "kinds": m.kinds, "turns": m.turns}).to_string()
 }
 
 #[cfg(test)]
@@ -273,7 +279,10 @@ mod tests {
         anyhow::ensure!(m.kinds.values().all(|k| k.get("n").and_then(Value::as_u64) == Some(1) && k.get("p999_us").and_then(Value::as_u64).is_some()), "{m:?}");
         anyhow::ensure!(m.p50_us <= m.p99_us && m.p99_us <= m.p999_us && m.p999_us <= m.max_us, "{m:?}");
         let v: Value = serde_json::from_str(&line(&m))?;
-        anyhow::ensure!(["n", "p50_ms", "p99_ms", "p999_ms", "max_ms"].iter().all(|k| v.get(k).is_some()), "{v}");
+        anyhow::ensure!(["n", "p50_ms", "p99_ms", "p999_ms", "max_ms", "turns"].iter().all(|k| v.get(k).is_some()), "{v}");
+        // The edits took their stack's turn, and the driver went round.
+        let counted = |k: &str| m.turns.get(k).and_then(|t| t.get("n")).and_then(Value::as_u64).unwrap_or(0);
+        anyhow::ensure!(counted("own_wait") >= 1 && counted("rounds") >= 1, "{m:?}");
         Ok(())
     }
 
