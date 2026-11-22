@@ -874,6 +874,81 @@ mod tests {
         })
     }
 
+    /// A store whose commits each wait for the next turn before they're made, so commits started
+    /// together overlap: each has been handed to the store before any is made.
+    struct Overlapping(kiln_seams::records::SimRecords);
+
+    /// Pending once, asking to be polled again: lets the other futures joined with it run first.
+    struct NextTurn(bool);
+
+    impl std::future::Future for NextTurn {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            if self.0 {
+                return std::task::Poll::Ready(());
+            }
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Records for Overlapping {
+        fn get<'a>(&'a self, family: &'a str, key: &'a [u8], at: Consistency) -> futures::future::BoxFuture<'a, Result<Option<Row>, Refusal>> {
+            self.0.get(family, key, at)
+        }
+        fn scan<'a>(&'a self, family: &'a str, scan: Scan) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Page, Refusal>> {
+            self.0.scan(family, scan)
+        }
+        fn commit<'a>(&'a self, tx: Tx) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Rev, Refusal>> {
+            Box::pin(async move {
+                NextTurn(false).await;
+                self.0.commit(tx).await
+            })
+        }
+        fn changes<'a>(&'a self, family: &'a str, after: kiln_seams::records::Rev, limit: usize) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Changes, Refusal>> {
+            self.0.changes(family, after, limit)
+        }
+        fn wait<'a>(&'a self, family: &'a str, after: kiln_seams::records::Rev) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Rev, Refusal>> {
+            self.0.wait(family, after)
+        }
+        fn head(&self) -> futures::future::BoxFuture<'_, Result<kiln_seams::records::Rev, Refusal>> {
+            self.0.head()
+        }
+    }
+
+    /// CP-T1.6: two commits through one lease at once, one of them its holder's own write to the
+    /// work row, both go through and the lease still holds. Were the fence read, then the commit
+    /// made, then the fence moved, as separate steps, both would carry the fence from before the
+    /// row's write, and the second would be refused and the lease taken for lost.
+    #[test]
+    fn cp_t1_6_commits_at_once_through_one_lease_keep_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let recs: std::sync::Arc<dyn Records> = std::sync::Arc::new(Overlapping(kiln_seams::records::SimRecords::new()));
+            let st: Recs<'_> = &*recs;
+            schedule(st, 5, 10).await?;
+            let &[lease] = claim(st, "a", 10, 60, 16).await?.as_slice() else { anyhow::bail!("a takes it") };
+            let a = Fenced::new(std::sync::Arc::clone(&recs), lease);
+            let moved = Work { due_at: 20, owner: "a".into(), lease_until: 70 };
+            let row = a.commit(Tx { conds: Vec::new(), writes: vec![put(WORK, ascending(5).to_vec(), to_json(&moved)?)] });
+            let other = a.commit(Tx { conds: Vec::new(), writes: vec![put(STATE, b"seen-by".to_vec(), b"a".to_vec())] });
+            let (row, other) = futures::join!(row, other);
+            anyhow::ensure!(row.is_ok(), "the holder's write to its work row goes through: {row:?}");
+            anyhow::ensure!(other.is_ok(), "and so does the commit made with it: {other:?}");
+            kv_set(&a, "seen-by", "a, after").await?;
+            anyhow::ensure!(kv_get(st, "seen-by").await?.as_deref() == Some("a, after"), "the lease still holds");
+            // Many at once, every one moving the row: each goes through, one after another.
+            let txs = (0..8).map(|i| Ok(Tx { conds: Vec::new(), writes: vec![put(WORK, ascending(5).to_vec(), to_json(&Work { due_at: 30 + i, ..moved.clone() })?)] })).collect::<anyhow::Result<Vec<_>>>()?;
+            for r in futures::future::join_all(txs.into_iter().map(|tx| a.commit(tx))).await {
+                anyhow::ensure!(r.is_ok(), "each of the holder's writes goes through: {r:?}");
+            }
+            // And the fence still refuses a write once another moved the row.
+            schedule(st, 5, 99).await?;
+            anyhow::ensure!(kv_set(&a, "seen-by", "a, late").await.is_err(), "the lease ends once the row moved under it");
+            Ok(())
+        })
+    }
+
     /// Two servers racing for one release's work: one takes it, the other doesn't, and once the
     /// lease lapses the other may.
     #[test]
