@@ -100,11 +100,63 @@ pub fn top(point: &str) -> PathBuf {
 pub const NO_POINT: &str = "every drive letter is taken: Slates mounts a volume on Windows at a drive letter of its own, so a Windows machine holds as many workspaces at once as it has letters free";
 
 /// Makes `point` ready to mount at: its folder made (Unix); nothing on Windows, where the drive appears with the mount.
+/// A mount its daemon left behind when it died (its endpoint dead: every look at it answers `ENOTCONN`, "Transport
+/// endpoint is not connected", while the mount table still lists it) is taken down lazily first ([`lazy_unmount`]), so a
+/// workspace started again after its machine's Slates daemon died is mounted there again, or made anew, rather than
+/// refused at its own folder (2026-11-21: two agents' mounts on adacachy, dead after the anchor's restart).
 pub fn ready(point: &Path) -> anyhow::Result<()> {
-    if !cfg!(windows) {
-        std::fs::create_dir_all(point)?;
+    if cfg!(windows) {
+        return Ok(());
     }
+    take_down_dead(point)?;
+    std::fs::create_dir_all(point)?;
     Ok(())
+}
+
+/// A mount point no workspace will use again let go: a dead mount there taken down ([`take_down_dead`]), and its empty
+/// folder removed ([`clear`]).
+pub fn let_go_dead(point: &Path) -> anyhow::Result<()> {
+    if cfg!(windows) {
+        return Ok(());
+    }
+    take_down_dead(point)?;
+    clear(point);
+    Ok(())
+}
+
+/// A mount at `point` its daemon left behind when it died ([`dead_endpoint`]) taken down lazily ([`lazy_unmount`]);
+/// nothing for any other.
+fn take_down_dead(point: &Path) -> anyhow::Result<()> {
+    if !dead_endpoint(&std::fs::metadata(point)) {
+        return Ok(());
+    }
+    let mut down = lazy_unmount(point);
+    let out = down.output().map_err(|e| anyhow::anyhow!("{} is a dead mount, and {:?} couldn't run to take it down: {e}", point.display(), down.get_program()))?;
+    anyhow::ensure!(out.status.success(), "{} is a dead mount, and {:?} didn't take it down: {}", point.display(), down.get_program(), String::from_utf8_lossy(&out.stderr).trim());
+    tracing::warn!(point = %point.display(), "a workspace's mount its Slates daemon left behind when it died was taken down");
+    Ok(())
+}
+
+/// Whether a look at a mount point (`stat`) says the mount there is dead: its file server is gone (`ENOTCONN`).
+fn dead_endpoint(stat: &std::io::Result<std::fs::Metadata>) -> bool {
+    stat.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected)
+}
+
+/// The command that takes a dead mount at `point` down without asking its gone server anything: Linux's FUSE one
+/// lazily, as the mount's own user may (`fusermount3 -u -z`); elsewhere the system's own `umount -f` by its place (a
+/// BSD's, macOS's NFS mounts), as [`mount_table`] reads the table.
+fn lazy_unmount(point: &Path) -> std::process::Command {
+    let mut c = if cfg!(target_os = "linux") {
+        let mut c = std::process::Command::new("fusermount3");
+        c.args(["-u", "-z"]);
+        c
+    } else {
+        let mut c = std::process::Command::new("/sbin/umount");
+        c.arg("-f");
+        c
+    };
+    c.arg(point);
+    c
 }
 
 /// What a mount leaves once it's gone: its empty folder removed (Unix); nothing on Windows, where the drive goes with
@@ -242,6 +294,33 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mount whose daemon died (2026-11-21, adacachy): every stat of its point answers `ENOTCONN`. Do judge a stat
+    /// answering that, one answering another refusal, and one of a live folder; expect only the first taken for a dead
+    /// mount, and the command that takes it down lazy, naming the point (`fusermount3 -u -z` on Linux).
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_mount_left_by_its_daemon_is_judged_dead_and_taken_down_lazily() -> anyhow::Result<()> {
+        assert!(dead_endpoint(&Err(std::io::Error::from(std::io::ErrorKind::NotConnected))));
+        #[cfg(target_os = "linux")]
+        assert!(dead_endpoint(&Err(std::io::Error::from_raw_os_error(107))), "ENOTCONN, as Linux's stat answers it");
+        assert!(!dead_endpoint(&Err(std::io::Error::from(std::io::ErrorKind::NotFound))));
+        let dir = tempfile::tempdir()?;
+        assert!(!dead_endpoint(&std::fs::metadata(dir.path())));
+        let point = dir.path().join("kiln-01a1ffd0");
+        let down = lazy_unmount(&point);
+        let args: Vec<_> = down.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        if cfg!(target_os = "linux") {
+            assert_eq!(down.get_program(), "fusermount3");
+            assert_eq!(args, ["-u".to_owned(), "-z".to_owned(), point.to_string_lossy().into_owned()]);
+        } else {
+            assert_eq!(args, ["-f".to_owned(), point.to_string_lossy().into_owned()]);
+        }
+        // A point that's no mount at all is made ready as before.
+        ready(&point)?;
+        assert!(point.is_dir());
+        Ok(())
+    }
 
     /// Windows' drives as a mask (bit 0 `A:`).
     fn mask(letters: &str) -> u32 {

@@ -269,15 +269,18 @@ for the next free one, as is a letter another start took meanwhile. `KILN_SLATES
 `KILN_SLATES_DIRECT` starts its anchor in its own process group on Linux too; every process of an
 instance carries `--instance <name>`.
 
-**W2 Every agent on a volume (the person's decision, 2026-11-18, kiln goal 01a1ec34…).** kiln's bare-metal
-engine runs every harness and agent on a Slates volume: a start that names no `workspace` gets **its own Slates
-volume**, whoever starts it (a person, an agent, a plan, a goal stack). Where its machine can't make one, the start is
-refused, naming what the machine lacks (`lineage::NoWorkspace`: `fusermount3`, `/dev/fuse`, WinFsp, `mount_nfs`, a
-kiln new enough, as the runner's facts type it, `workspaces.missing`); no agent runs in its plain folder instead, which
-would be a second path. `workspace`: `volume` asks for one (refused the same way where the machine can't make one) and
-`folder` (the folder itself) is a
-person's explicit choice, kept as made, in Mission control's composer (More options, where Own volume is now the
-choice made) and `agents.start`. Several agents on one folder each get their own. An agent started in another
+**W2 Agents on volumes, an option (the person's ruling, 2026-11-21, over the decision of 2026-11-18, kiln goal
+01a1ec34…).** "Slates shouldn't even be enabled yet. It is not even remotely product complete. Like the microVM
+engine, it's designed to be an option we can enable." Slates workspaces are off until the server's config turns them
+on (`[workspaces] enabled = true`, `config::Workspaces`); a start that names no `workspace` works in **its folder**,
+whoever starts it (a person, an agent, a plan, a goal stack), on or off. `workspace: "volume"` asks for **its own
+Slates volume**: refused while they're off, saying how to turn them on (`config::WORKSPACES_OFF`, typed `workspaces`),
+and with them on, refused where its machine can't make one, naming what it lacks (`lineage::NoWorkspace`:
+`fusermount3`, `/dev/fuse`, WinFsp, `mount_nfs`, a kiln new enough, as the runner's facts type it,
+`workspaces.missing`); it never runs in its plain folder instead. So while they're off no machine starts Slates for a
+new agent; an agent that has a volume already keeps working in it, mounted again as it starts again, moves or is taken
+up (`workspace::prepare`). Mission control's composer offers Own volume (More options) where its machine can make one,
+This folder chosen until a person picks it. Several agents on one folder, each asking, each get their own. An agent started in another
 agent's folder on that agent's machine (a child placed in its parent's folder, above all) works in that agent's
 volume, as two agents in one folder did (`workspace.owner` names whose it is): a volume is never laid over a volume,
 which Slates refuses (its A-227). An isolated agent's workspace is its microVM's boundary's to share (W8); a volume
@@ -307,10 +310,8 @@ value or each path of a list (`OLDPWD`, an activated virtual environment's `VIRT
 the folder it starts in; the harness's own homes (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`,
 `XDG_*`) stay where kiln reads its records, and nothing of its environment names the person's folder, so a command
 that trusts it works in the volume, never past it (no second path; the composer offers Own volume for a shell's agent
-as for any). A server sets the default with
-`[agents] workspace`: `volume` (kiln's own) or `folder`, the folder itself as before; kiln's test servers and
-scratch hubs say `folder`, so no test leaves a volume or a mount behind on the machine that runs it, and a test of
-workspaces asks for its volumes.
+as for any). A test of workspaces turns them on (`[workspaces] enabled`) and asks for its volumes; every other
+test's agents work in their folders, so none leaves a volume or a mount behind on the machine that runs it.
 
 **W3 How.** On the agent's machine, before its harness starts: an **overlay volume** laid over its
 folder's repository (the library's overlay over `<top>`), mounted under the runner's state

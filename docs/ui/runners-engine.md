@@ -1,7 +1,8 @@
 # Runners: where agents run, where CI runs, and a runner's microVMs
 
 Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2.3 (a runner's engine) and P3.2 (warm pools). Decision 3: a runner
-that can run microVMs defaults to `microvm`, its owner opts out per runner. Decision 8: a switch drains, with an
+that can run microVMs defaults to `microvm`, its owner opts out per runner. (Superseded by the person's ruling of
+2026-11-21: every runner's engine is `host` until its owner sets `microvm`.) Decision 8: a switch drains, with an
 explicit "End them now"; only `runners.manage` switches; the workspace default is in Settings → Runners, a
 project's override shown. Rules: [principles.md](principles.md).
 

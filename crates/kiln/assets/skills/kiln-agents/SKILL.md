@@ -26,8 +26,8 @@ skill). Work you'll do yourself, item by item, is a goal stack of your own.
 
 Children in one folder share it: **only one should write at a time** there. To let several
 write, give each a workspace of its own: `workspace: "volume"` in `agents_start`, a Slates volume
-over the folder where what it changes stays its own (where its machine has Slates; it says if
-not). Otherwise give writers separate folders, or let one write and the others read, review or
+over the folder where what it changes stays its own (where kiln's Slates workspaces are on, off
+by default, and its machine has Slates; it says if not). Otherwise give writers separate folders, or let one write and the others read, review or
 test.
 
 ## Briefing a child

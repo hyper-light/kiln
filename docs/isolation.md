@@ -179,8 +179,9 @@ sessions: `host`, each a process of its machine's with no microVM, or `microvm`,
 its own through Hex (`sandbox::hexvm`).
 
 - **Which one.** What its owner set on the server (`PUT /api/runners/:name/engine`, `runners.engine.set` over
-  MCP and code mode; `runners.manage` on that runner), else `microvm` where it can hold microVMs now (the
-  person's decision 3), else `host`, saying why. Whether it can is read in one place, `engine::capable`, from
+  MCP and code mode; `runners.manage` on that runner), else `host`: the microVM engine is an option its owner
+  enables, never a default (the person's ruling, 2026-11-21, over decision 3's `microvm` wherever it could hold
+  them), saying why where it can't hold microVMs. Whether it can is read in one place, `engine::capable`, from
   its isolation facts below, which carry Shards' own check of its host (`shards_api::host_check`).
   `microvm` set where it can't any more is held as `host`, saying why.
 - **Refused.** `microvm` on a runner that can't hold microVMs, saying why (409).

@@ -134,6 +134,33 @@ shards_for() {
   echo "build.sh: kiln for $t carries Shards ($KILN_SHARDS_DIR)"
 }
 
+# Every binary in dist/ is a whole executable for its platform before its sum is written: at least
+# KILN_MIN_BINARY bytes (8 MiB; a release is ~600 MB, a lab's without the UI server or Shards far
+# more than this) and starting with its platform's header (ELF, Mach-O 64-bit, PE's MZ). One that
+# isn't is removed and the build fails, so no artifact of it is kept: an empty build marked valid
+# was offered as an upgrade and a Mac's runner installed it (2026-11-21).
+check_dist() {
+  local min=${KILN_MIN_BINARY:-8388608} f size head want bad=0
+  for f in "$dist"/kiln-*; do
+    [ -f "$f" ] || continue
+    case $f in *SHA256SUMS) continue ;; esac
+    size=$(wc -c < "$f" | tr -d ' ')
+    head=$(od -An -tx1 -N4 "$f" | tr -d ' \n')
+    case $f in
+      *-linux-*) want=7f454c46 ;;
+      *-apple-darwin) want=cffaedfe ;;
+      *.exe) want=4d5a ;;
+      *) want= ;;
+    esac
+    if [ "$size" -lt "$min" ] || [ -z "$want" ] || [ "${head#"$want"}" = "$head" ]; then
+      echo "build.sh: $f isn't a whole kiln for its platform ($size bytes, header ${head:-none}, wanted ${want:-a known target} and at least $min bytes): removed" >&2
+      rm -f "$f"
+      bad=1
+    fi
+  done
+  [ "$bad" = 0 ] || exit 1
+}
+
 # On a Mac: its own toolchain and SDK, no zig.
 if $native_mac; then
   for t in "${targets[@]}"; do
@@ -143,6 +170,7 @@ if $native_mac; then
     MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --locked -p kiln --target "$t"
     cp "$target_dir/$t/release/kiln" "$dist/kiln-$t"
   done
+  check_dist
   (cd "$dist" && shasum -a 256 kiln-* > SHA256SUMS && cat SHA256SUMS)
   exit 0
 fi
@@ -285,4 +313,5 @@ for t in "${targets[@]}"; do
   esac
 done
 
+check_dist
 (cd "$dist" && sha256sum kiln-* > SHA256SUMS && cat SHA256SUMS)

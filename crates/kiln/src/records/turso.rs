@@ -340,7 +340,11 @@ fn serve(mut db: Db, jobs: &crate::memory::queue::Receiver<Job>, seen: &Mutex<Se
             // What's durable is said before anyone is answered: a caller told its commit is in
             // finds it in the head and the feed.
             db.publish(seen);
-            for ((_owner, reply), answer) in replies.into_iter().zip(answers) {
+            // Each commit's authority (`commit_owned`'s owner: the bytes its caller charged to it, W20) let go before
+            // it's answered, as the other stores let theirs go: answered first, the caller went on while the charge
+            // was still held, and read its budget with it in.
+            for ((owner, reply), answer) in replies.into_iter().zip(answers) {
+                drop(owner);
                 let _ = reply.send(answer);
             }
             changed.notify();

@@ -4495,12 +4495,10 @@ impl Registry {
             crate::harness::lineage::isolation_on(hub, target).map_err(|why| anyhow::anyhow!("an agent can't run isolated there: {why}"))?;
         }
         let loc = Location::of_target(target);
-        // Where it works, on its machine's host (the person's decision, 2026-11-18, kiln goal
-        // 01a1ec34599974448aed2672bafaf9a2; docs/agentic.md W2): one whose folder lies in a workspace an agent there
-        // works in now works in that one; one whose start named none gets a volume of its own, and a machine that can't
-        // make one refuses the start, naming what it lacks (`lineage::NoWorkspace`), rather than run it in its plain
-        // folder: no second path (`[agents] workspace`, `volume` unless a server says `folder`). In a microVM
-        // its boundary's sharing decides. One started in a person's shell (`shell`) works on a volume too: the shell's
+        // Where it works, on its machine's host (docs/agentic.md W2): one whose folder lies in a workspace an agent there
+        // works in now works in that one; else its folder, unless its start asked for a volume of its own (the person's
+        // ruling, 2026-11-21: Slates workspaces are an option kiln's owner enables, `[workspaces]`, never a default). In
+        // a microVM its boundary's sharing decides. One started in a person's shell (`shell`) on a volume: the shell's
         // folder, read on its machine as it starts, is the one laid over, and its environment is moved onto the mount
         // with it (`workspace::prepare`, `kinds::launch`), so nothing of it names the person's folder (I11); and so does
         // a conversation taken up (`resume`), its harness's record of it moved to where the harness looks from the
@@ -4509,10 +4507,14 @@ impl Registry {
             let live = self.live_at(&loc.target());
             if let Some(shared) = spec.cwd.as_deref().and_then(|cwd| crate::workspace::sharing(cwd, &live)) {
                 spec.workspace = Some(shared);
-            } else if spec.workspace.is_none() && hub.cfg.agents.workspace == crate::config::DefaultWorkspace::Volume {
-                crate::harness::lineage::workspaces_on(hub, target, crate::harness::lineage::WorkspaceUse::Mounted).await?;
-                spec.workspace = Some(crate::workspace::Workspace { kind: "volume".to_owned(), ..Default::default() });
             }
+        }
+        // A volume still to be made, however its start came, only while `[workspaces]` is on and where its machine can
+        // make one (`lineage::workspaces_on`), refused, typed, otherwise: no machine starts Slates for a new agent while
+        // they're off, and none runs in its plain folder instead. One that has its volume (started again, moved, taken
+        // up) keeps it.
+        if spec.workspace.as_ref().is_some_and(|w| w.kind == "volume" && w.made.is_none() && w.owner.is_none()) {
+            crate::harness::lineage::workspaces_on(hub, target, crate::harness::lineage::WorkspaceUse::of(spec.isolation.is_some())).await?;
         }
         // How much its launcher lets it do unasked, kept as given whatever it or its harness says later (the person's
         // rule, 2026-11-18: an agent never raises its own permission; docs/agentic.md W6): what its permissions are
