@@ -20,6 +20,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 const OUT: &str = "docs/records-inventory.md";
+/// Where the file's part written by hand starts (the moves' designs): kept as it is when the file is
+/// written again, and not read against the code.
+const BY_HAND: &str = "\n## Designed by hand\n";
 
 /// Where each table is created and dropped, and whether only tests make it.
 #[derive(Default)]
@@ -258,10 +261,21 @@ fn cp_t1_5_every_table_and_json_record_has_its_inventory_entry() -> Result<(), S
     let root = repo()?;
     let want = inventory(&root)?;
     let path = root.join(OUT);
+    let read = std::fs::read_to_string(&path).map(|t| t.replace("\r\n", "\n"));
+    // The part written by hand, from its heading on: kept, and not read against the code.
+    let (have, by_hand) = match &read {
+        Ok(t) => match t.find(BY_HAND) {
+            Some(at) => (t.get(..at).unwrap_or("").to_owned(), t.get(at..).unwrap_or("").to_owned()),
+            None => (t.clone(), String::new()),
+        },
+        Err(_) => (String::new(), String::new()),
+    };
     if std::env::var_os("KILN_BLESS").is_some() {
-        return std::fs::write(&path, &want).map_err(|e| format!("{}: {e}", path.display()));
+        return std::fs::write(&path, format!("{want}{by_hand}")).map_err(|e| format!("{}: {e}", path.display()));
     }
-    let have = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e} (write it with scripts/records-inventory.sh)", path.display()))?.replace("\r\n", "\n");
+    if let Err(e) = &read {
+        return Err(format!("{}: {e} (write it with scripts/records-inventory.sh)", path.display()));
+    }
     if have == want {
         return Ok(());
     }
