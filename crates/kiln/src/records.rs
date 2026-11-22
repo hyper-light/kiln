@@ -29,6 +29,7 @@ use rusqlite::{OptionalExtension, params};
 use crate::store::Store;
 
 pub mod carry;
+pub mod cli;
 pub mod turso;
 
 /// A host's records file, in its folder (beside its conversation store): its sessions' inboxes, where the host keeps no
