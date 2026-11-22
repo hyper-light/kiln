@@ -240,6 +240,8 @@ mod tests {
             let (_d, store) = crate::convo::store::scratch()?;
             store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?), since: None });
             store.send("s1", &Update::State { state: Box::new(State { harness_session: Some("cc-1".into()), epoch: 2, ..State::default() }) });
+            // Claude Code's record of it, as its machine sent it: what a resume from the store goes on from.
+            store.put(vec![Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n: 0, end: 10, line: "{\"a\":1}".into(), kept: None }))]);
             store.sync()?;
             let inbox = crate::convo::inbox::InboxRecords::new(crate::convo::inbox::Source::Store(store.clone()), crate::harness::inbox::FAMILIES, None);
             let put = |family: &str, key: &str, value: Vec<u8>| Write::Put { family: family.into(), key: key.as_bytes().to_vec(), value };
