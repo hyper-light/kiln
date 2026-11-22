@@ -279,6 +279,9 @@ enum Cmd {
     Config(kiln::config_cli::ConfigArgs),
     /// Where the server keeps its bytes (docs/blobs.md): copy the local store's into S3.
     Blobs(kiln::blobs::cli::BlobsArgs),
+    /// kiln's goal and plan tables carried into Records and compared with them, by table, key and
+    /// column (CP-T1.5): `carry`, `compare`.
+    Records(kiln::records::cli::RecordsArgs),
     /// The Agentfiles kiln ships: `context` writes one's build context and prints its recipe.
     Agentfiles(kiln::agentfiles::cli::AgentfilesArgs),
     /// kiln's own code signature on a Mac: `setup` once, so macOS keeps kiln's local network
@@ -1238,6 +1241,10 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
         Cmd::Blobs(a) => {
             let cfg = config::Config::load(&config_path)?;
             boxed(|| kiln::blobs::cli::run(a, &cfg)).await
+        }
+        Cmd::Records(a) => {
+            let cfg = config::Config::load(&config_path)?;
+            boxed(|| kiln::records::cli::run(a, &cfg)).await
         }
         Cmd::Agentfiles(a) => boxed(|| kiln::agentfiles::cli::run(a)).await,
         Cmd::Signing(a) => kiln::os::macsign::run(a),
