@@ -1476,11 +1476,15 @@ pub async fn work(d: &Arc<Deploy>) -> anyhow::Result<()> {
         }
         let now = crate::util::now_unix();
         match store::claim(&*d.records, &d.owner, now, LEASE_SECS, 16).await {
-            Ok(ids) => {
-                for id in ids {
-                    if let Err(e) = step(d, id).await {
+            Ok(leases) => {
+                for lease in leases {
+                    // Every write of the step holds only while the lease does (CP-T1.6): a server
+                    // whose lease passed on writes nothing over the new holder's.
+                    let id = lease.release;
+                    let st = store::Fenced::new(Arc::clone(&d.records), lease);
+                    if let Err(e) = step(d, &st, id).await {
                         tracing::warn!(release = id, error = %format!("{e:#}"), "deploy: a step failed; trying again shortly");
-                        let _ = store::schedule(&*d.records, id, now + 5).await;
+                        let _ = store::schedule(&st, id, now + 5).await;
                     }
                 }
             }
@@ -1501,8 +1505,7 @@ pub async fn work(d: &Arc<Deploy>) -> anyhow::Result<()> {
 }
 
 /// Moves one release as far as it can go now.
-async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
-    let st = &*d.records;
+async fn step(d: &Deploy, st: store::Recs<'_>, id: i64) -> anyhow::Result<()> {
     let Some(mut r) = store::release(st, id).await? else {
         store::done(st, id).await?;
         return Ok(());
@@ -1513,7 +1516,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
     let unreachable = env.as_ref().map_or(6 * 60 * 60, |e| i64::try_from(e.watch.unreachable_secs).unwrap_or(21_600)).max(timeout);
     match r.state {
         State::Waiting | State::WaitingApproval => match holds(d, &r, false).await? {
-            Holds::Superseded(by) => superseded(d, r, &by).await?,
+            Holds::Superseded(by) => superseded(d, st, r, &by).await?,
             Holds::Wait(why) => {
                 let moved = r.message.as_deref() != Some(why.as_str());
                 r.message = Some(why);
@@ -1525,7 +1528,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             Holds::Go => {
                 let was = r.state;
                 let (Some(env), Some(a)) = (env.clone(), store::app(st, &r.app).await?) else {
-                    return finish(d, r, State::Failed, Some("its app or environment is gone".into())).await;
+                    return finish(d, st, r, State::Failed, Some("its app or environment is gone".into())).await;
                 };
                 match gates::evaluate(d, &r, &env, &a).await? {
                     Verdict::Go(results) => {
@@ -1540,7 +1543,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                             emit_release(d, &r);
                             // One target: the newest deploy rolls out, and the older ones waiting
                             // end (W28-R38).
-                            coalesce(d, &r.app, &r.environment).await?;
+                            coalesce(d, st, &r.app, &r.environment).await?;
                         }
                         store::schedule(st, id, now).await?;
                     }
@@ -1563,7 +1566,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                             tracing::warn!(release = r.id, error = %format!("{e:#}"), "deploy: a promotion refused wasn't recorded");
                         }
                         r.gates = results;
-                        finish(d, r, State::Failed, Some(why)).await?;
+                        finish(d, st, r, State::Failed, Some(why)).await?;
                     }
                 }
             }
@@ -1574,11 +1577,11 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             Ok(Committed::Refused(why)) => {
                 let message = format!("refused before its commit, nothing changed: {why}");
                 if r.kind == Kind::Rollback {
-                    degrade(d, &r, &format!("release {} failed: {message}; what it rolled back from runs on", r.id)).await?;
+                    degrade(d, st, &r, &format!("release {} failed: {message}; what it rolled back from runs on", r.id)).await?;
                 }
-                finish(d, r, State::Failed, Some(message)).await?;
+                finish(d, st, r, State::Failed, Some(message)).await?;
             }
-            Ok(Committed::Done(sha, secrets, irreversible)) => committed(d, r, sha, secrets, irreversible, now).await?,
+            Ok(Committed::Done(sha, secrets, irreversible)) => committed(d, st, r, sha, secrets, irreversible, now).await?,
             // Proposed as a pull request (`via: pull-request`): it waits for the merge, looked at
             // every minute, and at once when GitHub's webhook says the pull request moved.
             Ok(Committed::Proposed(pr, why)) => {
@@ -1602,16 +1605,16 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 if let Some(by) = by {
                     r.approvals.push(Approval { by, at: now, approved: true, note: Some(merged) });
                 }
-                committed(d, r, commit, secrets, irreversible, now).await?;
+                committed(d, st, r, commit, secrets, irreversible, now).await?;
             }
-            Ok(Committed::Closed(why)) => finish(d, r, State::Cancelled, Some(why)).await?,
+            Ok(Committed::Closed(why)) => finish(d, st, r, State::Cancelled, Some(why)).await?,
             // One waiting on its pull request waits on while GitHub can't be asked.
             Err(e) if r.provider.get("pull_request").is_some_and(Value::is_object) => {
                 r.message = Some(format!("its pull request can't be looked at now: {e}"));
                 store::update_release(st, &r, State::Committing).await?;
                 store::schedule(st, id, now + PROPOSAL_LOOK).await?;
             }
-            Err(e) if now - r.created_at > timeout => finish(d, r, State::Failed, Some(format!("not committed: {e}"))).await?,
+            Err(e) if now - r.created_at > timeout => finish(d, st, r, State::Failed, Some(format!("not committed: {e}"))).await?,
             Err(e) => {
                 r.message = Some(format!("committing: {e}"));
                 store::update_release(st, &r, State::Committing).await?;
@@ -1620,10 +1623,10 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
         },
         State::Delivering => {
             // A newer release of its target rolling out supersedes it (docs/ci.md W28-R38).
-            if coalesce(d, &r.app, &r.environment).await?.contains(&r.id) {
+            if coalesce(d, st, &r.app, &r.environment).await?.contains(&r.id) {
                 return Ok(());
             }
-            let Some(commit) = r.commit.clone() else { return finish(d, r, State::Failed, Some("delivering, but no commit was recorded".into())).await };
+            let Some(commit) = r.commit.clone() else { return finish(d, st, r, State::Failed, Some("delivering, but no commit was recorded".into())).await };
             let committed_at = r.committed_at.unwrap_or(r.created_at);
             let settle = env.as_ref().map_or(30, |e| i64::try_from(e.watch.settle_secs).unwrap_or(30));
             let delivered = r.provider.get("delivered_at").and_then(Value::as_i64);
@@ -1634,7 +1637,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             let unanswered_since = r.provider.get("unanswered_since").and_then(Value::as_i64);
             let clock = unanswered_at.map_or(committed_at, |at| at.max(committed_at));
             // When the provider first held the release: kept from one look to the next.
-            let looked = follow(d, &r, &commit).await.map(|(landed, mut view)| {
+            let looked = follow(d, st, &r, &commit).await.map(|(landed, mut view)| {
                 let held = !matches!(landed, Landed::Refused(_));
                 if let Some(at) = delivered.or(held.then_some(now)) {
                     note(&mut view, "delivered_at", json!(at));
@@ -1649,7 +1652,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     let since = r.provider.get("landed_at").and_then(Value::as_i64).unwrap_or(now);
                     if now - since >= settle {
                         r.provider = view;
-                        return finish(d, r, State::Succeeded, None).await;
+                        return finish(d, st, r, State::Succeeded, None).await;
                     }
                     if let Some(m) = view.as_object_mut() {
                         m.insert("landed_at".into(), json!(since));
@@ -1664,7 +1667,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 // or held for a person (§8.1): see `aftermath`.
                 Ok((Landed::Failed(why), view)) => {
                     r.provider = view;
-                    failed(d, r, why).await?;
+                    failed(d, st, r, why).await?;
                 }
                 Ok((Landed::Refused(why), mut view)) => {
                     let since = r.provider.get("refused_at").and_then(Value::as_i64).unwrap_or(now);
@@ -1673,7 +1676,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     note(&mut view, "refused_at", json!(since));
                     r.provider = view;
                     if now - since >= grace {
-                        return refused(d, r, format!("{name} refused it: {why}")).await;
+                        return refused(d, st, r, format!("{name} refused it: {why}")).await;
                     }
                     r.message = Some(format!("{name} refuses it: {why} (it fails in {}s unless that clears)", grace - (now - since)));
                     store::update_release(st, &r, State::Delivering).await?;
@@ -1688,7 +1691,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     if now - since >= grace {
                         // Said object by object where the provider says it (Kubernetes' reason).
                         let why = degraded_objects(d, &r).await.unwrap_or(why);
-                        return failed(d, r, format!("it is Degraded: {why}")).await;
+                        return failed(d, st, r, format!("it is Degraded: {why}")).await;
                     }
                     r.message = Some(format!("Degraded: {why} (it fails in {}s unless it recovers)", grace - (now - since)));
                     store::update_release(st, &r, State::Delivering).await?;
@@ -1706,7 +1709,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                     let progressing = view.get("health").and_then(Value::as_str) == Some("Progressing");
                     r.provider = view;
                     let why = if progressing { format!("it didn't land within {}s, still progressing (three times watch.timeout_secs)", timeout * 3) } else { format!("it didn't land within {timeout}s (watch.timeout_secs)") };
-                    failed(d, r, why).await?;
+                    failed(d, st, r, why).await?;
                 }
                 Ok((Landed::No, view)) => {
                     // What it waits on, where the provider says; a stream wakes it as that changes,
@@ -1719,7 +1722,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 }
                 // The provider never held it: nothing changed there, and git goes back too.
                 Err(e) if now - committed_at > timeout && delivered.is_none() => {
-                    refused(d, r, format!("it never reached the provider within {timeout}s: {e}")).await?;
+                    refused(d, st, r, format!("it never reached the provider within {timeout}s: {e}")).await?;
                 }
                 // It held it, and can't be asked since: what it did is unknown, and nothing is
                 // done blind. It's judged when the provider answers; held when it hasn't for
@@ -1727,7 +1730,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
                 Err(e) => {
                     let first = unanswered_since.unwrap_or(now);
                     if now - first > unreachable {
-                        hold(d, r, &format!("the provider couldn't be asked for {unreachable}s: {e}"), "what it did is unknown").await?;
+                        hold(d, st, r, &format!("the provider couldn't be asked for {unreachable}s: {e}"), "what it did is unknown").await?;
                     } else {
                         note(&mut r.provider, "unanswered_since", json!(first));
                         note(&mut r.provider, "unanswered_at", json!(now));
@@ -1741,7 +1744,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
         // Cancelled while its pull request waited: the pull request is closed (or, merged meanwhile,
         // its merge undone).
         State::Cancelled if r.provider.get("withdraw").and_then(Value::as_bool) == Some(true) => {
-            let withdrawn = withdraw(d, &mut r).await;
+            let withdrawn = withdraw(d, st, &mut r).await;
             note(&mut r.provider, "withdraw", json!(false));
             r.message = Some(format!("{}; {withdrawn}", r.message.as_deref().unwrap_or("cancelled")));
             if store::update_release(st, &r, State::Cancelled).await? {
@@ -1750,7 +1753,7 @@ async fn step(d: &Deploy, id: i64) -> anyhow::Result<()> {
             store::done(st, id).await?;
         }
         State::Cancelled if r.provider.get("undo").and_then(Value::as_bool) == Some(true) => {
-            let undone = undo(d, &r, &format!("{} (release {} was delivering)", r.message.as_deref().unwrap_or("cancelled"), r.id)).await;
+            let undone = undo(d, st, &r, &format!("{} (release {} was delivering)", r.message.as_deref().unwrap_or("cancelled"), r.id)).await;
             note(&mut r.provider, "undo", json!(false));
             r.message = Some(format!("{}; {undone}", r.message.as_deref().unwrap_or("cancelled")));
             if store::update_release(st, &r, State::Cancelled).await? {
@@ -1887,8 +1890,8 @@ async fn holds(d: &Deploy, r: &Release, asked: bool) -> anyhow::Result<Holds> {
 /// write is done and it rolls out. Each is cancelled, naming the release that took its place;
 /// nothing of it is reverted, the newer release's commit landing on top of its own, as a rollout's
 /// newer revision supersedes it.
-async fn coalesce(d: &Deploy, app: &str, env: &str) -> anyhow::Result<Vec<i64>> {
-    let flying = store::flying(&*d.records, app, env).await?;
+async fn coalesce(d: &Deploy, st: store::Recs<'_>, app: &str, env: &str) -> anyhow::Result<Vec<i64>> {
+    let flying = store::flying(st, app, env).await?;
     let q: Vec<kiln_cd::deploys::Deploy> = flying
         .iter()
         .map(|r| {
@@ -1901,7 +1904,7 @@ async fn coalesce(d: &Deploy, app: &str, env: &str) -> anyhow::Result<Vec<i64>> 
     for r in flying {
         if let Some(by) = g.superseded_by(&queued(&r).0) {
             let (id, by) = (r.id, by.id.clone());
-            superseded(d, r, &by).await?;
+            superseded(d, st, r, &by).await?;
             ended.push(id);
         }
     }
@@ -1910,14 +1913,13 @@ async fn coalesce(d: &Deploy, app: &str, env: &str) -> anyhow::Result<Vec<i64>> 
 
 /// Ends a release a newer one of its target supersedes (W28-R38): cancelled, saying which release
 /// took its place.
-async fn superseded(d: &Deploy, r: Release, by: &str) -> anyhow::Result<()> {
+async fn superseded(d: &Deploy, st: store::Recs<'_>, r: Release, by: &str) -> anyhow::Result<()> {
     let why = format!("superseded by {by}: the newest revision of {} in {} rolls out", r.app, r.environment);
-    finish(d, r, State::Cancelled, Some(why)).await
+    finish(d, st, r, State::Cancelled, Some(why)).await
 }
 
 /// A release committed (`sha`): delivering from now, handed to its provider.
-async fn committed(d: &Deploy, mut r: Release, sha: String, secrets: Option<String>, irreversible: Option<String>, now: i64) -> anyhow::Result<()> {
-    let st = &*d.records;
+async fn committed(d: &Deploy, st: store::Recs<'_>, mut r: Release, sha: String, secrets: Option<String>, irreversible: Option<String>, now: i64) -> anyhow::Result<()> {
     r.irreversible = irreversible;
     r.commit = Some(sha);
     // What it changes of the app's secrets, as it pinned them (§3.5).
@@ -1933,8 +1935,8 @@ async fn committed(d: &Deploy, mut r: Release, sha: String, secrets: Option<Stri
     emit_release(d, &r);
     // Its write done, it takes the place of the older releases of its target rolling out
     // (docs/ci.md W28-R38).
-    coalesce(d, &r.app, &r.environment).await?;
-    match deliver(d, &r).await {
+    coalesce(d, st, &r.app, &r.environment).await?;
+    match deliver(d, st, &r).await {
         Ok(()) => note(&mut r.provider, "delivered_at", json!(now)),
         Err(e) => r.message = Some(e.to_string()),
     }
@@ -1946,11 +1948,11 @@ async fn committed(d: &Deploy, mut r: Release, sha: String, secrets: Option<Stri
 /// A release cancelled while its pull request waited: the pull request closed, saying so, and its
 /// branch deleted. Merged meanwhile, its merge is in git: undone as a delivering release's commit
 /// is (§9). What was done, as the release's message says it.
-async fn withdraw(d: &Deploy, r: &mut Release) -> String {
+async fn withdraw(d: &Deploy, st: store::Recs<'_>, r: &mut Release) -> String {
     let (Some(number), branch) = (r.provider.pointer("/pull_request/number").and_then(Value::as_u64), r.provider.pointer("/pull_request/branch").and_then(Value::as_str).unwrap_or_default().to_owned()) else {
         return "it had no pull request".to_owned();
     };
-    let env = match store::environment(&*d.records, &r.environment).await {
+    let env = match store::environment(st, &r.environment).await {
         Ok(Some(e)) => e,
         _ => return format!("its environment is gone: close its pull request ({number}) on its host"),
     };
@@ -1969,7 +1971,7 @@ async fn withdraw(d: &Deploy, r: &mut Release) -> String {
         Ok(crate::githost::ChangeState::Merged { commit: Some(sha), .. }) => {
             gh.drop_branch(&branch).await;
             r.commit = Some(sha);
-            format!("its {it} was merged meanwhile; {}", undo(d, r, &format!("{why} (release {} was proposed)", r.id)).await)
+            format!("its {it} was merged meanwhile; {}", undo(d, st, r, &format!("{why} (release {} was proposed)", r.id)).await)
         }
         Ok(crate::githost::ChangeState::Merged { commit: None, .. }) => format!("its {it} was merged meanwhile, into a commit {on} hasn't said: roll back to undo it"),
         Ok(crate::githost::ChangeState::Closed) => {
@@ -2205,19 +2207,19 @@ fn stand_in(_: &Deploy) -> Option<Arc<dyn super::provider::StandIn>> {
     None
 }
 
-async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
+async fn deliver(d: &Deploy, st: store::Recs<'_>, r: &Release) -> Result<(), Undelivered> {
     if let Some(p) = stand_in(d) {
         return p.deliver(r);
     }
     let commit = r.commit.clone().ok_or("no commit to deliver")?;
-    let a = store::app(&*d.records, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
-    let env = store::environment(&*d.records, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
-    let mut reg = store::registration(&*d.records, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
+    let a = store::app(st, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
+    let env = store::environment(st, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
+    let mut reg = store::registration(st, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
     let file = release_file_at(d, &a, &env, &commit).await?;
     // A release resumes the provider's automation (docs/deploy-api.md §5).
     if file.enabled && file.version.is_some() && reg.paused {
         reg.paused = false;
-        store::put_registration(&*d.records, &reg).await.map_err(|e| format!("{e:#}"))?;
+        store::put_registration(st, &reg).await.map_err(|e| format!("{e:#}"))?;
     }
     if let Some(name) = argo_of(&env) {
         let argo = argocd::Argo::of(&d.hub, name).await?;
@@ -2264,18 +2266,18 @@ async fn deliver(d: &Deploy, r: &Release) -> Result<(), Undelivered> {
 
 /// Where a delivering release stands, delivered again when the provider lost it (a restart
 /// between the commit and the delivery).
-async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value), String> {
+async fn follow(d: &Deploy, st: store::Recs<'_>, r: &Release, commit: &str) -> Result<(Landed, Value), String> {
     if let Some(p) = stand_in(d) {
         return Ok(p.follow(r, commit));
     }
-    let a = store::app(&*d.records, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
-    let env = store::environment(&*d.records, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
+    let a = store::app(st, &r.app).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no app {}", r.app))?;
+    let env = store::environment(st, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or_else(|| format!("no environment {}", r.environment))?;
     let file = release_file_at(d, &a, &env, commit).await?;
     if let Some(name) = argo_of(&env) {
         let argo = argocd::Argo::of(&d.hub, name).await?;
         watch_argo(d, name);
         if appset::integration_of(&env).is_some() {
-            let reg = store::registration(&*d.records, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
+            let reg = store::registration(st, &r.app, &r.environment).await.map_err(|e| format!("{e:#}"))?.ok_or("the app isn't registered there any more")?;
             return appset::follow(d, &argo, r, &a, &env, &reg, &file, commit).await;
         }
         let app_name = argocd::application_name(&a, &env.name);
@@ -2287,7 +2289,7 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
         if !file.enabled {
             // Still there and not on its way out: the delete didn't happen, and is asked for again.
             if current.as_ref().is_some_and(|c| c.pointer("/metadata/deletionTimestamp").is_none()) {
-                deliver(d, r).await.map_err(|e| e.to_string())?;
+                deliver(d, st, r).await.map_err(|e| e.to_string())?;
             }
             return Ok((if current.is_some() { Landed::No } else { Landed::Yes }, json!({ "application": app_name, "removed": true })));
         }
@@ -2299,7 +2301,7 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
         // names in its release.json the release it puts back, not itself.
         let stamped = current.as_ref().and_then(|c| c.pointer("/metadata/annotations/kiln.dev~1commit").and_then(Value::as_str).map(str::to_owned));
         if stamped.as_deref() != Some(commit) {
-            return match deliver(d, r).await {
+            return match deliver(d, st, r).await {
                 Ok(()) => Ok((Landed::No, json!({ "application": app_name, "message": "written again" }))),
                 Err(Undelivered::Refused(why)) => Ok((Landed::Refused(why), json!({ "application": app_name }))),
                 Err(Undelivered::Unreachable(e)) => Err(e),
@@ -2321,7 +2323,7 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
     if !file.enabled {
         // KilnCD lets go of an app as it deletes it: one still there wasn't deleted, and is again.
         if cd.apps.read().contains_key(&id) {
-            deliver(d, r).await.map_err(|e| e.to_string())?;
+            deliver(d, st, r).await.map_err(|e| e.to_string())?;
         }
         return Ok((if cd.apps.read().contains_key(&id) { Landed::No } else { Landed::Yes }, json!({ "app": id, "removed": true })));
     }
@@ -2329,7 +2331,7 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
         return Ok((Landed::Yes, json!({ "app": id, "message": "registered and enabled; no version deployed yet" })));
     }
     if present != Some(true) {
-        match deliver(d, r).await {
+        match deliver(d, st, r).await {
             Ok(()) => {}
             Err(Undelivered::Refused(why)) => return Ok((Landed::Refused(why), json!({ "app": id }))),
             Err(Undelivered::Unreachable(e)) => return Err(e),
@@ -2354,8 +2356,7 @@ async fn follow(d: &Deploy, r: &Release, commit: &str) -> Result<(Landed, Value)
 }
 
 /// Ends a release: its state, its registration's, and the release it replaced.
-async fn finish(d: &Deploy, mut r: Release, state: State, message: Option<String>) -> anyhow::Result<()> {
-    let st = &*d.records;
+async fn finish(d: &Deploy, st: store::Recs<'_>, mut r: Release, state: State, message: Option<String>) -> anyhow::Result<()> {
     let was = r.state;
     r.state = state;
     r.message = message;
@@ -2503,24 +2504,24 @@ pub(super) fn aftermath(r: &Release) -> Aftermath {
 
 /// A release that failed after its commit, for `why`: what ran before put back (a revert, followed
 /// until it lands), or the release held as it is for a person.
-async fn failed(d: &Deploy, mut r: Release, why: String) -> anyhow::Result<()> {
+async fn failed(d: &Deploy, st: store::Recs<'_>, mut r: Release, why: String) -> anyhow::Result<()> {
     if let Aftermath::Hold(reason) = aftermath(&r) {
-        return hold(d, r, &why, &reason).await;
+        return hold(d, st, r, &why, &reason).await;
     }
     if let Some(off) = auto_rollback_off(d, &r).await {
-        return hold(d, r, &why, &off).await;
+        return hold(d, st, r, &why, &off).await;
     }
     match revert(d, &r, &why).await {
-        Ok((Some(sha), _)) => match start_revert(d, &r, &sha).await {
+        Ok((Some(sha), _)) => match start_revert(d, st, &r, &sha).await {
             Ok(back) => {
                 r.reverted_by = Some(back.id);
-                finish(d, r, State::Failed, Some(format!("{why}; release {} puts back what ran before", back.id))).await
+                finish(d, st, r, State::Failed, Some(format!("{why}; release {} puts back what ran before", back.id))).await
             }
-            Err(e) => hold(d, r, &why, &format!("its commit is reverted in {}, but putting that through failed: {e:#}", short(&sha))).await,
+            Err(e) => hold(d, st, r, &why, &format!("its commit is reverted in {}, but putting that through failed: {e:#}", short(&sha))).await,
         },
         // Someone changed its files since: what runs is theirs.
-        Ok((None, _)) => finish(d, r, State::Failed, Some(format!("{why}; nothing of its commit was left to revert"))).await,
-        Err(e) => hold(d, r, &why, &format!("its commit couldn't be reverted ({e})")).await,
+        Ok((None, _)) => finish(d, st, r, State::Failed, Some(format!("{why}; nothing of its commit was left to revert"))).await,
+        Err(e) => hold(d, st, r, &why, &format!("its commit couldn't be reverted ({e})")).await,
     }
 }
 
@@ -2537,28 +2538,27 @@ async fn auto_rollback_off(d: &Deploy, r: &Release) -> Option<String> {
 /// A release its provider refused, or never got: nothing of it was applied, and git goes back
 /// with it. A revert refused isn't reverted, and a rollback refused leaves running what it rolled
 /// back from: both need a person.
-async fn refused(d: &Deploy, r: Release, why: String) -> anyhow::Result<()> {
+async fn refused(d: &Deploy, st: store::Recs<'_>, r: Release, why: String) -> anyhow::Result<()> {
     if r.kind == Kind::Revert {
-        return hold(d, r, &why, "putting back what ran before was refused too").await;
+        return hold(d, st, r, &why, "putting back what ran before was refused too").await;
     }
-    let undone = give_back(d, &r, &why).await;
+    let undone = give_back(d, st, &r, &why).await;
     let message = format!("{why}; {undone}");
     if r.kind == Kind::Rollback {
-        degrade(d, &r, &format!("release {} failed: {message}; what it rolled back from runs on", r.id)).await?;
+        degrade(d, st, &r, &format!("release {} failed: {message}; what it rolled back from runs on", r.id)).await?;
     }
-    finish(d, r, State::Failed, Some(message)).await
+    finish(d, st, r, State::Failed, Some(message)).await
 }
 
 /// Fails a release held as it is: the registration says it needs a person, and why.
-async fn hold(d: &Deploy, r: Release, why: &str, reason: &str) -> anyhow::Result<()> {
+async fn hold(d: &Deploy, st: store::Recs<'_>, r: Release, why: &str, reason: &str) -> anyhow::Result<()> {
     let message = format!("{why}; held: {reason}");
-    degrade(d, &r, &format!("release {} failed: {message}", r.id)).await?;
-    finish(d, r, State::Failed, Some(message)).await
+    degrade(d, st, &r, &format!("release {} failed: {message}", r.id)).await?;
+    finish(d, st, r, State::Failed, Some(message)).await
 }
 
 /// Marks a release's registration as needing a person, for `why`.
-async fn degrade(d: &Deploy, r: &Release, why: &str) -> anyhow::Result<()> {
-    let st = &*d.records;
+async fn degrade(d: &Deploy, st: store::Recs<'_>, r: &Release, why: &str) -> anyhow::Result<()> {
     if let Some(mut reg) = store::registration(st, &r.app, &r.environment).await? {
         reg.degraded = Some(why.to_owned());
         store::put_registration(st, &reg).await?;
@@ -2569,8 +2569,7 @@ async fn degrade(d: &Deploy, r: &Release, why: &str) -> anyhow::Result<()> {
 /// The release that puts back what ran before `failed`, whose commit `sha` reverted: delivered and
 /// followed as any release, so it says whether what ran before runs again. Asked for once however
 /// often this runs (a restart between the revert and its record).
-async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result<Release> {
-    let st = &*d.records;
+async fn start_revert(d: &Deploy, st: store::Recs<'_>, failed: &Release, sha: &str) -> anyhow::Result<Release> {
     let a = store::app(st, &failed.app).await?.ok_or_else(|| anyhow::anyhow!("no app {}", failed.app))?;
     let env = store::environment(st, &failed.environment).await?.ok_or_else(|| anyhow::anyhow!("no environment {}", failed.environment))?;
     let running = store::registration(st, &failed.app, &failed.environment).await?.and_then(|reg| reg.running);
@@ -2610,7 +2609,7 @@ async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result
     let (back, new) = store::insert_release(st, &back).await?;
     if new {
         // Not handed over now, it is when it's followed: `follow` delivers what isn't there.
-        if let Err(e) = deliver(d, &back).await {
+        if let Err(e) = deliver(d, st, &back).await {
             tracing::warn!(release = back.id, error = %e, "deploy: handing a revert to its provider failed; following it hands it again");
         }
         store::schedule(st, back.id, now + 2).await?;
@@ -2620,11 +2619,11 @@ async fn start_revert(d: &Deploy, failed: &Release, sha: &str) -> anyhow::Result
     Ok(back)
 }
 
-async fn give_back(d: &Deploy, r: &Release, why: &str) -> String {
+async fn give_back(d: &Deploy, st: store::Recs<'_>, r: &Release, why: &str) -> String {
     if r.origin == Origin::Git {
         return "it is a commit kiln didn't make, so git keeps it".to_owned();
     }
-    undo(d, r, why).await
+    undo(d, st, r, why).await
 }
 
 /// Whether what a release left in the cluster stays when git goes back to `file` (its revert, or
@@ -2655,7 +2654,7 @@ async fn keeps_objects(d: &Deploy, file: Option<&ReleaseFile>) -> bool {
 /// while delivering): its commit is reverted, and the provider handed what git says then. Where
 /// nothing ran before it, what it made goes; a disable that kept what ran keeps it ([`keeps`]).
 /// What was done, as the release's message says it.
-async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
+async fn undo(d: &Deploy, st: store::Recs<'_>, r: &Release, why: &str) -> String {
     let (reverted, head) = match revert(d, r, why).await {
         Ok(back) => back,
         Err(e) => return format!("its commit couldn't be reverted ({e}): roll back to undo it"),
@@ -2665,13 +2664,13 @@ async fn undo(d: &Deploy, r: &Release, why: &str) -> String {
         None => "nothing of its commit was left to revert".to_owned(),
     };
     let Some(head) = head else { return said };
-    let (a, env) = (store::app(&*d.records, &r.app).await.ok().flatten(), store::environment(&*d.records, &r.environment).await.ok().flatten());
+    let (a, env) = (store::app(st, &r.app).await.ok().flatten(), store::environment(st, &r.environment).await.ok().flatten());
     let file = match (&a, &env) {
         (Some(a), Some(env)) => release_file_at(d, a, env, &head).await.ok(),
         _ => None,
     };
     let back = Release { commit: Some(head.clone()), keep: keeps_objects(d, file.as_ref()).await, ..r.clone() };
-    if let Err(e) = deliver(d, &back).await {
+    if let Err(e) = deliver(d, st, &back).await {
         return format!("{said}, but handing the provider what git says failed: {e}");
     }
     match file {
@@ -2803,7 +2802,7 @@ async fn scan_git(d: &Deploy) -> anyhow::Result<()> {
                     irreversible: None,
                 };
                 let (r, _) = store::insert_release(st, &r).await?;
-                if let Err(e) = deliver(d, &r).await {
+                if let Err(e) = deliver(d, st, &r).await {
                     tracing::warn!(release = r.id, error = %e, "deploy: delivering a commit kiln didn't make");
                 }
                 store::schedule(st, r.id, now + 2).await?;
@@ -2984,7 +2983,7 @@ mod tests {
             let (b, _) = store::insert_release(st, &release("b", "2.0", State::Delivering)).await?;
             let (a2, _) = store::insert_release(st, &release("a", "1.1", State::Waiting)).await?;
             anyhow::ensure!(matches!(holds(&d, &a2, false).await?, Holds::Go), "the second a goes beside b, superseding the first");
-            step(&d, a2.id).await?;
+            step(&d, &*d.records, a2.id).await?;
             anyhow::ensure!(get(a2.id).await?.state == State::Committing, "the second a writes");
             anyhow::ensure!(get(a1.id).await?.state == State::Delivering, "the first a rolls on while the second writes");
             // Its write done, the second a rolls out and the first gives way to it; b rolls on.
@@ -2992,7 +2991,7 @@ mod tests {
             written.state = State::Delivering;
             written.commit = Some("a-1.1".into());
             anyhow::ensure!(store::update_release(st, &written, State::Committing).await?);
-            step(&d, a1.id).await?;
+            step(&d, &*d.records, a1.id).await?;
             let first = get(a1.id).await?;
             anyhow::ensure!(first.state == State::Cancelled, "the first a ends: {:?}", first.state);
             let said = format!("superseded by release {}: the newest revision of a in prod rolls out", a2.id);
@@ -3003,7 +3002,7 @@ mod tests {
             let Holds::Wait(why) = holds(&d, &release("c", "3.0", State::Committing), true).await? else { anyhow::bail!("c, asked for, doesn't wait") };
             anyhow::ensure!(why == waits, "{why}");
             let (c, _) = store::insert_release(st, &release("c", "3.0", State::Waiting)).await?;
-            step(&d, c.id).await?;
+            step(&d, &*d.records, c.id).await?;
             let c = get(c.id).await?;
             anyhow::ensure!(c.state == State::Waiting && c.message.as_deref() == Some(waits.as_str()), "{:?} {:?}", c.state, c.message);
             Ok(())
@@ -3085,7 +3084,7 @@ mod tests {
             let held = crate::custody::take(&hub.store, &hub.pki.ca_der, &hub.pki.organization(), &staged, "a test", crate::util::now_unix()).await?.map_err(|e| anyhow::anyhow!("{e}"))?.digest;
             // Production takes it at A: CD hands it on from staging as it goes...
             let (p, _) = store::insert_release(st, &release("production", &a, State::Waiting)).await?;
-            step(&d, p.id).await?;
+            step(&d, &*d.records, p.id).await?;
             let mut going = get(p.id).await?;
             anyhow::ensure!(going.state == State::Committing, "{:?} {:?}", going.state, going.message);
             let promoted = going.gates.iter().find(|g| g.gate == super::super::promotion::GATE).ok_or_else(|| anyhow::anyhow!("no promotion: {:?}", going.gates))?;
@@ -3094,7 +3093,7 @@ mod tests {
             going.state = State::Delivering;
             going.commit = Some("web-1.2.0".into());
             anyhow::ensure!(store::update_release(st, &going, State::Committing).await?);
-            finish(&d, going, State::Succeeded, None).await?;
+            finish(&d, &*d.records, going, State::Succeeded, None).await?;
             let (org, now) = (hub.pki.organization(), crate::util::now_unix());
             let view = crate::custody::chain(&hub.store, &hub.pki.ca_der, &org, &format!("sha256:{a}"), now).await?.ok_or_else(|| anyhow::anyhow!("no chain for A"))?;
             anyhow::ensure!(view.get("unbroken") == Some(&json!(true)), "{view}");
@@ -3109,7 +3108,7 @@ mod tests {
             anyhow::ensure!(hops.iter().all(|h| h.pointer("/subject/0/digest/sha256") == Some(&json!(a))), "{view}");
             // Production at B: not what staging ran, refused as a promotion and recorded.
             let (other, _) = store::insert_release(st, &release("production", &b, State::Waiting)).await?;
-            step(&d, other.id).await?;
+            step(&d, &*d.records, other.id).await?;
             let refused = get(other.id).await?;
             anyhow::ensure!(refused.state == State::Failed && refused.message.as_deref().is_some_and(|m| m.contains("with other artifacts")), "{:?} {:?}", refused.state, refused.message);
             let recorded = crate::custody::refusals(&hub.store, 10).await?;
@@ -3444,24 +3443,33 @@ mod tests {
             let r = release(&a, &Who::kiln("admin"), ask).await.map_err(|(_, m)| anyhow::anyhow!(m))?;
             // Server A takes it, and moves it on: through its gates, committed, handed over.
             let now = crate::util::now_unix();
-            anyhow::ensure!(store::claim(st, &a.owner, now, LEASE_SECS, 16).await? == vec![r.id], "server A takes the release");
+            let &[lease] = store::claim(st, &a.owner, now, LEASE_SECS, 16).await?.as_slice() else { anyhow::bail!("server A takes the release, alone") };
+            anyhow::ensure!(lease.release == r.id, "server A takes the release");
+            let held_by_a = store::Fenced::new(Arc::clone(&records), lease);
             for _ in 0..4 {
                 if store::release(st, r.id).await?.is_some_and(|x| x.state == State::Delivering) {
                     break;
                 }
-                step(&a, r.id).await?;
+                step(&a, &held_by_a, r.id).await?;
             }
             let delivering = store::release(st, r.id).await?.ok_or_else(|| anyhow::anyhow!("the release"))?;
             anyhow::ensure!(delivering.state == State::Delivering, "server A delivers it: {:?} ({:?})", delivering.state, delivering.message);
             let commit = delivering.commit.clone().ok_or_else(|| anyhow::anyhow!("its commit"))?;
-            // Server A dies here: it does nothing more, and its lease stands until it lapses.
-            drop(a);
+            // Server A stops here (a pause, a partition): it does nothing more until after its lease
+            // lapsed, and the lease stands until then.
             // Due again, but A's: B doesn't take it while A's lease holds.
             anyhow::ensure!(store::claim(st, &b.owner, now + LEASE_SECS / 2, LEASE_SECS, 16).await?.is_empty(), "server B waits while A's lease holds");
             // Once A's lease has lapsed, B takes the release and follows it until it lands.
             let later = now + LEASE_SECS + 1;
-            anyhow::ensure!(store::claim(st, &b.owner, later, LEASE_SECS, 16).await? == vec![r.id], "server B takes it once the lease lapses");
-            step(&b, r.id).await?;
+            let &[lease] = store::claim(st, &b.owner, later, LEASE_SECS, 16).await?.as_slice() else { anyhow::bail!("server B takes it once the lease lapses") };
+            anyhow::ensure!(lease.release == r.id, "server B takes it once the lease lapses");
+            // CP-T1.6: server A comes back, its lease gone to B: its step writes nothing, and the
+            // release is as A left it.
+            anyhow::ensure!(step(&a, &held_by_a, r.id).await.is_err(), "server A's step past its lease is refused");
+            let after_a = store::release(st, r.id).await?.ok_or_else(|| anyhow::anyhow!("the release"))?;
+            anyhow::ensure!(after_a.state == State::Delivering, "server A changed nothing: {:?} ({:?})", after_a.state, after_a.message);
+            anyhow::ensure!(store::schedule(&held_by_a, r.id, later).await.is_err(), "nor does server A move B's work");
+            step(&b, &store::Fenced::new(Arc::clone(&records), lease), r.id).await?;
             let landed = store::release(st, r.id).await?.ok_or_else(|| anyhow::anyhow!("the release"))?;
             anyhow::ensure!(landed.state == State::Succeeded, "server B finishes it: {:?} ({:?})", landed.state, landed.message);
             anyhow::ensure!(landed.commit.as_deref() == Some(commit.as_str()), "with A's commit");
@@ -3470,6 +3478,7 @@ mod tests {
             anyhow::ensure!(delivered == vec![(r.id, commit.clone())], "handed over once: {delivered:?}");
             // Nothing is left to follow.
             anyhow::ensure!(store::claim(st, &b.owner, later + 3600, LEASE_SECS, 16).await?.is_empty(), "nothing is left in the work queue");
+            drop(a);
             Ok(())
         })
     }
