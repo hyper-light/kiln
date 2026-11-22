@@ -4934,6 +4934,29 @@ mod tests {
         })
     }
 
+    /// G9 step 3 (goal a2a44298, T-T1.5.1): an agent's news says the stacks that read it: its own and its parent's
+    /// (whose step looks at its children at work); one not seen before (a new session), every stack; the same info
+    /// again, nothing.
+    #[test]
+    fn g9_s3_an_agent_s_news_says_its_stack_and_its_parent_s() -> anyhow::Result<()> {
+        let store = crate::store::Store::in_memory_inline()?;
+        let changes = store.changes();
+        let mut seen = HashMap::new();
+        let mut child = Info { id: "news-child".into(), parent: Some("news-parent".into()), status: Status::Idle, ..Info::default() };
+        anyhow::ensure!(news_said(changes, &child, &mut seen), "a new session wasn't news");
+        let (said, _) = changes.take_said();
+        anyhow::ensure!(said.all, "a new session didn't say every stack: {said:?}");
+        anyhow::ensure!(!news_said(changes, &child, &mut seen), "the same info was news");
+        let (said, _) = changes.take_said();
+        anyhow::ensure!(!said.all && said.keys.is_empty(), "the same info said something: {said:?}");
+        child.status = Status::Running;
+        anyhow::ensure!(news_said(changes, &child, &mut seen), "a status change wasn't news");
+        let (said, _) = changes.take_said();
+        let want: HashSet<String> = ["news-child", "news-parent"].into_iter().map(String::from).collect();
+        anyhow::ensure!(!said.all && said.keys == want, "its news didn't say its stack and its parent's alone: {said:?}");
+        Ok(())
+    }
+
     /// G9 step 3 (goal a2a44298, T-T1.5.1): with the driver stepping the stacks said changed ([`Steps::Stacks`]), a
     /// goal added to a stack during a round (after the round took what was said) isn't stepped by that round, but
     /// said as its change gives its turn back, it wakes the next, which sends it; the other stack's goal, sent by the
