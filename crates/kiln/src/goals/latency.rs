@@ -61,6 +61,9 @@ pub(crate) struct Measured {
     /// Where the time went, while the edits ran (`turn_times`): the waits for the stacks' turns,
     /// every stack's turn held, and the driver's rounds, each within a factor of two.
     pub turns: serde_json::Map<String, Value>,
+    /// Which stacks the driver's rounds stepped (`KILN_GOAL_FEED`, `goals::Steps`): `stacks`, those said changed;
+    /// `every`, the control.
+    pub feed: &'static str,
 }
 
 /// The `q`th quantile of `sorted` by nearest rank (`q` in 0..=1).
@@ -239,14 +242,15 @@ pub(crate) async fn measure(load: Load) -> anyhow::Result<Measured> {
         let (p50, p99, p999, max) = summary(&of);
         kinds.insert(kind.into(), json!({"n": of.len(), "p50_us": p50, "p99_us": p99, "p999_us": p999, "max_us": max}));
     }
-    Ok(Measured { n: took.len(), agents: load.agents, p50_us, p99_us, p999_us, max_us, lost: timed.len() - took.len(), kinds, turns })
+    let feed = if super::Steps::from_env() == super::Steps::Stacks { "stacks" } else { "every" };
+    Ok(Measured { n: took.len(), agents: load.agents, p50_us, p99_us, p999_us, max_us, lost: timed.len() - took.len(), kinds, turns, feed })
 }
 
 /// The measurement as one JSON line, its times in milliseconds.
 pub(crate) fn line(m: &Measured) -> String {
     #[allow(clippy::cast_precision_loss)]
     let ms = |us: u64| us as f64 / 1000.0;
-    json!({"measure": "goal_edit_to_driver_action", "n": m.n, "agents": m.agents, "p50_ms": ms(m.p50_us), "p99_ms": ms(m.p99_us), "p999_ms": ms(m.p999_us), "max_ms": ms(m.max_us), "lost": m.lost, "kinds": m.kinds, "turns": m.turns}).to_string()
+    json!({"measure": "goal_edit_to_driver_action", "n": m.n, "agents": m.agents, "p50_ms": ms(m.p50_us), "p99_ms": ms(m.p99_us), "p999_ms": ms(m.p999_us), "max_ms": ms(m.max_us), "lost": m.lost, "kinds": m.kinds, "turns": m.turns, "feed": m.feed}).to_string()
 }
 
 #[cfg(test)]
