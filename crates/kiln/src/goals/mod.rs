@@ -2876,10 +2876,19 @@ where
             // What woke it says which stacks the next round steps ([`Steps`]): the feed and the says, those said
             // (and those whose goals wait on plans); the agents' news, those it said (`heard_news`); a reminder's
             // deadline, those due; the test's news, a subagent's retry or a stir, every stack.
+            // A say after the round's take (`Steps::Stacks` alone: the control steps every stack at the feed's
+            // move, and a say there would only bring a second round for the same change).
+            let said = async {
+                if changing.steps == Steps::Stacks {
+                    self.store.changes().said_after(said_at).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
             let woke = futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 _ = feed.after(at).fuse() => Woke::Change,
-                () = self.store.changes().said_after(said_at).fuse() => Woke::Change,
+                () = said.fuse() => Woke::Change,
                 () = told.fuse() => Woke::Every,
                 open = heard.fuse() => if open { Woke::Change } else { Woke::Closed },
                 () = due.fuse() => if due_every { Woke::Every } else { Woke::Change },
