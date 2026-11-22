@@ -784,38 +784,34 @@ fn in_layers(store: &shards_image::store::Store, layers: &[shards_image::store::
 }
 
 /// kiln's MCP for `kind`'s harness in its microVM, through its link's `mcp` lane's bridge (step 18,
-/// `crate::harness::isolated::mcp`): its command line's form added to `args`; Antigravity's entry put
-/// in its own config in its person's volume as `home` lays it out ([`home_of`]; the only place agy reads one
-/// from, kept as agy keeps it: `mcp::agy_config`), from kiln's own Agentfile or a person's alike: the one fixed
-/// entry, as its lane, not the entry, names its session (Shards D254); none with no home of its person's here. An
-/// ACP agent's is given at its `session/new` (`kinds::acp_servers`). A config that couldn't be written, or that
-/// lies in none of its volumes, starts it without kiln's MCP, said, as on its machine (`Kind::prepare`).
+/// `crate::harness::isolated::mcp`): its command line's form added to `args`. An ACP agent's (Antigravity's
+/// `agy acp` among them) is given at its `session/new` (`kinds::acp_servers`). For Antigravity, the one fixed entry
+/// kiln wrote for its headless stream-json in its own config in its person's volume, as `home` lays it out
+/// ([`home_of`]), is taken out (`mcp::forget_bridge`), from kiln's own Agentfile or a person's alike: its session's
+/// would start kiln's MCP a second time. A config that couldn't be read or written is left as it is, said.
 async fn offer_mcp(kind: &Kind, home: Option<&home::Layout>, args: &mut Vec<String>) {
     use crate::harness::isolated::mcp;
     match mcp::for_harness(kind) {
         mcp::Config::Args(more) => args.extend(more),
-        mcp::Config::Shared(_) => {
+        mcp::Config::Acp(_) if kind.id == "antigravity" => {
             let Some(layout) = home.cloned() else { return };
-            let put = crate::rt::blocking(move || -> anyhow::Result<()> {
+            let forgot = crate::rt::blocking(move || -> anyhow::Result<()> {
                 let guest = format!("{}/.gemini/config/mcp_config.json", layout.guest_home().trim_end_matches('/'));
                 // Outside its volumes is its microVM's scratch, which kiln never makes and its harness never sees here.
-                let at = layout.host_of(&guest).filter(|at| layout.mounts().iter().any(|m| at.starts_with(&m.host)));
-                let at = at.ok_or_else(|| anyhow::anyhow!("{guest} is in none of its volumes, where kiln could put it"))?;
-                let config = match std::fs::read(&at) {
-                    Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Bool(false)),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+                let Some(at) = layout.host_of(&guest).filter(|at| layout.mounts().iter().any(|m| at.starts_with(&m.host))) else { return Ok(()) };
+                let bytes = match std::fs::read(&at) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                     Err(e) => return Err(anyhow::anyhow!("{}: {e}", at.display())),
                 };
-                if let Some(next) = mcp::agy_config(&config) {
-                    if let Some(dir) = at.parent() {
-                        std::fs::create_dir_all(dir)?;
-                    }
-                    std::fs::write(&at, serde_json::to_vec_pretty(&next)?)?;
+                let Ok(mut config) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return Ok(()) };
+                if mcp::forget_bridge(&mut config) {
+                    std::fs::write(&at, serde_json::to_vec_pretty(&config)?)?;
                 }
                 Ok(())
             });
-            if let Err(e) = put.await.and_then(|r| r) {
-                tracing::warn!(harness = kind.id, error = %format!("{e:#}"), "kiln's MCP couldn't be put in its config: it starts without it");
+            if let Err(e) = forgot.await.and_then(|r| r) {
+                tracing::warn!(harness = kind.id, error = %format!("{e:#}"), "kiln's entry from before couldn't be taken out of its config");
             }
         }
         mcp::Config::Acp(_) | mcp::Config::Refused(_) => {}
@@ -979,9 +975,11 @@ mod tests {
     }
 
     /// Plan 01a1d2c16eb074f19cf7ae7f1025c0be step 4: two isolated Antigravity sessions of one person on one machine.
-    /// Both launches put kiln's entry in agy's own `mcp_config.json`, in the person's volume they share: the lane's
-    /// bridge alone, naming no session, token or address, and nothing else is written there. Each session's bridge
-    /// takes only its own run's connections from the machine's one lane, and kiln answers each as that session.
+    /// agy's ACP server takes kiln's MCP at each session's `session/new` (`kinds::acp_servers`), as every ACP agent
+    /// does: the lane's bridge alone, naming no session, token or address, and neither launch adds to its command
+    /// line. The one fixed entry kiln wrote in agy's own config in the person's volume for its headless stream-json
+    /// goes, the person's own servers kept. Each session's bridge takes only its own run's connections from the
+    /// machine's one lane, and kiln answers each as that session.
     #[test]
     fn s35_mcp_two_antigravity_sessions_of_one_person_are_each_their_own() -> anyhow::Result<()> {
         use super::super::fake::{FakeLanes, connection};
@@ -991,21 +989,30 @@ mod tests {
         let (volumes, env) = crate::harness::isolated::home::of_builtin(builtin_of("antigravity")?);
         let layout = crate::harness::isolated::home::Layout::new(&homes, "user:u1", "antigravity", &volumes, &env)?;
         let laid = layout.clone();
+        // What kiln wrote there for agy's stream-json, beside a server of the person's own.
+        let guest = format!("{}/.gemini/config/mcp_config.json", layout.guest_home().trim_end_matches('/'));
+        let kept_at = layout.host_of(&guest).ok_or_else(|| anyhow::anyhow!("no path here for its config"))?;
+        anyhow::ensure!(layout.mounts().iter().any(|m| kept_at.starts_with(&m.host)), "not in the person's volume: {}", kept_at.display());
+        std::fs::create_dir_all(kept_at.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?)?;
+        std::fs::write(&kept_at, serde_json::json!({"mcpServers": {"kiln": {"command": crate::harness::isolated::mcp::BRIDGE, "args": []}, "github": {"command": "gh-mcp"}}}).to_string())?;
         crate::rt::block_on(async move {
             let agy = kind("antigravity")?;
             for _ in 0..2 {
                 let mut args = Vec::new();
                 offer_mcp(agy, Some(&laid), &mut args).await;
-                anyhow::ensure!(args.is_empty(), "agy takes kiln's MCP from its own config alone: {args:?}");
+                anyhow::ensure!(args.is_empty(), "agy takes kiln's MCP at its session/new alone: {args:?}");
             }
             anyhow::Ok(())
         })?;
+        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&kept_at)?)?;
+        anyhow::ensure!(kept == serde_json::json!({"mcpServers": {"github": {"command": "gh-mcp"}}}), "{kept}");
         let written = files_in(&homes)?;
-        let [kept_at] = written.as_slice() else { anyhow::bail!("written in the person's volume: {written:?}") };
-        anyhow::ensure!(kept_at.ends_with(".gemini/config/mcp_config.json"), "{}", kept_at.display());
-        anyhow::ensure!(layout.mounts().iter().any(|m| kept_at.starts_with(&m.host)), "not in the person's volume: {}", kept_at.display());
-        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(kept_at)?)?;
-        anyhow::ensure!(kept == serde_json::json!({"mcpServers": {"kiln": {"command": crate::harness::isolated::mcp::BRIDGE, "args": []}}}), "{kept}");
+        anyhow::ensure!(written == [kept_at.clone()], "written in the person's volume: {written:?}");
+        for session in ["agy-a", "agy-b"] {
+            let spec = Spec { kind: "antigravity".into(), isolation: Some(Isolation::microvm()), ..Spec::default() };
+            let given = crate::harness::kinds::acp_servers(&spec, session);
+            anyhow::ensure!(given == [serde_json::json!({"name": "kiln", "command": crate::harness::isolated::mcp::BRIDGE, "args": [], "env": []})], "{session}: {given:?}");
+        }
 
         let node = crate::reach::node::Config {
             mirrors: dir.path().join("mirrors"),
@@ -1052,12 +1059,11 @@ mod tests {
     }
 
     /// Plan step 35 (s35-tests' P1): Antigravity started from a person's own Agentfile gets kiln's MCP as from kiln's own:
-    /// the one fixed entry, the lane's bridge alone (Shards D254), in agy's own `mcp_config.json` beneath the home its
-    /// image's harness names, in the volume its Agentfile gives that harness, as its launch lays them out ([`home_of`]).
-    /// An image whose harness's home is in none of its volumes (its microVM's scratch, `/tmp`) gets none: nothing is
-    /// written for it, and no scratch is made here.
+    /// at its `session/new`, the lane's bridge alone (Shards D254, `kinds::acp_servers`), whatever home its image's
+    /// harness names, in the volume its Agentfile gives that harness or in its microVM's scratch (`/tmp`), as its launch
+    /// lays them out ([`home_of`]): nothing is written for either launch, and no scratch is made here.
     #[test]
-    fn s35_mcp_antigravity_from_a_persons_own_agentfile_gets_the_one_fixed_entry() -> anyhow::Result<()> {
+    fn s35_mcp_antigravity_from_a_persons_own_agentfile_gets_kilns_mcp_at_its_session() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let homes = dir.path().join("homes");
         let images = Images::new(dir.path().join("no-shards"), dir.path().join("shards-home"), dir.path().join("scratch"));
@@ -1078,19 +1084,17 @@ mod tests {
                 let (_, layout) = home_of(&root, "user:u1", agy, source, &images, &pinned).await?;
                 let mut args = Vec::new();
                 offer_mcp(agy, Some(&layout), &mut args).await;
-                anyhow::ensure!(args.is_empty(), "agy takes kiln's MCP from its own config alone: {args:?}");
+                anyhow::ensure!(args.is_empty(), "agy takes kiln's MCP at its session/new alone: {args:?}");
+                let given = crate::harness::kinds::acp_servers(&spec, "agy-own");
+                anyhow::ensure!(given == [serde_json::json!({"name": "kiln", "command": crate::harness::isolated::mcp::BRIDGE, "args": [], "env": []})], "{given:?}");
                 laid.push(layout);
             }
             anyhow::Ok(laid)
         })?;
         let [in_volume, in_scratch] = laid.as_slice() else { anyhow::bail!("two launches: {laid:?}") };
         anyhow::ensure!(in_volume.guest_home() == "/home/me", "its home as its image names it: {}", in_volume.guest_home());
-        let kept_at = in_volume.host_of("/home/me/.gemini/config/mcp_config.json").ok_or_else(|| anyhow::anyhow!("no path here for its config"))?;
-        anyhow::ensure!(in_volume.mounts().iter().any(|m| kept_at.starts_with(&m.host)), "not in its volume: {}", kept_at.display());
-        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(&kept_at)?)?;
-        anyhow::ensure!(kept == serde_json::json!({"mcpServers": {"kiln": {"command": crate::harness::isolated::mcp::BRIDGE, "args": []}}}), "{kept}");
         let written = files_in(&homes)?;
-        anyhow::ensure!(written == [kept_at], "written for either launch: {written:?}");
+        anyhow::ensure!(written.is_empty(), "written for either launch: {written:?}");
         anyhow::ensure!(!in_scratch.host_home().exists(), "a scratch made here: {}", in_scratch.host_home().display());
         Ok(())
     }

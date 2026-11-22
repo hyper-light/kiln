@@ -11,7 +11,7 @@ browsers watching it.
 | Claude Code | `claude -p` stream-json + control protocol | `harness/claude.rs` |
 | Codex | `codex app-server` (JSON-RPC v2) | `harness/codex.rs` |
 | Devin, Gemini CLI, opencode, Goose, Amp, Cursor CLI | Agent Client Protocol | `harness/acp.rs` |
-| Antigravity CLI | `agy` headless stream-json, one turn per message on stdin (agy 1.4 or newer) | `harness/antigravity.rs` |
+| Antigravity CLI | Agent Client Protocol, its own server (`agy acp`, agy 1.5 or newer) | `harness/acp.rs` |
 | Pi | `pi --mode rpc`: JSON commands on stdin, responses and its session's events on stdout | `harness/pi.rs` |
 
 Devin runs as `devin acp`, with its modes, models and effort announced by the harness. Its modes
@@ -24,7 +24,8 @@ Devin CLI 3000.11.92.
 Devin's advertised `cognition.ai/midTurnPrompts` capability enables Steer and queued-message
 steering without cancellation. Concurrent prompts share a turn; kiln records their completion
 and usage once. A runner upgrade refreshes this capability on existing Devin sessions without
-restarting their processes. Other ACP agents keep steering queued.
+restarting their processes. Other ACP agents keep steering queued. The Antigravity CLI's ACP server
+takes a message into its turn too (below).
 
 Before a Devin session starts, each machine loads its model catalog with an ACP handshake
 in a temporary configuration that keeps its native default model, with imports, MCP servers and
@@ -82,18 +83,37 @@ a session that couldn't open for want of a sign-in says so, and opens once you s
 `/login`. Its own terminal interface is `agent`. Written from its docs and its CLI's own source
 (2026.11.11); not yet run end to end.
 
-The Antigravity CLI runs as `agy --input-format stream-json --output-format stream-json`: kiln
-writes `{"event":"user","message":{"content":…}}` for each turn and reads `init` (its conversation,
-which a restart resumes with `--conversation`), `step_update`s (the reply as it streams, each tool
-call with its input and output) and one `result` per turn. In that mode it can't ask anything: a
-tool that needs your approval is denied, the turn's result lists it (`denied_actions`), and kiln
-says what was denied and which mode lets it go ahead. Its modes are Ask (its own default:
-everything that needs approval is denied), Accept edits (a new agent's: it edits files; commands
-that need approval are denied), Plan and Bypass (`--dangerously-skip-permissions`). It can't be
-stopped mid-turn either: a stop ends its process, which keeps the turn so far, and kiln starts it
-again on the same conversation. A new model, effort or mode is a flag, so it starts again with it
-between turns. Files you attach go to it as their paths on its machine; its models come from
-`agy models`.
+The Antigravity CLI runs as `agy acp`, its own ACP server (the one Zed's ACP registry lists).
+Its modes are its own Default (it asks: kiln shows each request to go ahead, but for what it writes
+in its temporary folder, `TMPDIR`, which agy lets through unasked), Accept edits and
+Plan, and kiln's Bypass, as it has none of its own (and its Auto, where agy offers it); its models
+and thinking levels are its session's config options, and a stop is ACP's cancel. Before a session
+says them, its models are what `agy models` lists, folded into a model and its thinking levels as its
+ACP server gives them (`gemini-4-neon-high` and its kin become Gemini 4 Neon, low to xhigh), asked on
+a machine whose agents run on it and where agy signs in itself (with a sign-in kiln keeps, its sessions
+tell them); a session never prompted would leave a conversation in agy's history, its listing none. It signs in with the Google account agy keeps
+in the machine's keyring, or with what kiln keeps for it on the machine
+(`~/.gemini/antigravity-cli/kiln`, written by `/login`): a Gemini API key or Google Cloud's
+application-default credentials, which kiln signs its session in with (ACP's `authenticate`,
+`gemini-api-key` or `agent-platform`) and whose key or project it starts agy with (a session given
+its own `GEMINI_API_KEY` or `GOOGLE_CLOUD_PROJECT` keeps it). A sign-in from kiln starts its
+sessions on that machine again once their turn ends, as agy reads its credentials as it starts. In
+a microVM of its own it signs in as its person's volume says, never with what kiln keeps on the
+machine. Its own terminal interface is `agy`.
+
+A message for its turn under way goes to it at once: agy answers the prompt the message joined
+there and then and goes on in the same turn, the whole turn's tokens coming with its last answer
+(`docs/research/agy-acp/steer-1.5.14-macos-arm64.log`); a second one in the same turn waits for
+its end. Its subagents are agy's own: ACP reports none, so a pause or a subagent's limits don't
+hold them.
+
+Before agy's ACP server, kiln ran it in its headless stream-json (`agy --input-format stream-json`),
+and put its MCP server and a hook in agy's global config for it (`~/.gemini/config/mcp_config.json`'s
+`kiln`, `hooks.json`'s `kiln`). An Antigravity session still running that way when its runner
+upgrades starts again on `agy acp`, kiln loading its conversation by its id. As a session starts,
+kiln takes its own entries out of that config, the person's own kept (the MCP server would start a
+second time beside its session's); an old hook entry run until then answers agy's pass at once
+(`kiln harness-hook --agy`), as agy fails a call whose hook fails.
 
 Pi runs as `pi --mode rpc` (pi.dev/docs/latest/rpc): kiln writes one command a line (`prompt`, `steer`,
 `abort`, `set_model`, `set_thinking_level`, `compact`, ...), each under an id its `response` names,
@@ -111,23 +131,6 @@ extension's dialogs (select, confirm, input, editor) are yours to answer; its no
 timeline's. Pictures go to it inline, other files as their paths on its machine. Its own terminal
 interface is `pi`. Written from its docs and its RPC mode's source (Pi 1.5.2); not yet run end to
 end.
-
-Its subagents (`invoke_subagent`, each a conversation of agy's own) are tasks of the session: the
-stream names each one its agent starts (a `subagent` step's `subagent_info`: its conversation, role,
-type and first prompt), under the call that started it, its transcript as its output. Their own
-steps aren't in the stream, so kiln hears of them from its hook: agy reads hooks only from its
-hooks.json, so kiln puts one entry, `kiln`, in `~/.gemini/config/hooks.json` as an agent starts
-(beside the person's own, rewritten only when this kiln's path differs): `PreToolUse` for every tool
-(its answer awaited up to 7 days; past that agy fails the call), `PreInvocation` and `Stop`, each
-`kiln harness-hook --agy <event>` behind a shell guard: the entry stays in the person's hooks.json,
-and once that kiln binary is gone (its version pruned, kiln uninstalled) it answers agy's pass
-itself, as agy fails a call whose hook fails. It hands each to the socket of the runner process
-that started the session (`KILN_RUNNER_SOCK`), else the machine's harness socket (`KILN_HARNESS_SOCK`;
-agy hands both on), with its conversation's tokens so far from its transcript; agy run outside kiln
-gets the answer that changes nothing (`allow`). A subagent's `Stop` ends its task (completed); its
-agent's `manage_subagents` kill, stopped. A subagent's own subagents are named nowhere kiln reads
-(not in the stream, and a hook names only the conversation it's in), so they aren't in the tree;
-the session's limits hold their calls.
 
 An agent goes on in any other of these harnesses, its conversation carried over: picking another
 harness's model in the head's line (`set_model` with `kind`; a harness that lists no models yet
@@ -408,8 +411,7 @@ groups share what the unit has past it, so what they run never presses on the se
 A harness has none of kiln's own variables (`KILN_*`) from the environment of the server or runner
 that starts it (its data folder, config, supervisor's socket, admin token), nor from the shell
 `kiln spawn` took the environment of (a kiln terminal's has the server's): only those kiln gives it,
-`KILN_AGENT`, its sockets (`KILN_HARNESS_SOCK`, `KILN_RUNNER_SOCK`, `KILN_REACH_SOCK`) and, for
-Antigravity, its kiln MCP server's (`KILN_REACH_ON`, `KILN_SESSION`). A test server an agent started
+`KILN_AGENT` and its sockets (`KILN_HARNESS_SOCK`, `KILN_RUNNER_SOCK`, `KILN_REACH_SOCK`). A test server an agent started
 opened production's database through its inherited `KILN_DATA_DIR` (2026-11-06).
 
 Every ten seconds the runner notes what runs under each harness and what else is the agent's (in
@@ -549,9 +551,11 @@ to the same limits.
 Claude Code, Codex, Antigravity and Pi say how many tokens their sessions use, and only Claude Code
 and Pi say what they cost. An ACP agent (Devin, Gemini CLI, opencode, Goose, Amp, Cursor CLI) says
 its tokens or its cost only where it chooses to: ACP leaves both to each agent, turn by turn, and no
-agent says beforehand whether it will. kiln can't hold a limit to what a harness doesn't say, so it
-refuses one as you save the definition and tells you what to limit instead: a token limit for Codex
-or Antigravity in place of a cost limit, and a time limit for an ACP agent. Where an agent runs
+agent says beforehand whether it will. Antigravity's ACP server does, in its answer to each prompt, a
+cancelled turn's too (agy 1.5.14, `docs/research/agy-acp/live-1.5.14-macos-arm64.log`), so kiln holds
+it to a token limit. kiln can't hold a limit to what a harness doesn't say,
+so it refuses one as you save the definition and tells you what to limit instead: a token limit for
+Codex or Antigravity in place of a cost limit, and a time limit for another ACP agent. Where an agent runs
 another harness than its definition's (one its start chose, such as an attachment's) and that
 harness doesn't say what a limit counts, the limit can't be held, so the agent is ended as it
 starts, saying so (`ended`: `its token limit of 1000 tokens can't be held: Gemini CLI doesn't say
@@ -606,8 +610,8 @@ crashed with it is resumed with it, still its child (one that ended or errored s
 beside a process of it: only a crashed agent is resumed so, and no runner holds a crashed one. Its
 harness's own record of the conversation is on its machine, so every harness goes on in its own
 conversation, by its own id (`moving::Carry::Native`): Claude Code `--resume`, Codex `thread/resume`
-of its thread, Antigravity `--conversation`, Pi `--session-id`, and an ACP agent (Devin, Gemini CLI,
-OpenCode, Goose, Amp, Cursor) `session/load` of its session where it advertises `loadSession`. One
+of its thread, Pi `--session-id`, and an ACP agent (Devin, Gemini CLI, OpenCode, Goose, Amp, Cursor,
+Antigravity) `session/load` of its session where it advertises `loadSession`. One
 that doesn't load sessions starts a new one, given the conversation in words with its first
 message, and says so. Its timeline says which.
 
@@ -1068,6 +1072,13 @@ and shows what a sign-in asks for:
   method. Signing out runs `pi auth logout` for each of the two. Its other providers sign in in its
   own screen (`/screen`, then its `/login`), or by their API keys in its environment. A session
   starts again on its conversation once idle, to take the sign-in.
+- Antigravity CLI (`agy acp --login`): a Google sign-in page to open on any device, then the code
+  that page shows (or the address it lands on), pasted back; signing out is its ACP server's
+  `logout`, and its account card reads `agy models`. Or a Gemini API key, never echoed, checked
+  with Google before kiln keeps it on the machine; or Google Cloud's application-default
+  credentials (`gcloud auth application-default login --no-launch-browser`, the same page and
+  code), with gcloud's default project. One replaces the other; signing out forgets both. A
+  session starts again on its conversation once its turn ends, to take the sign-in.
 
 Not on Windows machines yet. What is typed in goes to the CLI only: never logged, kept once the
 sign-in ends, or shown in its output.
@@ -1389,7 +1400,7 @@ Kiln never infers replaceability from those words or silently merges them.
 The modes, harness by harness: Claude Code `plan` (plan), `default` and `dontAsk` (ask),
 `acceptEdits` (accept edits), `auto` (auto), `bypassPermissions` (bypass); Codex `read-only`
 (plan), `untrusted` (ask), `auto` (auto), `full-access` (bypass); the Antigravity CLI `plan`,
-`default` (ask), `accept-edits`, `bypass`; ACP agents kiln's `kiln-ask` and `kiln-bypass`, and
+`default` (ask), `accept-edits`, `auto` where agy offers it, and kiln's `kiln-bypass`; ACP agents kiln's `kiln-ask` and `kiln-bypass`, and
 their own modes by their words (`yolo` is bypass, `autoEdit` accept edits, `plan` plan). A mode
 kiln can't place is refused for a child; a parent in one counts as ask. The limits hold when a
 child starts: a person may change its mode later, as for any agent.
@@ -1749,8 +1760,8 @@ to `s28-pi-agentfile`).
   kiln's own MCP takes no grant at all: it comes over the encrypted link kiln drives the harness
   by, as that link's own MCP lane (Shards D254), on every OS kiln runs on. Inside the microVM each
   harness names the lane's bridge, `/run/shards/mcp`, as a stdio server in its own form (Claude
-  Code's `--mcp-config`, Codex's `-c mcp_servers.kiln.*`, an ACP agent's `mcpServers`, one fixed
-  entry in Antigravity's own `mcp_config.json`), and kiln answers it itself, with no token of
+  Code's `--mcp-config`, Codex's `-c mcp_servers.kiln.*`, an ACP agent's `mcpServers`, Antigravity's
+  `agy acp` among them), and kiln answers it itself, with no token of
   kiln's in the microVM: the lane says which session asks. So no Agentfile grants anything for it,
   and kiln refuses to keep one that grants a way to kiln itself, at its line, typed (`ReachesKiln`:
   "kiln's MCP rides the agent-control lane (D254)"). That covers a destination or a remote MCP
@@ -1763,7 +1774,7 @@ to `s28-pi-agentfile`).
   today. Each call over the lane is logged on the runner (`kiln.mcp.lane`), naming its session and
   tool. Each agent's launch asks its microVM for the bridge and hands the runner every connection
   its harness makes to it, as that agent's alone: two of your agents on one machine each reach
-  kiln's MCP as themselves, Antigravity's too, though its entry in your volume is the same for both.
+  kiln's MCP as themselves.
 - **Use a tool its image doesn't have.** The project's toolchain comes from the image: build your
   own Agentfile on your project's image (above).
 - **Move to another machine.** Not yet: it stays where it started, and says so when asked. To go on
@@ -1820,7 +1831,7 @@ is of its machine's architecture. What differs is the harness's own:
 | Goose | waits for its turn's end | no | yes |
 | Amp | waits for its turn's end | no | yes |
 | Devin | taken at once | yes | yes |
-| Antigravity CLI | waits for its turn's end; a stop ends its process, which kiln starts again on the same conversation, and a tool that needs approval is denied | no | yes, through the one entry kiln writes in its `mcp_config.json` in your volume |
+| Antigravity CLI | taken at once | no | yes |
 | Cursor CLI | waits for its turn's end | no | yes |
 | Pi | taken at once | no | no: Pi takes no MCP server from kiln |
 
@@ -1898,8 +1909,7 @@ let go of as its harness next starts.
 | Claude Code | `--add-dir` as it starts | live: its flag settings' `permissions.additionalDirectories` |
 | Codex | the folders it may write ride each turn (`turn/start`'s `sandboxPolicy.writableRoots`) | from its next turn; a read-only folder needs nothing, as its sandbox reads everywhere |
 | Gemini CLI | `--include-directories` as it starts | it starts again with it once nothing is under way, its conversation going on |
-| Antigravity | `--add-dir` as it starts | it starts again with it once nothing is under way, as for its other settings |
-| Devin, opencode, Goose, Amp, Cursor | ACP's `additionalDirectories` as its session opens, where it says it takes them (`sessionCapabilities.additionalDirectories`) | it opens its session again with them; one that doesn't say so holds its tools to no folder kiln sets, and kiln's scope holds the calls it asks about |
+| Devin, opencode, Goose, Amp, Cursor, Antigravity | ACP's `additionalDirectories` as its session opens, where it says it takes them (`sessionCapabilities.additionalDirectories`) | it opens its session again with them; one that doesn't say so holds its tools to no folder kiln sets, and kiln's scope holds the calls it asks about |
 | Pi | none: it holds its tools to no folder | kiln's scope alone |
 
 In a microVM, a harness that takes its folders only as it starts takes a change as it next starts: kiln
@@ -2341,8 +2351,8 @@ Besides the timeline-related fields (`status`, `approvals`, `queue`, `delivery`,
   compact: …"), or stopped first (its turn or its process ended: "Compaction stopped after 41s").
   Claude Code says one with `status: "compacting"` (again every 30 s), its end (`compact_result`,
   `compact_error`) and its boundary (`compact_metadata`); Codex with its `contextCompaction` item
-  (its older `thread/compacted` alone, from a Codex without the item); ACP agents as above. The
-  Antigravity CLI says nothing of one. The conversation draws the one under way where its live
+  (its older `thread/compacted` alone, from a Codex without the item); ACP agents (the Antigravity
+  CLI's `agy acp` among them) as above. The conversation draws the one under way where its live
   line is, and each marker as the boundary it is, kiln's earlier words for one
   ("Conversation compacted …") too.
 
@@ -2588,9 +2598,8 @@ messages for its subagents wait in their queues too.
 | Codex (multi-agent v1, its default) | on the subagent's own thread: `turn/start` (with the session's permissions then), `turn/steer` into its turn, `turn/interrupt` then `turn/start` for now; Codex says it back under kiln's id (`clientUserMessageId`) | queue, steer, now while it works; queue (a turn at once) between turns |
 | Codex (multi-agent v2; a subagent this process didn't spawn) | Codex refuses input there (`direct app-server input is not allowed for multi-agent v2 sub-agents`), so kiln asks the agent, in its turn, to pass it on with its own agent tools (`send_message`, `followup_task`; v1's `send_input`); delivered once the agent's call reaches it | queue, steer; agents it started itself only |
 | Claude Code | it takes nothing for a subagent from kiln (2.1.309 and 2.1.310 answer `send_task_message` "Unsupported control request subtype" in `-p`, and a prompt naming the subagent's call goes to the agent), so kiln asks the agent, in its turn, to pass it on with its SendMessage tool: at the subagent's next tool round while it works in the background, or resuming it once it has finished; under way when the agent's SendMessage to it starts, delivered when that succeeds | queue, steer while it works in the background; queue while in the foreground (its agent's turn waits on it) or once it finished; none once stopped (Claude Code doesn't resume one stopped) |
-| Antigravity CLI | before the subagent's next model call: kiln's hook (below) answers agy's `PreInvocation` in that subagent's conversation with the message (`injectSteps`, a `userMessage`; the files attached by their paths); under way then, delivered once it goes on past that call. Not once it has ended (agy calls a stopped subagent's model no more), nor before kiln's hook is heard from it | steer while it goes |
 | ACP agents (opencode) | kiln can't prompt an opencode subagent itself (an ACP prompt goes to a session kiln opened), so it asks the agent, once its turn is free, to pass it on with opencode's subagent tool, which takes a follow-up by the subagent's session id, running or ended; sent once kiln asks | queue |
-| ACP agents (Gemini CLI, Goose, Amp, Devin) | kiln has no subagent threads for them: their subagents aren't reported over ACP (below) | none |
+| ACP agents (Gemini CLI, Goose, Amp, Devin, Antigravity's `agy acp`) | kiln has no subagent threads for them: their subagents aren't reported over ACP (below) | none |
 
 What kiln asks an agent to pass on carries the person's words as written (the files attached by
 their paths) and is kiln's own message in its timeline (`kiln-relay-<message id>`); a turn that
@@ -2654,7 +2663,7 @@ their `server` and `tool_short`; skill calls their `skill`.
 
 An agent's subagents show as one tree: those kiln started for it (sessions of their own, `subagent`
 with it as `parent`, and theirs) and its harness's own (`subagents` in lists, nested by
-`parent_task`; Antigravity's from its stream, but not a subagent's own), each under what started it, in the order they started. Mission control's row of
+`parent_task`), each under what started it, in the order they started. Mission control's row of
 an agent with subagents has a toggle (the subagent mark and a chevron) that opens the tree under
 it in the row's own columns: each subagent's piece of the path (the lines of those it's under
 passing by, a curve into its own mark), its name, its word and what it's at, its machine, time and
@@ -2705,30 +2714,26 @@ ones (commands, `apply_patch`, MCP calls and its read tools): a `PreToolUse` com
 in the session's flags, with that hook's trust for this session alone (the hash Codex trusts it
 by), so the person's own hooks keep theirs. Its command, `kiln harness-hook`, hands the call to the
 runner's harness socket, which knows the session by the asking process; Codex names no subagent,
-so kiln tells it by the call's turn. Antigravity's are on each of its tool calls too: kiln's entry
-in agy's hooks.json (above), the subagent told by the call's conversation. The call of a paused subagent, or of one under it, waits for
+so kiln tells it by the call's turn. The call of a paused subagent, or of one under it, waits for
 its answer until it's resumed (`tasks[].paused_at`). `tasks[].pausable` says which can be held so:
 Claude Code's while they go; Codex's once Codex lists kiln's hook as trusted (a session whose hook
 it doesn't trust says why); an ACP agent's where its requests name them (opencode's, below);
-Antigravity's once kiln's hook is heard from it (its first hook turns `limits` on in its
-`meta.features`). What a pause holds says Paused; the
+Antigravity's, none. What a pause holds says Paused; the
 one paused offers Resume, and those under it wait for that.
 
 **What each may do** (`perms`, `{perms?, task?}`): Read, Edit, Run and Web, each `allow`, `ask` or
 `off`; a `folder` its file calls stay in; the most `minutes` and `tokens` it may use. Never more
 than what it's under: the server narrows a session's to its parent's, and the subagents kiln
 started under it to its own (narrowing one narrows those under it; widening it widens none);
-Claude Code's, Codex's and Antigravity's adapters narrow one of their own subagents' to the
+Claude Code's and Codex's adapters narrow one of their own subagents' to the
 session's and the one it's under. They hold at each tool call the same hook sees: `off` refuses the call with the reason,
-`ask` makes it ask the person (Codex's hook can't ask, nor can headless agy, so kiln holds the call
-and asks them itself; a yes is agy's `auto_approve`, so it goes even where agy's mode would deny it,
-and a no its `deny` with their words), a file outside its folder is refused (a command there asks; for Codex, the files an
+`ask` makes it ask the person (Codex's hook can't ask, so kiln holds the call and asks them itself),
+a file outside its folder is refused (a command there asks; for Codex, the files an
 `apply_patch` names), and past its minutes or tokens each call is refused and it's told to finish.
 Codex's web search is hosted, out of any hook's reach (`web_whole` in its `meta.features`): `off`,
 and `ask`, which it can't do, turn it off for the session's threads (`web_search = "disabled"`), as
 it starts again once idle, the conversation going on; a subagent of its own has no Web choice.
-Antigravity's web tools (`search_web`, `read_url_content`, `browser_*`) are calls its hook sees, so
-Web holds per call there as each other kind does. The
+The
 shield on the thread's crumbs opens the panel under them, every choice at its right edge; a
 session whose harness kiln doesn't answer that way (no `limits` in its `meta.features`) has it off.
 
@@ -2834,8 +2839,8 @@ queued turns until the registration is answered, then refreshes native discovery
 gets a native `skill` input item. The selected instructions also travel as text, so older Codex
 versions that lack root registration keep working through the portable path without native items.
 ACP agents
-(Devin, OpenCode, Gemini CLI, Goose, and Amp) and Antigravity get the selected instructions in their
-prompt transport. Images, resource links, message ids and queue semantics are retained. Skills
+(Devin, OpenCode, Gemini CLI, Goose, Amp and Antigravity's `agy acp`) get the selected instructions in
+their prompt transport. Images, resource links, message ids and queue semantics are retained. Skills
 remain readable while setup runs or needs repair. Disabling or removing a package updates the
 next delivered turn's catalogue, including a turn that was already queued. Nothing writes to the
 repository or a shared harness home, so agent/person/repository scopes stay isolated.
@@ -2845,7 +2850,7 @@ repository or a shared harness home, so agent/person/repository scopes stay isol
 | Claude Code | Native plugin discovery and reload |
 | Codex | Process-local native discovery, native skill input items, portable fallback |
 | Devin, OpenCode, Gemini CLI, Goose, Amp | Scoped catalogue; instructions and asset directory over ACP |
-| Antigravity | Scoped catalogue; instructions and asset directory over headless stream-json |
+| Antigravity | Scoped catalogue; instructions and asset directory over ACP |
 
 Python/Go/Node/Rust setup is independent of the harness. Agent definitions, hooks and package MCP
 configuration currently activate as Claude Code components; the UI says so for other harnesses,
@@ -2943,11 +2948,11 @@ mock-up, a small tool) as a page: see docs/previews.md.
     neither is under `/tmp`, the harness's scratch. Out, HTTPS alone, to the hosts of its four sign-ins,
     each by name (the table above), and nothing comes in. Its telemetry host (play.googleapis.com) isn't
     granted, so that never leaves the microVM.
-  - **In a microVM, as on its machine.** A tool that needs approval is denied, a stop ends its process,
-    which kiln starts again on the same conversation, and a message steered in waits for its turn's end.
-    It reaches kiln's MCP through the one entry kiln writes in its `mcp_config.json` in your volume, the
-    same for each of your agy agents, and each reaches kiln as itself. It signs in itself, its tokens in
-    your volume ("Signing in, and your credentials", above).
+  - **In a microVM, as on its machine.** harness.json runs its ACP server, `agy acp`: a tool that needs
+    approval asks you, a stop is ACP's cancel, and a message steered in waits for its turn's end. It
+    reaches kiln's MCP at each session's `session/new`, through the lane's bridge, and each of your agy
+    agents reaches kiln as itself. It signs in itself, its tokens in your volume ("Signing in, and your
+    credentials", above).
   - **Records.** pin.sh's record is `pin.log`, beside it. docs/research/s26-agy-agentfile/ holds
     the rest: the tests' runs, the microVM build, smokes and probe on both platforms
     (`evidence/step4/`), and what stayed unverified (its README).

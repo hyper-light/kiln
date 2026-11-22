@@ -11,11 +11,12 @@
 //! anything for it (`agentfiles::check` refuses a grant that reaches kiln itself).
 //!
 //! Each form is the harness's own documented one, as kiln gives it on its machine (`reach::mcp`):
-//! Claude Code's `--mcp-config`, Codex's `-c mcp_servers.*`, an ACP agent's `session/new`
-//! `mcpServers` (stdio, which every ACP agent takes), and Antigravity's own `mcp_config.json`, the
-//! only place agy reads a server from, which is in its person's volume and so the same for every
-//! session: one fixed entry suits it, as the lane, not the entry, names the session (goal 65's probe,
-//! docs/research/s35-every-harness/agy-mcp). Pi takes no MCP server.
+//! Claude Code's `--mcp-config`, Codex's `-c mcp_servers.*`, and an ACP agent's `session/new`
+//! `mcpServers` (stdio, which every ACP agent takes, Antigravity's own server, `agy acp`, among
+//! them). Pi takes no MCP server. Antigravity's headless stream-json, which kiln ran it with before,
+//! read a server only from its own `mcp_config.json` in its person's volume, where kiln wrote one
+//! fixed entry (goal 65's probe, docs/research/s35-every-harness/agy-mcp): [`forget_bridge`] takes
+//! it out, as its session's own would start kiln's MCP a second time.
 
 use serde_json::{Value, json};
 
@@ -32,9 +33,6 @@ pub enum Config {
     Args(Vec<String>),
     /// An ACP agent's `session/new` `mcpServers` entry.
     Acp(Value),
-    /// The entry its own config file keeps under `mcpServers.kiln`, the same for every session
-    /// (Antigravity's `mcp_config.json`, put there by [`agy_config`]).
-    Shared(Value),
     /// It takes none, and why.
     Refused(&'static str),
 }
@@ -55,39 +53,24 @@ pub fn for_harness(kind: &Kind) -> Config {
             ])
         }
         Protocol::Acp(_) => Config::Acp(json!({"name": "kiln", "command": BRIDGE, "args": [], "env": []})),
-        Protocol::AgyStreamJson => Config::Shared(json!({"command": BRIDGE, "args": []})),
         Protocol::PiRpc => Config::Refused("Pi takes no MCP server"),
         Protocol::Terminal => Config::Refused("it runs as a terminal program, with no structured mode"),
     }
 }
 
-/// Antigravity's `mcp_config.json` (`config`, as its person's volume holds it; `Null` when it has
-/// none) with kiln's entry through the bridge as `mcpServers.kiln`, its other servers and settings
-/// kept: None when it holds that entry already, when a person turned kiln's off (`agy mcp disable
-/// kiln`, kept), or when it isn't a JSON object agy wrote (left as it is).
-pub fn agy_config(config: &Value) -> Option<Value> {
-    let Config::Shared(entry) = for_harness(Kind::get("antigravity")?) else { return None };
-    let mut out = match config {
-        Value::Null => json!({}),
-        Value::Object(_) => config.clone(),
-        _ => return None,
-    };
-    let servers = out.as_object_mut()?.entry("mcpServers").or_insert_with(|| json!({}));
-    let servers = servers.as_object_mut()?;
-    match servers.get("kiln") {
-        Some(s) if s.get("disabled").and_then(Value::as_bool) == Some(true) => return None,
-        Some(s) if s.get("command") == entry.get("command") && s.get("args") == entry.get("args") => return None,
-        _ => {}
-    }
-    servers.insert("kiln".to_owned(), entry);
-    Some(out)
+/// Antigravity's `mcp_config.json` (`config`, as its person's volume holds it) without the one fixed entry kiln wrote
+/// there for its headless stream-json (`mcpServers.kiln`, the lane's bridge with no arguments), its other servers and
+/// settings kept. Whether it had it.
+pub fn forget_bridge(config: &mut Value) -> bool {
+    let Some(servers) = config.get_mut("mcpServers").and_then(Value::as_object_mut) else { return false };
+    servers.get("kiln").is_some_and(|s| s.get("command").and_then(Value::as_str) == Some(BRIDGE) && s.get("args").is_none_or(|a| *a == json!([]))) && servers.remove("kiln").is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{BRIDGE, Config, agy_config, for_harness};
+    use super::{BRIDGE, Config, for_harness, forget_bridge};
     use crate::harness::kinds::Kind;
 
     fn kind(id: &str) -> anyhow::Result<&'static Kind> {
@@ -108,11 +91,10 @@ mod tests {
         let want = ["-c", "mcp_servers.kiln.command=\"/run/shards/mcp\"", "-c", "mcp_servers.kiln.args=[]", "-c"];
         anyhow::ensure!(args.get(..want.len()).is_some_and(|a| a.iter().zip(want).all(|(x, y)| x == y)), "{args:?}");
         anyhow::ensure!(args.last() == Some(&format!("mcp_servers.kiln.tool_timeout_sec={}", crate::reach::codex_tool_timeout_sec())), "{args:?}");
-        for acp in ["devin", "gemini", "opencode", "goose", "amp", "cursor"] {
+        for acp in ["devin", "gemini", "opencode", "goose", "amp", "cursor", "antigravity"] {
             let Config::Acp(s) = for_harness(kind(acp)?) else { anyhow::bail!("{acp}") };
             anyhow::ensure!(s == json!({"name": "kiln", "command": BRIDGE, "args": [], "env": []}), "{acp}: {s}");
         }
-        anyhow::ensure!(for_harness(kind("antigravity")?) == Config::Shared(json!({"command": BRIDGE, "args": []})));
         anyhow::ensure!(matches!(for_harness(kind("pi")?), Config::Refused(_)));
         for k in ["claude", "codex", "devin", "antigravity"] {
             let said = format!("{:?}", for_harness(kind(k)?));
@@ -121,18 +103,18 @@ mod tests {
         Ok(())
     }
 
-    /// agy's shared config gets kiln's entry once, with its other servers kept; one a person turned off
-    /// stays off, and a file agy didn't write is left alone.
+    /// The one fixed entry kiln wrote in agy's shared config for its headless stream-json goes, once, with its other
+    /// servers and settings kept; a server of the person's own named kiln, or a file that isn't agy's, is left alone.
     #[test]
-    fn step18_agys_shared_config_names_the_bridge_once() -> anyhow::Result<()> {
-        let fresh = agy_config(&Value::Null).ok_or_else(|| anyhow::anyhow!("none for no file"))?;
-        anyhow::ensure!(fresh == json!({"mcpServers": {"kiln": {"command": BRIDGE, "args": []}}}), "{fresh}");
-        anyhow::ensure!(agy_config(&fresh).is_none(), "written twice");
-        let theirs = json!({"mcpServers": {"github": {"command": "gh-mcp"}, "kiln": {"command": "/old/kiln", "args": ["reach", "mcp"]}}, "theme": "dark"});
-        let next = agy_config(&theirs).ok_or_else(|| anyhow::anyhow!("an old entry kept"))?;
-        anyhow::ensure!(next == json!({"mcpServers": {"github": {"command": "gh-mcp"}, "kiln": {"command": BRIDGE, "args": []}}, "theme": "dark"}), "{next}");
-        anyhow::ensure!(agy_config(&json!({"mcpServers": {"kiln": {"command": "/old/kiln", "disabled": true}}})).is_none(), "a person's off undone");
-        anyhow::ensure!(agy_config(&json!(["not", "agy's"])).is_none());
+    fn step18_agys_shared_config_forgets_the_bridge_kiln_wrote() -> anyhow::Result<()> {
+        let mut config = json!({"mcpServers": {"kiln": {"command": BRIDGE, "args": []}, "github": {"command": "gh-mcp"}}, "theme": "dark"});
+        anyhow::ensure!(forget_bridge(&mut config), "kept");
+        anyhow::ensure!(config == json!({"mcpServers": {"github": {"command": "gh-mcp"}}, "theme": "dark"}), "{config}");
+        anyhow::ensure!(!forget_bridge(&mut config), "twice");
+        let mut theirs = json!({"mcpServers": {"kiln": {"command": "/opt/their-kiln", "args": ["serve"]}}});
+        anyhow::ensure!(!forget_bridge(&mut theirs), "a person's own kiln server went");
+        let mut other: Value = json!(["not", "agy's"]);
+        anyhow::ensure!(!forget_bridge(&mut other));
         Ok(())
     }
 }

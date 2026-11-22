@@ -6,9 +6,7 @@
 use anyhow::{Context, anyhow, bail, ensure};
 use serde_json::Value;
 
-use crate::harness::antigravity;
 use crate::harness::kinds::{Kind, Protocol};
-use crate::harness::session::Spec;
 
 /// Where Google's updater sends each archive of a release: under `<version>-<execution id>/`.
 const STORAGE: &str = "https://storage.googleapis.com/antigravity-public/antigravity-cli/";
@@ -21,13 +19,13 @@ fn harness_json(b: &super::Builtin) -> anyhow::Result<&'static str> {
     b.files.iter().find(|(name, _)| *name == "harness.json").map(|(_, text)| *text).ok_or_else(|| anyhow!("{} carries no harness.json", b.name))
 }
 
-/// What kiln starts for Kind `antigravity` in `mode`, for a new session with no model or effort
-/// chosen: its program, then `antigravity::args`.
-fn kind_command(mode: &str) -> anyhow::Result<Vec<String>> {
+/// What kiln starts for Kind `antigravity`: its program, then what every launch of it begins with
+/// (`Kind::base_args`: its ACP server, `agy acp`). Its mode, model and effort go over ACP, so no
+/// session's choice changes it.
+fn kind_command() -> anyhow::Result<Vec<String>> {
     let kind = Kind::get("antigravity").ok_or_else(|| anyhow!("no Kind antigravity"))?;
-    ensure!(kind.protocol == Protocol::AgyStreamJson, "Kind antigravity doesn't speak agy's stream-json");
-    let spec = Spec { kind: kind.id.to_owned(), mode: Some(mode.to_owned()), ..Spec::default() };
-    Ok(std::iter::once(kind.program.to_owned()).chain(antigravity::args(&spec)).collect())
+    ensure!(kind.protocol == Protocol::Acp(&["acp"]), "Kind antigravity doesn't run agy's ACP server");
+    Ok(std::iter::once(kind.program.to_owned()).chain(kind.base_args()).collect())
 }
 
 /// agy's version form: three dot-separated numbers (1.5.6).
@@ -307,17 +305,17 @@ fn antigravity_pin_names_agy_for_both_platforms() -> anyhow::Result<()> {
 }
 
 #[test]
-fn antigravity_harness_file_runs_agy_in_ask_mode_with_its_home_in_the_volume() -> anyhow::Result<()> {
+fn antigravity_harness_file_runs_agys_acp_server_with_its_home_in_the_volume() -> anyhow::Result<()> {
     let b = agy()?;
     let pin = check_pin(b.pin)?;
     let harness = harness_json(b)?;
-    let command = kind_command(antigravity::ASK)?;
+    let command = kind_command()?;
     check_harness(harness, &pin, b.text, &command)?;
-    // What kiln starts in its default mode adds `--mode accept-edits`: harness.json's isn't that.
-    let default_mode = kind_command(antigravity::DEFAULT_MODE)?;
-    ensure!(default_mode != command && check_harness(harness, &pin, b.text, &default_mode).is_err(), "harness.json passed as the default mode's command too");
     let changes = [
-        ("\"stream-json\"]", "\"stream-json\", \"--mode\", \"accept-edits\"]"),
+        // agy's headless stream-json, which kiln ran it with before its ACP server.
+        ("[\"agy\", \"acp\"]", "[\"agy\", \"--input-format\", \"stream-json\", \"--output-format\", \"stream-json\"]"),
+        // A flag kiln doesn't start it with: what a person's choice would be is said over ACP.
+        ("\"acp\"]", "\"acp\", \"--dangerously-skip-permissions\"]"),
         ("\"HOME=/home/antigravity\"", "\"HOME=/tmp\""),
         ("\"HOME=/home/antigravity\"", "\"HOME=/home/antigravity/.gemini\""),
         ("\"AGY_CLI_DISABLE_AUTO_UPDATE=true\"", "\"AGY_CLI_DISABLE_AUTO_UPDATE=false\""),

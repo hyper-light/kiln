@@ -11,7 +11,7 @@ at one.
 |---|---|
 | `crates/kiln/tests/vm_harnesses.rs` | step 34's tests: `checks` (the acceptance's checks against samples), `stub` (the stand-in driven as a process), `host` (Claude Code's and Codex's interfaces driven through kiln on the host), `step34` (each in a microVM of its own) |
 | `crates/kiln/tests/vm_e2e/mod.rs` | the drive (start, steer, interrupt, stop, resume, through the API), the checks it feeds, `in_microvm` and `on_host`, which step 35's file builds on |
-| `crates/kiln/tests/fixtures/vm-stub/harness/stub` | the stand-in harness: Claude Code's stream-json, Codex's app-server, ACP, Antigravity's stream-json and Pi's RPC; no model |
+| `crates/kiln/tests/fixtures/vm-stub/harness/stub` | the stand-in harness: Claude Code's stream-json, Codex's app-server, ACP (Antigravity's `agy acp` among them) and Pi's RPC; no model |
 | `crates/kiln/tests/fixtures/vm-stub/harness/`, `vm_e2e::stub_agentfile` | the stand-in as a microVM image: its harness directory, and its Agentfile, its text alone, which the drive writes for each harness and keeps in kiln for the run |
 
 Step 35's own (`vm_e2e/step35.rs`, `vm_e2e/gaps.json`, `vm_e2e/mcp.rs`, `ui/e2e/vm-harnesses.spec.ts`)
@@ -325,7 +325,7 @@ Step 34's variables (above), and:
 They wait on (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be): step 1 (`agents_start`'s `image` and
 `resume`, on kiln main), step 3 (kiln's MCP from inside a microVM, over the agent-control link's
 `mcp` lane, Shards D254: goals 58's and 61's, read as step 34's drive reads it, by `mcp_round_trip`
-and `VM_E2E_LINKS`' `mcp` entry), step 4 (Antigravity's, one fixed entry in its shared config, over that lane), step 5 (a microVM conversation picked up again in one
+and `VM_E2E_LINKS`' `mcp` entry), step 4 (Antigravity's, at each session's `session/new` since kiln runs it as `agy acp`, over that lane), step 5 (a microVM conversation picked up again in one
 from the UI, on kiln main), and step 34's own (kiln plan steps 16, 17, 18 and 33 and the links' owners).
 
 #### Linux x86_64 (KVM: adacachy, or adacachy2 through kiln run)
