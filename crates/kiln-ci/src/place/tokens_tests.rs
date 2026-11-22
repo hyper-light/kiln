@@ -487,8 +487,8 @@ fn lb08_a_run_offered_at_once_wants_nothing_of_anyone() -> Result<(), String> {
     Ok(())
 }
 
-/// A runner that takes no new work (drained, on battery, its machine under strain) is cordoned in
-/// its kernel: each owner that hears tokens is told at once it holds none of its room; once it
+/// A runner that takes no new work (drained, on battery), or whose machine is under strain, is
+/// cordoned in its kernel: each owner that hears tokens is told at once it holds none of its room; once it
 /// takes work again, the room is no owner's run's, so the first watcher's, told to it alone.
 fn cordoned() -> Result<(), String> {
     let mut f = Fleet::new(&[("a", true), ("b", true)], 1, 4, true);

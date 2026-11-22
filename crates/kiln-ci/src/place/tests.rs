@@ -113,68 +113,50 @@ fn e5_a_quote_is_the_answer_a_probe_of_that_size_would_get_and_changes_nothing()
     a.check()
 }
 
-/// AUDIT L1: a runner whose machine is under strain (the gate guard's predicate, as its shell
-/// measured it when it decided) offers nothing new: a probe waits there saying why, its room is
-/// hinted as none, and once a measure shows the strain gone what fits is offered in that same
-/// input, nobody polling.
-#[test]
-fn l1_a_strained_runner_offers_nothing_until_a_measure_says_it_isnt() -> Result<(), String> {
-    let mut a = runner(machine(8, 16, 0, 0), false);
-    let mut out = Vec::new();
-    a.strain(Some("its tasks all stalled on memory and I/O 40% of the time".into()), 0, &mut out);
-    let said = probe(&mut a, O1, ask("r1", "cpus=2")?, None, 1);
-    assert!(offer(&said, "o1", "r1").is_none(), "{said:?}");
-    assert!(matches!(waiting(&said, "r1"), Some((Reason::Strained { why }, _)) if why.contains("40%")), "{said:?}");
-    assert_eq!(a.hint(), Resources::default());
-    a.check()?;
-    let mut out = Vec::new();
-    a.strain(None, 2, &mut out);
-    assert!(offer(&out, "o1", "r1").is_some(), "offered once it isn't strained: {out:?}");
-    a.check()
-}
-
-/// An agent session's start, as kiln's server asks one (`harness::lineage::place_agents`).
-fn session(run: &str, spelling: &str) -> Result<Ask, String> {
-    Ok(Ask { class: crate::sched::state::Class::Interactive, key: Some("session:claude".into()), ..ask(run, spelling)? })
-}
-
-/// AUDIT L1 and Ada's word (2026-11-21: kiln never keeps a person from starting a session): a
-/// strained runner holds back what can wait, never an agent session's start. One that fits is
-/// offered as it comes, past the work the strain holds back, its room said as none (as its hint
-/// says it) so that its owner takes a runner free of strain where one offered; one short of room
+/// AUDIT L1 and Ada's word (2026-11-21: commands and CI jobs aren't held, kiln's balancer places
+/// them): a runner whose machine is under strain (the gate guard's predicate, as its shell measured
+/// it when it decided) holds nothing back. What fits is offered as it comes, a command and an agent
+/// session's start alike, each offer saying its room is none, as its hint and its kernel's words
+/// do, so that its owner takes a runner free of strain where one offered; what's short of room
 /// waits for room alone, and is offered once room frees, the strain still standing. Draining holds
-/// it as ever.
+/// what comes as ever.
 #[test]
-fn l1_a_strained_runner_still_offers_an_agent_sessions_start() -> Result<(), String> {
+fn l1_a_strained_runner_holds_nothing_and_says_its_room_is_none() -> Result<(), String> {
     let mut a = runner(machine(8, 16, 0, 0), false);
     let mut out = Vec::new();
     a.strain(Some("its tasks all stalled on memory and I/O 40% of the time".into()), 0, &mut out);
-    let said = probe(&mut a, O1, ask("cmd", "cpus=2")?, None, 1);
-    assert!(matches!(waiting(&said, "cmd"), Some((Reason::Strained { .. }, _))), "a command waits the strain out: {said:?}");
-    let said = probe(&mut a, O1, session("s1", "")?, None, 2);
-    assert!(offer(&said, "o1", "s1").is_some(), "a session's start goes under strain: {said:?}");
-    assert!(said.iter().any(|(_, m)| matches!(m, ToOwner::Offer { run, free, .. } if run == "s1" && *free == Resources::default())), "its room said as none: {said:?}");
+    assert_eq!(a.hint(), Resources::default());
+    assert_eq!(a.taking(), Ok(()));
+    let session = Ask { class: crate::sched::state::Class::Interactive, key: Some("session:claude".into()), ..ask("s1", "")? };
+    for (run, asked) in [("cmd", ask("cmd", "cpus=2")?), ("s1", session)] {
+        let said = probe(&mut a, O1, asked, None, 1);
+        assert!(offer(&said, "o1", run).is_some(), "{run} goes under strain: {said:?}");
+        assert!(said.iter().any(|(_, m)| matches!(m, ToOwner::Offer { run: r, free, .. } if r == run && *free == Resources::default())), "{run}: its room said as none: {said:?}");
+    }
     a.check()?;
     // One that takes most of the runner starts; the next, short of room, waits for room, not for the strain.
-    let said = probe(&mut a, O2, session("s2", "cpus=6")?, None, 3);
-    let f2 = offer(&said, "o2", "s2").ok_or(format!("s2: {said:?}"))?;
-    run_it(&mut a, O2, "s2", f2, 3)?;
-    let said = probe(&mut a, O3, session("s3", "cpus=4")?, None, 4);
-    assert!(matches!(waiting(&said, "s3"), Some((Reason::Room { .. }, _))), "{said:?}");
+    let said = probe(&mut a, O2, ask("big", "cpus=5")?, None, 2);
+    let f = offer(&said, "o2", "big").ok_or(format!("big: {said:?}"))?;
+    run_it(&mut a, O2, "big", f, 2)?;
+    let said = probe(&mut a, O3, ask("next", "cpus=4")?, None, 3);
+    assert!(matches!(waiting(&said, "next"), Some((Reason::Room { .. }, _))), "{said:?}");
     a.check()?;
-    let said = ended(&mut a, O2, "s2", 5);
-    assert!(offer(&said, "o3", "s3").is_some(), "offered as room frees, strained still: {said:?}");
-    assert!(offer(&said, "o1", "cmd").is_none(), "{said:?}");
+    let said = ended(&mut a, O2, "big", 4);
+    assert!(offer(&said, "o3", "next").is_some(), "offered as room frees, strained still: {said:?}");
     a.check()?;
-    // Draining, it takes no session's start either.
+    // Draining, it takes nothing new.
     let mut out = Vec::new();
-    a.drain(true, 6, &mut out);
-    let said = probe(&mut a, O1, session("s4", "")?, None, 7);
-    assert!(matches!(waiting(&said, "s4"), Some((Reason::Draining, _))), "{said:?}");
+    a.drain(true, 5, &mut out);
+    let said = probe(&mut a, O1, ask("late", "")?, None, 6);
+    assert!(matches!(waiting(&said, "late"), Some((Reason::Draining, _))), "{said:?}");
     a.check()?;
     let mut out = Vec::new();
-    a.drain(false, 8, &mut out);
-    assert!(offer(&out, "o1", "s4").is_some(), "{out:?}");
+    a.drain(false, 7, &mut out);
+    assert!(offer(&out, "o1", "late").is_some(), "{out:?}");
+    a.check()?;
+    let mut out = Vec::new();
+    a.strain(None, 8, &mut out);
+    assert!(!a.hint().cpu.is_zero(), "its room said again once it isn't strained: {:?}", a.hint());
     a.check()
 }
 

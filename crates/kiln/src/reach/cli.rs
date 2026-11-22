@@ -36,7 +36,7 @@ pub struct RunArgs {
     /// `tool:cargo`, `cpus>=16`) and the room it asks for, idle and free there now (`cpus=8`,
     /// `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it). kiln's load balancer places
     /// it on the runner that has it with the most room for it at its measured speed, back where that
-    /// kind of work last went well, never one under strain. Default: the best of all. The command
+    /// kind of work last went well, one under strain only when no other has room. Default: the best of all. The command
     /// finds them in KILN_NEEDS (`ci/gate.sh` holds itself to them).
     #[arg(long, default_value = "")]
     pub needs: String,

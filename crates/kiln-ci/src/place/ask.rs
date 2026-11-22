@@ -72,15 +72,6 @@ pub struct Ask {
     pub asker: Option<String>,
 }
 
-impl Ask {
-    /// Whether it's an agent session's start (its key `session:<harness>`, as kiln's server asks
-    /// one): its machine's strain never holds it back (Ada, 2026-11-21: kiln never keeps a person
-    /// from starting a session).
-    pub fn session(&self) -> bool {
-        self.key.as_deref().is_some_and(|k| k.starts_with("session:"))
-    }
-}
-
 fn is_zero(p: &u8) -> bool {
     *p == 0
 }
