@@ -4888,25 +4888,27 @@ mod tests {
     #[test]
     fn g9_s3_a_change_said_during_a_round_wakes_the_next_and_is_in_it() -> anyhow::Result<()> {
         use futures::FutureExt as _;
-        let store = crate::store::Store::in_memory_inline()?;
-        let changes = store.changes();
-        changes.say("a");
-        let (said, at) = changes.take_said();
-        anyhow::ensure!(!said.all && said.keys.len() == 1 && said.keys.contains("a"), "the round didn't take what was said: {said:?}");
-        anyhow::ensure!(changes.said_after(at).now_or_never().is_none(), "a wait past the take was over with nothing said since");
-        // A change lands during the round.
-        changes.say("b");
-        anyhow::ensure!(changes.said_after(at).now_or_never().is_some(), "a say after the take didn't wake the next round");
-        let (said, at) = changes.take_said();
-        anyhow::ensure!(!said.all && said.keys.len() == 1 && said.keys.contains("b"), "the next round didn't take what was said during the last: {said:?}");
-        changes.say_all();
-        changes.say("c");
-        let (said, _) = changes.take_said();
-        anyhow::ensure!(said.all && said.keys.is_empty(), "every stack said, keys were kept: {said:?}");
-        anyhow::ensure!(changes.said_after(at).now_or_never().is_some(), "the says after a take didn't wake the next round");
-        let (said, _) = changes.take_said();
-        anyhow::ensure!(!said.all && said.keys.is_empty(), "taken twice: {said:?}");
-        Ok(())
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory_inline()?;
+            let changes = store.changes();
+            changes.say("a");
+            let (said, at) = changes.take_said();
+            anyhow::ensure!(!said.all && said.keys.len() == 1 && said.keys.contains("a"), "the round didn't take what was said: {said:?}");
+            anyhow::ensure!(changes.said_after(at).now_or_never().is_none(), "a wait past the take was over with nothing said since");
+            // A change lands during the round.
+            changes.say("b");
+            anyhow::ensure!(changes.said_after(at).now_or_never().is_some(), "a say after the take didn't wake the next round");
+            let (said, at) = changes.take_said();
+            anyhow::ensure!(!said.all && said.keys.len() == 1 && said.keys.contains("b"), "the next round didn't take what was said during the last: {said:?}");
+            changes.say_all();
+            changes.say("c");
+            let (said, _) = changes.take_said();
+            anyhow::ensure!(said.all && said.keys.is_empty(), "every stack said, keys were kept: {said:?}");
+            anyhow::ensure!(changes.said_after(at).now_or_never().is_some(), "the says after a take didn't wake the next round");
+            let (said, _) = changes.take_said();
+            anyhow::ensure!(!said.all && said.keys.is_empty(), "taken twice: {said:?}");
+            Ok(())
+        })
     }
 
     /// G9 step 3 (goal a2a44298, T-T1.5.1): with the driver stepping the stacks said changed ([`Steps::Stacks`]), a
