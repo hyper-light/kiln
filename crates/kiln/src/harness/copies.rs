@@ -8738,12 +8738,12 @@ mod tests {
 
     /// G9 step 3 (goal a2a44298, T-T1.5.1): who's whose child ([`Kin`]) is what a scan of every session says, and each
     /// parent's children read through it ([`Copies::children`]) are a scan's, in its order, after sessions made, closed and
-    /// given other parents (or none) in random orders, spread over several owners.
+    /// given other parents (or none) in random orders, spread over the runtime's owners.
     #[test]
     fn g9_s3_who_s_whose_child_matches_a_scan_after_random_registers_unregisters_and_reparents() -> anyhow::Result<()> {
         use std::collections::BTreeMap;
         crate::rt::block_on(async {
-            let copies = Arc::new(Copies::start_with(sim_bus(), 4, 64 * MSG));
+            let copies = Arc::new(Copies::start_with(sim_bus(), crate::rt::shard_count().max(1), 64 * MSG));
             // splitmix64: the test's own random numbers, by seed, so a failing seed runs again the same.
             let next = |x: &mut u64| {
                 *x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);

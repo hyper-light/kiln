@@ -3243,12 +3243,12 @@ where
     /// Session `id`'s weekly usage, its percent, as [`Driver::near`] finds it: what its program's usage rule reads of each
     /// member (`crate::programs::rule_by`).
     fn weekly_pct(&self, near: &Near, id: &str) -> Option<f64> {
-        let pct = |i: &Info| crate::programs::weekly(&i.limits).map(|u| u.pct);
-        match (&near.listed, self.hub) {
-            (Some(all), _) => all.iter().find(|i| i.id == id).and_then(|i| pct(i)),
-            (None, Some(hub)) => hub.harness.info_shared(id).and_then(|i| pct(&i)),
+        let found: Option<Arc<Info>> = match (&near.listed, self.hub) {
+            (Some(all), _) => all.iter().find(|i| i.id == id).cloned(),
+            (None, Some(hub)) => hub.harness.info_shared(id),
             (None, None) => None,
-        }
+        };
+        found.and_then(|i| crate::programs::weekly(&i.limits)).map(|u| u.pct)
     }
 }
 
