@@ -365,8 +365,8 @@ mod tests {
             let refused = asked.open(&path).err().ok_or_else(|| anyhow::anyhow!("{asked} opened {made}'s store"))?;
             let other = refused.downcast_ref::<OtherEngine>().ok_or_else(|| anyhow::anyhow!("{asked} refused {made}'s store untyped: {refused:#}"))?;
             anyhow::ensure!((other.made_by, other.asked) == (made, asked), "{other}");
-            let said = other.to_string();
-            anyhow::ensure!(said.contains(&format!("{ENGINE_VAR}={made}")), "it doesn't say how to go on: {said}");
+            let told = other.to_string();
+            anyhow::ensure!(told.contains(&format!("{ENGINE_VAR}={made}")), "it doesn't say how to go on: {told}");
             let (st, aside) = open_or_set_aside_on(asked, dir.path(), FILE, store::Upkeep::default());
             anyhow::ensure!(st.is_none() && aside.is_none(), "{asked} on {made}'s store: a store {}, set aside at {aside:?}", st.is_some());
             anyhow::ensure!(path.exists() && !beside(&path, SET_ASIDE).exists(), "{made}'s store moved");
