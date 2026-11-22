@@ -427,15 +427,118 @@ enum ReadMsg {
     Stop(mpsc::Sender<()>),
 }
 
-/// The reader thread: what's asked of the reader beside the writer, in turn.
-fn read_on(mut reader: Box<dyn Read + Send>, rx: &mpsc::Receiver<ReadMsg>) {
+/// A reader thread: what's asked of its reader beside the writer, in turn, `waiting` counting what it was sent and
+/// hasn't finished.
+fn read_on(mut reader: Box<dyn Read + Send>, rx: &mpsc::Receiver<ReadMsg>, waiting: &AtomicUsize) {
     while let Ok(msg) = rx.recv() {
         match msg {
-            ReadMsg::Run(job) => job(&mut *reader),
+            ReadMsg::Run(job) => {
+                job(&mut *reader);
+                waiting.fetch_sub(1, Ordering::Relaxed);
+            }
             ReadMsg::Use(next) => reader = next,
             ReadMsg::Stop(done) => {
                 drop(reader);
                 let _ = done.send(());
+                return;
+            }
+        }
+    }
+}
+
+/// CP-T1.1 A/B (lane vendor-amphora-11): how many readers read beside the writer, each a connection and thread of its
+/// own. One is the control; the other a reader a core, for followers by the thousand that would otherwise queue behind
+/// one another on one thread. The load scenario's ladder measures both (feed lag, feed and append latency).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readers {
+    /// The control: one reader thread, every read in turn.
+    One,
+    /// A reader for each core the host says it has (`std::thread::available_parallelism`), each read sent to the one
+    /// with the fewest reads waiting.
+    Cores,
+}
+
+/// Which [`Readers`] a store starts with: `one` (the control, and unset) or `cores`.
+pub const READERS_VAR: &str = "KILN_CONVO_READERS";
+
+impl Readers {
+    /// As [`READERS_VAR`] says: unset, the control; anything but `one` or `cores` refused by name.
+    pub fn configured() -> anyhow::Result<Self> {
+        match std::env::var(READERS_VAR) {
+            Err(std::env::VarError::NotPresent) => Ok(Self::One),
+            Err(e) => Err(anyhow::anyhow!("{READERS_VAR}: {e}")),
+            Ok(v) => Self::named(&v),
+        }
+    }
+
+    /// By its name in [`READERS_VAR`].
+    pub fn named(v: &str) -> anyhow::Result<Self> {
+        match v.trim() {
+            "one" => Ok(Self::One),
+            "cores" => Ok(Self::Cores),
+            other => anyhow::bail!("{READERS_VAR} is `{other}`: it takes `one` or `cores`"),
+        }
+    }
+
+    /// The reader threads it starts: the host's cores as it reports them, one where it can't say.
+    pub fn count(self) -> usize {
+        match self {
+            Self::One => 1,
+            Self::Cores => std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        }
+    }
+}
+
+/// The reader threads beside the writer ([`Store::read`]): each its own connection and queue, a read sent to the one
+/// with the fewest waiting (none picked by turn, so one slow read holds up only what's behind it on that thread).
+struct Pool {
+    readers: Vec<(mpsc::Sender<ReadMsg>, Arc<AtomicUsize>)>,
+}
+
+impl Pool {
+    /// `readers` of the engine's file beside its writer; None where it has none (Windows, or none could connect).
+    fn start(engine: &dyn Engine, readers: Readers) -> anyhow::Result<Option<Self>> {
+        let n = readers.count();
+        let mut pool = Vec::with_capacity(n);
+        for _ in 0..n {
+            let Some(reader) = engine.reader() else { break };
+            let (tx, rx) = mpsc::channel::<ReadMsg>();
+            let waiting = Arc::new(AtomicUsize::new(0));
+            let w = Arc::clone(&waiting);
+            std::thread::Builder::new().name("kiln-convo-read".into()).spawn(move || read_on(reader, &rx, &w))?;
+            pool.push((tx, waiting));
+        }
+        Ok((!pool.is_empty()).then_some(Self { readers: pool }))
+    }
+
+    /// `job` to the reader with the fewest reads waiting; given back if that reader has stopped.
+    fn run(&self, job: ReadJob) -> Result<(), ReadMsg> {
+        let Some((tx, waiting)) = self.readers.iter().min_by_key(|(_, w)| w.load(Ordering::Relaxed)) else { return Err(ReadMsg::Run(job)) };
+        waiting.fetch_add(1, Ordering::Relaxed);
+        tx.send(ReadMsg::Run(job)).map_err(|mpsc::SendError(msg)| {
+            waiting.fetch_sub(1, Ordering::Relaxed);
+            msg
+        })
+    }
+
+    /// Every reader reads the engine's file anew (a compaction's copy took the old one's place), one it can't connect
+    /// reading on as before.
+    fn renew(&self, engine: &dyn Engine) {
+        for (tx, _) in &self.readers {
+            if let Some(reader) = engine.reader() {
+                let _ = tx.send(ReadMsg::Use(reader));
+            }
+        }
+    }
+
+    /// Every reader lets go of the file and stops, each told at once and all waited for within one `READ_WAIT`.
+    fn stop(&self) {
+        let (done, stopped) = mpsc::channel();
+        let told = self.readers.iter().filter(|(tx, _)| tx.send(ReadMsg::Stop(done.clone())).is_ok()).count();
+        drop(done);
+        let until = Instant::now() + READ_WAIT;
+        for _ in 0..told {
+            if stopped.recv_timeout(until.saturating_duration_since(Instant::now())).is_err() {
                 return;
             }
         }
@@ -585,13 +688,19 @@ pub struct Store {
     watchers: Watchers,
     /// Sessions that ended at or after this (unix ms) keep their records ([`Store::hold_prune`]).
     hold: Arc<AtomicI64>,
-    /// The reader thread beside the writer, where the engine has a reader ([`Store::read`]).
-    reads: Option<mpsc::Sender<ReadMsg>>,
+    /// The reader threads beside the writer, where the engine has a reader ([`Store::read`], [`Readers`]).
+    reads: Option<Arc<Pool>>,
 }
 
 impl Store {
-    /// The store, its writer thread started on `engine`, looking after its file as `upkeep` says.
-    pub fn start(mut engine: Box<dyn Engine>, upkeep: Upkeep) -> anyhow::Result<Self> {
+    /// The store, its writer thread started on `engine`, looking after its file as `upkeep` says, its readers as
+    /// [`READERS_VAR`] says.
+    pub fn start(engine: Box<dyn Engine>, upkeep: Upkeep) -> anyhow::Result<Self> {
+        Self::start_with(engine, upkeep, Readers::configured()?)
+    }
+
+    /// As [`Store::start`], with `readers` reading beside the writer.
+    pub fn start_with(mut engine: Box<dyn Engine>, upkeep: Upkeep, readers: Readers) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel::<Msg>();
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
@@ -599,14 +708,7 @@ impl Store {
         let hold = Arc::new(AtomicI64::new(i64::MAX));
         let queue: Arc<Queue> = Arc::default();
         queue.top.store(engine.top(), Ordering::Release);
-        let reads = match engine.reader() {
-            Some(reader) => {
-                let (rtx, rrx) = mpsc::channel::<ReadMsg>();
-                std::thread::Builder::new().name("kiln-convo-read".into()).spawn(move || read_on(reader, &rrx))?;
-                Some(rtx)
-            }
-            None => None,
-        };
+        let reads = Pool::start(&*engine, readers)?.map(Arc::new);
         let (w, m, h, q, r) = (watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue), reads.clone());
         std::thread::Builder::new().name("kiln-convo".into()).spawn(move || {
             writer(engine, &rx, &w, upkeep, &m, &h, &q, r.as_ref());
@@ -871,7 +973,7 @@ impl Store {
             let _ = rtx.send(f(r));
         });
         let back = match &self.reads {
-            Some(reads) => reads.send(ReadMsg::Run(job)).err().map(|mpsc::SendError(msg)| msg),
+            Some(reads) => reads.run(job).err(),
             None => Some(ReadMsg::Run(job)),
         };
         if let Some(ReadMsg::Run(job)) = back {
@@ -1123,7 +1225,7 @@ impl Store {
 /// everything sent before it. Rows waited up to `COMMIT_MS` (50 ms) for others to share their commit, or for
 /// `COMMIT_ROWS` (2048) of them.
 #[allow(clippy::too_many_arguments)]
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue, reads: Option<&mpsc::Sender<ReadMsg>>) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue, reads: Option<&Arc<Pool>>) {
     let keep_closed = upkeep.keep_closed;
     // The hold on letting records go as it last looked: one moved later lets more go, so it looks
     // again.
@@ -1247,10 +1349,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             // Its files closed before it says so, its reader's first: whoever moves them next finds them
                             // let go of.
                             if let Some(reads) = reads {
-                                let (done, stopped) = mpsc::channel();
-                                if reads.send(ReadMsg::Stop(done)).is_ok() {
-                                    let _ = stopped.recv_timeout(READ_WAIT);
-                                }
+                                reads.stop();
                             }
                             let released = engine.release();
                             drop(engine);
@@ -1279,9 +1378,9 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                         Ok((e, Compacting::Going)) => e,
                         Ok((e, done)) => {
                             if let Compacting::Done { before, after } = done {
-                                // The file is the compact copy now: its reader reads that one.
-                                if let (Some(reads), Some(reader)) = (reads, e.reader()) {
-                                    let _ = reads.send(ReadMsg::Use(reader));
+                                // The file is the compact copy now: its readers read that one.
+                                if let Some(reads) = reads {
+                                    reads.renew(&*e);
                                 }
                                 tracing::info!(before, after, "conversation store: its file was made compact");
                                 let ms = u64::try_from(compact_began.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1743,6 +1842,56 @@ mod tests {
             c.close().map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
         }
         Ok(())
+    }
+
+    /// CP-T1.1 A/B (lane vendor-amphora-11): a store with a reader a core starts one for each core the host reports,
+    /// and a read held on one of them holds up no other: the history asked meanwhile answers, on another reader, with
+    /// what was committed. With one reader (the control) it would wait behind the held one.
+    #[test]
+    #[cfg_attr(windows, ignore = "Windows has no reader beside the writer: a compaction's swap can't rename over an open file")]
+    fn cp_t1_1_a_read_held_on_one_reader_of_the_pool_holds_up_no_other() -> anyhow::Result<()> {
+        use kiln_seams::conversations::{Conversations, Entry};
+        let cores = Readers::Cores.count();
+        let dir = tempfile::tempdir()?;
+        let store = Store::start_with(super::super::Kind::Turso.open(&dir.path().join(super::super::FILE))?, Upkeep::default(), Readers::Cores)?;
+        let started = store.reads.as_ref().map_or(0, |p| p.readers.len());
+        anyhow::ensure!(started == cores, "{started} readers started for {cores} cores");
+        if cores < 2 {
+            // One core: the pool is the control's single reader, and there is no other to read on.
+            return store.close();
+        }
+        let c = super::super::seam::StoreConversations::new(store.clone());
+        let first = Entry { conversation: "a".into(), id: "m1".into(), seq: 1, text: "committed".into() };
+        c.append(std::slice::from_ref(&first)).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let holder = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store.read(move |_| {
+                    let _ = held_tx.send(());
+                    let _ = go_rx.recv();
+                    Ok(())
+                })
+            })
+        };
+        held_rx.recv()?;
+        let history = c.history("a", None, 10);
+        let _ = go_tx.send(());
+        let _ = holder.join();
+        let history = history.map_err(|e| anyhow::anyhow!("the history with a reader held: {e}"))?;
+        anyhow::ensure!(history == vec![first], "the history with a reader held: {history:?}");
+        c.close().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// CP-T1.1 A/B: the readers' switch by name, the control unset; anything else refused, naming what it takes.
+    #[test]
+    fn cp_t1_1_the_readers_switch_takes_one_or_cores() {
+        assert_eq!(Readers::named("one").ok(), Some(Readers::One));
+        assert_eq!(Readers::named(" cores ").ok(), Some(Readers::Cores));
+        let refused = Readers::named("many").err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(refused.contains("`one` or `cores`"), "{refused}");
+        assert_eq!(Readers::One.count(), 1);
     }
 
     /// consts-audit B3 (goal 9, plan 01a1a87b2cec step 5): the docs say the store's commit as its writer makes it.

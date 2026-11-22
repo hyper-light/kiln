@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kiln_seams::conversations::{Changed, Conversations, Entry, Error, Page};
 use parking_lot::Mutex;
@@ -14,21 +14,130 @@ use super::store::{Refusal, Store};
 use crate::harness::core::Update;
 use crate::harness::model::{Body, Event};
 
+/// CP-T1.1 A/B (lane vendor-amphora-11): how an append knows a conversation's session row is written (a session's
+/// row goes before its first event, as kiln's harness writes it). The load scenario's ladder measures both: append
+/// latency and the memory held a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opened {
+    /// The control: a set in memory of the conversations this handle gave their row, let go of as it closes: an entry
+    /// a conversation it appended to, for the handle's life.
+    Set,
+    /// The store asked, beside its writer, whether the row is there, once for each conversation of each append:
+    /// nothing held a conversation, a read more an append.
+    Ask,
+}
+
+/// Which [`Opened`] a handle keeps: `set` (the control, and unset) or `ask`.
+pub const OPENED_VAR: &str = "KILN_CONVO_OPENED";
+
+impl Opened {
+    /// As [`OPENED_VAR`] says: unset, the control; anything but `set` or `ask` refused by name.
+    pub fn configured() -> anyhow::Result<Self> {
+        match std::env::var(OPENED_VAR) {
+            Err(std::env::VarError::NotPresent) => Ok(Self::Set),
+            Err(e) => Err(anyhow::anyhow!("{OPENED_VAR}: {e}")),
+            Ok(v) => Self::named(&v),
+        }
+    }
+
+    /// By its name in [`OPENED_VAR`].
+    pub fn named(v: &str) -> anyhow::Result<Self> {
+        match v.trim() {
+            "set" => Ok(Self::Set),
+            "ask" => Ok(Self::Ask),
+            other => anyhow::bail!("{OPENED_VAR} is `{other}`: it takes `set` or `ask`"),
+        }
+    }
+}
+
+/// [`Opened::Set`]'s conversations, and the bytes their names take.
+#[derive(Default)]
+struct OpenedSet {
+    set: HashSet<String>,
+    name_bytes: usize,
+}
+
+impl OpenedSet {
+    /// What it holds, at least: a name and a control byte for each entry its table has room for (std's hash table's
+    /// layout) and the names' own bytes.
+    fn bytes(&self) -> usize {
+        self.set.capacity().saturating_mul(std::mem::size_of::<String>().saturating_add(1)).saturating_add(self.name_bytes)
+    }
+
+    fn insert(&mut self, name: &str) -> bool {
+        if self.set.contains(name) {
+            return false;
+        }
+        self.name_bytes = self.name_bytes.saturating_add(name.len());
+        self.set.insert(name.to_owned())
+    }
+
+    fn remove(&mut self, name: &str) {
+        if self.set.remove(name) {
+            self.name_bytes = self.name_bytes.saturating_sub(name.len());
+        }
+    }
+
+    fn clear(&mut self) {
+        self.set = HashSet::new();
+        self.name_bytes = 0;
+    }
+}
+
 /// A [`Store`] as the seam's Conversations: an entry is an assistant's event of its session.
 pub struct StoreConversations {
     store: Store,
-    /// Sessions given their row: a session's row goes before its first event, as kiln's harness writes it. One entry
-    /// a conversation this handle appended to, let go of as the handle closes (seam review 8); within a handle's
-    /// life it grows with the conversations it writes, as the store's own sessions do (see the lane's report).
-    opened: Mutex<HashSet<String>>,
+    /// How an append knows a session's row is written ([`Opened`]).
+    by: Opened,
+    /// [`Opened::Set`]'s sessions given their row, let go of as the handle closes (seam review 8).
+    opened: Mutex<OpenedSet>,
+    /// The most bytes `opened` held, for the load scenario's memory a conversation; shared by the handles a fixture
+    /// opens.
+    held_most: Arc<AtomicUsize>,
     closed: AtomicBool,
     /// Told as the handle is let go of: a wait under way hears it and is refused Closed ([`Conversations::wait`]).
     closing: crate::rt::Shutdown,
 }
 
 impl StoreConversations {
+    /// A handle keeping what [`OPENED_VAR`] says (the control where it can't be read: it's said).
     pub fn new(store: Store) -> Self {
-        Self { store, opened: Mutex::new(HashSet::new()), closed: AtomicBool::new(false), closing: crate::rt::Shutdown::new() }
+        let by = Opened::configured().unwrap_or_else(|e| {
+            tracing::warn!(error = %format!("{e:#}"), "the conversation seam keeps its opened sessions in memory, the control");
+            Opened::Set
+        });
+        Self::with(store, by, Arc::default())
+    }
+
+    /// A handle keeping `by`, the most its set held told to `held_most`.
+    pub fn with(store: Store, by: Opened, held_most: Arc<AtomicUsize>) -> Self {
+        Self { store, by, opened: Mutex::new(OpenedSet::default()), held_most, closed: AtomicBool::new(false), closing: crate::rt::Shutdown::new() }
+    }
+
+    /// The conversations of `entries` this append gives their row: for [`Opened::Set`], those not in its set (put in
+    /// it now); for [`Opened::Ask`], those whose row the store says isn't there, at its last commit.
+    fn unopened(&self, entries: &[Entry]) -> Result<HashSet<String>, Error> {
+        let mut new = HashSet::new();
+        match self.by {
+            Opened::Set => {
+                let mut opened = self.opened.lock();
+                for e in entries {
+                    if opened.insert(&e.conversation) {
+                        new.insert(e.conversation.clone());
+                    }
+                }
+                self.held_most.fetch_max(opened.bytes(), Ordering::Relaxed);
+            }
+            Opened::Ask => {
+                let mut asked = HashSet::new();
+                for e in entries {
+                    if asked.insert(e.conversation.as_str()) && self.store.restorable_committed(&e.conversation, 0).map_err(|x| self.failed(x))?.is_none() {
+                        new.insert(e.conversation.clone());
+                    }
+                }
+            }
+        }
+        Ok(new)
     }
 
     fn live(&self) -> Result<(), Error> {
@@ -62,25 +171,25 @@ impl Conversations for StoreConversations {
     fn append(&self, entries: &[Entry]) -> Result<(), Error> {
         self.live()?;
         let now = crate::util::now_ms();
-        let mut out = Vec::with_capacity(entries.len().saturating_add(1));
         // Sessions given their row by this append: theirs to give again if it isn't written.
-        let mut new = Vec::new();
-        {
-            let mut opened = self.opened.lock();
-            for e in entries {
-                if opened.insert(e.conversation.clone()) {
-                    new.push(e.conversation.clone());
-                    out.push(Row::Session { session: e.conversation.clone(), info: None, meta: None, state: None, changes: None, epoch: None, open: true, at: now });
-                }
-                let event = Event { id: e.id.clone(), seq: e.seq, at: i64::try_from(e.seq).unwrap_or(i64::MAX), parent: None, by: None, body: Body::Assistant { text: e.text.clone(), streaming: false } };
-                out.extend(rows::of(&e.conversation, &Update::Events { events: vec![event] }, now));
+        let new = self.unopened(entries)?;
+        let mut out = Vec::with_capacity(entries.len().saturating_add(new.len()));
+        let mut given = HashSet::new();
+        for e in entries {
+            // Its row before its first event.
+            if new.contains(&e.conversation) && given.insert(e.conversation.as_str()) {
+                out.push(Row::Session { session: e.conversation.clone(), info: None, meta: None, state: None, changes: None, epoch: None, open: true, at: now });
             }
+            let event = Event { id: e.id.clone(), seq: e.seq, at: i64::try_from(e.seq).unwrap_or(i64::MAX), parent: None, by: None, body: Body::Assistant { text: e.text.clone(), streaming: false } };
+            out.extend(rows::of(&e.conversation, &Update::Events { events: vec![event] }, now));
         }
         // Ok only once the commit these rows went in was written: the writer's own outcome (CP-T1.1).
         self.store.put_committed(out).map_err(|e| {
-            let mut opened = self.opened.lock();
-            for s in &new {
-                opened.remove(s);
+            if self.by == Opened::Set {
+                let mut opened = self.opened.lock();
+                for s in &new {
+                    opened.remove(s);
+                }
             }
             self.failed(e)
         })
@@ -156,12 +265,23 @@ pub struct Fixture {
     pub dir: Option<tempfile::TempDir>,
     /// While set, the engine's writes fail (CONVO-7): its engine is wrapped in a [`super::store::FailsWrites`].
     pub failing: Arc<AtomicBool>,
+    /// The A/B arms its handles and stores run ([`Opened`], [`super::store::Readers`]), or why they couldn't be read.
+    pub arms: Result<(Opened, super::store::Readers), String>,
+    /// The most bytes [`Opened::Set`]'s set held in any handle it opened.
+    pub held_most: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
 impl Fixture {
+    /// On the arms [`OPENED_VAR`] and [`super::store::READERS_VAR`] say (the controls, unset).
     pub fn new(kind: super::Kind, dir: Option<tempfile::TempDir>) -> Self {
-        Self { kind, dir, failing: Arc::new(AtomicBool::new(false)) }
+        let arms = Opened::configured().and_then(|o| super::store::Readers::configured().map(|r| (o, r))).map_err(|e| format!("{e:#}"));
+        Self { kind, dir, failing: Arc::new(AtomicBool::new(false)), arms, held_most: Arc::default() }
+    }
+
+    /// On the arms given.
+    pub fn arm(kind: super::Kind, dir: Option<tempfile::TempDir>, opened: Opened, readers: super::store::Readers) -> Self {
+        Self { arms: Ok((opened, readers)), ..Self::new(kind, dir) }
     }
 }
 
@@ -169,10 +289,11 @@ impl Fixture {
 impl kiln_seams::conversations::ConversationsFixture for Fixture {
     fn open(&self) -> Result<Arc<dyn Conversations>, String> {
         let dir = self.dir.as_ref().ok_or_else(|| "no folder for the store".to_owned())?;
+        let (opened, readers) = self.arms.clone()?;
         let inner = self.kind.open(&dir.path().join(super::FILE)).map_err(|e| format!("{e:#}"))?;
         let engine = Box::new(super::store::FailsWrites { inner, failing: Arc::clone(&self.failing) });
-        let store = Store::start(engine, super::store::Upkeep::default()).map_err(|e| format!("{e:#}"))?;
-        Ok(Arc::new(StoreConversations::new(store)))
+        let store = Store::start_with(engine, super::store::Upkeep::default(), readers).map_err(|e| format!("{e:#}"))?;
+        Ok(Arc::new(StoreConversations::with(store, opened, Arc::clone(&self.held_most))))
     }
 
     fn fail_writes(&self, failing: bool) {
@@ -182,6 +303,7 @@ impl kiln_seams::conversations::ConversationsFixture for Fixture {
 
 #[cfg(test)]
 mod tests {
+    use super::super::store::Readers;
     use super::*;
     use kiln_seams::conversations::{Load, cases};
 
@@ -282,13 +404,69 @@ mod tests {
     fn cp_t1_1_a_closed_handle_lets_go_of_the_sessions_it_opened() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let kind = super::super::Kind::Turso;
-        let c = StoreConversations::new(Store::start(kind.open(&dir.path().join(super::super::FILE))?, super::super::store::Upkeep::default())?);
+        let c = StoreConversations::with(Store::start(kind.open(&dir.path().join(super::super::FILE))?, super::super::store::Upkeep::default())?, Opened::Set, Arc::default());
         let batch: Vec<Entry> = (1..=8u64).map(|i| Entry { conversation: format!("c{i}"), id: "m1".into(), seq: 1, text: "words".into() }).collect();
         c.append(&batch).map_err(|e| anyhow::anyhow!("{e}"))?;
-        anyhow::ensure!(c.opened.lock().len() == batch.len(), "{} sessions held for {} conversations", c.opened.lock().len(), batch.len());
+        anyhow::ensure!(c.opened.lock().set.len() == batch.len(), "{} sessions held for {} conversations", c.opened.lock().set.len(), batch.len());
         c.close().map_err(|e| anyhow::anyhow!("{e}"))?;
-        anyhow::ensure!(c.opened.lock().is_empty(), "{} sessions still held after close", c.opened.lock().len());
+        let (left, bytes) = {
+            let held = c.opened.lock();
+            (held.set.len(), held.bytes())
+        };
+        anyhow::ensure!(left == 0 && bytes == 0, "{left} sessions ({bytes} bytes) still held after close");
         Ok(())
+    }
+
+    /// CP-T1.1 A/B (lane vendor-amphora-11): asking the store (`Opened::Ask`) holds nothing a conversation, and gives
+    /// each session its row once, before its first event: a conversation appended to again, or by another handle (here
+    /// the store opened again, where the set, empty again, gives it a second), gets no second row, and a batch naming
+    /// one conversation twice gives it one. The feed hands on a session's row at the revision it was last written, so
+    /// a row written again comes after its events there; on each engine.
+    #[test]
+    fn cp_t1_1_asking_the_store_gives_each_session_its_row_once_and_holds_nothing() -> anyhow::Result<()> {
+        for kind in super::super::Kind::ALL {
+            let f = Fixture::arm(kind, Some(tempfile::tempdir()?), Opened::Ask, Readers::One);
+            let e = |c: &str, i: u64| Entry { conversation: c.into(), id: format!("m{i}"), seq: i, text: "words".into() };
+            let c = kiln_seams::conversations::ConversationsFixture::open(&f).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            c.append(&[e("a", 1), e("a", 2), e("b", 1)]).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            c.append(&[e("a", 3)]).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            c.close().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let c = kiln_seams::conversations::ConversationsFixture::open(&f).map_err(|e| anyhow::anyhow!("{kind:?}: opened again: {e}"))?;
+            c.append(&[e("b", 2)]).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            let top = c.top().map_err(|e| anyhow::anyhow!("{e}"))?;
+            c.close().map_err(|e| anyhow::anyhow!("{e}"))?;
+            anyhow::ensure!(f.held_most.load(Ordering::Relaxed) == 0, "{kind:?}: asking held {} bytes", f.held_most.load(Ordering::Relaxed));
+            // The store's own feed, sessions' rows and all: one row a session, before its first event.
+            let dir = f.dir.as_ref().ok_or_else(|| anyhow::anyhow!("no folder"))?;
+            let store = Store::start(kind.open(&dir.path().join(super::super::FILE))?, super::super::store::Upkeep::default())?;
+            let batch = store.changes(0, 1 << 20)?;
+            store.close()?;
+            let (mut rowed, mut evented) = (HashSet::new(), HashSet::new());
+            for ch in &batch.rows {
+                match &ch.row {
+                    Row::Session { session, .. } => {
+                        anyhow::ensure!(!evented.contains(session), "{kind:?}: {session}'s row was written again, after its events (top {top})");
+                        rowed.insert(session.clone());
+                    }
+                    Row::Event(ev) => {
+                        anyhow::ensure!(rowed.contains(&ev.session), "{kind:?}: {}'s event came before its row", ev.session);
+                        evented.insert(ev.session.clone());
+                    }
+                    _ => {}
+                }
+            }
+            anyhow::ensure!(rowed.len() == 2 && evented.len() == 2, "{kind:?}: rows for {rowed:?}, events for {evented:?}");
+        }
+        Ok(())
+    }
+
+    /// CP-T1.1 A/B: the opened switch by name, the control unset; anything else refused, naming what it takes.
+    #[test]
+    fn cp_t1_1_the_opened_switch_takes_set_or_ask() {
+        assert_eq!(Opened::named("set").ok(), Some(Opened::Set));
+        assert_eq!(Opened::named(" ask\n").ok(), Some(Opened::Ask));
+        let refused = Opened::named("cache").err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(refused.contains("`set` or `ask`"), "{refused}");
     }
 
     /// The folder and engine a crashing child writes in ([`cp_t1_1_every_acknowledged_append_stays_through_a_crash`]).
@@ -380,6 +558,13 @@ mod tests {
     /// as it goes, and a line a rung and engine printed with what was measured, the store's memory apart from the
     /// harness's. Same driver, adapter and process for both engines. Its scale comes from KILN_CONVO_LOAD_* (a tiny one
     /// unset: rungs 1 and 8); the run of record sets KILN_CONVO_LOAD_LADDER=1,8,32,128,512,2048,4096 on Linux.
+    ///
+    /// Each engine runs each A/B's arm against the control (lane vendor-amphora-11): `opened=Set readers=One` (today's),
+    /// `opened=Ask` (the store asked whether a session's row is there, each append) and `readers=Cores` (a reader a
+    /// core). A `convo-ab` line a rung and arm says what decides each: append p50/p99/p99.9 and the bytes held an open
+    /// conversation (the set's own, counted, and the process's growth, Linux's) for `opened`; the feed's lag in
+    /// revisions and its read time p50/p99/p99.9 for `readers`. KILN_CONVO_LOAD_ARMS picks arms by name
+    /// (`control,ask,cores`, all of them unset).
     #[test]
     fn cp_t1_1_the_load_scenario_runs_on_each_engine() -> anyhow::Result<()> {
         let base = Load {
@@ -396,12 +581,43 @@ mod tests {
             Ok(v) => v.split(',').map(|n| n.trim().parse::<usize>()).collect::<Result<_, _>>()?,
             Err(_) => kiln_seams::conversations::LADDER.iter().copied().take(2).collect(),
         };
-        println!("convo-load-platform os={} arch={} cpus={} tmp={}", std::env::consts::OS, std::env::consts::ARCH, std::thread::available_parallelism().map_or(0, |n| n.get()), std::env::temp_dir().display());
+        let all = [("control", Opened::Set, Readers::One), ("ask", Opened::Ask, Readers::One), ("cores", Opened::Set, Readers::Cores)];
+        let arms: Vec<(&str, Opened, Readers)> = match std::env::var("KILN_CONVO_LOAD_ARMS") {
+            Ok(v) => v.split(',').map(|name| all.iter().find(|(n, ..)| *n == name.trim()).copied().ok_or_else(|| anyhow::anyhow!("KILN_CONVO_LOAD_ARMS: no arm `{name}` (control, ask, cores)"))).collect::<anyhow::Result<_>>()?,
+            Err(_) => all.to_vec(),
+        };
+        println!("convo-load-platform os={} arch={} cpus={} readers_cores={} tmp={}", std::env::consts::OS, std::env::consts::ARCH, std::thread::available_parallelism().map_or(0, |n| n.get()), Readers::Cores.count(), std::env::temp_dir().display());
         for kind in super::super::Kind::ALL {
-            let reports = kiln_seams::conversations::ladder(&base, &rungs, || Ok(Fixture::new(kind, Some(tempfile::tempdir().map_err(|e| e.to_string())?)))).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
-            for (n, r) in reports {
-                anyhow::ensure!(r.appended == n.saturating_mul(base.appends), "{kind:?} at {n}: {r:?}");
-                println!("convo-load {kind:?} rung={n} {r:?}");
+            for &(arm, opened, readers) in &arms {
+                // Each rung's fixture's count of the set's bytes, in rung order.
+                let mut held = Vec::with_capacity(rungs.len());
+                let reports = kiln_seams::conversations::ladder(&base, &rungs, || {
+                    let f = Fixture::arm(kind, Some(tempfile::tempdir().map_err(|e| e.to_string())?), opened, readers);
+                    held.push(Arc::clone(&f.held_most));
+                    Ok(f)
+                })
+                .map_err(|e| anyhow::anyhow!("{kind:?} {arm}: {e}"))?;
+                for ((n, r), held) in reports.into_iter().zip(held) {
+                    anyhow::ensure!(r.appended == n.saturating_mul(base.appends), "{kind:?} {arm} at {n}: {r:?}");
+                    let open = base.conversations.max(n).max(1);
+                    let set_bytes = held.load(Ordering::Relaxed);
+                    let (a, lag, feed) = (&r.append_us, &r.feed_lag_revs, &r.feed_us);
+                    println!(
+                        "convo-ab {kind:?} arm={arm} rung={n} append_us={}/{}/{} feed_lag_revs={}/{}/{} feed_us={}/{}/{} set_bytes_per_conversation={} store_bytes_per_conversation={} conversations={open}",
+                        a.p50,
+                        a.p99,
+                        a.p999,
+                        lag.p50,
+                        lag.p99,
+                        lag.p999,
+                        feed.p50,
+                        feed.p99,
+                        feed.p999,
+                        set_bytes / open,
+                        r.store_bytes.map_or_else(|| "none".to_owned(), |b| (b / u64::try_from(open).unwrap_or(u64::MAX)).to_string()),
+                    );
+                    println!("convo-load {kind:?} arm={arm} rung={n} {r:?}");
+                }
             }
         }
         Ok(())
