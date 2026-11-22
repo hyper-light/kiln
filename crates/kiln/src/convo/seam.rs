@@ -561,10 +561,11 @@ mod tests {
     ///
     /// Each engine runs each A/B's arm against the control (lane vendor-amphora-11): `opened=Set readers=One` (today's),
     /// `opened=Ask` (the store asked whether a session's row is there, each append) and `readers=Cores` (a reader a
-    /// core). A `convo-ab` line a rung and arm says what decides each: append p50/p99/p99.9 and the bytes held an open
-    /// conversation (the set's own, counted, and the process's growth, Linux's) for `opened`; the feed's lag in
-    /// revisions and its read time p50/p99/p99.9 for `readers`. KILN_CONVO_LOAD_ARMS picks arms by name
-    /// (`control,ask,cores`, all of them unset).
+    /// core), and `ask-cores` (both: an `ask` append's read waits behind the followers' on one reader, so this tells
+    /// the cost of asking from the cost of the queue). A `convo-ab` line a rung and arm says what decides each: append
+    /// p50/p99/p99.9 and the bytes held an open conversation (the set's own, counted, and the process's growth, Linux's)
+    /// for `opened`; the feed's lag in revisions and its read time p50/p99/p99.9 for `readers`. KILN_CONVO_LOAD_ARMS
+    /// picks arms by name (`control,ask,cores,ask-cores`, all of them unset).
     #[test]
     fn cp_t1_1_the_load_scenario_runs_on_each_engine() -> anyhow::Result<()> {
         let base = Load {
@@ -581,9 +582,9 @@ mod tests {
             Ok(v) => v.split(',').map(|n| n.trim().parse::<usize>()).collect::<Result<_, _>>()?,
             Err(_) => kiln_seams::conversations::LADDER.iter().copied().take(2).collect(),
         };
-        let all = [("control", Opened::Set, Readers::One), ("ask", Opened::Ask, Readers::One), ("cores", Opened::Set, Readers::Cores)];
+        let all = [("control", Opened::Set, Readers::One), ("ask", Opened::Ask, Readers::One), ("cores", Opened::Set, Readers::Cores), ("ask-cores", Opened::Ask, Readers::Cores)];
         let arms: Vec<(&str, Opened, Readers)> = match std::env::var("KILN_CONVO_LOAD_ARMS") {
-            Ok(v) => v.split(',').map(|name| all.iter().find(|(n, ..)| *n == name.trim()).copied().ok_or_else(|| anyhow::anyhow!("KILN_CONVO_LOAD_ARMS: no arm `{name}` (control, ask, cores)"))).collect::<anyhow::Result<_>>()?,
+            Ok(v) => v.split(',').map(|name| all.iter().find(|(n, ..)| *n == name.trim()).copied().ok_or_else(|| anyhow::anyhow!("KILN_CONVO_LOAD_ARMS: no arm `{name}` (control, ask, cores, ask-cores)"))).collect::<anyhow::Result<_>>()?,
             Err(_) => all.to_vec(),
         };
         println!("convo-load-platform os={} arch={} cpus={} readers_cores={} tmp={}", std::env::consts::OS, std::env::consts::ARCH, std::thread::available_parallelism().map_or(0, |n| n.get()), Readers::Cores.count(), std::env::temp_dir().display());
