@@ -6,7 +6,9 @@
 //!
 //! Into the records the server keeps in its store (kiln.db), which is written: with the server
 //! stopped. With `--into`, a records file opened by [`super::open`] (the one place that chooses the
-//! engine under Records), kiln.db only read, so it may run beside a server.
+//! engine under Records), kiln.db only read, so it may run beside a server; and the Records the
+//! server keeps there (deploys' and their fenced leases among them) are copied into it and compared
+//! too, family by family ([`carry::copy_records`]).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,8 +70,40 @@ pub async fn run(args: RecordsArgs, cfg: &Config) -> Result<()> {
     for line in report(&found) {
         println!("{line}");
     }
-    anyhow::ensure!(found.differences.is_empty(), "the tables and their records differ in {} places", found.differences.len());
+    // Into another store, the Records the server keeps (deploys' and their leases among them) go
+    // too, family by family (CP-T1.5, CP-T1.6).
+    let moved = match &w.into {
+        Some(_) => {
+            let server = super::StoreRecords::open(store.clone())?;
+            let families = carry::families(&store).await?;
+            if carrying {
+                println!("copied {} of the server's records", carry::copy_records(&server, &families, &*records).await?);
+            }
+            let differ = carry::compare_records(&server, &families, &*records).await?;
+            for line in records_report(&differ) {
+                println!("{line}");
+            }
+            differ.len()
+        }
+        None => 0,
+    };
+    anyhow::ensure!(found.differences.is_empty() && moved == 0, "the tables and their records differ in {} places, the server's records and their copies in {moved}", found.differences.len());
     Ok(())
+}
+
+/// What [`carry::compare_records`] found, a line a record (family, key in hex), then how many.
+pub fn records_report(differ: &[carry::Difference]) -> Vec<String> {
+    let mut out: Vec<String> = differ
+        .iter()
+        .map(|d| match &d.differs {
+            Differs::NoRecord => format!("{} {}: the server's record, not copied", d.table, d.key),
+            Differs::NoRow => format!("{} {}: a copy the server doesn't keep", d.table, d.key),
+            Differs::Value { from, to } => format!("{} {}: a value that differs ({from} bytes, {to} copied)", d.table, d.key),
+            other => format!("{} {}: {other:?}", d.table, d.key),
+        })
+        .collect();
+    out.push(format!("the server's records: {} differences", differ.len()));
+    out
 }
 
 /// Carries, when asked, then compares: how many rows were carried, and what the comparison found.
@@ -93,6 +127,7 @@ pub fn report(c: &Compared) -> Vec<String> {
             Differs::NoRow => format!("{} {}: a record with no row", d.table, d.key),
             Differs::Field { column, row, record } => format!("{} {} {column}: row {}, record {}", d.table, d.key, shown(row), shown(record)),
             Differs::Unreadable(why) => format!("{} {}: a record that isn't a row ({why})", d.table, d.key),
+            Differs::Value { from, to } => format!("{} {}: a value that differs ({from} bytes, {to} in the record)", d.table, d.key),
         })
         .collect();
     out.push(format!("{} rows, {} records: {} differences", c.rows, c.records, c.differences.len()));
