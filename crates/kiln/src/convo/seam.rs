@@ -20,11 +20,13 @@ pub struct StoreConversations {
     /// Sessions given their row: a session's row goes before its first event, as kiln's harness writes it.
     opened: Mutex<HashSet<String>>,
     closed: AtomicBool,
+    /// Told as the handle is let go of: a wait under way hears it and is refused Closed ([`Conversations::wait`]).
+    closing: crate::rt::Shutdown,
 }
 
 impl StoreConversations {
     pub fn new(store: Store) -> Self {
-        Self { store, opened: Mutex::new(HashSet::new()), closed: AtomicBool::new(false) }
+        Self { store, opened: Mutex::new(HashSet::new()), closed: AtomicBool::new(false), closing: crate::rt::Shutdown::new() }
     }
 
     fn live(&self) -> Result<(), Error> {
@@ -102,8 +104,8 @@ impl Conversations for StoreConversations {
 
     fn wait(&self, after: u64) -> Result<u64, Error> {
         // Watching before looking: a commit between the look and the wait leaves its word, so none is missed. The
-        // store's writer sets the top it committed, then tells its watchers of each commit and of its close
-        // (`Store::watch`, `Store::committed_top`): a reader woken asks nothing of the writer.
+        // store's writer sets the top it committed, then tells its watchers of each commit (`Store::watch`,
+        // `Store::committed_top`): a reader woken asks nothing of the writer. The handle let go of meanwhile ends it.
         let commits = self.store.watch();
         loop {
             self.live()?;
@@ -111,7 +113,7 @@ impl Conversations for StoreConversations {
             if top > after {
                 return Ok(top);
             }
-            futures::executor::block_on(commits.notified());
+            let _ = futures::executor::block_on(futures::future::select(std::pin::pin!(commits.notified()), std::pin::pin!(self.closing.cancelled())));
         }
     }
 
@@ -119,6 +121,7 @@ impl Conversations for StoreConversations {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        self.closing.cancel();
         self.store.close().map_err(failed)
     }
 }

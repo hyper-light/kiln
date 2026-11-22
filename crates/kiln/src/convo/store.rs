@@ -1197,9 +1197,6 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             }
                             let released = engine.release();
                             drop(engine);
-                            // Its watchers told it's gone, as of a commit: one waiting for the next hears it was let go of
-                            // (the Conversations seam's wait, refused Closed), never waits on a store that won't commit.
-                            notify(watchers);
                             let _ = reply.send(released);
                             return;
                         }
