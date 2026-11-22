@@ -374,7 +374,7 @@ impl Placer {
     /// Whether sense's health bars `ask`'s kind of work here now, by its last measure (L2): its
     /// kernel start is declined as ever, nothing reserved.
     fn kernel_barred(&self, ask: &Ask) -> bool {
-        self.strained.is_none() && self.last.as_ref().is_some_and(|m| super::barred(ask, self.key_here(ask), m).is_some())
+        self.last.as_ref().is_some_and(|m| super::barred(ask, self.key_here(ask), m).is_some())
     }
 
     /// Reserve `id` said for `pending`, which waits for its answer: its word goes on the link it

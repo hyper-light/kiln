@@ -66,7 +66,29 @@ pub struct Config {
     /// kiln's Slates fleet (docs/agentic.md W7): which runners' Slates join it, where each is
     /// reached, and its fault tolerance; the server's word, none until declared.
     pub slates_fleet: SlatesFleet,
+    /// Agents' Slates workspaces (docs/agentic.md W2): off until declared.
+    pub workspaces: Workspaces,
 }
+
+/// `[workspaces]`, the server's: whether an agent may work in a Slates volume of its own laid over its folder. Off by
+/// default (the person's ruling, 2026-11-21: "Slates shouldn't even be enabled yet. It is not even remotely product
+/// complete. Like the microVM engine, it's designed to be an option we can enable"). Off, every new agent works in its
+/// folder, a start asking for a volume (`workspace: "volume"`, a pod's) is refused saying how to turn them on
+/// ([`WORKSPACES_OFF`]), and no machine starts Slates for a new agent; an agent that has a volume already keeps working
+/// in it. On, an agent works in a volume only where its start asks for one.
+///
+/// ```toml
+/// [workspaces]
+/// enabled = true
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Workspaces {
+    pub enabled: bool,
+}
+
+/// Why a start that asks for a Slates volume is refused while `[workspaces]` is off ([`Workspaces`]).
+pub const WORKSPACES_OFF: &str = "Slates workspaces are off on this kiln: they're an option its owner enables (`[workspaces] enabled = true` in the server's config)";
 
 /// `[slates_fleet]` (docs/agentic.md W7; kiln goal 95101ef32ffb8b099942fe076619c310, K3), the
 /// server's: the runners whose Slates join kiln's Slates fleet, each by its machine's name with
@@ -633,28 +655,12 @@ pub struct Agents {
     /// default): none is granted live (default deny).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub egress_ceiling: Vec<String>,
-    /// Where an agent on its machine's host works when its start names no workspace (docs/agentic.md W2): `volume`, a
-    /// Slates volume of its own where its machine can make one (the person's decision, 2026-11-18, kiln goal
-    /// 01a1ec34599974448aed2672bafaf9a2), or `folder`, the folder itself, as before it (test servers and labs, whose
-    /// agents must leave no volume or mount behind on the machine that runs them).
-    pub workspace: DefaultWorkspace,
 }
 
 impl Default for Agents {
     fn default() -> Self {
-        Self { max_depth: 3, max_children: None, egress_ceiling: Vec::new(), workspace: DefaultWorkspace::Volume }
+        Self { max_depth: 3, max_children: None, egress_ceiling: Vec::new() }
     }
-}
-
-/// `[agents] workspace`: what an agent works in when its start names no workspace.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DefaultWorkspace {
-    /// A Slates volume of its own laid over its folder where its machine can make one, else its folder, saying why.
-    #[default]
-    Volume,
-    /// Its folder itself.
-    Folder,
 }
 
 impl Conversations {

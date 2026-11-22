@@ -466,7 +466,8 @@ pub struct Admission {
     /// keeper, where one is known (`keeper::reserves`; one that asks nothing reserves nothing).
     reserving: u32,
     draining: bool,
-    /// Its machine is under strain, and why (AUDIT L1, the shell's measure): it offers nothing new.
+    /// Its machine is under strain, and why (AUDIT L1, the shell's measure): it holds nothing back,
+    /// but says its room is none ([`Self::cordoned`]), so owners place work elsewhere first.
     strained: Option<String>,
     /// Where it stands with its machine's capacity keeper (docs/lb.md "A machine's keeper"; Hex's
     /// capacity-view.md CV7, CV11), as its shell last said: none known, unsynced (it offers nothing
@@ -1724,22 +1725,28 @@ impl Admission {
         self.line.is_empty() && self.kept.is_none() && self.whole_claims == 0
     }
 
-    /// Whether it takes no new work: draining (an upgrade pending, or its battery), under strain, or
-    /// not synced with its machine's capacity keeper (Hex's capacity-view.md CV11). Its kernel is
-    /// cordoned so (docs/lb.md "Thermals and battery"): it admits nothing, its words say no room, and
-    /// under room tokens each owner's word says it holds none here.
-    fn cordoned(&self) -> bool {
-        self.draining || self.strained.is_some() || self.keeper.unsynced().is_some()
+    /// Whether it takes no new work: draining (an upgrade pending, or its battery), or not synced
+    /// with its machine's capacity keeper (Hex's capacity-view.md CV11). Its machine's strain holds
+    /// nothing back (Ada, 2026-11-21: kiln's balancer places work around a strained machine, never
+    /// holds it there): it only says its room is none ([`Self::cordoned`]).
+    fn closed(&self) -> bool {
+        self.draining || self.keeper.unsynced().is_some()
     }
 
-    /// Why it takes no new work, when it doesn't ([`Self::cordoned`]): the one reason its waiting
+    /// Whether its kernel is cordoned (docs/lb.md "Thermals and battery"): it takes no new work
+    /// ([`Self::closed`]), or its machine is under strain. Its words say no room, so owners' kernels
+    /// pick elsewhere, and under room tokens each owner's word says it holds none here; its hint and,
+    /// under strain, its offers say none too, so an owner takes it only where no other runner
+    /// offered.
+    fn cordoned(&self) -> bool {
+        self.closed() || self.strained.is_some()
+    }
+
+    /// Why it takes no new work, when it doesn't ([`Self::closed`]): the one reason its waiting
     /// runs, its quotes and [`Self::taking`] say.
     fn not_taking(&self) -> Option<Reason> {
         if self.draining {
             return Some(Reason::Draining);
-        }
-        if let Some(why) = &self.strained {
-            return Some(Reason::Strained { why: why.clone() });
         }
         self.keeper.unsynced().map(|u| Reason::Unsynced { why: u.why().to_owned() })
     }
@@ -1888,7 +1895,7 @@ impl Admission {
     fn admit(&mut self, now: i64, out: &mut Vec<Reply>) {
         loop {
             self.restand(now, out);
-            if self.cordoned() {
+            if self.closed() {
                 self.kept = None;
                 return;
             }
@@ -1981,7 +1988,10 @@ impl Admission {
         if self.owner(p.owner).is_none_or(|w| w.away) {
             return;
         }
-        let free = ask::resources(&free.unwrap_or_else(|| self.free_now()));
+        // Under strain its room is said as none, as its kernel's words and its hint say it: its
+        // owner takes it here only where no runner free of strain offered (`Owner::best`, the least
+        // full first).
+        let free = if self.strained.is_some() { Resources::default() } else { ask::resources(&free.unwrap_or_else(|| self.free_now())) };
         out.push(Reply { owner: p.owner, token: p.token, run: Arc::clone(&p.run), msg: Up::Offer { fence, got: ask::resources(&p.amounts), free, predicted: p.predicted, disk: self.sample.disk, pace: self.sample.pace } });
     }
 
@@ -2505,7 +2515,7 @@ impl Admission {
         // Nobody waits here and it has room: it's offered as it comes, which is what entering the
         // line, admitting and leaving it again come to with no one else in it (docs/needs.md §11,
         // AUDIT P6: an arrival at an empty line touches no line).
-        if self.line.is_empty() && !self.cordoned() && self.can_start(s) {
+        if self.line.is_empty() && !self.closed() && self.can_start(s) {
             self.kept = None;
             self.offer(s, now, out);
             return;
@@ -3155,8 +3165,8 @@ impl Admission {
     }
 
     /// Its machine under strain (`why`), or not (AUDIT L1, as the shell measured it at decision
-    /// time): strained, it offers nothing new, and its runs wait saying why; no longer, what fits
-    /// starts in the same input.
+    /// time): strained, it holds nothing back, its room said as none in its kernel's words, its hint
+    /// and its offers so owners place work elsewhere first; no longer, its room is said again.
     pub fn strain(&mut self, why: Option<String>, now: i64, out: &mut Vec<Said>) {
         self.wire(out, |a, r| a.strain_r(why, now, r));
     }
@@ -3477,8 +3487,9 @@ impl Admission {
     }
 
     /// What it publishes of its room (the `offers` named feature): what's free for an ordinary run
-    /// now, nothing while it takes nothing new ([`Self::cordoned`]) or is held whole. A hint for
-    /// owners choosing where to probe, never a claim.
+    /// now, nothing while its kernel is cordoned (it takes nothing new, or its machine is under
+    /// strain: [`Self::cordoned`]) or it's held whole. A hint for owners choosing where to probe,
+    /// never a claim.
     pub fn hint(&self) -> Resources {
         if self.cordoned() || self.whole_claims > 0 {
             return Resources::default();
@@ -3489,7 +3500,7 @@ impl Admission {
     /// What a probe of `ask` (in its class) would be answered here now, without probing it (the
     /// `offers` hint's quotes, docs/needs.md E5): never and why, as a probe of it would be; now, by
     /// the same room rule a probe is admitted by ([`Self::can_start`]'s), unless the runner takes
-    /// nothing new (draining, strained, not synced with its keeper), holds as many claims as its
+    /// nothing new (draining, not synced with its keeper), holds as many claims as its
     /// holder may reserve, or keeps room for the first in line; else it would wait, with its one
     /// reason and when it would start, estimated as a waiting probe's is from the work ahead of the
     /// end of its class's line. O(log n); changes nothing.
@@ -3520,8 +3531,8 @@ impl Admission {
         Quote::Waits { reason, start: self.estimate(&end, now) }
     }
 
-    /// Whether it takes nothing new: draining (an upgrade pending), its machine under strain, or not
-    /// synced with its machine's capacity keeper.
+    /// Whether it takes nothing new: draining (an upgrade pending), or not synced with its machine's
+    /// capacity keeper. Its machine's strain holds nothing back ([`Self::closed`]).
     pub fn taking(&self) -> Result<(), Reason> {
         self.not_taking().map_or(Ok(()), Err)
     }
@@ -3632,8 +3643,9 @@ impl Admission {
         if waiting != self.line.len() {
             return Err(format!("{}: {waiting} waiting, its line holds {}", self.me, self.line.len()));
         }
-        // Work-conserving: what can start is offered in the input that let it, nobody polling.
-        if !self.cordoned()
+        // Work-conserving: what can start is offered in the input that let it, nobody polling, its
+        // machine's strain or not.
+        if !self.closed()
             && let Some((_, h)) = self.line.first()
             && self.can_start(h)
         {

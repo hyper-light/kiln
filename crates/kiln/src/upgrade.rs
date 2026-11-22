@@ -260,7 +260,13 @@ fn copy_atomic(from: &Path, to: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     let tmp = to.with_extension(format!("new.{}", std::process::id()));
-    std::fs::copy(from, &tmp)?;
+    let copied = std::fs::copy(from, &tmp)?;
+    // Never a kiln in its place that isn't whole: the copy as long as what it's of, and a kiln.
+    let whole = std::fs::metadata(from).map(|m| m.len() == copied).unwrap_or(false);
+    if let Some(why) = (!whole).then(|| format!("the copy of {} is {copied} bytes, not its length", from.display())).or_else(|| crate::updates::not_whole(&tmp)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(std::io::Error::other(format!("not installing {}: {why}", to.display())));
+    }
     crate::os::make_executable(&tmp)?;
     std::fs::rename(&tmp, to)
 }

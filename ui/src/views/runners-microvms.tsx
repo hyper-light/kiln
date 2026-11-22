@@ -167,7 +167,7 @@ export function EngineBlock({ name, manage }: { name: string; manage: boolean })
             </span>
           ))}
         </span>
-        <span className="rv-default" title={e.from === "server" ? "Its owner set it on the server" : "What it can do decides: microvm where it can hold them, else host"}>
+        <span className="rv-default" title={e.from === "server" ? "Its owner set it on the server" : "Nothing set: host. microvm is its owner's to set"}>
           {e.from === "server" ? "set" : "default"}
           {e.draining > 0 && (
             <button

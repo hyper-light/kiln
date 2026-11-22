@@ -9,7 +9,7 @@
 //!   is down): the workspace's mount let go, the move asked of Slates and its answers followed until the configuration
 //!   names the target (`MoveProgress::Moved`), the session handed over after. A refused move mounts the workspace again
 //!   and the agent goes on where it was; the refusal is said by kind ([`MoveRefused::of`]).
-//! - **The target runner** (`workspace::arrived_here`, `workspace::mounted_for`): the moved volume mounted under its own
+//! - **The target runner** (`workspace::arrived_here`, `workspace::prepare`): the moved volume mounted under its own
 //!   place for workspaces, the agent's folder there, before its harness starts.
 //!
 //! An overlay (a workspace laid over its machine's folder, as kiln makes them today) is refused `NotPlain` by Slates: its

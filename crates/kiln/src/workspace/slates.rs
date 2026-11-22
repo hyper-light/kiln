@@ -915,8 +915,10 @@ fn is_mount(dir: &Path) -> bool {
     super::place::is_mount(dir)
 }
 
-/// Workspace `m` is mounted where it says (again, after the machine's mount went away while its
-/// volume stayed).
+/// Workspace `m` is mounted where it says (again, after the machine's mount went away while its volume stayed), waiting
+/// while Slates asks for a pause (a volume that just moved here is served once its new owner has adopted it: until then
+/// its verbs are refused for now, `Error::Retry`), each pause the one Slates derived: Slates bounds the adoption itself,
+/// so no clock of kiln's ends the wait.
 pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     // One made with no mount (an isolated session's, [`make_unmounted`]) has none to make again.
     if m.mount.is_empty() {
@@ -928,7 +930,29 @@ pub async fn mounted(m: &Made) -> anyhow::Result<()> {
     if mounted_as_made(m).await? {
         return Ok(());
     }
-    mount_at(m).await
+    loop {
+        match mount_typed(m).await? {
+            Ok(()) => return Ok(()),
+            Err(refused) => match after_refusal(&refused, false) {
+                AfterRefusal::Again(pause) => pause_for_move(pause).await,
+                AfterRefusal::NextPoint | AfterRefusal::Refused => anyhow::bail!("Slates' mount: {refused}"),
+            },
+        }
+    }
+}
+
+/// What Slates still holds of workspace `m`'s volume, gone from its instance ([`gone`]), destroyed, its being missing
+/// there taken as done; and its base let go with it, as [`remove`] lets it go (K5). Refused, typed, otherwise.
+pub async fn destroy_remains(m: &Made) -> anyhow::Result<()> {
+    let id = volume_id(&m.volume)?;
+    match call("destroy", move |i| Ok(i.destroy(id))).await? {
+        Ok(()) | Err(slates_api::Error::NotFound(_)) => {}
+        Err(refused) => anyhow::bail!("Slates refused the destroy of its old volume {}: {refused}", m.volume),
+    }
+    if let Some(base) = &m.base {
+        release_base(base, id).await;
+    }
+    Ok(())
 }
 
 /// Whether workspace `m`'s volume is gone from its machine's instance (Slates answers it missing): a volume lives in its
@@ -957,24 +981,6 @@ fn placed_under(m: &Made, root: &Path) -> anyhow::Result<Made> {
     }
     let point = super::place::points(root, &m.name).into_iter().next().ok_or_else(|| anyhow::anyhow!(super::place::NO_POINT))?;
     Ok(Made { mount: point.to_string_lossy().into_owned(), ..m.clone() })
-}
-
-/// [`mounted`], waiting while Slates asks for a pause (a volume that just moved here is served once its new owner has
-/// adopted it: until then its verbs are refused for now, `Error::Retry`), each pause the one Slates derived: Slates
-/// bounds the adoption itself, so no clock of kiln's ends the wait.
-pub async fn mounted_patiently(m: &Made) -> anyhow::Result<()> {
-    if m.mount.is_empty() || mounted_as_made(m).await? {
-        return Ok(());
-    }
-    loop {
-        match mount_typed(m).await? {
-            Ok(()) => return Ok(()),
-            Err(refused) => match after_refusal(&refused, false) {
-                AfterRefusal::Again(pause) => pause_for_move(pause).await,
-                AfterRefusal::NextPoint | AfterRefusal::Refused => anyhow::bail!("Slates' mount: {refused}"),
-            },
-        }
-    }
 }
 
 /// Workspace `m`'s mount let go before its volume moves (K4): its agent's harness is down, so nothing of it holds the
@@ -1091,14 +1097,9 @@ fn attachment_at(own: &[slates_api::MountReport], point: &str) -> Option<u64> {
     own.iter().find(|mount| mount.path.eq_ignore_ascii_case(point)).map(|mount| mount.attachment)
 }
 
-/// Mounts workspace `m` at its point, which holds nothing of it now: a folder made for it (Unix), or a drive letter
-/// the mount itself makes (Windows). [`mount_typed`], its refusal in Slates' words.
-async fn mount_at(m: &Made) -> anyhow::Result<()> {
-    mount_typed(m).await?.map_err(|refused| anyhow::anyhow!("Slates' mount: {refused}"))
-}
-
-/// [`mount_at`] with Slates' refusal kept typed (`Ok(Err(refused))`), apart from a failure to ask Slates at all, so
-/// [`make`] can tell a drive letter Slates refuses as another volume's from a refusal every letter would meet.
+/// Mounts workspace `m` at its point, which holds nothing of it now: a folder made for it (Unix), or a drive letter the
+/// mount itself makes (Windows). Slates' refusal kept typed (`Ok(Err(refused))`), apart from a failure to ask Slates at
+/// all, so [`make`] can tell a drive letter Slates refuses as another volume's from a refusal every letter would meet.
 async fn mount_typed(m: &Made) -> anyhow::Result<Result<(), slates_api::Error>> {
     let dir = PathBuf::from(&m.mount);
     super::place::ready(&dir)?;
@@ -1122,7 +1123,7 @@ fn another_letter_may_serve(refused: &slates_api::Error, taken_now: bool) -> boo
 }
 
 /// What a workspace's mount does after Slates answered `refused` at a point (`taken_now`: a drive holds the point now):
-/// every mount alike, a workspace's first ([`make`]) and a moved volume's ([`mounted_patiently`]).
+/// every mount alike, a workspace's first ([`make`]) and one made already ([`mounted`]: a moved volume's among them).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AfterRefusal {
     /// Refused for now (`Error::Retry`: a lease not yet confirmed across the LAN, `LeaseUnconfirmed`, or a moved volume

@@ -1706,7 +1706,7 @@ impl Host {
         }
         let mut pkg = pkg;
         // A workspace volume that moved here with it (K4): its mount re-placed under this machine's own place for
-        // workspaces and its folder there, mounted as the session starts (`workspace::mounted_for`).
+        // workspaces and its folder there, mounted as the session starts (`workspace::prepare`).
         let volume_here = crate::workspace::arrived_here(&mut pkg.spec);
         let mut cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
         // Its folder isn't here (it wasn't a repository kiln keeps in step): it works in home. A

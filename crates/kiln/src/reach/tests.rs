@@ -1948,26 +1948,24 @@ fn m4_g1_ci_legs_and_commands_never_pass_a_runners_budget_together() -> anyhow::
 
 /// AUDIT O1 (core's half), O2: a runner says its admission's hint when it changes something
 /// decided by, never per sample: its first; nothing for a reading that moves the room but no
-/// answer; again when a dimension's room goes to none (its CPUs, here), and when it's strained.
+/// answer; again when a dimension's room goes to none (its CPUs, here).
 #[test]
 fn o1_a_runners_hint_goes_only_on_a_change_decided_by() -> anyhow::Result<()> {
     use super::place::{Placer, sample_of};
     let mut p = Placer::new("r", 1, kiln_ci::facts::RunnerFacts::default(), Vec::new(), sample_of(&reading(10.0)), kiln_ci::place::runner::Settings::default(), 0);
-    let first = p.hint_due(0, None).ok_or_else(|| anyhow::anyhow!("its first hint"))?;
+    let first = p.hint_due(0).ok_or_else(|| anyhow::anyhow!("its first hint"))?;
     let h: crate::offers::hint::Hint = serde_json::from_str(&first)?;
     assert!(h.whole && h.seq == 1 && h.room.first().is_some_and(|c| *c > 0), "{first}");
     let _ = p.measured(sample_of(&reading(10.0)), 1);
-    assert_eq!(p.hint_due(1, None), None, "a reading that changes nothing is no news");
+    assert_eq!(p.hint_due(1), None, "a reading that changes nothing is no news");
     // The placement kernel picks by a runner's exact room (docs/lb.md "Adopted"): a reading that
     // moves its word is news to owners' kernels, though it changes no answer of the admission's.
     let _ = p.measured(sample_of(&reading(12.0)), 2);
-    let moved: crate::offers::hint::Hint = serde_json::from_str(&p.hint_due(2, None).ok_or_else(|| anyhow::anyhow!("the kernel's word moved: news"))?)?;
+    let moved: crate::offers::hint::Hint = serde_json::from_str(&p.hint_due(2).ok_or_else(|| anyhow::anyhow!("the kernel's word moved: news"))?)?;
     assert!(moved.seq == 2 && moved.fast != h.fast && moved.room.first() < h.room.first(), "its kernel word moved: {moved:?}");
     let _ = p.measured(sample_of(&reading(100.0)), 3);
-    let full: crate::offers::hint::Hint = serde_json::from_str(&p.hint_due(3, None).ok_or_else(|| anyhow::anyhow!("no room is news"))?)?;
+    let full: crate::offers::hint::Hint = serde_json::from_str(&p.hint_due(3).ok_or_else(|| anyhow::anyhow!("no room is news"))?)?;
     assert!(full.seq == 3 && full.room.first() == Some(&0) && !full.whole, "its CPUs went to none: {full:?}");
-    let strained = p.hint_due(4, Some("stalled".into())).ok_or_else(|| anyhow::anyhow!("strain is news"))?;
-    assert!(strained.contains("strained"), "{strained}");
     // Another runner's room goes to its owner; its own is no hint to itself.
     p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "other".into(), epoch: 1, seq: 1, room: [4000, 8 << 30, 0, 0], fast: None })?);
     p.hinted(&serde_json::to_string(&crate::offers::hint::Room { runner: "r".into(), epoch: 1, seq: 1, room: [0; 4], fast: None })?);
@@ -2052,10 +2050,10 @@ fn o1_a_runners_hint_quotes_its_sizes_and_says_when_it_drains() -> anyhow::Resul
     let needs = kiln_ci::sched::needs::parse("cpus=4").map_err(anyhow::Error::msg)?;
     let _ = p.directory(&[], 0);
     let _ = p.ask(kiln_ci::place::Ask { run: "r1".into(), needs, ..kiln_ci::place::Ask::default() }, 0);
-    let h: Hint = serde_json::from_str(&p.hint_due(1, None).ok_or_else(|| anyhow::anyhow!("its first hint"))?)?;
+    let h: Hint = serde_json::from_str(&p.hint_due(1).ok_or_else(|| anyhow::anyhow!("its first hint"))?)?;
     anyhow::ensure!(h.quotes.iter().any(|q| q.ask.first() == Some(&4_000)), "a quote for the size held here: {h:?}");
     let _ = p.drain(true, 2);
-    let h: Hint = serde_json::from_str(&p.hint_due(2, None).ok_or_else(|| anyhow::anyhow!("draining is news"))?)?;
+    let h: Hint = serde_json::from_str(&p.hint_due(2).ok_or_else(|| anyhow::anyhow!("draining is news"))?)?;
     anyhow::ensure!(h.state == Taking::Draining, "{h:?}");
     anyhow::ensure!(h.quotes.iter().all(|q| !matches!(q.answer, crate::offers::hint::Quoted::Now)), "nothing starts now while it drains: {h:?}");
     Ok(())

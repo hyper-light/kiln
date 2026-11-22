@@ -854,7 +854,8 @@ device would give a new run's I/O under its load now. The load-balancing kernel 
   AUDIT L1):
   - **The gap:** on macOS, Windows and a Linux without PSI, health's strain rests on the stand-ins
     above (the work device's ρ, swap-ins' share). Only the events in **When** read them again, and a
-    strained runner takes nothing new. So an idle one met no event, and its strain stood for good:
+    strained runner says its room is none, so owners place work elsewhere first (docs/lb.md
+    "Thermals and battery"). So an idle one met no event, and its strain stood for good:
     every start placed there waited (kiln goal 3cd82843's E2E on a Windows desktop, 2026-11-17:
     `queued: 0 of 1 can start it now (1 machine under strain)`).
   - **The follow-up:** a measure that finds strain there reads the stand-ins again 2 s on, and again

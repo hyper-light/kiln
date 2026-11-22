@@ -275,6 +275,8 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
     }
     // Terminals the last runner process handed over, for the next one.
     let mut handed: Option<crate::os::supervise::Terminals> = None;
+    // Whether kiln on disk was a whole kiln when it last changed (its modification time then): it's judged once each time.
+    let mut judged: Option<(Option<SystemTime>, bool)> = None;
 
     loop {
         generation += 1;
@@ -427,7 +429,28 @@ pub async fn run(opts: Options) -> anyhow::Result<()> {
                     }
                 }
                 Ev::UpgradeCheck => {
-                    if exe_mtime(&exe) != started_mtime && started.elapsed() > Duration::from_secs(5) {
+                    let changed = exe_mtime(&exe);
+                    // What's on disk now is taken up only once it's a whole kiln (`updates::whole_kiln`), judged once each
+                    // time it changes: one cut short, empty or still being written is left alone, said once, and the
+                    // child goes on as it is (an empty build installed on a Mac, 2026-11-21, ended its runner).
+                    let whole = if changed != started_mtime && started.elapsed() > Duration::from_secs(5) {
+                        match &judged {
+                            Some((at, verdict)) if *at == changed => *verdict,
+                            _ => {
+                                let verdict = crate::updates::whole_kiln(&exe).await;
+                                if let Err(why) = &verdict {
+                                    let msg = format!("kiln on disk changed, but it isn't a whole kiln, so it isn't taken up: {why}");
+                                    tracing::error!("{msg}");
+                                    crash_log(&opts.state_dir, &msg);
+                                }
+                                judged = Some((changed, verdict.is_ok()));
+                                verdict.is_ok()
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if whole {
                         match takes {
                             // The runner takes it up once idle, as a fresh process started here.
                             Takes::Successor => {
