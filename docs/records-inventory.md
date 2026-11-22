@@ -3,9 +3,9 @@
 CP-T1.5 to CP-T1.7 (G9 step 2): what moves to Records on Amphora. Written by
 `scripts/records-inventory.sh`; `crates/kiln-seams/tests/records_inventory.rs` fails when this
 file and the code differ, and says how it reads the code. A table only tests make, or one
-dropped by a later migration, is listed too, and says so. Each JSON file says how it's kept on
-Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why. The part after
-"Designed by hand" is written by hand.
+dropped by a later migration, is listed too, and says so; so does a drop only tests make. Each
+JSON file says how it's kept on Amphora: as Records (`crates/kiln/src/records/files.rs`), or as
+a file, and why. The part after "Designed by hand" is written by hand.
 
 ## SQLite tables
 
@@ -143,8 +143,8 @@ Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why.
 | `ci_variables` | `crates/kiln/src/store/migrations/20261018-0030_w09_secrets.sql` |  |  |
 | `ci_workflows` | `crates/kiln/src/store/migrations/20261017-1200_w02_workflows.sql` |  |  |
 | `cluster_conf` | `crates/kiln/src/store/group.rs` |  |  |
-| `cluster_mark` | `crates/kiln/src/store/group.rs` | `crates/kiln/src/store/group.rs` |  |
-| `cluster_state` | `crates/kiln/src/store/group.rs` | `crates/kiln/src/store/group.rs` |  |
+| `cluster_mark` | `crates/kiln/src/store/group.rs` | `crates/kiln/src/store/group.rs` (tests only) |  |
+| `cluster_state` | `crates/kiln/src/store/group.rs` | `crates/kiln/src/store/group.rs` (tests only) |  |
 | `confirms` | `crates/kiln/src/store/migrations/20261114-2200_confirms.sql` |  |  |
 | `copied` | `crates/kiln/src/convo/sql.rs` |  |  |
 | `custody` | `crates/kiln/src/store/migrations/20261030-0100_w27_custody.sql` |  |  |
@@ -157,7 +157,7 @@ Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why.
 | `custody_things` | `crates/kiln/src/store/migrations/20261030-0100_w27_custody.sql` |  |  |
 | `d` | `crates/kiln/src/store/migrations.rs` |  | yes |
 | `dbq_custody_kept` | `crates/kiln/src/store/migrations/20261106-2102_dbq_custody.sql` | `crates/kiln/src/store/migrations/20261106-2102_dbq_custody.sql` |  |
-| `dbq_principals` | `crates/kiln/src/ci/review.rs`, `crates/kiln/src/store/migrations/20261106-2104_dbq_ci.sql` | `crates/kiln/src/ci/review.rs`, `crates/kiln/src/store/migrations/20261106-2104_dbq_ci.sql` |  |
+| `dbq_principals` | `crates/kiln/src/ci/review.rs`, `crates/kiln/src/store/migrations/20261106-2104_dbq_ci.sql` | `crates/kiln/src/ci/review.rs` (tests only), `crates/kiln/src/store/migrations/20261106-2104_dbq_ci.sql` |  |
 | `dbq_relays_passes` | `crates/kiln/src/store/migrations/20261106-2106_dbq_relays.sql` | `crates/kiln/src/store/migrations/20261106-2106_dbq_relays.sql` |  |
 | `deploy_apps` | `crates/kiln/src/store/migrations/20261019-0100_cd_deploy_api.sql` |  |  |
 | `deploy_environments` | `crates/kiln/src/store/migrations/20261019-0100_cd_deploy_api.sql` |  |  |
@@ -274,8 +274,8 @@ Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why.
 | `secret_reads` | `crates/kiln/src/store/migrations/20261019-1600_secrets_store.sql` |  |  |
 | `secret_versions` | `crates/kiln/src/store/migrations/20261019-1600_secrets_store.sql` |  |  |
 | `sessions` | `crates/kiln/src/aisessions.rs`, `crates/kiln/src/aisessions/devin.rs`, `crates/kiln/src/convo/sql.rs` |  |  |
-| `ship_changes` | `crates/kiln/src/ship.rs`, `crates/kiln/src/store/migrations/20261025-0100_ship_changes.sql` | `crates/kiln/src/ship.rs` |  |
-| `ship_changes_away` | `crates/kiln/src/ship.rs` | `crates/kiln/src/ship.rs` | yes |
+| `ship_changes` | `crates/kiln/src/ship.rs`, `crates/kiln/src/store/migrations/20261025-0100_ship_changes.sql` | `crates/kiln/src/ship.rs` (tests only) |  |
+| `ship_changes_away` | `crates/kiln/src/ship.rs` | `crates/kiln/src/ship.rs` (tests only) | yes |
 | `ship_handoffs` | `crates/kiln/src/store/migrations/20261029-0100_w26_handoffs.sql` |  |  |
 | `ship_order` | `crates/kiln/src/store/migrations/20261025-0100_ship_changes.sql` |  |  |
 | `ship_seq` | `crates/kiln/src/store/migrations/20261025-0100_ship_changes.sql` |  |  |
@@ -373,7 +373,7 @@ Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why.
 | `extension/manifest.json` | `crates/kiln/src/browser/stream.rs` |  | a file: a browser extension's manifest |
 | `files/s1.json` | `crates/kiln/src/harness/kept.rs` | yes |  |
 | `fixtures/shards-groups.json` | `crates/kiln/src/reach/place.rs` | yes |  |
-| `gone.json` | `crates/kiln/src/headroom/pace.rs` |  | tests only (headroom/pace.rs's tests: the reader takes their item as ended at a brace in a string) |
+| `gone.json` | `crates/kiln/src/headroom/pace.rs` | yes |  |
 | `guard.json` | `crates/kiln/src/protect.rs` | yes |  |
 | `handovers-decided.json` | `crates/kiln/src/harness/host.rs` |  | Records `kiln.files` |
 | `handovers-taken.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/inbox/faults.rs` |  | Records `kiln.files` |
@@ -385,7 +385,7 @@ Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why.
 | `hold.json` | `crates/kiln-lab/src/bar.rs` |  | lab output: a file |
 | `holders.json` | `crates/kiln/src/harness/registry.rs` |  | Records `kiln.files` |
 | `hooks/hooks.json` | `crates/kiln/src/skills/place.rs` | yes |  |
-| `identity.json` | `crates/kiln/src/ci/dependency_sources.rs` |  | a file: this device's sign-in and its key, a secret kept 0600 on its machine (`kiln login`) |
+| `identity.json` | `crates/kiln/src/ci/dependency_sources.rs` |  | a file, never Records: this device's sign-in and its key, a secret, and secrets don't go into the record store; kept 0600 on its machine (`kiln login`) |
 | `incidents/9.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
 | `incidents/{}.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
 | `indexes.json` | `crates/kiln/src/observe/indexes/mod.rs` |  | Records `kiln.files` |
@@ -398,7 +398,7 @@ Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why.
 | `kiln-mcp.json` | `crates/kiln/src/mcp/mod.rs` |  | a file: the agents' MCP configuration |
 | `kiln-{t}.json` | `crates/kiln/src/updates.rs` |  | a file: a binary kept the old way (`<data>/binaries`), taken into kiln's blob store as the server starts |
 | `lane.json` | `crates/kiln/src/runner/warm.rs` |  | Records `kiln.files` |
-| `live.json` | `crates/kiln/src/headroom/pace.rs` |  | tests only (headroom/pace.rs's tests: the reader takes their item as ended at a brace in a string) |
+| `live.json` | `crates/kiln/src/headroom/pace.rs` | yes |  |
 | `local.json` | `crates/kiln/src/harness/registry.rs` |  | Records `kiln.files` |
 | `manifest.json` | `crates/kiln/src/browser/stream.rs`, `crates/kiln/src/runner/rootfs.rs` |  | a file: a browser extension's manifest, or an image's (docker save), only read |
 | `member.json` | `crates/kiln/src/observe/owner.rs` |  | Records `kiln.files` |
@@ -415,7 +415,7 @@ Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why.
 | `other-agent-other.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
 | `p.json` | `crates/kiln/src/observe/collect/files.rs` | yes |  |
 | `pace.json` | `crates/kiln/src/sense/pace.rs` |  | Records `kiln.files` |
-| `paced.json` | `crates/kiln/src/headroom/pace.rs` |  | a file: read once and deleted (headroom::pace::release_left); nothing writes it now |
+| `paced.json` | `crates/kiln/src/headroom/pace.rs` | yes |  |
 | `pacer.json` | `crates/kiln/src/headroom/pace.rs` | yes |  |
 | `package.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/inbox/faults.rs` |  | scratch: a session's package, taken by Host::adopt_package, gone with it |
 | `pins.json` | `crates/kiln/src/reach/e2e.rs` |  | Records `kiln.files` |
@@ -552,9 +552,9 @@ The JSON files table above lists every `.json` file name in kiln's code. Its las
 - **Not a file:** an HTTP answer, or a key in kiln's blob store (kiln-seams' `Blobs`), which moves
   with its blobs.
 
-One of kiln's own is left a file on purpose: `identity.json`, this device's sign-in and its key, a
-secret kept 0600 on its machine. Records keeps no secrets apart from other values, so it isn't
-copied there.
+One of kiln's own stays a file on purpose, never Records: `identity.json`, this device's sign-in
+and its key, kept 0600 on its machine. It is a secret, and secrets don't go into the record store,
+so it isn't copied there (the coordinator's decision, 2026-11-22).
 
 `records::files::FILES` says where each kind of state file is kept (its base folder, and its paths
 under it) and which code writes and reads it. `kiln records carry` and `compare` carry and compare
