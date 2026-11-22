@@ -508,7 +508,9 @@ does inside one engine (`Engine::compact_some`: a copy "under the same numbers",
 Here it goes across engines:
 1. **Writers stopped.** The store is let go (`Store::close`, which calls `Engine::release`):
    everything is in the file, and its log is empty. The copy refuses a source whose `-wal` isn't
-   empty, and one whose `meta.rev` moved between its start and its end.
+   empty, and one whose `meta.rev` (read from the file) moved between its start and its end. On a
+   runner that means its runner stopped, which ends the sessions it runs: that step is the
+   person's, as every runner restart is.
 2. **The target is made beside where it goes** (`<target>.copy.tmp`), by Amphora's engine with the same
    migrations, and refused unless its `meta.schema` equals the source's. It isn't opened as a store
    until the copy is whole: opening it would make it a new `meta.id`.
