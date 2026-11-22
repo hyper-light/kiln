@@ -279,7 +279,7 @@ enum Cmd {
     Config(kiln::config_cli::ConfigArgs),
     /// Where the server keeps its bytes (docs/blobs.md): copy the local store's into S3.
     Blobs(kiln::blobs::cli::BlobsArgs),
-    /// kiln's goal and plan tables carried into Records and compared with them, by table, key and
+    /// Every table of kiln's store carried into Records and compared with them, by table, key and
     /// column (CP-T1.5): `carry`, `compare`.
     Records(kiln::records::cli::RecordsArgs),
     /// The Agentfiles kiln ships: `context` writes one's build context and prints its recipe.
