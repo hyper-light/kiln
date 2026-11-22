@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use crate::convo::rows::{EventRow, InboxRow, RecordRow, Row};
 use crate::convo::sql;
 use crate::convo::store::{Change, Changes, Compacting, Engine, InboxPage, Kept, Look, Mark, Query, Read, SearchFrom, Took, Unended};
+use crate::convo::copy::Cell;
 use crate::convo::telemetry::CompactView;
 
 /// Rows of each kind a feed reads at once.
@@ -1870,6 +1871,74 @@ impl Engine for Sql {
             }
         }
     }
+}
+
+/// The store's tables row by row, as they are, for a copy onto another engine (`convo::copy`; CP-T1.1, CP-T1.5): each
+/// value with its storage class ([`Cell`]), which both engines' values become and are made from.
+impl Sql {
+    /// Its tables, by name (SQLite's own left out), as [`Sql::tables`] reads them.
+    pub fn copy_tables(&self) -> anyhow::Result<Vec<String>> {
+        self.tables()
+    }
+
+    /// The migrations done on it ([`sql::SCHEMA_GET`]).
+    pub fn copy_schema(&self) -> anyhow::Result<Option<String>> {
+        self.meta("schema")
+    }
+
+    /// The rows of `table` after rowid `after`, in rowid order, every column whole: a compaction's step of them at
+    /// most ([`COMPACT_ROWS`], the store's own step of a copy), and the last one's rowid (`after` when there's none).
+    pub fn copy_page(&self, table: &str, after: i64) -> anyhow::Result<(Vec<Vec<Cell>>, i64)> {
+        let mut stmt = self.prepare(&format!("SELECT rowid, * FROM {table} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2"))?;
+        let (mut rows, mut last) = (Vec::new(), after);
+        self.run(&mut stmt, &[int(after), int(COMPACT_ROWS)], |r| {
+            last = r.get::<i64>(0).map_err(fail)?;
+            rows.push(r.get_values().skip(1).map(|v| cell_of(table, v)).collect::<anyhow::Result<Vec<Cell>>>()?);
+            Ok(())
+        })?;
+        Ok((rows, last))
+    }
+
+    /// Whole rows into `table`, in order, in one transaction, the table emptied first when `empty`: what is there
+    /// under the same key is replaced.
+    pub fn copy_put(&mut self, table: &str, rows: &[Vec<Cell>], empty: bool) -> anyhow::Result<()> {
+        let values: Vec<Vec<Value>> = rows.iter().map(|r| r.iter().map(value_of).collect::<anyhow::Result<Vec<Value>>>()).collect::<anyhow::Result<_>>()?;
+        self.transaction(|t| {
+            if empty {
+                t.exec(&format!("DELETE FROM {table}"))?;
+            }
+            t.put_rows(table, &values)
+        })
+    }
+
+    /// Everything in its log written into the file, the log emptied ([`Sql::flush`]).
+    pub fn copy_flush(&self) -> anyhow::Result<()> {
+        self.flush()
+    }
+}
+
+/// A value as `convo::copy` carries it between engines.
+fn cell_of(table: &str, v: &Value) -> anyhow::Result<Cell> {
+    use super::engine::types::ValueType;
+    Ok(match v.value_type() {
+        ValueType::Null => Cell::Null,
+        ValueType::Integer => Cell::Integer(v.as_int().ok_or_else(|| anyhow::anyhow!("an integer of {table} that isn't one"))?),
+        ValueType::Float => Cell::Real(v.as_float().to_bits()),
+        ValueType::Text => Cell::Text(v.to_text().ok_or_else(|| anyhow::anyhow!("a text of {table} that isn't UTF-8"))?.to_owned()),
+        ValueType::Blob => Cell::Blob(v.to_blob().map(<[u8]>::to_vec).unwrap_or_default()),
+        ValueType::Error => anyhow::bail!("a value of {table} the engine reads as an error"),
+    })
+}
+
+/// A value of this engine's from what `convo::copy` carries.
+fn value_of(c: &Cell) -> anyhow::Result<Value> {
+    Ok(match c {
+        Cell::Null => Value::Null,
+        Cell::Integer(i) => Value::from_i64(*i),
+        Cell::Real(bits) => Value::from_f64(f64::from_bits(*bits)),
+        Cell::Text(t) => Value::from_text(t.clone()),
+        Cell::Blob(b) => bytes(b)?,
+    })
 }
 
 #[cfg(test)]

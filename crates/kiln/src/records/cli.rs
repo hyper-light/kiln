@@ -34,6 +34,20 @@ enum RecordsCmd {
     /// Compare every table of kiln's store with its records: each row with no record, record with
     /// no row, and field that differs, by table, key and column. Fails when any differs.
     Compare(Where),
+    /// Copy a conversation store's Turso file into a new Amphora file, every table row by row under the same
+    /// numbers, and compare the two (`convo::copy`): the copy is the same store, its identity and its peers'
+    /// places in its feed kept. Let the store go first (stop its server or runner).
+    Conversations(Conversations),
+}
+
+#[derive(clap::Args)]
+struct Conversations {
+    /// The Turso file (a machine's conversations.db).
+    #[arg(long)]
+    from: PathBuf,
+    /// The Amphora file to make: it mustn't be there yet.
+    #[arg(long)]
+    into: PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -52,6 +66,14 @@ pub async fn run(args: RecordsArgs, cfg: &Config) -> Result<()> {
     let (w, carrying) = match args.cmd {
         RecordsCmd::Carry(w) => (w, true),
         RecordsCmd::Compare(w) => (w, false),
+        RecordsCmd::Conversations(c) => {
+            let copied = crate::convo::copy::copy(&c.from, &c.into)?;
+            for (table, rows) in &copied.tables {
+                println!("{table}: {rows} rows");
+            }
+            println!("copied {} into {}: the store {} at {}, compared the same", c.from.display(), c.into.display(), copied.id, copied.top);
+            return Ok(());
+        }
     };
     let path = w.store.unwrap_or_else(|| cfg.data("kiln.db"));
     anyhow::ensure!(path.is_file(), "no kiln store at {}", path.display());

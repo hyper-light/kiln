@@ -11,9 +11,11 @@
 //! - [`mirror`]: runners that keep a copy of the server's store.
 //! - [`telemetry`]: what each store and feed is doing, for the System page and its dashboards.
 //! - [`board`]: the server's board of every store: their state, series and what happened lately.
+//! - [`copy`]: a store's Turso file copied into an Amphora file, the same store under the same numbers.
 
 pub mod amphora;
 pub mod board;
+pub mod copy;
 pub mod feed;
 pub mod inbox;
 pub mod mirror;
