@@ -166,6 +166,23 @@ mod tests {
         );
     }
 
+    /// CP-T1.5 / CP-T1.6: each difference between the server's records and their copies is
+    /// reported by family and key, then how many.
+    #[test]
+    fn cp_t1_5_the_servers_records_report_each_difference_by_family_and_key() {
+        let d = |f: &str, k: &str, differs| Difference { table: f.into(), key: k.into(), differs };
+        let lines = records_report(&[d("deploy.lease", "776562", Differs::Value { from: 7, to: 8 }), d("deploy.release", "7231", Differs::NoRecord), d("deploy.release", "73", Differs::NoRow)]);
+        assert_eq!(
+            lines,
+            vec![
+                "deploy.lease 776562: a value that differs (7 bytes, 8 copied)".to_owned(),
+                "deploy.release 7231: the server's record, not copied".to_owned(),
+                "deploy.release 73: a copy the server doesn't keep".to_owned(),
+                "the server's records: 3 differences".to_owned(),
+            ]
+        );
+    }
+
     /// T-T1.5.2: what the command runs: carried, the two compare the same; a record with no row,
     /// put after, is found by its table and key, and carrying again doesn't take it away.
     #[test]
