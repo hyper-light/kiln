@@ -293,9 +293,37 @@ fn bytes(n: u64) -> String {
     crate::reach::directory::human_bytes(n)
 }
 
+/// Minimum mean I/O latency (µs) required before a non-PSI device (macOS, Windows, Linux without
+/// PSI) is treated as genuinely queueing past its knee: parallel multi-queue NVMe SSDs routinely
+/// serve 2-8 concurrent requests at 50-500 µs with zero contention, whereas saturated NVMe
+/// (e.g. 2026-11-21 Mac re-index: 12.7 in-flight at 2194 µs) and queueing HDDs exceed 2 ms.
+const IO_QUEUE_LATENCY_US: f64 = 2_000.0;
+/// Extreme non-PSI latency floor (µs) before cordoning an entire runner: local headroom throttling
+/// handles 2-10 ms I/O bursts cleanly; cordoning is reserved for sustained >= 10 ms saturation
+/// (or >= 25 ms on slower queues).
+const EXTREME_IO_LATENCY_US: f64 = 10_000.0;
+const EXTREME_HDD_LATENCY_US: f64 = 25_000.0;
+/// Maximum `target_use` used for emergency runner cordoning (at least 50% full-stall reserve),
+/// preventing mild 11-15% transient PSI bursts on 32-64 core machines from cordoning the runner.
+const EXTREME_CORDON_TARGET_USE: f64 = 0.50;
+
 /// Why the machine is strained, or none (see the module doc): the worst of its own, the runner's
 /// cgroup's and kiln's other services' memory and I/O full stalls, past `1 − target_use`.
 pub fn strained(m: &Measure, target_use: f64) -> Option<String> {
+    strained_with(m, target_use, super::pace::stand_ins(), false)
+}
+
+/// Emergency-only strain predicate used by placement before cordoning an entire runner: requires
+/// extreme machine-wide saturation (>= 50% full stalls on PSI/swap, >= 10 ms deep queueing on
+/// non-PSI devices, or macOS `MemoryLevel::Critical`) so moderate/spiky load is handled by
+/// granular local headroom pacing instead of cordoning the runner.
+pub fn extreme_strained(m: &Measure, target_use: f64) -> Option<String> {
+    strained_with(m, target_use.min(EXTREME_CORDON_TARGET_USE), super::pace::stand_ins(), true)
+}
+
+/// Pure core of [`strained`] and [`extreme_strained`] taking the pace stand-ins explicitly so
+/// every platform's edge cases are tested without global state.
+fn strained_with(m: &Measure, target_use: f64, stand_ins: (Option<f64>, Option<f64>, Option<f64>, Option<f64>), extreme: bool) -> Option<String> {
     let reserve = (1.0 - target_use).clamp(0.0, 1.0);
     let stall = |p: &super::Pressure| p.memory.full.unwrap_or(0.0) + p.io.full.unwrap_or(0.0);
     let mut worst: Option<(f64, String)> = None;
@@ -304,8 +332,16 @@ pub fn strained(m: &Measure, target_use: f64) -> Option<String> {
             worst = Some((v, who.to_owned()));
         }
     };
-    let (swap, device_rho, stretch) = super::pace::stand_ins();
-    let (memory, swapping) = machine_memory(m.pressure.memory.full, swap);
+    let (swap, pace_rho, stretch, pace_latency_us) = stand_ins;
+    // On macOS, when XNU itself reports `MemoryLevel::Normal` AND at least 10% of physical memory
+    // is genuinely free (`VmPages::room`, which already deducts compressor pressure), transient
+    // background swap-ins are not machine-wide thrashing and must not cordon a healthy Mac.
+    let swap_effective = if m.memory_level == Some(super::MemoryLevel::Normal) && m.mem_total > 0 && m.mem_available.saturating_mul(10) >= m.mem_total {
+        None
+    } else {
+        swap
+    };
+    let (memory, swapping) = machine_memory(m.pressure.memory.full, swap_effective);
     weigh(memory + m.pressure.io.full.unwrap_or(0.0), if swapping { "the machine (swapping)" } else { "the machine" });
     if let Some(c) = &m.cgroup {
         weigh(stall(&c.pressure), "the runner's own cgroup");
@@ -317,15 +353,39 @@ pub fn strained(m: &Measure, target_use: f64) -> Option<String> {
     if m.memory_level == Some(super::MemoryLevel::Critical) {
         return Some("macOS says its memory pressure is critical: even compressed, its working set no longer fits".to_owned());
     }
-    // Where the kernel keeps no I/O stall time (macOS, Windows), the work device past its knee:
-    // its utilization by M/M/1 against its own uncontended latency past the load at which
-    // latency rises faster than throughput (Kleinrock's power, ρ* = 1/2 for one server:
-    // `kiln_ci::sched::state::knee(1)`), as Linux's I/O stall past the reserve would.
-    if m.pressure.io.full.is_none()
-        && let Some(rho) = device_rho
-        && rho > kiln_ci::sched::state::knee(1)
-    {
-        return Some(format!("its work device is past its knee: its latency is {:.1}× its own uncontended, {:.0}% busy by M/M/1, past the {:.0}% at which latency rises faster than throughput", stretch.unwrap_or(0.0), rho * 100.0, kiln_ci::sched::state::knee(1) * 100.0));
+    // Where the kernel keeps no I/O stall time (macOS, Windows, Linux without PSI), check the work
+    // device. Prefer the fresh `m.device` from this measure over the pace singleton so an idle
+    // disk clears strain immediately instead of sticking on a stale event read. Parallel multi-queue
+    // NVMe SSDs routinely run `in_flight > 1` (`rho > 0.50`) at sub-millisecond latency with zero
+    // queueing; require real queueing latency (`>= 2 ms`, or `>= 10 ms` for emergency runner
+    // cordoning) so healthy NVMe concurrency never falsely cordons a runner.
+    if m.pressure.io.full.is_none() {
+        let (io_rho, io_latency_us) = match &m.device {
+            Some(act) => (
+                kiln_ci::pace::device::utilization(act.in_flight),
+                kiln_ci::pace::device::mean_latency(act.read_latency_us, act.read_ops_per_s, act.write_latency_us, act.write_ops_per_s),
+            ),
+            None => (pace_rho, pace_latency_us),
+        };
+        if let Some(rho) = io_rho {
+            let knee_single = kiln_ci::sched::state::knee(1);
+            let deep = target_use.max(0.85);
+            let io_strained = if extreme {
+                match io_latency_us {
+                    Some(lat) => (rho > 0.85 && lat >= EXTREME_IO_LATENCY_US) || (rho > 0.75 && lat >= EXTREME_HDD_LATENCY_US),
+                    None => rho > 0.92,
+                }
+            } else {
+                match io_latency_us {
+                    Some(lat) => rho > knee_single && (lat >= IO_QUEUE_LATENCY_US || (rho > deep && stretch.is_some_and(|s| s >= 8.0) && lat >= 1_000.0)),
+                    None => rho > deep,
+                }
+            };
+            if io_strained {
+                let lat_str = io_latency_us.map(|l| format!("mean latency {:.1} ms, ", l / 1_000.0)).unwrap_or_default();
+                return Some(format!("its work device is past its knee: {lat_str}{:.0}% queued by M/M/1, past the {:.0}% threshold", rho * 100.0, knee_single * 100.0));
+            }
+        }
     }
     let (v, who) = worst?;
     (v > reserve).then(|| format!("{who}'s tasks all stalled on memory and I/O {:.0}% of the time, past the {:.0}% the scheduler keeps in reserve (1 − target_use)", v * 100.0, reserve * 100.0))
@@ -400,6 +460,44 @@ mod tests {
         assert_eq!(machine_memory(Some(0.02), Some(0.99)), (0.02, false), "PSI's measure, not the estimate");
         assert_eq!(machine_memory(None, Some(0.3)), (0.3, true));
         assert_eq!(machine_memory(None, None), (0.0, false));
+    }
+
+    /// Cross-platform non-PSI strain guard: parallel multi-queue NVMe I/O at sub-millisecond
+    /// latency must not falsely cordon macOS/Windows runners (`in_flight > 1.0` gives M/M/1
+    /// `rho > 0.50` even at 100 µs latency!), while genuine queueing (>= 2 ms) still cordons,
+    /// fresh idle `m.device` immediately overrides stale stand-ins, and macOS `MemoryLevel::Normal`
+    /// with ample free RAM ignores transient swap-in bursts.
+    #[test]
+    fn non_psi_nvme_parallel_io_and_normal_macos_memory_do_not_falsely_cordon() {
+        let m = calm();
+        // Healthy parallel NVMe build: 3 requests in flight (rho = 0.75 > 0.50), fast 120 µs latency -> NOT strained.
+        assert_eq!(strained_with(&m, 0.85, (None, Some(0.75), Some(2.0), Some(120.0)), false), None);
+        // Real Mac NVMe thrashing (2026-11-21 re-index: 12.67 in flight -> rho = 0.927, 2194 µs) -> strained for normal check, NOT extreme cordon (local headroom handles 2 ms bursts).
+        assert!(strained_with(&m, 0.85, (None, Some(0.927), Some(116.0), Some(2_194.0)), false).is_some());
+        assert_eq!(strained_with(&m, 0.50, (None, Some(0.927), Some(116.0), Some(2_194.0)), true), None);
+        // Extreme NVMe saturation (rho = 0.93, 15 ms latency) -> triggers extreme cordon.
+        assert!(strained_with(&m, 0.50, (None, Some(0.93), Some(150.0), Some(15_000.0)), true).is_some());
+        // Real HDD queueing (1.5 in flight -> rho = 0.60, 15 ms latency) -> strained.
+        assert!(strained_with(&m, 0.85, (None, Some(0.60), Some(3.0), Some(15_000.0)), false).is_some());
+        // Fresh idle `m.device` overrides stale thrashing stand-ins immediately.
+        let mut fresh_idle = calm();
+        fresh_idle.device = Some(disk::Activity { read_ops_per_s: 20.0, read_latency_us: Some(90.0), in_flight: 0.05, interval_us: 1_000_000, ..disk::Activity::default() });
+        assert_eq!(strained_with(&fresh_idle, 0.85, (None, Some(0.95), Some(50.0), Some(5_000.0)), false), None);
+        // macOS `MemoryLevel::Normal` with 50% RAM free ignores transient swap stand-in.
+        let mut mac_roomy = calm();
+        mac_roomy.memory_level = Some(super::super::MemoryLevel::Normal);
+        assert_eq!(strained_with(&mac_roomy, 0.85, (Some(0.40), None, None, None), false), None);
+        // macOS `MemoryLevel::Normal` with <10% RAM free (like 2026-11-13 swapping Macs) still catches real swap thrashing.
+        let mut mac_tight = mac_roomy;
+        mac_tight.mem_available = GIB; // 1 GiB / 32 GiB = 3.1% < 10%
+        assert!(strained_with(&mac_tight, 0.85, (Some(0.40), None, None, None), false).is_some());
+        // Extreme Linux PSI cordon requires > 50% full stalls (not a 20% build burst on a 64-core box).
+        let mut linux_mod = calm();
+        linux_mod.pressure = Pressure { memory: Stall { some: None, full: Some(0.05) }, io: Stall { some: None, full: Some(0.20) }, ..Pressure::default() };
+        assert_eq!(extreme_strained(&linux_mod, 0.90), None);
+        let mut linux_extreme = calm();
+        linux_extreme.pressure = Pressure { memory: Stall { some: None, full: Some(0.25) }, io: Stall { some: None, full: Some(0.35) }, ..Pressure::default() };
+        assert!(extreme_strained(&linux_extreme, 0.90).is_some());
     }
 
     #[test]

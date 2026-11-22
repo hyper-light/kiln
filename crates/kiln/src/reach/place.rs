@@ -464,7 +464,12 @@ pub struct Placer {
     sensor: Option<crate::sense::Sensor>,
     last: Option<crate::sense::Measure>,
     strained: Option<String>,
-    /// When a strain measured from the pace's stand-ins is read again ([`follow_up_at`]).
+    /// When extreme strain was first continuously observed, and how many consecutive measures saw
+    /// it: cordoning a runner requires sustained extreme strain (not a single spiky burst).
+    strain_since: Option<i64>,
+    strain_hits: u32,
+    /// When a strain measured from the pace's stand-ins (or a pending cordon confirmation) is read
+    /// again ([`follow_up_at`]).
     follow_up_at: Option<i64>,
     /// Probes its health bars (L2), by owner and epoch: answered so, and probed once a measure
     /// shows the cause cleared.
@@ -834,6 +839,37 @@ pub fn machine_of(r: &RunnerInfo) -> Machine {
     Machine { name: r.name.clone(), facts, labels: r.labels.clone(), size, epoch: 0, connected: r.connected && r.reach, places: feature::speaks(&r.features, feature::PLACE), idle: None, syncs: feature::speaks(&r.features, feature::PLACE_SYNC), fast: feature::speaks(&r.features, feature::FAST) }
 }
 
+/// How long extreme strain must persist across consecutive measures before cordoning the entire
+/// runner (ms): transient spikes (Rust link, git gc, APFS snapshot, Defender scan) are absorbed by
+/// granular local headroom pacing without cordoning the runner.
+const STRAIN_SUSTAIN_MS: i64 = 10_000;
+
+/// Spike-resistant runner cordon gate: returns `(cordoned_why, pending_confirmation)`.
+/// - Calm (`raw == None`) clears immediately.
+/// - Urgent OS emergency (`urgent == true`, e.g. macOS `MemoryLevel::Critical`) cordons at once.
+/// - Any other extreme strain must persist across >= 2 consecutive measures spanning at least
+///   [`STRAIN_SUSTAIN_MS`] before cordoning the runner; while confirming, `pending_confirmation`
+///   is `true` so placement schedules a follow-up read.
+fn cordon_gate(raw: Option<String>, urgent: bool, now: i64, since: &mut Option<i64>, hits: &mut u32) -> (Option<String>, bool) {
+    let Some(why) = raw else {
+        *since = None;
+        *hits = 0;
+        return (None, false);
+    };
+    if urgent {
+        *since.get_or_insert(now) = *since.get_or_insert(now);
+        *hits = hits.saturating_add(1);
+        return (Some(why), false);
+    }
+    let start = *since.get_or_insert(now);
+    *hits = hits.saturating_add(1);
+    if *hits >= 2 && now.saturating_sub(start) >= STRAIN_SUSTAIN_MS {
+        (Some(why), false)
+    } else {
+        (None, true)
+    }
+}
+
 /// How long after a strain measured from the pace's stand-ins they're read again, ms: Linux's PSI
 /// window for an unprivileged process, borrowed so a strain's end is seen as soon after it on every
 /// OS as Linux's trigger sees it (docs/needs.md §17.2). The kernel's own words
@@ -1068,7 +1104,7 @@ impl Placer {
         let mut owner = Owner::seeded(me, epoch, rand::random());
         owner.configure(&settings);
         let init = Init { me: me.to_owned(), epoch, since: None, facts: facts.clone(), labels: labels.clone(), sample, records: Records::new(), settings };
-        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), keeper: None, numbering: kiln_ci::place::holder::Numbering::new(epoch), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, follow_up_at: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default(), outlived: Vec::new() }
+        Placer { me: me.to_owned(), epoch, owner, admission: Admission::new(init, now), specs: BTreeMap::new(), keeper: None, numbering: kiln_ci::place::holder::Numbering::new(epoch), started: BTreeMap::new(), machines: Vec::new(), facts, labels, away: std::collections::BTreeSet::new(), told_to: std::collections::BTreeSet::new(), hinted: None, waits: BTreeMap::new(), gone: Vec::new(), waits_moved: false, whole: true, sensor: None, last: None, strained: None, strain_since: None, strain_hits: 0, follow_up_at: None, parked: Vec::new(), groups: std::collections::HashMap::new(), asked_keys: std::collections::HashMap::new(), aliases: std::collections::HashMap::new(), pace: kiln_ci::pace::Pace::default(), draining: false, unplugged: None, topo: None, links: BTreeMap::new(), records: None, unkept: BTreeMap::new(), to_deliver: Vec::new(), askers: BTreeMap::new(), restored: std::collections::BTreeSet::new(), known: std::collections::BTreeSet::new(), budget: super::budget::Budget::new(me, epoch), hand: handoff::Hand::default(), outlived: Vec::new() }
     }
 
     /// It measures its machine itself on events, with `sensor` (AUDIT L1, L2; W05-R26).
@@ -1099,8 +1135,17 @@ impl Placer {
         let target = kiln_ci::sched::state::knee(m.cpus);
         // Over the window the decision is about (sense::window): since the load here last changed.
         let weighed = window.as_ref().unwrap_or(&m);
-        let strained = crate::sense::health::strained(weighed, target);
-        self.follow_up_at = follow_up_at(strained.is_some(), weighed.pressure.io.full.is_some(), now);
+        // Cordoning an entire runner is last-resort only: require extreme saturation AND
+        // sustained persistence across consecutive measures so spikes are handled locally by
+        // granular headroom pacing rather than cordoning the runner.
+        let raw_strained = crate::sense::health::extreme_strained(weighed, target);
+        let urgent = weighed.memory_level == Some(crate::sense::MemoryLevel::Critical);
+        let (strained, confirming) = cordon_gate(raw_strained, urgent, now, &mut self.strain_since, &mut self.strain_hits);
+        self.follow_up_at = if confirming {
+            Some(now.saturating_add(FOLLOW_UP_MS))
+        } else {
+            follow_up_at(strained.is_some(), weighed.pressure.io.full.is_some(), now)
+        };
         if let Ok(mut h) = crate::sense::health::runner().lock() {
             h.measured(&m);
         }
@@ -2401,6 +2446,28 @@ mod measure_tests {
         assert!(p.follow_up_due(due), "not due at its time");
         assert!(!p.follow_up_due(due), "due twice for one strain's measure");
         assert!(p.follow_up_at.is_none());
+    }
+
+    #[test]
+    fn cordon_gate_absorbs_transient_spikes_and_cordons_only_sustained_extreme_strain() {
+        let (mut since, mut hits) = (None, 0u32);
+        // First spiky reading: confirms instead of immediately cordoning.
+        let (c1, pending1) = cordon_gate(Some("extreme stall".into()), false, 1_000, &mut since, &mut hits);
+        assert!(c1.is_none() && pending1, "single spike must not cordon immediately");
+        // Second reading only 2s later: still confirming (< 10s sustained).
+        let (c2, pending2) = cordon_gate(Some("extreme stall".into()), false, 3_000, &mut since, &mut hits);
+        assert!(c2.is_none() && pending2);
+        // Spike clears at 5s: resets completely with zero cordon ever issued.
+        let (c3, pending3) = cordon_gate(None, false, 5_000, &mut since, &mut hits);
+        assert!(c3.is_none() && !pending3 && since.is_none() && hits == 0);
+        // Sustained extreme strain across >= 10s: cordons the runner.
+        let _ = cordon_gate(Some("extreme stall".into()), false, 10_000, &mut since, &mut hits);
+        let (c4, pending4) = cordon_gate(Some("extreme stall".into()), false, 20_500, &mut since, &mut hits);
+        assert!(c4.is_some() && !pending4, "sustained extreme strain should cordon");
+        // Urgent OS critical memory pressure cordons immediately.
+        let (mut s2, mut h2) = (None, 0u32);
+        let (cu, pu) = cordon_gate(Some("macOS critical".into()), true, 1_000, &mut s2, &mut h2);
+        assert!(cu.is_some() && !pu);
     }
 }
 

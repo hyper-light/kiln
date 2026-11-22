@@ -30,6 +30,8 @@ use crate::harness::session::{Sink, Taken};
 
 /// Longest a read waits for the writer.
 pub const READ_WAIT: Duration = Duration::from_secs(10);
+/// Longest an inbox operation waits for the writer under transient disk bursts.
+pub const INBOX_WAIT: Duration = Duration::from_secs(30);
 /// The most sessions [`Store::ended`] answers a page.
 pub const ENDED_MAX: usize = 1000;
 /// While the writer has nothing else to do, record lines kept before lines were compressed are
@@ -457,11 +459,26 @@ struct InboxJob {
     reply: futures::channel::oneshot::Sender<anyhow::Result<Result<u64, kiln_seams::records::Refusal>>>,
 }
 
+/// A priority inbox operation that jumps ahead of queued `Msg::Rows` bursts while preserving strict
+/// FIFO linearizability among all inbox reads and commits.
+enum InboxOp {
+    Commit(Box<InboxJob>),
+    Run(Job),
+}
+
+#[derive(Default)]
+struct InboxState {
+    queue: std::collections::VecDeque<InboxOp>,
+    stopped: bool,
+}
+
+type InboxQueue = Arc<parking_lot::Mutex<InboxState>>;
+
 enum Msg {
     /// Rows, and the bytes [`Queue`] counts them at.
     Rows(Vec<Row>, usize),
-    /// A commit to the sessions' inboxes: those that come together go in one transaction, one sync.
-    Inbox(Box<InboxJob>),
+    /// Wakes the writer when the priority inbox queue transitions from empty to non-empty.
+    InboxWake,
     /// Run on the engine, between commits (whatever was sent before it is committed first).
     Run(Job),
     /// Commit what was sent before, let go of the file ([`Engine::release`]) and stop.
@@ -580,6 +597,7 @@ impl Queue {
 #[derive(Clone)]
 pub struct Store {
     tx: mpsc::Sender<Msg>,
+    inbox_q: InboxQueue,
     queue: Arc<Queue>,
     id: Arc<str>,
     meter: Arc<Meter>,
@@ -594,6 +612,7 @@ impl Store {
     /// The store, its writer thread started on `engine`, looking after its file as `upkeep` says.
     pub fn start(engine: Box<dyn Engine>, upkeep: Upkeep) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel::<Msg>();
+        let inbox_q: InboxQueue = Arc::new(parking_lot::Mutex::new(InboxState { queue: std::collections::VecDeque::new(), stopped: false }));
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
         let meter: Arc<Meter> = Arc::default();
@@ -607,9 +626,9 @@ impl Store {
             }
             None => None,
         };
-        let (w, m, h, q, r) = (watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue), reads.clone());
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h, &q, r.as_ref()))?;
-        Ok(Self { tx, queue, id, meter, watchers, hold, reads })
+        let (iq, w, m, h, q, r) = (Arc::clone(&inbox_q), watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue), reads.clone());
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &iq, &w, upkeep, &m, &h, &q, r.as_ref()))?;
+        Ok(Self { tx, inbox_q, queue, id, meter, watchers, hold, reads })
     }
 
     /// Keeps the records of sessions that ended at or after `ended_ms` (unix ms), however long
@@ -764,15 +783,29 @@ impl Store {
         }
     }
 
-    /// [`Store::run`], awaited: the caller's shard is never held while the writer works (`READ_WAIT` at most).
-    async fn run_async<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+    /// Enqueues a priority inbox operation ahead of bulk `Msg::Rows`, waking the writer if idle.
+    fn push_inbox(&self, op: InboxOp) -> anyhow::Result<()> {
+        let wake = {
+            let mut st = self.inbox_q.lock();
+            if st.stopped {
+                anyhow::bail!("the conversation store has stopped");
+            }
+            let was_empty = st.queue.is_empty();
+            st.queue.push_back(op);
+            was_empty
+        };
+        if wake {
+            let _ = self.tx.send(Msg::InboxWake);
+        }
+        Ok(())
+    }
+
+    async fn inbox_run_async<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
         let (rtx, rrx) = futures::channel::oneshot::channel();
-        self.tx
-            .send(Msg::Run(Box::new(move |e| {
-                let _ = rtx.send(f(e));
-            })))
-            .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
-        match crate::rt::timeout(READ_WAIT, rrx).await {
+        self.push_inbox(InboxOp::Run(Box::new(move |e| {
+            let _ = rtx.send(f(e));
+        })))?;
+        match crate::rt::timeout(INBOX_WAIT, rrx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => Err(anyhow::anyhow!("the conversation store has stopped")),
             Err(_) => {
@@ -784,14 +817,14 @@ impl Store {
 
     /// A row of a session's inbox and journal ([`Engine::inbox_get`]), read on the writer: what the inbox reads to
     /// decide a commit must be every commit before it (`Consistency::Linearizable`), which a reader beside the writer
-    /// may not have seen yet.
+    /// may not have seen yet. Runs on the priority inbox queue so heavy row bursts cannot starve message intake.
     pub async fn inbox_get(&self, family: String, key: Vec<u8>) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
-        self.run_async(move |e| e.inbox_get(&family, &key)).await
+        self.inbox_run_async(move |e| e.inbox_get(&family, &key)).await
     }
 
     /// A family's inbox rows in key order ([`Engine::inbox_scan`]), read on the writer as [`Store::inbox_get`] is.
     pub async fn inbox_scan(&self, family: String, prefix: Vec<u8>, after: Option<Vec<u8>>, limit: usize) -> anyhow::Result<InboxPage> {
-        self.run_async(move |e| e.inbox_scan(&family, &prefix, after.as_deref(), limit)).await
+        self.inbox_run_async(move |e| e.inbox_scan(&family, &prefix, after.as_deref(), limit)).await
     }
 
     /// `tx` committed to the inbox on the writer, after what was sent before it ([`Engine::inbox_commit`]), synced past
@@ -799,8 +832,8 @@ impl Store {
     /// writer is done with it. Its feed is told.
     pub async fn inbox_commit(&self, tx: kiln_seams::records::Tx, sessions: Vec<String>, owner: Option<Box<dyn Send + Sync>>) -> anyhow::Result<Result<u64, kiln_seams::records::Refusal>> {
         let (reply, answer) = futures::channel::oneshot::channel();
-        self.tx.send(Msg::Inbox(Box::new(InboxJob { tx, sessions, owner, reply }))).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
-        match crate::rt::timeout(READ_WAIT, answer).await {
+        self.push_inbox(InboxOp::Commit(Box::new(InboxJob { tx, sessions, owner, reply })))?;
+        match crate::rt::timeout(INBOX_WAIT, answer).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => Err(anyhow::anyhow!("the conversation store has stopped")),
             Err(_) => {
@@ -830,7 +863,7 @@ impl Store {
 
     /// The store's numbers go on from past `rev` at least ([`Engine::inbox_floor`]).
     pub async fn inbox_floor(&self, rev: u64) -> anyhow::Result<()> {
-        self.run_async(move |e| e.inbox_floor(rev)).await
+        self.inbox_run_async(move |e| e.inbox_floor(rev)).await
     }
 
     /// Run `f` on the reader beside the writer, at the last commit ([`Read`]): never behind what was sent before it,
@@ -1116,7 +1149,7 @@ impl Store {
 /// everything sent before it. Rows waited up to `COMMIT_MS` (50 ms) for others to share their commit, or for
 /// `COMMIT_ROWS` (2048) of them.
 #[allow(clippy::too_many_arguments)]
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue, reads: Option<&mpsc::Sender<ReadMsg>>) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &InboxQueue, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue, reads: Option<&mpsc::Sender<ReadMsg>>) {
     let keep_closed = upkeep.keep_closed;
     // The hold on letting records go as it last looked: one moved later lets more go, so it looks
     // again.
@@ -1208,10 +1241,33 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
             notify(watchers);
         }
     };
+    let drain_inbox = |engine: &mut Box<dyn Engine>, inbox: &mut Vec<Box<InboxJob>>| {
+        loop {
+            let ops: Vec<InboxOp> = {
+                let mut st = inbox_q.lock();
+                if st.queue.is_empty() {
+                    return;
+                }
+                st.queue.drain(..).collect()
+            };
+            for op in ops {
+                match op {
+                    InboxOp::Commit(job) => inbox.push(job),
+                    InboxOp::Run(f) => {
+                        commit_inbox(engine, inbox);
+                        f(engine.as_mut());
+                        meter.ran();
+                    }
+                }
+            }
+            commit_inbox(engine, inbox);
+        }
+    };
     let mut inbox: Vec<Box<InboxJob>> = Vec::new();
     const DRAIN_MSGS_MAX: usize = 64;
     const DRAIN_BYTES_MAX: usize = 256 << 10;
     loop {
+        drain_inbox(&mut engine, &mut inbox);
         let idle = if squeezing || looking || compacting.is_some() { SQUEEZE_EVERY } else { look_at.saturating_duration_since(Instant::now()).max(SQUEEZE_EVERY).min(LOOK_FILE) };
         // Nothing waits here between commits (each takes all there is), so the writer waits on its channel: the first of
         // what's sent wakes it, and what's sent while it commits waits there, waking nothing (goal 9, plan 01a1a87b2cec
@@ -1223,6 +1279,8 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         let began = Instant::now();
         match got {
             Ok(first) => {
+                // Service any priority inbox ops first before draining bulk rows.
+                drain_inbox(&mut engine, &mut inbox);
                 // Drain a bounded slice of what waits so a large event burst never starves inbox
                 // commits or control reads behind unbounded `Msg::Rows` draining.
                 let mut next = Some(first);
@@ -1236,15 +1294,18 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             #[cfg(test)]
                             queue.took_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
                         }
-                        Msg::Inbox(job) => inbox.push(job),
+                        Msg::InboxWake => drain_inbox(&mut engine, &mut inbox),
                         Msg::Run(f) => {
-                            commit_inbox(&mut engine, &mut inbox);
+                            drain_inbox(&mut engine, &mut inbox);
                             commit(&mut engine, &mut pending, &mut pending_bytes);
                             f(engine.as_mut());
                             meter.ran();
                         }
                         Msg::Close(reply) => {
-                            commit_inbox(&mut engine, &mut inbox);
+                            {
+                                inbox_q.lock().stopped = true;
+                            }
+                            drain_inbox(&mut engine, &mut inbox);
                             commit(&mut engine, &mut pending, &mut pending_bytes);
                             // Its files closed before it says so, its reader's first: whoever moves them next finds them
                             // let go of.
@@ -1260,12 +1321,12 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             return;
                         }
                     }
-                    if (!inbox.is_empty() && drained >= 16) || drained >= DRAIN_MSGS_MAX || pending_bytes >= DRAIN_BYTES_MAX {
+                    if !inbox_q.lock().queue.is_empty() || drained >= DRAIN_MSGS_MAX || pending_bytes >= DRAIN_BYTES_MAX {
                         break;
                     }
                     next = rx.try_recv().ok();
                 }
-                commit_inbox(&mut engine, &mut inbox);
+                drain_inbox(&mut engine, &mut inbox);
                 commit(&mut engine, &mut pending, &mut pending_bytes);
             }
             // Nothing waits (each commit took all there was): the file's upkeep.
@@ -1493,7 +1554,7 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 #[cfg(test)]
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::channel();
-    Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), reads: None }
+    Store { tx, queue: Arc::default(), inbox_q: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), reads: None }
 }
 
 /// An engine that takes `hold` longer than `inner` to let go of its file ([`Engine::release`]), its
@@ -2275,6 +2336,35 @@ mod tests {
         let failing = Store::start(Box::new(FailingApply { inner: Box::new(super::super::turso::Turso::open(&dir2.path().join(super::super::FILE))?) }), Upkeep::default())?;
         let ok = failing.put_wait(rows::of("a1", &said("m1", 1, "cannot drop silently"), crate::util::now_ms()));
         anyhow::ensure!(!ok, "put_wait must return false when engine.apply fails");
+        Ok(())
+    }
+
+    #[test]
+    fn inbox_ops_jump_ahead_of_queued_row_bursts_without_starvation() -> anyhow::Result<()> {
+        let (_dir, store) = scratch()?;
+        // Flood the writer channel with 500 separate row batches (far more than one drain slice),
+        // then immediately submit an inbox commit + linearizable read.
+        for i in 0..500u64 {
+            store.put(rows::of("noisy", &said(&format!("e-{i}"), i + 1, "bulk stream line"), crate::util::now_ms()));
+        }
+        let store_c = store.clone();
+        let (committed, read_back) = crate::rt::block_on(async move {
+            let tx = kiln_seams::records::Tx {
+                conds: Vec::new(),
+                writes: vec![kiln_seams::records::Write::Put {
+                    family: "inbox".into(),
+                    key: b"sess-prio/msg-1".to_vec(),
+                    value: b"urgent".to_vec(),
+                }],
+            };
+            let rev = store_c.inbox_commit(tx, vec!["sess-prio".into()], None).await?;
+            let got = store_c.inbox_get("inbox".into(), b"sess-prio/msg-1".to_vec()).await?;
+            anyhow::Ok((rev, got))
+        })?;
+        anyhow::ensure!(committed.is_ok(), "inbox_commit failed under row burst: {committed:?}");
+        anyhow::ensure!(read_back.as_ref().map(|(v, _)| v.as_slice()) == Some(b"urgent".as_slice()), "linearizable inbox_get missed priority commit: {read_back:?}");
+        store.sync()?;
+        anyhow::ensure!(store.kept("noisy", 600)?.map(|k| k.events.len()) == Some(500), "all 500 bulk rows must still be durably committed");
         Ok(())
     }
 }

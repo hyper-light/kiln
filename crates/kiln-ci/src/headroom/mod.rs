@@ -55,10 +55,15 @@ pub struct Target {
     /// disk under it is shown to take, on a machine whose disks don't say (`Engine::least_writes`).
     #[serde(default)]
     pub sync_bytes: Option<f64>,
+    /// Passive (unprobed, event-driven) target such as `agent messages`: only produces samples
+    /// when work happens, so it must never trigger disk write cuts when probed disk targets are
+    /// calm, and its alarm auto-clears once nothing is waiting for a full tolerance window.
+    #[serde(default)]
+    pub passive: bool,
 }
 
 /// The version of what's learned that this build reads as its own ([`Learned::version`]).
-pub const LEARNED_VERSION: u32 = 3;
+pub const LEARNED_VERSION: u32 = 4;
 
 /// What the engine learned, kept between runs.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -345,9 +350,11 @@ impl Engine {
         self.learned.detectors.values().any(|d| d.alarm.is_some())
     }
 
-    /// Whether a target that comes first (`first`), or one that doesn't, is in trouble.
+    /// Whether a probed target that comes first (`first`), or a probed target that doesn't, is in
+    /// trouble. Passive (unprobed) targets such as `agent messages` are excluded from disk trouble
+    /// so a slow harness startup or LLM turnaround never stops all disk writers on the runner.
     fn alarmed_where(&self, first: bool) -> bool {
-        self.targets.iter().filter(|t| t.first == first).any(|t| self.learned.detectors.get(&t.name).is_some_and(|d| d.alarm.is_some()))
+        self.targets.iter().filter(|t| t.first == first && !t.passive).any(|t| self.learned.detectors.get(&t.name).is_some_and(|d| d.alarm.is_some()))
     }
 
     /// The longest a cut of kiln's has taken to show, of its writes or its CPU (11-05: the CPU's
@@ -434,7 +441,23 @@ impl Engine {
                 (a, w) => a.or(w),
             }
         };
-        o.inflight.iter().filter_map(|(n, age)| after(n, *age)).fold(None, |a: Option<f64>, r| Some(a.map_or(r, |a| a.min(r)))).map(|r| o.now_us.saturating_add(r.ceil() as u64).saturating_add(1))
+        let inflight_due = o.inflight.iter().filter_map(|(n, age)| after(n, *age)).fold(None, |a: Option<f64>, r| Some(a.map_or(r, |a| a.min(r)))).map(|r| o.now_us.saturating_add(r.ceil() as u64).saturating_add(1));
+        // Passive targets with nothing waiting wake once their tolerance window elapses so a
+        // one-off slow message delivery never sticks the engine in alarm forever.
+        let passive_due = self
+            .targets
+            .iter()
+            .filter(|t| t.passive && !o.inflight.iter().any(|(n, _)| n == &t.name))
+            .filter_map(|t| {
+                let d = self.learned.detectors.get(&t.name)?;
+                d.alarm.as_ref()?;
+                Some(d.last_us().saturating_add(t.tolerance_us as u64).saturating_add(1))
+            })
+            .min();
+        match (inflight_due, passive_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     pub fn step(&mut self, o: &Observation) -> Plan {
@@ -548,6 +571,28 @@ impl Engine {
                 events.push(format!("{name}: {why}"));
             }
         }
+        // Passive (unprobed) targets such as `agent messages` only produce samples while messages
+        // wait. Once nothing is waiting and a full tolerance window has elapsed with no new slow
+        // delivery, clear the alarm so a one-off slow harness startup cannot lock the pacer forever.
+        for t in self.targets.iter().filter(|t| t.passive) {
+            let has_inflight = o.inflight.iter().any(|(n, _)| n == &t.name);
+            let had_rising_answer = o.answers.iter().any(|(n, a)| {
+                n == &t.name
+                    && match a {
+                        Answer::Took(us) | Answer::Failed(us) => self.learned.detectors.get(&t.name).is_some_and(|d| d.rising(*us)),
+                        Answer::Unavailable => false,
+                    }
+            });
+            if !has_inflight
+                && !had_rising_answer
+                && let Some(d) = self.learned.detectors.get_mut(&t.name)
+                && d.alarm.is_some()
+                && now.saturating_sub(d.last_us()) >= t.tolerance_us as u64
+            {
+                d.clear_passive();
+                events.push(format!("{}: nothing waiting now; back to calm", t.name));
+            }
+        }
         // The budgets: both cut when trouble begins (either may be the cause), each raised again on
         // its own as it holds calm where it limits.
         let hold = self.hold_us();
@@ -566,6 +611,8 @@ impl Engine {
         };
         let firsts: Vec<String> = self.targets.iter().filter(|t| t.first).map(|t| t.name.clone()).collect();
         let is_first = |n: &str| firsts.iter().any(|f| f == n);
+        let passives: Vec<String> = self.targets.iter().filter(|t| t.passive).map(|t| t.name.clone()).collect();
+        let is_passive = |n: &str| passives.iter().any(|p| p == n);
         let mut worse = false;
         let mut shown = false;
         if let Some((at, first)) = &mut self.cut {
@@ -631,9 +678,9 @@ impl Engine {
         let worst: f64 = o
             .answers
             .iter()
-            .filter(|(n, _)| !is_first(n))
+            .filter(|(n, _)| !is_first(n) && !is_passive(n))
             .filter_map(|(n, a)| took(n, a).map(|us| us / tolerance(n)))
-            .chain(o.inflight.iter().filter(|(n, _)| !is_first(n)).map(|(n, age)| age / tolerance(n)))
+            .chain(o.inflight.iter().filter(|(n, _)| !is_first(n) && !is_passive(n)).map(|(n, age)| age / tolerance(n)))
             .fold(0.0, f64::max);
         let drain_w = capacity.map(|c| c * (1.0 - worst.min(1.0)) - others);
         if shown {
@@ -659,14 +706,21 @@ impl Engine {
             if held {
                 events.push(format!("kiln's writes not cut: it writes {}{}, no more than when stopping its writers last didn't speed the probes up", Unit::Writes.fmt(ours_w), of_disks(share)));
             } else {
-                events.push(self.learned.knee.alarm(now, ours_w, drain_w, Unit::Writes, least_w));
+                // Only cut kiln's disk write budget when a probed non-first target (such as
+                // `runner disk`) is in trouble; a passive target like `agent messages` or a
+                // CPU-first delay target must not zero out disk writers while the disk is calm.
+                if disk_trouble {
+                    events.push(self.learned.knee.alarm(now, ours_w, drain_w, Unit::Writes, least_w));
+                }
                 if cpu_cut {
                     events.push(self.learned.cpu_knee.alarm(now, ours_c_level, None, Unit::Cpu, least_c));
                 } else if !disks_full && let Some(idle) = o.cpu_idle {
                     events.push(format!("kiln's CPU not cut: {} idle, so the CPU isn't what's short", Unit::Cpu.fmt(idle)));
                 }
-                self.cut = Some((now, None));
-                cut_now = true;
+                if disk_trouble || cpu_cut {
+                    self.cut = Some((now, None));
+                    cut_now = true;
+                }
             }
         } else if now_alarmed && self.episode.as_ref().is_some_and(|e| e.held) {
             // Shown not to be kiln's, or not cut for that: nothing more is cut until it clears.
@@ -692,7 +746,7 @@ impl Engine {
             ));
             self.cut = None;
         } else if now_alarmed {
-            let cut_w = self.learned.knee.persisting(now, ours_w, drain_w, worse, Unit::Writes, least_w);
+            let cut_w = if disk_trouble { self.learned.knee.persisting(now, ours_w, drain_w, worse, Unit::Writes, least_w) } else { None };
             let cut_c = if !(first_trouble || (!disks_full && self.cpu_short(o))) {
                 None
             } else if persists && !self.learned.cpu_knee.cutting() && ours_c_level > 0.0 {
@@ -857,7 +911,7 @@ mod tests {
     fn engine() -> Engine {
         Engine::new(
             Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 },
-            vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: Some(4096.0) }],
+            vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: Some(4096.0), passive: false }],
             Learned::default(),
             0,
         )
@@ -872,7 +926,7 @@ mod tests {
     /// past the tolerance no longer speeds probing, and the disk is held to the load share too.
     #[test]
     fn a_lag_past_the_tolerance_leaves_probing_at_its_calm_pace() -> anyhow::Result<()> {
-        let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }, Target { name: "server".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }];
+        let targets = vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None, passive: false }, Target { name: "server".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None, passive: false }];
         let run = |lag: Option<f64>| {
             let mut learned = Learned { version: LEARNED_VERSION, ..Learned::default() };
             learned.knee.lag_us = lag;
@@ -906,7 +960,7 @@ mod tests {
     #[test]
     fn g8_s5_the_servers_delay_rising_slows_legs_and_agents() -> anyhow::Result<()> {
         let delay = "kiln server delay";
-        let target = Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true, sync_bytes: None };
+        let target = Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: true, sync_bytes: None, passive: false };
         let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![target], Learned::default(), 0);
         let running = |cores: f64, share: f64| vec![Group { cpu_cores: 8.0 * cores * share, ..group("job 01a1", 0.0, share) }, Group { cpu_cores: 4.0 * cores * share, ..group("01a1agent", 0.0, share) }];
         let at = |t: u64, us: f64, cores: f64, share: f64| Observation { now_us: t, answers: vec![(delay.into(), Answer::Took(us))], mem_free: 1e11, running: running(cores, share), cores: Some(32.0), ..Observation::default() };
@@ -959,7 +1013,7 @@ mod tests {
     #[test]
     fn g8_s5_a_windowed_targets_probe_out_past_its_tolerance_is_no_harm_until_its_window() -> anyhow::Result<()> {
         let delay = "kiln server delay";
-        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: false, sync_bytes: None }], Learned::default(), 0);
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: delay.into(), tolerance_us: 10_000.0, window_us: Some(1e6), first: false, sync_bytes: None, passive: false }], Learned::default(), 0);
         let legs = |cores: f64| vec![Group { cpu_cores: cores, ..group("job 01a1", 0.0, 1.0) }];
         let mut t = 0;
         for i in 0..2_000u64 {
@@ -1346,7 +1400,7 @@ mod tests {
         anyhow::ensure!(share(&p, "s1") < 1.0, "harm paces the session: {:?}", p.shares);
         let budgets = (p.status.budget_bps, p.status.cpu_budget);
         t += 1_000_000;
-        let p = e.step(&at(t, 1e6, Class::Person));
+        let p = e.step(&at(t, 1e6, Class::Runner));
         anyhow::ensure!((p.status.budget_bps, p.status.cpu_budget) == budgets, "the budget changed: {:?}", p.events);
         anyhow::ensure!(share(&p, "s1") >= 1.0, "a message waits, yet the session is paced: {:?}", p.shares);
         anyhow::ensure!(share(&p, "s2") < 1.0, "the session beside it is let go too: {:?}", p.shares);
@@ -1400,7 +1454,7 @@ mod tests {
         old.knee.budget = Some(164e3);
         old.knee.lag_us = Some(2.7e9);
         old.not_kiln = Some(NotKiln { write_bps: 1.0, share: None });
-        let e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }], old, 0);
+        let e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None, passive: false }], old, 0);
         assert_eq!((e.learned.knee.budget, e.learned.cpu_knee.budget, e.learned.cpu_knee.unsafe_at), (None, None, None));
         assert_eq!((e.learned.knee.lag_us, e.learned.not_kiln.clone(), e.learned.version), (None, None, LEARNED_VERSION));
         // One this build learned is kept.
@@ -1632,14 +1686,74 @@ mod tests {
         assert_eq!(detect::Detector::new(1e6, 0).probe_share(), None);
         let mut learned = Learned { version: LEARNED_VERSION, ..Learned::default() };
         learned.knee.lag_us = Some(0.9e6);
-        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }], learned, 0);
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None, passive: false }], learned, 0);
         let p = e.step(&Observation { now_us: 1, answers: vec![("disk".into(), Answer::Took(9_000.0))], mem_free: 1e11, ..Observation::default() });
         assert!(p.probe_every_us.get("disk").is_some_and(|every| *every >= 0.5e6 - 1.0), "probing sped up for a lag on a target that may not afford it: {:?}", p.probe_every_us);
         // Learned: the lag is won back only as far as the target affords.
-        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None }], Learned { detectors: [("disk".to_owned(), disk.clone())].into_iter().collect(), ..e.learned.clone() }, 0);
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 1.0 }, vec![Target { name: "disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None, passive: false }], Learned { detectors: [("disk".to_owned(), disk.clone())].into_iter().collect(), ..e.learned.clone() }, 0);
         let p = e.step(&Observation { now_us: 401_000_000, answers: vec![("disk".into(), Answer::Took(9_000.0))], mem_free: 1e11, ..Observation::default() });
         let every = p.probe_every_us.get("disk").copied().unwrap_or(0.0);
         assert!(every * share >= calm * (1.0 - 1e-6), "probes every {every} µs take more than the {share} the disk affords at {calm} µs each");
+    }
+
+    /// Passive (unprobed) targets like `agent messages` must never zero out the disk write budget
+    /// when `runner disk` is calm, and their alarm must auto-clear via `due_us` once nothing is
+    /// waiting for a tolerance window so future CI jobs placed on the runner are never frozen solid.
+    #[test]
+    fn a_passive_agent_messages_delay_never_freezes_disk_or_sticks_in_alarm() -> anyhow::Result<()> {
+        let targets = vec![
+            Target { name: "runner disk".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: Some(4096.0), passive: false },
+            Target { name: "agent messages".into(), tolerance_us: 1e6, window_us: None, first: false, sync_bytes: None, passive: true },
+        ];
+        let mut e = Engine::new(Policy { false_alarms_per_day: 1.0, probe_load_share: 0.1 }, targets, Learned::default(), 0);
+        let mut t = 0u64;
+        for _ in 0..50 {
+            t += 1_000_000;
+            e.step(&Observation {
+                now_us: t,
+                answers: vec![("runner disk".into(), Answer::Took(3_000.0))],
+                delivered_bps: Some(500e6),
+                disks_idle_ms: Some(0.0),
+                mem_free: 1e11,
+                running: vec![group("job1", 200e6, 1.0)],
+                cores: Some(16.0),
+                cpu_idle: Some(10.0),
+                ..Observation::default()
+            });
+        }
+        // One slow agent message (1.5s) while disk is 3ms calm and 10 cores are idle:
+        // must NOT cut write budget (would freeze job1 at 0%) and must NOT cut CPU.
+        t += 1_000_000;
+        let p = e.step(&Observation {
+            now_us: t,
+            answers: vec![("runner disk".into(), Answer::Took(3_000.0)), ("agent messages".into(), Answer::Took(1_500_000.0))],
+            delivered_bps: Some(500e6),
+            disks_idle_ms: Some(0.0),
+            mem_free: 1e11,
+            running: vec![group("job1", 200e6, 1.0)],
+            cores: Some(16.0),
+            cpu_idle: Some(10.0),
+            ..Observation::default()
+        });
+        anyhow::ensure!(p.status.budget_bps.is_none(), "slow agent message froze disk writes: {:?}", p.status);
+        anyhow::ensure!(p.status.cpu_budget.is_none(), "slow agent message cut CPU with 10 cores idle: {:?}", p.status);
+        anyhow::ensure!(p.shares.iter().all(|s| s.share >= 1.0), "job1 paced for calm disk + idle CPU: {:?}", p.shares);
+        // Nothing waiting anymore: `due_us` schedules automatic wakeup to clear the passive alarm.
+        let wake = p.due_us.ok_or_else(|| anyhow::anyhow!("passive alarm has no auto-clear due_us"))?;
+        anyhow::ensure!(wake > t && wake <= t + 1_000_001, "unexpected clear due_us {wake} vs {t}");
+        let p2 = e.step(&Observation {
+            now_us: wake,
+            answers: vec![("runner disk".into(), Answer::Took(3_000.0))],
+            delivered_bps: Some(500e6),
+            disks_idle_ms: Some(500.0),
+            mem_free: 1e11,
+            running: vec![group("job1", 200e6, 1.0)],
+            cores: Some(16.0),
+            cpu_idle: Some(10.0),
+            ..Observation::default()
+        });
+        anyhow::ensure!(p2.status.targets.iter().all(|tg| tg.alarm.is_none()), "passive alarm stuck after nothing waiting: {:?}", p2.status.targets);
+        Ok(())
     }
 
     proptest! {

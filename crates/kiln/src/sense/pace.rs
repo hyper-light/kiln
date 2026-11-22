@@ -62,8 +62,13 @@ pub struct Raw {
     pub cpus: u32,
     /// Pages swapped in so far (Linux `pswpin`, macOS `swapins`).
     pub swapins: Option<u64>,
+    /// Minimum span (µs) over which a `swapins` delta was accumulated by the OS (macOS's
+    /// rate-limited 1-second `HOST_VM_INFO64` copy: 1_000_000; 0 elsewhere). Prevents a tiny
+    /// inter-read gap crossing a 1-second copy boundary from multiplying the swap-in rate.
+    pub swapins_min_span_us: u64,
     /// Pages read in a second to resolve faults, as the OS rates it (Windows' `Memory\Pages
-    /// Input/sec`, over the interval since its previous read).
+    /// Input/sec`, over the interval since its previous read, when memory is genuinely under
+    /// pagefile pressure).
     pub swapin_rate: Option<f64>,
     /// Swap space, total and in use, bytes (Linux's swap; macOS's `vm.swapusage`; Windows' page
     /// files).
@@ -95,8 +100,21 @@ pub struct Read {
     pub device_rho: Option<f64>,
     /// The work device's latency now against its uncontended: R / S₀.
     pub device_stretch: Option<f64>,
+    /// The work device's mean request latency over the interval, µs.
+    pub device_latency_us: Option<f64>,
     /// What it would give a new run's I/O now, bytes a second (0 unmeasured).
     pub disk_bps: u64,
+}
+
+/// Filters Windows' `\Memory\Pages Input/sec` counter so ordinary file-mapped hard page faults
+/// (DLLs, executables, mmap'd git packs/SQLite) are not misclassified as pagefile swap thrashing.
+/// Only reports swap-in pressure when the pagefile actually holds pages AND available physical RAM
+/// is below 10% of total physical RAM.
+pub fn windows_swapin_rate(pages_in: Option<f64>, total_phys: u64, avail_phys: u64, swap: Option<(u64, u64)>) -> Option<f64> {
+    let rate = pages_in.filter(|r| r.is_finite() && *r >= 0.0)?;
+    let pagefile_used = swap.is_some_and(|(_, used)| used > 0);
+    let ram_tight = total_phys > 0 && avail_phys.saturating_mul(10) < total_phys;
+    (pagefile_used && ram_tight).then_some(rate)
 }
 
 /// The share of `interval_us` a cumulative µs count grew by.
@@ -140,10 +158,11 @@ pub fn between(earlier: &Raw, later: &Raw, interval_us: u64, kept: &mut Kept) ->
     s.level = later.level;
     let secs = interval_us as f64 / 1e6;
     let activity = earlier.device.as_ref().zip(later.device.as_ref()).and_then(|(a, b)| Activity::between(a, b, interval_us));
-    let (mut rho, mut stretch) = (None, None);
+    let (mut rho, mut stretch, mut device_latency_us) = (None, None, None);
     if let Some(a) = &activity {
         let ops = a.read_ops_per_s + a.write_ops_per_s;
         let latency = device::mean_latency(a.read_latency_us, a.read_ops_per_s, a.write_latency_us, a.write_ops_per_s);
+        device_latency_us = latency;
         if let Some(l) = latency {
             kept.calibration.add(l, a.in_flight, ops * secs);
         }
@@ -160,13 +179,14 @@ pub fn between(earlier: &Raw, later: &Raw, interval_us: u64, kept: &mut Kept) ->
     if s.io.is_none() {
         s.io = rho;
     }
+    let swap_secs = secs.max(later.swapins_min_span_us as f64 / 1e6);
     let rate = later.swapin_rate.or_else(|| match (earlier.swapins, later.swapins) {
-        (Some(a), Some(b)) if secs > 0.0 => Some(b.saturating_sub(a) as f64 / secs),
+        (Some(a), Some(b)) if swap_secs > 0.0 => Some(b.saturating_sub(a) as f64 / swap_secs),
         _ => None,
     });
     s.swap = rate.zip(kept.calibration.service_us()).and_then(|(r, s0)| device::swap_share(r, s0));
     let disk_bps = rho.map_or(0, |r| device::rate(kept.peak_bps, r));
-    Read { signals: s, device_rho: rho, device_stretch: stretch, disk_bps }
+    Read { signals: s, device_rho: rho, device_stretch: stretch, device_latency_us, disk_bps }
 }
 
 /// Who's told this runner's pace, and whether it drains on battery (and why), each time it changes.
@@ -180,6 +200,9 @@ type Woke = Box<dyn Fn() + Send>;
 struct Keeper {
     reader: Option<crate::os::pace::Reader>,
     last: Option<(Instant, Raw)>,
+    /// Last non-duplicate `swapins` count and when it was read, so an intermediate duplicate XNU
+    /// copy (`swapins: None`) never erases the baseline or compresses the denominator.
+    last_swap: Option<(Instant, u64)>,
     kept: Kept,
     path: Option<PathBuf>,
     read: Read,
@@ -194,7 +217,7 @@ struct Keeper {
 
 fn keeper() -> &'static Mutex<Keeper> {
     static K: OnceLock<Mutex<Keeper>> = OnceLock::new();
-    K.get_or_init(|| Mutex::new(Keeper { reader: None, last: None, kept: Kept::default(), path: None, read: Read::default(), speed: 0, policy: OnBattery::default(), on_battery: None, tell: None, told: None, woke: None }))
+    K.get_or_init(|| Mutex::new(Keeper { reader: None, last: None, last_swap: None, kept: Kept::default(), path: None, read: Read::default(), speed: 0, policy: OnBattery::default(), on_battery: None, tell: None, told: None, woke: None }))
 }
 
 /// How many times the OS's events woke this runner's pace so far, whatever woke it: an idle
@@ -205,12 +228,27 @@ pub fn wakes() -> u64 {
 
 impl Keeper {
     /// Reads now: what the interval since the last read says, kept.
+    #[allow(clippy::cast_precision_loss)]
     fn measure(&mut self) {
         let Some(reader) = self.reader.as_mut() else { return };
         let now = (Instant::now(), reader.read());
         if let Some((at, before)) = &self.last {
             let us = u64::try_from(now.0.duration_since(*at).as_micros()).unwrap_or(u64::MAX);
-            self.read = between(before, &now.1, us, &mut self.kept);
+            let mut read = between(before, &now.1, us, &mut self.kept);
+            if read.signals.swap.is_none()
+                && now.1.swapin_rate.is_none()
+                && let (Some((sw_at, sw0)), Some(sw1)) = (self.last_swap, now.1.swapins)
+                && let Some(s0) = self.kept.calibration.service_us()
+            {
+                let span_s = now.0.duration_since(sw_at).as_secs_f64().max(now.1.swapins_min_span_us as f64 / 1e6);
+                if span_s > 0.0 {
+                    read.signals.swap = device::swap_share(sw1.saturating_sub(sw0) as f64 / span_s, s0);
+                }
+            }
+            self.read = read;
+        }
+        if let Some(sw) = now.1.swapins {
+            self.last_swap = Some((now.0, sw));
         }
         self.on_battery = now.1.on_battery;
         self.last = Some(now);
@@ -411,9 +449,10 @@ pub fn set_speed(speed: u32) {
 }
 
 /// What stands for the kernel's stall times where it keeps none, as last read: swap-ins' share of
-/// time (for memory's), and the work device's utilization and latency stretch (for I/O's).
-pub fn stand_ins() -> (Option<f64>, Option<f64>, Option<f64>) {
-    keeper().lock().map_or((None, None, None), |k| (k.read.signals.swap, k.read.device_rho, k.read.device_stretch))
+/// time (for memory's), and the work device's utilization, latency stretch, and mean latency in µs
+/// (for I/O's).
+pub fn stand_ins() -> (Option<f64>, Option<f64>, Option<f64>, Option<f64>) {
+    keeper().lock().map_or((None, None, None, None), |k| (k.read.signals.swap, k.read.device_rho, k.read.device_stretch, k.read.device_latency_us))
 }
 
 /// The runner's pace as last told (for its page).
@@ -529,5 +568,35 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert_eq!(parse::keyed("pswpin 42\npswpout 7\n", "pswpin"), Some(42));
         assert_eq!(parse::keyed("pswpin x\n", "pswpin"), None);
+    }
+
+    /// Windows `\Memory\Pages Input/sec` counts all hard page faults (file-mapped DLLs, git packs,
+    /// SQLite mmap), not just pagefile swap-ins: only report it when physical RAM is tight (<10%
+    /// available) AND pagefile is actually in use.
+    #[test]
+    fn windows_hard_page_faults_are_not_counted_as_swap_when_ram_is_free() {
+        const GIB: u64 = 1 << 30;
+        // 64 GiB RAM with 32 GiB free and 12,000 hard faults/sec from normal file-mapped reads: NOT swap.
+        assert_eq!(windows_swapin_rate(Some(12_000.0), 64 * GIB, 32 * GIB, Some((16 * GIB, 2 * GIB))), None);
+        // 64 GiB RAM with 2 GiB free (<10%) but zero pagefile used: NOT swap.
+        assert_eq!(windows_swapin_rate(Some(12_000.0), 64 * GIB, 2 * GIB, Some((16 * GIB, 0))), None);
+        // 64 GiB RAM with 2 GiB free (<10%) AND pagefile actively used: real swap pressure.
+        assert_eq!(windows_swapin_rate(Some(12_000.0), 64 * GIB, 2 * GIB, Some((16 * GIB, 4 * GIB))), Some(12_000.0));
+    }
+
+    /// macOS `HOST_VM_INFO64` returns a 1-second cached copy when `swapins_live` is false: two
+    /// reads 20 ms apart across a 1-second boundary must divide by at least 1 s (`swapins_min_span_us`),
+    /// never multiplying a 1-second delta by 50x into a false 100% swap stall.
+    #[test]
+    fn macos_cached_swapin_copy_boundary_does_not_inflate_rate() {
+        let dev = |ops: u64, ns: u64, bytes: u64| Counters { read: super::super::disk::Dir { ops, bytes, time_ns: ns }, ..Counters::default() };
+        let mut kept = Kept::default();
+        kept.calibration.add(100.0, 0.0, 1000.0);
+        let a = Raw { cpus: 16, device: Some(dev(0, 0, 0)), swapins: Some(1_000), swapins_min_span_us: 1_000_000, ..Raw::default() };
+        // 500 swapins accumulated over XNU's 1s copy window, read only 20ms after `a`.
+        let b = Raw { cpus: 16, device: Some(dev(10, 1_000_000, 40_960)), swapins: Some(1_500), swapins_min_span_us: 1_000_000, ..Raw::default() };
+        let r = between(&a, &b, 20_000, &mut kept);
+        // 500/s * 100 us = 0.05 (5%), NOT 25,000/s * 100 us = 1.0 (100%!).
+        assert!(r.signals.swap.is_some_and(|s| (s - 0.05).abs() < 0.01), "inflated swap share across XNU copy boundary: {r:?}");
     }
 }

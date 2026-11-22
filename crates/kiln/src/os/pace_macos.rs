@@ -133,16 +133,20 @@ impl Reader {
         let runnable = sysctl::<LoadAvg>(c"vm.loadavg").filter(|l| l.fscale > 0).and_then(|l| Some(f64::from(*l.ldavg.first()?) / l.fscale as f64));
         let swap = sysctl::<SwapUsage>(c"vm.swapusage").filter(|s| s.total > 0).map(|s| (s.total, s.used));
         let (on_battery, percent) = battery();
+        let swapin = swapins();
+        let swapins_min_span_us = if swapin.is_some_and(|(_, copy)| copy.is_some()) { 1_000_000 } else { 0 };
         Raw {
             level,
             runnable,
             cpus: u32::try_from(std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1)).unwrap_or(1),
             // A copy's count it said before says nothing of the time since: none then, never a rate of zero
-            // (`kiln_ci::facts::VmPages::copy`).
-            swapins: swapins().and_then(|(n, copy)| match copy {
+            // (`kiln_ci::facts::VmPages::copy`). When read from XNU's 1-second shared copy, its delta covers
+            // at least one 1-second window (`swapins_min_span_us`), never a tiny gap across a boundary.
+            swapins: swapin.and_then(|(n, copy)| match copy {
                 Some(c) => (self.copy.replace(c) != Some(c)).then_some(n),
                 None => Some(n),
             }),
+            swapins_min_span_us,
             swap,
             device: self.device.as_mut().and_then(crate::os::sense_disk_macos::Device::counters),
             on_battery,

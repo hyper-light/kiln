@@ -5608,7 +5608,10 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             Err(e) => error = Some(format!("{e:#}")),
             Ok(mut p) => {
                 // Its process here; none for a harness its boundary holds (a microVM's member).
-                *s.pid.lock() = p.host_pid();
+                let host_pid = p.host_pid();
+                *s.pid.lock() = host_pid;
+                crate::headroom::mark_subagent(&s.id, spec.subagent);
+                crate::headroom::set_harness_pid(&s.id, host_pid);
                 s.began(&p);
                 // What a person changed of it while it ran before, given again (a restart, a resume, a restore).
                 reapply_overrides(&s, p.boundary()).await;

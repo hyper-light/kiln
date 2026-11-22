@@ -206,6 +206,46 @@ pub mod linux {
     }
 }
 
+/// Pure arithmetic for Windows `IOCTL_DISK_PERFORMANCE` delta conversion, kept here so it is
+/// tested on every platform. Converting interval deltas (rather than rescaling lifetime cumulative
+/// totals by a jittering `QueryTime / dt` rate) guarantees monotonic nanosecond counters even
+/// across multi-week uptime, NTP clock steps, and sleep/resume.
+pub mod windows {
+    /// Standard Windows 100-ns tick rate (`KeQuerySystemTime` / 10 MHz QPC).
+    pub const DEFAULT_TICK_RATE: f64 = 1e7;
+
+    /// Converts one interval's raw `DISK_PERFORMANCE` deltas into `(read_ns, write_ns, busy_ns)`
+    /// and returns the effective tick rate (`ticks/s`) to retain for future NTP-jump guarding.
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn delta_ns(dq: i64, dt_secs: f64, d_read: i64, d_write: i64, d_idle: i64, known_rate: Option<f64>) -> Option<(u64, u64, u64, f64)> {
+        if !dt_secs.is_finite() || dt_secs <= 0.0 {
+            return None;
+        }
+        let raw_rate = if dq > 0 { Some(dq as f64 / dt_secs) } else { None };
+        let sane_raw = raw_rate.filter(|r| {
+            r.is_finite()
+                && (1e6..=1e8).contains(r)
+                && match known_rate {
+                    Some(prev) => *r >= prev * 0.8 && *r <= prev * 1.25,
+                    None => true,
+                }
+        });
+        let rate = sane_raw.or(known_rate).unwrap_or(DEFAULT_TICK_RATE);
+        let to_ns = |units: i64| -> u64 {
+            let u = u64::try_from(units).unwrap_or(0);
+            let ns = u as f64 * 1e9 / rate;
+            if ns.is_finite() && ns >= 0.0 { ns.min(u64::MAX as f64) as u64 } else { 0 }
+        };
+        let span_ns = (dt_secs * 1e9).clamp(0.0, u64::MAX as f64) as u64;
+        let expected_ticks = if sane_raw.is_some() { dq } else { (dt_secs * rate).clamp(0.0, i64::MAX as f64) as i64 };
+        let busy_units = expected_ticks.saturating_sub(d_idle.max(0)).max(0);
+        let read_ns = to_ns(d_read);
+        let write_ns = to_ns(d_write);
+        let busy_ns = to_ns(busy_units).min(span_ns);
+        Some((read_ns, write_ns, busy_ns, rate))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +295,29 @@ mod tests {
         let ds = "   8       0 sda 10 0 80 5 2 0 16 1 0 6 6 0 0 0 0 0 0\n 259       0 nvme0n1 1 0 8 1 0 0 0 0 0 1 1 0 0 0 0 0 0\n";
         assert_eq!(linux::diskstats(ds, "nvme0n1").map(|c| c.read.bytes), Some(4096));
         assert_eq!(linux::diskstats(ds, "sdb"), None);
+    }
+
+    /// Windows `IOCTL_DISK_PERFORMANCE` delta conversion: converting interval deltas instead of
+    /// rescaling lifetime totals stays exact (0 ns on idle intervals) under clock/NTP jitter and
+    /// backwards wall-clock steps, and handles non-10MHz QPC rates cleanly.
+    #[test]
+    fn windows_disk_delta_conversion_is_monotonic_under_clock_jitter_and_ntp_steps() {
+        // Normal 1-second interval at 10 MHz (100-ns ticks): 2 ms read, 3 ms write, 995 ms idle -> 5 ms busy.
+        let (r, w, b, rate) = windows::delta_ns(10_000_000, 1.0, 20_000, 30_000, 9_950_000, None).unwrap_or_default();
+        assert_eq!((r, w, b), (2_000_000, 3_000_000, 5_000_000));
+        assert!((rate - 1e7).abs() < 1.0);
+        // Idle interval with 0.5% scheduling jitter: zero read/write time regardless of prior uptime.
+        let (r, w, b, _) = windows::delta_ns(10_000_000, 1.005, 0, 0, 10_000_000, Some(rate)).unwrap_or_default();
+        assert_eq!((r, w, b), (0, 0, 0));
+        // NTP step backward (negative dq) during a 1s interval with 1 ms of real reads: falls back to known_rate.
+        let (r, w, b, rate2) = windows::delta_ns(-50_000_000, 1.0, 10_000, 0, 9_990_000, Some(rate)).unwrap_or_default();
+        assert_eq!((r, w), (1_000_000, 0));
+        assert_eq!(b, 1_000_000);
+        assert!((rate2 - rate).abs() < 1.0);
+        // NTP step forward (+60s in 1s wall time): rejected as outlier, retains known_rate, busy clamped <= 1s.
+        let (r, w, b, rate3) = windows::delta_ns(610_000_000, 1.0, 10_000, 0, 9_990_000, Some(rate)).unwrap_or_default();
+        assert_eq!((r, w), (1_000_000, 0));
+        assert!(b <= 1_000_000_000);
+        assert!((rate3 - rate).abs() < 1.0);
     }
 }

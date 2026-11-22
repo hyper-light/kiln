@@ -298,6 +298,10 @@ impl Input {
         }
     }
     pub fn now_ns(&self) -> u64 { u64::try_from(self.born.elapsed().as_nanos()).unwrap_or(u64::MAX) }
+    pub fn physical_headroom(&self) -> usize {
+        let (held, bound) = self.physical.counts();
+        bound.saturating_sub(held)
+    }
     pub fn reserve_buffer(&self, bytes: usize) -> Result<Option<BufferCharge>, Error> { self.physical.reserve_buffer_for(bytes, Some(Arc::clone(&self.account))) }
     /// Only attachment preparation requires a second original command representation. Reserve
     /// its owned storage before making that fallible copy; ordinary text input stays borrowed.
@@ -800,6 +804,17 @@ impl Controller {
         self.readiness = Readiness::Unavailable;
         self.observations = Observations::default();
         self.changed()
+    }
+
+    /// Recovers from a transient `Readiness::Unavailable` latch once a real durable storage
+    /// operation succeeds again while this host owns the session (`Ownership::Here`). Never clears
+    /// a `Promoting` or `Fenced` state, preserving legacy promotion invariants.
+    pub fn recover(&mut self) -> Result<bool, Error> {
+        if self.readiness != Readiness::Unavailable || self.ownership != Ownership::Here { return Ok(false); }
+        self.readiness = Readiness::Ready;
+        self.credit()?;
+        self.changed()?;
+        Ok(true)
     }
 
     /// Its session reset (docs/agents.md, "Reset"): every lease it still holds ends, its bytes released (its caller ended

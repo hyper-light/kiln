@@ -35,7 +35,7 @@ pub type PeerId = u64;
 
 /// What a runner process keeps unanswered of its commands, at the most: past it, a command is
 /// refused here rather than kept.
-pub const ROOM: usize = 4 << 20;
+pub const ROOM: usize = 16 << 20;
 /// How long a command sent on a live link waits for its answer before it goes again.
 pub const PATIENCE: Duration = Duration::from_secs(3);
 /// The most a command carries: the frame its item rides (`ServerMsg::Wire`, on the control lane) is

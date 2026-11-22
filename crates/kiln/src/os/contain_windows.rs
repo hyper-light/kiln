@@ -157,6 +157,7 @@ const JOB_OBJECT_LIMIT_PRIORITY_CLASS: u32 = 0x0000_0020;
 const JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION: i32 = 15;
 const JOB_OBJECT_CPU_RATE_CONTROL_ENABLE: u32 = 0x1;
 const JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED: u32 = 0x2;
+const JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP: u32 = 0x4;
 /// Weight-based CPU rate control's least share: "a value from 1 through 9, where 1 is the smallest
 /// share and 9 is the largest" (`JOBOBJECT_CPU_RATE_CONTROL_INFORMATION`).
 const LEAST_WEIGHT: u32 = 1;
@@ -677,6 +678,21 @@ pub(crate) fn suspend_all(pids: &[u32]) -> Vec<u32> {
 /// Undoes one [`suspend_all`] of the processes `pids`.
 pub(crate) fn resume_all(pids: &[u32]) {
     each_thread(pids, ResumeThread);
+}
+
+/// Smoothly throttles session `session`'s Windows Job Object via `JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP`
+/// (`pct = Some(1..=99)`, where Windows takes 1/100th percent units `100..=9900`) without
+/// suspending any thread; `pct = None` restores default weight-based scheduling (`LEAST_WEIGHT`).
+/// Returns `true` when applied cleanly.
+pub(crate) fn set_cpu_cap(session: &str, pct: Option<u8>) -> bool {
+    let Some(job) = jobs().lock().get(session).cloned() else { return false };
+    let rate = match pct {
+        Some(p) => CpuRate { control_flags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP, value: (u32::from(p) * 100).clamp(100, 9900) },
+        None => CpuRate { control_flags: JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED, value: LEAST_WEIGHT },
+    };
+    let size = u32::try_from(std::mem::size_of::<CpuRate>()).unwrap_or(0);
+    // SAFETY: the job's handle, and a whole JOBOBJECT_CPU_RATE_CONTROL_INFORMATION of that size.
+    unsafe { SetInformationJobObject(job.0, JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION, (&raw const rate).cast(), size) != 0 }
 }
 
 /// The sessions with a job now.

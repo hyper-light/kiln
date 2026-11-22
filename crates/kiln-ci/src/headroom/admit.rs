@@ -13,16 +13,28 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Who yields first: the lowest class is held and slowed first, and a person is never held.
+/// Who yields first: the lowest class is held and slowed first, and runner-critical work is never held.
+/// Granular escalation order: `Background` -> `Tool` (individual child calls / builds / reach
+/// commands / CI jobs) -> `Subagent` -> `Agent` (primary harness) -> `Runner` (never slowed;
+/// runner cordoning is last resort only under extreme sustained strain).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Class {
     /// Benches, sync.
     Background,
-    /// What an agent runs on its own: its turns, its tools' commands.
+    /// Individual process calls spawned by a harness/agent (e.g. `cargo`, `rustc`), agent `reach`
+    /// commands, CI jobs, and escaped user units: slowed FIRST before touching any subagent or
+    /// harness.
+    Tool,
+    /// Subagent sessions: slowed after tool calls / reach commands, before primary agent harnesses.
+    Subagent,
+    /// What a primary agent runs on its own: its harness and session, slowed only after tools and
+    /// subagents.
     Agent,
-    /// A person's own message or command: never held.
-    Person,
+    /// Runner-level interactive / critical work (direct human messages, human `reach` commands,
+    /// runner control plane): never held or slowed.
+    #[serde(alias = "person")]
+    Runner,
 }
 
 /// What a piece of work needs.
@@ -233,8 +245,8 @@ pub fn decide(now_us: u64, room: &Room, promised: &[Promise], waiting: &[Waiting
 
     let mut out = Vec::with_capacity(order.len());
     for (w, d) in order {
-        if w.class == Class::Person {
-            out.push(Decision { id: w.id.clone(), start: true, at_us: Some(now_us), why: "a person's: never held".into() });
+        if w.class == Class::Runner {
+            out.push(Decision { id: w.id.clone(), start: true, at_us: Some(now_us), why: "runner-priority work: never held".into() });
             continue;
         }
         let Some(d) = d else {
@@ -295,7 +307,7 @@ mod tests {
         let l = learned(&[("short", 10e6, 1e9, 1e6), ("long", 10e6, 1e9, 1e9)]);
         // Memory for one at a time (writes are paced, not held for).
         let room = Room { write_budget: Some(10e6), write_used: 0.0, mem_free: 1.5e9, frees: Vec::new(), cpu_budget: None, cpu_used: 0.0 };
-        let q = [w("L", "long", Class::Agent, 0), w("S", "short", Class::Agent, 0), w("P", "short", Class::Person, 0)];
+        let q = [w("L", "long", Class::Agent, 0), w("S", "short", Class::Agent, 0), w("P", "short", Class::Runner, 0)];
         let d = decide(1_000_000, &room, &[], &q, &l);
         let started: Vec<&str> = d.iter().filter(|d| d.start).map(|d| d.id.as_str()).collect();
         assert_eq!(started, vec!["P", "S"]);

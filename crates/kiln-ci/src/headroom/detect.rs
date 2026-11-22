@@ -402,6 +402,21 @@ impl Detector {
         self.up.s
     }
 
+    /// Timestamp (µs) of the last sample or inflight update seen by this detector.
+    pub fn last_us(&self) -> u64 {
+        self.last_us
+    }
+
+    /// Clears a passive (unprobed) target's alarm once nothing is waiting and a full tolerance
+    /// window has passed with no new slow delivery, preventing a one-off slow agent message from
+    /// locking the runner's pacer in alarm forever when no further messages arrive.
+    pub fn clear_passive(&mut self) {
+        self.alarm = None;
+        self.up.s = 0.0;
+        self.up.peak = 0.0;
+        self.up.harm = false;
+    }
+
     /// Whoever watched this target is going (kiln's work was stopped with an excursion under way, or
     /// its watcher ends): how the excursion would have ended is unknown, so it calibrates nothing and
     /// what it put in calm comes back out; the next watcher starts at calm with what was learned

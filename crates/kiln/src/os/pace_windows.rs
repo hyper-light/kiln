@@ -206,16 +206,25 @@ impl Reader {
         let battery = have_power && power.battery_flag != NO_BATTERY && power.battery_flag != UNKNOWN;
         let mut mem = MemoryStatus { length: u32::try_from(std::mem::size_of::<MemoryStatus>()).unwrap_or(0), ..MemoryStatus::default() };
         // SAFETY: a struct the call fills, its length set.
-        let swap = (unsafe { GlobalMemoryStatusEx(&raw mut mem) } != 0).then(|| {
-            let total = mem.total_page_file.saturating_sub(mem.total_phys);
-            let used = mem.total_page_file.saturating_sub(mem.avail_page_file).saturating_sub(mem.total_phys.saturating_sub(mem.avail_phys));
-            (total, used.min(total))
-        }).filter(|(t, _)| *t > 0);
+        let have_mem = unsafe { GlobalMemoryStatusEx(&raw mut mem) } != 0;
+        let swap = have_mem
+            .then(|| {
+                let total = mem.total_page_file.saturating_sub(mem.total_phys);
+                let used = mem.total_page_file.saturating_sub(mem.avail_page_file).saturating_sub(mem.total_phys.saturating_sub(mem.avail_phys));
+                (total, used.min(total))
+            })
+            .filter(|(t, _)| *t > 0);
+        // `\Memory\Pages Input/sec` counts every hard page fault including ordinary file-mapped
+        // reads (DLLs, executables, mmap'd git packs/SQLite), not just pagefile swap-ins. Only
+        // report it as swap pressure when physical RAM is genuinely tight (< 10% available) and
+        // the pagefile actually holds pages; otherwise normal Windows disk reads falsely cordon
+        // the runner as 100% swapping.
+        let swapin_rate = crate::sense::pace::windows_swapin_rate(pages_in, if have_mem { mem.total_phys } else { 0 }, if have_mem { mem.avail_phys } else { 0 }, swap);
         Raw {
             clock: clock(cpus),
             runnable: queue.zip(busy).map(|(q, b)| q + b * f64::from(cpus)),
             cpus,
-            swapin_rate: pages_in,
+            swapin_rate,
             swap,
             device: self.device.as_mut().and_then(crate::os::sense_disk_windows::Device::counters),
             on_battery: battery.then_some(power.ac_line == 0),

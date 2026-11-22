@@ -61,6 +61,14 @@ struct Shared {
     changed: crate::rt::Notify,
     /// Sessions a person paused ([`pause`]): their groups held stopped, paced or not.
     paused: Mutex<HashSet<String>>,
+    /// Sessions known to be subagents (slowed after child tool calls/reach commands, before primary
+    /// agent harnesses).
+    subagents: Mutex<HashSet<String>>,
+    /// Each host-mode agent session's root harness PID so spawned child calls (`cargo`, `rustc`,
+    /// etc.) are paced first without touching the interactive harness itself.
+    harness_pids: Mutex<HashMap<String, u32>>,
+    /// Reach command groups started directly by a person (never slowed).
+    person_groups: Mutex<HashSet<String>>,
 }
 
 static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
@@ -74,7 +82,65 @@ static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     latest: Mutex::new(None),
     changed: crate::rt::Notify::new(),
     paused: Mutex::new(HashSet::new()),
+    subagents: Mutex::new(HashSet::new()),
+    harness_pids: Mutex::new(HashMap::new()),
+    person_groups: Mutex::new(HashSet::new()),
 });
+
+/// Marks whether `session` is a subagent so headroom slows it before primary harnesses and after
+/// child tool/reach processes.
+pub fn mark_subagent(session: &str, is_subagent: bool) {
+    if session.is_empty() {
+        return;
+    }
+    let mut s = SHARED.subagents.lock();
+    if is_subagent {
+        s.insert(session.to_owned());
+    } else {
+        s.remove(session);
+    }
+}
+
+/// Records `session`'s host harness root PID so spawned child builds/tool calls are targeted first.
+pub fn set_harness_pid(session: &str, pid: Option<u32>) {
+    if session.is_empty() {
+        return;
+    }
+    let mut h = SHARED.harness_pids.lock();
+    match pid {
+        Some(p) => {
+            h.insert(session.to_owned(), p);
+        }
+        None => {
+            h.remove(session);
+        }
+    }
+}
+
+pub(super) fn clear_harness_pid(session: &str) {
+    if !session.is_empty() {
+        SHARED.harness_pids.lock().remove(session);
+        SHARED.subagents.lock().remove(session);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn harness_pid(session: &str) -> Option<u32> {
+    SHARED.harness_pids.lock().get(session).copied()
+}
+
+/// Marks a `reach` run group started directly by a person (never slowed by headroom).
+pub fn mark_person_group(name: &str, active: bool) {
+    if name.is_empty() {
+        return;
+    }
+    let mut p = SHARED.person_groups.lock();
+    if active {
+        p.insert(name.to_owned());
+    } else {
+        p.remove(name);
+    }
+}
 
 fn kick() {
     let (lock, cv) = &SHARED.kick;
@@ -93,7 +159,7 @@ pub fn admit(session: &str, class: Class) -> bool {
     let s = &*SHARED;
     // W05-R03: an unbound core has no session whose turn can be granted or released, just as
     // `turn_ended` and the message meter ignore it. It must not enter another runner's ledger.
-    if session.is_empty() || !s.running.load(Ordering::Acquire) || !s.enabled.load(Ordering::Acquire) || class == Class::Person {
+    if session.is_empty() || !s.running.load(Ordering::Acquire) || !s.enabled.load(Ordering::Acquire) || class == Class::Runner {
         return true;
     }
     let now = now_us();
@@ -347,47 +413,71 @@ pub struct Status {
     pub events: Vec<String>,
 }
 
-/// The machine's write rate from its disks' own counters (/proc/diskstats: sectors written, of
-/// whole physical devices), between two reads, and how long the disks written sat idle meanwhile
-/// (their busy time, "# of milliseconds spent doing I/Os": iostats.rst).
+/// The work volume's write rate from its disks' own counters (`/proc/diskstats`: sectors written,
+/// of the work volume's underlying physical devices where resolved, else all whole physical
+/// devices), between two reads, and how long the busiest disk written sat idle meanwhile (their
+/// busy time, "# of milliseconds spent doing I/Os": iostats.rst).
 #[derive(Default)]
 struct Disks {
+    /// Block device names backing the runner's work volume (`None`: fall back to all physical
+    /// whole devices in `/proc/diskstats`). Scoping to the work volume prevents unrelated drives
+    /// (OS disk, USB, backup volumes) from hiding work-disk saturation or inflating `others`.
+    only: Option<HashSet<String>>,
     last: Option<(std::time::Instant, BTreeMap<String, (u64, u64)>)>,
 }
 
 impl Disks {
-    /// Each whole physical device's sectors written and milliseconds busy.
-    fn counters() -> Option<BTreeMap<String, (u64, u64)>> {
+    fn for_dir(work_dir: &Path) -> Self {
+        #[cfg(target_os = "linux")]
+        let only = crate::os::sense_disk_linux::facts(work_dir)
+            .filter(|s| !s.network)
+            .map(|s| s.devices.into_iter().filter(|d| !d.name.is_empty() && !matches!(d.kind, kiln_ci::facts::DeviceKind::Ram | kiln_ci::facts::DeviceKind::Network)).map(|d| d.name).collect::<HashSet<_>>())
+            .filter(|set| !set.is_empty());
+        #[cfg(not(target_os = "linux"))]
+        let only = {
+            let _ = work_dir;
+            None
+        };
+        Self { only, last: None }
+    }
+
+    /// Each tracked block device's sectors written and milliseconds busy.
+    fn counters(&self) -> Option<BTreeMap<String, (u64, u64)>> {
         let text = std::fs::read_to_string("/proc/diskstats").ok()?;
         let mut out = BTreeMap::new();
         for line in text.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
             let (Some(name), Some(sectors), Some(busy)) = (f.get(2), f.get(9).and_then(|v| v.parse::<u64>().ok()), f.get(12).and_then(|v| v.parse::<u64>().ok())) else { continue };
-            // Whole physical devices only: a partition or a mapper would count the same writes twice.
-            if Path::new("/sys/block").join(name).join("device").exists() {
+            let include = match &self.only {
+                Some(names) => names.contains(*name),
+                // Whole physical devices only: a partition or a mapper would count the same writes twice.
+                None => !name.starts_with("loop") && !name.starts_with("ram") && !name.starts_with("zram") && Path::new("/sys/block").join(name).join("device").exists(),
+            };
+            if include {
                 out.insert((*name).to_owned(), (sectors, busy));
             }
         }
         (!out.is_empty()).then_some(out)
     }
 
-    /// Bytes written a second since the last read, and the longest any disk written meanwhile sat
-    /// idle (ms; none when none wrote): none on the first read, or where the system can't say. A disk
-    /// idle part of the span wasn't full, so what it delivered says nothing of what it takes
-    /// (`kiln_ci::protect::cause::at_capacity`, LB05 step 2).
+    /// Bytes written a second since the last read, and the shortest idle time (ms; none when none
+    /// wrote) of any tracked disk that wrote meanwhile: none on the first read, or where the
+    /// system can't say. Taking the minimum across work devices ensures one saturated member disk
+    /// is never masked by an idle sibling.
     fn rate(&mut self) -> Option<(f64, Option<f64>)> {
         let now = std::time::Instant::now();
-        let cur = Self::counters()?;
+        let cur = self.counters()?;
         let out = self.last.as_ref().map(|(at, before)| {
             let span = now.duration_since(*at);
+            let span_ms = span.as_secs_f64() * 1e3;
             let written: u64 = cur.iter().map(|(d, (s, _))| s.saturating_sub(before.get(d).map_or(*s, |b| b.0))).sum();
             let idle = cur
                 .iter()
                 .filter_map(|(d, (s, busy))| {
                     let (s0, busy0) = before.get(d)?;
-                    (s > s0).then(|| (span.as_millis() as f64 - busy.saturating_sub(*busy0) as f64).max(0.0))
+                    (s > s0).then(|| (span_ms - busy.saturating_sub(*busy0) as f64).max(0.0))
                 })
-                .fold(None, |m: Option<f64>, i| Some(m.map_or(i, |m| m.max(i))));
+                .fold(None, |m: Option<f64>, i| Some(m.map_or(i, |m| m.min(i))));
             (written as f64 * 512.0 / span.as_secs_f64().max(f64::MIN_POSITIVE), idle)
         });
         self.last = Some((now, cur));
@@ -397,23 +487,28 @@ impl Disks {
 
 /// Memory the machine has free for new work, in bytes: MemAvailable on Linux; on macOS the room its
 /// runner's sample and facts read ([`mac_free`]), so this guard holds work where the balancer sees no
-/// room; what the system says is available elsewhere.
-fn mem_free() -> f64 {
+/// room; what the system says is available elsewhere (reusing `sys` instead of allocating a fresh
+/// `sysinfo::System` on every headroom step).
+fn mem_free_with(sys: &mut sysinfo::System) -> f64 {
     #[cfg(target_os = "macos")]
-    if let Some((pages, page)) = crate::os::sense::memory_pages() {
-        return mac_free(&pages, page);
+    {
+        let _ = sys;
+        if let Some((pages, page)) = crate::os::sense::memory_pages() {
+            return mac_free(&pages, page);
+        }
     }
-    std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|t| t.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<f64>().ok()))
-        .map_or_else(
-            || {
-                let mut sys = sysinfo::System::new();
-                sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
-                sys.available_memory() as f64
-            },
-            |kib| kib * 1024.0,
-        )
+    #[cfg(target_os = "linux")]
+    if let Some(kib) = std::fs::read_to_string("/proc/meminfo").ok().and_then(|t| t.lines().find_map(|l| l.strip_prefix("MemAvailable:")).and_then(|v| v.split_whitespace().next()).and_then(|v| v.parse::<f64>().ok())) {
+        return kib * 1024.0;
+    }
+    sys.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+    sys.available_memory() as f64
+}
+
+#[cfg(test)]
+fn mem_free() -> f64 {
+    let mut sys = sysinfo::System::new();
+    mem_free_with(&mut sys)
 }
 
 /// A Mac's memory free for new work, read from its pages as its runner's sample and facts read them
@@ -427,10 +522,74 @@ fn mac_free(pages: &kiln_ci::facts::VmPages, page: u64) -> f64 {
     pages.room(page) as f64
 }
 
-/// A group as the engine knows it: an agent session by its id (as it waits and is let in), anything
-/// else by where it is.
+/// A group as the engine knows it: a primary/subagent harness by its session id (matching its
+/// admission waits), a session's child tool processes by its `dir` (`tools:<session>`) so tools
+/// are slowed independently of the harness, and anything else by its `dir`.
 fn id_of(g: &pace::Group) -> String {
-    g.session.clone().unwrap_or_else(|| g.dir.display().to_string())
+    match (g.kind, &g.session) {
+        (pace::GroupKind::Harness, Some(s)) => s.clone(),
+        _ => g.dir.display().to_string(),
+    }
+}
+
+/// Priority class of a paced group:
+/// `Runner` (direct human message delivery or human `reach` run) > `Agent` (primary harness) >
+/// `Subagent` (subagent harness) > `Tool` (spawned child tool/build calls, agent `reach` commands,
+/// CI jobs, escaped user units) > `Background`.
+fn class_of_group(g: &pace::Group, delivering: &HashSet<String>, subagents: &HashSet<String>, person_groups: &HashSet<String>) -> Class {
+    if person_groups.contains(&g.label) || g.session.as_ref().is_some_and(|s| person_groups.contains(s)) {
+        return Class::Runner;
+    }
+    match g.kind {
+        pace::GroupKind::Tool | pace::GroupKind::Job | pace::GroupKind::Escape => Class::Tool,
+        pace::GroupKind::Harness => match &g.session {
+            Some(s) if delivering.contains(s) => Class::Runner,
+            Some(s) if subagents.contains(s) => Class::Subagent,
+            _ => Class::Agent,
+        },
+    }
+}
+
+/// Minimum smooth throttle share kept during Stage 1 before ever escalating to a hard freeze:
+/// keeps demanding Rust builds making steady progress instead of locking up on spikes.
+const MIN_SOFT_SHARE: f64 = 0.10;
+/// Base escalation window before automatic pacing may freeze a group when smooth throttling failed
+/// to drain harm (10 s for tools/jobs/background, 20 s for subagents, 30 s for primary harnesses).
+const FREEZE_ESCALATION_US: u64 = 10_000_000;
+
+/// Progressive slow-before-freeze gate: converts sudden `share == 0.0` stop requests into smooth
+/// throttling ([`MIN_SOFT_SHARE`]) until harm persists across the tier's escalation window, so
+/// transient spikes and demanding builds slow smoothly and only freeze when all else fails.
+#[derive(Default)]
+struct FreezeGate {
+    zero_since: HashMap<PathBuf, u64>,
+}
+
+impl FreezeGate {
+    fn escalation_us(class: Class) -> u64 {
+        match class {
+            Class::Background | Class::Tool => FREEZE_ESCALATION_US,
+            Class::Subagent => FREEZE_ESCALATION_US * 2,
+            Class::Agent | Class::Runner => FREEZE_ESCALATION_US * 3,
+        }
+    }
+
+    fn apply(&mut self, dir: &Path, class: Class, share: f64, now_us: u64) -> f64 {
+        if share > 0.0 {
+            self.zero_since.remove(dir);
+            return share;
+        }
+        let since = *self.zero_since.entry(dir.to_path_buf()).or_insert(now_us);
+        if now_us.saturating_sub(since) >= Self::escalation_us(class) {
+            0.0
+        } else {
+            MIN_SOFT_SHARE
+        }
+    }
+
+    fn retain(&mut self, active: &HashMap<PathBuf, f64>) {
+        self.zero_since.retain(|d, _| active.contains_key(d));
+    }
 }
 
 /// The share of the last `span` that a group was let run: all of it less what the pacer held it
@@ -461,7 +620,14 @@ fn run(ctx: Ctx, mut settings: Settings) {
     let engine_targets = |s: &Settings| -> Vec<Target> {
         targets(s, &ctx)
             .into_iter()
-            .map(|t| Target { tolerance_us: f64::from(t.tolerance_ms()) * 1e3, window_us: t.window_ms.map(|w| f64::from(w) * 1e3), first: matches!(t.probe, settings::Probe::Delay { .. }), sync_bytes: matches!(t.probe, settings::Probe::Fsync { .. }).then(page_bytes).flatten(), name: t.name })
+            .map(|t| Target {
+                tolerance_us: f64::from(t.tolerance_ms()) * 1e3,
+                window_us: t.window_ms.map(|w| f64::from(w) * 1e3),
+                first: matches!(t.probe, settings::Probe::Delay { .. }),
+                sync_bytes: matches!(t.probe, settings::Probe::Fsync { .. }).then(page_bytes).flatten(),
+                passive: matches!(t.probe, settings::Probe::Messages),
+                name: t.name,
+            })
             .collect()
     };
     let learned_path = ctx.dir.join(LEARNED);
@@ -470,12 +636,13 @@ fn run(ctx: Ctx, mut settings: Settings) {
     let mut probes = probes::Probes::start(specs(&settings), Arc::clone(&wake));
     let pacer = pace::Pacer::start(&ctx.dir);
     let mut meter = pace::Meter::default();
-    let mut disks = Disks::default();
+    let mut disks = Disks::for_dir(&ctx.data_dir);
     let mut groups: Vec<pace::Group> = Vec::new();
     let mut loads: Vec<pace::Load> = Vec::new();
     // The machine's CPU, all its processes counted: how much of it sat idle since the last look.
     let mut machine_cpu = sysinfo::System::new();
     machine_cpu.refresh_cpu_usage();
+    let cpu_baseline_at = std::time::Instant::now();
     let mut cpu_idle: Option<f64> = None;
     let mut measured_at: Option<std::time::Instant> = None;
     let mut delivered: Option<f64> = None;
@@ -484,6 +651,8 @@ fn run(ctx: Ctx, mut settings: Settings) {
     // held it stopped in all at the last look.
     let mut ran: HashMap<PathBuf, f64> = HashMap::new();
     let mut held_before: HashMap<PathBuf, Duration> = HashMap::new();
+    let mut freeze_gate = FreezeGate::default();
+    let mut applied_shares: HashMap<PathBuf, f64> = HashMap::new();
     let mut events: Vec<String> = Vec::new();
     let mut last_status: Option<String> = None;
     tracing::info!(pacing = pace::how(), targets = probes.specs.len(), "headroom: watching this machine");
@@ -528,15 +697,29 @@ fn run(ctx: Ctx, mut settings: Settings) {
             let last = measured_at.replace(at);
             groups = pace::groups(settings.escapes);
             loads = meter.load(&groups);
-            machine_cpu.refresh_cpu_usage();
-            let used = f64::from(machine_cpu.global_cpu_usage());
-            cpu_idle = std::thread::available_parallelism().ok().filter(|_| used.is_finite()).map(|n| n.get() as f64 * (1.0 - used / 100.0).clamp(0.0, 1.0));
+            // `sysinfo::System::global_cpu_usage()` requires at least ~200 ms between refreshes
+            // (`MINIMUM_CPU_UPDATE_INTERVAL`) for valid deltas across Linux, macOS, and Windows.
+            if last.map_or_else(|| cpu_baseline_at.elapsed(), |l| at.duration_since(l)) >= Duration::from_millis(250) {
+                machine_cpu.refresh_cpu_usage();
+                let used = f64::from(machine_cpu.global_cpu_usage());
+                cpu_idle = std::thread::available_parallelism().ok().filter(|_| used.is_finite()).map(|n| n.get() as f64 * (1.0 - used / 100.0).clamp(0.0, 1.0));
+            }
             let written = disks.rate();
             delivered = written.map(|w| w.0);
             disks_idle = written.and_then(|w| w.1);
             let held = pacer.stopped();
             let span = last.map(|l| at.duration_since(l));
-            ran = groups.iter().map(|g| (g.dir.clone(), ran_share(held.get(&g.dir), held_before.get(&g.dir), span))).collect();
+            ran = groups
+                .iter()
+                .map(|g| {
+                    let s = if pacer.is_soft_throttled(&g.dir) {
+                        applied_shares.get(&g.dir).copied().unwrap_or(1.0)
+                    } else {
+                        ran_share(held.get(&g.dir), held_before.get(&g.dir), span)
+                    };
+                    (g.dir.clone(), s)
+                })
+                .collect();
             held_before = held;
         }
         let (mut answers, mut inflight) = probes.drain();
@@ -546,11 +729,21 @@ fn run(ctx: Ctx, mut settings: Settings) {
         let (took, oldest, delivering) = messages::drain(now);
         answers.extend(took.into_iter().map(|us| (messages::TARGET.to_owned(), Answer::Took(us))));
         inflight.extend(oldest.map(|age| (messages::TARGET.to_owned(), age)));
-        let class_of = |session: Option<&String>| if session.is_some_and(|s| delivering.contains(s)) { Class::Person } else { Class::Agent };
+        let subagents = SHARED.subagents.lock().clone();
+        let person_groups = SHARED.person_groups.lock().clone();
+        let class_of_session = |s: &str| {
+            if delivering.contains(s) || person_groups.contains(s) {
+                Class::Runner
+            } else if subagents.contains(s) {
+                Class::Subagent
+            } else {
+                Class::Agent
+            }
+        };
         let (waiting, ended) = {
             let mut a = SHARED.admit.lock();
             a.granted.retain(|_, until| *until > now);
-            let waiting: Vec<Waiting> = a.waiting.iter().map(|(s, since)| Waiting { id: s.clone(), key: s.clone(), class: class_of(Some(s)), since_us: *since }).collect();
+            let waiting: Vec<Waiting> = a.waiting.iter().map(|(s, since)| Waiting { id: s.clone(), key: s.clone(), class: class_of_session(s), since_us: *since }).collect();
             (waiting, std::mem::take(&mut a.ended))
         };
         // What a person paused is theirs, not the engine's: it neither counts nor learns from it.
@@ -562,7 +755,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
             .map(|(g, l)| Group {
                 id: id_of(g),
                 key: g.session.clone().unwrap_or_else(|| g.label.clone()),
-                class: class_of(g.session.as_ref()),
+                class: class_of_group(g, &delivering, &subagents, &person_groups),
                 protected: false,
                 write_bps: l.write_rate,
                 cpu_cores: l.cpu_pct / 100.0,
@@ -573,20 +766,33 @@ fn run(ctx: Ctx, mut settings: Settings) {
         // Sessions whose turn ended, or that ended (with processes or without): by the same id
         // they waited and run under.
         let cores = std::thread::available_parallelism().ok().map(|n| n.get() as f64);
-        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, disks_idle_ms: disks_idle, mem_free: mem_free(), running, waiting, ended, cores, cpu_idle };
+        let obs = Observation { now_us: now, answers, inflight, delivered_bps: delivered, disks_idle_ms: disks_idle, mem_free: mem_free_with(&mut machine_cpu), running, waiting, ended, cores, cpu_idle };
         let plan = engine.step(&obs);
         due = plan.due_us.map(|at| std::time::Instant::now() + Duration::from_micros(at.saturating_sub(now)));
         for (name, every) in &plan.probe_every_us {
             probes.set_interval(name, *every);
         }
         // Pacing: the engine's shares, unless off or another process of this machine paces.
+        // Smooth slowdown comes first (`FreezeGate`): sudden stop requests stay at `MIN_SOFT_SHARE`
+        // (smooth throttling) and only escalate to 0% freeze if harm persists past the tier's
+        // escalation window. Explicit human pauses (`with_paused`) always stop immediately.
         let pacing = settings.enabled && !SHARED.standby.load(Ordering::Acquire);
         let mut shares: HashMap<PathBuf, f64> = if pacing {
-            plan.shares.iter().filter(|p| p.share < 1.0).filter_map(|p| groups.iter().find(|g| id_of(g) == p.id).map(|g| (g.dir.clone(), p.share))).collect()
+            plan.shares
+                .iter()
+                .filter(|p| p.share < 1.0)
+                .filter_map(|p| {
+                    let g = groups.iter().find(|g| id_of(g) == p.id)?;
+                    let class = class_of_group(g, &delivering, &subagents, &person_groups);
+                    Some((g.dir.clone(), freeze_gate.apply(&g.dir, class, p.share, now)))
+                })
+                .collect()
         } else {
             HashMap::new()
         };
+        freeze_gate.retain(&shares);
         with_paused(&mut shares, &groups, &paused);
+        applied_shares.clone_from(&shares);
         pacer.set(shares.iter().map(|(d, s)| (d.clone(), pace::step_of(*s))).collect(), Duration::from_micros(probes.fastest_us()));
         // Admission: who the engine let start.
         // A place holds until the session's turn ends (or it does): how long it was expected to
@@ -644,7 +850,7 @@ fn run(ctx: Ctx, mut settings: Settings) {
                     write_mb_s: (l.write_rate / 1e6).round() as u32,
                     mem_mb: (l.mem_bytes / 1e6).round() as u64,
                     share: shares.get(&g.dir).map_or(100, |s| pace::step_of(*s)),
-                    why: plan.shares.iter().find(|p| p.id == g.dir.display().to_string()).map(|p| p.why.clone()).unwrap_or_default(),
+                    why: plan.shares.iter().find(|p| p.id == id_of(g)).map(|p| p.why.clone()).unwrap_or_default(),
                 })
                 .collect(),
             held,
@@ -710,7 +916,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_session_a_person_paused_is_held_all_the_time_whatever_the_engine_gave_it() {
-        let group = |dir: &str, session: Option<&str>| pace::Group { dir: dir.into(), label: dir.into(), session: session.map(str::to_owned) };
+        let group = |dir: &str, session: Option<&str>| pace::Group { dir: dir.into(), label: dir.into(), session: session.map(str::to_owned), kind: pace::GroupKind::Harness };
         let groups = [group("/a", Some("a")), group("/b", Some("b")), group("/unit", None)];
         let mut shares: HashMap<PathBuf, f64> = [(PathBuf::from("/b"), 0.5)].into_iter().collect();
         with_paused(&mut shares, &groups, &["a".to_owned()].into_iter().collect());
@@ -797,5 +1003,43 @@ pub(crate) mod tests {
         let read = [swapping, crowded, after, desktop, idle].map(|mac| mac_free(&mac, page));
         assert_eq!(read, [3_805, 35_608, 1_454_202, 1_040_198, 1_227_944].map(|pages: u64| (pages * page) as f64));
         assert_eq!(read, [swapping, crowded, after, desktop, idle].map(|mac| mac.room(page) as f64), "the room the runner's sample and facts read");
+    }
+
+    #[test]
+    fn freeze_gate_throttles_smoothly_first_and_escalates_by_tier_only_when_harm_persists() {
+        let mut gate = FreezeGate::default();
+        let tool = Path::new("/tools/s1");
+        let sub = Path::new("/session/sub1");
+        let agent = Path::new("/session/main1");
+        // Initial stop request at t=0: every tier stays at smooth `MIN_SOFT_SHARE` (10%), NEVER freezes immediately.
+        assert_eq!(gate.apply(tool, Class::Tool, 0.0, 0), MIN_SOFT_SHARE);
+        assert_eq!(gate.apply(sub, Class::Subagent, 0.0, 0), MIN_SOFT_SHARE);
+        assert_eq!(gate.apply(agent, Class::Agent, 0.0, 0), MIN_SOFT_SHARE);
+        // At 10s of continuous unimproved harm: Tool escalates to 0% freeze; Subagent & Agent stay smoothly throttled!
+        assert_eq!(gate.apply(tool, Class::Tool, 0.0, FREEZE_ESCALATION_US), 0.0);
+        assert_eq!(gate.apply(sub, Class::Subagent, 0.0, FREEZE_ESCALATION_US), MIN_SOFT_SHARE);
+        assert_eq!(gate.apply(agent, Class::Agent, 0.0, FREEZE_ESCALATION_US), MIN_SOFT_SHARE);
+        // At 20s: Subagent escalates; primary Agent still throttles smoothly until 30s!
+        assert_eq!(gate.apply(sub, Class::Subagent, 0.0, FREEZE_ESCALATION_US * 2), 0.0);
+        assert_eq!(gate.apply(agent, Class::Agent, 0.0, FREEZE_ESCALATION_US * 2), MIN_SOFT_SHARE);
+        assert_eq!(gate.apply(agent, Class::Agent, 0.0, FREEZE_ESCALATION_US * 3), 0.0);
+        // Non-zero share resets escalation immediately.
+        assert_eq!(gate.apply(tool, Class::Tool, 0.5, FREEZE_ESCALATION_US * 4), 0.5);
+        assert_eq!(gate.apply(tool, Class::Tool, 0.0, FREEZE_ESCALATION_US * 4 + 1_000), MIN_SOFT_SHARE);
+    }
+
+    #[test]
+    fn granular_group_classification_orders_tools_subagents_agents_and_people() {
+        let delivering = HashSet::from(["chatting".to_owned()]);
+        let subagents = HashSet::from(["sub1".to_owned()]);
+        let persons = HashSet::from(["run-human".to_owned()]);
+        let g = |dir: &str, label: &str, session: Option<&str>, kind| pace::Group { dir: dir.into(), label: label.into(), session: session.map(str::to_owned), kind };
+        assert_eq!(class_of_group(&g("tools:main1", "main1 (tools)", Some("main1"), pace::GroupKind::Tool), &delivering, &subagents, &persons), Class::Tool);
+        assert_eq!(class_of_group(&g("session:run-agent", "run-agent", Some("run-agent"), pace::GroupKind::Tool), &delivering, &subagents, &persons), Class::Tool);
+        assert_eq!(class_of_group(&g("session:run-human", "run-human", Some("run-human"), pace::GroupKind::Tool), &delivering, &subagents, &persons), Class::Runner);
+        assert_eq!(class_of_group(&g("/job1", "job 1", None, pace::GroupKind::Job), &delivering, &subagents, &persons), Class::Tool);
+        assert_eq!(class_of_group(&g("session:sub1", "sub1", Some("sub1"), pace::GroupKind::Harness), &delivering, &subagents, &persons), Class::Subagent);
+        assert_eq!(class_of_group(&g("session:main1", "main1", Some("main1"), pace::GroupKind::Harness), &delivering, &subagents, &persons), Class::Agent);
+        assert_eq!(class_of_group(&g("session:chatting", "chatting", Some("chatting"), pace::GroupKind::Harness), &delivering, &subagents, &persons), Class::Runner);
     }
 }

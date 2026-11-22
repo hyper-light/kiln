@@ -853,15 +853,14 @@ fn hand_over(owner: &Owner, held: &mut VecDeque<NetEvent>, held_bytes: &mut usiz
     true
 }
 
-/// Holds each of `peers`' lanes (every lane a peer may open), or lets them go
-/// ([`Endpoint::hold_lane`]).
-fn hold_lanes<B, D>(ep: &mut Endpoint<Kiln, B, D>, peers: impl Iterator<Item = PeerId>, lanes: u32, hold: bool)
+/// Holds lanes `first..lanes` for each of `peers`, or lets them go ([`Endpoint::hold_lane`]).
+fn hold_lanes<B, D>(ep: &mut Endpoint<Kiln, B, D>, peers: impl Iterator<Item = PeerId>, first: u32, lanes: u32, hold: bool)
 where
     B: hyper_transport::Budget<Class>,
     D: Directory<Role = Role>,
 {
     for peer in peers {
-        for lane in 0..lanes {
+        for lane in first..lanes {
             let _ = if hold { ep.hold_lane(peer, lane) } else { ep.release_lane(peer, lane) };
         }
     }
@@ -1236,7 +1235,7 @@ where
                     q.pop_front();
                     sent_any = true;
                 }
-                Err(Refusal::LaneFull) => break,
+                Err(Refusal::LaneFull | Refusal::Budget) => break,
                 Err(Refusal::NotConnected | Refusal::Closed) => {
                     dead.push(peer);
                     break;
@@ -1301,8 +1300,13 @@ async fn run_loop(
     // runner past its window.
     let held_most = || if spec.server { crate::memory::room::share() } else { EVENTS_BYTES };
     let lanes = limits(spec.server).lanes_per_peer;
+    let interactive_lanes = 2u32.min(lanes);
     let mut peers: HashSet<PeerId> = HashSet::new();
-    let mut holding = false;
+    // Two-tier receive backpressure: hold bulk lanes (logs, convo feed, files) at 1x share while
+    // keeping LANE_CONTROL (0) and LANE_TERM (1) open so messages, session opens, and command ACKs
+    // keep flowing under bulk bursts; only hold interactive lanes too if held_bytes hits 2x share.
+    let mut holding_bulk = false;
+    let mut holding_interactive = false;
     // This turn took what came in: it goes to the owner before the turn's sends.
     let mut received = false;
 
@@ -1324,10 +1328,16 @@ async fn run_loop(
         if held.len() < before {
             stamp(me, Step::Handed(before.saturating_sub(held.len())));
         }
-        let hold = if holding { handing.is_some() || !held.is_empty() } else { held_bytes >= held_most() };
-        if hold != holding {
-            with_driver!(&mut driver, d => hold_lanes(d.endpoint(), peers.iter().copied(), lanes, hold));
-            holding = hold;
+        let limit_bytes = held_most();
+        let hold_bulk = if holding_bulk { handing.is_some() || !held.is_empty() } else { held_bytes >= limit_bytes };
+        if hold_bulk != holding_bulk {
+            with_driver!(&mut driver, d => hold_lanes(d.endpoint(), peers.iter().copied(), interactive_lanes, lanes, hold_bulk));
+            holding_bulk = hold_bulk;
+        }
+        let hold_interactive = if holding_interactive { handing.is_some() || !held.is_empty() } else { held_bytes >= limit_bytes.saturating_mul(2) };
+        if hold_interactive != holding_interactive {
+            with_driver!(&mut driver, d => hold_lanes(d.endpoint(), peers.iter().copied(), 0, interactive_lanes, hold_interactive));
+            holding_interactive = hold_interactive;
         }
         let pending = !outbox.is_empty();
         let ev = {
@@ -1561,8 +1571,11 @@ async fn run_loop(
                 // One that connects while the others' lanes are held is held too.
                 NetEvent::Connected { peer, .. } => {
                     peers.insert(*peer);
-                    if holding {
-                        with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), lanes, true));
+                    if holding_bulk {
+                        with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), interactive_lanes, lanes, true));
+                    }
+                    if holding_interactive {
+                        with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), 0, interactive_lanes, true));
                     }
                     // The server's room cut again for the runners connected now (join-burst, item 1).
                     if spec.server {
@@ -1570,8 +1583,11 @@ async fn run_loop(
                     }
                 }
                 NetEvent::Closed { peer, .. } | NetEvent::Unreachable { peer, .. } => {
-                    if holding {
-                        with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), lanes, false));
+                    if holding_bulk {
+                        with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), interactive_lanes, lanes, false));
+                    }
+                    if holding_interactive {
+                        with_driver!(&mut driver, d => hold_lanes(d.endpoint(), std::iter::once(*peer), 0, interactive_lanes, false));
                     }
                     if peers.remove(peer) && spec.server {
                         crate::memory::room::runners(peers.len());

@@ -523,7 +523,7 @@ pub fn open(core: &mut Core) -> bool {
 /// waited in an idle agent's queue while the machine was loaded, 2026-11-11); another agent's,
 /// kiln's own and a goal's are held for room.
 pub fn class_of(id: &str) -> crate::headroom::Class {
-    if super::queued::persons(id) { crate::headroom::Class::Person } else { crate::headroom::Class::Agent }
+    if super::queued::persons(id) { crate::headroom::Class::Runner } else { crate::headroom::Class::Agent }
 }
 
 pub(super) fn open_for(core: &mut Core, class: crate::headroom::Class) -> bool {

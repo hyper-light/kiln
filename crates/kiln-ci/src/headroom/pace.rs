@@ -142,7 +142,7 @@ fn level(demands: &[f64], left: f64) -> f64 {
 fn fill(budget: Option<f64>, groups: &[Running], demand: impl Fn(&Running) -> f64) -> Vec<f64> {
     let wanted: f64 = groups.iter().map(|g| demand(g).max(0.0)).sum();
     let Some(budget) = budget.filter(|b| wanted > *b) else { return vec![1.0; groups.len()] };
-    let exempt = |g: &Running| g.protected || g.class == Class::Person || demand(g) <= 0.0;
+    let exempt = |g: &Running| g.protected || g.class == Class::Runner || demand(g) <= 0.0;
     let mut left = budget - groups.iter().filter(|g| exempt(g)).map(|g| demand(g).max(0.0)).sum::<f64>();
     let mut levels: Vec<(Class, f64)> = Vec::new();
     let mut classes: Vec<Class> = groups.iter().filter(|g| !exempt(g)).map(|g| g.class).collect();
@@ -178,8 +178,8 @@ pub fn plan(write_budget: Option<f64>, cpu_budget: Option<f64>, groups: &[Runnin
             let share = sw.min(*sc);
             let why = if g.protected {
                 "a protected target's: never slowed".to_owned()
-            } else if g.class == Class::Person {
-                "a person's: never slowed".to_owned()
+            } else if g.class == Class::Runner {
+                "runner-priority: never slowed".to_owned()
             } else if share >= 1.0 {
                 "within its fair part of every budget".to_owned()
             } else if share <= 0.0 {
@@ -205,10 +205,10 @@ mod tests {
 
     #[test]
     fn the_lowest_class_is_slowed_first_and_people_and_readers_never() {
-        let groups = [g("person", Class::Person, 500e6), g("a1", Class::Agent, 100e6), g("a2", Class::Agent, 400e6), g("bench", Class::Background, 300e6), g("reader", Class::Agent, 0.0)];
+        let groups = [g("runner", Class::Runner, 500e6), g("a1", Class::Agent, 100e6), g("a2", Class::Agent, 400e6), g("bench", Class::Background, 300e6), g("reader", Class::Agent, 0.0)];
         let p = plan(Some(800e6), None, &groups);
         let share = |id: &str| p.iter().find(|x| x.id == id).map_or(-1.0, |x| x.share);
-        assert_eq!(share("person"), 1.0);
+        assert_eq!(share("runner"), 1.0);
         assert_eq!(share("reader"), 1.0);
         // 300 MB/s left after the person: agents 100 + 200 of 400, the bench stopped.
         assert_eq!(share("a1"), 1.0);
@@ -237,6 +237,33 @@ mod tests {
         // Writes: 200 of 400 MB/s; its CPU share is whole, the smaller is the write share.
         assert!((share("link") - 0.5).abs() < 1e-9);
         assert_eq!(share("idle"), 1.0);
+    }
+
+    #[test]
+    fn granular_tier_order_slows_tools_then_subagents_then_agents_never_runner() {
+        let mk = |id: &str, class: Class, cpu: f64| Running { id: id.into(), class, demand_bps: 0.0, demand_cpu: cpu, protected: false };
+        let groups = [
+            mk("runner", Class::Runner, 2.0),
+            mk("primary", Class::Agent, 4.0),
+            mk("subagent", Class::Subagent, 4.0),
+            mk("cargo", Class::Tool, 8.0),
+            mk("bg", Class::Background, 4.0),
+        ];
+        // 14-core budget: runner (2) + primary (4) + subagent (4) all stay 100%; cargo gets 4 of 8 (50%); bg gets 0%.
+        let p = plan(None, Some(14.0), &groups);
+        let share = |id: &str| p.iter().find(|x| x.id == id).map_or(-1.0, |x| x.share);
+        assert_eq!(share("runner"), 1.0);
+        assert_eq!(share("primary"), 1.0);
+        assert_eq!(share("subagent"), 1.0);
+        assert!((share("cargo") - 0.5).abs() < 1e-9);
+        assert_eq!(share("bg"), 0.0);
+        // Tighter 8-core budget: runner (2) + primary (4) stay 100%; subagent slows to 2/4 (50%); tools & bg yield first.
+        let p2 = plan(None, Some(8.0), &groups);
+        let share2 = |id: &str| p2.iter().find(|x| x.id == id).map_or(-1.0, |x| x.share);
+        assert_eq!(share2("runner"), 1.0);
+        assert_eq!(share2("primary"), 1.0);
+        assert!((share2("subagent") - 0.5).abs() < 1e-9);
+        assert_eq!(share2("cargo"), 0.0);
     }
 
     /// A group held to `share` percent of a `cycle_us` cycle, followed by its due times alone for
@@ -397,13 +424,13 @@ mod tests {
             budget in 0f64..2e9,
             groups in prop::collection::vec((0u8..3, 0f64..1e9, any::<bool>()), 1..16)
         ) {
-            let classes = [Class::Background, Class::Agent, Class::Person];
+            let classes = [Class::Background, Class::Agent, Class::Runner];
             let gs: Vec<Running> = groups.iter().enumerate().map(|(i, (c, d, p))| Running {
                 id: format!("g{i}"), class: classes.get(usize::from(*c)).copied().unwrap_or(Class::Agent), demand_bps: *d, demand_cpu: 0.0, protected: *p,
             }).collect();
             let p = plan(Some(budget), None, &gs);
             let got = |r: &Running| p.iter().find(|x| x.id == r.id).map_or(0.0, |x| x.share * r.demand_bps);
-            let exempt = |r: &Running| r.protected || r.class == Class::Person || r.demand_bps <= 0.0;
+            let exempt = |r: &Running| r.protected || r.class == Class::Runner || r.demand_bps <= 0.0;
             let exempt_sum: f64 = gs.iter().filter(|r| exempt(r)).map(|r| r.demand_bps).sum();
             let paced_sum: f64 = gs.iter().filter(|r| !exempt(r)).map(&got).sum();
             let total: f64 = gs.iter().map(|r| r.demand_bps).sum();

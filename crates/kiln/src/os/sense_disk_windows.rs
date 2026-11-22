@@ -511,15 +511,20 @@ pub fn facts(work_dir: &Path) -> Option<Storage> {
     Some(Storage { fs: v.fs, mount: Some(v.root), source: v.name, network: v.remote, devices })
 }
 
-/// One drive's counters as read, and what calibrates them.
+/// One drive's counters as read, accumulated monotonically from interval deltas.
 struct Drive {
     handle: Handle,
-    /// The first read's `QueryTime` and idle time, and when it was made.
-    anchor: Option<(i64, i64, Instant)>,
-    /// The 32-bit operation counts as last read, and their sums since the first read.
-    counts: Option<(u32, u32)>,
+    /// Previous raw `DISK_PERFORMANCE` reading and when it was taken.
+    prev: Option<(DiskPerformance, Instant)>,
+    /// Learned tick rate (`QueryTime` units per second), retained across NTP jumps.
+    rate: Option<f64>,
     reads: u64,
     writes: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+    read_time_ns: u64,
+    write_time_ns: u64,
+    busy_ns: u64,
 }
 
 /// The work volume's drives, as found once: their handles.
@@ -530,12 +535,16 @@ pub struct Device {
 impl Device {
     pub fn of(work_dir: &Path) -> Option<Device> {
         let v = volume(work_dir).filter(|v| !v.remote)?;
-        let drives: Vec<Drive> = drives_of(v.name.as_deref()?).into_iter().filter_map(|n| Handle::open(&drive_name(n))).map(|handle| Drive { handle, anchor: None, counts: None, reads: 0, writes: 0 }).collect();
+        let drives: Vec<Drive> = drives_of(v.name.as_deref()?)
+            .into_iter()
+            .filter_map(|n| Handle::open(&drive_name(n)))
+            .map(|handle| Drive { handle, prev: None, rate: None, reads: 0, writes: 0, read_bytes: 0, write_bytes: 0, read_time_ns: 0, write_time_ns: 0, busy_ns: 0 })
+            .collect();
         (!drives.is_empty()).then_some(Device { drives })
     }
 
-    /// The drives' counters now, summed (a volume over several), with times in ns at their
-    /// calibrated rate; none until each drive has been read twice (no rate yet).
+    /// The drives' counters now, summed (a volume over several), with times accumulated from
+    /// monotonic interval deltas; none until each drive has been read twice (no interval yet).
     pub fn counters(&mut self) -> Option<Counters> {
         let single = self.drives.len() == 1;
         let mut total = Counters { busy_ns: if single { Some(0) } else { None }, ..Counters::default() };
@@ -543,31 +552,38 @@ impl Device {
         for d in &mut self.drives {
             let p = d.handle.performance()?;
             let now = Instant::now();
-            // The 32-bit counts wrap: their sums since the first read are kept in 64 bits.
-            if let Some((r, w)) = d.counts {
-                d.reads += u64::from(p.read_count.wrapping_sub(r));
-                d.writes += u64::from(p.write_count.wrapping_sub(w));
-            }
-            d.counts = Some((p.read_count, p.write_count));
-            let Some((q0, idle0, t0)) = d.anchor else {
-                d.anchor = Some((p.query_time, p.idle_time, now));
+            let Some((prev, t0)) = d.prev else {
+                d.prev = Some((p, now));
                 calibrated = false;
                 continue;
             };
-            let (dq, dt) = (p.query_time.saturating_sub(q0), now.duration_since(t0).as_secs_f64());
-            if dq <= 0 || dt <= 0.0 {
+            let dt = now.duration_since(t0).as_secs_f64();
+            if dt <= 0.0 {
                 calibrated = false;
                 continue;
             }
-            // Units per second of QueryTime, and so of the times kept with it.
-            let rate = dq as f64 / dt;
-            let ns = |units: i64| (u64::try_from(units).unwrap_or(0) as f64 * 1e9 / rate) as u64;
-            let bytes = |b: i64| u64::try_from(b).unwrap_or(0);
-            total.read = Dir { ops: total.read.ops + d.reads, bytes: total.read.bytes + bytes(p.bytes_read), time_ns: total.read.time_ns + ns(p.read_time) };
-            total.write = Dir { ops: total.write.ops + d.writes, bytes: total.write.bytes + bytes(p.bytes_written), time_ns: total.write.time_ns + ns(p.write_time) };
-            // Busy: all time since the first read less the idle time since.
-            let busy = dq.saturating_sub(p.idle_time.saturating_sub(idle0)).max(0);
-            total.busy_ns = total.busy_ns.map(|b| b + ns(busy));
+            // The 32-bit operation counts wrap: accumulate deltas in 64 bits.
+            d.reads = d.reads.saturating_add(u64::from(p.read_count.wrapping_sub(prev.read_count)));
+            d.writes = d.writes.saturating_add(u64::from(p.write_count.wrapping_sub(prev.write_count)));
+            d.read_bytes = d.read_bytes.saturating_add(u64::try_from(p.bytes_read.saturating_sub(prev.bytes_read)).unwrap_or(0));
+            d.write_bytes = d.write_bytes.saturating_add(u64::try_from(p.bytes_written.saturating_sub(prev.bytes_written)).unwrap_or(0));
+            let dq = p.query_time.saturating_sub(prev.query_time);
+            let d_read = p.read_time.saturating_sub(prev.read_time);
+            let d_write = p.write_time.saturating_sub(prev.write_time);
+            let d_idle = p.idle_time.saturating_sub(prev.idle_time);
+            d.prev = Some((p, now));
+            if let Some((r_ns, w_ns, b_ns, rate)) = crate::sense::disk::windows::delta_ns(dq, dt, d_read, d_write, d_idle, d.rate) {
+                d.rate = Some(rate);
+                d.read_time_ns = d.read_time_ns.saturating_add(r_ns);
+                d.write_time_ns = d.write_time_ns.saturating_add(w_ns);
+                d.busy_ns = d.busy_ns.saturating_add(b_ns);
+            } else {
+                calibrated = false;
+                continue;
+            }
+            total.read = Dir { ops: total.read.ops.saturating_add(d.reads), bytes: total.read.bytes.saturating_add(d.read_bytes), time_ns: total.read.time_ns.saturating_add(d.read_time_ns) };
+            total.write = Dir { ops: total.write.ops.saturating_add(d.writes), bytes: total.write.bytes.saturating_add(d.write_bytes), time_ns: total.write.time_ns.saturating_add(d.write_time_ns) };
+            total.busy_ns = total.busy_ns.map(|b| b.saturating_add(d.busy_ns));
         }
         total.errors = Errors::default();
         calibrated.then_some(total)

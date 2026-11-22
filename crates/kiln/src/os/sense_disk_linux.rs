@@ -274,12 +274,15 @@ impl Device {
     }
 
     /// The devices' counters now, summed over them (a btrfs over several): one `stat` line each,
-    /// and the error counters found.
+    /// and the error counters found. For a multi-device filesystem, `in_flight_ns` is averaged per
+    /// member disk so N independent disks don't multiply single-device queue depth by N.
     pub fn counters(&mut self) -> Option<Counters> {
         let mut total: Option<Counters> = None;
+        let mut count: u64 = 0;
         for p in &self.stats {
             let mut buf = [0u8; 256];
             let Some(c) = read_small(p, &mut buf).and_then(linux::stat) else { continue };
+            count += 1;
             total = Some(match total {
                 None => c,
                 Some(t) => Counters {
@@ -287,12 +290,15 @@ impl Device {
                     write: crate::sense::disk::Dir { ops: t.write.ops + c.write.ops, bytes: t.write.bytes + c.write.bytes, time_ns: t.write.time_ns + c.write.time_ns },
                     // Several devices' busy times don't add up to one's.
                     busy_ns: None,
-                    in_flight_ns: t.in_flight_ns.zip(c.in_flight_ns).map(|(a, b)| a + b),
+                    in_flight_ns: t.in_flight_ns.zip(c.in_flight_ns).map(|(a, b)| a.saturating_add(b)),
                     errors: Errors::default(),
                 },
             });
         }
         let mut total = total?;
+        if count > 1 {
+            total.in_flight_ns = total.in_flight_ns.map(|ns| ns / count);
+        }
         let mut e = Errors::default();
         for (p, what) in &self.errors {
             let mut buf = [0u8; 256];

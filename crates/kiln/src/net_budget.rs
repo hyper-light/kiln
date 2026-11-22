@@ -74,7 +74,14 @@ impl Spares {
 
 impl Budget<Class> for Spares {
     fn reserve(&mut self, bytes: u64, lane: Lane<Class>) -> Result<Reservation, Refusal> {
-        let used = self.used.checked_add(bytes).filter(|used| *used <= self.capacity);
+        // Keep 25% of transport budget reserved for Interactive traffic (control commands, ACKs,
+        // session opens, routed messages) so bulk CI logs / convo feeds / file transfers can never
+        // starve or drop interactive frames under moderate or heavy load.
+        let limit = match lane {
+            Lane::Class(Class::Bulk) => self.capacity.saturating_sub(self.capacity / 4),
+            Lane::Class(Class::Interactive) | Lane::Window => self.capacity,
+        };
+        let used = self.used.checked_add(bytes).filter(|used| *used <= limit);
         let (Some(used), Ok(wanted)) = (used, usize::try_from(bytes)) else {
             self.refused = self.refused.saturating_add(1);
             return Err(Refusal::Budget);
@@ -216,6 +223,21 @@ mod tests {
         anyhow::ensure!(window.granted() == 60 && window.room() == 60 && window.bytes().is_empty());
         budget.release(window);
         anyhow::ensure!((budget.peak, budget.out) == (1, 0), "a window's reservation is no frame's");
+        Ok(())
+    }
+
+    #[test]
+    fn bulk_never_starves_interactive_headroom() -> anyhow::Result<()> {
+        let mut budget = Spares::new(100);
+        // Bulk is capped at 75% (75 bytes), preserving 25% headroom for Interactive frames.
+        let bulk = budget.reserve(75, Lane::Class(Class::Bulk)).map_err(refused)?;
+        anyhow::ensure!(budget.reserve(1, Lane::Class(Class::Bulk)).err() == Some(Refusal::Budget));
+        // Interactive frames still succeed using the reserved 25% headroom.
+        let interactive = budget.reserve(25, Lane::Class(Class::Interactive)).map_err(refused)?;
+        anyhow::ensure!(budget.used() == 100);
+        budget.release(interactive);
+        budget.release(bulk);
+        anyhow::ensure!(budget.used() == 0);
         Ok(())
     }
 }

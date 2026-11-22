@@ -2191,7 +2191,7 @@ impl Codex {
         }
         // A pause (or a switch) holds what waits, and the stop point may start one here.
         let class = if core.state.queue.first().is_some_and(|m| self.now.as_deref() == Some(&m.id)) {
-            crate::headroom::Class::Person
+            crate::headroom::Class::Runner
         } else {
             crate::headroom::Class::Agent
         };

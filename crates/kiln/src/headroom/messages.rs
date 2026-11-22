@@ -96,6 +96,7 @@ pub fn waiting(session: &str, ids: &[&str]) {
 pub fn gone(session: &str) {
     if on() {
         STATE.lock().waiting.remove(session);
+        super::clear_harness_pid(session);
     }
 }
 

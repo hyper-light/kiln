@@ -36,15 +36,33 @@ const GUARD_READY: &str = "ready";
 /// The pacers' records, one each, in headroom's folder.
 const RECORDS: &str = "paced";
 
+/// Granular role of a paced process group for priority ordering (`Tool` / `Job` / `Escape` slowed
+/// FIRST before touching any `Harness`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum GroupKind {
+    /// An agent or subagent session's harness process.
+    #[default]
+    Harness,
+    /// Spawned child tool/build processes (e.g. `cargo`, `rustc`) or agent `reach` command.
+    Tool,
+    /// A CI job's cgroup.
+    Job,
+    /// An escaped transient user systemd unit.
+    Escape,
+}
+
 /// A group of processes headroom can see and slow.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Group {
-    /// Where it is (a cgroup's folder).
+    /// Where it is (a cgroup's folder, `session:<id>`, or `tools:<id>`).
     pub dir: PathBuf,
     /// What it is: an agent session's id, or a unit's name.
     pub label: String,
     /// The agent session it is, when it's one.
     pub session: Option<String>,
+    /// What tier of work this group holds.
+    pub kind: GroupKind,
 }
 
 /// How the machine paces work: `"cgroup"` (Linux), `"signals"` (macOS), `"threads"` (Windows), or
@@ -198,6 +216,9 @@ pub struct Pacer {
     shares: Arc<Mutex<HashMap<PathBuf, u8>>>,
     period: Arc<Mutex<Duration>>,
     stopped: Arc<Mutex<HashMap<PathBuf, Stopped>>>,
+    /// Groups currently paced via smooth kernel CPU throttling (`cpu.max` on Linux, Job Object
+    /// hard cap on Windows) rather than freeze/stop.
+    soft_throttled: Arc<Mutex<HashSet<PathBuf>>>,
     stop: Arc<AtomicBool>,
     wake: Arc<Wake>,
     /// No guard runs, and the last couldn't start: told of every set, which tries again.
@@ -229,10 +250,11 @@ impl Pacer {
         let shares: Arc<Mutex<HashMap<PathBuf, u8>>> = Arc::default();
         let period = Arc::new(Mutex::new(Duration::ZERO));
         let stopped: Arc<Mutex<HashMap<PathBuf, Stopped>>> = Arc::default();
+        let soft_throttled: Arc<Mutex<HashSet<PathBuf>>> = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let wake = Arc::new(Wake::default());
         let unguarded = Arc::new(AtomicBool::new(false));
-        let (sh, pe, sp, st, wa, ug, dir) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&stopped), Arc::clone(&stop), Arc::clone(&wake), Arc::clone(&unguarded), dir.to_owned());
+        let (sh, pe, sp, sf, st, wa, ug, dir) = (Arc::clone(&shares), Arc::clone(&period), Arc::clone(&stopped), Arc::clone(&soft_throttled), Arc::clone(&stop), Arc::clone(&wake), Arc::clone(&unguarded), dir.to_owned());
         let spawned = std::thread::Builder::new().name("kiln-pacer".into()).spawn(move || match Proc::me() {
             Some(me) => {
                 let records = dir.join(RECORDS);
@@ -240,19 +262,25 @@ impl Pacer {
                 // Records of pacers that end with their guards while this one runs (a runner it took
                 // over from, killed with its guard): by event, never a look on a clock.
                 let watch = watch_records(records);
-                run(&Shared { shares: &sh, period: &pe, stopped: &sp, stop: &st, wake: &wa, unguarded: &ug }, &Paced { me, record, how: guard });
+                run(&Shared { shares: &sh, period: &pe, stopped: &sp, soft_throttled: &sf, stop: &st, wake: &wa, unguarded: &ug }, &Paced { me, record, how: guard });
                 drop(watch);
             }
             None => tracing::warn!("headroom: this process's own start is unknown, so nothing is paced"),
         });
         let thread = spawned.map_err(|e| tracing::warn!(error = %e, "headroom: the pacer couldn't start; work past the window still waits to start")).ok();
-        Self { shares, period, stopped, stop, wake, unguarded, thread }
+        Self { shares, period, stopped, soft_throttled, stop, wake, unguarded, thread }
     }
 
     /// How long each paced group has been held stopped in all, as of now.
     pub fn stopped(&self) -> HashMap<PathBuf, Duration> {
         let now = Instant::now();
         self.stopped.lock().iter().map(|(d, s)| (d.clone(), s.total(now))).collect()
+    }
+
+    /// Whether `dir` is currently slowed smoothly by kernel CPU throttling (`cpu.max` / Windows
+    /// Job Object hard cap) rather than stopped/frozen.
+    pub fn is_soft_throttled(&self, dir: &Path) -> bool {
+        self.soft_throttled.lock().contains(dir)
     }
 
     /// Each paced group's share from now (percent; groups at 100 aren't listed). Only a change is
@@ -329,6 +357,7 @@ struct Shared<'a> {
     shares: &'a Mutex<HashMap<PathBuf, u8>>,
     period: &'a Mutex<Duration>,
     stopped: &'a Mutex<HashMap<PathBuf, Stopped>>,
+    soft_throttled: &'a Mutex<HashSet<PathBuf>>,
     stop: &'a AtomicBool,
     wake: &'a Arc<Wake>,
     unguarded: &'a AtomicBool,
@@ -341,11 +370,32 @@ struct Paced {
     how: GuardCmd,
 }
 
+/// Maximum pacing cycle (µs) applied when lag spikes: bounds single-cycle freeze duration so
+/// a laptop sleep/resume pause or slow disk write in `tell()` can never turn `lag * 100` into a
+/// multi-minute or multi-hour freeze of all jobs and sessions on the runner.
+const MAX_CYCLE_US: u64 = 2_000_000;
+/// Maximum plausible single actuator-switch lag (µs): delays larger than this (or longer than
+/// the cycle itself) reflect OS sleep/resume, VM pause, or disk I/O in `tell()`, not scheduler
+/// switch jitter, and are rejected from the RTO lag estimator.
+const MAX_LAG_SAMPLE_US: f64 = 50_000.0;
+
+pub(crate) fn bounded_cycle_us(asked_us: u64, lag_us: Option<f64>) -> u64 {
+    kiln_ci::headroom::pace::cycle_us(asked_us, lag_us).min(asked_us.max(MAX_CYCLE_US))
+}
+
+pub(crate) fn bounded_lag_sample(late_us: u64, cycle_us: u64) -> Option<f64> {
+    let late = late_us as f64;
+    if !late.is_finite() || late > (cycle_us.max(MAX_CYCLE_US) as f64) {
+        return None;
+    }
+    Some(late.min(MAX_LAG_SAMPLE_US))
+}
+
 /// The pacer's thread: each paced group stopped for its share of every cycle, at that group's own
 /// due times, and only while a guard runs that will start it again. Between passes nothing runs:
 /// it's told of a change or woken for the next due time (LB05, G11; it was a look every 50 ms).
 fn run(sh: &Shared<'_>, p: &Paced) {
-    let Shared { shares, period, stopped, stop, wake, unguarded } = *sh;
+    let Shared { shares, period, stopped, soft_throttled, stop, wake, unguarded } = *sh;
     let base = Instant::now();
     let now_us = || u64::try_from(base.elapsed().as_micros()).unwrap_or(u64::MAX);
     let mut duty = kiln_ci::headroom::pace::Duty::default();
@@ -356,7 +406,11 @@ fn run(sh: &Shared<'_>, p: &Paced) {
     let mut due_at: HashMap<PathBuf, u64> = HashMap::new();
     // The groups stopped now, each with what starts it again (`imp::release`).
     let mut held: HashMap<PathBuf, Vec<String>> = HashMap::new();
-    // What the guard and the record list, group by group: all a paced group has had stopped.
+    // Groups smoothly slowed by kernel CPU throttling (`cpu.max` on Linux, Job Object hard cap on
+    // Windows) rather than frozen: (share_pct, guard_release_key).
+    let mut throttled: HashMap<PathBuf, (u8, String)> = HashMap::new();
+    // What the guard and the record list, group by group: all a paced group has had stopped or
+    // throttled.
     let mut listed: HashMap<PathBuf, BTreeSet<String>> = HashMap::new();
     let mut guard: Option<Guard> = None;
     // Guards that ended, kept until they're reaped.
@@ -367,7 +421,7 @@ fn run(sh: &Shared<'_>, p: &Paced) {
     let mut warned = false;
     while !stop.load(Ordering::Relaxed) {
         let asked = u64::try_from(period.lock().as_micros()).unwrap_or(u64::MAX);
-        let cycle = kiln_ci::headroom::pace::cycle_us(asked, lag.estimate_us(0.0));
+        let cycle = bounded_cycle_us(asked, lag.estimate_us(0.0));
         let want: Vec<(PathBuf, u8)> = shares.lock().iter().map(|(d, s)| (d.clone(), *s)).collect();
         let now = now_us();
         gone.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
@@ -381,7 +435,7 @@ fn run(sh: &Shared<'_>, p: &Paced) {
                 scope = false;
             }
             gone.extend(guard.take().map(|g| g.child));
-            release_all(&mut held, &mut listed, &mut guard, p);
+            release_all(&mut held, &mut throttled, &mut listed, &mut guard, p);
         }
         if guard.is_none() && !want.is_empty() {
             let tried = match Guard::start(p, scope, wake) {
@@ -410,7 +464,37 @@ fn run(sh: &Shared<'_>, p: &Paced) {
         let mut unheard = false;
         let mut soonest: Option<u64> = None;
         for (dir, share) in &want {
-            let phase = duty.phase(&dir.to_string_lossy(), *share, now, cycle);
+            // Prefer smooth kernel CPU throttling (`cpu.max` on Linux, Job Object hard cap on
+            // Windows) whenever `share > 0` instead of stopping/freezing the processes.
+            if guarded && *share > 0 && *share < 100 {
+                if throttled.get(dir).is_some_and(|(s, _)| *s == *share) {
+                    continue;
+                }
+                if let Some(key) = imp::soft_throttle_key(dir) {
+                    let mine = listed.entry(dir.clone()).or_default();
+                    if !mine.contains(&key) {
+                        mine.insert(key.clone());
+                        if !tell(&mut guard, &listed, p) {
+                            unheard = true;
+                            break;
+                        }
+                    }
+                    if imp::apply_soft_throttle(dir, *share) {
+                        if let Some(keys) = held.remove(dir) {
+                            keys.iter().for_each(|k| imp::release(k));
+                        }
+                        throttled.insert(dir.clone(), (*share, key));
+                        continue;
+                    }
+                }
+            }
+            if let Some((_, key)) = throttled.remove(dir) {
+                imp::release(&key);
+            }
+            // On macOS (signal-based child duty cycling), keep non-zero soft cycles short (<= 500 ms)
+            // so throttled builds pause smoothly in sub-half-second slices rather than multi-second stalls.
+            let group_cycle = if cfg!(target_os = "macos") && *share > 0 { cycle.min(500_000) } else { cycle };
+            let phase = duty.phase(&dir.to_string_lossy(), *share, now, group_cycle);
             soonest = match (soonest, phase.next_us) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -418,8 +502,10 @@ fn run(sh: &Shared<'_>, p: &Paced) {
             if phase.runs {
                 if let Some(keys) = held.remove(dir) {
                     keys.iter().for_each(|k| imp::release(k));
-                    if let Some(due) = due_at.get(dir) {
-                        lag.sample(now_us().saturating_sub(*due) as f64);
+                    if let Some(due) = due_at.get(dir)
+                        && let Some(sample) = bounded_lag_sample(now_us().saturating_sub(*due), group_cycle)
+                    {
+                        lag.sample(sample);
                     }
                 }
             } else if guarded && !held.contains_key(dir) {
@@ -432,16 +518,24 @@ fn run(sh: &Shared<'_>, p: &Paced) {
                 }
                 // Told first: the guard and the record list it all before any of it stops.
                 let mine = listed.entry(dir.clone()).or_default();
+                let mut wrote_record = false;
                 if !keys.iter().all(|k| mine.contains(k)) {
                     mine.extend(keys.iter().cloned());
+                    wrote_record = true;
                     if !tell(&mut guard, &listed, p) {
                         unheard = true;
                         break;
                     }
                 }
                 held.insert(dir.clone(), imp::stop_keys(&keys));
-                if let Some(due) = due_at.get(dir) {
-                    lag.sample(now_us().saturating_sub(*due) as f64);
+                // Do not feed synchronous disk-write latency from `tell()` into the actuator
+                // switch lag estimator: under disk load that turns `cycle = lag * 100` into a
+                // multi-minute freeze.
+                if !wrote_record
+                    && let Some(due) = due_at.get(dir)
+                    && let Some(sample) = bounded_lag_sample(now_us().saturating_sub(*due), group_cycle)
+                {
+                    lag.sample(sample);
                 }
             }
             if let Some(next) = phase.next_us {
@@ -455,7 +549,7 @@ fn run(sh: &Shared<'_>, p: &Paced) {
                 let _ = g.child.kill();
                 let _ = g.child.wait();
             }
-            release_all(&mut held, &mut listed, &mut guard, p);
+            release_all(&mut held, &mut throttled, &mut listed, &mut guard, p);
         }
         // Groups no longer paced run again and come off the list.
         held.retain(|dir, keys| {
@@ -465,6 +559,14 @@ fn run(sh: &Shared<'_>, p: &Paced) {
             }
             keep
         });
+        throttled.retain(|dir, (_, key)| {
+            let keep = want.iter().any(|(d, _)| d == dir);
+            if !keep {
+                imp::release(key);
+            }
+            keep
+        });
+        *soft_throttled.lock() = throttled.keys().cloned().collect();
         let before = listed.len();
         listed.retain(|dir, _| want.iter().any(|(d, _)| d == dir));
         if listed.len() != before {
@@ -489,7 +591,8 @@ fn run(sh: &Shared<'_>, p: &Paced) {
         wake.wait(soonest.map(|us| base + Duration::from_micros(us)));
     }
     // Ending: everything runs again, the guard hears nothing is left, and it goes.
-    release_all(&mut held, &mut listed, &mut guard, p);
+    release_all(&mut held, &mut throttled, &mut listed, &mut guard, p);
+    soft_throttled.lock().clear();
     if let Some(mut g) = guard {
         g.finish();
     }
@@ -498,10 +601,13 @@ fn run(sh: &Shared<'_>, p: &Paced) {
     }
 }
 
-/// Everything held runs again and nothing is listed any more.
-fn release_all(held: &mut HashMap<PathBuf, Vec<String>>, listed: &mut HashMap<PathBuf, BTreeSet<String>>, guard: &mut Option<Guard>, p: &Paced) {
+/// Everything held or throttled runs at full speed again and nothing is listed any more.
+fn release_all(held: &mut HashMap<PathBuf, Vec<String>>, throttled: &mut HashMap<PathBuf, (u8, String)>, listed: &mut HashMap<PathBuf, BTreeSet<String>>, guard: &mut Option<Guard>, p: &Paced) {
     for keys in std::mem::take(held).into_values() {
         keys.iter().for_each(|k| imp::release(k));
+    }
+    for (_, key) in std::mem::take(throttled).into_values() {
+        imp::release(&key);
     }
     listed.clear();
     tell(guard, listed, p);
@@ -856,7 +962,8 @@ mod imp {
             for e in rd.flatten() {
                 if e.path().is_dir() {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    out.push(Group { dir: e.path(), label: name.clone(), session: Some(name) });
+                    let kind = if name.starts_with(crate::os::RUN_GROUP) { super::GroupKind::Tool } else { super::GroupKind::Harness };
+                    out.push(Group { dir: e.path(), label: name.clone(), session: Some(name), kind });
                 }
             }
         }
@@ -867,7 +974,7 @@ mod imp {
             for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
                 if e.path().is_dir() {
                     let name = e.file_name().to_string_lossy().into_owned();
-                    out.push(Group { dir: e.path(), label: format!("job {name}"), session: None });
+                    out.push(Group { dir: e.path(), label: format!("job {name}"), session: None, kind: super::GroupKind::Job });
                 }
             }
         }
@@ -892,7 +999,7 @@ mod imp {
                             if name.ends_with(".slice") {
                                 next.push(p);
                             } else if (name.ends_with(".service") || name.ends_with(".scope")) && !desktop(&name) && !name.starts_with(GUARD_UNIT) && transient.join(&name).exists() && !mine.starts_with(&p) {
-                                out.push(Group { dir: p, label: name, session: None });
+                                out.push(Group { dir: p, label: name, session: None, kind: super::GroupKind::Escape });
                             }
                         }
                     }
@@ -992,7 +1099,34 @@ mod imp {
         keys.iter().filter(|k| freeze(Path::new(k), true).is_ok()).cloned().collect()
     }
 
+    /// Guard key for smooth cgroup v2 `cpu.max` bandwidth throttling when available.
+    pub fn soft_throttle_key(dir: &Path) -> Option<String> {
+        if ELSEWHERE.lock().contains(dir) || !dir.join("cpu.max").exists() {
+            return None;
+        }
+        Some(format!("cpumax:{}", dir.display()))
+    }
+
+    /// Smoothly throttles a cgroup v2 group via `cpu.max` (`<quota_us> 100000`) instead of freezing
+    /// processes with `cgroup.freeze`, so demanding builds make continuous progress without lock or
+    /// pipe stalls.
+    pub fn apply_soft_throttle(dir: &Path, share_pct: u8) -> bool {
+        if ELSEWHERE.lock().contains(dir) || share_pct == 0 || share_pct >= 100 {
+            return false;
+        }
+        const PERIOD_US: u64 = 100_000;
+        let cpus = std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1) as u64;
+        let quota_us = (cpus.saturating_mul(PERIOD_US).saturating_mul(u64::from(share_pct)) / 100).max(1_000);
+        fs::write(dir.join("cpu.max"), format!("{quota_us} {PERIOD_US}")).is_ok()
+    }
+
     pub fn release(key: &str) {
+        if let Some(path) = key.strip_prefix("cpumax:") {
+            if !ELSEWHERE.lock().contains(Path::new(path)) {
+                let _ = fs::write(Path::new(path).join("cpu.max"), "max 100000");
+            }
+            return;
+        }
         if !ELSEWHERE.lock().contains(Path::new(key)) {
             let _ = freeze(Path::new(key), false);
         }
@@ -1023,29 +1157,88 @@ mod imp {
 
     use super::Group;
 
-    /// A session's group's `dir`: no folder here, the session it is.
+    /// A session's harness group (`session:<id>`) or its spawned child tool processes (`tools:<id>`).
     const SESSION: &str = "session:";
+    const TOOLS: &str = "tools:";
 
-    /// Pacing by stopping processes: macOS by signal, Windows thread by thread.
+    /// Pacing by smooth throttling or stopping processes: macOS by child-first signal duty cycling,
+    /// Windows by Job Object CPU rate caps (falling back to thread suspension only on freeze).
     pub fn available() -> bool {
         cfg!(any(target_os = "macos", windows))
     }
 
-    /// A group for each agent session with processes held (`crate::os::contain`): a job object's
-    /// on Windows, those followed fork by fork on macOS. A unit outside them (a build an agent
-    /// started to outlive its command) isn't one: nothing here holds it.
+    /// Groups for each agent session / reach command held (`crate::os::contain`): when an agent
+    /// session has spawned child processes (e.g. `cargo`, `rustc`), those children are emitted as
+    /// a separate `tools:<session>` group (`GroupKind::Tool`) so headroom slows individual tool
+    /// calls FIRST without touching the interactive harness process (`session:<session>`).
     pub fn groups(_escapes: bool) -> Vec<Group> {
-        crate::os::contain::sessions().into_iter().map(|s| Group { dir: PathBuf::from(format!("{SESSION}{s}")), label: s.clone(), session: Some(s) }).collect()
+        let mut out = Vec::new();
+        for s in crate::os::contain::sessions() {
+            if s.starts_with(crate::os::RUN_GROUP) {
+                out.push(Group { dir: PathBuf::from(format!("{SESSION}{s}")), label: s.clone(), session: Some(s), kind: super::GroupKind::Tool });
+                continue;
+            }
+            let hpid = super::super::harness_pid(&s);
+            let all = crate::os::contain::Group::existing(&s).map(|g| g.pids()).unwrap_or_default();
+            let has_children = hpid.is_some_and(|h| all.iter().any(|p| *p != h));
+            if has_children {
+                out.push(Group { dir: PathBuf::from(format!("{TOOLS}{s}")), label: format!("{s} (tools)"), session: Some(s.clone()), kind: super::GroupKind::Tool });
+            }
+            out.push(Group { dir: PathBuf::from(format!("{SESSION}{s}")), label: s.clone(), session: Some(s), kind: super::GroupKind::Harness });
+        }
+        out
     }
 
-    /// The session's processes' counters, summed.
+    /// The group's processes' counters, summed.
     pub fn counters(dir: &Path) -> (u64, u64, u64) {
         super::processes(&pids(dir))
     }
 
     fn pids(dir: &Path) -> Vec<u32> {
-        let Some(session) = dir.to_str().and_then(|d| d.strip_prefix(SESSION)) else { return Vec::new() };
-        crate::os::contain::Group::existing(session).map(|g| g.pids()).unwrap_or_default()
+        let Some(d) = dir.to_str() else { return Vec::new() };
+        if let Some(session) = d.strip_prefix(TOOLS) {
+            let hpid = super::super::harness_pid(session);
+            return crate::os::contain::Group::existing(session)
+                .map(|g| g.pids().into_iter().filter(|p| Some(*p) != hpid).collect())
+                .unwrap_or_default();
+        }
+        let Some(session) = d.strip_prefix(SESSION) else { return Vec::new() };
+        let all = crate::os::contain::Group::existing(session).map(|g| g.pids()).unwrap_or_default();
+        if !session.starts_with(crate::os::RUN_GROUP)
+            && let Some(hpid) = super::super::harness_pid(session)
+            && all.contains(&hpid)
+            && all.len() > 1
+        {
+            return vec![hpid];
+        }
+        all
+    }
+
+    /// Smooth kernel CPU rate-cap key on Windows (Job Object `HARD_CAP`); none on macOS.
+    #[cfg(windows)]
+    pub fn soft_throttle_key(dir: &Path) -> Option<String> {
+        let d = dir.to_str()?;
+        let session = d.strip_prefix(TOOLS).or_else(|| d.strip_prefix(SESSION))?;
+        Some(format!("winjob:{session}"))
+    }
+
+    #[cfg(not(windows))]
+    pub fn soft_throttle_key(_dir: &Path) -> Option<String> {
+        None
+    }
+
+    /// Applies Windows Job Object `JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP` so demanding builds slow
+    /// smoothly in kernel space without suspending any thread (`SuspendThread`).
+    #[cfg(windows)]
+    pub fn apply_soft_throttle(dir: &Path, share_pct: u8) -> bool {
+        let Some(d) = dir.to_str() else { return false };
+        let Some(session) = d.strip_prefix(TOOLS).or_else(|| d.strip_prefix(SESSION)) else { return false };
+        crate::os::contain::set_cpu_cap(session, Some(share_pct))
+    }
+
+    #[cfg(not(windows))]
+    pub fn apply_soft_throttle(_dir: &Path, _share_pct: u8) -> bool {
+        false
     }
 
     /// What stopping the session stops: each of its processes now, by id and start (an id may be
@@ -1092,8 +1285,14 @@ mod imp {
         procs.into_iter().filter(|(_, p)| stopped.contains(p)).map(|(k, _)| k.clone()).collect()
     }
 
-    /// Starts again what a key names, while it's still the process it was.
+    /// Starts again (or removes smooth CPU cap on) what a key names, while it's still the process
+    /// or job it was.
     pub fn release(key: &str) {
+        #[cfg(windows)]
+        if let Some(session) = key.strip_prefix("winjob:") {
+            let _ = crate::os::contain::set_cpu_cap(session, None);
+            return;
+        }
         let Some(p) = parse(key).filter(super::Proc::alive) else { return };
         #[cfg(target_os = "macos")]
         if let Ok(pid) = i32::try_from(p.pid) {
@@ -1195,6 +1394,22 @@ mod portable_tests {
         anyhow::ensure!(mem > 0, "no memory");
         anyhow::ensure!(w.works_within(Duration::from_secs(30)), "no CPU time or nothing written");
         Ok(())
+    }
+
+    /// Sleep/resume pauses and slow disk writes in `tell()` must never inflate the pacer's RTO lag
+    /// estimator or turn `cycle = lag * 100` into multi-minute/multi-hour runner freezes.
+    #[test]
+    fn sleep_or_disk_lag_spikes_never_produce_runaway_pacing_cycles() {
+        // Normal 2 ms switch lag stays exact: 200 ms cycle.
+        assert_eq!(super::bounded_cycle_us(5_000, Some(2_000.0)), 200_000);
+        // Huge 500 ms lag estimate is bounded at 2 s max cycle (not 50 s!).
+        assert_eq!(super::bounded_cycle_us(200_000, Some(500_000.0)), 2_000_000);
+        // A 1-hour laptop sleep outlier is rejected completely from lag samples.
+        assert_eq!(super::bounded_lag_sample(3_600_000_000, 1_000_000), None);
+        // A 500 ms disk-stall outlier within a 2s window is clamped to 50 ms.
+        assert_eq!(super::bounded_lag_sample(500_000, 1_000_000), Some(50_000.0));
+        // Normal 3 ms wake jitter passes through intact.
+        assert_eq!(super::bounded_lag_sample(3_000, 1_000_000), Some(3_000.0));
     }
 
     /// Set in a child these tests start as a pacer's guard: the record it guards.
