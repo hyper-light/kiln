@@ -3721,7 +3721,13 @@ where
             d.metrics.goal_ended(status == "met");
         }
         Next::Done => {
-            store.call(move |c| touch(c, &a, Some("done"), None, now)).await?;
+            // Done only if nothing is left at the write, not as the stack read before it said
+            // (G9 step 3, T-T1.5.1): a goal added between that read and this write saw the stack
+            // running, so it didn't restart it; marking it done anyway left the goal pending in a
+            // done stack, never sent (kiln-sim seeds 7645 and 8076). `settle` counts what's left in
+            // this write's own transaction; a goal added since keeps the stack running, and its
+            // write moved the feed past this round's start, so the next round sends it.
+            store.call(move |c| settle(c, &a, now)).await?;
         }
         Next::Start { id, .. } if stack.items.iter().any(|i| i.id == id && i.waits_on.is_some()) => {
             store

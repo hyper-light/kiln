@@ -767,6 +767,17 @@ mod tests {
         Ok(())
     }
 
+    /// G9 step 3, T-T1.5.1: a goal added as the driver ends its stack's last goal goes to the
+    /// agent. The driver marked the stack done from what it had read, after the add saw the stack
+    /// running; the goal stayed pending in a done stack (the 10,000-seed run's seeds 7645 and 8076).
+    #[test]
+    fn g9_s3_a_goal_added_as_its_stack_ends_still_goes() -> Result<(), String> {
+        for seed in [7645, 8076] {
+            run(seed, 0)?;
+        }
+        Ok(())
+    }
+
     /// CP-T6.1, AC-T6.1.4: a seed runs the same every time.
     #[test]
     fn a_goals_seed_replays_exactly() -> Result<(), String> {
