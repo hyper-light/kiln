@@ -506,8 +506,8 @@ sessions, and an agent's to do to the agents it started (and theirs), as `agents
 ### Reset
 
 An agent that's stuck (it takes no messages, its queue never goes, a move or a pause it can't leave)
-is reset from its page's ⋯ menu (Reset…, asked in a line under its head, why in your words if you
-like), as an operation (`agents.reset`: "Operations", below), an MCP tool (`agents_reset`) or
+is reset from its page's ⋯ menu (Reset: done as it's chosen, nothing asked first; Ada,
+2026-11-21), as an operation (`agents.reset`: "Operations", below), an MCP tool (`agents_reset`) or
 `POST /api/harness/agents/:id/reset` (Ada, 2026-11-21). A reset:
 
 - **Ends everything it had pending.** Each message to it that kiln holds and hasn't handed out is
