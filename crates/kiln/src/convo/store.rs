@@ -461,6 +461,10 @@ pub struct Queue {
     /// Bytes of feeds' batches taken in ([`Store::take`], [`Store::take_copy`]): with `written`, what this store's own
     /// feeds have to ship ([`Store::grown`]).
     taken: AtomicU64,
+    /// The newest number committed, set before the store's watchers are told of each commit ([`Store::committed_top`]):
+    /// a watcher woken reads it without a turn of the writer's (CP-T1.1: every follower woken by a commit asked the
+    /// writer for the top, a job each on the writer per commit).
+    top: AtomicU64,
     /// Told each time the writer commits (`crate::rt::Changed`, no lock; goal 5, plan 01a1a59c2aae, its top goal: it
     /// was an event-listener `Event`, its list behind a `Mutex`).
     room: crate::rt::Changed,
@@ -549,13 +553,14 @@ pub struct Store {
 
 impl Store {
     /// The store, its writer thread started on `engine`, looking after its file as `upkeep` says.
-    pub fn start(engine: Box<dyn Engine>, upkeep: Upkeep) -> anyhow::Result<Self> {
+    pub fn start(mut engine: Box<dyn Engine>, upkeep: Upkeep) -> anyhow::Result<Self> {
         let (tx, rx) = mpsc::channel::<Msg>();
         let id: Arc<str> = engine.id().into();
         let watchers: Watchers = Arc::default();
         let meter: Arc<Meter> = Arc::default();
         let hold = Arc::new(AtomicI64::new(i64::MAX));
         let queue: Arc<Queue> = Arc::default();
+        queue.top.store(engine.top(), Ordering::Release);
         let reads = match engine.reader() {
             Some(reader) => {
                 let (rtx, rrx) = mpsc::channel::<ReadMsg>();
@@ -949,6 +954,7 @@ impl Store {
             let took = e.take(&p, m.as_deref(), from, &batch)?;
             if took.applied > 0 {
                 q.taken.fetch_add(batch_bytes(&batch), Ordering::Relaxed);
+                q.top.store(e.top(), Ordering::Release);
                 notify(&w);
             }
             Ok(took)
@@ -963,6 +969,7 @@ impl Store {
             let took = e.take_copy(&p, from, &batch)?;
             if took.applied > 0 {
                 q.taken.fetch_add(batch_bytes(&batch), Ordering::Relaxed);
+                q.top.store(e.top(), Ordering::Release);
                 notify(&w);
             }
             Ok(took)
@@ -989,6 +996,12 @@ impl Store {
     /// The last number the store gave a write. Blocking.
     pub fn top(&self) -> anyhow::Result<u64> {
         self.run(|e| Ok(e.top()))
+    }
+
+    /// The newest number committed, as the writer last said before telling its watchers ([`Store::watch`]): never
+    /// waits for the writer, and never behind a commit a watcher was told of.
+    pub fn committed_top(&self) -> u64 {
+        self.queue.top.load(Ordering::Acquire)
     }
 
     /// Through where this store has `peer`'s feed. Blocking.
@@ -1076,10 +1089,8 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         }
         let rows = rows::coalesce(std::mem::take(pending));
         let applied = engine.apply(&rows);
-        // Whoever waits on this commit hears how it went, before anyone else is told (CP-T1.1).
-        let outcome = applied.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
-        for t in told.drain(..) {
-            let _ = t.send(outcome.clone());
+        if applied.is_ok() {
+            queue.top.store(engine.top(), Ordering::Release);
         }
         #[cfg(test)]
         queue.committed_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1091,6 +1102,11 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
         }
         #[cfg(test)]
         queue.counted_when_told.store(meter.report("").commits, Ordering::Relaxed);
+        // Whoever waits on this commit hears how it went (CP-T1.1), once its top is set and it's counted.
+        let outcome = applied.as_ref().map(|_| ()).map_err(|e| format!("{e:#}"));
+        for t in told.drain(..) {
+            let _ = t.send(outcome.clone());
+        }
         queue.let_go(std::mem::take(pending_bytes), applied.is_ok());
         if applied.is_ok() {
             notify(watchers);
@@ -1126,6 +1142,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
             }
         }
         if wrote {
+            queue.top.store(engine.top(), Ordering::Release);
             notify(watchers);
         }
     };
@@ -1180,6 +1197,9 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, watchers: &Watc
                             }
                             let released = engine.release();
                             drop(engine);
+                            // Its watchers told it's gone, as of a commit: one waiting for the next hears it was let go of
+                            // (the Conversations seam's wait, refused Closed), never waits on a store that won't commit.
+                            notify(watchers);
                             let _ = reply.send(released);
                             return;
                         }

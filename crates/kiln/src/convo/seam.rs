@@ -30,6 +30,12 @@ impl StoreConversations {
     fn live(&self) -> Result<(), Error> {
         if self.closed.load(Ordering::Acquire) { Err(Error::Closed) } else { Ok(()) }
     }
+
+    /// The store's error, or Closed when the handle was let go of meanwhile: what was under way as it closed (its writer
+    /// gone with it) is refused Closed, as what's asked after is, and never written once refused.
+    fn failed(&self, e: anyhow::Error) -> Error {
+        if self.closed.load(Ordering::Acquire) { Error::Closed } else { failed(e) }
+    }
 }
 
 fn failed(e: anyhow::Error) -> Error {
@@ -64,13 +70,13 @@ impl Conversations for StoreConversations {
             for s in &new {
                 opened.remove(s);
             }
-            failed(e)
+            self.failed(e)
         })
     }
 
     fn history(&self, conversation: &str, before: Option<u64>, limit: usize) -> Result<Vec<Entry>, Error> {
         self.live()?;
-        Ok(self.store.events(conversation, before, limit).map_err(failed)?.iter().map(entry_of).collect())
+        Ok(self.store.events(conversation, before, limit).map_err(|e| self.failed(e))?.iter().map(entry_of).collect())
     }
 
     fn changes(&self, from: u64, max_bytes: usize) -> Result<Page, Error> {
@@ -78,7 +84,7 @@ impl Conversations for StoreConversations {
         // The store's feed hands on its sessions' rows too: past a page of them alone, on to the next.
         let mut at = from;
         loop {
-            let batch = self.store.changes(at, max_bytes).map_err(failed)?;
+            let batch = self.store.changes(at, max_bytes).map_err(|e| self.failed(e))?;
             let changes: Vec<Changed> = batch.rows.iter().filter_map(|c| if let Row::Event(e) = &c.row { Some(Changed { rev: c.rev, entry: entry_of(e) }) } else { None }).collect();
             let more = !batch.rows.is_empty() && batch.upto > at;
             at = batch.upto.max(at);
@@ -90,7 +96,23 @@ impl Conversations for StoreConversations {
 
     fn top(&self) -> Result<u64, Error> {
         self.live()?;
-        self.store.top().map_err(failed)
+        // What's committed, as the writer said it: no turn of the writer's for it (a follower asks it every page).
+        Ok(self.store.committed_top())
+    }
+
+    fn wait(&self, after: u64) -> Result<u64, Error> {
+        // Watching before looking: a commit between the look and the wait leaves its word, so none is missed. The
+        // store's writer sets the top it committed, then tells its watchers of each commit and of its close
+        // (`Store::watch`, `Store::committed_top`): a reader woken asks nothing of the writer.
+        let commits = self.store.watch();
+        loop {
+            self.live()?;
+            let top = self.store.committed_top();
+            if top > after {
+                return Ok(top);
+            }
+            futures::executor::block_on(commits.notified());
+        }
     }
 
     fn close(&self) -> Result<(), Error> {
@@ -122,7 +144,7 @@ impl kiln_seams::conversations::ConversationsFixture for Fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kiln_seams::conversations::{Load, cases, load};
+    use kiln_seams::conversations::{Load, cases};
 
     /// CP-T1.1: the conversation store passes every clause of the Conversations seam on each engine, Turso and
     /// Amphora's (the feed's exactly-once-in-order model test, CONVO-3 and CONVO-4, among them).
@@ -249,25 +271,35 @@ mod tests {
         }
     }
 
-    /// CP-T1.1: the seam's load scenario on each engine, Turso the control: many conversations written at once, a
-    /// burst of readers following the feed, a restart mid-stream; each reader's feed held to exactly once, in order,
-    /// and what was measured printed a line an engine. Its scale comes from KILN_CONVO_LOAD_* (a tiny one unset).
+    /// CP-T1.1: the seam's load scenario on each engine, Turso the control, up the concurrency ladder (seam review 11):
+    /// at each rung as many writers as readers, many conversations written at once, readers following the feed waiting
+    /// on each commit, a restart with appends and reads in flight; each reader's feed held to exactly once, in order,
+    /// as it goes, and a line a rung and engine printed with what was measured, the store's memory apart from the
+    /// harness's. Same driver, adapter and process for both engines. Its scale comes from KILN_CONVO_LOAD_* (a tiny one
+    /// unset: rungs 1 and 8); the run of record sets KILN_CONVO_LOAD_LADDER=1,8,32,128,512,2048,4096 on Linux.
     #[test]
     fn cp_t1_1_the_load_scenario_runs_on_each_engine() -> anyhow::Result<()> {
-        let l = Load {
+        let base = Load {
             conversations: knob("KILN_CONVO_LOAD_CONVERSATIONS", 16)?,
-            writers: knob("KILN_CONVO_LOAD_WRITERS", 4)?,
+            writers: 0,
             appends: knob("KILN_CONVO_LOAD_APPENDS", 25)?,
-            readers: knob("KILN_CONVO_LOAD_READERS", 3)?,
+            readers: 0,
             text_bytes: knob("KILN_CONVO_LOAD_TEXT_BYTES", 600)?,
             page_bytes: knob("KILN_CONVO_LOAD_PAGE_BYTES", 1 << 16)?,
             history_entries: knob("KILN_CONVO_LOAD_HISTORY_ENTRIES", 50)?,
             restart: knob("KILN_CONVO_LOAD_RESTART", 1)? != 0,
         };
+        let rungs: Vec<usize> = match std::env::var("KILN_CONVO_LOAD_LADDER") {
+            Ok(v) => v.split(',').map(|n| n.trim().parse::<usize>()).collect::<Result<_, _>>()?,
+            Err(_) => kiln_seams::conversations::LADDER.iter().copied().take(2).collect(),
+        };
+        println!("convo-load-platform os={} arch={} cpus={} tmp={}", std::env::consts::OS, std::env::consts::ARCH, std::thread::available_parallelism().map_or(0, |n| n.get()), std::env::temp_dir().display());
         for kind in super::super::Kind::ALL {
-            let r = load(&Fixture { kind, dir: Some(tempfile::tempdir()?) }, &l).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
-            anyhow::ensure!(r.appended == l.writers.saturating_mul(l.appends), "{kind:?}: {r:?}");
-            println!("convo-load {kind:?} {l:?} {r:?}");
+            let reports = kiln_seams::conversations::ladder(&base, &rungs, || Ok(Fixture { kind, dir: Some(tempfile::tempdir().map_err(|e| e.to_string())?) })).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            for (n, r) in reports {
+                anyhow::ensure!(r.appended == n.saturating_mul(base.appends), "{kind:?} at {n}: {r:?}");
+                println!("convo-load {kind:?} rung={n} {r:?}");
+            }
         }
         Ok(())
     }

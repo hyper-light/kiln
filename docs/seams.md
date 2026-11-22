@@ -721,10 +721,13 @@ The store kiln keeps its agents' conversations in (docs/conversations.md; CP-T1.
 durably to conversations, each known by its id within its conversation and kept as it was appended last; a
 conversation's history reads the newest of them before a sequence, oldest first; and a change feed of
 revisions hands on what was committed after any revision, oldest first, a page of about the bytes asked for,
-with the revision it read through, which kiln's peers and followers read. Beside the suite, every
-implementation runs the seam's load scenario (`kiln_seams::conversations::load`): many conversations
-written at once, a burst of readers following the feed, a restart mid-stream, reporting append, history and
-feed read latency (p50, p99, p99.9), the feed's lag in revisions, the time to catch up and the memory held.
+with the revision it read through, which kiln's peers and followers read; a follower at the top waits for
+the commit that passes it, woken by that commit, never by polling. Beside the suite, every implementation
+runs the seam's load scenario (`kiln_seams::conversations::load`, and `ladder` up the concurrency ladder
+of 1, 8, 32, 128, 512, 2048 and 4096 writers and readers): many conversations written at once, readers
+following the feed, each held to exactly once in order as it goes, and a restart with appends and reads in
+flight, reporting append, history and feed read latency (p50, p99, p99.9), the feed's lag in revisions,
+the time to catch up, appends a second, and the memory held, the store's apart from the harness's.
 
 - **Implementations:** kiln's conversation store (`crates/kiln/src/convo/seam.rs`, a `convo::store::Store`
   as the seam), on Turso (`vendor/turso`, the default and the control) or on Amphora's engine
@@ -734,13 +737,14 @@ feed read latency (p50, p99, p99.9), the feed's lag in revisions, the time to ca
 - **Used by:** kiln's conversation store (`crates/kiln/src/convo`).
 - **Passed by:** the simulator, and the store on each engine, every clause (`convo::seam`'s tests).
 
-Methods: `append`, `history`, `changes`, `top`, `close`.
+Methods: `append`, `history`, `changes`, `top`, `wait`, `close`.
 
 - **CONVO-1** appended entries are read back by their conversation's history, the newest asked for before a sequence, oldest first
 - **CONVO-2** an entry appended again by its id is kept as appended last, once; the same again commits nothing, and the feed hands it on once more only when it changed
 - **CONVO-3** the feed from any revision hands on every entry committed after it exactly once, oldest first, while writers append at once
 - **CONVO-4** what was committed and its revisions stay through a restart: a reader goes on from where it was, nothing missed or seen twice; a closed handle is refused Closed
 - **CONVO-5** a page of one byte holds one change, paging by where each read through reaches the top, and past the top there is nothing
+- **CONVO-6** a wait past a revision answers at once when one is committed past it, else with the commit that passes it; one under way is refused Closed as its handle is let go of
 
 ## Search
 

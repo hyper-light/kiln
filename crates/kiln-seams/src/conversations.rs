@@ -8,11 +8,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use futures::future::BoxFuture;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::conformance::{Case, Failure};
 
@@ -64,6 +64,9 @@ pub trait Conversations: Send + Sync + 'static {
     fn changes(&self, from: u64, max_bytes: usize) -> Result<Page, Error>;
     /// The newest revision committed.
     fn top(&self) -> Result<u64, Error>;
+    /// Waits for a revision past `after` to be committed, woken by that commit (never by polling or a timer): the
+    /// newest revision then, at once when one is already. A wait under way is refused Closed when its handle is let go.
+    fn wait(&self, after: u64) -> Result<u64, Error>;
     /// Lets go of its files, once all it took is committed; everything asked of the handle after is refused Closed.
     fn close(&self) -> Result<(), Error>;
 }
@@ -89,12 +92,14 @@ struct SimDisk {
 /// The conversation store in memory: what it commits stays with its fixture, as on a disk, across handles.
 pub struct SimConversations {
     disk: Arc<Mutex<SimDisk>>,
+    /// Told of each commit, and of a handle let go of ([`Conversations::wait`]), with the disk's lock held.
+    commits: Arc<Condvar>,
     closed: AtomicBool,
 }
 
 impl SimConversations {
-    fn open_on(disk: &Arc<Mutex<SimDisk>>) -> Self {
-        Self { disk: Arc::clone(disk), closed: AtomicBool::new(false) }
+    fn open_on(disk: &Arc<Mutex<SimDisk>>, commits: &Arc<Condvar>) -> Self {
+        Self { disk: Arc::clone(disk), commits: Arc::clone(commits), closed: AtomicBool::new(false) }
     }
 
     fn live(&self) -> Result<(), Error> {
@@ -126,6 +131,8 @@ impl Conversations for SimConversations {
             }
             d.log.insert(rev, key);
         }
+        drop(d);
+        self.commits.notify_all();
         Ok(())
     }
 
@@ -160,19 +167,37 @@ impl Conversations for SimConversations {
         Ok(self.disk.lock().rev)
     }
 
+    fn wait(&self, after: u64) -> Result<u64, Error> {
+        let mut d = self.disk.lock();
+        loop {
+            self.live()?;
+            if d.rev > after {
+                return Ok(d.rev);
+            }
+            self.commits.wait(&mut d);
+        }
+    }
+
     fn close(&self) -> Result<(), Error> {
+        // Under the disk's lock, so a wait between its look and its sleep hears it.
+        let d = self.disk.lock();
         self.closed.store(true, Ordering::Release);
+        drop(d);
+        self.commits.notify_all();
         Ok(())
     }
 }
 
 /// The simulator's fixture: one disk, opened as often as a case asks.
 #[derive(Default)]
-pub struct SimConversationsFixture(Arc<Mutex<SimDisk>>);
+pub struct SimConversationsFixture {
+    disk: Arc<Mutex<SimDisk>>,
+    commits: Arc<Condvar>,
+}
 
 impl ConversationsFixture for SimConversationsFixture {
     fn open(&self) -> Result<Arc<dyn Conversations>, Failure> {
-        Ok(Arc::new(SimConversations::open_on(&self.0)))
+        Ok(Arc::new(SimConversations::open_on(&self.disk, &self.commits)))
     }
 }
 
@@ -230,7 +255,8 @@ pub fn exactly_once(seen: &[Changed], appended: &[Vec<Entry>]) -> Result<(), Fai
 /// Writers appending `per` entries each, one an append, to conversations of their own, while one reader follows the
 /// feed from `from`, then catches up to the top: what each writer appended, in order, and where the reader got to.
 fn write_and_follow(c: &Arc<dyn Conversations>, round: usize, writers: usize, per: u64, from: u64, seen: &mut Vec<Changed>) -> Result<(Vec<Vec<Entry>>, u64), Failure> {
-    let done = AtomicBool::new(false);
+    // The reader follows until it has every entry of the round, waiting on each commit when it's at the top.
+    let want = usize::try_from(per).unwrap_or(usize::MAX).saturating_mul(writers);
     let (appended, at) = std::thread::scope(|s| -> Result<(Vec<Vec<Entry>>, u64), Failure> {
         let handles: Vec<_> = (0..writers)
             .map(|w| {
@@ -251,8 +277,12 @@ fn write_and_follow(c: &Arc<dyn Conversations>, round: usize, writers: usize, pe
         let reader = s.spawn(|| -> Result<(Vec<Changed>, u64), Failure> {
             let mut got = Vec::new();
             let mut at = from;
-            while !done.load(Ordering::Acquire) {
+            while got.len() < want {
                 let page = c.changes(at, 4096).map_err(err)?;
+                if page.changes.is_empty() && page.upto <= at {
+                    c.wait(at).map_err(err)?;
+                    continue;
+                }
                 at = page.upto;
                 got.extend(page.changes);
             }
@@ -267,11 +297,15 @@ fn write_and_follow(c: &Arc<dyn Conversations>, round: usize, writers: usize, pe
                 Err(_) => failed = Some("a writer stopped".to_owned()),
             }
         }
-        done.store(true, Ordering::Release);
-        let (got, at) = reader.join().map_err(|_| "the reader stopped".to_owned())??;
+        // A writer that failed leaves the reader short: its handle let go of, its wait is refused.
+        if failed.is_some() {
+            let _ = c.close();
+        }
+        let read = reader.join().map_err(|_| "the reader stopped".to_owned())?;
         if let Some(e) = failed {
             return Err(e);
         }
+        let (got, at) = read?;
         seen.extend(got);
         Ok((appended, at))
     })?;
@@ -374,6 +408,33 @@ fn c5<F: ConversationsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c6<F: ConversationsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let c = f.open()?;
+        c.append(&[entry("a", "m1", 1, "first")]).map_err(err)?;
+        let top = c.top().map_err(err)?;
+        let before = c.wait(top.saturating_sub(1)).map_err(err)?;
+        check(before == top, || format!("a wait past {} answered {before}, the top {top}", top.saturating_sub(1)))?;
+        // Past the top: answered by the next commit, whenever the wait began.
+        let (woke, closed) = std::thread::scope(|s| {
+            let waiter = s.spawn(|| c.wait(top));
+            let appended = c.append(&[entry("a", "m2", 2, "second")]);
+            let woke = waiter.join().map_err(|_| "the waiter stopped".to_owned()).and_then(|w| w.map_err(err));
+            // Past the top again, nothing more appended: the wait ends only as its handle is let go of, refused Closed.
+            let now = c.top().unwrap_or(u64::MAX);
+            let held = &c;
+            let waiter = s.spawn(move || held.wait(now));
+            let closed = c.close();
+            let refused = waiter.join().map_err(|_| "the waiter stopped".to_owned());
+            (appended.map_err(err).and(woke), closed.map_err(err).and(refused))
+        });
+        let woke = woke?;
+        check(woke > top, || format!("a wait past {top} answered {woke}"))?;
+        let refused = closed?;
+        check(matches!(refused, Err(Error::Closed)), || format!("a wait as its handle was let go of answered {refused:?}"))
+    })
+}
+
 /// The suite: each case a clause of docs/seams.md's Conversations section.
 pub fn cases<F: ConversationsFixture>() -> Vec<Case<F>> {
     vec![
@@ -382,6 +443,7 @@ pub fn cases<F: ConversationsFixture>() -> Vec<Case<F>> {
         Case { id: "CONVO-3", says: "the feed from any revision hands on every entry committed after it exactly once, oldest first, while writers append at once", check: c3::<F> },
         Case { id: "CONVO-4", says: "what was committed and its revisions stay through a restart: a reader goes on from where it was, nothing missed or seen twice; a closed handle is refused Closed", check: c4::<F> },
         Case { id: "CONVO-5", says: "a page of one byte holds one change, paging by where each read through reaches the top, and past the top there is nothing", check: c5::<F> },
+        Case { id: "CONVO-6", says: "a wait past a revision answers at once when one is committed past it, else with the commit that passes it; one under way is refused Closed as its handle is let go of", check: c6::<F> },
     ]
 }
 
@@ -402,9 +464,13 @@ pub struct Load {
     pub page_bytes: usize,
     /// The newest entries a reader asks of a conversation's history, for the last change of each page it reads.
     pub history_entries: usize,
-    /// Let go of and opened again once the writers are half way, readers mid-feed.
+    /// Let go of and opened again once half the appends are acknowledged, the writers still appending and the readers
+    /// mid-feed (seam review 14: it was quiesced, nothing in flight).
     pub restart: bool,
 }
+
+/// The concurrency ladder (Ada, 2026-11-21 07:24Z): the writers and readers at each rung of a run of record.
+pub const LADDER: [usize; 7] = [1, 8, 32, 128, 512, 2048, 4096];
 
 /// Percentiles by nearest rank (p50, p99, p99.9) of what was measured, and how many.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -429,7 +495,9 @@ impl Percentiles {
 /// What the load scenario measured.
 #[derive(Debug, Clone, Default)]
 pub struct LoadReport {
-    /// Each append's time to commit, microseconds.
+    /// Writer and reader threads, the rung's concurrency.
+    pub threads: usize,
+    /// Each append's time to commit, microseconds (one retried through the restart counts its wait for it).
     pub append_us: Percentiles,
     /// Each history read's time, microseconds.
     pub history_us: Percentiles,
@@ -439,11 +507,22 @@ pub struct LoadReport {
     pub feed_lag_revs: Percentiles,
     /// The time from the writers' last commit to every reader at the top, microseconds.
     pub catch_up_us: u64,
+    /// From the first append to every reader at the top, microseconds, and the appends acknowledged a second in it.
+    pub wall_us: u64,
+    pub appends_per_s: u64,
     pub appended: usize,
+    /// Appends answered Closed by the restart under way and made again on the store opened again.
+    pub retried: usize,
     pub restarts: usize,
-    /// The process's resident memory at the end and at its highest (Linux's VmRSS and VmHWM), bytes.
+    /// The process's resident memory at the end and at its highest (Linux's VmRSS and VmHWM), bytes; before the
+    /// store opened; and the harness's own (its samples and its checks, counted), which isn't the store's.
     pub rss_bytes: Option<u64>,
     pub rss_peak_bytes: Option<u64>,
+    pub rss_before_bytes: Option<u64>,
+    pub harness_bytes: u64,
+    /// What the store holds: the process's growth past where it stood before the store opened, less the harness's own
+    /// (seam review 12). Linux's alone (None elsewhere: no /proc).
+    pub store_bytes: Option<u64>,
 }
 
 /// The process's resident memory and its peak, from /proc/self/status (kB there, as Linux's proc(5) states).
@@ -459,149 +538,244 @@ fn micros(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-struct Phase {
-    /// Each writer's appends, in the order it made them.
-    appended: Vec<Vec<Entry>>,
+/// The model check as a reader goes (seam review 12: each reader kept every change it saw, so the checker, not the
+/// store, set the memory reported): writer `w`'s append `i` is entry `w{w}a{i}` at sequence `i * writers + w`, so a
+/// counter a writer holds it to exactly once, in its writer's order, its revisions rising.
+struct Check {
+    writers: usize,
+    appends: usize,
+    /// The next append each writer's feed must hand on.
+    next: Vec<usize>,
+    last_rev: u64,
+    seen: usize,
+}
+
+impl Check {
+    fn new(writers: usize, appends: usize) -> Self {
+        Self { writers, appends, next: vec![0; writers], last_rev: 0, seen: 0 }
+    }
+
+    fn saw(&mut self, c: &Changed) -> Result<(), Failure> {
+        check(c.rev > self.last_rev, || format!("revision {} came after {}", c.rev, self.last_rev))?;
+        self.last_rev = c.rev;
+        let never = || format!("{:?} was never appended", c.entry.id);
+        let n = usize::try_from(c.entry.seq).map_err(|_| never())?;
+        let (w, i) = (n.checked_rem(self.writers).ok_or_else(never)?, n.checked_div(self.writers).ok_or_else(never)?);
+        check(i < self.appends && c.entry.id == format!("w{w}a{i}"), never)?;
+        let want = self.next.get_mut(w).ok_or_else(never)?;
+        check(i == *want, || if i < *want { format!("{:?} came twice", c.entry.id) } else { format!("{:?} came before w{w}a{}, appended after it", c.entry.id, *want) })?;
+        *want = want.saturating_add(1);
+        self.seen = self.seen.saturating_add(1);
+        Ok(())
+    }
+
+    fn whole(&self) -> bool {
+        self.seen >= self.writers.saturating_mul(self.appends)
+    }
+
+    fn bytes(&self) -> u64 {
+        u64::try_from(self.next.capacity().saturating_mul(std::mem::size_of::<usize>())).unwrap_or(u64::MAX)
+    }
+}
+
+/// The handle every thread of the scenario uses, opened again by the restart while they go on.
+struct Shared<'a, F> {
+    f: &'a F,
+    current: RwLock<Arc<dyn Conversations>>,
+    /// Set when a thread failed: the others stop.
+    stop: AtomicBool,
+    retried: AtomicUsize,
+}
+
+impl<F: ConversationsFixture> Shared<'_, F> {
+    /// `op` on the handle now; answered Closed by the restart under way, on the store opened again (the write lock
+    /// held through the restart makes the next look wait for it).
+    fn on<T>(&self, mut op: impl FnMut(&dyn Conversations) -> Result<T, Error>) -> Result<T, Failure> {
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return Err("stopped: another thread of the scenario failed".to_owned());
+            }
+            let c = Arc::clone(&self.current.read());
+            match op(c.as_ref()) {
+                Err(Error::Closed) => {
+                    self.retried.fetch_add(1, Ordering::Relaxed);
+                }
+                r => return r.map_err(err),
+            }
+        }
+    }
+
+    /// Let go of the store and open it again, the others' work in flight.
+    fn restart(&self) -> Result<(), Failure> {
+        let mut c = self.current.write();
+        c.close().map_err(err)?;
+        *c = self.f.open()?;
+        Ok(())
+    }
+
+    /// A thread failed: the others stop, a reader's wait under way refused as its handle is let go of.
+    fn fail(&self, e: Failure) -> Failure {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.current.read().close();
+        e
+    }
+}
+
+struct Writer {
     append_us: Vec<u64>,
-    history_us: Vec<u64>,
-    feed_us: Vec<u64>,
-    lag: Vec<u64>,
     last_commit: Option<Instant>,
 }
 
-/// One stretch of the scenario on `c`: writers append `from..to` of their appends while readers follow the feed
-/// from where each was (`at`), until the writers end, then (`catch_up`) on to the top.
-fn phase(c: &Arc<dyn Conversations>, l: &Load, from: usize, to: usize, at: &mut [u64], seen: &mut [Vec<Changed>], catch_up: bool) -> Result<Phase, Failure> {
+struct Reader {
+    feed_us: Vec<u64>,
+    history_us: Vec<u64>,
+    lag: Vec<u64>,
+    check_bytes: u64,
+    done: Instant,
+}
+
+fn joined<T>(h: std::thread::ScopedJoinHandle<'_, Result<T, Failure>>, who: &str) -> Result<T, Failure> {
+    h.join().map_err(|_| format!("a {who} stopped"))?
+}
+
+/// The load scenario on what `f` opens: writers append to many conversations at once while readers follow the feed
+/// from the start, each waiting on the store's commits when it's at the top (never polling), and (`restart`) the store
+/// let go of and opened again half way, with appends and reads in flight. Every reader's feed is held to what was
+/// appended as it goes (each entry exactly once, in its writer's order) before anything measured is reported.
+pub fn load<F: ConversationsFixture>(f: &F, l: &Load) -> Result<LoadReport, Failure> {
+    let (rss_before, _) = memory();
+    let total = l.writers.saturating_mul(l.appends);
+    let half = if l.restart && total >= 2 { total / 2 } else { 0 };
+    let sh = Shared { f, current: RwLock::new(f.open()?), stop: AtomicBool::new(false), retried: AtomicUsize::new(0) };
+    let acked = AtomicUsize::new(0);
+    let restarts = AtomicUsize::new(0);
     let text = "w".repeat(l.text_bytes);
-    let writing = AtomicBool::new(true);
     let conversations = l.conversations.max(1);
-    std::thread::scope(|s| -> Result<Phase, Failure> {
+    let began = Instant::now();
+    let (writers, readers) = std::thread::scope(|s| -> Result<(Vec<Writer>, Vec<Reader>), Failure> {
         let writers: Vec<_> = (0..l.writers)
             .map(|w| {
-                let (c, text) = (Arc::clone(c), text.as_str());
-                s.spawn(move || -> Result<(Vec<Entry>, Vec<u64>, Option<Instant>), Failure> {
-                    let (mut mine, mut us, mut last) = (Vec::new(), Vec::new(), None);
-                    for i in from..to {
+                let (sh, text, acked, restarts) = (&sh, text.as_str(), &acked, &restarts);
+                s.spawn(move || -> Result<Writer, Failure> {
+                    let mut me = Writer { append_us: Vec::with_capacity(l.appends), last_commit: None };
+                    for i in 0..l.appends {
                         let n = i.saturating_mul(l.writers).saturating_add(w);
-                        let conv = format!("c{}", n % conversations);
-                        let e = entry(&conv, &format!("w{w}a{i}"), u64::try_from(n).unwrap_or(u64::MAX), text);
+                        let e = entry(&format!("c{}", n % conversations), &format!("w{w}a{i}"), u64::try_from(n).unwrap_or(u64::MAX), text);
                         let t = Instant::now();
-                        c.append(std::slice::from_ref(&e)).map_err(err)?;
-                        us.push(micros(t));
-                        last = Some(Instant::now());
-                        mine.push(e);
+                        // One answered Closed by the restart goes again, whole, on the store opened again: the same
+                        // entry, which commits nothing more if it was in.
+                        sh.on(|c| c.append(std::slice::from_ref(&e))).map_err(|e| sh.fail(e))?;
+                        me.append_us.push(micros(t));
+                        me.last_commit = Some(Instant::now());
+                        // The append that makes half the scenario's restarts it, the others' appends and reads under way.
+                        if half > 0 && acked.fetch_add(1, Ordering::AcqRel).saturating_add(1) == half {
+                            sh.restart().map_err(|e| sh.fail(e))?;
+                            restarts.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
-                    Ok((mine, us, last))
+                    Ok(me)
                 })
             })
             .collect();
-        let readers: Vec<_> = at
-            .iter_mut()
-            .zip(seen.iter_mut())
-            .map(|(at, seen)| {
-                let (c, writing) = (Arc::clone(c), &writing);
-                s.spawn(move || -> Result<(Vec<u64>, Vec<u64>, Vec<u64>), Failure> {
-                    let (mut feed_us, mut history_us, mut lag) = (Vec::new(), Vec::new(), Vec::new());
-                    let mut read = |at: &mut u64| -> Result<bool, Failure> {
+        let readers: Vec<_> = (0..l.readers)
+            .map(|_| {
+                let sh = &sh;
+                s.spawn(move || -> Result<Reader, Failure> {
+                    let mut me = Reader { feed_us: Vec::new(), history_us: Vec::new(), lag: Vec::new(), check_bytes: 0, done: Instant::now() };
+                    let mut model = Check::new(l.writers, l.appends);
+                    let mut at = 0u64;
+                    let read = |me: &mut Reader, model: &mut Check, at: &mut u64| -> Result<(), Failure> {
                         let t = Instant::now();
-                        let page = c.changes(*at, l.page_bytes).map_err(err)?;
-                        feed_us.push(micros(t));
-                        let top = c.top().map_err(err)?;
-                        lag.push(top.saturating_sub(page.upto));
-                        *at = page.upto;
+                        let page = sh.on(|c| c.changes(*at, l.page_bytes))?;
+                        me.feed_us.push(micros(t));
+                        let top = sh.on(|c| c.top())?;
+                        me.lag.push(top.saturating_sub(page.upto));
                         if let Some(last) = page.changes.last() {
                             let t = Instant::now();
-                            c.history(&last.entry.conversation, None, l.history_entries).map_err(err)?;
-                            history_us.push(micros(t));
+                            sh.on(|c| c.history(&last.entry.conversation, None, l.history_entries))?;
+                            me.history_us.push(micros(t));
                         }
-                        let moved = !page.changes.is_empty();
-                        seen.extend(page.changes);
-                        Ok(moved || *at < top)
+                        for ch in &page.changes {
+                            model.saw(ch)?;
+                        }
+                        // At the top with more to come: woken by the commit that passes it.
+                        if page.changes.is_empty() && page.upto <= *at && !model.whole() {
+                            sh.on(|c| c.wait(*at))?;
+                        }
+                        *at = page.upto.max(*at);
+                        Ok(())
                     };
-                    while writing.load(Ordering::Acquire) {
-                        read(at)?;
+                    while !model.whole() {
+                        read(&mut me, &mut model, &mut at).map_err(|e| sh.fail(e))?;
                     }
-                    if catch_up {
-                        while read(at)? {}
-                    }
-                    Ok((feed_us, history_us, lag))
+                    me.check_bytes = model.bytes();
+                    me.done = Instant::now();
+                    Ok(me)
                 })
             })
             .collect();
-        let mut p = Phase { appended: Vec::new(), append_us: Vec::new(), history_us: Vec::new(), feed_us: Vec::new(), lag: Vec::new(), last_commit: None };
+        // The first failure is the one said; any stops the rest.
         let mut failed = None;
+        let mut ws = Vec::with_capacity(l.writers);
         for h in writers {
-            match h.join() {
-                Ok(Ok((mine, us, last))) => {
-                    p.appended.push(mine);
-                    p.append_us.extend(us);
-                    p.last_commit = p.last_commit.max(last);
-                }
-                Ok(Err(e)) => failed = Some(e),
-                Err(_) => failed = Some("a writer stopped".to_owned()),
+            match joined(h, "writer") {
+                Ok(w) => ws.push(w),
+                Err(e) => failed = failed.or(Some(sh.fail(e))),
             }
         }
-        writing.store(false, Ordering::Release);
+        let mut rs = Vec::with_capacity(l.readers);
         for h in readers {
-            match h.join() {
-                Ok(Ok((feed_us, history_us, lag))) => {
-                    p.feed_us.extend(feed_us);
-                    p.history_us.extend(history_us);
-                    p.lag.extend(lag);
-                }
-                Ok(Err(e)) => failed = Some(e),
-                Err(_) => failed = Some("a reader stopped".to_owned()),
+            match joined(h, "reader") {
+                Ok(r) => rs.push(r),
+                Err(e) => failed = failed.or(Some(sh.fail(e))),
             }
         }
         match failed {
             Some(e) => Err(e),
-            None => Ok(p),
+            None => Ok((ws, rs)),
         }
-    })
-}
-
-/// The load scenario on what `f` opens: every reader's feed held to what was appended (each entry exactly once,
-/// in order) before anything measured is reported.
-pub fn load<F: ConversationsFixture>(f: &F, l: &Load) -> Result<LoadReport, Failure> {
-    let mut at = vec![0u64; l.readers];
-    let mut seen: Vec<Vec<Changed>> = vec![Vec::new(); l.readers];
-    let half = if l.restart { l.appends / 2 } else { l.appends };
-    let mut c = f.open()?;
-    let mut phases = vec![phase(&c, l, 0, half, &mut at, &mut seen, !l.restart)?];
-    let mut restarts = 0;
-    if l.restart {
-        c.close().map_err(err)?;
-        c = f.open()?;
-        restarts = 1;
-        phases.push(phase(&c, l, half, l.appends, &mut at, &mut seen, true)?);
-    }
-    let caught_up = Instant::now();
-    // Writer w's appends of each phase, the phases in turn: one writer's order through the restart.
-    let mut appended: Vec<Vec<Entry>> = vec![Vec::new(); l.writers];
-    for p in &phases {
-        for (mine, all) in p.appended.iter().zip(appended.iter_mut()) {
-            all.extend(mine.iter().cloned());
-        }
-    }
-    for s in &seen {
-        exactly_once(s, &appended)?;
-    }
-    let last = phases.iter().filter_map(|p| p.last_commit).max();
+    })?;
+    let ended = readers.iter().map(|r| r.done).max().unwrap_or_else(Instant::now);
+    // Memory as the run ends, before the samples are gathered for their percentiles.
     let (rss, peak) = memory();
-    let all = |pick: fn(&Phase) -> &Vec<u64>| Percentiles::of(phases.iter().flat_map(|p| pick(p).iter().copied()).collect());
+    let samples: usize = writers.iter().map(|w| w.append_us.capacity()).chain(readers.iter().map(|r| r.feed_us.capacity().saturating_add(r.history_us.capacity()).saturating_add(r.lag.capacity()))).sum();
+    let harness_bytes = u64::try_from(samples.saturating_mul(std::mem::size_of::<u64>())).unwrap_or(u64::MAX).saturating_add(readers.iter().map(|r| r.check_bytes).sum());
+    let last = writers.iter().filter_map(|w| w.last_commit).max();
+    let wall_us = u64::try_from(ended.saturating_duration_since(began).as_micros()).unwrap_or(u64::MAX);
+    let appended: usize = writers.iter().map(|w| w.append_us.len()).sum();
     let report = LoadReport {
-        append_us: all(|p| &p.append_us),
-        history_us: all(|p| &p.history_us),
-        feed_us: all(|p| &p.feed_us),
-        feed_lag_revs: all(|p| &p.lag),
-        catch_up_us: last.map_or(0, |t| u64::try_from(caught_up.saturating_duration_since(t).as_micros()).unwrap_or(u64::MAX)),
-        appended: appended.iter().map(Vec::len).sum(),
-        restarts,
+        threads: l.writers.saturating_add(l.readers),
+        append_us: Percentiles::of(writers.iter().flat_map(|w| w.append_us.iter().copied()).collect()),
+        history_us: Percentiles::of(readers.iter().flat_map(|r| r.history_us.iter().copied()).collect()),
+        feed_us: Percentiles::of(readers.iter().flat_map(|r| r.feed_us.iter().copied()).collect()),
+        feed_lag_revs: Percentiles::of(readers.iter().flat_map(|r| r.lag.iter().copied()).collect()),
+        catch_up_us: last.map_or(0, |t| u64::try_from(ended.saturating_duration_since(t).as_micros()).unwrap_or(u64::MAX)),
+        wall_us,
+        appends_per_s: u64::try_from(appended).unwrap_or(u64::MAX).saturating_mul(1_000_000).checked_div(wall_us).unwrap_or(0),
+        appended,
+        retried: sh.retried.load(Ordering::Relaxed),
+        restarts: restarts.load(Ordering::Relaxed),
         rss_bytes: rss,
         rss_peak_bytes: peak,
+        rss_before_bytes: rss_before,
+        harness_bytes,
+        store_bytes: rss.zip(rss_before).map(|(r, b)| r.saturating_sub(b).saturating_sub(harness_bytes)),
     };
-    c.close().map_err(err)?;
+    sh.current.read().close().map_err(err)?;
     Ok(report)
+}
+
+/// The load scenario up a ladder of concurrency: at each rung `n` of `rungs`, `n` writers and `n` readers (and as many
+/// conversations, at least `base`'s), on a store `fixture` makes afresh: a report a rung.
+pub fn ladder<F: ConversationsFixture>(base: &Load, rungs: &[usize], mut fixture: impl FnMut() -> Result<F, Failure>) -> Result<Vec<(usize, LoadReport)>, Failure> {
+    rungs
+        .iter()
+        .map(|&n| {
+            let l = Load { writers: n, readers: n, conversations: base.conversations.max(n), ..base.clone() };
+            let f = fixture()?;
+            load(&f, &l).map(|r| (n, r)).map_err(|e| format!("at {n} writers and readers: {e}"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -618,7 +792,37 @@ mod tests {
     fn cp_t1_1_the_load_scenario_runs_on_the_simulator_each_entry_once() -> Result<(), String> {
         let l = Load { conversations: 8, writers: 4, appends: 50, readers: 3, text_bytes: 64, page_bytes: 4096, history_entries: 50, restart: true };
         let r = load(&SimConversationsFixture::default(), &l)?;
-        check(r.appended == 200 && r.restarts == 1 && r.append_us.n == 200, || format!("{r:?}"))
+        check(r.appended == 200 && r.restarts == 1 && r.append_us.n == 200 && r.threads == 7, || format!("{r:?}"))
+    }
+
+    /// CP-T1.1 (seam review 11): the ladder runs a rung each, its writers and readers at the rung's count.
+    #[test]
+    fn cp_t1_1_the_load_scenario_climbs_the_ladder_on_the_simulator() -> Result<(), String> {
+        let l = Load { conversations: 4, writers: 0, appends: 6, readers: 0, text_bytes: 16, page_bytes: 4096, history_entries: 8, restart: true };
+        let rungs = LADDER.get(..3).ok_or("no ladder")?;
+        let rs = ladder(&l, rungs, || Ok(SimConversationsFixture::default()))?;
+        let got: Vec<(usize, usize, usize)> = rs.iter().map(|(n, r)| (*n, r.threads, r.appended)).collect();
+        check(got == vec![(1, 2, 6), (8, 16, 48), (32, 64, 192)], || format!("{got:?}"))
+    }
+
+    /// CP-T1.1 (seam review 12): the check as it goes refuses a change lost, repeated or out of its writer's order.
+    #[test]
+    fn cp_t1_1_the_running_check_refuses_a_repeated_or_reordered_change() {
+        let ch = |w: usize, i: usize, rev: u64| Changed { rev, entry: entry("c", &format!("w{w}a{i}"), u64::try_from(i * 2 + w).unwrap_or(0), "t") };
+        let mut ok = Check::new(2, 2);
+        for c in [ch(0, 0, 1), ch(1, 0, 2), ch(0, 1, 3), ch(1, 1, 4)] {
+            assert!(ok.saw(&c).is_ok(), "{c:?}");
+        }
+        assert!(ok.whole());
+        let mut twice = Check::new(2, 2);
+        assert!(twice.saw(&ch(0, 0, 1)).is_ok());
+        assert!(twice.saw(&ch(0, 0, 2)).is_err(), "twice");
+        let mut skipped = Check::new(2, 2);
+        assert!(skipped.saw(&ch(0, 1, 1)).is_err(), "reordered");
+        let mut falling = Check::new(2, 2);
+        assert!(falling.saw(&ch(0, 0, 2)).is_ok());
+        assert!(falling.saw(&ch(1, 0, 1)).is_err(), "revisions falling");
+        assert!(!falling.whole(), "lost");
     }
 
     /// CP-T1.1: the model check refuses a feed that loses, repeats or reorders what one writer appended.
