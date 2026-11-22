@@ -1881,9 +1881,10 @@ impl Sql {
         self.tables()
     }
 
-    /// The migrations done on it ([`sql::SCHEMA_GET`]).
-    pub fn copy_schema(&self) -> anyhow::Result<Option<String>> {
-        self.meta("schema")
+    /// What its file's `meta` says under `key` (`schema`: the migrations done; `rev`: its last number), read from the
+    /// file now, not from what this connection last wrote.
+    pub fn copy_meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+        self.meta(key)
     }
 
     /// The rows of `table` after rowid `after`, in rowid order, every column whole: a compaction's step of them at

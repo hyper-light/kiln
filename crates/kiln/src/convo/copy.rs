@@ -77,10 +77,11 @@ pub fn copy(from: &Path, into: &Path) -> anyhow::Result<Copied> {
         }
     }
     let mut src = Turso::open(from)?;
-    let (id, top) = (src.id(), src.top());
+    let (id, top, rev) = (src.id(), src.top(), src.copy_meta("rev")?);
     let tables = {
         let mut dst = Amphora::open(&part)?;
-        anyhow::ensure!(src.copy_schema()? == dst.copy_schema()?, "the two engines' stores are at different migrations: {:?} and {:?}", src.copy_schema()?, dst.copy_schema()?);
+        let (ours, theirs) = (src.copy_meta("schema")?, dst.copy_meta("schema")?);
+        anyhow::ensure!(ours == theirs, "the two engines' stores are at different migrations: {ours:?} and {theirs:?}");
         let (mut names, theirs) = (src.copy_tables()?, dst.copy_tables()?);
         anyhow::ensure!(names == theirs, "the two stores' tables differ: {names:?} and {theirs:?}");
         // `meta` last: its identity is the source's only once everything else is there.
@@ -108,12 +109,15 @@ pub fn copy(from: &Path, into: &Path) -> anyhow::Result<Copied> {
         dst.copy_flush()?;
         tables
     };
-    anyhow::ensure!(src.top() == top, "{} was written while it was copied: let its store go first", from.display());
+    // Read from the file: another process's write moves it, where this one's number (`top`) doesn't.
+    anyhow::ensure!(src.copy_meta("rev")? == rev, "{} was written while it was copied: let its store go first", from.display());
     let found = compare_open(&src, &Amphora::open(&part)?)?;
     anyhow::ensure!(found.is_empty(), "the copy differs from {} in {} rows, the first: {:?}", from.display(), found.len(), found.first());
+    // Only the file moves into place: a log beside it that still held anything would be left behind.
+    anyhow::ensure!(size(&beside(&part, "-wal")) == 0, "the copy's log isn't empty after it was flushed: {} left as it is", part.display());
     for f in ["-wal", "-shm"] {
         let side = beside(&part, f);
-        if side.exists() && size(&side) == 0 {
+        if side.exists() {
             std::fs::remove_file(&side).map_err(|e| anyhow::anyhow!("{}: {e}", side.display()))?;
         }
     }
