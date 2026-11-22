@@ -1,9 +1,10 @@
 //! kiln's records through kiln-seams' `Records` (docs/seams.md, "Records"; the critical path's
 //! master plan §3, "Seams"): what kiln keeps goes through that trait, so the store under it can
 //! change without the code over it changing. Until Amphora's lands (CP-T1.5), kiln has two of its
-//! own, as `SimRecords` is the one in memory: a host keeps its records in a file of kiln's embedded
-//! Turso ([`turso::TursoRecords`]; [`open`] is the one place that chooses it, so moving to Amphora
-//! is a change to its one line), and the server keeps its own in kiln's store ([`StoreRecords`]).
+//! own, as `SimRecords` is the one in memory: a host keeps its records in a file of an embedded SQL
+//! engine, Turso's ([`turso::TursoRecords`], the control) or Amphora's ([`amphora::AmphoraRecords`]),
+//! one code path on both, [`open`] the one place that chooses ([`Engine`]); and the server keeps its
+//! own in kiln's store ([`StoreRecords`]).
 //!
 //! [`StoreRecords`] keeps every version of a row by family, key and the commit that wrote it, so a
 //! snapshot read and the change feed come from one table; [`StoreRecords::compact`] forgets the
@@ -28,6 +29,9 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::store::Store;
 
+pub mod amphora;
+#[cfg(test)]
+mod bench;
 pub mod carry;
 pub mod cli;
 pub mod turso;
@@ -36,10 +40,55 @@ pub mod turso;
 /// conversation store; else brought into it once (`crate::convo::inbox`).
 pub const FILE: &str = "records.db";
 
-/// The records kept at `path`, in the store kiln keeps a host's records in: Turso's, until
-/// Amphora's.
+/// The records kept at `path`, on the engine `KILN_RECORDS_ENGINE` names ([`Engine::configured`]):
+/// Turso's, the control, unless it says Amphora's.
 pub fn open(path: &Path) -> anyhow::Result<Arc<dyn Records>> {
-    Ok(Arc::new(turso::TursoRecords::open(path)?))
+    Engine::configured()?.open(path)
+}
+
+/// Which engine keeps a host's records (CP-T1.5): Turso, unless `KILN_RECORDS_ENGINE` says
+/// `amphora`. Both run the one store kept in SQL (`records/sql.rs`); Amphora's engine is Turso's
+/// lineage with its pages checksummed. Turso stays the control until the move's comparison says
+/// otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    Turso,
+    Amphora,
+}
+
+/// The variable that chooses the records' engine ([`Engine::configured`]).
+pub const ENGINE_VAR: &str = "KILN_RECORDS_ENGINE";
+
+impl Engine {
+    /// Every engine, for what must hold on each (tests, the benchmark).
+    pub const ALL: [Engine; 2] = [Engine::Turso, Engine::Amphora];
+
+    /// The engine `KILN_RECORDS_ENGINE` names (`turso` or `amphora`; unset or empty: Turso).
+    /// Anything else is an error naming what it takes, never a guess.
+    pub fn configured() -> anyhow::Result<Self> {
+        match std::env::var(ENGINE_VAR) {
+            Err(std::env::VarError::NotPresent) => Ok(Self::Turso),
+            Err(e) => Err(anyhow::anyhow!("{ENGINE_VAR}: {e}")),
+            Ok(v) => Self::named(&v),
+        }
+    }
+
+    /// The engine called `name` (`turso` or `amphora`, any case; empty: Turso).
+    pub fn named(name: &str) -> anyhow::Result<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "" | "turso" => Ok(Self::Turso),
+            "amphora" => Ok(Self::Amphora),
+            other => anyhow::bail!("{ENGINE_VAR} is `{other}`: it takes `turso` or `amphora`"),
+        }
+    }
+
+    /// Its records at `path`, made as needed.
+    pub fn open(self, path: &Path) -> anyhow::Result<Arc<dyn Records>> {
+        Ok(match self {
+            Self::Turso => Arc::new(turso::TursoRecords::open(path)?),
+            Self::Amphora => Arc::new(amphora::AmphoraRecords::open(path)?),
+        })
+    }
 }
 
 /// What's kept in memory beside the tables.

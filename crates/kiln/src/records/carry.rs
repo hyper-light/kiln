@@ -329,6 +329,30 @@ mod tests {
         })
     }
 
+    /// T-T1.5.2 on each engine `records::open` chooses (CP-T1.5): Turso's, the control, and
+    /// Amphora's. Every goal and plan carried reads back the same, field by field, and a field
+    /// changed after the copy is found by its table and column.
+    #[test]
+    fn t_t1_5_2_goals_and_plans_carry_and_compare_the_same_on_each_engine() -> anyhow::Result<()> {
+        for engine in crate::records::Engine::ALL {
+            crate::rt::block_on(async {
+                let dir = tempfile::tempdir()?;
+                let records = engine.open(&dir.path().join("records.db"))?;
+                let store = Store::in_memory()?;
+                fill(&store).await?;
+                let carried = carry(&store, &*records).await?;
+                let same = compare(&store, &*records).await?;
+                anyhow::ensure!(same.differences.is_empty() && same.records == carried && carried == 2 * TABLES.len(), "{engine:?}: {carried} carried, {} read back, {:?}", same.records, same.differences);
+                store.call(|c| Ok(c.execute("UPDATE goal_items SET pos = 'first' WHERE pos = 1000000007", [])?)).await?;
+                let found = compare(&store, &*records).await?;
+                let what: Vec<(&str, Option<&str>)> = found.differences.iter().map(|d| (d.table, if let Differs::Field { column, .. } = &d.differs { Some(column.as_str()) } else { None })).collect();
+                anyhow::ensure!(what == [("goal_items", Some("pos"))], "{engine:?}: the changed field found: {what:?}");
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     /// Each storage class survives the trip: a real's bits, a text that isn't UTF-8, a blob.
     #[test]
     fn t_t1_5_2_fields_keep_their_storage_class() -> anyhow::Result<()> {
