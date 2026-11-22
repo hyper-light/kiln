@@ -1448,7 +1448,7 @@ impl Node {
         }
         if std::mem::take(&mut self.place_touched)
             && self.hints
-            && let Some(json) = self.place.hint_due(crate::util::now_ms(), self.place.strain())
+            && let Some(json) = self.place.hint_due(crate::util::now_ms())
         {
             self.send_out(AgentMsg::Offers { json }).await;
         }

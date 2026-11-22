@@ -506,8 +506,8 @@ sessions, and an agent's to do to the agents it started (and theirs), as `agents
 ### Reset
 
 An agent that's stuck (it takes no messages, its queue never goes, a move or a pause it can't leave)
-is reset from its page's ⋯ menu (Reset…, asked in a line under its head, why in your words if you
-like), as an operation (`agents.reset`: "Operations", below), an MCP tool (`agents_reset`) or
+is reset from its page's ⋯ menu (Reset: done as it's chosen, nothing asked first; Ada,
+2026-11-21), as an operation (`agents.reset`: "Operations", below), an MCP tool (`agents_reset`) or
 `POST /api/harness/agents/:id/reset` (Ada, 2026-11-21). A reset:
 
 - **Ends everything it had pending.** Each message to it that kiln holds and hasn't handed out is
@@ -1275,11 +1275,12 @@ they run, and refused and noted the same way.
 Every route needs `agents.run`. An agent is named by its id or the start of it (8 characters, as
 lists shorten it). Called by an agent, `agents.change` without `agent` is about that agent itself,
 as are the goal stack's operations (`goals.*`); what ends, stops or steers an agent always names it.
-kiln's MCP server tells each agent its id. `workspace` is `volume` (a Slates volume of its own:
-what it gets when it names none; a machine that can't make one refuses the start, 409, naming what
-it lacks) or `folder` (the folder itself, a person's explicit choice); in a result it is
+kiln's MCP server tells each agent its id. `workspace` is `folder` (the folder itself:
+what it gets when it names none) or `volume` (a Slates volume of its own, where the server's
+`[workspaces] enabled` is on, off by default: refused, 409, saying how to turn them on while they're
+off, and naming what it lacks on a machine that can't make one); in a result it is
 `{kind, over, sub, volume, mount, owner}`: `owner` when it works in another agent's volume,
-and `null` for one isolated in a microVM or one started before volumes were the default (one started in a person's
+and `null` for one isolated in a microVM or one working in its folder having named none (one started in a person's
 shell works on a volume too, its folder and environment moved onto the mount, its `PWD` the folder it starts in, and so
 does a conversation taken up, `resume`, its harness's record of it moved to where the harness looks from the mount's
 folder; when an agent on a volume ends, its conversation goes back to its person's folder's project once its processes
@@ -1486,9 +1487,11 @@ permissions low and how to merge their work.
 
 ## Workspaces of their own
 
-Every agent works in **its own Slates volume** wherever its machine can make one, unless a person
-chooses its folder itself (Mission control's composer → More options → Workspace → This folder;
-`agents.start` with `workspace: "folder"`) or the server's `[agents] workspace` is `folder` (docs/agentic.md, W2). An agent started in another
+An agent works in its folder unless it asks for **its own Slates volume** (Mission control's composer
+→ More options → Workspace → Own volume; `agents.start` with `workspace: "volume"`). Slates workspaces
+are an option the server's owner enables, off by default (`[workspaces] enabled = true` in its config;
+the person's ruling, 2026-11-21): while they're off, a start asking for a volume is refused, saying so,
+and an agent that has one already keeps working in it (docs/agentic.md, W2). An agent started in another
 agent's folder on that agent's machine works in that agent's volume:
 
 - **What it is.** On the agent's machine, before its harness starts, kiln lays an overlay volume

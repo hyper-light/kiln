@@ -271,6 +271,11 @@ budget (`Runner::set_budget`) or cordon it (`Runner::cordon`): it takes no new r
 no room so owners pick elsewhere, its runs run on, runs waiting in its line stay (each waits at
 another runner too) and are held when it opens again. The place core cordons its kernel while its
 runner takes no work: draining (an upgrade pending, or `[runner] on_battery`) or under strain.
+Strain holds nothing back (Ada, 2026-11-21: kiln's balancer places work around a strained
+machine, never holds it there): the runner's admission still offers what fits to the owner that
+probes it, a CI leg, a command or an agent session's start alike, each offer saying its room is
+none, as its words and its hint do, so the owner takes a runner free of strain where one offered
+and this one where none did.
 Under room tokens a cordon leaves no room to hold, so every token is cut to none and each owner
 that held some is told; the room that comes back is no owner's run's, so the first watcher's.
 
@@ -581,7 +586,7 @@ the fleet (64).
   its budget the admission's cap, its room for a new run what's free for an ordinary run while
   nothing waits in the line and no run holds it whole, else none (`sync_fast`, at the close of
   every input; everything else is its `outside`), and it's cordoned while the runner takes no
-  work (draining, on battery, under strain). So a run takes its room once in each whichever path
+  work (draining, on battery) or its machine is under strain. So a run takes its room once in each whichever path
   admitted it, and nothing passes a line: while runs wait, owners' kernels see no room there and
   probe. Runs probing admits don't enter the kernel's
   ledger (they are `outside`), so its end counts are the kernel's runs' alone.

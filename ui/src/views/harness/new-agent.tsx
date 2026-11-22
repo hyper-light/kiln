@@ -125,8 +125,8 @@ function useChoices() {
   };
   const [modelByKind, setModelByKind] = useLocalStorage<Record<string, string>>("kiln.agents.models", {});
   const [speedByKind, setSpeedByKind] = useLocalStorage<Record<string, string>>("kiln.agents.speeds", {});
-  /** `volume`: a Slates volume of its own over the folder, where the machine can make one (what an agent gets unless a person chooses its folder: kiln goal 01a1ec34…, the person's decision of 2026-11-18). */
-  const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "volume");
+  /** `volume`: a Slates volume of its own over the folder, where Slates workspaces are on and the machine can make one; else its folder (the person's ruling, 2026-11-21: Slates is an option kiln's owner enables). */
+  const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "folder");
   /** The Agentfile each harness's microVM is made from, per project (views/agentfiles/choose.ts); none kept: a process on its machine. */
   const [agentfiles, setAgentfiles] = useLocalStorage<Record<string, string>>("kiln.agents.agentfiles", {});
   /** The environments it runs with, top first, kept as the Agentfile is (docs/agents.md, "Environments"); none: its machine's user's. The one kept before stacks starts it. */

@@ -694,7 +694,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "runners.engine",
-            summary: "How a runner runs new agent sessions, its engine: `host` (each a process on the machine, no microVM) or `microvm` (each in a Shards microVM of its own, through Hex); where that comes from (its owner set it, or what the runner can do: `microvm` where it can hold microVMs, else `host`) and why; whether it can hold microVMs now and why not; its isolation facts; and how many of its sessions run on its engine and how many on the other, which finish there (`draining`), each of those listed (`draining_sessions`: id, name, harness, state, engine), with the switch they drain for while any does (`switch`: `from`, `to`, `at`).",
+            summary: "How a runner runs new agent sessions, its engine: `host` (each a process on the machine, no microVM) or `microvm` (each in a Shards microVM of its own, through Hex); where that comes from (its owner set it, or nothing set: `host`, the microVM engine being an option its owner enables) and why; whether it can hold microVMs now and why not; its isolation facts; and how many of its sessions run on its engine and how many on the other, which finish there (`draining`), each of those listed (`draining_sessions`: id, name, harness, state, engine), with the switch they drain for while any does (`switch`: `from`, `to`, `at`).",
             read_only: true,
             destructive: false,
             input: Input::of::<input::RunnersEngine>(),
@@ -703,7 +703,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "runners.engine.set",
-            summary: "Set how a runner runs new agent sessions: `host` or `microvm`, or null for what it can do (`microvm` where it can hold microVMs, else `host`). `microvm` is refused, saying why, where the runner can't hold microVMs now. Nothing running stops: its sessions on the other engine finish there, and new sessions take the new one.",
+            summary: "Set how a runner runs new agent sessions: `host` or `microvm`, or null for the default (`host`: the microVM engine is an option its owner enables here, never a default). `microvm` is refused, saying why, where the runner can't hold microVMs now. Nothing running stops: its sessions on the other engine finish there, and new sessions take the new one.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::RunnersEngineSet>(),

@@ -13,6 +13,10 @@
 //! The waits' bound ([`super::registry::WAITING_MAX`]) is counted where a wait is asked for, without the
 //! owner. The count covers the messages waited on, and the waits on their way to the owner. At the bound,
 //! the waits whose ends were dropped go first, then the wait is asked again, as before.
+//!
+//! The owner also keeps where a message routed to a runner went ([`Routed`]; docs/sends.md, "Routed to its
+//! session"), with its wait and only while it's waited on: a forward of it from that runner reads it there,
+//! asked as a message too, and it goes as its wait does.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +29,16 @@ use super::inbox::Said;
 /// A message waited on: its session and its id.
 type Key = (String, String);
 
+/// A message this server routed to a runner, while its answer is waited for (docs/sends.md, "Routed to its session"):
+/// where it went and what went, so a forward of it from that runner (`Registry::forward`) sends on the very words routed
+/// there, never what a runner says they were.
+#[derive(Clone)]
+pub struct Routed {
+    pub to: String,
+    pub json: String,
+    pub route: super::route::Route,
+}
+
 /// What the owner is told, taken in the order sent.
 enum Ask {
     /// A message's wait, counted: the end its answer goes to.
@@ -36,6 +50,11 @@ enum Ask {
     Answered { key: Key, said: Said },
     /// The bound was reached: every wait whose end was dropped goes; told once done.
     Sweep(oneshot::Sender<()>),
+    /// Where the message waited on went (a runner it was routed to), or, with none, that a forward of it is no
+    /// longer taken: kept while it's waited on, and only then.
+    Route { key: Key, routed: Option<Routed> },
+    /// Where the message waited on went, as kept: told to the end given.
+    WentTo { key: Key, tx: oneshot::Sender<Option<Routed>> },
     /// How many wait now, the owner's count (a test's).
     #[cfg(test)]
     Held(oneshot::Sender<usize>),
@@ -99,6 +118,20 @@ impl Answers {
         let _ = self.tx.try_send(Ask::Answered { key: (id.to_owned(), said.message.clone()), said });
     }
 
+    /// Message `message` to session `id`, waited on, went to a runner as `routed`; with none, a forward of it is no
+    /// longer taken. Kept with its wait, and gone with it: a message not waited on keeps none.
+    pub fn route(&self, id: &str, message: &str, routed: Option<Routed>) {
+        let _ = self.tx.try_send(Ask::Route { key: (id.to_owned(), message.to_owned()), routed });
+    }
+
+    /// Where message `message` to session `id` went, while it's waited on: none when it isn't waited on, or went
+    /// nowhere a forward of it is taken from. Asked after a [`Self::route`] (in the same order), it reads that.
+    pub async fn routed(&self, id: &str, message: &str) -> Option<Routed> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.try_send(Ask::WentTo { key: (id.to_owned(), message.to_owned()), tx }).ok()?;
+        rx.await.ok().flatten()
+    }
+
     /// One more counted, if the bound has room for it.
     fn count(&self) -> bool {
         let mut now = self.counted.load(Ordering::Acquire);
@@ -133,6 +166,8 @@ fn uncount(counted: &AtomicUsize, n: usize) {
 /// The waits' owner: it alone holds them, taking each message in the order sent, until the registry goes.
 async fn own(rx: crate::memory::queue::Receiver<Ask>, counted: Arc<AtomicUsize>) {
     let mut waiting: HashMap<Key, Vec<oneshot::Sender<Said>>> = HashMap::new();
+    // Where those routed to a runner went, while they're waited on.
+    let mut routed: HashMap<Key, Routed> = HashMap::new();
     while let Ok(ask) = rx.recv().await {
         match ask {
             Ask::Wait { key, tx } => {
@@ -148,6 +183,7 @@ async fn own(rx: crate::memory::queue::Receiver<Ask>, counted: Arc<AtomicUsize>)
                     waits.retain(|tx| !tx.is_canceled());
                     if waits.is_empty() {
                         waiting.remove(&key);
+                        routed.remove(&key);
                         uncount(&counted, 1);
                     }
                 }
@@ -158,6 +194,7 @@ async fn own(rx: crate::memory::queue::Receiver<Ask>, counted: Arc<AtomicUsize>)
                 let first = (!waits.is_empty()).then(|| waits.remove(0));
                 if waits.is_empty() {
                     waiting.remove(&key);
+                    routed.remove(&key);
                     uncount(&counted, 1);
                 }
                 if let Some(tx) = first {
@@ -171,7 +208,20 @@ async fn own(rx: crate::memory::queue::Receiver<Ask>, counted: Arc<AtomicUsize>)
                     !waits.is_empty()
                 });
                 uncount(&counted, before.saturating_sub(waiting.len()));
+                routed.retain(|key, _| waiting.contains_key(key));
                 let _ = done.send(());
+            }
+            Ask::Route { key, routed: went } => match went {
+                Some(went) if waiting.contains_key(&key) => {
+                    routed.insert(key, went);
+                }
+                Some(_) => {}
+                None => {
+                    routed.remove(&key);
+                }
+            },
+            Ask::WentTo { key, tx } => {
+                let _ = tx.send(routed.get(&key).cloned());
             }
             #[cfg(test)]
             Ask::Held(tx) => {
@@ -228,6 +278,38 @@ mod tests {
             }
             anyhow::ensure!(answers.held().await == Some(0), "waits left: {:?}", answers.held().await);
             anyhow::ensure!(answers.counted.load(Ordering::Acquire) == 0, "{} still counted", answers.counted.load(Ordering::Acquire));
+            Ok(())
+        })
+    }
+
+    /// Where a message routed to a runner went is kept with its wait, so a forward of it from there goes on, and goes
+    /// with it: answered, given up, or let go of; one not waited on keeps none.
+    #[test]
+    fn a_routed_message_is_kept_with_its_wait_and_goes_with_it() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let answers = Answers::new(10);
+            let went = |to: &str| Routed { to: to.into(), json: "{}".into(), route: crate::harness::route::Route::new(to, "admin") };
+            let to = |r: Option<Routed>| r.map(|r| r.to);
+            answers.route("s1", "m0", Some(went("r0")));
+            anyhow::ensure!(answers.routed("s1", "m0").await.is_none(), "not waited on: none kept");
+            let a = answers.wait_for("s1", "m1").await.ok_or_else(|| anyhow::anyhow!("no wait"))?;
+            answers.route("s1", "m1", Some(went("r1")));
+            anyhow::ensure!(to(answers.routed("s1", "m1").await).as_deref() == Some("r1"));
+            answers.route("s1", "m1", Some(went("r2")));
+            anyhow::ensure!(to(answers.routed("s1", "m1").await).as_deref() == Some("r2"), "sent on: where it went last");
+            answers.answered("s1", refused("s1", "m1"));
+            anyhow::ensure!(a.await.is_ok(), "its sender is told");
+            anyhow::ensure!(answers.routed("s1", "m1").await.is_none(), "answered: gone");
+            let b = answers.wait_for("s1", "m2").await.ok_or_else(|| anyhow::anyhow!("no wait"))?;
+            answers.route("s1", "m2", Some(went("r1")));
+            drop(b);
+            answers.unwait("s1", "m2");
+            anyhow::ensure!(answers.routed("s1", "m2").await.is_none(), "given up: gone");
+            let _c = answers.wait_for("s1", "m3").await.ok_or_else(|| anyhow::anyhow!("no wait"))?;
+            answers.route("s1", "m3", Some(went("r1")));
+            answers.route("s1", "m3", None);
+            anyhow::ensure!(answers.routed("s1", "m3").await.is_none(), "let go of: gone");
+            anyhow::ensure!(answers.held().await == Some(1), "its wait stays: {:?}", answers.held().await);
             Ok(())
         })
     }

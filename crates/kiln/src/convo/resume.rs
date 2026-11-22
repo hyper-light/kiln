@@ -161,10 +161,29 @@ pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown
     };
     let mut pkg = moving::pack(id, spec, &goes_on_in, from, &from_cwd, carry, events, state);
     // The messages it was sent go with it, so one sent again after it goes on is answered there.
-    pkg.inbox = sent_ids(store, id).unwrap_or_else(|e| {
+    let timeline = sent_ids(store, id).unwrap_or_else(|e| {
         tracing::warn!(target: "kiln.sends", event = "carry_failed", session = %id, error = %format!("{e:#}"), "the ids of the messages a session was sent couldn't be read from the store: those its timeline shows go with it");
         Vec::new()
     });
+    // What its inbox took and still held, as the store's copy of it has them (each runner's inbox is fed with its
+    // conversation, Ada, 2026-11-20): its ids beside the timeline's, digests and all, so a message its machine took that
+    // never reached the timeline is still its repeat where it goes; and what waited in its journal goes again there.
+    let (kept, waiting) = crate::harness::inbox::carried_from(store, id).unwrap_or_else(|e| {
+        tracing::warn!(target: "kiln.sends", event = "carry_inbox_failed", session = %id, error = %format!("{e:#}"), "a session's inbox couldn't be read from the store's copy: the ids its timeline shows go with it, and nothing that waited");
+        (Vec::new(), Vec::new())
+    });
+    let held: std::collections::HashSet<&str> = waiting.iter().map(|p| p.lease.message.as_str()).collect();
+    let mut ids: Vec<(String, String)> = timeline.into_iter().filter(|m| !held.contains(m.as_str())).map(|m| (m, String::new())).collect();
+    for (message, digest) in kept {
+        match ids.iter_mut().find(|(m, _)| *m == message) {
+            Some(known) => known.1 = digest,
+            None => ids.push((message, digest)),
+        }
+    }
+    let past = ids.len().saturating_sub(usize::try_from(crate::harness::inbox::KEEP).unwrap_or(usize::MAX));
+    let ids: Vec<(String, String)> = ids.into_iter().skip(past).collect();
+    (pkg.inbox, pkg.inbox_digests) = crate::harness::host::split_kept(ids);
+    pkg.waiting = waiting.into_iter().filter_map(|p| Some(moving::Waiting { command: p.current_command()?.clone(), sender: p.lease.peer.clone(), status: p.status.clone() })).collect();
     Ok(pkg)
 }
 
@@ -206,6 +225,37 @@ mod tests {
         // Another folder there, if asked.
         assert_eq!(package(&store, "s1", "gone-box", Some("/elsewhere"), ("gone-box", "here"))?.spec.cwd.as_deref(), Some("/elsewhere"));
         Ok(())
+    }
+
+    /// Ada, 2026-11-20: a session resumed from the server's store carries the store's copy of its inbox (each runner's
+    /// is fed with its conversation): the ids its machine took, digests and all, beside its timeline's; and what still
+    /// waited in its journal, which goes again where it goes, its id left out of the ids so it's taken there.
+    #[test]
+    fn a_resumed_session_carries_the_stores_copy_of_its_inbox() -> anyhow::Result<()> {
+        use kiln_seams::records::{Records, Tx, Write};
+        crate::rt::block_on(async {
+            let (_d, store) = crate::convo::store::scratch()?;
+            store.send("s1", &Update::Open { info: Box::new(info("claude", Some("cc-1"))?), since: None });
+            store.send("s1", &Update::State { state: Box::new(State { harness_session: Some("cc-1".into()), epoch: 2, ..State::default() }) });
+            // Claude Code's record of it, as its machine sent it: what a resume from the store goes on from.
+            store.put(vec![Row::Record(Box::new(RecordRow { session: "s1".into(), source: "cc-1".into(), n: 0, end: 10, line: "{\"a\":1}".into(), kept: None }))]);
+            store.sync()?;
+            let inbox = crate::convo::inbox::InboxRecords::new(crate::convo::inbox::Source::Store(store.clone()), crate::harness::inbox::FAMILIES, None);
+            let put = |family: &str, key: &str, value: Vec<u8>| Write::Put { family: family.into(), key: key.as_bytes().to_vec(), value };
+            let kept = serde_json::to_vec(&serde_json::json!({"epoch": 2, "at": 5, "digest": "d-took"}))?;
+            let mut held = crate::harness::inbox::Pending::new(
+                crate::harness::admission::Lease { message: "w1".into(), peer: "agent:a1".into(), epoch: 2, bytes: 10, stage: crate::harness::admission::Stage::Waiting, token: None, handoff: None },
+                crate::harness::model::Command::Send { id: "w1".into(), text: "still waiting".into(), mode: crate::harness::model::SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None },
+            );
+            held.origin = crate::harness::inbox::Origin::Routed;
+            inbox.commit(Tx { conds: Vec::new(), writes: vec![put("inbox", "s1/took", kept.clone()), put("inbox", "s1/w1", kept), put("inbox-pending", "s1/w1", serde_json::to_vec(&held)?)] }).await?;
+            let pkg = package(&store, "s1", "gone-box", None, ("gone-box", "here"))?;
+            let ids: Vec<(String, String)> = pkg.inbox.iter().cloned().zip(pkg.inbox_digests.iter().cloned().chain(std::iter::repeat(String::new()))).collect();
+            anyhow::ensure!(ids.contains(&("took".to_owned(), "d-took".to_owned())), "the id its machine took goes, its digest with it: {ids:?}");
+            anyhow::ensure!(!pkg.inbox.iter().any(|m| m == "w1"), "what still waited isn't among the ids: it's taken where it goes");
+            anyhow::ensure!(pkg.waiting.len() == 1 && pkg.waiting.first().is_some_and(|w| w.sender == "agent:a1" && matches!(&w.command, crate::harness::model::Command::Send { text, .. } if text == "still waiting")), "{:?}", pkg.waiting);
+            Ok(())
+        })
     }
 
     /// Ada, 2026-11-13: a crashed session resumed in place goes on natively, by its harness's own

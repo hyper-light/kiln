@@ -62,7 +62,9 @@ pub enum Taking {
     Taking,
     /// An upgrade is pending: it takes nothing new.
     Draining,
-    /// Its machine is under strain, as the gate's guard sees it (sense's predicate): `why` says how.
+    /// It takes nothing new, `why` says why: not synced with its machine's capacity keeper (Hex's
+    /// capacity-view.md CV11), or, from a runner before a machine's strain held nothing back, its
+    /// machine under strain as the gate's guard sees it. A runner's strain is said as its room alone.
     Strained { why: String },
 }
 

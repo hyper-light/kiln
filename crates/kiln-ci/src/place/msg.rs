@@ -487,8 +487,10 @@ pub enum Reason {
     /// owner is back.
     Away,
     /// The runner's machine is under strain as the gate's guard sees it (AUDIT L1: its tasks
-    /// stalled on memory and I/O past the scheduler's reserve, `why`): it offers nothing new until
-    /// a measure shows it isn't. Appended: an owner from before reads none of it.
+    /// stalled on memory and I/O past the scheduler's reserve, `why`), from a runner before strain
+    /// held nothing back (Ada, 2026-11-21), which offered nothing new until a measure showed it
+    /// wasn't; and `Unsynced` as an owner before `place.keeper` reads it. A runner since says its
+    /// strain as its room alone. Appended: an owner from before reads none of it.
     Strained { why: String },
     /// The runner's own health bars this kind of work here until its cause clears, by an event
     /// (AUDIT L2: its work volume ran full, a run was killed for memory, a tool wasn't found, its

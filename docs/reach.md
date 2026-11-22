@@ -179,8 +179,8 @@ says another owner's run waited there for room, and holds what it can't use, giv
 (`fast_release`), forwarded to that owner once. An owner that hears its own words takes no hint of
 that runner's while it does. Owners whose links didn't name it (builds from before it), the
 server's CI engine and the runner's own node hear its hints, as before, and so does an owner while
-its link is down. A runner that takes no work (draining, on battery, under strain) holds nothing
-for anyone: each owner is told so, and the room that comes back is the first owner's.
+its link is down. A runner that takes no work (draining, on battery), or whose machine is under
+strain, holds nothing for anyone: each owner is told so, and the room that comes back is the first owner's.
 
 **Settings.** A runner's placement decides by `[reach]` of its own config (docs/needs.md §21),
 each as kiln has it until declared: `overcommit_cpu` (its CPUs offered beside what's held, a

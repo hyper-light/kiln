@@ -824,7 +824,9 @@ device would give a new run's I/O under its load now. The load-balancing kernel 
 - **The work device** (`kiln_ci::pace::device`), where the kernel keeps no I/O stall time and for
   `disk_bps` everywhere: its uncontended service time S₀ fitted from its own history (M/M/1 with
   Little's law: R = S(1 + N), least squares through the origin, weighted by requests), its
-  utilization now ρ = 1 − S₀/R, and its rate for a new run, the most it was seen to move × (1 − ρ).
+  utilization now from its own queue, ρ = N/(1 + N) (M/M/1's N = ρ/(1 − ρ); never 1 − S₀/R, which
+  read a device idle but for reads past its knee: one S₀ is fitted over writes its cache absorbs
+  and reads from flash alike), and its rate for a new run, the most it was seen to move × (1 − ρ).
   On macOS and Windows a device past its knee (ρ > 1/2, M/M/1's: `knee(1)`) is strained as Linux's
   I/O stall past the reserve is.
 - **Thermal throttling is speed now**: core-bound time goes as 1/f (Weiser et al. 1994), so speed
@@ -852,7 +854,8 @@ device would give a new run's I/O under its load now. The load-balancing kernel 
   AUDIT L1):
   - **The gap:** on macOS, Windows and a Linux without PSI, health's strain rests on the stand-ins
     above (the work device's ρ, swap-ins' share). Only the events in **When** read them again, and a
-    strained runner takes nothing new. So an idle one met no event, and its strain stood for good:
+    strained runner says its room is none, so owners place work elsewhere first (docs/lb.md
+    "Thermals and battery"). So an idle one met no event, and its strain stood for good:
     every start placed there waited (kiln goal 3cd82843's E2E on a Windows desktop, 2026-11-17:
     `queued: 0 of 1 can start it now (1 machine under strain)`).
   - **The follow-up:** a measure that finds strain there reads the stand-ins again 2 s on, and again
