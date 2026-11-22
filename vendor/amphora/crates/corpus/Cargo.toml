@@ -1,0 +1,23 @@
+[package]
+name = "amphora-corpus"
+description = "The competition corpus's runner (G2 steps 4 and 7): sqllogictest records as SQLite's own runner reads, renders and compares them, on Amphora and, through the bench, on every competitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "amphora-corpus"
+path = "src/main.rs"
+
+[dependencies]
+# The engine under test, and the renderer of REALs as SQLite renders them (its port of
+# sqlite3FpDecode and printf's etFLOAT, checked against SQLite's own answers by real_text.rs).
+amphora-engine = { path = "../engine", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "amphora-columnar"
+description = "Amphora's column compression: BtrBlocks' sampled cascade against FastLanes' layouts (G11 step 3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false
+
+[lints]
+workspace = true

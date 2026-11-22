@@ -1,0 +1,49 @@
+Subject: RamStore for tests alone: the write-ahead log mandatory
+Why: Quiver's plan mandates hyper-durable's GroupStore on a real device and makes RamStore test-only (kiln's CP-T2.1, T-T2.1.2: RamStore outside cfg(test) fails the build). RamStore is compiled only for this crate's own tests or where a dev-dependency asks for the test-store feature, so a production build that names it fails; the crate's own tests ask for it through a dev-dependency on itself.
+
+diff --git a/crates/hyper-durable/Cargo.toml b/crates/hyper-durable/Cargo.toml
+index f66cfbc934ba1ab814a6f960fb34756a45bcb5a2..b830fd642d13d00939d1c2edfbaec6146cf392f4 100644
+--- a/crates/hyper-durable/Cargo.toml
++++ b/crates/hyper-durable/Cargo.toml
+@@ -11,6 +11,10 @@ repository.workspace = true
+ # A defect planted in the replica's core (`Replica::plant`, `hyper_raft::Mutant`), for a test build
+ # that shows its checks catch it; no consumer enables it.
+ mutants = ["hyper-raft/mutants"]
++# `RamStore`, a store whose writes complete as they're submitted, for tests alone: a dev-dependency
++# asks for it (this crate's own tests, below). Quiver's and kiln's copies make it so, as the
++# write-ahead log is mandatory there (Quiver's docs/design/focal-bus.md, "GroupStore mandated").
++test-store = []
+ 
+ [dependencies]
+ hyper-block = { path = "../hyper-block" }
+@@ -21,6 +25,7 @@ hyper-timing = { path = "../hyper-timing" }
+ thiserror.workspace = true
+ 
+ [dev-dependencies]
++hyper-durable = { path = ".", features = ["test-store"] }
+ hyper-block = { path = "../hyper-block", features = ["sim"] }
+ # The oracles the simulated groups are held to, and their crash enumeration by fork (docs/sim.md
+ # S-6, `tests/support/cluster.rs`).
+diff --git a/crates/hyper-durable/src/lib.rs b/crates/hyper-durable/src/lib.rs
+index 84745497b55c3f4ccfc42f75cb5e0bb51648b2a3..4eeba92f61e88afddc3e8cc03d286817c5608d0b 100644
+--- a/crates/hyper-durable/src/lib.rs
++++ b/crates/hyper-durable/src/lib.rs
+@@ -39,6 +39,10 @@ mod compaction;
+ mod held;
+ mod hyperlog;
+ mod machine;
++// A store whose writes complete as they're submitted: for tests alone where this copy is built
++// (Quiver's and kiln's: the write-ahead log is mandatory there), its feature asked for by a
++// dev-dependency.
++#[cfg(any(test, feature = "test-store"))]
+ mod memory;
+ mod owner;
+ mod patience;
+@@ -50,6 +54,7 @@ pub use compaction::Compaction;
+ pub use held::Held;
+ pub use hyperlog::{ClaimError, ENTRY_OVERHEAD, GroupStore, LogGroups, decode_entry, encode_entry};
+ pub use machine::{Fatal, StateMachine};
++#[cfg(any(test, feature = "test-store"))]
+ pub use memory::RamStore;
+ pub use owner::{Full, Handle, Owner};
+ pub use replica::{

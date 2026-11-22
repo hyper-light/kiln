@@ -942,6 +942,26 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         })
     }
 
+    /// The owner's node-level detector suspects `member`, for whose held answers a leader counts
+    /// alone (core step R-8): they are not counted until [`Replica::trust_held`]. For an owner
+    /// that elects on ticks, whose elections take no detector's word, so that [`Replica::suspect`]
+    /// is refused there; one that elects by suspicion tells [`Replica::suspect`], which takes both.
+    pub fn suspect_held(&mut self, member: u64) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let held = r.node.suspect_held(member);
+            r.heard(held)
+        })
+    }
+
+    /// The owner's node-level detector trusts `member` again, or saw its node start again, for
+    /// the held count alone: its held answers count from now on (core step R-8).
+    pub fn trust_held(&mut self, member: u64) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let held = r.node.trust_held(member);
+            r.heard(held)
+        })
+    }
+
     /// Judged apart from its disk, `member`'s disk is slow, as its heartbeats say
     /// (`hyper_liveness::Change::DiskSlow`, kiln's CP-T2.2): what the replica trusts of its process
     /// is unchanged, and while it is slow it is named heir to no hand-over of the leader's patience

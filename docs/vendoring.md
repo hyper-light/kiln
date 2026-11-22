@@ -3,9 +3,10 @@
 kiln builds from its own copies of the projects it's made of: Turso, Bun, Quiver with what it's
 built on (Focal's bus and hyper-raft, CP-T2.1, docs/bus.md), vorpal (the search across a change,
 docs/ci.md W26-R07; `vendor/vorpal/UPSTREAM.md`), Mantle, Shards and Hex (kiln's harnesses'
-microVMs and their runtime, at one Shards revision: docs/shards.md), and Slates (agents' workspaces of
-their own, driven through its library: docs/agentic.md, W; `vendor/slates/UPSTREAM.md`) today, and the
-other hyper-light products (Amphora, Veil, Reliquary, and what they take from Focal) as the critical
+microVMs and their runtime, at one Shards revision: docs/shards.md), Slates (agents' workspaces of
+their own, driven through its library: docs/agentic.md, W; `vendor/slates/UPSTREAM.md`) and Amphora
+(the database kiln keeps its records in, CP-T1.1; `vendor/amphora/UPSTREAM.md`) today, and the
+other hyper-light products (Veil, Reliquary, and what they take from Focal) as the critical
 path brings them in (its master plan §5, CP-M1). Each copy is its upstream at one revision plus kiln's
 recorded changes, and one command takes a new revision.
 

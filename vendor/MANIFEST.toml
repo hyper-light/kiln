@@ -40,6 +40,21 @@ path = "vendor/turso"
 take = ["Cargo.toml", "LICENSE.md", "NOTICE.md", "core", "extensions/core", "macros", "sqlite/parser"]
 own = ["UPSTREAM.md"]
 
+# Amphora, the database kiln keeps its records in (kiln's critical path T1, CP-T1.1; its master plan
+# §4): KilnDB made a product, its engine Amphora's own code (crates/engine*, from Turso 3e09a82,
+# synced with Turso in neither direction). Built on kiln's one hyper-raft (vendor/hyper-raft): kiln's
+# copy leaves Amphora's own copy of it out, and its benchmarks, docs and CI, which are Amphora's and
+# no part of what kiln builds. Its record of what it vendors (its vendor/MANIFEST.toml and
+# vendor/patches) is kept, so kiln's pins are checked against Amphora's as kiln's copy holds them
+# (vendor/amphora/UPSTREAM.md).
+[projects.amphora]
+kind = "git"
+repository = "https://github.com/hyper-light/amphora"
+commit = "6a4c2e4b743b6482720ae7a18ffc1bff258f977e"
+path = "vendor/amphora"
+exclude = [".kiln", "bench", "docs", "vendor/hyper-raft"]
+own = ["UPSTREAM.md"]
+
 # The Bun kiln carries to run its UI server (vendor/bun/README.md). Its revision is a release.
 [projects.bun]
 kind = "bun"

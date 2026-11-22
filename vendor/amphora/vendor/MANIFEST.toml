@@ -1,0 +1,33 @@
+# What Amphora vendors, each project at one revision (kiln's docs/vendoring.md). scripts/vendor.py
+# reads it; kiln, vendoring Amphora, holds every project named here at the same revision.
+format = 1
+
+# Amphora's gate, run after a re-vendor.
+gate = ["bash scripts/gates.sh"]
+
+# Consensus, its durable shell and device log, pinned to the revision Kiln consumes.
+[projects.hyper-raft]
+kind = "git"
+repository = "https://github.com/hyper-light/hyper-raft"
+commit = "e0613f524b0df198cc61dc1e82b33c22d604cf7b"
+path = "vendor/hyper-raft"
+take = [
+  "Cargo.toml",
+  "LICENSE",
+  "crates/hyper-block",
+  "crates/hyper-datagram",
+  "crates/hyper-durable",
+  "crates/hyper-liveness",
+  "crates/hyper-log",
+  "crates/hyper-measure",
+  "crates/hyper-quic",
+  "crates/hyper-raft",
+  "crates/hyper-rt",
+  "crates/hyper-rt-transport",
+  "crates/hyper-seal",
+  "crates/hyper-sim",
+  "crates/hyper-timing",
+  "crates/hyper-tls",
+  "crates/hyper-transport",
+]
+own = ["UPSTREAM.md"]

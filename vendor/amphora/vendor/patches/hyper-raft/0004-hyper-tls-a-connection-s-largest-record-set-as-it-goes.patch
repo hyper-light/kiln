@@ -1,0 +1,22 @@
+Subject: hyper-tls: a connection's largest record set as it goes
+Why: kiln's browser protocol socket keeps each TLS record at most its chunk, which follows the path's rate (kiln's goal 3, plan 01a1a832eb2f711f9c6f51d88effe89d step 3): the configuration's max_fragment_size is fixed when the connection is made, before the server knows the connection carries that socket or what its chunk is
+
+diff --git a/crates/hyper-tls/src/conn.rs b/crates/hyper-tls/src/conn.rs
+index 16df6fb9a462199fa346fe7b7c61dd0ff13cc43a..8a8eb4cd3e2cab9d31e362febe23318fb21d9f3a 100644
+--- a/crates/hyper-tls/src/conn.rs
++++ b/crates/hyper-tls/src/conn.rs
+@@ -483,6 +483,14 @@ impl<Data: SideData> ConnectionCommon<Data> {
+         self.sendable_tls.set_limit(limit);
+     }
+ 
++    /// Sets the largest TLS record this connection sends from now on, header and all (`None`: TLS's
++    /// own, 16 KiB), as the configuration's `max_fragment_size` does when the connection is made:
++    /// for a connection whose records follow its path as it goes (kiln's browser protocol socket,
++    /// whose records are at most its chunk). Records already made keep their size.
++    pub fn set_max_fragment_size(&mut self, new: Option<usize>) -> Result<(), Error> {
++        self.core.common_state.set_max_fragment_size(new)
++    }
++
+     /// Sends a TLS1.3 `key_update` message to refresh a connection's keys.
+     ///
+     /// This call refreshes our encryption keys. Once the peer receives the message,

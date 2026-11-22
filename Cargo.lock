@@ -105,6 +105,143 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
 
 [[package]]
+name = "amphora"
+version = "0.1.0"
+dependencies = [
+ "amphora-api",
+ "amphora-engine",
+ "amphora-engine-parser",
+ "anyhow",
+ "fs4",
+ "getrandom 0.4.3",
+ "hmac 0.12.1",
+ "hyper-block",
+ "hyper-durable",
+ "hyper-log",
+ "hyper-raft",
+ "hyper-timing",
+ "memory-stats",
+ "postcard",
+ "private-fs",
+ "rustix",
+ "serde",
+ "sha2 0.10.9",
+ "socket2 0.6.5 (git+https://github.com/rust-lang/socket2?rev=8b8b96fdaa1301698fd2b6f4de188635df4a8bd1)",
+ "thiserror 2.0.21",
+ "tracing",
+ "winapi-util",
+]
+
+[[package]]
+name = "amphora-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "amphora-engine"
+version = "0.1.0"
+dependencies = [
+ "aegis",
+ "aes",
+ "aes-gcm",
+ "allocator-api2 0.4.0",
+ "amphora-engine-ext",
+ "amphora-engine-macros",
+ "amphora-engine-parser",
+ "antithesis_sdk",
+ "arc-swap",
+ "aristo",
+ "bigdecimal",
+ "bitflags 2.13.2",
+ "branches",
+ "bumpalo",
+ "bytemuck",
+ "cfg_aliases 0.2.2",
+ "cfg_block",
+ "chrono",
+ "crc32c",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "either",
+ "fallible-iterator",
+ "fastbloom 0.14.1",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
+ "hex",
+ "icu_collator",
+ "icu_locale",
+ "intrusive-collections",
+ "libc",
+ "libloading",
+ "libm",
+ "loom",
+ "lz4_flex 0.13.2",
+ "memchr",
+ "miette",
+ "num-bigint",
+ "num-traits",
+ "pack1",
+ "parking_lot",
+ "pastey",
+ "polling",
+ "rand 0.9.5",
+ "rapidhash",
+ "regex",
+ "regex-syntax",
+ "roaring",
+ "rustc-hash",
+ "rustix",
+ "serde_json",
+ "shuttle",
+ "simdutf8",
+ "smallvec",
+ "strum",
+ "strum_macros",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+ "twox-hash",
+ "uncased",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "amphora-engine-ext"
+version = "0.1.0"
+dependencies = [
+ "amphora-engine-macros",
+ "chrono",
+ "getrandom 0.4.3",
+]
+
+[[package]]
+name = "amphora-engine-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "amphora-engine-parser"
+version = "0.1.0"
+dependencies = [
+ "amphora-engine-macros",
+ "bitflags 2.13.2",
+ "memchr",
+ "miette",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -727,7 +864,7 @@ dependencies = [
  "js-sys",
  "num-traits",
  "wasm-bindgen",
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -1452,6 +1589,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
+name = "fs4"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8640e34b88f7652208ce9e88b1a37a2ae95227d84abec377ccd3c5cfeb141ed4"
+dependencies = [
+ "rustix",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1562,7 +1709,7 @@ dependencies = [
  "libc",
  "log",
  "rustversion",
- "windows-link",
+ "windows-link 0.2.1",
  "windows-result",
 ]
 
@@ -1840,7 +1987,7 @@ dependencies = [
  "sha2 0.10.9",
  "shards-abi",
  "shards-api",
- "socket2",
+ "socket2 0.6.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
  "triomphe",
  "windows",
@@ -2432,6 +2579,7 @@ dependencies = [
 name = "kiln"
 version = "0.2.0"
 dependencies = [
+ "amphora",
  "anyhow",
  "arc-swap",
  "argon2",
@@ -2517,7 +2665,7 @@ dependencies = [
  "shards-image",
  "slates-api",
  "slates-ipc",
- "socket2",
+ "socket2 0.6.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "str0m",
  "sysinfo",
  "tar",
@@ -2765,7 +2913,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
 dependencies = [
  "cfg-if",
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -2890,6 +3038,12 @@ dependencies = [
 
 [[package]]
 name = "lz4_flex"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a027efd2ad3c4dbb4123b5c018e3efbe7f6236da7c7612f122dad030f5d2de5"
+
+[[package]]
+name = "lz4_flex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
@@ -2979,6 +3133,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "memory-stats"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c73f5c649995a115e1a0220b35e4df0a1294500477f97a91d0660fb5abeb574a"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3279,7 +3443,7 @@ dependencies = [
  "libc",
  "redox_syscall",
  "smallvec",
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -3470,6 +3634,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
+]
+
+[[package]]
+name = "private-fs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "216836ac7881f1a6a3ef0a0d92e9e8892c8f5b4070c338b0a408ab996ba219ef"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+ "rustix",
+ "thiserror 2.0.21",
+ "windows-link 0.100.0",
 ]
 
 [[package]]
@@ -4992,6 +5169,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "socket2"
+version = "0.6.5"
+source = "git+https://github.com/rust-lang/socket2?rev=8b8b96fdaa1301698fd2b6f4de188635df4a8bd1#8b8b96fdaa1301698fd2b6f4de188635df4a8bd1"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "softaes"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6238,7 +6424,7 @@ checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
 dependencies = [
  "windows-implement",
  "windows-interface",
- "windows-link",
+ "windows-link 0.2.1",
  "windows-result",
  "windows-strings",
 ]
@@ -6250,7 +6436,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
 dependencies = [
  "windows-core",
- "windows-link",
+ "windows-link 0.2.1",
  "windows-threading",
 ]
 
@@ -6283,13 +6469,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
+name = "windows-link"
+version = "0.100.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b39de7c7fe78858b0144c50c3fc000bab3be17d5e9b85b1053871693c7f7415"
+
+[[package]]
 name = "windows-numerics"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
 dependencies = [
  "windows-core",
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -6298,7 +6490,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
 dependencies = [
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -6307,7 +6499,7 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
 dependencies = [
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -6315,6 +6507,15 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
+version = "0.59.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
@@ -6334,7 +6535,7 @@ version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -6359,7 +6560,7 @@ version = "0.53.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3"
 dependencies = [
- "windows-link",
+ "windows-link 0.2.1",
  "windows_aarch64_gnullvm 0.53.1",
  "windows_aarch64_msvc 0.53.1",
  "windows_i686_gnu 0.53.1",
@@ -6376,7 +6577,7 @@ version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
 dependencies = [
- "windows-link",
+ "windows-link 0.2.1",
 ]
 
 [[package]]

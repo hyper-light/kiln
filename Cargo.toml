@@ -2,9 +2,9 @@
 resolver = "3"
 members = ["crates/*"]
 # Turso (the conversation store's engine) is vendored with its own workspace: vendor/turso/UPSTREAM.md;
-# so are Quiver, Focal's bus, hyper-raft, vorpal, aws-lc-rs, Mantle, Shards, Hex and Slates (vendor/MANIFEST.toml),
+# so are Quiver, Focal's bus, hyper-raft, vorpal, aws-lc-rs, Mantle, Shards, Hex, Slates and Amphora (vendor/MANIFEST.toml),
 # each a workspace of its own.
-exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "vendor/vorpal", "vendor/aws-lc-rs", "vendor/mantle", "vendor/shards", "vendor/hex", "vendor/slates", "bench/kilndb", "bench/http"]
+exclude = ["vendor/turso", "vendor/quiver", "vendor/focal-bus", "vendor/hyper-raft", "vendor/vorpal", "vendor/aws-lc-rs", "vendor/mantle", "vendor/shards", "vendor/hex", "vendor/slates", "vendor/amphora", "bench/kilndb", "bench/http"]
 
 [workspace.package]
 version = "0.2.0"
@@ -100,6 +100,10 @@ shards-image = { path = "vendor/shards/crates/image" }
 # Its own crates take one another by path, as Slates' root manifest points them.
 slates-api = { path = "vendor/slates/crates/api" }
 slates-ipc = { path = "vendor/slates/crates/ipc" }
+# Amphora, the database kiln keeps its records in (vendor/amphora; CP-T1.1): the crates kiln names. Its
+# engine's crates take one another by path, as Amphora's root manifest points them.
+amphora = { path = "vendor/amphora/crates/amphora" }
+amphora-api = { path = "vendor/amphora/crates/api" }
 quiver = { path = "vendor/quiver/crates/quiver" }
 quiver-api = { path = "vendor/quiver/crates/quiver-api" }
 # vorpal, the search across a change (docs/ci.md W26-R07): its crates, the tree-sitter runtime it
