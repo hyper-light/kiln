@@ -414,6 +414,9 @@ impl Sim {
                         touch(c, &a, None, None, now_ms)
                     }))
                     .map_err(|e| format!("{e:#}"))?;
+                    // Said once it's in, as `goals_done` says its change (`goals::Saying`): the driver stepping
+                    // only the stacks said changed (`goals::Steps::Stacks`) steps this one.
+                    self.store.changes().say(&id);
                     self.port.update(&id, |info| {
                         info.status = Status::Idle;
                         info.last_activity = now_ms;
@@ -554,6 +557,7 @@ impl Sim {
                 let text = format!("goal {k} of agent {i}, added");
                 a.goals.push(text.clone());
                 let agent = a.id.clone();
+                let said = agent.clone();
                 self.counts.edits += 1;
                 self.counts.goals += 1;
                 futures::executor::block_on(self.store.call(move |c| {
@@ -563,6 +567,8 @@ impl Sim {
                     touch(c, &agent, done.then_some("running"), None, now_ms)
                 }))
                 .map_err(|e| format!("{e:#}"))?;
+                // Said once it's in, as `goals_add` says its change (`goals::Saying`).
+                self.store.changes().say(&said);
                 self.trace.note(|| format!("{now:?} a goal added to agent {i}'s stack"));
             }
         }

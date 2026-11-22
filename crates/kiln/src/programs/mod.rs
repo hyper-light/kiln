@@ -543,7 +543,7 @@ async fn seeded(hub: &Hub, master: &str) -> anyhow::Result<Settings> {
 /// The usage rule that holds for `agent`: its program's (it's a program's coordinator, or a
 /// track's worker), or `Ok`. `agents` are every agent kiln knows, as they are now. A store that
 /// can't be read leaves it `Ok`, said in the log: the driver goes on.
-pub async fn rule(store: &crate::store::Store, agents: &[Info], agent: &str) -> Rule {
+pub async fn rule<I: std::borrow::Borrow<Info> + Sync>(store: &crate::store::Store, agents: &[I], agent: &str) -> Rule {
     match rule_of(store, agents, agent).await {
         Ok(r) => r,
         Err(e) => {
@@ -553,14 +553,14 @@ pub async fn rule(store: &crate::store::Store, agents: &[Info], agent: &str) -> 
     }
 }
 
-async fn rule_of(store: &crate::store::Store, agents: &[Info], agent: &str) -> anyhow::Result<Rule> {
+async fn rule_of<I: std::borrow::Borrow<Info> + Sync>(store: &crate::store::Store, agents: &[I], agent: &str) -> anyhow::Result<Rule> {
     for m in masters(store).await? {
         let Some(coordinator) = m.coordinator else { continue };
         let workers: Vec<String> = assignments(store, &m.id).await?.into_values().map(|a| a.agent).collect();
         if agent != coordinator && !workers.iter().any(|w| w == agent) {
             continue;
         }
-        let members = agents.iter().filter(|i| i.id == coordinator || workers.contains(&i.id));
+        let members = agents.iter().map(<I as std::borrow::Borrow<Info>>::borrow).filter(|i| i.id == coordinator || workers.contains(&i.id));
         let pct = members.filter_map(|i| weekly(&i.limits)).map(|u| u.pct).max_by(f64::total_cmp);
         return Ok(Rule::at(pct));
     }

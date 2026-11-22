@@ -162,8 +162,10 @@ fn news_of(i: &Info) -> u64 {
 
 /// Whether session event `text` is news to the goal driver: an agent's info changed in what it acts
 /// on ([`news_of`], against `seen`, what it last saw of each), or a session closed.
-fn heard_news(hub: &Hub, text: &str, seen: &mut HashMap<String, u64>) -> bool {
+fn heard_news(hub: &Hub, text: &str, seen: &mut HashMap<String, (u64, u64)>) -> bool {
+    let changes = hub.store.changes();
     if crate::wire::events::kind_of(text) != Some("harness") {
+        changes.say_all();
         return true;
     }
     let id = text.strip_prefix(r#"{"type":"harness","info":{"id":""#).and_then(|r| r.get(..r.find('"')?)).filter(|id| !id.contains('\\'));
@@ -171,18 +173,44 @@ fn heard_news(hub: &Hub, text: &str, seen: &mut HashMap<String, u64>) -> bool {
         // Its id not at its front: every agent looked at.
         let mut changed = false;
         for i in hub.harness.list_shared() {
-            let n = news_of(&i);
-            changed |= seen.insert(i.id.clone(), n) != Some(n);
+            changed |= news_said(changes, &i, seen);
         }
         return changed;
     };
-    let Some(info) = hub.harness.info_shared(id) else { return seen.remove(id).is_some() };
-    let n = news_of(&info);
-    if seen.get(id) == Some(&n) {
+    let Some(info) = hub.harness.info_shared(id) else {
+        // A session gone: who read it (its stack, its parent's, its program's) isn't known any more.
+        let gone = seen.remove(id).is_some();
+        if gone {
+            changes.say_all();
+        }
+        return gone;
+    };
+    news_said(changes, &info, seen)
+}
+
+/// Whether `i` is news against `seen` ([`news_of`]); if so, said as a change to the stacks that read it (G9 step 3,
+/// goal a2a44298, T-T1.5.1; [`Steps::Stacks`]): its own and its parent's (whose step looks at its children at work),
+/// or, its usage changed, every stack (a program's rule reads its members' usage).
+fn news_said(changes: &crate::store::Changes, i: &Info, seen: &mut HashMap<String, (u64, u64)>) -> bool {
+    let n = (news_of(i), usage_of(i));
+    let before = seen.insert(i.id.clone(), n);
+    if before == Some(n) {
         return false;
     }
-    seen.insert(id.to_owned(), n);
+    if before.is_none_or(|(_, u)| u != n.1) {
+        changes.say_all();
+    } else {
+        changes.say(&i.id);
+        if let Some(parent) = i.parent.as_deref() {
+            changes.say(parent);
+        }
+    }
     true
+}
+
+/// An agent's weekly usage as [`news_of`] counts it: what programs' rules read of every member.
+fn usage_of(i: &Info) -> u64 {
+    crate::programs::weekly(&i.limits).map_or(u64::MAX, |u| u.pct.to_bits())
 }
 
 /// `soonest`, or `t` if it's sooner and after `now`.
@@ -195,8 +223,10 @@ fn sooner(soonest: Option<i64>, t: i64, now: i64) -> Option<i64> {
 
 /// What woke the goal driver.
 enum Woke {
-    /// Something it acts on changed, or a deadline came: a round.
+    /// Something it acts on changed: a round, of the stacks it was to ([`Steps`]).
     Change,
+    /// A deadline came, a stir, or news not told apart: a round of every stack.
+    Every,
     /// The agents' news ended (the hub is going).
     Closed,
 }
@@ -218,15 +248,72 @@ static CHANGING: std::sync::LazyLock<Changing> = std::sync::LazyLock::new(Changi
 pub(crate) struct Changing {
     all: crate::turn::ReadWrite,
     each: crate::turn::Keyed<String, crate::turn::Gate>,
+    /// Whether the driver that follows these changes steps only the stacks they were to ([`Steps::Stacks`]), or
+    /// every running stack at each change (the control, [`Steps::Every`]).
+    steps: Steps,
+}
+
+/// Which running stacks a round of the goal driver steps (G9 step 3, goal a2a44298, T-T1.5.1), a switch for the
+/// A/B (`KILN_GOAL_FEED`: `stacks`, else the control).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Steps {
+    /// The control: every running stack at each round, whatever woke it. Any agent's write steps every stack, and
+    /// each step copied every session's info: a round was O(N²) in the agents.
+    Every,
+    /// Those whose inputs changed: the stacks the changes since the last round said they were to (`store::Said`,
+    /// each change's own stack once its writes are in, or every stack for one that spans them), the agents' news
+    /// (its agent's stack and its parent's; every stack's for a change to its usage, which programs' rules read),
+    /// and the stacks whose goals wait on plans (whose tables' writes say no stack). A deadline, a stir, a lost
+    /// session event or a restart steps every stack, as the control does.
+    Stacks,
+}
+
+impl Steps {
+    /// As `KILN_GOAL_FEED` says, read once.
+    fn from_env() -> Self {
+        static STEPS: LazyLock<Steps> = LazyLock::new(|| if std::env::var("KILN_GOAL_FEED").is_ok_and(|v| v == "stacks") { Steps::Stacks } else { Steps::Every });
+        *STEPS
+    }
+}
+
+/// The running stacks a round steps ([`Steps`]).
+pub(crate) enum Which {
+    All,
+    Said(HashSet<String>),
+}
+
+impl Which {
+    fn has(&self, agent: &str) -> bool {
+        match self {
+            Which::All => true,
+            Which::Said(keys) => keys.contains(agent),
+        }
+    }
 }
 
 impl Changing {
     pub(crate) fn new() -> Self {
-        Self { all: crate::turn::ReadWrite::new(), each: crate::turn::Keyed::new() }
+        Self::stepping(Steps::from_env())
     }
 
-    /// A change that spans stacks: alone, after every change to a stack before it.
+    /// With its driver's rounds stepping as `steps` says (the driver's tests and kiln-sim's model pick it).
+    pub(crate) fn stepping(steps: Steps) -> Self {
+        Self { all: crate::turn::ReadWrite::new(), each: crate::turn::Keyed::new(), steps }
+    }
+
+    /// A change that spans stacks: alone, after every change to a stack before it. It says no stack changed
+    /// ([`stack_turn!`] says it, for its change); a change across stacks takes [`Changing::every_on`].
     pub(crate) async fn every(&self) -> Every<'_> {
+        self.every_saying(None).await
+    }
+
+    /// [`Changing::every`] for a change across stacks in `store`: once it's given back (its writes in), it says
+    /// every stack may have changed (`store::Changes::say_all`), so the driver's next round steps each.
+    pub(crate) async fn every_on<'a>(&'a self, store: &'a crate::store::Store) -> Every<'a> {
+        self.every_saying(Some(store.changes())).await
+    }
+
+    async fn every_saying<'a>(&'a self, says: Option<&'a crate::store::Changes>) -> Every<'a> {
         #[cfg(test)]
         let asked = std::time::Instant::now();
         let writing = self.all.write().await;
@@ -234,8 +321,42 @@ impl Changing {
         turn_times::EVERY_WAIT.since(asked, true);
         Every {
             _writing: writing,
+            says,
             #[cfg(test)]
             since: std::time::Instant::now(),
+        }
+    }
+}
+
+/// A change to `agent`'s stack, said once it's given back (its writes in) so the driver's next round steps the stack
+/// ([`stack_turn!`]; G9 step 3, goal a2a44298, T-T1.5.1): said to the store's [`crate::store::Changes::say`], or,
+/// where it took every stack's turn, as every stack's. Declared before the turns, so it's said after they're given
+/// back. The driver's own (`quiet`) is said only if it wrote (`wrote`, as it says): a step that did nothing says
+/// nothing, so a round that changed nothing brings no other. (A count of the stacks' tables' writes while it was
+/// held would say it for others' writes too: under steady edits, nearly every stack, every round.)
+pub(crate) struct Saying<'a> {
+    pub(crate) changes: &'a crate::store::Changes,
+    pub(crate) agent: String,
+    pub(crate) quiet: bool,
+    pub(crate) wrote: bool,
+    pub(crate) spanned: bool,
+}
+
+impl<'a> Saying<'a> {
+    pub(crate) fn new(store: &'a crate::store::Store, agent: &str, quiet: bool) -> Self {
+        Self { changes: store.changes(), agent: agent.to_owned(), quiet, wrote: false, spanned: false }
+    }
+}
+
+impl Drop for Saying<'_> {
+    fn drop(&mut self) {
+        if self.quiet && !self.wrote {
+            return;
+        }
+        if self.spanned {
+            self.changes.say_all();
+        } else {
+            self.changes.say(&self.agent);
         }
     }
 }
@@ -244,14 +365,19 @@ impl Changing {
 /// given back (`turn_times`, G9 step 3's trace of an edit's time).
 pub(crate) struct Every<'a> {
     _writing: crate::turn::Writing<'a>,
+    /// Where it says every stack changed as it's given back ([`Changing::every_on`]).
+    says: Option<&'a crate::store::Changes>,
     #[cfg(test)]
     since: std::time::Instant,
 }
 
-#[cfg(test)]
 impl Drop for Every<'_> {
     fn drop(&mut self) {
+        #[cfg(test)]
         turn_times::EVERY_HELD.since(self.since, true);
+        if let Some(changes) = self.says {
+            changes.say_all();
+        }
     }
 }
 
@@ -275,10 +401,10 @@ impl Drop for Every<'_> {
 /// set its stack spanning and sent from it, and what it planned or handed out was decided with the
 /// other stacks moving under it. Said so, the stack isn't looked at for it.
 macro_rules! stack_turn {
-    ($changing:expr, $store:expr, $agent:expr) => {
-        stack_turn!($changing, $store, $agent, false)
-    };
-    ($changing:expr, $store:expr, $agent:expr, $reaches:expr) => {
+    // Declared first, so given back last: the change is said once its turns are given back, its writes in
+    // ([`Saying`]).
+    (@turn $saying:ident, $quiet:expr, $changing:expr, $store:expr, $agent:expr, $reaches:expr) => {
+        let mut $saying = crate::goals::Saying::new($store, $agent, $quiet);
         let changing: &Changing = $changing;
         let reaches: bool = $reaches;
         #[cfg(test)]
@@ -301,6 +427,18 @@ macro_rules! stack_turn {
         } else {
             None
         };
+        $saying.spanned = _every.is_some();
+    };
+    // The driver's own change (its round's adoptions, resumptions and steps): said only if it wrote, as the
+    // caller sets `$saying.wrote`.
+    ($changing:expr, $store:expr, $agent:expr, quiet $saying:ident) => {
+        stack_turn!(@turn $saying, true, $changing, $store, $agent, false)
+    };
+    ($changing:expr, $store:expr, $agent:expr) => {
+        stack_turn!(@turn saying, false, $changing, $store, $agent, false)
+    };
+    ($changing:expr, $store:expr, $agent:expr, $reaches:expr) => {
+        stack_turn!(@turn saying, false, $changing, $store, $agent, $reaches)
     };
 }
 
@@ -2388,7 +2526,7 @@ pub async fn forget(hub: &Hub, agent: &str) -> R<()> {
 /// harness's last goal adopted, [`adopt`]), and ROOT's step 11 stayed held by it for good.
 pub(crate) async fn forget_with(hub: &Hub, agent: &str, why: &str) -> R<()> {
     SAID.lock().remove(agent);
-    let _one = CHANGING.every().await;
+    let _one = CHANGING.every_on(&hub.store).await;
     let (a, reason, now) = (agent.to_owned(), format!("Back from its subagent: {why}."), now_ms(hub));
     let holders = hub
         .store
@@ -2650,13 +2788,21 @@ where
             },
             None => None,
         };
-        let mut seen: HashMap<String, u64> = HashMap::new();
+        let mut seen: HashMap<String, (u64, u64)> = HashMap::new();
+        // The first round steps every stack (as a restarted server's does): what changed before it isn't said.
+        let mut every = true;
         loop {
             if self.shutdown.is_cancelled() {
                 return Ok(());
             }
             // Where the feed stands before the round reads the stacks: a write after this is heard.
             let at = feed.at();
+            // The stacks the changes since the last round were to, taken before the round reads them (G9 step 3, goal
+            // a2a44298, T-T1.5.1): each change is said once its writes are in, so a change said before this take is in
+            // what the round reads, and one said after it wakes the next round (`said_after`), which steps its stack.
+            let (said, said_at) = self.store.changes().take_said();
+            let which = if changing.steps == Steps::Every || every || said.all { Which::All } else { Which::Said(said.keys) };
+            every = false;
             #[cfg(test)]
             let round_began = std::time::Instant::now();
             // When the round began: a deadline after it wasn't due in what the round and its riders
@@ -2665,9 +2811,9 @@ where
             // What the round sees of each agent: news is what differs from it.
             seen.clear();
             for i in self.agents_shared() {
-                seen.insert(i.id.clone(), news_of(&i));
+                seen.insert(i.id.clone(), (news_of(&i), usage_of(&i)));
             }
-            let (running, waiting) = crate::rt::labeled(&ROUND, self.round(changing)).await;
+            let (running, waiting) = crate::rt::labeled(&ROUND, self.round(changing, &which)).await;
             // The riders go with each round: what wakes the round (the feed, the agents' news, its
             // deadlines and theirs, a stir) is what they act on; none has a pace of its own.
             if tend {
@@ -2707,8 +2853,11 @@ where
                     while let Some(e) = ev.take() {
                         match e {
                             Ok(text) => changed |= heard_news(hub, &text, &mut seen),
-                            // Some lost: looked at again.
-                            Err(crate::memory::lanes::RecvError::Overflowed(_)) => changed = true,
+                            // Some lost: looked at again, every stack.
+                            Err(crate::memory::lanes::RecvError::Overflowed(_)) => {
+                                hub.store.changes().say_all();
+                                changed = true;
+                            }
                             Err(crate::memory::lanes::RecvError::Closed) => return false,
                         }
                         ev = match events.try_recv() {
@@ -2723,16 +2872,25 @@ where
                     }
                 }
             };
+            // What woke it says which stacks the next round steps ([`Steps`]): the feed and the says, those said
+            // (and those whose goals wait on plans); the agents' news, those it said (`heard_news`); the test's news,
+            // a deadline or a stir, every stack.
             let woke = futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 _ = feed.after(at).fuse() => Woke::Change,
-                () = told.fuse() => Woke::Change,
+                () = self.store.changes().said_after(said_at).fuse() => Woke::Change,
+                () = told.fuse() => Woke::Every,
                 open = heard.fuse() => if open { Woke::Change } else { Woke::Closed },
-                () = due.fuse() => Woke::Change,
-                () = stirred.fuse() => Woke::Change,
+                () = due.fuse() => Woke::Every,
+                () = stirred.fuse() => Woke::Every,
             };
-            if matches!(woke, Woke::Closed) {
-                sessions = None;
+            match woke {
+                Woke::Change => {}
+                Woke::Every => every = true,
+                Woke::Closed => {
+                    sessions = None;
+                    every = true;
+                }
             }
         }
     }
@@ -2803,7 +2961,7 @@ where
     /// adoption, resumption and step is one change to the stacks, under `changing` (`CHANGING`, as
     /// each of yours is; kiln-sim's model has its own). The stacks running, and those paused for a
     /// while.
-    async fn round(&self, changing: &Changing) -> (Vec<String>, Vec<String>) {
+    async fn round(&self, changing: &Changing, which: &Which) -> (Vec<String>, Vec<String>) {
         // Each agent as the registry shares it, none copied (`agents_shared`), and the loop's turn on
         // its shard given up between agents, before the stacks are held: an agent with no goal of its
         // own to adopt takes no wait, so the loop over every agent was one poll (goal 9, plan
@@ -2813,12 +2971,16 @@ where
             turns.end().await;
             // One with no goal set in it has none to adopt: the stacks aren't held for it (goal 9, plan 01a1a87b2cec
             // step 3: the gate taken and given back for each agent, a fence each time, in the driver's first poll).
-            if set_goal(&info).is_none() {
+            if set_goal(&info).is_none() || !which.has(&info.id) {
                 continue;
             }
-            stack_turn!(changing, self.store, &info.id);
-            if let Err(e) = adopt(self, &info).await {
-                tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
+            stack_turn!(changing, self.store, &info.id, quiet saying);
+            match adopt(self, &info).await {
+                Ok(wrote) => saying.wrote = wrote,
+                Err(e) => {
+                    saying.wrote = true;
+                    tracing::warn!(agent = %info.id, error = %format!("{e:#}"), "goal stack");
+                }
             }
         }
         // Stacks paused for a while whose time is up: running again, what's next going at once.
@@ -2835,7 +2997,9 @@ where
             .await
             .unwrap_or_default();
         for agent in &due {
-            stack_turn!(changing, self.store, agent);
+            // Due, so it changes (or was changed since): said.
+            stack_turn!(changing, self.store, agent, quiet saying);
+            saying.wrote = true;
             if let Err(e) = resume_due(self, agent).await {
                 tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
             }
@@ -2849,10 +3013,33 @@ where
             })
             .await
             .unwrap_or_default();
-        for agent in &running {
-            stack_turn!(changing, self.store, agent);
-            if let Err(e) = step(self, agent, false).await {
-                tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
+        // Those whose inputs changed ([`Steps::Stacks`]): said so, or with goals that wait on plans, whose tables'
+        // writes say no stack.
+        let planned = match which {
+            Which::All => HashSet::new(),
+            Which::Said(_) => self
+                .store
+                .read(|c| {
+                    let mut st = c.prepare_cached(
+                        "SELECT DISTINCT i.agent FROM goal_items i JOIN goal_stacks s ON s.agent = i.agent WHERE s.state = 'running' \
+                         AND (i.plan_id IS NOT NULL OR i.plan_run IS NOT NULL OR i.waits_on IS NOT NULL OR i.part_kind IS NOT NULL)",
+                    )?;
+                    let v = st.query_map([], |r| r.get(0))?.collect::<Result<HashSet<String>, _>>()?;
+                    Ok(v)
+                })
+                .await
+                // Unread: every running stack is stepped.
+                .unwrap_or_else(|_| running.iter().cloned().collect()),
+        };
+        for agent in running.iter().filter(|a| which.has(a) || planned.contains(*a)) {
+            stack_turn!(changing, self.store, agent, quiet saying);
+            match step(self, agent, false).await {
+                Ok(wrote) => saying.wrote = wrote,
+                Err(e) => {
+                    // What it wrote before it failed isn't known: said.
+                    saying.wrote = true;
+                    tracing::warn!(%agent, error = %format!("{e:#}"), "goal stack");
+                }
             }
         }
         // A plan's steps side by side: the steps out on subagents followed, and those ready
@@ -3062,24 +3249,24 @@ where
 /// harness's own goal set some other way), pursued or given up on for now but still set, joins the
 /// stack as the goal under way,
 /// so kiln keeps it like the others; one the stack had under way goes back to the front of what's
-/// next. The stack runs.
-async fn adopt<P: HarnessPort<Agent = Info>>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<()> {
+/// next. The stack runs. Whether it wrote.
+async fn adopt<P: HarnessPort<Agent = Info>>(d: &Driver<'_, P>, info: &Info) -> anyhow::Result<bool> {
     if set_goal(info).is_none() {
-        return Ok(());
+        return Ok(false);
     }
     // Gone since the round looked (ended, its stack forgotten: [`forget_with`]): its goal makes it no
     // stack again. There, its goal as it is now, not as the round saw it: the stack may have ended
     // it since, and its harness let it go.
-    let Some(info) = d.port.agent(&info.id) else { return Ok(()) };
-    let Some(o) = set_goal(&info) else { return Ok(()) };
-    let Ok(text) = clean(&o.text) else { return Ok(()) };
+    let Some(info) = d.port.agent(&info.id) else { return Ok(false) };
+    let Some(o) = set_goal(&info) else { return Ok(false) };
+    let Ok(text) = clean(&o.text) else { return Ok(false) };
     let (agent, how, at, now, gave_up) = (info.id.clone(), how(d.port, &info.id), o.at, d.clock.unix_ms(), o.status == "unmet");
     d.store
         .call(move |c| {
             // One you cleared or skipped is being cleared in the agent: it doesn't come back.
             let dropped: i64 = c.query_row("SELECT dropped_at FROM goal_stacks WHERE agent = ?1", params![agent], |r| r.get(0)).optional()?.unwrap_or(0);
             if at <= dropped {
-                return Ok(());
+                return Ok(false);
             }
             // One the stack ended (said met through it, met, skipped) at or after the agent's goal
             // was set: what the agent still has is the goal the stack sent it, not one set anew, and
@@ -3090,7 +3277,7 @@ async fn adopt<P: HarnessPort<Agent = Info>>(d: &Driver<'_, P>, info: &Info) -> 
                 params![agent, text, at],
                 |r| r.get::<_, bool>(0),
             )? {
-                return Ok(());
+                return Ok(false);
             }
             // Its harness giving up on a goal the stack knows, one it still had set: one the stack has
             // ended already (said met, skipped, taken out) or put back among the others (split into
@@ -3103,7 +3290,7 @@ async fn adopt<P: HarnessPort<Agent = Info>>(d: &Driver<'_, P>, info: &Info) -> 
                     |r| r.get::<_, bool>(0),
                 )?
             {
-                return Ok(());
+                return Ok(false);
             }
             let tx = crate::store::tx(c)?;
             // The agent's own goal under way (`here`), not one under way on a subagent beside it.
@@ -3111,7 +3298,7 @@ async fn adopt<P: HarnessPort<Agent = Info>>(d: &Driver<'_, P>, info: &Info) -> 
                 .query_row("SELECT id, text FROM goal_items WHERE agent = ?1 AND status = 'active' AND subagent IS NULL AND COALESCE(how, '') != ?2", params![agent, OWN], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
             if active.as_ref().is_some_and(|(_, t)| same(t, &text)) {
-                return Ok(());
+                return Ok(false);
             }
             // Where it goes: after the goals done, before the ones to come.
             let pos: i64 = tx.query_row("SELECT COALESCE(MAX(pos), -1) + 1 FROM goal_items WHERE agent = ?1 AND status NOT IN ('pending', 'active')", params![agent], |r| r.get(0))?;
@@ -3133,7 +3320,7 @@ async fn adopt<P: HarnessPort<Agent = Info>>(d: &Driver<'_, P>, info: &Info) -> 
             touch(&tx, &agent, Some("running"), None, now)?;
             tx.commit()?;
             tracing::info!(%agent, "a goal set in the agent joins its goal stack");
-            Ok(())
+            Ok(true)
         })
         .await
 }
@@ -3189,7 +3376,7 @@ pub struct Planned {
 pub async fn plan(hub: &Hub, agent: &str, id: Option<&str>, title: Option<&str>, by: &str, delegated: bool) -> R<Planned> {
     let info = known(hub, agent)?;
     release_gone(hub, agent).await?;
-    let _one = CHANGING.every().await;
+    let _one = CHANGING.every_on(&hub.store).await;
     let (planned, sends) = plan_locked(hub, &info, agent, id, title, by, delegated).await?;
     // The goal under way put back after its planning: that goes to the agent at once.
     if sends {
@@ -3430,7 +3617,7 @@ pub async fn answer_plan(hub: &Hub, agent: &str, goal: &str, plan: &crate::plans
     known(hub, agent)?;
     let part = revise.map(|(words, research)| clean(&revise_words(plan, research, words))).transpose()?;
     {
-        let _one = CHANGING.every().await;
+        let _one = CHANGING.every_on(&hub.store).await;
         let stack = get(hub, agent).await?;
         if !stack.items.iter().any(|i| i.id == goal && matches!(i.status.as_str(), "pending" | "active")) {
             return Err(Error::Bad("the goal this plan was made from has ended, or gone: its review has nothing left to answer".into()));
@@ -3685,7 +3872,7 @@ where
         if crate::programs::rule(d.store, &all, &agent).await != crate::programs::Rule::Ok {
             continue;
         }
-        let _one = changing.every().await;
+        let _one = changing.every_on(d.store).await;
         let said_at = all.iter().find(|i| i.id == agent).and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
         let now = d.clock.unix_ms();
         let a = agent.clone();
@@ -3725,7 +3912,7 @@ where
 /// `item` isn't a goal of the stack still to come.
 #[allow(clippy::too_many_arguments)]
 pub async fn delegate(store: &crate::store::Store, agent: &str, back: Option<&str>, item: Option<&str>, on: Option<&str>, met: bool, record: (String, String), now: i64) -> anyhow::Result<bool> {
-    let _one = CHANGING.every().await;
+    let _one = CHANGING.every_on(store).await;
     // A goal said met through it (programs.assign) ends, and counts as one said met does.
     let saying_met = met && item.is_some();
     let (agent, back, item, on) = (agent.to_owned(), back.map(str::to_owned), item.map(str::to_owned), on.map(str::to_owned));
@@ -3762,22 +3949,25 @@ pub async fn delegate(store: &crate::store::Store, agent: &str, back: Option<&st
 
 /// One step of a running stack (`decide`), by the driver's clock and through its port; `push`:
 /// yours, which goes now.
-async fn step<P>(d: &Driver<'_, P>, agent: &str, push: bool) -> anyhow::Result<()>
+async fn step<P>(d: &Driver<'_, P>, agent: &str, push: bool) -> anyhow::Result<bool>
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
     let (store, port) = (d.store, d.port);
+    // Whether it wrote to the stack (G9 step 3, goal a2a44298, T-T1.5.1): the driver says the stack changed only
+    // then (`Saying`), so a step that did nothing brings no other round.
+    let mut wrote = false;
     // Attention plan 01a199e1b177752e84dad5dc990e6a15: an archive's durable
     // intent holds goal automation even if its runner has not acknowledged the stop yet.
     if let Some(hub) = d.hub
         && crate::harness::attention::is_archived(hub, agent).await?
     {
-        return Ok(());
+        return Ok(wrote);
     }
     let mut stack = stack_of(store, agent).await?;
     // Paused or done since it was found running: left as it is.
     if stack.state != "running" {
-        return Ok(());
+        return Ok(wrote);
     }
     // A part waiting for a plan run: met once the run is done; until then nothing goes to the
     // agent (the run's agents do the work, and it's told as each settles).
@@ -3786,7 +3976,7 @@ where
         let r = run.clone();
         let state: Option<String> = store.call(move |c| Ok(c.query_row("SELECT state FROM plan_runs WHERE id = ?1", params![r], |x| x.get(0)).optional()?)).await?;
         if state.as_deref() != Some("done") {
-            return Ok(());
+            return Ok(wrote);
         }
         let (a, now) = (agent.to_owned(), d.clock.unix_ms());
         store
@@ -3795,6 +3985,7 @@ where
                 touch(c, &a, None, None, now)
             })
             .await?;
+        wrote = true;
         d.metrics.goal_ended(true);
         stack = stack_of(store, agent).await?;
     }
@@ -3807,12 +3998,14 @@ where
                 touch(c, &a, None, None, now)
             })
             .await?;
+        wrote = true;
         d.metrics.goal_ended(true);
         stack = stack_of(store, agent).await?;
     }
-    // Read here, with the stacks held, as each step reads it: through the hub, copied off the shard
-    // (`Driver::agents_now`; goal 9, plan 01a1a87b2cec step 3).
-    let all = d.agents_now().await;
+    // Read here, with the stacks held, as each step reads it: each session as the registry shares it, none copied
+    // (`Driver::agents_shared`; G9 step 3, goal a2a44298, T-T1.5.1): each step copied every session's whole info,
+    // and of those it reads only its agent's, its children's and its program's members' usage.
+    let all = d.agents_shared();
     // Agents it started at work hold its next goal back (it ended its turn to let them), but for the
     // subagents kiln started for its plan's steps (`subagents`): its stack goes on beside those.
     let children = {
@@ -3822,22 +4015,23 @@ where
     // Its program's usage rule (docs/programs.md; the critical path's master plan, §5): above 95%
     // of a weekly window every stack of the program pauses, above 80% no new goal starts.
     let rule = crate::programs::rule(store, &all, agent).await;
-    let info = all.into_iter().find(|i| i.id == agent);
+    let info: Option<Arc<Info>> = all.into_iter().find(|i| i.id == agent);
     let now = d.clock.unix_ms();
     let a = agent.to_owned();
     if let crate::programs::Rule::Pause { why } = &rule {
         let why = why.clone();
         store.call(move |c| pause_for_usage(c, &a, &why, now)).await?;
+        wrote = true;
         tracing::info!(%agent, "goal stack paused for usage");
         // Its own goal (Claude Code's /goal) cleared too, so the agent doesn't go on pursuing it, and
         // what still waits in its queue for its goals withdrawn.
-        if let Some(i) = info.as_ref() {
+        if let Some(i) = info.as_deref() {
             if under_way(&stack.items).is_some() {
                 clear_in_agent(port, i, &stack.items, now).await;
             }
             withdraw(port, agent, &stack.items, |g| matches!(g.status.as_str(), "active" | "pending")).await;
         }
-        return Ok(());
+        return Ok(wrote);
     }
     // Its plans' steps as their graphs say (docs/agentic.md P2): those that can be under way at once
     // that are about to go to subagents (`subagents::tick`) are left for them. A graph that can't be
@@ -3846,47 +4040,50 @@ where
         tracing::warn!(%agent, error = %format!("{e:#}"), "a plan's steps: their graph not read");
         subagents::Graph::default()
     });
-    if let (Some(hub), Some(i)) = (d.planner, info.as_ref())
+    if let (Some(hub), Some(i)) = (d.planner, info.as_deref())
         && !rule.holds_new_goals()
     {
         subagents::leave(&mut graph, hub, &stack, i, now).await;
     }
-    let going = Going { children, runs: info.as_ref().is_some_and(crate::harness::told::runs_awaited) };
+    let going = Going { children, runs: info.as_deref().is_some_and(crate::harness::told::runs_awaited) };
     // Its goals ready together side by side on subagents (docs/agentic.md G2), as its Subagents
     // setting leaves room (none set, no limit), where a person left that on: those that go to
     // subagents (`subagents::give_out`) aren't the agent's, and it coordinates. None while its
     // program holds new goals for usage, or when no subagent can be started for it now
     // (`subagents::may_hand`): it takes its goals itself then, one at a time.
-    let room = match (d.planner, info.as_ref()) {
+    let room = match (d.planner, info.as_deref()) {
         (Some(hub), Some(i)) if stack.side_by_side && !rule.holds_new_goals() && subagents::may_hand(i, now) => subagents::room_now(hub, i).await,
         _ => graph::Room::Never,
     };
-    let mut next = decide_on(&stack, &graph, info.as_ref(), now, going, push, room);
+    let mut next = decide_on(&stack, &graph, info.as_deref(), now, going, push, room);
     // A big goal of the agent's own about to start, on a stack that plans those first: planned
     // first, as Make a plan does (researched inside and out, its steps written), its planning going
     // to the agent in its place and its steps after. One that can't be planned goes as it is.
     let starts = if let Next::Start { id, .. } = &next { Some(id.clone()) } else { None };
-    if let (Some(id), Some(hub), Some(i)) = (starts, d.planner, info.as_ref())
+    if let (Some(id), Some(hub), Some(i)) = (starts, d.planner, info.as_deref())
         && !rule.holds_new_goals()
         && plans_first(&stack, &id)
     {
         match plan_locked(hub, i, agent, Some(&id), None, "kiln", false).await {
             Ok((p, _)) => {
+                wrote = true;
                 tracing::info!(%agent, goal = %id, plan = %p.plan, "a big goal planned first");
                 stack = stack_of(store, agent).await?;
-                next = decide_on(&stack, &graph, info.as_ref(), now, going, push, room);
+                next = decide_on(&stack, &graph, info.as_deref(), now, going, push, room);
             }
             Err(e) => tracing::warn!(%agent, goal = %id, error = %e, "planning a big goal first"),
         }
     }
     // What its harness last said of the goal it pursues: a verdict on what's sent now must be newer.
-    let prior_at = info.as_ref().and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
+    let prior_at = info.as_deref().and_then(|i| i.objective.as_ref()).map_or(0, |o| o.at);
     match next {
         Next::Wait => {}
         Next::Busy { id } => {
+            wrote = true;
             store.call(move |c| Ok(c.execute("UPDATE goal_items SET busy_at = ?2 WHERE id = ?1", params![id, now]).map(|_| ())?)).await?;
         }
         Next::End { id, status, reason } => {
+            wrote = true;
             store
                 .call(move |c| {
                     c.execute("UPDATE goal_items SET status = ?2, reason = ?3, ended_at = ?4 WHERE id = ?1", params![id, status, reason, now])?;
@@ -3902,9 +4099,11 @@ where
             // done stack, never sent (kiln-sim seeds 7645 and 8076). `settle` counts what's left in
             // this write's own transaction; a goal added since keeps the stack running, and its
             // write moved the feed past this round's start, so the next round sends it.
+            wrote = true;
             store.call(move |c| settle(c, &a, now)).await?;
         }
         Next::Start { id, .. } if stack.items.iter().any(|i| i.id == id && i.waits_on.is_some()) => {
+            wrote = true;
             store
                 .call(move |c| {
                     c.execute("UPDATE goal_items SET status = 'active', how = 'run', started_at = ?2, reminded_at = ?2, reminders = 0, busy_at = 0 WHERE id = ?1", params![id, now])?;
@@ -3916,12 +4115,13 @@ where
         Next::Start { .. } if rule.holds_new_goals() => {}
         Next::Start { id, text } => {
             let how = how(port, agent);
-            let stopped = info.as_ref().is_some_and(|i| i.status == Status::Exited);
+            let stopped = info.as_deref().is_some_and(|i| i.status == Status::Exited);
             let c = first_command(how, &text, stopped);
             let (message, found, waiting) = goal_message(store, port, d.planner, agent, &id, &c, now).await?;
             let (went, sent) = say_with(port, agent, Some(id.as_str()), with_id(c, &message), found.as_ref(), waiting, now).await;
             match went {
                 Sent::Delivered | Sent::Retained => {
+                    wrote = true;
                     d.metrics.goal_sent(false);
                     store
                         .call(move |c| {
@@ -3946,6 +4146,7 @@ where
             let (went, sent) = say_with(port, agent, Some(id.as_str()), with_id(c, &message), found.as_ref(), waiting, now).await;
             match went {
                 Sent::Delivered | Sent::Retained => {
+                    wrote = true;
                     // Afresh (resumed, or reworded) it goes as a goal goes first: a start.
                     d.metrics.goal_sent(!fresh);
                     tracing::info!(%agent, worked, stopped, fresh, "goal sent again");
@@ -3963,12 +4164,13 @@ where
                 // its way elsewhere): tried again after a pause, as a reminder that brought no work,
                 // under the same id until it gets there (CP-T3.2).
                 Sent::NoSession | Sent::Unreachable | Sent::Full | Sent::Cancelled => {
+                    wrote = true;
                     store.call(move |c| Ok(c.execute("UPDATE goal_items SET reminded_at = ?2, reminders = reminders + 1 WHERE id = ?1", params![id, now]).map(|_| ())?)).await?;
                 }
             }
         }
     }
-    Ok(())
+    Ok(wrote)
 }
 
 #[cfg(test)]
@@ -4656,6 +4858,8 @@ mod tests {
                         touch(c, &a, Some("running"), None, 0)
                     })
                     .await?;
+                // Said once it's in, as a change under its stack's turn says it (`Saying`).
+                store.changes().say(id);
                 // Until it's sent (its send marks the goal: a write the test hears too).
                 let sent = async {
                     loop {
@@ -4675,6 +4879,90 @@ mod tests {
             let (driven, tested) = futures::join!(driver.follow(&changing, &fed, None, false), test);
             driven?;
             tested
+        })
+    }
+
+    /// G9 step 3 (goal a2a44298, T-T1.5.1): what's said changed is taken whole by a round, and a say after the take
+    /// (a change landing during the round) is kept for the next and wakes it: none is lost, none taken twice. Once
+    /// every stack is said, no key is kept (they're at most every stack).
+    #[test]
+    fn g9_s3_a_change_said_during_a_round_wakes_the_next_and_is_in_it() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        let store = crate::store::Store::in_memory_inline()?;
+        let changes = store.changes();
+        changes.say("a");
+        let (said, at) = changes.take_said();
+        anyhow::ensure!(!said.all && said.keys.len() == 1 && said.keys.contains("a"), "the round didn't take what was said: {said:?}");
+        anyhow::ensure!(changes.said_after(at).now_or_never().is_none(), "a wait past the take was over with nothing said since");
+        // A change lands during the round.
+        changes.say("b");
+        anyhow::ensure!(changes.said_after(at).now_or_never().is_some(), "a say after the take didn't wake the next round");
+        let (said, at) = changes.take_said();
+        anyhow::ensure!(!said.all && said.keys.len() == 1 && said.keys.contains("b"), "the next round didn't take what was said during the last: {said:?}");
+        changes.say_all();
+        changes.say("c");
+        let (said, _) = changes.take_said();
+        anyhow::ensure!(said.all && said.keys.is_empty(), "every stack said, keys were kept: {said:?}");
+        anyhow::ensure!(changes.said_after(at).now_or_never().is_some(), "the says after a take didn't wake the next round");
+        let (said, _) = changes.take_said();
+        anyhow::ensure!(!said.all && said.keys.is_empty(), "taken twice: {said:?}");
+        Ok(())
+    }
+
+    /// G9 step 3 (goal a2a44298, T-T1.5.1): with the driver stepping the stacks said changed ([`Steps::Stacks`]), a
+    /// goal added to a stack during a round (after the round took what was said) isn't stepped by that round, but
+    /// said as its change gives its turn back, it wakes the next, which sends it; the other stack's goal, sent by the
+    /// first round, isn't sent again. No reminder lost, none twice.
+    #[test]
+    fn g9_s3_a_goal_added_during_a_round_goes_in_the_next_and_once() -> anyhow::Result<()> {
+        use futures::FutureExt as _;
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let clock = SimClock::new();
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let shutdown = crate::rt::Shutdown::new();
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let (a, b) = ("goals-said-a", "goals-said-b");
+            for id in [a, b] {
+                anyhow::ensure!(port.open(id, Info { id: id.into(), status: Status::Idle, ..Info::default() }), "not opened");
+                port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
+            }
+            store
+                .call(move |c| {
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES ('said-a1', ?1, 0, 'the first goal')", params![a])?;
+                    touch(c, a, Some("running"), None, 0)
+                })
+                .await?;
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
+            let changing = Changing::stepping(Steps::Stacks);
+            // The first round, every stack: a's goal goes.
+            let _ = store.changes().take_said();
+            driver.round(&changing, &Which::All).await;
+            anyhow::ensure!(port.heard(a).len() == 1, "a's goal didn't go: {:?}", port.heard(a));
+            // The next round takes what was said (a's, its send), then a goal is added to b during it.
+            let (said, at) = store.changes().take_said();
+            {
+                stack_turn!(&changing, &store, b);
+                store
+                    .call(move |c| {
+                        c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES ('said-b1', ?1, 0, 'b goal')", params![b])?;
+                        touch(c, b, Some("running"), None, 0)
+                    })
+                    .await?;
+            }
+            anyhow::ensure!(!said.all && !said.keys.contains(b), "the round took a change made after it began: {said:?}");
+            driver.round(&changing, &Which::Said(said.keys)).await;
+            anyhow::ensure!(port.heard(b).is_empty(), "b stepped by a round that wasn't told of it: {:?}", port.heard(b));
+            // Said as its turn was given back: the next round is woken, and steps b.
+            anyhow::ensure!(store.changes().said_after(at).now_or_never().is_some(), "b's change didn't wake the next round");
+            let (said, _) = store.changes().take_said();
+            anyhow::ensure!(said.all || said.keys.contains(b), "b's change wasn't said: {said:?}");
+            driver.round(&changing, &Which::Said(said.keys)).await;
+            anyhow::ensure!(port.heard(b).len() == 1, "b's goal didn't go once: {:?}", port.heard(b));
+            anyhow::ensure!(port.heard(a).len() == 1, "a's goal went again: {:?}", port.heard(a));
+            Ok(())
         })
     }
 

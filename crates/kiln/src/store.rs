@@ -1120,6 +1120,23 @@ pub struct Changes {
     any: std::sync::atomic::AtomicU64,
     /// Each told after every committed write that touched one of its tables, or said none ([`Changes::watch`]).
     watches: arc_swap::ArcSwap<Vec<(Box<[Arc<str>]>, Arc<crate::rt::Notify>)>>,
+    /// What writers said they changed, by key, since its reader last took it ([`Changes::say`]).
+    said: parking_lot::Mutex<Said>,
+    /// Told at each [`Changes::say`].
+    said_told: crate::rt::Notify,
+}
+
+/// What writers said they changed, by key, since its reader last took it (G9 step 3, goal a2a44298, T-T1.5.1: the
+/// goal stacks each change was to, said by the change once its writes are in, so the goal driver steps those alone).
+/// Its keys are at most every key there is (the stacks); once `all` is said, none is kept.
+#[derive(Debug, Default)]
+pub struct Said {
+    /// Every key changed, or may have: a change that spans them.
+    pub all: bool,
+    /// The keys changed.
+    pub keys: std::collections::HashSet<String>,
+    /// Moves with each say: a wait past one sees each say after it.
+    seq: u64,
 }
 
 impl Changes {
@@ -1165,6 +1182,50 @@ impl Changes {
             if tables.iter().any(|t| now.get(&**t) != before.get(&**t)) {
                 told.notify();
             }
+        }
+    }
+
+    /// Says `key` changed (G9 step 3, goal a2a44298, T-T1.5.1): said once the change's writes are in, so a reader
+    /// that takes it after ([`Changes::take_said`]) reads what it wrote.
+    pub fn say(&self, key: &str) {
+        {
+            let mut said = self.said.lock();
+            if !said.all && !said.keys.contains(key) {
+                said.keys.insert(key.to_owned());
+            }
+            said.seq = said.seq.wrapping_add(1);
+        }
+        self.said_told.notify();
+    }
+
+    /// Says every key changed, or may have (a change that spans them).
+    pub fn say_all(&self) {
+        {
+            let mut said = self.said.lock();
+            said.all = true;
+            said.keys = std::collections::HashSet::new();
+            said.seq = said.seq.wrapping_add(1);
+        }
+        self.said_told.notify();
+    }
+
+    /// What was said since it was last taken, and where the says stand at the take: [`Changes::said_after`] that
+    /// is over at the first say after it, so a say the take missed wakes its reader.
+    pub fn take_said(&self) -> (Said, u64) {
+        let mut said = self.said.lock();
+        let seq = said.seq;
+        let taken = Said { all: said.all, keys: std::mem::take(&mut said.keys), seq };
+        said.all = false;
+        (taken, seq)
+    }
+
+    /// Once a say comes after `seq` (a [`Changes::take_said`]'s).
+    pub async fn said_after(&self, seq: u64) {
+        loop {
+            if self.said.lock().seq != seq {
+                return;
+            }
+            self.said_told.notified().await;
         }
     }
 
