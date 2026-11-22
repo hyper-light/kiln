@@ -355,3 +355,165 @@ fn qt7_fused_loop_resumes_row_at_a_time_where_the_batch_ends() {
     conn.set_vectorized_scans(false);
     BUDGET.with(|b| b.set(None));
 }
+
+thread_local! {
+    static CUT: Cell<usize> = const { Cell::new(0) };
+    static SAME_GROUP: Cell<usize> = const { Cell::new(0) };
+    static FOUND: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A fused group step ran: `cut` when a full group table refused a row past the run's first
+/// (`fused.rs`).
+pub(super) fn note_cut(cut: bool) {
+    CUT.with(|c| c.set(c.get() + usize::from(cut)));
+}
+
+/// A row of a fused group step: of the group stepped just before it (its find and the save
+/// before it skipped), or found.
+pub(super) fn note_same_group(same: bool) {
+    if same {
+        SAME_GROUP.with(|s| s.set(s.get() + 1));
+    } else {
+        FOUND.with(|f| f.set(f.get() + 1));
+    }
+}
+
+/// The counters of fused group steps: (rows found, rows of the group before them, runs cut
+/// short by a full table).
+fn group_counters() -> (usize, usize, usize) {
+    (
+        FOUND.with(Cell::get),
+        SAME_GROUP.with(Cell::get),
+        CUT.with(Cell::get),
+    )
+}
+
+fn reset_group_counters() {
+    FOUND.with(|f| f.set(0));
+    SAME_GROUP.with(|s| s.set(0));
+    CUT.with(|c| c.set(0));
+}
+
+/// Every query's answer with the switch on equals its answer with it off.
+fn same_answers(conn: &Arc<Connection>, queries: &[String], what: &str) {
+    for sql in queries {
+        conn.set_vectorized_scans(false);
+        let row_at_a_time = rows(conn, sql);
+        conn.set_vectorized_scans(true);
+        let batched = rows(conn, sql);
+        assert_eq!(batched, row_at_a_time, "{what}: {sql}");
+    }
+    conn.set_vectorized_scans(false);
+}
+
+/// Bounds the group table of a new database's statements so it fills: the statement's memory
+/// budget is the connection's page cache, here its fewest pages (`CacheSize::MIN`) of the
+/// smallest page size, as a hash table's share of it.
+fn small_budget(conn: &Arc<Connection>) {
+    conn.execute("PRAGMA page_size = 512").unwrap();
+    conn.execute(format!(
+        "PRAGMA cache_size = {}",
+        crate::storage::page_cache::MINIMUM_PAGE_CACHE_SIZE_IN_PAGES
+    ))
+    .unwrap();
+}
+
+/// One seed of hash GROUP BYs, filtered and not, one key and two, over every storage class,
+/// NULLs, a collation, overflow rows and added columns; `small` bounds the group table so it
+/// fills mid-scan. Returns the group counters.
+fn group_differential(seed: u64, small: bool) -> (usize, usize, usize) {
+    BUDGET.with(|b| b.set(Some(1 << 20)));
+    reset_group_counters();
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let conn = open();
+    if small {
+        small_budget(&conn);
+    }
+    build(&conn, &mut rng);
+    let mut queries = vec![
+        "SELECT c, count(*), sum(a), max(b) FROM t GROUP BY c".to_string(),
+        "SELECT a, b, count(*), avg(e), total(b) FROM t GROUP BY a, b".to_string(),
+        "SELECT e, f, min(c), max(d), count(g), sum(a) FROM t GROUP BY e, f".to_string(),
+        "SELECT g, b, count(*), min(a) FROM t GROUP BY g, b".to_string(),
+        "SELECT a, c, count(*) FROM t GROUP BY a, c ORDER BY 3 DESC, 1, 2".to_string(),
+    ];
+    for _ in 0..8 {
+        let p = filter(&mut rng, 2);
+        queries.push(format!(
+            "SELECT c, count(*), sum(a), max(b), avg(e) FROM t WHERE {p} GROUP BY c"
+        ));
+        queries.push(format!(
+            "SELECT a, b, count(*), total(e), min(f) FROM t WHERE {p} GROUP BY a, b"
+        ));
+    }
+    same_answers(
+        &conn,
+        &queries,
+        &format!("seed {seed}, small budget {small}"),
+    );
+    BUDGET.with(|b| b.set(None));
+    group_counters()
+}
+
+/// T-QT.7.6: a hash GROUP BY's step runs over whole batches (the opcodes' own GroupFind and
+/// GroupSave for each selected row in order) against row-at-a-time, on random tables and
+/// filters: identical answers with the group table whole and with it filling mid-batch, and
+/// the batch group step ran (non-vacuity).
+#[test]
+fn qt7_batch_group_by_answers_as_row_at_a_time() {
+    for seed in 31..=34 {
+        let (found, _, cut) = group_differential(seed, false);
+        assert!(found > 0, "seed {seed}: no row ran in a batch group step");
+        assert_eq!(cut, 0, "seed {seed}: the whole table refused a row");
+    }
+    let mut cut_runs = 0;
+    for seed in 35..=38 {
+        let (found, _, cut) = group_differential(seed, true);
+        assert!(found > 0, "seed {seed}: no row ran in a batch group step");
+        cut_runs += cut;
+    }
+    assert!(cut_runs > 0, "no group table filled mid-batch");
+}
+
+/// T-QT.7.7: rows of one group in a row skip the save and the next find; a group table that
+/// fills mid-batch ends the run before the row it refused, which goes on row-at-a-time to the
+/// sorter: the answers are the row-at-a-time ones either way.
+#[test]
+fn qt7_batch_group_by_skips_runs_of_a_group_and_ends_where_the_table_fills() {
+    BUDGET.with(|b| b.set(Some(1 << 20)));
+    let queries = [
+        "SELECT k, count(*), sum(v), min(v), max(v) FROM u GROUP BY k".to_string(),
+        "SELECT k, count(*), avg(v) FROM u WHERE v <> 4 AND v < 11 OR v = 12 GROUP BY k"
+            .to_string(),
+    ];
+    // Runs of seven rows a group, each key a hundred and more bytes.
+    let table = |small: bool| {
+        let conn = open();
+        if small {
+            small_budget(&conn);
+        }
+        conn.execute("CREATE TABLE u(k, v)").unwrap();
+        for i in 0..4_200 {
+            conn.execute(format!(
+                "INSERT INTO u VALUES ('{}-{}', {})",
+                i / 7,
+                "k".repeat(100),
+                i % 13
+            ))
+            .unwrap();
+        }
+        conn
+    };
+    reset_group_counters();
+    same_answers(&table(false), &queries, "whole table");
+    let (found, same, cut) = group_counters();
+    assert!(found > 0, "no row ran in a batch group step");
+    assert!(same > found, "runs of one group took a find a row");
+    assert_eq!(cut, 0, "the whole table refused a row");
+    reset_group_counters();
+    same_answers(&table(true), &queries, "full table");
+    let (found, _, cut) = group_counters();
+    assert!(found > 0, "no row ran in a batch group step");
+    assert!(cut > 0, "the table didn't fill mid-batch");
+    BUDGET.with(|b| b.set(None));
+}

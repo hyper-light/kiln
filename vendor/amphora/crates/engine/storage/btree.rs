@@ -1404,6 +1404,23 @@ impl BTreeCursor {
     /// False, and the cursor unmoved, when it can't: a pending advance, another page type, or
     /// a cell behind it or past the leaf.
     pub(crate) fn advance_within_leaf_to(&mut self, cell: usize) -> bool {
+        if !self.can_advance_within_leaf_to(cell) {
+            return false;
+        }
+        let Ok(target) = i32::try_from(cell) else {
+            return false;
+        };
+        let (_, cell_idx) = self.stack.top_and_cell_index();
+        if target != cell_idx {
+            self.stack.set_cell_index(target);
+            self.invalidate_record();
+        }
+        true
+    }
+
+    /// Whether `advance_within_leaf_to(cell)` would move the cursor (QT.7: a fused run checks
+    /// before its body runs and moves once it knows where the run ends).
+    pub(crate) fn can_advance_within_leaf_to(&self, cell: usize) -> bool {
         if self.has_pending_advance_state() {
             return false;
         }
@@ -1412,14 +1429,7 @@ impl BTreeCursor {
         };
         let (page, cell_idx) = self.stack.top_and_cell_index();
         let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
-        if !is_leaf || cell_idx < 0 || target < cell_idx || cell >= cell_count {
-            return false;
-        }
-        if target != cell_idx {
-            self.stack.set_cell_index(target);
-            self.invalidate_record();
-        }
-        true
+        is_leaf && cell_idx >= 0 && target >= cell_idx && cell < cell_count
     }
 
     pub(crate) fn table_leaf_under_cursor(&self) -> Option<TableLeafUnderCursor<'_>> {

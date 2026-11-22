@@ -9,14 +9,16 @@
 //! by reading the table's interior pages level by level (no recursion; a level's pages in key
 //! order), keeping each leaf's greatest rowid from its parent's divider. A worker's cursor seeks
 //! past the divider below its first leaf and reads until a rowid passes the divider above its last.
-//! A hash join's probe with its aggregates (`TableJoinAggregate`) builds its table once from the
-//! build side's filtered rows, then each worker probes and folds over its own leaves.
+//! A hash join's probe with its aggregates (`TableJoinAggregate`) builds its table once, the
+//! workers together (`TableBuild`: each scans its own build leaves and scatters its rows' entries
+//! by partition, then each partition is filled by one worker), then each worker probes and folds
+//! over its own leaves.
 
 use std::ops::Range;
 
 use super::morsel::{
     execute, execute_at, Degree, HashProbe, MachineCosts, MemoryBudget, MorselError, ParallelMode,
-    Pipeline, Predicate, RunStats, ScanAggregate,
+    PartitionedTable, Partitioner, Pipeline, Predicate, RunStats, ScanAggregate, Scattered,
 };
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::{PageRef, Pager};
@@ -403,21 +405,57 @@ impl TableProbe<'_> {
     }
 }
 
-impl TableSource {
-    /// The rows that pass `filter`, in rowid order, read on the caller's thread: a hash join's
-    /// build side (QT.6). Each row kept is charged to the statement's budget, its values' own
-    /// bytes and their text or blob bytes.
-    pub fn filtered_rows(
+/// A hash join's build side read from a table's leaves by the workers together (QT.6): each
+/// worker keeps the rows of its leaves that pass the filter and whose key holds no NULL, charged
+/// to the statement's budget, and scatters their entries by partition; the table is then filled
+/// partition by partition ([`Partitioner::fill`]). A refusal is typed: the budget passed
+/// ([`MorselError::MemoryBudget`]) sends the statement to its serial loop.
+pub struct TableBuild<'a> {
+    pub table: &'a TableSource,
+    /// Terms over the build table's columns, tested before a row is kept.
+    pub filter: &'a [Predicate],
+    pub key: &'a [usize],
+    pub partitioner: &'a Partitioner,
+}
+
+/// A worker's run of build rows: its first leaf, the rows it kept, their scattered entries.
+pub struct BuildRun {
+    first: usize,
+    rows: Vec<Vec<Value>>,
+    scattered: Scattered,
+}
+
+impl Pipeline for TableBuild<'_> {
+    type Partial = Vec<BuildRun>;
+
+    fn rows(&self) -> usize {
+        self.table.leaves()
+    }
+
+    fn empty(&self) -> Vec<BuildRun> {
+        Vec::new()
+    }
+
+    fn run(
         &self,
-        filter: &[Predicate],
+        leaves: Range<usize>,
+        partial: &mut Vec<BuildRun>,
         budget: &MemoryBudget,
-    ) -> Result<Vec<Vec<Value>>, MorselError> {
-        let mut out = Vec::new();
-        self.scan(0..self.leaves(), |_, row| {
-            for term in filter {
+    ) -> Result<(), MorselError> {
+        let first = leaves.start;
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut scattered = self.partitioner.empty()?;
+        self.table.scan(leaves, |_, row| {
+            for term in self.filter {
                 if !term.holds(row)? {
                     return Ok(());
                 }
+            }
+            if !self
+                .partitioner
+                .scatter(row, self.key, rows.len(), &mut scattered, budget)?
+            {
+                return Ok(());
             }
             let bytes = row.iter().fold(
                 std::mem::size_of::<Value>().saturating_mul(row.len()),
@@ -430,14 +468,95 @@ impl TableSource {
                 },
             );
             budget.charge(bytes)?;
-            out.try_reserve(1)?;
+            rows.try_reserve(1)?;
             let mut owned = Vec::new();
             owned.try_reserve_exact(row.len())?;
             owned.extend_from_slice(row);
-            out.push(owned);
+            rows.push(owned);
             Ok(())
         })?;
-        Ok(out)
+        partial.try_reserve(1)?;
+        partial.push(BuildRun {
+            first,
+            rows,
+            scattered,
+        });
+        Ok(())
+    }
+
+    fn merge(
+        &self,
+        into: &mut Vec<BuildRun>,
+        from: Vec<BuildRun>,
+        _budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        into.try_reserve(from.len())?;
+        into.extend(from);
+        Ok(())
+    }
+}
+
+/// What a build did: its scan's run and its fill's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BuildStats {
+    pub scan: RunStats,
+    pub fill: RunStats,
+}
+
+impl TableBuild<'_> {
+    /// The kept build rows in rowid order and their table, scanned and filled as the switch and
+    /// the measured costs pick the workers.
+    pub fn run_mode(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, PartitionedTable, BuildStats), MorselError> {
+        let (runs, scan) = execute(self, mode, costs, budget)?;
+        let (rows, table, fill) = self.finish(runs, mode, costs, budget)?;
+        Ok((rows, table, BuildStats { scan, fill }))
+    }
+
+    /// The same at a stated degree for the scan (the fill runs serially): a test's fixed machine.
+    pub fn run_at(
+        &self,
+        degree: Degree,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, PartitionedTable, BuildStats), MorselError> {
+        let (runs, scan) = execute_at(self, 0, degree, None, budget)?;
+        let mut costs = MachineCosts::stated(std::num::NonZeroUsize::MIN, 0.0, 0.0);
+        let (rows, table, fill) = self.finish(runs, ParallelMode::Off, &mut costs, budget)?;
+        Ok((rows, table, BuildStats { scan, fill }))
+    }
+
+    /// Puts the runs in leaf order, numbers their rows from there, and fills the table.
+    fn finish(
+        &self,
+        mut runs: Vec<BuildRun>,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, PartitionedTable, RunStats), MorselError> {
+        runs.sort_by_key(|run| run.first);
+        let total = runs
+            .iter()
+            .map(|run| run.rows.len())
+            .fold(0usize, usize::saturating_add);
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(total)?;
+        let mut offsets = Vec::new();
+        offsets.try_reserve_exact(runs.len())?;
+        let mut scattered = Vec::new();
+        scattered.try_reserve_exact(runs.len())?;
+        for run in runs {
+            offsets.push(rows.len());
+            rows.extend(run.rows);
+            scattered.push(run.scattered);
+        }
+        let (table, stats) = self
+            .partitioner
+            .fill(scattered, &offsets, mode, costs, budget)?;
+        Ok((rows, table, stats))
     }
 }
 
@@ -520,6 +639,157 @@ impl TableJoinAggregate<'_> {
     ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
         let (partial, stats) = execute(self, mode, costs, budget)?;
         Ok((self.shape.finish(partial)?, stats))
+    }
+}
+
+/// A hash join's rows, no aggregates (QT.6): each worker probes its own leaves and keeps each
+/// joined row's projected values; with ORDER BY each worker sorts its morsel's rows, and the runs
+/// are merged in leaf order by a stable merge, so rows equal under the ORDER BY keys keep the
+/// serial loop's probe order. Without ORDER BY the runs are concatenated in leaf order: probe-row
+/// order, each probe row's matches in build order.
+pub struct TableJoinRows<'a> {
+    pub table: &'a TableSource,
+    /// Terms over the probe row alone, tested before it is probed.
+    pub probe_filter: &'a [Predicate],
+    pub probe: &'a HashProbe<'a>,
+    /// The build side's rows, as `probe` numbers them.
+    pub build: &'a [Vec<Value>],
+    /// The joined row's columns (the probe row's, then the build row's) each output row takes.
+    pub project: &'a [usize],
+    /// The sort keys: each one's place in the output row, and whether it descends.
+    pub order: &'a [(usize, bool)],
+}
+
+/// A worker's output rows, each run tagged with its morsel's first leaf.
+pub type JoinRowsPartial = Vec<(usize, Vec<Vec<Value>>)>;
+
+impl TableJoinRows<'_> {
+    fn compare(&self, a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+        for (at, descending) in self.order {
+            let order = match (a.get(*at), b.get(*at)) {
+                (Some(x), Some(y)) => x.cmp(y),
+                _ => std::cmp::Ordering::Equal,
+            };
+            let order = if *descending { order.reverse() } else { order };
+            if order.is_ne() {
+                return order;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    /// The rows in leaf order, sorted when the query asks: `sort_by` is a stable merge sort that
+    /// finds the workers' sorted runs and merges them.
+    pub fn finish(&self, mut partial: JoinRowsPartial) -> Result<Vec<Vec<Value>>, MorselError> {
+        partial.sort_by_key(|(first, _)| *first);
+        let total = partial
+            .iter()
+            .map(|(_, run)| run.len())
+            .fold(0usize, usize::saturating_add);
+        let mut out = Vec::new();
+        out.try_reserve_exact(total)?;
+        for (_, run) in partial {
+            out.extend(run);
+        }
+        if !self.order.is_empty() {
+            out.sort_by(|a, b| self.compare(a, b));
+        }
+        Ok(out)
+    }
+
+    /// The rows as the switch and the measured costs pick the degree.
+    pub fn run_mode(
+        &self,
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
+        let (partial, stats) = execute(self, mode, costs, budget)?;
+        Ok((self.finish(partial)?, stats))
+    }
+
+    /// The rows at a stated degree, its morsels counted in leaf pages.
+    pub fn run_at(
+        &self,
+        degree: Degree,
+        budget: &MemoryBudget,
+    ) -> Result<(Vec<Vec<Value>>, RunStats), MorselError> {
+        let (partial, stats) = execute_at(self, 0, degree, None, budget)?;
+        Ok((self.finish(partial)?, stats))
+    }
+}
+
+impl Pipeline for TableJoinRows<'_> {
+    type Partial = JoinRowsPartial;
+
+    fn rows(&self) -> usize {
+        self.table.leaves()
+    }
+
+    fn empty(&self) -> JoinRowsPartial {
+        Vec::new()
+    }
+
+    fn run(
+        &self,
+        leaves: Range<usize>,
+        partial: &mut JoinRowsPartial,
+        budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        let first = leaves.start;
+        let mut found: Vec<Vec<Value>> = Vec::new();
+        self.table.scan(leaves, |_, row| {
+            for term in self.probe_filter {
+                if !term.holds(row)? {
+                    return Ok(());
+                }
+            }
+            for build in self.probe.matches(row)? {
+                let build_row = self.build.get(*build).ok_or(MorselError::Overflow {
+                    what: "a match's build row",
+                })?;
+                let mut out = Vec::new();
+                out.try_reserve_exact(self.project.len())?;
+                let mut bytes = std::mem::size_of::<Value>().saturating_mul(self.project.len());
+                for at in self.project {
+                    let value = match at.checked_sub(row.len()) {
+                        None => row.get(*at),
+                        Some(at) => build_row.get(at),
+                    }
+                    .ok_or_else(|| MorselError::NoColumn {
+                        column: *at,
+                        width: row.len().saturating_add(build_row.len()),
+                    })?;
+                    bytes = bytes.saturating_add(match value {
+                        Value::Text(text) => text.as_str().len(),
+                        Value::Blob(blob) => blob.len(),
+                        _ => 0,
+                    });
+                    out.push(value.clone());
+                }
+                budget.charge(bytes)?;
+                found.try_reserve(1)?;
+                found.push(out);
+            }
+            Ok(())
+        })?;
+        if !self.order.is_empty() {
+            found.sort_by(|a, b| self.compare(a, b));
+        }
+        partial.try_reserve(1)?;
+        partial.push((first, found));
+        Ok(())
+    }
+
+    fn merge(
+        &self,
+        into: &mut JoinRowsPartial,
+        from: JoinRowsPartial,
+        _budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        into.try_reserve(from.len())?;
+        into.extend(from);
+        Ok(())
     }
 }
 

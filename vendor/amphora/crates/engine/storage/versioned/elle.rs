@@ -409,9 +409,9 @@ const MIN_LEN: u64 = 1;
 const MAX_LEN: u64 = 4;
 const MAX_WRITES: usize = 256;
 /// The step's 32 writers: transactions open at once.
-const WRITERS: usize = 32;
+pub(super) const WRITERS: usize = 32;
 /// Transactions a seed runs: Elle's most writes to one key.
-const TXNS: usize = MAX_WRITES;
+pub(super) const TXNS: usize = MAX_WRITES;
 
 /// An operation the generator plans.
 #[derive(Clone, Copy, Debug)]
@@ -436,7 +436,7 @@ pub struct Gen {
     zipf: Vec<f64>,
 }
 
-fn splitmix(state: &mut u64) -> u64 {
+pub(super) fn splitmix(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);

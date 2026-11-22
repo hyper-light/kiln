@@ -11,7 +11,8 @@
 //! (`elle`, G8 step 1); and a table's column copy ([`columns`], G11). Stage 3 begins with the
 //! executor's cursor on the trees ([`cursor`]), then transactions' savepoints ([`version`]),
 //! checked against the current engine by the shared model test of transactions (`txn_model`); and
-//! the switch that puts a connection's B-trees on this storage ([`switch`]).
+//! the switch that puts a connection's B-trees on this storage ([`switch`]); then many writers
+//! through SQL against a serial replay (`many_writers`) and Elle's checks through SQL (`elle_sql`).
 
 pub mod blink;
 pub mod columns;
@@ -24,7 +25,11 @@ pub mod durable;
 #[cfg(test)]
 mod elle;
 #[cfg(test)]
+mod elle_sql;
+#[cfg(test)]
 mod evict;
+#[cfg(test)]
+mod many_writers;
 pub mod memory;
 pub mod overflow;
 pub mod page;

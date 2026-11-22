@@ -15,8 +15,12 @@
 //! A hash join's probe with its aggregates qualifies too (`shape_join`): two rowid tables the
 //! planner joins inner by a hash join on equalities of columns of one affinity, every other term
 //! a filter on one table, every column read of INTEGER or TEXT affinity and BINARY collation.
-//! The build side is read and its hash table built once; each worker probes over its own run of
-//! the probe table's leaves and folds the joined rows into its partial aggregates.
+//! The build side is read and its hash table built once, by the workers together (each scans its
+//! own build leaves and scatters its rows by partition; each partition is filled by one worker);
+//! each worker probes over its own run of the probe table's leaves and folds the joined rows into
+//! its partial aggregates. Such a join with no aggregates returns its rows instead: each worker
+//! keeps its joined rows, sorted when there is an ORDER BY over the tables' columns, and the runs
+//! merge in leaf order, stably, so the rows come out as the serial loop gives them.
 
 use crate::function::AggFunc;
 use crate::schema::{BTreeTable, Table};
@@ -28,9 +32,9 @@ use crate::translate::plan::{
 use crate::types::Value;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::ProgramBuilder;
-use crate::vdbe::insn::{Insn, MorselAggregateData, MorselJoinData};
+use crate::vdbe::insn::{Insn, MorselAggregateData, MorselJoinData, MorselRows};
 use crate::vdbe::morsel::{Aggregate, CmpOp, Predicate};
-use amphora_engine_parser::ast::{Expr, Literal, Operator, UnaryOperator};
+use amphora_engine_parser::ast::{Expr, Literal, Operator, SortOrder, UnaryOperator};
 
 /// The labels the hook's code jumps to: the serial loop it falls back to, and the statement's end.
 pub(crate) struct MorselHook {
@@ -122,6 +126,7 @@ fn shape(plan: &SelectPlan) -> Option<MorselAggregateData> {
         aggregates,
         result_map,
         join: None,
+        joined_rows: None,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
     })
 }
@@ -211,9 +216,21 @@ fn literal(expr: &Expr) -> Option<Value> {
 /// The checks every shape shares: a top-level SELECT whose rows are its aggregates' groups, with
 /// none of what the pipelines don't run (ORDER BY, LIMIT, DISTINCT, windows, subqueries).
 fn plain(plan: &SelectPlan) -> bool {
-    !(plan.aggregates.is_empty()
-        || !plan.order_by.is_empty()
-        || plan.limit.is_some()
+    !plan.aggregates.is_empty() && plan.order_by.is_empty() && plain_any(plan)
+}
+
+/// The checks a join's rows take (QT.6): no aggregates and no GROUP BY, an ORDER BY allowed, and
+/// the rest as [`plain`].
+fn plain_rows(plan: &SelectPlan) -> bool {
+    plan.aggregates.is_empty()
+        && plan.group_by.is_none()
+        && plan.result_columns.iter().all(|r| !r.contains_aggregates)
+        && plain_any(plan)
+}
+
+/// What every shape refuses: LIMIT, OFFSET, DISTINCT, windows, subqueries, rows not returned.
+fn plain_any(plan: &SelectPlan) -> bool {
+    !(plan.limit.is_some()
         || plan.offset.is_some()
         || plan.contains_constant_false_condition
         || !matches!(plan.query_destination, QueryDestination::ResultRows)
@@ -304,6 +321,38 @@ fn outputs(
     Some((group_by, aggregates, result_map))
 }
 
+/// A join's rows (QT.6): each result column a column of either table, then each ORDER BY key
+/// that is not one already; no NULLS FIRST or LAST named (SQLite's default, NULLs least, is the
+/// values' own order). The projection names joined-row columns: the probe table's, then the
+/// build's.
+fn joined_rows(
+    plan: &SelectPlan,
+    joined_at: &impl Fn(&Expr) -> Option<usize>,
+) -> Option<(Vec<usize>, MorselRows)> {
+    let mut project = Vec::new();
+    for result in &plan.result_columns {
+        project.push(joined_at(&result.expr)?);
+    }
+    let width = project.len();
+    let mut order = Vec::new();
+    for (expr, sort, nulls) in &plan.order_by {
+        if nulls.is_some() {
+            return None;
+        }
+        let at = joined_at(expr)?;
+        let place = match project.iter().position(|p| *p == at) {
+            Some(place) => place,
+            None => {
+                let place = project.len();
+                project.push(at);
+                place
+            }
+        };
+        order.push((place, matches!(sort, SortOrder::Desc)));
+    }
+    Some((project, MorselRows { order, width }))
+}
+
 /// A hash join's probe with the aggregates over its matches (QT.6): two rowid tables joined inner
 /// by the planner's hash join on equalities of columns of one affinity, every other term a filter
 /// on one table's columns. The pipeline's row is the probe table's columns, then the build's.
@@ -313,7 +362,13 @@ fn outputs(
 /// on a tie (the serial loop's order of a probe row's matches is its hash table's) cannot change
 /// the answer.
 fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
-    if !plain(plan) {
+    // A join with no aggregates returns its rows (QT.6): the workers' runs merge in order.
+    let rows_mode = plan.aggregates.is_empty();
+    if !(if rows_mode {
+        plain_rows(plan)
+    } else {
+        plain(plan)
+    }) {
         return None;
     }
     let [first, second] = plan.table_references.joined_tables() else {
@@ -417,7 +472,13 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
             None => build_filter.push(predicate(&term.expr, &on_build, build_table)?),
         }
     }
-    let (group_by, aggregates, result_map) = outputs(plan, &joined_at, &integer)?;
+    let (group_by, aggregates, result_map, joined_rows) = if rows_mode {
+        let (project, rows) = joined_rows(plan, &joined_at)?;
+        (Vec::new(), Vec::new(), project, Some(rows))
+    } else {
+        let (group_by, aggregates, result_map) = outputs(plan, &joined_at, &integer)?;
+        (group_by, aggregates, result_map, None)
+    };
     Some(MorselAggregateData {
         root_page: probe_table.root_page,
         columns: width,
@@ -434,6 +495,7 @@ fn shape_join(plan: &SelectPlan) -> Option<MorselAggregateData> {
             probe_key,
             build_key,
         }),
+        joined_rows,
         target_pc_serial: crate::vdbe::BranchOffset::Placeholder,
     })
 }

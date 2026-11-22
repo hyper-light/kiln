@@ -625,7 +625,7 @@ impl ExactSum {
 /// A value as a grouping or join key: SQLite's numeric equality (an integral REAL equals its
 /// INTEGER), text and blobs by their bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum KeyPart {
+pub(crate) enum KeyPart {
     Null,
     Int(i64),
     Real(u64),
@@ -1129,20 +1129,248 @@ impl Pipeline for ScanAggregate<'_> {
     }
 }
 
+/// A hash join's table, cut into partitions by each key's hash so the workers fill it together
+/// (QT.6; Leis et al. 2014 section 4.2 build theirs in the same two phases): each worker scatters
+/// its rows' entries into one run per partition, then each partition is filled by one worker from
+/// every run, with no lock on the table. A key's build rows stay in build order, whatever worker
+/// read them, because the runs are filled in the order of their rows.
+pub struct PartitionedTable {
+    partitioner: Partitioner,
+    partitions: Vec<HashMap<Vec<KeyPart>, Vec<usize>>>,
+}
+
+/// One entry scattered for the fill: a build row's key and its place in the run that holds it.
+pub(crate) type Entry = (Vec<KeyPart>, usize);
+
+/// A worker's entries for one run of build rows, one list per partition.
+pub(crate) type Scattered = Vec<Vec<Entry>>;
+
+/// Says which partition a key goes to: the partition count is the build's, one per worker that
+/// may fill (the machine's cores when parallel mode is on, one when it is off), so no partition
+/// count is picked.
+#[derive(Clone)]
+pub struct Partitioner {
+    hasher: std::hash::RandomState,
+    count: NonZeroUsize,
+}
+
+impl Partitioner {
+    pub fn new(count: NonZeroUsize) -> Self {
+        Partitioner {
+            hasher: std::hash::RandomState::new(),
+            count,
+        }
+    }
+
+    pub fn count(&self) -> NonZeroUsize {
+        self.count
+    }
+
+    fn partition(&self, key: &[KeyPart]) -> Result<usize, MorselError> {
+        use std::hash::BuildHasher;
+        let count = u64::try_from(self.count.get()).map_err(|_| MorselError::Overflow {
+            what: "the partition count",
+        })?;
+        usize::try_from(self.hasher.hash_one(key) % count).map_err(|_| MorselError::Overflow {
+            what: "a key's partition",
+        })
+    }
+
+    /// A run's empty lists, one per partition.
+    pub(crate) fn empty(&self) -> Result<Scattered, MorselError> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(self.count.get())?;
+        out.resize_with(self.count.get(), Vec::new);
+        Ok(out)
+    }
+
+    /// Scatters `row`'s entry, its key at `key_at`, as the run's row `at`, charging the entry
+    /// (its key's parts and their text or blob bytes, and its place) to the statement's budget.
+    /// False when the key holds a NULL: such a row matches nothing and is not kept.
+    pub(crate) fn scatter(
+        &self,
+        row: &[Value],
+        key_at: &[usize],
+        at: usize,
+        into: &mut Scattered,
+        budget: &MemoryBudget,
+    ) -> Result<bool, MorselError> {
+        let Some(key) = join_key(row, key_at)? else {
+            return Ok(false);
+        };
+        let bytes = key.iter().fold(
+            std::mem::size_of::<Entry>()
+                .saturating_add(std::mem::size_of::<KeyPart>().saturating_mul(key.len())),
+            |sum, part| {
+                sum.saturating_add(match part {
+                    KeyPart::Text(text) => text.len(),
+                    KeyPart::Blob(blob) => blob.len(),
+                    _ => 0,
+                })
+            },
+        );
+        budget.charge(bytes)?;
+        let partition = self.partition(&key)?;
+        let list = into.get_mut(partition).ok_or(MorselError::Overflow {
+            what: "a key's partition",
+        })?;
+        list.try_reserve(1)?;
+        list.push((key, at));
+        Ok(true)
+    }
+
+    /// Fills the table from the workers' runs, in the order of their rows: run `r`'s row `at` is
+    /// build row `offsets[r] + at`. Each partition is filled by one worker, the workers as the
+    /// switch and the measured costs pick them.
+    pub(crate) fn fill(
+        &self,
+        runs: Vec<Scattered>,
+        offsets: &[usize],
+        mode: ParallelMode,
+        costs: &mut MachineCosts,
+        budget: &MemoryBudget,
+    ) -> Result<(PartitionedTable, RunStats), MorselError> {
+        if runs.len() != offsets.len() {
+            return Err(MorselError::Overflow {
+                what: "the build's runs",
+            });
+        }
+        let count = self.count.get();
+        let mut by_partition: Vec<Vec<(usize, Vec<Entry>)>> = Vec::new();
+        by_partition.try_reserve_exact(count)?;
+        by_partition.resize_with(count, Vec::new);
+        for (run, offset) in runs.into_iter().zip(offsets) {
+            if run.len() != count {
+                return Err(MorselError::Overflow {
+                    what: "a run's partitions",
+                });
+            }
+            for (list, entries) in by_partition.iter_mut().zip(run) {
+                if !entries.is_empty() {
+                    list.try_reserve(1)?;
+                    list.push((*offset, entries));
+                }
+            }
+        }
+        let mut lists = Vec::new();
+        lists.try_reserve_exact(count)?;
+        lists.extend(by_partition.into_iter().map(crate::sync::Mutex::new));
+        let fill = Fill { lists };
+        let (mut filled, stats) = execute(&fill, mode, costs, budget)?;
+        filled.sort_by_key(|(partition, _)| *partition);
+        if filled.len() != count {
+            return Err(MorselError::Overflow {
+                what: "the filled partitions",
+            });
+        }
+        let mut partitions = Vec::new();
+        partitions.try_reserve_exact(count)?;
+        partitions.extend(filled.into_iter().map(|(_, map)| map));
+        Ok((
+            PartitionedTable {
+                partitioner: self.clone(),
+                partitions,
+            },
+            stats,
+        ))
+    }
+}
+
+/// A partition's entries from every run, each run with the build row its rows are numbered from.
+type PartitionRuns = Vec<(usize, Vec<Entry>)>;
+
+/// The fill's pipeline: its rows are the partitions, each taken whole by the worker that claims it.
+struct Fill {
+    lists: Vec<crate::sync::Mutex<PartitionRuns>>,
+}
+
+impl Pipeline for Fill {
+    type Partial = Vec<(usize, HashMap<Vec<KeyPart>, Vec<usize>>)>;
+
+    fn rows(&self) -> usize {
+        self.lists.len()
+    }
+
+    fn empty(&self) -> Self::Partial {
+        Vec::new()
+    }
+
+    fn run(
+        &self,
+        partitions: Range<usize>,
+        partial: &mut Self::Partial,
+        _budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        for partition in partitions {
+            let list = self.lists.get(partition).ok_or(MorselError::Overflow {
+                what: "a fill's partition",
+            })?;
+            let runs = std::mem::take(&mut *list.lock());
+            let mut map: HashMap<Vec<KeyPart>, Vec<usize>> = HashMap::new();
+            // Runs in the order of their rows, each run's entries in its rows' order: a key's
+            // build rows go in in build order. Every entry was charged when it was scattered;
+            // its key moves into the table.
+            for (offset, entries) in runs {
+                map.try_reserve(entries.len())?;
+                for (key, at) in entries {
+                    let position = offset.checked_add(at).ok_or(MorselError::Overflow {
+                        what: "a build row's position",
+                    })?;
+                    let rows = map.entry(key).or_default();
+                    rows.try_reserve(1)?;
+                    rows.push(position);
+                }
+            }
+            partial.try_reserve(1)?;
+            partial.push((partition, map));
+        }
+        Ok(())
+    }
+
+    fn merge(
+        &self,
+        into: &mut Self::Partial,
+        from: Self::Partial,
+        _budget: &MemoryBudget,
+    ) -> Result<(), MorselError> {
+        into.try_reserve(from.len())?;
+        into.extend(from);
+        Ok(())
+    }
+}
+
+impl PartitionedTable {
+    /// The build rows whose key is `key`, in build order.
+    fn get(&self, key: &[KeyPart]) -> Result<&[usize], MorselError> {
+        let partition = self.partitioner.partition(key)?;
+        Ok(self
+            .partitions
+            .get(partition)
+            .and_then(|map| map.get(key))
+            .map_or(&[], Vec::as_slice))
+    }
+
+    /// How many partitions hold at least one key: a test's count that the fill was partitioned.
+    pub fn filled_partitions(&self) -> usize {
+        self.partitions.iter().filter(|map| !map.is_empty()).count()
+    }
+}
+
 /// A hash join's probe side, run in parallel against a table built once (an inner equi-join; a
 /// row with a NULL in its key matches nothing). Matches come out in probe-row order, each probe
 /// row's matches in build-row order, as the serial probe gives them.
 pub struct HashProbe<'a> {
     probe: &'a [Vec<Value>],
     probe_key: &'a [usize],
-    table: HashMap<Vec<KeyPart>, Vec<usize>>,
+    table: PartitionedTable,
 }
 
 /// A worker's matches, each run of them tagged with the first probe row of its morsel.
 pub type ProbePartial = Vec<(usize, Vec<(usize, usize)>)>;
 
 impl<'a> HashProbe<'a> {
-    /// Builds the table from `build`'s rows, charging it to the statement's budget.
+    /// Builds the table from `build`'s rows on this thread, in one partition, charging it to the
+    /// statement's budget.
     pub fn build(
         build: &[Vec<Value>],
         build_key: &[usize],
@@ -1150,25 +1378,31 @@ impl<'a> HashProbe<'a> {
         probe_key: &'a [usize],
         budget: &MemoryBudget,
     ) -> Result<Self, MorselError> {
-        let mut table: HashMap<Vec<KeyPart>, Vec<usize>> = HashMap::new();
-        let entry_bytes = std::mem::size_of::<KeyPart>()
-            .saturating_mul(build_key.len())
-            .saturating_add(std::mem::size_of::<usize>());
-        for (position, row) in build.iter().enumerate() {
-            let Some(key) = join_key(row, build_key)? else {
-                continue;
-            };
-            budget.charge(entry_bytes)?;
-            table.try_reserve(1)?;
-            let matches = table.entry(key).or_default();
-            matches.try_reserve(1)?;
-            matches.push(position);
+        let partitioner = Partitioner::new(NonZeroUsize::MIN);
+        let mut run = partitioner.empty()?;
+        for (at, row) in build.iter().enumerate() {
+            partitioner.scatter(row, build_key, at, &mut run, budget)?;
         }
-        Ok(HashProbe {
+        let mut runs = Vec::new();
+        runs.try_reserve_exact(1)?;
+        runs.push(run);
+        let mut costs = MachineCosts::stated(NonZeroUsize::MIN, 0.0, 0.0);
+        let (table, _) = partitioner.fill(runs, &[0], ParallelMode::Off, &mut costs, budget)?;
+        Ok(Self::over(table, probe, probe_key))
+    }
+
+    /// The probe of a table built already (`TableBuild` fills one from a table's leaves).
+    pub fn over(table: PartitionedTable, probe: &'a [Vec<Value>], probe_key: &'a [usize]) -> Self {
+        HashProbe {
             probe,
             probe_key,
             table,
-        })
+        }
+    }
+
+    /// The table probed.
+    pub fn table(&self) -> &PartitionedTable {
+        &self.table
     }
 
     /// The build rows whose key equals `row`'s at the probe key's columns, in build order; none
@@ -1177,7 +1411,7 @@ impl<'a> HashProbe<'a> {
         let Some(key) = join_key(row, self.probe_key)? else {
             return Ok(&[]);
         };
-        Ok(self.table.get(&key).map_or(&[], Vec::as_slice))
+        self.table.get(&key)
     }
 
     /// The matches as (probe row, build row), in the serial order.

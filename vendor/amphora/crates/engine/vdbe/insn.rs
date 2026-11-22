@@ -413,7 +413,19 @@ pub struct MorselAggregateData {
     /// A hash join's build side when the scan is the join's probe: the pipeline's row is the probe
     /// table's columns, then the build's; `filter` is then over the probe table's alone.
     pub join: Option<MorselJoinData>,
+    /// A join's rows rather than groups: `result_map` then names the joined row's columns each
+    /// output row takes (the result columns, then the ORDER BY keys), and there are no aggregates.
+    pub joined_rows: Option<MorselRows>,
     pub target_pc_serial: BranchOffset,
+}
+
+/// Amphora: how [MorselAggregateData]'s joined rows come out (QT.6).
+#[derive(Debug, Clone)]
+pub struct MorselRows {
+    /// The ORDER BY keys: each one's place in the output row, and whether it descends.
+    pub order: Vec<(usize, bool)>,
+    /// How many of the output row's values are result columns (the rest are sort keys).
+    pub width: usize,
 }
 
 /// Amphora: the build side of [MorselAggregateData]'s hash join (QT.6).

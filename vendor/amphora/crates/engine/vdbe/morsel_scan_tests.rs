@@ -534,3 +534,262 @@ fn t_qt_6_11_vdbe_hook_probes_a_hash_join_as_the_serial_loop() {
         queries * 4
     );
 }
+
+/// T-QT.6.12: a hash join's table built by the workers together, partitioned. The build side is
+/// scanned over its own leaves at 1, 2, 3, 4 and 8 workers and filled into 1, 2, 3, 4 and 8
+/// partitions; the probe's matches equal the serial VDBE join's, in order (a key's build rows in
+/// build order whatever worker read them), and the runs were parallel and partitioned. A budget
+/// too small for the table is a typed refusal, never a partial table.
+#[test]
+fn t_qt_6_12_partitioned_parallel_build_matches_the_serial_join() {
+    let conn = open(":memory:qt-6-12");
+    let mut rng = ChaCha8Rng::seed_from_u64(612);
+    fill(&conn, &mut rng, "t", 1500);
+    fill(&conn, &mut rng, "u", 1200);
+    conn.execute("BEGIN").unwrap();
+    let probe_table = source(&conn, "t");
+    let build_table = source(&conn, "u");
+    let mut parallel_scans = 0usize;
+    let mut partitioned = 0usize;
+    for (probe_key, build_key, filter) in [
+        (vec![0usize], vec![0usize], vec![]),
+        (
+            vec![2, 0],
+            vec![2, 0],
+            vec![Predicate::NotNull { column: 1 }],
+        ),
+        (
+            vec![2],
+            vec![2],
+            vec![Predicate::Compare {
+                column: 0,
+                op: CmpOp::Ge,
+                value: Value::from_i64(-5),
+            }],
+        ),
+    ] {
+        let on: Vec<String> = probe_key
+            .iter()
+            .zip(&build_key)
+            .map(|(p, b)| format!("t.{} = u.{}", COLUMNS[*p], COLUMNS[*b]))
+            .collect();
+        let mut sql = format!(
+            "SELECT t.rowid, u.rowid FROM t JOIN u ON {}",
+            on.join(" AND ")
+        );
+        for term in &filter {
+            sql.push_str(match term {
+                Predicate::NotNull { .. } => " AND u.b IS NOT NULL",
+                _ => " AND u.a >= -5",
+            });
+        }
+        sql.push_str(" ORDER BY t.rowid, u.rowid");
+        let expected: Vec<(i64, i64)> = sql_rows(&conn, &sql)
+            .into_iter()
+            .map(|row| match (&row[0], &row[1]) {
+                (
+                    Value::Numeric(crate::numeric::Numeric::Integer(t)),
+                    Value::Numeric(crate::numeric::Numeric::Integer(u)),
+                ) => (*t, *u),
+                other => panic!("not two rowids: {other:?}"),
+            })
+            .collect();
+        assert!(!expected.is_empty(), "{sql}");
+        // The rowid of each kept build row, read back from the build's own rows by the rowid
+        // stored in no column: the test keeps `u`'s rows with their rowids beside them.
+        let all = build_table.rows().unwrap();
+        for partitions in [1usize, 2, 3, 4, 8] {
+            let partitioner = Partitioner::new(NonZeroUsize::new(partitions).unwrap());
+            for degree in degrees(build_table.leaves()) {
+                let budget = MemoryBudget::new(usize::MAX);
+                let build = TableBuild {
+                    table: &build_table,
+                    filter: &filter,
+                    key: &build_key,
+                    partitioner: &partitioner,
+                };
+                let (rows, table, stats) = build.run_at(degree, &budget).unwrap();
+                if stats.scan.workers > 1 {
+                    parallel_scans += 1;
+                }
+                if table.filled_partitions() > 1 {
+                    partitioned += 1;
+                }
+                // Kept rows map back to rowids: rows are kept in rowid order, so walk `all`.
+                let mut rowids = Vec::new();
+                let mut next = all.iter();
+                for row in &rows {
+                    let (rowid, _) = next.by_ref().find(|(_, r)| r == row).unwrap();
+                    rowids.push(*rowid);
+                }
+                let probe = HashProbe::over(table, &[], &probe_key);
+                let pipeline = TableProbe {
+                    table: &probe_table,
+                    probe: &probe,
+                };
+                let (matches, _) = pipeline.run_at(degree, &budget).unwrap();
+                let got: Vec<(i64, i64)> = matches
+                    .into_iter()
+                    .map(|(t, build)| (t, rowids[build]))
+                    .collect();
+                assert_eq!(
+                    got, expected,
+                    "{sql}: {partitions} partitions at {degree:?}"
+                );
+            }
+        }
+        // A budget the table can't fit in is refused by type, at every degree.
+        for degree in degrees(build_table.leaves()) {
+            let partitioner = Partitioner::new(NonZeroUsize::new(4).unwrap());
+            let budget = MemoryBudget::new(4096);
+            let build = TableBuild {
+                table: &build_table,
+                filter: &filter,
+                key: &build_key,
+                partitioner: &partitioner,
+            };
+            assert!(
+                matches!(
+                    build.run_at(degree, &budget),
+                    Err(MorselError::MemoryBudget { .. })
+                ),
+                "{sql} at {degree:?}"
+            );
+        }
+    }
+    conn.execute("COMMIT").unwrap();
+    // Non-vacuity: most builds ran on several workers and filled several partitions.
+    assert!(parallel_scans > 100, "{parallel_scans}");
+    assert!(partitioned > 150, "{partitioned}");
+}
+
+/// A random inner equi-join of `t` and `u` returning rows: result columns of either table, filters
+/// on either, and half the time an ORDER BY over the first one or two result columns, ascending or
+/// descending.
+fn random_join_rows(rng: &mut ChaCha8Rng) -> String {
+    let tables = ["t", "u"];
+    let ops = ["<", "<=", "=", "<>", ">", ">="];
+    let keys: &[&str] = match rng.random_range(0..3) {
+        0 => &["a"],
+        1 => &["c"],
+        _ => &["a", "c"],
+    };
+    let on: Vec<String> = keys.iter().map(|k| format!("t.{k} = u.{k}")).collect();
+    let mut terms = Vec::new();
+    for _ in 0..rng.random_range(0..3) {
+        let table = tables[rng.random_range(0..2)];
+        let op = ops[rng.random_range(0..ops.len())];
+        terms.push(match rng.random_range(0..4) {
+            0 => format!("{table}.a {op} {}", rng.random_range(-20i64..20)),
+            1 => format!("{table}.c {op} 't{}'", rng.random_range(0..12)),
+            2 => format!("{table}.c IS NULL"),
+            _ => format!("{table}.a IS NOT NULL"),
+        });
+    }
+    let column = |rng: &mut ChaCha8Rng| {
+        format!(
+            "{}.{}",
+            tables[rng.random_range(0..2)],
+            ["a", "b", "c", "p"][rng.random_range(0..4)]
+        )
+    };
+    let select: Vec<String> = (0..rng.random_range(1..5)).map(|_| column(rng)).collect();
+    let mut sql = format!(
+        "SELECT {} FROM t JOIN u ON {}",
+        select.join(", "),
+        on.join(" AND ")
+    );
+    if !terms.is_empty() {
+        sql.push_str(&format!(" WHERE {}", terms.join(" AND ")));
+    }
+    if rng.random_bool(0.5) {
+        // The ORDER BY keys lead the select list, so a tie's rows can be told apart below.
+        let keys = rng.random_range(1..=select.len().min(2));
+        let order: Vec<String> = select[..keys]
+            .iter()
+            .map(|key| {
+                let dir = if rng.random_bool(0.5) { " DESC" } else { "" };
+                format!("{key}{dir}")
+            })
+            .collect();
+        sql.push_str(&format!(" ORDER BY {} -- keys {keys}", order.join(", ")));
+    }
+    sql
+}
+
+/// How many ORDER BY keys lead `sql`'s select list, read from the comment `random_join_rows` ends it with.
+fn order_keys(sql: &str) -> Option<usize> {
+    let (_, keys) = sql.split_once("-- keys ")?;
+    keys.trim().parse().ok()
+}
+
+/// T-QT.6.13: joins returning rows, no aggregates, run on morsels. Random inner equi-joins of two
+/// tables of many leaves, with filters on either table and an ORDER BY or none, answer the same
+/// with `ParallelMode` off (the serial hash join) and on, the machine stated as 2, 3, 4 and 8
+/// cores: in order with an ORDER BY (the workers' sorted runs merged), as the same rows without
+/// one; and the hook ran for most of them.
+#[test]
+fn t_qt_6_13_vdbe_hook_returns_a_hash_joins_rows_as_the_serial_loop() {
+    let conn = open(":memory:qt-6-13");
+    let mut rng = ChaCha8Rng::seed_from_u64(613);
+    fill(&conn, &mut rng, "t", 1500);
+    fill(&conn, &mut rng, "u", 400);
+    conn.set_join_methods(crate::JoinMethods::HashJoinsOnly);
+    let queries = 40usize;
+    let mut hooked = 0usize;
+    let mut ordered = 0usize;
+    for _ in 0..queries {
+        let sql = random_join_rows(&mut rng);
+        let has_order = order_keys(&sql).is_some();
+        conn.set_parallel_mode(ParallelMode::Off);
+        let serial = sql_rows(&conn, &sql);
+        conn.set_parallel_mode(ParallelMode::On);
+        for cores in [2usize, 3, 4, 8] {
+            *conn.morsel_costs.lock() = Some(MachineCosts::stated(
+                NonZeroUsize::new(cores).unwrap(),
+                1.0,
+                1.0,
+            ));
+            let parallel = sql_rows(&conn, &sql);
+            if let Some(keys) = order_keys(&sql) {
+                // In ORDER BY order, row for row in the keys; rows tied on them may come in
+                // any order, so each run of ties is compared as a set.
+                let key = |row: &Vec<Value>| format!("{:?}", &row[..keys]);
+                let serial_keys: Vec<String> = serial.iter().map(key).collect();
+                let parallel_keys: Vec<String> = parallel.iter().map(key).collect();
+                assert_eq!(parallel_keys, serial_keys, "{sql} on {cores} cores");
+                assert_eq!(
+                    canonical(&parallel),
+                    canonical(&serial),
+                    "{sql} on {cores} cores"
+                );
+            } else {
+                assert_eq!(
+                    canonical(&parallel),
+                    canonical(&serial),
+                    "{sql} on {cores} cores"
+                );
+            }
+            let ran = conn
+                .morsel_costs
+                .lock()
+                .as_ref()
+                .is_some_and(|costs| costs.worker_start().samples() > 1);
+            if ran {
+                hooked += 1;
+                if has_order {
+                    ordered += 1;
+                }
+            }
+        }
+    }
+    conn.set_parallel_mode(ParallelMode::Off);
+    conn.set_join_methods(crate::JoinMethods::ByCost);
+    // Non-vacuity: most joins took the hook, ordered ones among them.
+    assert!(
+        hooked > queries * 2,
+        "the hook ran {hooked} times of {}",
+        queries * 4
+    );
+    assert!(ordered > 0, "no ordered join took the hook");
+}

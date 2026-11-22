@@ -1,7 +1,7 @@
 # Amphora, vendored
 
 The database kiln keeps its records in (kiln's critical path T1; its master plan §4, CP-T1.1): KilnDB made a
-product, at Amphora's commit `6a4c2e4b743b6482720ae7a18ffc1bff258f977e`, MIT (`LICENSE`). Its engine
+product, at Amphora's commit `dab76dd9f0f04a8552dc9802c7c73221bc87a1e7`, MIT (`LICENSE`). Its engine
 (`crates/engine*`, the crates `amphora-engine`, `amphora-engine-parser`, `amphora-engine-macros` and
 `amphora-engine-ext`) is Amphora's own code, forked from Turso 3e09a82 (`crates/engine/ORIGIN.md`), so it can't
 collide with kiln's `turso_core` (`vendor/turso`).
