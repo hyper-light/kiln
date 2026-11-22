@@ -8,7 +8,9 @@
 //! stopped. With `--into`, a records file opened by [`super::open`] (the one place that chooses the
 //! engine under Records), kiln.db only read, so it may run beside a server; and the Records the
 //! server keeps there (deploys' and their fenced leases among them) are copied into it and compared
-//! too, family by family ([`carry::copy_records`]).
+//! too, family by family ([`carry::copy_records`]). Either way, kiln's own JSON state files on this machine go too
+//! ([`files`]: the server's data folder, its runner's state and work folders, `kiln run`'s copies, the agents'
+//! skills), each a record of `kiln.files`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +19,7 @@ use anyhow::Result;
 use kiln_seams::records::Records;
 
 use super::carry::{self, Compared, Differs, Field};
+use super::files;
 use crate::config::Config;
 use crate::store::Store;
 
@@ -60,6 +63,34 @@ struct Where {
     /// first.
     #[arg(long)]
     into: Option<PathBuf>,
+    /// This machine's runner state folder, whose state files go too (default: the server's own runner's,
+    /// `<data>/local-agent`, else `config::default_data_dir()/agent`; none there: none).
+    #[arg(long)]
+    state: Option<PathBuf>,
+    /// The runner's work folder (default: `<state>/work`).
+    #[arg(long)]
+    work: Option<PathBuf>,
+    /// The machine the state files are keyed by (default: this one's runner name).
+    #[arg(long)]
+    machine: Option<String>,
+}
+
+/// Where this machine's state files are, as `w` and `cfg` say ([`files::Roots`]): a folder that isn't there has none.
+fn roots(w: &Where, cfg: &Config) -> files::Roots {
+    let state = w.state.clone().or_else(|| [cfg.data("local-agent"), crate::config::default_data_dir().join("agent")].into_iter().find(|d| d.is_dir()));
+    let work = w.work.clone().or_else(|| state.as_ref().map(|s| s.join("work")));
+    let mut bases = std::collections::BTreeMap::new();
+    bases.insert(files::Base::Data, cfg.server.data_dir.clone());
+    bases.insert(files::Base::Reach, crate::os::home_dir().join(".kiln").join("reach"));
+    bases.insert(files::Base::Skills, crate::skills::place::root());
+    if let Some(s) = state {
+        bases.insert(files::Base::State, s);
+    }
+    if let Some(wd) = work {
+        bases.insert(files::Base::Work, wd);
+    }
+    bases.retain(|_, d| d.is_dir());
+    files::Roots { machine: w.machine.clone().unwrap_or_else(|| cfg.local_agent_name()), bases }
 }
 
 pub async fn run(args: RecordsArgs, cfg: &Config) -> Result<()> {
@@ -75,7 +106,7 @@ pub async fn run(args: RecordsArgs, cfg: &Config) -> Result<()> {
             return Ok(());
         }
     };
-    let path = w.store.unwrap_or_else(|| cfg.data("kiln.db"));
+    let path = w.store.clone().unwrap_or_else(|| cfg.data("kiln.db"));
     anyhow::ensure!(path.is_file(), "no kiln store at {}", path.display());
     let (store, records): (Store, Arc<dyn Records>) = match &w.into {
         Some(into) => (Store::open_replica(&path)?, super::open(into)?),
@@ -109,7 +140,21 @@ pub async fn run(args: RecordsArgs, cfg: &Config) -> Result<()> {
         }
         None => 0,
     };
-    anyhow::ensure!(found.differences.is_empty() && moved == 0, "the tables and their records differ in {} places, the server's records and their copies in {moved}", found.differences.len());
+    // kiln's own JSON state files on this machine (CP-T1.5): each a record of `kiln.files`.
+    let roots = roots(&w, cfg);
+    if carrying {
+        println!("carried {} of kiln's state files", files::carry(&roots, &*records).await?);
+    }
+    let files_differ = files::compare(&roots, &*records).await?;
+    for line in files_report(&files_differ) {
+        println!("{line}");
+    }
+    anyhow::ensure!(
+        found.differences.is_empty() && moved == 0 && files_differ.is_empty(),
+        "the tables and their records differ in {} places, the server's records and their copies in {moved}, kiln's state files and their records in {}",
+        found.differences.len(),
+        files_differ.len()
+    );
     Ok(())
 }
 
@@ -125,6 +170,21 @@ pub fn records_report(differ: &[carry::Difference]) -> Vec<String> {
         })
         .collect();
     out.push(format!("the server's records: {} differences", differ.len()));
+    out
+}
+
+/// What [`files::compare`] found, a line a file (its path, its record's key), then how many.
+pub fn files_report(differ: &[carry::Difference]) -> Vec<String> {
+    let mut out: Vec<String> = differ
+        .iter()
+        .map(|d| match &d.differs {
+            Differs::NoRecord => format!("{} ({}): a state file with no record", d.table, d.key),
+            Differs::NoRow => format!("{}: a record with no state file", d.key),
+            Differs::Value { from, to } => format!("{} ({}): bytes that differ ({from} in the file, {to} in the record)", d.table, d.key),
+            other => format!("{} ({}): {other:?}", d.table, d.key),
+        })
+        .collect();
+    out.push(format!("kiln's state files: {} differences", differ.len()));
     out
 }
 
@@ -201,6 +261,22 @@ mod tests {
                 "deploy.release 7231: the server's record, not copied".to_owned(),
                 "deploy.release 73: a copy the server doesn't keep".to_owned(),
                 "the server's records: 3 differences".to_owned(),
+            ]
+        );
+    }
+
+    /// CP-T1.5: each state file that differs from its record is reported by its path and key, then how many.
+    #[test]
+    fn cp_t1_5_the_state_files_report_each_difference_by_path_and_key() {
+        let d = |t: &str, k: &str, differs| Difference { table: t.into(), key: k.into(), differs };
+        let lines = files_report(&[d("/s/reach/told.json", "m1:state/reach/told.json", Differs::Value { from: 16, to: 14 }), d("/d/sync/tasks.json", "m1:data/sync/tasks.json", Differs::NoRecord), d("kiln.files", "m1:state/reach/pins.json", Differs::NoRow)]);
+        assert_eq!(
+            lines,
+            vec![
+                "/s/reach/told.json (m1:state/reach/told.json): bytes that differ (16 in the file, 14 in the record)".to_owned(),
+                "/d/sync/tasks.json (m1:data/sync/tasks.json): a state file with no record".to_owned(),
+                "m1:state/reach/pins.json: a record with no state file".to_owned(),
+                "kiln's state files: 3 differences".to_owned(),
             ]
         );
     }

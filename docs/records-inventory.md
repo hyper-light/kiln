@@ -3,7 +3,9 @@
 CP-T1.5 to CP-T1.7 (G9 step 2): what moves to Records on Amphora. Written by
 `scripts/records-inventory.sh`; `crates/kiln-seams/tests/records_inventory.rs` fails when this
 file and the code differ, and says how it reads the code. A table only tests make, or one
-dropped by a later migration, is listed too, and says so.
+dropped by a later migration, is listed too, and says so. Each JSON file says how it's kept on
+Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why. The part after
+"Designed by hand" is written by hand.
 
 ## SQLite tables
 
@@ -27,7 +29,7 @@ dropped by a later migration, is listed too, and says so.
 | `agentenvs` | `crates/kiln/src/store/migrations/20261118-1100_agentenvs.sql` |  |  |
 | `agentfile_versions` | `crates/kiln/src/store/migrations/20261111-2000_agentfiles.sql` |  |  |
 | `agentfiles` | `crates/kiln/src/store/migrations/20261111-2000_agentfiles.sql` |  |  |
-| `agents` | `crates/kiln/src/store.rs` |  | yes |
+| `agents` | `crates/kiln/src/store.rs` |  |  |
 | `attention_archive` | `crates/kiln/src/store/migrations/20261108-0100_w21_attention.sql` |  |  |
 | `attention_archive_groups` | `crates/kiln/src/store/migrations/20261108-0100_w21_attention.sql` |  |  |
 | `attention_choice_exposures` | `crates/kiln/src/store/migrations/20261108-0101_w21_attention_examination.sql` |  |  |
@@ -45,7 +47,7 @@ dropped by a later migration, is listed too, and says so.
 | `attention_uses` | `crates/kiln/src/store/migrations/20261108-0100_w21_attention.sql` |  |  |
 | `attention_visit_feedback` | `crates/kiln/src/store/migrations/20261108-0101_w21_attention_examination.sql` |  |  |
 | `attention_visits` | `crates/kiln/src/store/migrations/20261108-0101_w21_attention_examination.sql` |  |  |
-| `audit` | `crates/kiln/src/store.rs`, `crates/kiln/src/store/capture.rs` |  | yes |
+| `audit` | `crates/kiln/src/store.rs`, `crates/kiln/src/store/capture.rs` |  |  |
 | `audit2` | `crates/kiln/src/harness/attention/examination.rs`, `crates/kiln/src/harness/attention/learned.rs`, `crates/kiln/src/harness/attention/mod.rs`, `crates/kiln/src/harness/attention/requests.rs`, `crates/kiln/src/harness/attention/store.rs`, `crates/kiln/src/store/migrations/20261018-2200_w19_audit2.sql` |  |  |
 | `audit2_indexed` | `crates/kiln/src/store/migrations/20261106-2103_dbq_store.sql` |  |  |
 | `audit2_search` | `crates/kiln/src/store/migrations/20261106-2103_dbq_store.sql` |  |  |
@@ -188,9 +190,9 @@ dropped by a later migration, is listed too, and says so.
 | `host_verifications` | `crates/kiln/src/store/migrations/20261030-2330_w27_host_verifications.sql` |  |  |
 | `identities` | `crates/kiln/src/store/migrations/20261026-1800_w27_identities.sql` |  |  |
 | `inbox` | `crates/kiln/src/convo/sql.rs` |  |  |
-| `jobs` | `crates/kiln/src/ci/logsearch.rs`, `crates/kiln/src/store.rs`, `crates/kiln/src/store/capture.rs` |  | yes |
+| `jobs` | `crates/kiln/src/ci/logsearch.rs`, `crates/kiln/src/store.rs`, `crates/kiln/src/store/capture.rs` |  |  |
 | `kiln_meta` | `crates/kiln/src/store/migrations.rs` |  |  |
-| `kv` | `crates/kiln/src/harness/told.rs`, `crates/kiln/src/store.rs` |  | yes |
+| `kv` | `crates/kiln/src/harness/told.rs`, `crates/kiln/src/store.rs` |  |  |
 | `land_queue` | `crates/kiln/src/store/migrations/20261019-0020_w14_review.sql` |  |  |
 | `land_records` | `crates/kiln/src/store/migrations/20261026-1700_w28_land_wire.sql` |  |  |
 | `land_signatures` | `crates/kiln/src/store/migrations/20261031-0200_w27_land_signatures.sql` |  |  |
@@ -229,7 +231,7 @@ dropped by a later migration, is listed too, and says so.
 | `records_families` | `crates/kiln/src/store/migrations/20261023-1300_p6_records.sql` |  |  |
 | `records_meta` | `crates/kiln/src/store/migrations/20261023-1300_p6_records.sql` |  |  |
 | `records_versions` | `crates/kiln/src/store/migrations/20261023-1300_p6_records.sql` |  |  |
-| `refs` | `crates/kiln/src/store.rs` |  | yes |
+| `refs` | `crates/kiln/src/store.rs` |  |  |
 | `registry_blobs` | `crates/kiln/src/store/migrations/20261019-0090_w12_registry.sql` |  |  |
 | `registry_manifests` | `crates/kiln/src/store/migrations/20261019-0090_w12_registry.sql` |  |  |
 | `registry_policies` | `crates/kiln/src/store/migrations/20261022-1800_p5_registry_policies.sql` |  |  |
@@ -238,7 +240,7 @@ dropped by a later migration, is listed too, and says so.
 | `registry_uploads` | `crates/kiln/src/store/migrations/20261019-0090_w12_registry.sql` |  |  |
 | `release_chat_posts` | `crates/kiln/src/store/migrations/20261022-2000_chat_releases.sql` |  |  |
 | `repo_ci` | `crates/kiln/src/store/migrations/20261019-0060_w23_providers.sql` |  |  |
-| `repos` | `crates/kiln/src/store.rs` |  | yes |
+| `repos` | `crates/kiln/src/store.rs` |  |  |
 | `research` | `crates/kiln/src/store/migrations/20261022-1000_research_goal_plans.sql` |  |  |
 | `review_agent_fixes` | `crates/kiln/src/store/migrations/20261031-2000_w26_agent_fixes.sql` |  |  |
 | `review_chat_posts` | `crates/kiln/src/store/migrations/20261021-0200_w14_replies.sql` |  |  |
@@ -264,7 +266,7 @@ dropped by a later migration, is listed too, and says so.
 | `run_size_rollups` | `crates/kiln/src/store/migrations/20261107-0500_e6_run_sizes.sql` |  |  |
 | `run_sizes` | `crates/kiln/src/store/migrations/20261107-0500_e6_run_sizes.sql` |  |  |
 | `run_speed_cells` | `crates/kiln/src/store/migrations/20261108-0100_w05_run_speed_cells.sql` |  |  |
-| `runs` | `crates/kiln/src/ci/logsearch.rs`, `crates/kiln/src/store.rs`, `crates/kiln/src/store/capture.rs` |  | yes |
+| `runs` | `crates/kiln/src/ci/logsearch.rs`, `crates/kiln/src/store.rs`, `crates/kiln/src/store/capture.rs` |  |  |
 | `seam_leases` | `crates/kiln/src/store/migrations/20261113-0600_cp_t8_seam_secrets.sql` |  |  |
 | `seam_secret_versions` | `crates/kiln/src/store/migrations/20261113-0600_cp_t8_seam_secrets.sql` |  |  |
 | `seam_secrets` | `crates/kiln/src/store/migrations/20261113-0600_cp_t8_seam_secrets.sql` |  |  |
@@ -283,7 +285,7 @@ dropped by a later migration, is listed too, and says so.
 | `ssh_signers` | `crates/kiln/src/store/migrations/20261030-1700_w27_ssh_signers.sql` |  |  |
 | `sso_states` | `crates/kiln/src/store/migrations/20261019-0080_w23_sso.sql` |  |  |
 | `stacks` | `crates/kiln/src/store/migrations/20261019-0010_w14_diffs.sql` |  |  |
-| `steps` | `crates/kiln/src/ci/logsearch.rs`, `crates/kiln/src/store.rs` |  | yes |
+| `steps` | `crates/kiln/src/ci/logsearch.rs`, `crates/kiln/src/store.rs` |  |  |
 | `subjects` | `crates/kiln/src/store/capture.rs` |  | yes |
 | `t` | `crates/kiln/src/memory/owners.rs`, `crates/kiln/src/os/alloc.rs`, `crates/kiln/src/store/indexes.rs` |  | yes |
 | `test_cases` | `crates/kiln/src/store/migrations/20261018-1500_w16_test_results.sql` |  |  |
@@ -317,160 +319,250 @@ dropped by a later migration, is listed too, and says so.
 
 ## JSON files kiln writes
 
-| File | Written in | Tests only |
-|---|---|---|
-| `../../ui/tests/bp-measure.json` | `crates/kiln/src/bp/measure.rs` |  |
-| `../../ui/tests/fixtures/attention-lean.json` | `crates/kiln/src/harness/attention/lean.rs` | yes |
-| `../../ui/tests/fixtures/columns.json` | `crates/kiln/src/wire/columns.rs` | yes |
-| `.claude-plugin/plugin.json` | `crates/kiln/src/skills/place.rs` | yes |
-| `.credentials.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `.gemini/antigravity-cli/settings.json` | `crates/kiln/src/harness/kinds.rs` | yes |
-| `.gemini/config/hooks.json` | `crates/kiln/src/harness/kinds.rs` | yes |
-| `.gemini/config/mcp_config.json` | `crates/kiln/src/harness/kinds.rs`, `crates/kiln/src/sandbox/isolated.rs` | yes |
-| `.keep.json` | `crates/kiln/src/reach/keeper.rs` |  |
-| `.sigstore.json` | `crates/kiln/src/runner/runtime.rs` |  |
-| `/../../docs/work-ops.schema.json` | `crates/kiln-ci/src/work/ops/schema.rs` | yes |
-| `/home/claude/.claude/settings.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |
-| `/home/h/x.json` | `crates/kiln/src/harness/session.rs` | yes |
-| `/home/me/.gemini/config/mcp_config.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |
-| `/home/runner/work/_temp/_github_workflow/event.json` | `crates/kiln/src/runner/runtime.rs` | yes |
-| `/state/slates-fleet/fleet.json` | `crates/kiln/src/workspace/slates.rs` | yes |
-| `/vm.json` | `crates/kiln/src/runner/firecracker.rs` |  |
-| `0.json` | `crates/kiln/src/runner/warm.rs` | yes |
-| `1.json` | `crates/kiln/src/harness/moving.rs`, `crates/kiln/src/observe/incidents/mod.rs` | yes |
-| `2.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |
-| `3.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |
-| `4.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |
-| `_kiln_build_{idx}.json` | `crates/kiln/src/runner/runtime.rs` |  |
-| `a.json` | `crates/kiln/src/ci/pushsig.rs`, `crates/kiln/src/harness/host.rs` | yes |
-| `agent-handover.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/inbox/faults.rs` |  |
-| `agent-limit.json` | `crates/kiln/src/harness/limit.rs` |  |
-| `antigravity-cli/settings.json` | `crates/kiln/src/harness/kinds.rs` | yes |
-| `archives.json` | `crates/kiln/src/observe/rehydrate.rs` | yes |
-| `attachments/uploads/{id}.json` | `crates/kiln/src/harness/registry.rs` | yes |
-| `auth.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `b.json` | `crates/kiln/src/harness/host.rs` | yes |
-| `bar.json` | `crates/kiln-lab/src/bar.rs` |  |
-| `binaries/kiln-{target}.json` | `crates/kiln/src/updates.rs` | yes |
-| `broken.json` | `crates/kiln/src/harness/isolated/home.rs` | yes |
-| `builds.json` | `crates/kiln/src/fleet.rs` |  |
-| `c.json` | `crates/kiln/src/harness/host.rs` | yes |
-| `chat.json` | `crates/kiln/src/aisessions.rs` | yes |
-| `clouds.json` | `crates/kiln/src/observe/cloud/mod.rs` |  |
-| `config.json` | `crates/kiln/src/runner/auth.rs`, `crates/kiln/src/runner/runtime.rs` |  |
-| `config.v2.json` | `crates/kiln/src/observe/collect/files.rs` |  |
-| `config/hooks.json` | `crates/kiln/src/harness/kinds.rs` | yes |
-| `context.json` | `crates/kiln/src/ci/pushsig.rs` |  |
-| `copies.json` | `crates/kiln/src/sync/runner.rs` |  |
-| `d.json` | `crates/kiln/src/observe/collect/files.rs` | yes |
-| `deploy/api/task.json` | `crates/kiln-cd/src/apps.rs` | yes |
-| `epochs.json` | `crates/kiln/src/harness/registry.rs` | yes |
-| `estimates.json` | `crates/kiln/src/ci/cli.rs` |  |
-| `event.json` | `crates/kiln/src/runner/runtime.rs` |  |
-| `eventhubs-{name}.json` | `crates/kiln/src/observe/cloud/mod.rs` |  |
-| `extension/manifest.json` | `crates/kiln/src/browser/stream.rs` |  |
-| `files/s1.json` | `crates/kiln/src/harness/kept.rs` | yes |
-| `fixtures/shards-groups.json` | `crates/kiln/src/reach/place.rs` | yes |
-| `gone.json` | `crates/kiln/src/headroom/pace.rs` | yes |
-| `guard.json` | `crates/kiln/src/protect.rs` | yes |
-| `handovers-decided.json` | `crates/kiln/src/harness/host.rs` |  |
-| `handovers-taken.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/inbox/faults.rs` |  |
-| `harness-models.json` | `crates/kiln/src/harness/host.rs` | yes |
-| `harness-sessions.json` | `crates/kiln/src/harness/host.rs` | yes |
-| `harness.json` | `crates/kiln/src/agent.rs`, `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/host/transfer/native.rs`, `crates/kiln/src/harness/inbox/faults.rs`, `crates/kiln/src/harness/isolated/home.rs`, `crates/kiln/src/harness/kinds.rs` |  |
-| `harness/antigravity.d/osi.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |
-| `harness/codex.d/osi.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |
-| `hold.json` | `crates/kiln-lab/src/bar.rs` |  |
-| `holders.json` | `crates/kiln/src/harness/registry.rs` | yes |
-| `hooks/hooks.json` | `crates/kiln/src/skills/place.rs` | yes |
-| `identity.json` | `crates/kiln/src/ci/dependency_sources.rs` | yes |
-| `incidents/9.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |
-| `incidents/{}.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |
-| `indexes.json` | `crates/kiln/src/observe/indexes/mod.rs` |  |
-| `instance.json` | `crates/kiln/src/agent.rs`, `crates/kiln/src/upgrade.rs` |  |
-| `integrations.json` | `crates/kiln/src/runner/runtime.rs` |  |
-| `jail.json` | `crates/kiln/src/runner/firecracker.rs`, `crates/kiln/src/runner/jail.rs` |  |
-| `job.json` | `crates/kiln-lab/src/browser/run.rs` |  |
-| `k.json` | `crates/kiln/src/observe/collect/files.rs` | yes |
-| `keep-off.json` | `crates/kiln/src/harness/registry.rs` | yes |
-| `kiln-mcp.json` | `crates/kiln/src/mcp/mod.rs` |  |
-| `kiln-{t}.json` | `crates/kiln/src/updates.rs` | yes |
-| `lane.json` | `crates/kiln/src/runner/warm.rs` |  |
-| `live.json` | `crates/kiln/src/headroom/pace.rs` | yes |
-| `local.json` | `crates/kiln/src/harness/registry.rs` | yes |
-| `manifest.json` | `crates/kiln/src/browser/stream.rs`, `crates/kiln/src/runner/rootfs.rs` |  |
-| `member.json` | `crates/kiln/src/observe/owner.rs` |  |
-| `members.json` | `crates/kiln/src/observe/owner.rs` |  |
-| `metadata.from-lab-a.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `metadata.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `mirrors.json` | `crates/kiln/src/convo/mirror.rs`, `crates/kiln/src/harness/registry.rs` | yes |
-| `moved-git.json` | `crates/kiln/src/harness/moving.rs` |  |
-| `names.json` | `crates/kiln/src/harness/registry.rs` | yes |
-| `next.json` | `crates/kiln/src/observe/incidents/mod.rs` |  |
-| `oauth_creds.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `openapi.json` | `crates/kiln/src/api.rs` |  |
-| `opencode.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |
-| `other-agent-other.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `p.json` | `crates/kiln/src/observe/collect/files.rs` | yes |
-| `pace.json` | `crates/kiln/src/sense/pace.rs` |  |
-| `paced.json` | `crates/kiln/src/headroom/pace.rs` |  |
-| `pacer.json` | `crates/kiln/src/headroom/pace.rs` | yes |
-| `package.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/inbox/faults.rs` |  |
-| `pins.json` | `crates/kiln/src/reach/e2e.rs` |  |
-| `places.json` | `crates/kiln/src/observe/collect/files.rs` | yes |
-| `plugin.json` | `crates/kiln/src/mcp/mod.rs` |  |
-| `profile-checks.json` | `crates/kiln-lab/src/browser/check.rs` |  |
-| `projects.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `provenance.sigstore.json` | `crates/kiln/src/runner/runtime.rs` |  |
-| `reads.json` | `crates/kiln/src/runner/rustc.rs` |  |
-| `record.json` | `crates/kiln-lab/src/browser/record.rs` |  |
-| `rehydrations.json` | `crates/kiln/src/observe/rehydrate.rs` |  |
-| `replaces.json` | `crates/kiln/src/updates.rs`, `crates/kiln/src/upgrade.rs` |  |
-| `result.json` | `crates/kiln-lab/src/browser/run.rs` |  |
-| `run.json` | `crates/kiln-lab/src/browser/run.rs`, `crates/kiln-lab/src/main.rs` |  |
-| `runner-engine.json` | `crates/kiln/src/harness/engine.rs` |  |
-| `runs.json` | `crates/kiln/src/runner/warm.rs` |  |
-| `s1-agent-s1.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `same-chat.json` | `crates/kiln/src/harness/host.rs` | yes |
-| `sample.json` | `crates/kiln/src/ci/cli.rs` |  |
-| `sbom.cdx.json` | `crates/kiln/src/runner/runtime.rs` |  |
-| `sbom.sigstore.json` | `crates/kiln/src/runner/runtime.rs` |  |
-| `sbom.spdx.json` | `crates/kiln/src/runner/runtime.rs` |  |
-| `scrapes.json` | `crates/kiln/src/observe/scrape.rs` |  |
-| `search-meta.json` | `crates/kiln/src/ci/search.rs` |  |
-| `secrets.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `ses_1.json` | `crates/kiln/src/harness/moving.rs` | yes |
-| `sessions.json` | `crates/kiln/src/harness/session.rs` | yes |
-| `shaped-{}.json` | `crates/kiln/src/ci/bench.rs` |  |
-| `state-{member}.json` | `crates/kiln/src/sync/group.rs` | yes |
-| `supervise-x.json` | `crates/kiln/src/supervise.rs` | yes |
-| `supervise-{}.json` | `crates/kiln/src/supervise.rs` |  |
-| `target/ci-bench.json` | `crates/kiln/src/ci/bench.rs` |  |
-| `task.json` | `crates/kiln-cd/src/apps.rs` | yes |
-| `tasks.json` | `crates/kiln/src/sync/tasks.rs` |  |
-| `terminal-handover.json` | `crates/kiln/src/agent.rs` | yes |
-| `times_ms.json` | `crates/kiln-lab/src/browser/run.rs` |  |
-| `told.json` | `crates/kiln/src/reach/told.rs`, `crates/kiln/src/reach/told/tests.rs` |  |
-| `u.json` | `crates/kiln/src/observe/collect/files.rs` | yes |
-| `ui/node_modules/x/package.json` | `crates/kiln/src/ci/graphs.rs` | yes |
-| `ui/package.json` | `crates/kiln/src/updates.rs` | yes |
-| `update-available.json` | `crates/kiln/src/agent.rs` | yes |
-| `vm.json` | `crates/kiln/src/runner/firecracker.rs` |  |
-| `{base}/index.json` | `crates/kiln/src/runner/runtime.rs` |  |
-| `{dir}.d/osi.json` | `crates/kiln/src/sandbox/isolated.rs` |  |
-| `{hex}.config.json` | `crates/kiln/src/runner/rootfs.rs` |  |
-| `{hex}.json` | `crates/kiln/src/runner/rootfs.rs` |  |
-| `{id}.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/visuals.rs`, `crates/kiln/src/runner/runtime.rs` |  |
-| `{key}.json` | `crates/kiln/src/reach/node.rs` | yes |
-| `{name}.json` | `crates/kiln/src/harness/isolated/home.rs` |  |
-| `{n}.json` | `crates/kiln/src/runner/warm.rs` |  |
-| `{out}/claude-to-codex.json` | `crates/kiln/src/harness/handoff.rs` | yes |
-| `{owner}.json` | `crates/kiln/src/skills/place.rs` |  |
-| `{project}.json` | `crates/kiln/src/runner/firecracker.rs` |  |
-| `{public_id}.json` | `crates/kiln/src/observe/incidents/mod.rs` |  |
-| `{safe}-{}.json` | `crates/kiln/src/sync/runner.rs` |  |
-| `{safe}.json` | `crates/kiln/src/mcp/mod.rs` |  |
-| `{}-gcp.json` | `crates/kiln/src/runner/auth.rs` |  |
-| `{}-{}.json` | `crates/kiln/src/headroom/pace.rs` |  |
-| `{}.json` | `crates/kiln/src/ci/pushsig.rs`, `crates/kiln/src/harness/kept.rs`, `crates/kiln/src/runner/firecracker.rs`, `crates/kiln/src/skills/place.rs` |  |
-| `{}/.gemini/config/mcp_config.json` | `crates/kiln/src/sandbox/isolated.rs` |  |
+| File | Written in | Tests only | Kept as |
+|---|---|---|---|
+| `../../ui/tests/bp-measure.json` | `crates/kiln/src/bp/measure.rs` |  | lab output: a file |
+| `../../ui/tests/fixtures/attention-lean.json` | `crates/kiln/src/harness/attention/lean.rs` | yes |  |
+| `../../ui/tests/fixtures/columns.json` | `crates/kiln/src/wire/columns.rs` | yes |  |
+| `.claude-plugin/plugin.json` | `crates/kiln/src/skills/place.rs` | yes |  |
+| `.credentials.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `.gemini/antigravity-cli/settings.json` | `crates/kiln/src/harness/kinds.rs` |  | a file: Antigravity's own settings, in its home |
+| `.gemini/config/hooks.json` | `crates/kiln/src/harness/kinds.rs` |  | a file: Antigravity's hooks, in its home |
+| `.gemini/config/mcp_config.json` | `crates/kiln/src/harness/kinds.rs`, `crates/kiln/src/sandbox/isolated.rs` |  | a file: Antigravity's MCP configuration, in its home |
+| `.keep.json` | `crates/kiln/src/reach/keeper.rs` |  | Records `kiln.files` |
+| `.sigstore.json` | `crates/kiln/src/runner/runtime.rs` |  | a file: a Sigstore bundle, for verifiers |
+| `/../../docs/work-ops.schema.json` | `crates/kiln-ci/src/work/ops/schema.rs` | yes |  |
+| `/home/claude/.claude/settings.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |  |
+| `/home/h/x.json` | `crates/kiln/src/harness/session.rs` | yes |  |
+| `/home/me/.gemini/config/mcp_config.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |  |
+| `/home/runner/work/_temp/_github_workflow/event.json` | `crates/kiln/src/runner/runtime.rs` | yes |  |
+| `/state/slates-fleet/fleet.json` | `crates/kiln/src/workspace/slates.rs` | yes |  |
+| `/vm.json` | `crates/kiln/src/runner/firecracker.rs` |  | a file: Firecracker's VM configuration |
+| `0.json` | `crates/kiln/src/runner/warm.rs` | yes |  |
+| `1.json` | `crates/kiln/src/harness/moving.rs`, `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
+| `2.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
+| `3.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
+| `4.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
+| `_kiln_build_{idx}.json` | `crates/kiln/src/runner/runtime.rs` |  | scratch: BuildKit's metadata of one leg's build, gone with it |
+| `a.json` | `crates/kiln/src/ci/pushsig.rs`, `crates/kiln/src/harness/host.rs` | yes |  |
+| `agent-handover.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/inbox/faults.rs` |  | Records `kiln.files` |
+| `agent-limit.json` | `crates/kiln/src/harness/limit.rs` |  | Records `kiln.files` |
+| `antigravity-cli/settings.json` | `crates/kiln/src/harness/kinds.rs` | yes |  |
+| `archives.json` | `crates/kiln/src/observe/rehydrate.rs` | yes |  |
+| `attachments/uploads/{id}.json` | `crates/kiln/src/harness/registry.rs` |  | not a file: an upload's metadata, a key in kiln's blob store (kiln-seams' Blobs), which moves with its blobs |
+| `auth.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `b.json` | `crates/kiln/src/harness/host.rs` | yes |  |
+| `bar.json` | `crates/kiln-lab/src/bar.rs` |  | lab output: a file |
+| `binaries/kiln-{target}.json` | `crates/kiln/src/updates.rs` |  | not a file: a release binary's metadata, a key in kiln's blob store (kiln-seams' Blobs), which moves with its blobs |
+| `broken.json` | `crates/kiln/src/harness/isolated/home.rs` | yes |  |
+| `builds.json` | `crates/kiln/src/fleet.rs` |  | Records `kiln.files` |
+| `c.json` | `crates/kiln/src/harness/host.rs` | yes |  |
+| `chat.json` | `crates/kiln/src/aisessions.rs` | yes |  |
+| `clouds.json` | `crates/kiln/src/observe/cloud/mod.rs` |  | Records `kiln.files` |
+| `config.json` | `crates/kiln/src/runner/auth.rs`, `crates/kiln/src/runner/runtime.rs` |  | a file: Docker's credentials configuration |
+| `config.v2.json` | `crates/kiln/src/observe/collect/files.rs` |  | a file: Docker's container configuration, only read |
+| `config/hooks.json` | `crates/kiln/src/harness/kinds.rs` | yes |  |
+| `context.json` | `crates/kiln/src/ci/pushsig.rs` |  | scratch: one push's signature check, gone with it |
+| `copies.json` | `crates/kiln/src/sync/runner.rs` |  | Records `kiln.files` |
+| `d.json` | `crates/kiln/src/observe/collect/files.rs` | yes |  |
+| `deploy/api/task.json` | `crates/kiln-cd/src/apps.rs` | yes |  |
+| `epochs.json` | `crates/kiln/src/harness/registry.rs` |  | Records `kiln.files` |
+| `estimates.json` | `crates/kiln/src/ci/cli.rs` |  | a file: criterion's output, only read |
+| `event.json` | `crates/kiln/src/runner/runtime.rs` |  | a file: GitHub's event payload, for a leg's actions |
+| `eventhubs-{name}.json` | `crates/kiln/src/observe/cloud/mod.rs` |  | Records `kiln.files` |
+| `extension/manifest.json` | `crates/kiln/src/browser/stream.rs` |  | a file: a browser extension's manifest |
+| `files/s1.json` | `crates/kiln/src/harness/kept.rs` | yes |  |
+| `fixtures/shards-groups.json` | `crates/kiln/src/reach/place.rs` | yes |  |
+| `gone.json` | `crates/kiln/src/headroom/pace.rs` |  | tests only (headroom/pace.rs's tests: the reader takes their item as ended at a brace in a string) |
+| `guard.json` | `crates/kiln/src/protect.rs` | yes |  |
+| `handovers-decided.json` | `crates/kiln/src/harness/host.rs` |  | Records `kiln.files` |
+| `handovers-taken.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/inbox/faults.rs` |  | Records `kiln.files` |
+| `harness-models.json` | `crates/kiln/src/harness/host.rs` |  | Records `kiln.files` |
+| `harness-sessions.json` | `crates/kiln/src/harness/host.rs` | yes |  |
+| `harness.json` | `crates/kiln/src/agent.rs`, `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/host/transfer/native.rs`, `crates/kiln/src/harness/inbox/faults.rs`, `crates/kiln/src/harness/isolated/home.rs`, `crates/kiln/src/harness/kinds.rs` |  | Records `kiln.files` |
+| `harness/antigravity.d/osi.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |  |
+| `harness/codex.d/osi.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |  |
+| `hold.json` | `crates/kiln-lab/src/bar.rs` |  | lab output: a file |
+| `holders.json` | `crates/kiln/src/harness/registry.rs` |  | Records `kiln.files` |
+| `hooks/hooks.json` | `crates/kiln/src/skills/place.rs` | yes |  |
+| `identity.json` | `crates/kiln/src/ci/dependency_sources.rs` |  | a file: this device's sign-in and its key, a secret kept 0600 on its machine (`kiln login`) |
+| `incidents/9.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
+| `incidents/{}.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
+| `indexes.json` | `crates/kiln/src/observe/indexes/mod.rs` |  | Records `kiln.files` |
+| `instance.json` | `crates/kiln/src/agent.rs`, `crates/kiln/src/upgrade.rs` |  | Records `kiln.files` |
+| `integrations.json` | `crates/kiln/src/runner/runtime.rs` |  | scratch: one leg's integrations, for `kiln auth` in it, gone with it |
+| `jail.json` | `crates/kiln/src/runner/firecracker.rs`, `crates/kiln/src/runner/jail.rs` |  | a file: the jailer's configuration of a VM |
+| `job.json` | `crates/kiln-lab/src/browser/run.rs` |  | lab output: a file |
+| `k.json` | `crates/kiln/src/observe/collect/files.rs` | yes |  |
+| `keep-off.json` | `crates/kiln/src/harness/registry.rs` |  | Records `kiln.files` |
+| `kiln-mcp.json` | `crates/kiln/src/mcp/mod.rs` |  | a file: the agents' MCP configuration |
+| `kiln-{t}.json` | `crates/kiln/src/updates.rs` |  | a file: a binary kept the old way (`<data>/binaries`), taken into kiln's blob store as the server starts |
+| `lane.json` | `crates/kiln/src/runner/warm.rs` |  | Records `kiln.files` |
+| `live.json` | `crates/kiln/src/headroom/pace.rs` |  | tests only (headroom/pace.rs's tests: the reader takes their item as ended at a brace in a string) |
+| `local.json` | `crates/kiln/src/harness/registry.rs` |  | Records `kiln.files` |
+| `manifest.json` | `crates/kiln/src/browser/stream.rs`, `crates/kiln/src/runner/rootfs.rs` |  | a file: a browser extension's manifest, or an image's (docker save), only read |
+| `member.json` | `crates/kiln/src/observe/owner.rs` |  | Records `kiln.files` |
+| `members.json` | `crates/kiln/src/observe/owner.rs` |  | Records `kiln.files` |
+| `metadata.from-lab-a.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `metadata.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `mirrors.json` | `crates/kiln/src/convo/mirror.rs`, `crates/kiln/src/harness/registry.rs` |  | Records `kiln.files` |
+| `moved-git.json` | `crates/kiln/src/harness/moving.rs` |  | Records `kiln.files` |
+| `names.json` | `crates/kiln/src/harness/registry.rs` |  | Records `kiln.files` |
+| `next.json` | `crates/kiln/src/observe/incidents/mod.rs` |  | Records `kiln.files` |
+| `oauth_creds.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `openapi.json` | `crates/kiln/src/api.rs` |  | not a file: the API's answer to GET /api/openapi.json |
+| `opencode.json` | `crates/kiln/src/sandbox/isolated.rs` | yes |  |
+| `other-agent-other.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `p.json` | `crates/kiln/src/observe/collect/files.rs` | yes |  |
+| `pace.json` | `crates/kiln/src/sense/pace.rs` |  | Records `kiln.files` |
+| `paced.json` | `crates/kiln/src/headroom/pace.rs` |  | a file: read once and deleted (headroom::pace::release_left); nothing writes it now |
+| `pacer.json` | `crates/kiln/src/headroom/pace.rs` | yes |  |
+| `package.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/inbox/faults.rs` |  | scratch: a session's package, taken by Host::adopt_package, gone with it |
+| `pins.json` | `crates/kiln/src/reach/e2e.rs` |  | Records `kiln.files` |
+| `places.json` | `crates/kiln/src/observe/collect/files.rs` | yes |  |
+| `plugin.json` | `crates/kiln/src/mcp/mod.rs` |  | a file: Claude Code's plugin manifest |
+| `profile-checks.json` | `crates/kiln-lab/src/browser/check.rs` |  | lab output: a file |
+| `projects.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `provenance.sigstore.json` | `crates/kiln/src/runner/runtime.rs` |  | a file: a Sigstore bundle, for verifiers |
+| `reads.json` | `crates/kiln/src/runner/rustc.rs` |  | a cache: rustc's reads, under ~/.cache/kiln/rustc, made again when gone |
+| `record.json` | `crates/kiln-lab/src/browser/record.rs` |  | lab output: a file |
+| `rehydrations.json` | `crates/kiln/src/observe/rehydrate.rs` |  | Records `kiln.files` |
+| `replaces.json` | `crates/kiln/src/updates.rs`, `crates/kiln/src/upgrade.rs` |  | Records `kiln.files` |
+| `result.json` | `crates/kiln-lab/src/browser/run.rs` |  | lab output: a file |
+| `run.json` | `crates/kiln-lab/src/browser/run.rs`, `crates/kiln-lab/src/main.rs` |  | lab output: a file |
+| `runner-engine.json` | `crates/kiln/src/harness/engine.rs` |  | Records `kiln.files` |
+| `runs.json` | `crates/kiln/src/runner/warm.rs` |  | Records `kiln.files` |
+| `s1-agent-s1.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `same-chat.json` | `crates/kiln/src/harness/host.rs` | yes |  |
+| `sample.json` | `crates/kiln/src/ci/cli.rs` |  | a file: criterion's output, only read |
+| `sbom.cdx.json` | `crates/kiln/src/runner/runtime.rs` |  | a file: a CycloneDX SBOM, for other tools |
+| `sbom.sigstore.json` | `crates/kiln/src/runner/runtime.rs` |  | a file: a Sigstore bundle, for verifiers |
+| `sbom.spdx.json` | `crates/kiln/src/runner/runtime.rs` |  | a file: an SPDX SBOM, for other tools |
+| `scrapes.json` | `crates/kiln/src/observe/scrape.rs` |  | Records `kiln.files` |
+| `search-meta.json` | `crates/kiln/src/ci/search.rs` |  | Records `kiln.files` |
+| `secrets.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `ses_1.json` | `crates/kiln/src/harness/moving.rs` | yes |  |
+| `sessions.json` | `crates/kiln/src/harness/session.rs` | yes |  |
+| `shaped-{}.json` | `crates/kiln/src/ci/bench.rs` |  | lab output: a file |
+| `state-{member}.json` | `crates/kiln/src/sync/group.rs` | yes |  |
+| `supervise-x.json` | `crates/kiln/src/supervise.rs` | yes |  |
+| `supervise-{}.json` | `crates/kiln/src/supervise.rs` |  | Records `kiln.files` |
+| `target/ci-bench.json` | `crates/kiln/src/ci/bench.rs` |  | lab output: a file |
+| `task.json` | `crates/kiln-cd/src/apps.rs` | yes |  |
+| `tasks.json` | `crates/kiln/src/sync/tasks.rs` |  | Records `kiln.files` |
+| `terminal-handover.json` | `crates/kiln/src/agent.rs` |  | Records `kiln.files` |
+| `times_ms.json` | `crates/kiln-lab/src/browser/run.rs` |  | lab output: a file |
+| `told.json` | `crates/kiln/src/reach/told.rs`, `crates/kiln/src/reach/told/tests.rs` |  | Records `kiln.files` |
+| `u.json` | `crates/kiln/src/observe/collect/files.rs` | yes |  |
+| `ui/node_modules/x/package.json` | `crates/kiln/src/ci/graphs.rs` | yes |  |
+| `ui/package.json` | `crates/kiln/src/updates.rs` |  | not written: a check that a folder is kiln's checkout (updates.rs) |
+| `update-available.json` | `crates/kiln/src/agent.rs` |  | a file: a note that an update is ready, for the person; kiln doesn't read it back |
+| `vm.json` | `crates/kiln/src/runner/firecracker.rs` |  | a file: Firecracker's VM configuration |
+| `{base}/index.json` | `crates/kiln/src/runner/runtime.rs` |  | not a file: an image index fetched over HTTP |
+| `{dir}.d/osi.json` | `crates/kiln/src/sandbox/isolated.rs` |  | a file: a Shards image's configuration, only read |
+| `{hex}.config.json` | `crates/kiln/src/runner/rootfs.rs` |  | a cache: an image's configuration beside its root file system, made again when gone |
+| `{hex}.json` | `crates/kiln/src/runner/rootfs.rs` |  | a cache: an image's manifest beside its root file system, made again when gone |
+| `{id}.json` | `crates/kiln/src/harness/host.rs`, `crates/kiln/src/harness/visuals.rs`, `crates/kiln/src/runner/runtime.rs` |  | Records `kiln.files` (host.rs: archived sessions; visuals.rs); scratch (runtime.rs: a microVM's call) |
+| `{key}.json` | `crates/kiln/src/reach/node.rs` |  | Records `kiln.files` |
+| `{name}.json` | `crates/kiln/src/harness/isolated/home.rs` |  | Records `kiln.files` |
+| `{n}.json` | `crates/kiln/src/runner/warm.rs` |  | Records `kiln.files` |
+| `{out}/claude-to-codex.json` | `crates/kiln/src/harness/handoff.rs` | yes |  |
+| `{owner}.json` | `crates/kiln/src/skills/place.rs` |  | Records `kiln.files` |
+| `{project}.json` | `crates/kiln/src/runner/firecracker.rs` |  | Records `kiln.files` |
+| `{public_id}.json` | `crates/kiln/src/observe/incidents/mod.rs` |  | Records `kiln.files` |
+| `{safe}-{}.json` | `crates/kiln/src/sync/runner.rs` |  | Records `kiln.files` |
+| `{safe}.json` | `crates/kiln/src/mcp/mod.rs` |  | a file: a session's MCP configuration, for its agent |
+| `{}-gcp.json` | `crates/kiln/src/runner/auth.rs` |  | a file: Google Cloud's credentials, for a leg's tools |
+| `{}-{}.json` | `crates/kiln/src/headroom/pace.rs` |  | Records `kiln.files` |
+| `{}.json` | `crates/kiln/src/ci/pushsig.rs`, `crates/kiln/src/harness/kept.rs`, `crates/kiln/src/runner/firecracker.rs`, `crates/kiln/src/skills/place.rs` |  | Records `kiln.files` (kept.rs, firecracker.rs, place.rs); scratch (pushsig.rs: a push's verdicts) |
+| `{}/.gemini/config/mcp_config.json` | `crates/kiln/src/sandbox/isolated.rs` |  | a file: Antigravity's MCP configuration, in its guest's home |
+
+## Designed by hand
+
+### The conversation store: a Turso file copied into an Amphora file (CP-T1.1, CP-T1.5)
+
+The conversation store (`crates/kiln/src/convo`) keeps each machine's sessions, events, the
+harness's record, the drops, the sessions' inboxes, and the peers whose feeds it took, in one
+file per store. Both engines run the same SQL (`convo/sqlstore.rs`, compiled once on Turso and
+once on Amphora's engine), so the two files have the same tables, column for column.
+
+**Why not replay the feed into the new file.** A store's feed (`Engine::changes` into
+`Engine::take`) is how one store takes another's rows. Used for this copy, it would:
+- number every row again, as the new store's own writes, so every number a peer holds of this
+  store is wrong. The server keeps, for each runner's store, the number it has that store's feed
+  through (`peers`), and a mirror keeps the same of the server's;
+- give the new file a new identity: `meta.id` is made when a file is first opened. Each peer would
+  then see a store it hasn't seen, answer its hello with 0, and be sent everything again;
+- leave out what the feed doesn't carry: the store's own `peers` (on the server, where it stands in
+  every runner's feed, so every runner would send everything again), `copied`, and `meta`
+  (`squeeze_below`, the store's last number);
+- give the inbox rows new numbers. The inbox is kiln-seams' `Records`, whose revisions are those
+  numbers, and a writer's conditional write names the revision it read.
+
+Keeping a mapping from old numbers to new ones would fix the first point only, and every peer's
+hello would have to go through that mapping for good: a shim kept forever. Replaying the feed in
+order fixes none of them.
+
+**The copy: every table, row by row, under the same numbers.** This is what compaction already
+does inside one engine (`Engine::compact_some`: a copy "under the same numbers", then the swap).
+Here it goes across engines:
+1. **Writers stopped.** The store is let go (`Store::close`, which calls `Engine::release`):
+   everything is in the file, and its log is empty. The copy refuses a source whose `-wal` isn't
+   empty, and one whose `meta.rev` moved between its start and its end.
+2. **The target is made beside where it goes** (`<target>.copy.tmp`), by Amphora's engine with the same
+   migrations, and refused unless its `meta.schema` equals the source's. It isn't opened as a store
+   until the copy is whole: opening it would make it a new `meta.id`.
+3. **Every table** (`sessions`, `events`, `records`, `drops`, `peers`, `copied`, `inbox`, then
+   `meta`), a page of rows at a time by rowid, one transaction a page. Each row is read whole
+   (`SELECT rowid, *`) and written whole (`INSERT OR REPLACE`), each value with its storage class:
+   NULL, integer, real by its bits, text, blob (the compressed record lines are blobs). `meta`
+   goes last, in the copy's last transaction, so a copy stopped part way has no `id` and is never
+   taken for the store. The indexes are the migrations', built by the target.
+4. **Compared** before the switch: every row of every table, value by value, by table and key (as
+   `records::carry::compare` does for kiln.db), and then the target opened as a store
+   (`convo::Kind::Amphora.open`): its `id()` and `top()` are the source's.
+5. **The switch:** the target takes the file's place under its own name, with
+   `KILN_CONVERSATION_ENGINE=amphora`. The Turso file is kept beside it until the new one has
+   served.
+
+So the copy is the same store: the same identity and the same numbers. A runner's hello gets the
+number it got before, its feed goes on from there, and the server's cursor into every runner's
+feed is carried in `peers`. Nothing is sent again.
+
+**Where it's built.** The copy needs both engines, which only the Amphora adapter's branch has
+(`t1/lane-kiln-records-10-amphora`, on the vendoring branch): `convo::copy::{copy, compare}` and
+`kiln records conversations --from <turso file> --into <amphora file>`.
+
+### JSON files: what Records keeps, and what stays a file
+
+The JSON files table above lists every `.json` file name in kiln's code. Its last column (held by
+`KEPT` in `crates/kiln-seams/tests/records_inventory.rs`) says how each is kept on Amphora:
+- **Records, family `kiln.files`:** kiln's own state, which kiln writes and reads back.
+  `records::files` carries and compares them: each file a record keyed by its machine, its base
+  folder and its path under it, its value the file's bytes as they are.
+- **A file:** a format another program reads (an SBOM, a signature bundle, the API's OpenAPI
+  document, a VM's or a jail's configuration, an image index, a harness's own settings). That
+  program reads it from disk, so it stays a file.
+- **Lab output:** kiln-lab's and the benches' results, written for a person or a check to read.
+- **Scratch:** written for one job or one run and gone with it.
+- **A cache:** made again from what it describes when it's gone (an image's manifest beside its
+  root file system, rustc's reads).
+- **Not a file:** an HTTP answer, or a key in kiln's blob store (kiln-seams' `Blobs`), which moves
+  with its blobs.
+
+One of kiln's own is left a file on purpose: `identity.json`, this device's sign-in and its key, a
+secret kept 0600 on its machine. Records keeps no secrets apart from other values, so it isn't
+copied there.
+
+`records::files::FILES` says where each kind of state file is kept (its base folder, and its paths
+under it) and which code writes and reads it. `kiln records carry` and `compare` carry and compare
+them with kiln.db's tables. Each is keyed by its machine, base and path
+(`adacachy:state/reach/told.json`), so each runner carries its own.
+
+### The cluster group's tables
+
+`cluster_state`, `cluster_conf` and `cluster_mark` aren't made by a migration. The cluster group
+makes them in kiln.db, its state machine, as it opens (`store::group`). `records::carry` takes every
+table kiln.db holds, so a store the group made carries them. Its test
+(`cp_t1_5_the_cluster_groups_configuration_is_carried_and_compared`) carries a configuration with
+learners from such a store, reads it back, and finds a learner added after the copy.
