@@ -107,6 +107,8 @@ pub enum Differs {
     Field { column: String, row: Option<Field>, record: Option<Field> },
     /// A record whose value isn't a row's encoding.
     Unreadable(String),
+    /// Between two Records ([`compare_records`]): a record whose value differs, each side's length.
+    Value { from: usize, to: usize },
 }
 
 /// A difference between a table and its family.
@@ -300,6 +302,78 @@ pub async fn compare(store: &Store, records: &dyn Records) -> anyhow::Result<Com
     Ok(out)
 }
 
+/// Every family of the Records kiln's store keeps ([`crate::records::StoreRecords`]: deploys' and
+/// their fenced leases among them), by name, from its own list of them (`records_families`): the
+/// Records seam lists no families, so a copy between two stores starts from the one that keeps it.
+pub async fn families(store: &Store) -> anyhow::Result<Vec<String>> {
+    store
+        .read(|c| {
+            let mut s = c.prepare("SELECT family FROM records_families ORDER BY family")?;
+            let all = s.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(all)
+        })
+        .await
+}
+
+/// Every record of `family` in `records` as they stand at `at`, by key.
+async fn every(records: &dyn Records, family: &str, at: Consistency) -> anyhow::Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    let mut after = None;
+    loop {
+        let p = records.scan(family, Scan { prefix: Vec::new(), after: after.take(), limit: SCAN_MAX, at }).await.map_err(refused)?;
+        after = p.rows.last().map(|r| r.key.clone());
+        out.extend(p.rows.into_iter().map(|r| (r.key, r.value)));
+        if !p.more || after.is_none() {
+            return Ok(out);
+        }
+    }
+}
+
+/// Every record of each of `families` in `from`, read at one snapshot (its head as the copy
+/// starts), put into `to` as it is (its key and value; `to` gives it a commit of its own), a page a
+/// commit (CP-T1.5, CP-T1.6: the server's Records, deploys under fenced leases among them, onto
+/// the store `records::open` chooses). A lease's fence is in its value, and each conditional write
+/// reads the revision it names afresh, so what the copy keeps is what a writer after the
+/// switch-over needs; as with [`carry`], writers stop before it, and [`compare_records`] says
+/// whether anything moved meanwhile. How many records it put.
+pub async fn copy_records(from: &dyn Records, families: &[String], to: &dyn Records) -> anyhow::Result<usize> {
+    let at = Consistency::Snapshot(from.head().await.map_err(refused)?);
+    let mut copied = 0;
+    for fam in families {
+        let all: Vec<(Vec<u8>, Vec<u8>)> = every(from, fam, at).await?.into_iter().collect();
+        for page in all.chunks(PAGE) {
+            let writes = page.iter().map(|(key, value)| Write::Put { family: fam.clone(), key: key.clone(), value: value.clone() }).collect();
+            to.commit(Tx { conds: Vec::new(), writes }).await.map_err(|e| anyhow::anyhow!("copying {fam}: {}", refused(e)))?;
+            copied += page.len();
+        }
+    }
+    Ok(copied)
+}
+
+/// Each record of `families` that differs between `from` and `to`, each read at its head: one in
+/// `from` with none in `to` ([`Differs::NoRecord`]), one in `to` alone ([`Differs::NoRow`]), or a
+/// value that differs ([`Differs::Value`]). [`Difference::table`] is the family; its key is shown
+/// as hex.
+pub async fn compare_records(from: &dyn Records, families: &[String], to: &dyn Records) -> anyhow::Result<Vec<Difference>> {
+    let (a, b) = (Consistency::Snapshot(from.head().await.map_err(refused)?), Consistency::Snapshot(to.head().await.map_err(refused)?));
+    let mut out = Vec::new();
+    for fam in families {
+        let mut theirs = every(to, fam, b).await?;
+        for (key, value) in every(from, fam, a).await? {
+            let differs = match theirs.remove(&key) {
+                None => Some(Differs::NoRecord),
+                Some(v) if v != value => Some(Differs::Value { from: value.len(), to: v.len() }),
+                Some(_) => None,
+            };
+            if let Some(differs) = differs {
+                out.push(Difference { table: fam.clone(), key: hex::encode(&key), differs });
+            }
+        }
+        out.extend(theirs.into_keys().map(|key| Difference { table: fam.clone(), key: hex::encode(&key), differs: Differs::NoRow }));
+    }
+    Ok(out)
+}
+
 /// Each column whose field differs between a row and its record, or is on one side only.
 fn fields_differ(row: &Fields, record: &Fields) -> Vec<Differs> {
     let mut out = Vec::new();
@@ -479,6 +553,45 @@ mod tests {
             let found = compare(&store, &records).await?;
             let what: Vec<(&str, &Differs)> = found.differences.iter().map(|d| (d.table.as_str(), &d.differs)).collect();
             anyhow::ensure!(what == vec![("plan_tags", &Differs::NoRow)], "{what:?}");
+            Ok(())
+        })
+    }
+
+    /// CP-T1.5 / CP-T1.6: the Records the server keeps in its store (deploys' among them) copied
+    /// family by family into another store read back the same, record by record; a record changed,
+    /// one lost and one added after the copy are each found by family and key; copying again leaves
+    /// only the added one.
+    #[test]
+    fn cp_t1_5_the_servers_records_copied_into_another_store_compare_record_by_record() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let store = Store::in_memory()?;
+            let from = crate::records::StoreRecords::open(store.clone())?;
+            let put = |f: &str, k: &str, v: &str| Write::Put { family: f.into(), key: k.as_bytes().to_vec(), value: v.as_bytes().to_vec() };
+            // A commit's most, and one more after: the copy takes more than one page.
+            let writes: Vec<Write> = (0..TX_MAX).map(|i| put("deploy.release", &format!("r{i}"), &format!("{{\"id\":{i}}}"))).collect();
+            from.commit(Tx { conds: Vec::new(), writes }).await?;
+            from.commit(Tx { conds: Vec::new(), writes: vec![put("deploy.release", "late", "1"), put("deploy.lease", "web", "fence 7"), put("deploy.lease", "gone", "x")] }).await?;
+            from.commit(Tx { conds: Vec::new(), writes: vec![Write::Delete { family: "deploy.lease".into(), key: b"gone".to_vec() }] }).await?;
+            let fams = families(&store).await?;
+            anyhow::ensure!(fams == ["deploy.lease", "deploy.release"], "{fams:?}");
+            let to = SimRecords::new();
+            let copied = copy_records(&from, &fams, &to).await?;
+            anyhow::ensure!(copied == TX_MAX + 2, "every record kept, the deleted one not: {copied}");
+            let same = compare_records(&from, &fams, &to).await?;
+            anyhow::ensure!(same.is_empty(), "{same:?}");
+            from.commit(Tx { conds: Vec::new(), writes: vec![put("deploy.lease", "web", "fence 8"), Write::Delete { family: "deploy.release".into(), key: b"r1".to_vec() }] }).await?;
+            to.commit(Tx { conds: Vec::new(), writes: vec![put("deploy.release", "stray", "1")] }).await.map_err(refused)?;
+            let mut found: Vec<(String, String, Differs)> = compare_records(&from, &fams, &to).await?.into_iter().map(|d| (d.table, d.key, d.differs)).collect();
+            found.sort_by(|x, y| (&x.0, &x.1).cmp(&(&y.0, &y.1)));
+            let want = vec![
+                ("deploy.lease".to_owned(), hex::encode("web"), Differs::Value { from: 7, to: 7 }),
+                ("deploy.release".to_owned(), hex::encode("r1"), Differs::NoRow),
+                ("deploy.release".to_owned(), hex::encode("stray"), Differs::NoRow),
+            ];
+            anyhow::ensure!(found == want, "{found:?}");
+            copy_records(&from, &fams, &to).await?;
+            let left: Vec<(String, Differs)> = compare_records(&from, &fams, &to).await?.into_iter().map(|d| (d.key, d.differs)).collect();
+            anyhow::ensure!(left == vec![(hex::encode("r1"), Differs::NoRow), (hex::encode("stray"), Differs::NoRow)], "a copy puts, it doesn't delete: {left:?}");
             Ok(())
         })
     }
