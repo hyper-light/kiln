@@ -1352,12 +1352,97 @@ mod tests {
 mod plans {
     use super::*;
 
+    /// How a step of a plan reads its table, in the words SQLite gives `EXPLAIN QUERY PLAN`'s
+    /// detail, which both engines keep (Turso's `translate/eqp.rs` and Amphora's): `SEARCH t USING
+    /// INDEX i (a=? AND b>?)`, `SEARCH t USING PRIMARY KEY (...)` (a WITHOUT ROWID table's own
+    /// key, Amphora's wording as SQLite's), `SEARCH t USING INTEGER PRIMARY KEY (rowid=?)`, `SCAN t
+    /// [USING [COVERING] INDEX i]`, and `USE TEMP B-TREE FOR ...` or `USE SORTER FOR ...` for rows
+    /// sorted after they're read.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Using<'a> {
+        /// The table's own B-tree: its rowid, or a WITHOUT ROWID table's primary key.
+        Table,
+        /// An index, by the name the engine keeps it under.
+        Index(&'a str),
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Step<'a> {
+        /// A seek on `using`, bound by `on`'s constraints in its key's order (`family=?`, `key>=?`;
+        /// a skip-scan's skipped column shows as `ANY(c)`).
+        Search { table: &'a str, using: Using<'a>, on: Vec<&'a str> },
+        /// A walk of a whole table or index.
+        Scan { table: &'a str, using: Using<'a> },
+        /// Rows sorted after they're read.
+        Sort,
+    }
+
+    /// The step a plan's detail says, or `None` for a wording this check doesn't read: a failure
+    /// to read the plan, never a pass.
+    fn step(detail: &str) -> Option<Step<'_>> {
+        let d = detail.trim();
+        if d.starts_with("USE TEMP B-TREE FOR ") || d.starts_with("USE SORTER FOR ") {
+            return Some(Step::Sort);
+        }
+        let d = d.strip_suffix(" LEFT-JOIN").unwrap_or(d);
+        let (kind, rest) = d.split_once(' ')?;
+        let (table, rest) = rest.split_once(' ').unwrap_or((rest, ""));
+        let (how, on) = match rest.split_once(" (") {
+            Some((how, on)) => (how, on.strip_suffix(')')?.split(" AND ").collect()),
+            None => (rest, Vec::new()),
+        };
+        let using = match how {
+            "" | "USING PRIMARY KEY" | "USING INTEGER PRIMARY KEY" => Using::Table,
+            _ => Using::Index(how.strip_prefix("USING COVERING INDEX ").or_else(|| how.strip_prefix("USING INDEX "))?),
+        };
+        match kind {
+            "SEARCH" => Some(Step::Search { table, using, on }),
+            "SCAN" if on.is_empty() => Some(Step::Scan { table, using }),
+            _ => None,
+        }
+    }
+
+    /// Whether `plan` is exactly one seek of `versions` on `index`, bound first by `on` (each
+    /// constraint as the engines word it), and nothing else: no other read of the table, no sort.
+    fn sought(plan: &[String], index: &str, on: &[&str]) -> bool {
+        let steps: Vec<Option<Step<'_>>> = plan.iter().map(|d| step(d.as_str())).collect();
+        matches!(steps.as_slice(), [Some(Step::Search { table: "versions", using: Using::Index(i), on: got })] if *i == index && got.starts_with(on))
+    }
+
+    /// The wordings both engines' plans use parse as the steps they are, and one this check
+    /// doesn't know doesn't parse (so it fails the check rather than passing it).
+    #[test]
+    fn plan_details_read_as_their_steps() {
+        let pk = "sqlite_autoindex_versions_1";
+        let search = |using, on: &[&'static str]| Some(Step::Search { table: "versions", using, on: on.to_vec() });
+        assert_eq!(step("SEARCH versions USING INDEX sqlite_autoindex_versions_1 (family=? AND key=? AND rev<?)"), search(Using::Index(pk), &["family=?", "key=?", "rev<?"]));
+        assert_eq!(step("SEARCH versions USING COVERING INDEX versions_by_rev (family=? AND rev>?)"), search(Using::Index("versions_by_rev"), &["family=?", "rev>?"]));
+        assert_eq!(step("SEARCH versions USING PRIMARY KEY (family=? AND key>?)"), search(Using::Table, &["family=?", "key>?"]));
+        assert_eq!(step("SEARCH versions USING INDEX sqlite_autoindex_versions_1 (ANY(family) AND key=?)"), search(Using::Index(pk), &["ANY(family)", "key=?"]));
+        assert_eq!(step("SCAN versions"), Some(Step::Scan { table: "versions", using: Using::Table }));
+        assert_eq!(step("SCAN versions USING INDEX versions_by_rev"), Some(Step::Scan { table: "versions", using: Using::Index("versions_by_rev") }));
+        assert_eq!(step("USE TEMP B-TREE FOR ORDER BY"), Some(Step::Sort));
+        assert_eq!(step("USE SORTER FOR ORDER BY"), Some(Step::Sort));
+        assert_eq!(step("MULTI-INDEX OR versions (a, b)"), None);
+        assert_eq!(step("SEARCH versions USING SOMETHING NEW (family=?)"), None);
+        let one = |d: &str| vec![d.to_owned()];
+        assert!(sought(&one("SEARCH versions USING INDEX sqlite_autoindex_versions_1 (family=? AND key=? AND rev<?)"), pk, &["family=?", "key=?"]));
+        // A skip-scan isn't a seek by family; a sort after the seek, or a second read, is more than one.
+        assert!(!sought(&one("SEARCH versions USING INDEX sqlite_autoindex_versions_1 (ANY(family) AND key=?)"), pk, &["family=?", "key=?"]));
+        assert!(!sought(&one("SEARCH versions USING INDEX versions_by_rev (family=? AND rev>?)"), pk, &["family=?"]));
+        assert!(!sought(&["SEARCH versions USING INDEX sqlite_autoindex_versions_1 (family=? AND key>=?)".to_owned(), "USE TEMP B-TREE FOR ORDER BY".to_owned()], pk, &["family=?", "key>=?"]));
+        assert!(!sought(&one("SCAN versions"), pk, &[]));
+    }
+
     /// CP-T3.2 (the eighth and ninth adversarial checks'): each read is planned on the index it
     /// needs, so none costs what its family holds. A row's newest version, and its version at a
     /// revision, are sought by its key on the primary key, as a prune and a scan are, never found by
     /// walking its family's every version by revision (a take's cost would grow with every
     /// session's ids on the host, and their history); and a family's versions from a revision on
-    /// are walked by revision.
+    /// are walked by revision. Each plan is read step by step ([`step`]) in the wording both
+    /// engines share, and must be the one seek named: on the index the engine itself keeps the
+    /// primary key under (read from its schema, not assumed), by family and key, with no other
+    /// read and no sort, whichever word for a sort (`USE TEMP B-TREE`, `USE SORTER`) it prints.
     #[test]
     fn its_reads_are_planned_on_the_index_they_need() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1368,6 +1453,14 @@ mod plans {
             let (answers, _) = db.commit_batch(&[Tx { conds: Vec::new(), writes: chunk.to_vec() }], &stats);
             anyhow::ensure!(answers.iter().all(Result::is_ok), "{answers:?}");
         }
+        // The primary key's index, as the engine names it in its schema (SQLite's rule, both
+        // engines': a rowid table's PRIMARY KEY is kept as `sqlite_autoindex_<table>_<n>`).
+        let mut autos = Vec::new();
+        db.query("SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'versions' AND name LIKE 'sqlite_autoindex_%'", &[], |r| {
+            autos.push(r.get::<String>(0).map_err(fail)?);
+            Ok(true)
+        })?;
+        let [pk] = autos.as_slice() else { anyhow::bail!("versions' primary key is one index: {autos:?}") };
         let two = [text("inbox"), blob(b"s1/m700")?];
         let three = [text("inbox"), blob(b"s1/m700")?, Value::from_i64(5)];
         let lookups: [(&str, &'static str, &[Value]); 6] = [
@@ -1389,7 +1482,7 @@ mod plans {
         };
         for (name, sql, params) in lookups {
             let plan = plan_of(&mut db, sql, params)?;
-            anyhow::ensure!(plan.iter().any(|p| p.contains("family=? AND key=?")) && !plan.iter().any(|p| p.contains("versions_by_rev")), "{name} isn't sought by its key: {plan:?}");
+            anyhow::ensure!(sought(&plan, pk, &["family=?", "key=?"]), "{name} isn't sought by its key on {pk}: {plan:?}");
         }
         // A scan, to a key or to its family's end, is sought on the primary key from its first key
         // and read in its order, never sorted (the twelfth adversarial check's).
@@ -1397,10 +1490,7 @@ mod plans {
         let scan_on = [text("inbox"), blob(b"s1/")?];
         for (name, sql, params) in [("SCAN_TO", SCAN_TO, &scan_to[..]), ("SCAN_ON", SCAN_ON, &scan_on[..])] {
             let plan = plan_of(&mut db, sql, params)?;
-            anyhow::ensure!(
-                plan.iter().any(|p| p.contains("family=? AND key>=?")) && !plan.iter().any(|p| p.contains("versions_by_rev") || p.contains("SORTER")),
-                "{name} isn't sought on its keys: {plan:?}"
-            );
+            anyhow::ensure!(sought(&plan, pk, &["family=?", "key>=?"]), "{name} isn't sought on its keys from {pk}: {plan:?}");
         }
         // CP-T3.2 (the ninth adversarial check's): a family's versions from a revision on, in their
         // order (the change feed, a compaction's step), are walked by `versions_by_rev` from that
@@ -1409,9 +1499,8 @@ mod plans {
         let window = [text("inbox"), Value::from_i64(5), Value::from_i64(8), Value::from_i64(100)];
         for (name, sql, params) in [("FEED", FEED, &feed[..]), ("WINDOW", WINDOW, &window[..])] {
             let plan = plan_of(&mut db, sql, params)?;
-            anyhow::ensure!(plan.iter().any(|p| p.contains("versions_by_rev (family=? AND rev>?")) && !plan.iter().any(|p| p.contains("SORTER")), "{name} isn't walked by revision: {plan:?}");
+            anyhow::ensure!(sought(&plan, "versions_by_rev", &["family=?", "rev>?"]), "{name} isn't walked by revision: {plan:?}");
         }
         Ok(())
     }
 }
-
