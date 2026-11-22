@@ -166,6 +166,82 @@ mod tests {
         Ok(())
     }
 
+    /// The folder and engine a crashing child writes in ([`cp_t1_1_every_acknowledged_append_stays_through_a_crash`]).
+    const CRASH_DIR: &str = "KILN_CONVO_CRASH_DIR";
+    const CRASH_ENGINE: &str = "KILN_CONVO_CRASH_ENGINE";
+    /// The test's size: the child is killed once it has said this many appends were acknowledged, more under way, and
+    /// it appends no more than `CRASH_MOST` were it never killed.
+    const CRASH_AFTER: usize = 32;
+    const CRASH_MOST: u64 = 100_000;
+
+    /// The crashing child: appends to one conversation, an entry an append, saying each once it's acknowledged, until
+    /// it's killed.
+    fn crash_child(dir: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        let kind = super::super::Kind::named(&std::env::var(CRASH_ENGINE)?)?;
+        let c = StoreConversations::new(Store::start(kind.open(&dir.join(super::super::FILE))?, super::super::store::Upkeep::default())?);
+        let mut out = std::io::stdout().lock();
+        for i in 1..=CRASH_MOST {
+            c.append(&[Entry { conversation: "c".into(), id: format!("m{i}"), seq: i, text: "acknowledged".into() }]).map_err(|e| anyhow::anyhow!("{e}"))?;
+            writeln!(out, "acked m{i}")?;
+            out.flush()?;
+        }
+        Ok(())
+    }
+
+    /// CP-T1.1 (seam review 2): every append the store acknowledged is there after the process dies with no close and
+    /// more appends under way: a child of this test binary appends, saying each acknowledged, and is killed; the store
+    /// opened again holds every one it said (read by the feed from the start), on each engine. CONVO-4 and the load
+    /// scenario reopen only after a clean close, which a store that made writes durable at close alone would pass.
+    #[test]
+    fn cp_t1_1_every_acknowledged_append_stays_through_a_crash() -> anyhow::Result<()> {
+        use std::io::BufRead;
+        if let Ok(dir) = std::env::var(CRASH_DIR) {
+            return crash_child(std::path::Path::new(&dir));
+        }
+        for kind in super::super::Kind::ALL {
+            let dir = tempfile::tempdir()?;
+            let mut child = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "convo::seam::tests::cp_t1_1_every_acknowledged_append_stays_through_a_crash", "--nocapture", "--test-threads=1"])
+                .env(CRASH_DIR, dir.path())
+                .env(CRASH_ENGINE, kind.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            let out = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no output from the child"))?;
+            let mut out = std::io::BufReader::new(out);
+            let mut acked = HashSet::new();
+            let mut killed = false;
+            let mut line = String::new();
+            // Every whole line it said counts, those still in the pipe after the kill too; a line cut by the kill doesn't.
+            loop {
+                line.clear();
+                if out.read_line(&mut line)? == 0 {
+                    break;
+                }
+                if let Some(id) = line.strip_prefix("acked ").and_then(|l| l.strip_suffix('\n')) {
+                    acked.insert(id.trim_end_matches('\r').to_owned());
+                }
+                if !killed && acked.len() >= CRASH_AFTER {
+                    child.kill()?;
+                    killed = true;
+                }
+            }
+            let status = child.wait()?;
+            anyhow::ensure!(killed, "{kind:?}: the child ended ({status}) after {} acknowledged appends, before it was killed", acked.len());
+            let f = Fixture { kind, dir: Some(dir) };
+            let c = kiln_seams::conversations::ConversationsFixture::open(&f).map_err(|e| anyhow::anyhow!("{kind:?}: opened again: {e}"))?;
+            let top = c.top().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut seen = Vec::new();
+            kiln_seams::conversations::follow(c.as_ref(), 0, top, 1 << 20, &mut seen).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            let kept: HashSet<String> = seen.into_iter().map(|ch| ch.entry.id).collect();
+            let lost: Vec<&String> = acked.iter().filter(|id| !kept.contains(*id)).collect();
+            anyhow::ensure!(lost.is_empty(), "{kind:?}: {} of {} acknowledged appends lost in the crash: {lost:?}", lost.len(), acked.len());
+            c.close().map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        Ok(())
+    }
+
     fn knob(name: &str, default: usize) -> anyhow::Result<usize> {
         match std::env::var(name) {
             Ok(v) => Ok(v.trim().parse()?),
