@@ -52,10 +52,11 @@ pub(crate) struct Measured {
     pub agents: usize,
     pub p50_us: u64,
     pub p99_us: u64,
+    pub p999_us: u64,
     pub max_us: u64,
     /// Edits whose action never came (left out of the percentiles).
     pub lost: usize,
-    /// Each kind's own p50, p99 and max, and how many.
+    /// Each kind's own p50, p99, p99.9 and max, and how many.
     pub kinds: serde_json::Map<String, Value>,
 }
 
@@ -74,10 +75,11 @@ fn us(d: Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
-fn summary(of: &[u64]) -> (u64, u64, u64) {
+/// p50, p99, p99.9 and max of `of`.
+fn summary(of: &[u64]) -> (u64, u64, u64, u64) {
     let mut s = of.to_vec();
     s.sort_unstable();
-    (rank(&s, 0.50), rank(&s, 0.99), s.last().copied().unwrap_or(0))
+    (rank(&s, 0.50), rank(&s, 0.99), rank(&s, 0.999), s.last().copied().unwrap_or(0))
 }
 
 async fn op(hub: &Arc<Hub>, name: &str, input: Value) -> anyhow::Result<Value> {
@@ -224,21 +226,21 @@ pub(crate) async fn measure(load: Load) -> anyhow::Result<Measured> {
         timed.extend(a?);
     }
     let took: Vec<u64> = timed.iter().filter_map(|t| t.took.map(us)).collect();
-    let (p50_us, p99_us, max_us) = summary(&took);
+    let (p50_us, p99_us, p999_us, max_us) = summary(&took);
     let mut kinds = serde_json::Map::new();
     for kind in CYCLE {
         let of: Vec<u64> = timed.iter().filter(|t| t.kind == kind).filter_map(|t| t.took.map(us)).collect();
-        let (p50, p99, max) = summary(&of);
-        kinds.insert(kind.into(), json!({"n": of.len(), "p50_us": p50, "p99_us": p99, "max_us": max}));
+        let (p50, p99, p999, max) = summary(&of);
+        kinds.insert(kind.into(), json!({"n": of.len(), "p50_us": p50, "p99_us": p99, "p999_us": p999, "max_us": max}));
     }
-    Ok(Measured { n: took.len(), agents: load.agents, p50_us, p99_us, max_us, lost: timed.len() - took.len(), kinds })
+    Ok(Measured { n: took.len(), agents: load.agents, p50_us, p99_us, p999_us, max_us, lost: timed.len() - took.len(), kinds })
 }
 
 /// The measurement as one JSON line, its times in milliseconds.
 pub(crate) fn line(m: &Measured) -> String {
     #[allow(clippy::cast_precision_loss)]
     let ms = |us: u64| us as f64 / 1000.0;
-    json!({"measure": "goal_edit_to_driver_action", "n": m.n, "agents": m.agents, "p50_ms": ms(m.p50_us), "p99_ms": ms(m.p99_us), "max_ms": ms(m.max_us), "lost": m.lost, "kinds": m.kinds}).to_string()
+    json!({"measure": "goal_edit_to_driver_action", "n": m.n, "agents": m.agents, "p50_ms": ms(m.p50_us), "p99_ms": ms(m.p99_us), "p999_ms": ms(m.p999_us), "max_ms": ms(m.max_us), "lost": m.lost, "kinds": m.kinds}).to_string()
 }
 
 #[cfg(test)]
@@ -268,16 +270,20 @@ mod tests {
     fn g9_s3_the_edit_to_action_measure_measures() -> anyhow::Result<()> {
         let m = crate::rt::block_on(measure(Load { edits: CYCLE.len(), agents: 1 }))?;
         anyhow::ensure!(m.n == CYCLE.len() && m.lost == 0, "{m:?}");
-        anyhow::ensure!(m.kinds.values().all(|k| k.get("n").and_then(Value::as_u64) == Some(1)), "{m:?}");
+        anyhow::ensure!(m.kinds.values().all(|k| k.get("n").and_then(Value::as_u64) == Some(1) && k.get("p999_us").and_then(Value::as_u64).is_some()), "{m:?}");
+        anyhow::ensure!(m.p50_us <= m.p99_us && m.p99_us <= m.p999_us && m.p999_us <= m.max_us, "{m:?}");
         let v: Value = serde_json::from_str(&line(&m))?;
-        anyhow::ensure!(["n", "p50_ms", "p99_ms", "max_ms"].iter().all(|k| v.get(k).is_some()), "{v}");
+        anyhow::ensure!(["n", "p50_ms", "p99_ms", "p999_ms", "max_ms"].iter().all(|k| v.get(k).is_some()), "{v}");
         Ok(())
     }
 
     #[test]
     fn nearest_rank_quantiles() {
         let s: Vec<u64> = (1..=100).collect();
-        assert_eq!((rank(&s, 0.5), rank(&s, 0.99), rank(&s, 1.0)), (50, 99, 100));
+        assert_eq!((rank(&s, 0.5), rank(&s, 0.99), rank(&s, 0.999), rank(&s, 1.0)), (50, 99, 100, 100));
+        let k: Vec<u64> = (1..=1000).collect();
+        assert_eq!((rank(&k, 0.99), rank(&k, 0.999)), (990, 999));
+        assert_eq!(summary(&[3, 1, 2]), (2, 3, 3, 3));
         assert_eq!(rank(&[7], 0.99), 7);
         assert_eq!(rank(&[], 0.5), 0);
     }
