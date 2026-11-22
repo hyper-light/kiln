@@ -4924,24 +4924,24 @@ mod tests {
             // the group and past it (G9 step 3, goal a2a44298, T-T1.5.1).
             let all = || store.changes().of(&["goal_stacks", "goal_items", "plan_runs", "plan_run_steps", "plan_tags", "kv"]);
             let (at, before) = (feed.at(), all());
-            driver.round(&gate).await;
+            driver.round(&gate, &Which::All).await;
             anyhow::ensure!(port.heard(id).len() == 1 && feed.at() != at, "the round didn't send the goal: {:?}", port.heard(id));
             // Idle before the reminder's due: nothing to do.
             let (at, before_quiet) = (feed.at(), all());
             anyhow::ensure!(before_quiet != before, "sending wrote nothing");
-            driver.round(&gate).await;
+            driver.round(&gate, &Which::All).await;
             anyhow::ensure!(feed.at() == at && all() == before_quiet, "an idle round wrote");
             // It goes to work on it: the round after notes when (`busy_at`, what tells real work from
             // a reminder that brought none), news, so one write.
             anyhow::ensure!(port.update(id, |i| i.status = Status::Running), "not updated");
-            driver.round(&gate).await;
+            driver.round(&gate, &Which::All).await;
             let busy_at = stack_of(&store, id).await?.items.first().map_or(0, |i| i.busy_at);
             anyhow::ensure!(busy_at > 0 && feed.at() != at, "the round didn't note the agent at work: busy_at {busy_at}");
             // Still at work on it, past the reminder's gap: nothing to do.
             let (at, before_busy) = (feed.at(), all());
             clock.advance(Duration::from_millis(u64::try_from(reminder_due(0, 0)).unwrap_or(u64::MAX)));
-            driver.round(&gate).await;
-            driver.round(&gate).await;
+            driver.round(&gate, &Which::All).await;
+            driver.round(&gate, &Which::All).await;
             anyhow::ensure!(feed.at() == at && all() == before_busy && port.heard(id).len() == 1, "a round with the agent at work wrote or sent");
             Ok(())
         })
