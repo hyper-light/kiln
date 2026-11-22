@@ -13,6 +13,15 @@
 //! KILN_RECORDS_BENCH_OPS=<n> KILN_RECORDS_BENCH_VALUE=<bytes> \
 //!   cargo test -p kiln --lib records::bench -- --ignored --nocapture
 //! ```
+//!
+//! `<n>` and `<bytes>` are what kiln's store holds: the versions of records it keeps, and their median size, read
+//! from the server's kiln.db (opened read-only, so beside a running server):
+//!
+//! ```text
+//! sqlite3 -readonly <data>/kiln.db "SELECT count(*) FROM records_versions WHERE value IS NOT NULL;
+//!   SELECT length(value) FROM records_versions WHERE value IS NOT NULL ORDER BY length(value)
+//!   LIMIT 1 OFFSET (SELECT count(*) / 2 FROM records_versions WHERE value IS NOT NULL)"
+//! ```
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
