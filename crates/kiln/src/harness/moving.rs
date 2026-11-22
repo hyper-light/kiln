@@ -129,6 +129,12 @@ pub struct Package {
     /// repeat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inbox_digests: Vec<String>,
+    /// The messages still waiting in its journal to be handed to it where it was (docs/sends.md, "Routed to its
+    /// session"), as the server's copy of its inbox has them: carried on a resume from the server's store (its machine
+    /// gone), each taken again where it goes, from its sender, in the order it came, before what's sent after. A move
+    /// from a machine that's up carries its journal itself (`mail`). A runner from before reads none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<Waiting>,
     /// What its harness keeps for it in its own home: its memories, its tasks, plans and
     /// checkpoints, its goal (`super::homes`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,6 +174,16 @@ impl Package {
         }
         self
     }
+}
+
+/// A message still waiting in a session's journal, carried with it ([`Package::waiting`]): its words as its sender sent
+/// them, its sender, and its status's key where it's a replaceable status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Waiting {
+    pub command: super::model::Command,
+    pub sender: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<super::mail::StatusKey>,
 }
 
 /// What a moved session's repository waits with until its files are in: written on arrival beside
@@ -275,6 +291,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
         home: None,
         inbox: Vec::new(),
         inbox_digests: Vec::new(),
+        waiting: Vec::new(),
         handover: false,
         attempt: None,
         hand_on: None,

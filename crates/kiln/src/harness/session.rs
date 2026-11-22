@@ -5513,16 +5513,41 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         unset_machine_vars(&s, env, &user.vars);
                     }
                 }
+                // Its workspace readied before anything of its harness reads its folder, by the one path every start
+                // takes (`workspace::prepare`): mounted again where it says (one that moved here with it waits for its new
+                // owner to answer, K4), or made anew where its volume is gone, which its session keeps from then on.
+                let blocked = match blocked {
+                    None => {
+                        let volume = |spec: &Spec| spec.workspace.as_ref().and_then(|w| w.made.as_ref()).map(|m| m.volume.clone());
+                        let was = volume(&spec);
+                        match crate::workspace::prepare(&mut spec, &s.id).await {
+                            Ok(()) => {
+                                if volume(&spec) != was {
+                                    {
+                                        let mut kept = s.spec.lock();
+                                        kept.workspace.clone_from(&spec.workspace);
+                                        kept.cwd.clone_from(&spec.cwd);
+                                    }
+                                    {
+                                        let mut info = s.info.lock();
+                                        info.workspace.clone_from(&spec.workspace);
+                                        if let Some(cwd) = &spec.cwd {
+                                            info.cwd.clone_from(cwd);
+                                        }
+                                    }
+                                    on_change();
+                                }
+                                None
+                            }
+                            Err(e) => Some(format!("its workspace: {e:#}")),
+                        }
+                    }
+                    other => other,
+                };
                 // What it needs before it starts (kiln's MCP server in Antigravity's own config).
                 if blocked.is_none() && !isolated && spec.container.is_none() {
                     kind.prepare(&spec).await;
                 }
-                // Its workspace volume mounted where it says before its harness starts in it: one that moved here with it
-                // (K4: its new owner may answer a moment after the move), or one a refused move let go of and took back.
-                let blocked = match blocked {
-                    None if !isolated => crate::workspace::mounted_for(&spec).await.err().map(|e| format!("its workspace: {e:#}")),
-                    other => other,
-                };
                 let spawned = match blocked {
                     Some(why) => Err(anyhow::anyhow!(why)),
                     // Isolated: its harness is a member of its image in a microVM of its own, through

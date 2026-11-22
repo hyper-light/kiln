@@ -9,11 +9,13 @@
 //!   S₀ is that line's least-squares slope through the origin over every interval measured, each
 //!   weighted by its requests (its R is the mean of that many latencies),
 //!   S₀ = Σ w R (1 + N) / Σ w (1 + N)²: two sums, folded in as each interval is ([`Calibration`]).
-//! - **Its utilization now:** ρ = 1 − S₀ / R, M/M/1's R = S / (1 − ρ) read the other way: a
-//!   device's latency rises with its queue as its load does, so one that thrashes is one whose
-//!   latency is a large multiple of its own uncontended. Where the kernel keeps no I/O stall times
-//!   (macOS, Windows) this is the I/O signal of `super::slow`, and strain where Linux's stall
-//!   time would be.
+//! - **Its utilization now:** ρ = N / (1 + N), M/M/1's N = ρ / (1 − ρ) read the other way: a
+//!   device that thrashes is one whose requests queue. From its own queue, not its latency against
+//!   S₀ (1 − S₀ / R): S₀ is one figure fitted over every kind of request, and a read from flash
+//!   takes several times a write the device's cache absorbs with nothing waiting, so a device idle
+//!   but for reads read as past its knee (a Mac with 0.04 requests in flight read 81% busy, and
+//!   took no new session). Where the kernel keeps no I/O stall times (macOS, Windows) this is the
+//!   I/O signal of `super::slow`, and strain where Linux's stall time would be.
 //! - **Its rate for a new run:** the capacity it has left, the most it was seen to move times
 //!   1 − ρ (the utilization law, U = X·S: Denning & Buzen, ACM Computing Surveys 10(3), 1978: busy
 //!   ρ of its time, it can serve 1 − ρ of its capacity more).
@@ -51,9 +53,9 @@ impl Calibration {
     }
 }
 
-/// ρ now, in [0, 1): 1 − S₀ / R.
-pub fn utilization(service_us: f64, latency_us: f64) -> Option<f64> {
-    (service_us.is_finite() && service_us > 0.0 && latency_us.is_finite() && latency_us > 0.0).then(|| (1.0 - service_us / latency_us).clamp(0.0, 1.0 - f64::EPSILON))
+/// ρ now, in [0, 1), from the interval's mean number in flight: N / (1 + N) (the module doc).
+pub fn utilization(in_flight: f64) -> Option<f64> {
+    (in_flight.is_finite() && in_flight >= 0.0).then(|| (in_flight / (1.0 + in_flight)).clamp(0.0, 1.0 - f64::EPSILON))
 }
 
 /// The rate a new run's I/O gets now, bytes a second: `peak_bps` × (1 − ρ); 0 unmeasured.
@@ -90,7 +92,7 @@ mod tests {
 
     /// W05-R26: a device that is M/M/1 with service time 80 µs, seen at loads from idle to 90%:
     /// the calibration recovers 80 µs from its history alone, and its utilization now from its
-    /// latency now. Planted: reading ρ as N / R or utilization off a latency picked as "slow" would
+    /// queue now. Planted: reading ρ as N / R or utilization off a latency picked as "slow" would
     /// miss both.
     #[test]
     fn w05_r26_calibration_recovers_mm1_service_time() -> Result<(), String> {
@@ -105,11 +107,29 @@ mod tests {
         let s0 = c.service_us().ok_or("calibrated")?;
         assert!((s0 / s - 1.0).abs() < 0.01, "{s0}");
         for rho in [0.0, 0.3, 0.75] {
-            let u = utilization(s0, s / (1.0 - rho)).ok_or("ρ")?;
+            let u = utilization(rho / (1.0 - rho)).ok_or("ρ")?;
             assert!((u - rho).abs() < 0.01, "{rho} {u}");
         }
-        // A latency under the service time (a cache's) is no load.
-        assert_eq!(utilization(s0, 10.0), Some(0.0));
+        assert_eq!(utilization(f64::NAN), None);
+        assert_eq!(utilization(-1.0), None);
+        Ok(())
+    }
+
+    /// W05-R26: a device's utilization is its queue's, whatever the mix of its requests. Measured on
+    /// a Mac (2026-11-21, IOKit's counters over 2 s): its S₀ fitted at 18.8 µs from a history of
+    /// writes its cache absorbed; then an interval nearly idle (0.04 in flight, 99 µs mostly for
+    /// 400 KB writes), one of reads under one in flight (0.73, 107 µs), and one of a re-index's
+    /// reads queued (12.67, 2194 µs). Planted: 1 − S₀ / R reads all three past the knee (0.81,
+    /// 0.82, 0.99), and the Mac took no new session; the queue's own ρ is past it only for the last.
+    #[test]
+    fn w05_r26_utilization_is_the_queues_not_the_mix() -> Result<(), String> {
+        let knee = crate::sched::state::knee(1);
+        let s0 = 18.8;
+        for (n, r, past) in [(0.04, 99.0, false), (0.73, 107.0, false), (12.67, 2194.0, true)] {
+            let u = utilization(n).ok_or("ρ")?;
+            assert_eq!(u > knee, past, "{n} in flight: ρ {u}");
+            assert!(1.0 - s0 / r > knee, "the planted reading: {r} µs");
+        }
         Ok(())
     }
 

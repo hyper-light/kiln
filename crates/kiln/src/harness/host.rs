@@ -1715,7 +1715,7 @@ impl Host {
         }
         let mut pkg = pkg;
         // A workspace volume that moved here with it (K4): its mount re-placed under this machine's own place for
-        // workspaces and its folder there, mounted as the session starts (`workspace::mounted_for`).
+        // workspaces and its folder there, mounted as the session starts (`workspace::prepare`).
         let volume_here = crate::workspace::arrived_here(&mut pkg.spec);
         let mut cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
         // Its folder isn't here (it wasn't a repository kiln keeps in step): it works in home. A
@@ -1740,6 +1740,8 @@ impl Host {
             std::fs::create_dir_all(&dir).and_then(|()| super::moving::keep_private(&super::moving::moved_git(&dir), &serde_json::to_vec(&kept).unwrap_or_default())).map_err(|e| Refused::NotTaken(format!("keeping its repository's state: {e}")))?;
         }
         let id = pkg.id.clone();
+        // What waited in its journal where it was (a resume from the server's store): taken again here once it's open.
+        let waiting = std::mem::take(&mut pkg.waiting);
         // One this machine ran already (its older runner process handed it over) isn't new here:
         // it's never refused for the machine's limits.
         let new = !pkg.handover;
@@ -1753,6 +1755,7 @@ impl Host {
         // takes this try over, and the one that handed it over doesn't go on with it.
         taken(&id)?;
         self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None, kept_pairs(pkg.inbox, pkg.inbox_digests), false, new).map_err(|e| Refused::NotTaken(format!("{e:#}")))?;
+        self.take_carried(&id, waiting);
         // Its record written as it arrives, with the ids it brought until they're taken in: a
         // restart a moment later still has them (CP-T3.2).
         self.save_now();

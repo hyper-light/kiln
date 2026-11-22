@@ -26,8 +26,8 @@ skill). Work you'll do yourself, item by item, is a goal stack of your own.
 
 Children in one folder share it: **only one should write at a time** there. To let several
 write, give each a workspace of its own: `workspace: "volume"` in `agents_start`, a Slates volume
-over the folder where what it changes stays its own (where its machine has Slates; it says if
-not). Otherwise give writers separate folders, or let one write and the others read, review or
+over the folder where what it changes stays its own (where kiln's Slates workspaces are on, off
+by default, and its machine has Slates; it says if not). Otherwise give writers separate folders, or let one write and the others read, review or
 test.
 
 ## Briefing a child
@@ -41,10 +41,11 @@ A child starts with nothing but your prompt. Say:
 - **Where**: `cwd` (by default yours, on your machine), and `on` for work that needs another
   machine: what it needs (`linux/amd64`, `macos`, `+gpu`, `cpus>=16`). kiln's load balancer
   places each child on the machine that suits best (room at its measured speed, where such work
-  last went well, never one under strain) and queues it, telling you, while none has room. That's
-  its work, not yours: don't look over machines' load, give children machines' names to spread
-  them out, or stop one to start it elsewhere because its machine looks busy. Name a machine only
-  when the child must work there (its checkout, its hardware, a person at it).
+  last went well, one under strain only when no other can start it) and queues it, telling you,
+  while none has room. That's its work, not yours: don't look over machines' load, give children
+  machines' names to spread them out, or stop one to start it elsewhere because its machine looks
+  busy. Name a machine only when the child must work there (its checkout, its hardware, a person
+  at it).
 
 ```js
 // code_run: two children on another machine, in two harnesses, then what they concluded

@@ -810,6 +810,24 @@ impl Store {
         }
     }
 
+    /// Every row of `family` of the inbox whose key starts with `prefix` (a session's: `<session>/`), in key order, read
+    /// on the writer. Blocking: for what's made off the runtime's shards (a resumed session's package).
+    pub fn inbox_rows(&self, family: &str, prefix: Vec<u8>) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>, u64)>> {
+        let family = family.to_owned();
+        self.run(move |e| {
+            let mut out = Vec::new();
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let (rows, more) = e.inbox_scan(&family, &prefix, after.as_deref(), kiln_seams::records::SCAN_MAX)?;
+                after = rows.last().map(|(key, ..)| key.clone());
+                out.extend(rows);
+                if !more || after.is_none() {
+                    return Ok(out);
+                }
+            }
+        })
+    }
+
     /// The store's numbers go on from past `rev` at least ([`Engine::inbox_floor`]).
     pub async fn inbox_floor(&self, rev: u64) -> anyhow::Result<()> {
         self.run_async(move |e| e.inbox_floor(rev)).await

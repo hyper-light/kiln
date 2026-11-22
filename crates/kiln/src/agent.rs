@@ -7082,15 +7082,11 @@ pub fn handed_over() -> bool {
     HANDED_OVER.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Whether `exe` starts at all (`--version` succeeds, saying it is kiln): what an upgrade checks
-/// before switching to it.
+/// Whether `exe` is a whole kiln that starts (`crate::updates::whole_kiln`: its size, its
+/// platform's header, and `--version` saying it is kiln): what an upgrade checks before switching
+/// to it.
 async fn binary_runs(exe: &std::path::Path) -> anyhow::Result<()> {
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--version");
-    let out = crate::os::proc::output(cmd, crate::proc::VERSION_WITHIN).await?;
-    let said = String::from_utf8_lossy(&out.stdout);
-    anyhow::ensure!(out.status.success() && said.starts_with("kiln"), "`{} --version` gave {} ({})", exe.display(), out.status, said.trim());
-    Ok(())
+    crate::updates::whole_kiln(exe).await.map_err(anyhow::Error::msg)
 }
 
 /// Write every terminal's handover (what the process after this one needs to take it over) to

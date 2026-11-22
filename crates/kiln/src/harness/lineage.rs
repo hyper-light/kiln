@@ -642,7 +642,8 @@ pub struct Ask {
     pub mode: Option<String>,
     pub name: Option<String>,
     pub count: Option<usize>,
-    /// `folder` (the folder itself, the only one there is until workspaces are built).
+    /// `folder` (the folder itself, what it works in when it names none) or `volume` (a Slates volume of its own over the
+    /// folder, where `[workspaces]` is on: [`crate::config::Workspaces`]).
     pub workspace: Option<String>,
     /// `none`, a process on its machine (the default), or `microvm`, a microVM of its own (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
     /// steps 17 and 32). An isolated agent's agents are isolated whatever it asks ([`isolation_for`]).
@@ -1428,9 +1429,9 @@ impl Kept {
     }
 }
 
-/// Why agents can't have workspaces of their own on a machine: what it lacks, typed, and the machine's own words for it.
-/// A start there is refused for it, whether it asked for a volume or named no workspace (docs/agentic.md W2): every agent
-/// on a machine's host works in a volume of its own, and none runs in its plain folder instead (no second path).
+/// Why agents can't have workspaces of their own on a machine: what it lacks, typed, and the machine's own words for it,
+/// or that Slates workspaces are off on this kiln ([`crate::config::WORKSPACES_OFF`]). A start that asks for a volume is
+/// refused for it (docs/agentic.md W2), never run in its plain folder instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoWorkspace {
     /// What the machine lacks.
@@ -1469,9 +1470,13 @@ impl WorkspaceUse {
 }
 
 /// Whether agents on `target` can have workspaces of their own used as `used` ([`WorkspaceUse`]): refused, typed,
-/// saying what that machine lacks ([`NoWorkspace`]).
+/// saying what that machine lacks ([`NoWorkspace`]), and everywhere while `[workspaces]` is off, saying how to turn them
+/// on (the person's ruling, 2026-11-21: Slates is an option kiln's owner enables).
 pub async fn workspaces_on(hub: &Hub, target: &str, used: WorkspaceUse) -> Result<(), NoWorkspace> {
     use crate::workspace::slates::WorkspaceMissing;
+    if !hub.cfg.workspaces.enabled {
+        return Err(NoWorkspace { missing: WorkspaceMissing::Workspaces, said: crate::config::WORKSPACES_OFF.to_owned() });
+    }
     let facts = match target.strip_prefix("agent:") {
         None => crate::workspace::slates::facts().await,
         Some(machine) => {
@@ -1904,12 +1909,12 @@ fn with_person(isolation: Option<Isolation>, person: Option<&str>) -> Option<Iso
 /// [`start`], the spec made for the ask then tuned by `tune` before anything starts.
 async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec) + Send) -> Result<Vec<Info>, Refused> {
     let kind = harness(&ask.kind)?;
-    // What it asked to work in: nothing (a volume where its machine can make one: `Registry::open_as`), its folder
-    // itself, or a volume, which its machine must be able to make.
+    // What it asked to work in: nothing or its folder (its folder itself), or a volume, which needs `[workspaces]` on
+    // and its machine able to make one (the person's ruling, 2026-11-21).
     let workspace = match ask.workspace.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(asked @ ("folder" | "volume")) => Some(crate::workspace::Workspace { kind: asked.to_owned(), ..Default::default() }),
-        Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder, what it gets where it says nothing and its machine can make one), not {w:?}"))),
+        Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder, where Slates workspaces are on: `[workspaces] enabled`), not {w:?}"))),
     };
     let volume = workspace.as_ref().is_some_and(|w| w.kind == "volume");
     let count = ask.count.unwrap_or(1).clamp(1, 16);
@@ -1941,6 +1946,10 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         }
         if hub.k8s.get().and_then(Option::as_ref).is_none() {
             return Err((StatusCode::CONFLICT, "the server runs no Kubernetes engine (`[kubernetes]`): no agent runs in a pod".to_owned()));
+        }
+        // A pod's agent works in the Slates volume its home holds for it (W10).
+        if !hub.cfg.workspaces.enabled {
+            return Err((StatusCode::CONFLICT, format!("an agent in a pod works in a Slates volume its home holds: {}", crate::config::WORKSPACES_OFF)));
         }
         Ask { isolation: None, ..ask.clone() }
     } else {
@@ -2386,7 +2395,7 @@ mod tests {
         use crate::workspace::slates::WorkspaceMissing as Lacks;
         use kiln_ci::facts::{RunnerFacts, Workspaces};
         crate::rt::block_on(async move {
-            let hub = crate::hub::tests::scratch_hub().await?;
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.workspaces.enabled = true).await?;
             // Runner `name` on `os`, as process `peer`: new enough for workspaces where `capable`, its facts `facts`.
             let join = |peer: crate::instances::PeerId, name: &str, os: &str, capable: bool, facts: Option<RunnerFacts>| {
                 let hello = crate::proto::Hello { protocol: crate::proto::VERSION, name: name.into(), labels: vec![], slots: 1, hostname: name.into(), os: os.into(), arch: "x86_64".into(), version: "test".into(), ephemeral: false, dedicated_job: None, running: vec![], terminal: true };
@@ -2447,6 +2456,31 @@ mod tests {
         })
     }
 
+    /// The person's ruling, 2026-11-21: Slates workspaces are an option kiln's owner enables (`[workspaces] enabled`, off
+    /// by default). Do ask, on a scratch hub with them off, of a runner lacking nothing and of the server itself, for a
+    /// workspace mounted on the host and one served to a microVM. Expect each refused, typed as a kiln keeping no
+    /// workspaces, saying how to turn them on.
+    #[test]
+    fn w2_with_workspaces_off_no_machine_gives_a_volume_and_says_how_to_turn_them_on() -> anyhow::Result<()> {
+        use kiln_ci::facts::{RunnerFacts, Workspaces};
+        crate::rt::block_on(async move {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            anyhow::ensure!(!hub.cfg.workspaces.enabled, "off by default");
+            let whole = RunnerFacts { workspaces: Some(Workspaces { available: true, slates: Some("slates ce9b6905e".into()), mount: Some("fuse".into()), ..Workspaces::default() }), ..RunnerFacts::default() };
+            hub.put_agent(crate::hub::AgentLive { facts: Some(Box::new(whole)), ..crate::hub::tests::live_runner("linux", "linux", "x86_64") });
+            for target in ["agent:linux", "local"] {
+                for used in [WorkspaceUse::Mounted, WorkspaceUse::Served] {
+                    let refused = workspaces_on(&hub, target, used).await;
+                    anyhow::ensure!(
+                        refused.as_ref().is_err_and(|no| no.missing == crate::workspace::slates::WorkspaceMissing::Workspaces && no.said.contains("`[workspaces] enabled = true`")),
+                        "{target} {used:?}: {refused:?}"
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32: an isolated agent's placement asks its
     /// microVM's own vCPUs and memory (as `on` sizes it, else as its isolation, its parent's, has
     /// it) of runners that start microVMs, in place of what it would ask for a process, its other
@@ -2501,9 +2535,9 @@ mod tests {
     fn step32_an_isolated_agent_is_placed_by_the_balancer_or_not_at_all() -> anyhow::Result<()> {
         crate::rt::block_on(async move {
             let hub = crate::hub::tests::scratch_hub_with(|c| c.terminal.enabled = true).await?;
-            // It holds microVMs, its engine what that makes it (`engine::overlay`, as the server writes it).
+            // It holds microVMs, its owner set `microvm` (`engine::overlay`, as the server writes it).
             let mut facts = kiln_ci::facts::RunnerFacts { isolation: Some(kiln_ci::facts::Isolation { available: true, ..Default::default() }), ..Default::default() };
-            crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked::default());
+            crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked { engine: Some(Engine::Microvm), version: 0 });
             hub.put_agent(crate::hub::AgentLive { facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner("vm-box", "linux", "x86_64") });
             let kinds = super::super::kinds::offered()
                 .into_iter()
@@ -2574,7 +2608,8 @@ mod tests {
                 crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked { engine: asked, version: 0 });
                 crate::hub::AgentLive { facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") }
             };
-            hub.put_agent(runner("vm", true, None));
+            // Its owner set `microvm`: the default is `host` (the person's ruling, 2026-11-21).
+            hub.put_agent(runner("vm", true, Some(Engine::Microvm)));
             hub.put_agent(runner("opted-out", true, Some(Engine::Host)));
             hub.put_agent(runner("plain", false, None));
             assert_eq!(wanted(None, Some(&Isolation::microvm())), Some(Engine::Microvm));
@@ -2607,7 +2642,7 @@ mod tests {
             let hub = crate::hub::tests::scratch_hub().await?;
             let runner = |name: &str, class: Option<NodeImageClass>| {
                 let mut facts = kiln_ci::facts::RunnerFacts { isolation: Some(kiln_ci::facts::Isolation { available: true, image_class: class, ..Default::default() }), ..Default::default() };
-                crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked::default());
+                crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked { engine: Some(Engine::Microvm), version: 0 });
                 crate::hub::AgentLive { facts: Some(Box::new(facts)), ..crate::hub::tests::live_runner(name, "linux", "x86_64") }
             };
             let why = "Shards image VMs on linux: cannot open /dev/kvm: permission denied";

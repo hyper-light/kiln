@@ -59,7 +59,7 @@ allow, something physical), start it yourself and tell them exactly what will ap
 suite, a benchmark), or needs what this one may not have, goes through `run` with what it needs: its platform (needs: \
 \"linux/amd64\" to build and test for Linux x86-64 from a Mac), a GPU (\"+gpu\"), the cores and memory it takes \
 (\"cpus=16,mem=32g\"). kiln's load balancer places it on the machine that has them with the most room for it at its measured \
-speed, back where that kind of work last went well, never one under strain: this one, when it's that machine. Choosing is the \
+speed, back where that kind of work last went well, one under strain only when no other has room: this one, when it's that machine. Choosing is the \
 balancer's work, not yours: don't check machines' load (uptime, free, `runners`) to decide, don't pick one to spread work out \
 or because it looks idle, and name one (`on`) only for a step that has to happen on that machine (its files, its hardware, a \
 service or a person there). A run that waits for room starts by itself when there is some, and kiln tells you: leave it \
@@ -1530,8 +1530,8 @@ pub mod input {
         /// `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and
         /// free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on
         /// it. kiln's load balancer places it on the machine that has them with the most room for
-        /// it at its measured speed, back where that kind of work last went well, never one under
-        /// strain; queued, telling you, until one has room.
+        /// it at its measured speed, back where that kind of work last went well, one under strain
+        /// only when no other has room; queued, telling you, until one has room.
         pub needs: Option<String>,
         /// A runner by name, only for a step that has to happen on that machine (its files, its
         /// hardware, a person or a service there; it must still meet `needs`), never to choose a
@@ -1573,8 +1573,8 @@ pub mod input {
         /// `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and
         /// free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on
         /// it. kiln's load balancer places it on the machine that has them with the most room for
-        /// it at its measured speed, back where that kind of work last went well, never one under
-        /// strain; queued, telling you, until one has room.
+        /// it at its measured speed, back where that kind of work last went well, one under strain
+        /// only when no other has room; queued, telling you, until one has room.
         pub needs: Option<String>,
         /// A runner by name, only for a step that has to happen on that machine (its files, its
         /// hardware, a person or a service there; it must still meet `needs`), never to choose a
@@ -1952,7 +1952,7 @@ mod tests {
         let command = |waits: bool| {
             let mut props = json!({
                 "command": {"type": "string", "description": "Shell text, run by bash in the synced copy of this repository."},
-                "needs": {"type": "string", "description": "What the work must have and takes: `linux/amd64`, `macos`, `+gpu` (a label), `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it. kiln's load balancer places it on the machine that has them with the most room for it at its measured speed, back where that kind of work last went well, never one under strain; queued, telling you, until one has room."},
+                "needs": {"type": "string", "description": "What the work must have and takes: `linux/amd64`, `macos`, `+gpu` (a label), `tool:cargo`, `cpus>=16` (cores in all), and the room the command asks for, idle and free there now: `cpus=8`, `mem=32g`, `disk=50g`, `gpus=1`; `exclusive`: no CI work on it. kiln's load balancer places it on the machine that has them with the most room for it at its measured speed, back where that kind of work last went well, one under strain only when no other has room; queued, telling you, until one has room."},
                 "on": {"type": "string", "description": "A runner by name, only for a step that has to happen on that machine (its files, its hardware, a person or a service there; it must still meet `needs`), never to choose a less busy one: that's the load balancer's. Default: where `needs` places it; with neither, the session's preferred runner, else this machine."},
                 "sync": {"type": "boolean", "description": "Copy this repository over first and run in it (default: true inside a git repository)."},
                 "cwd": {"type": "string", "description": "With sync: the folder here whose repository is synced and whose counterpart the command runs in (default: the session's folder). Without sync: the folder on the other machine (default: its home)."},

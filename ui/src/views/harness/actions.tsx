@@ -10,7 +10,6 @@ import { Check, MoreHorizontal } from "lucide-react";
 import { harnessApi, sessionStore, type AgentInfo, type Command } from "@/api/harness";
 import { pushApi, pushStateRes } from "@/api/push";
 import { ConfirmDialog } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toast";
 import { sendingProps, useAction } from "@/lib/action";
 import { harnessSessionsRes, useRes } from "@/lib/data";
@@ -35,7 +34,7 @@ const inLists = (f: (l: AgentInfo[]) => AgentInfo[]) => LISTS.forEach((key) => c
 /** Both read again, as the server has them: what was shown at once and didn't go goes back. */
 const readLists = () => LISTS.forEach((key) => invalidate(key));
 
-type Act = "end" | "remove" | "rename" | "move" | "reach" | "reset" | null;
+type Act = "end" | "remove" | "rename" | "move" | "reach" | null;
 
 /** One of the menu's ways to keep a row (Mission control's): `opens` a line of its own under the row, which takes the focus. */
 export interface OrganizeItem {
@@ -47,7 +46,7 @@ export interface OrganizeItem {
 
 /**
  * `after.onGone`: it's gone (ended or removed); `after.onFailed`: its Remove didn't go (the server kept it, why given), said where it's shown instead of in a toast.
- * `after.reset`: its menu offers Reset…, asked in a line its caller shows under its head (`resetAsk`: the agent's page).
+ * `after.reset`: its menu offers Reset (the agent's page), done as it's chosen.
  */
 export function useAgentActions(
   a: Pick<AgentInfo, "id" | "name" | "status" | "kind" | "kind_name" | "target" | "cwd" | "harness_session" | "left_behind" | "reach" | "keep_off" | "mode" | "model">,
@@ -142,10 +141,9 @@ export function useAgentActions(
     toast({ title: `Restarting ${name}`, tone: "running" });
     return command({ type: "restart" }, "restart it");
   });
-  // Reset (docs/agents.md, "Reset"): its line closes once it's taken, and the toast says what kiln held for it that ended.
-  const [reset, resetting] = useAction(async (why: string) => {
-    const r = await harnessApi.reset(a.id, why.trim() || undefined);
-    setAct(null);
+  // Reset (docs/agents.md, "Reset"): done as it's chosen, with nothing asked first (Ada, 2026-11-21); the toast says what kiln held for it that ended.
+  const [reset, resetting] = useAction(async () => {
+    const r = await harnessApi.reset(a.id);
     toast({ title: `Reset ${name}`, description: r.cancelled > 0 ? `${r.cancelled === 1 ? "1 message" : `${r.cancelled} messages`} waiting for it cancelled` : undefined, tone: "running" });
   }, "Couldn't reset the agent");
   // An ended one leaves both lists at once, and is back if it couldn't go (its machine kept it: an archive or restore under way).
@@ -183,13 +181,7 @@ export function useAgentActions(
       { label: "Move to…", onSelect: () => setAct("move"), hidden: !live || !movable(a) },
       { label: "Where commands run…", onSelect: () => setAct("reach"), hidden: !a.target.startsWith("agent:") },
       { label: "Copy session id", onSelect: () => void copyText(a.harness_session ?? a.id).then((ok) => ok && toast.success("Copied")) },
-      // Asked in a line under its page's head, whose field takes the focus (the menu doesn't hand it back to its button).
-      {
-        label: "Reset…",
-        onSelect: () => {
-          renameNext.current = true;
-          setAct("reset");
-        },
+      { label: "Reset", onSelect: reset, hidden: !after?.reset, going: resetting },
         hidden: !after?.reset,
         going: resetting,
       },
@@ -300,12 +292,9 @@ export function useAgentActions(
       <React.Suspense fallback={null}>{act === "reach" && <ReachDialog agent={a} onClose={() => setAct(null)} />}</React.Suspense>
     </>
   );
-  const resetAsk = after?.reset && act === "reset" && <ResetAsk name={name} harness={a.kind_name} pending={resetting} onReset={reset} onCancel={() => setAct(null)} />;
   return {
     menu,
     dialogs,
-    /** Its reset, asked in a line under its page's head while Reset… is chosen (`after.reset`). */
-    resetAsk,
     end: () => (live ? setAct("end") : remove()),
     live,
     /** An ended one's removal is on its way. */
@@ -368,38 +357,3 @@ function MuteItem({ id }: { id: string }) {
 }
 
 export { NameField } from "@/components/ui/name-field";
-
-/**
- * Its reset, asked in a line under its page's head (docs/agents.md, "Reset"): what ends and what stays, why in your words if
- * you like (said in its timeline), and Reset or Cancel. Its field takes the focus as it shows; Enter resets, Escape cancels.
- */
-function ResetAsk({ name, harness, pending, onReset, onCancel }: { name: string; harness: string; pending: boolean; onReset: (why: string) => void; onCancel: () => void }) {
-  const [why, setWhy] = React.useState("");
-  return (
-    <section className="ag-reset" aria-label={`Reset ${name}`}>
-      <p className="ag-reset-q">
-        {`Reset ${name}? Everything it has pending ends: the messages waiting for it are cancelled, each sender told so, and its queue, approvals and tasks stop. ${harness} starts again fresh on the same conversation; its goals and settings stay.`}
-      </p>
-      <div className="ag-reset-row">
-        <input
-          ref={(el) => el?.focus({ preventScroll: true })}
-          className="input ag-reset-why"
-          placeholder="Why, for its timeline (optional)"
-          aria-label="Why it's reset"
-          value={why}
-          onChange={(e) => setWhy(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") onReset(why);
-            else if (e.key === "Escape") onCancel();
-          }}
-        />
-        <Button size="xs" variant="danger" pending={pending} onClick={() => onReset(why)}>
-          Reset
-        </Button>
-        <Button size="xs" variant="ghost" onClick={onCancel}>
-          Cancel
-        </Button>
-      </div>
-    </section>
-  );
-}

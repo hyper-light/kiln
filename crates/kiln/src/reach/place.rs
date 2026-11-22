@@ -810,7 +810,8 @@ fn barred(ask: &Ask, key: Option<String>, m: &crate::sense::Measure) -> Option<c
     let tools = ask.needs.requires.iter().filter_map(|r| r.strip_prefix("tools has ")).map(|t| t.trim_matches(|c| c == '\'' || c == '"').to_owned()).collect();
     let a = crate::sense::health::Ask { key, disk: ask.needs.request.disk.max(1), mem: ask.needs.request.mem, tools };
     let h = crate::sense::health::runner().lock().ok()?;
-    // Its strain is the admission's (it waits, saying so): only the causes its runs met bar here.
+    // Its strain bars nothing (the balancer places around it, its room said as none): only the
+    // causes its runs met bar here.
     h.check(&a, m, 0.0).err().filter(|r| r.kind != "strained")
 }
 
@@ -847,8 +848,8 @@ const FOLLOW_UP_MS: i64 = 2_000;
 /// ([`Placer::follow_up_due`]). Where the kernel keeps no I/O stall time (`stall_kept` false: macOS,
 /// Windows, a Linux without PSI), strain rests on the pace's stand-ins (`crate::sense::pace::stand_ins`:
 /// the work device's utilization and swap-ins' share), which only an event reads again: on an idle
-/// machine none may come, and the strain, which takes nothing new while it stands (AUDIT L1), would
-/// stand for good (a Windows desktop's events are its power source's alone). So it's read once more
+/// machine none may come, and the strain, whose room is said as none while it stands (AUDIT L1),
+/// would stand for good (a Windows desktop's events are its power source's alone). So it's read once more
 /// [`FOLLOW_UP_MS`] on, and again while it stands. Where the kernel keeps stall times, its trigger
 /// says the end itself: none.
 fn follow_up_at(strained: bool, stall_kept: bool, now: i64) -> Option<i64> {
@@ -1082,8 +1083,8 @@ impl Placer {
     /// Its machine measured now, on an event (docs/needs.md E5: room is measured, never assumed;
     /// W05-R26: never by a decision, which reads the last measure): the room its admission admits
     /// against; whether the machine is under strain past the scheduler's reserve (sense's
-    /// predicate, the gate guard's: L1, the admission offers nothing new until a measure shows it
-    /// isn't); and the causes sense's health keeps that this measure shows cleared (L2), the probes
+    /// predicate, the gate guard's: L1, the admission says its room is none until a measure shows
+    /// it isn't, holding nothing back); and the causes sense's health keeps that this measure shows cleared (L2), the probes
     /// they parked probed now. Nothing to do without a sensor.
     fn measure_now(&mut self, now: i64, said: &mut Vec<(String, ToOwner)>) {
         let Some(sensor) = self.sensor.as_mut() else { return };
@@ -1104,10 +1105,10 @@ impl Placer {
             h.measured(&m);
         }
         if strained != self.strained {
-            // Its onset, with why, and its end in the runner's log (docs/needs.md §17.2): when it took
-            // nothing new, for a run that keeps its runners' logs. Not each new figure while it stands.
+            // Its onset, with why, and its end in the runner's log (docs/needs.md §17.2): when its
+            // room was said as none, for a run that keeps its runners' logs. Not each new figure while it stands.
             match (&self.strained, &strained) {
-                (None, Some(why)) => tracing::info!(why = %why, "placement: this machine is under strain: it takes nothing new until a measure shows it isn't"),
+                (None, Some(why)) => tracing::info!(why = %why, "placement: this machine is under strain: its room is said as none, so owners place work elsewhere first, until a measure shows it isn't"),
                 (Some(_), None) => tracing::info!("placement: this machine is no longer under strain"),
                 _ => {}
             }
@@ -1211,11 +1212,6 @@ impl Placer {
         self.said(said, now)
     }
 
-    /// Why its machine is under strain now, if it is, as its last measure said (the hint's state).
-    pub fn strain(&self) -> Option<String> {
-        self.strained.clone()
-    }
-
     /// Whether the stand-ins of a strain it measured are due to be read again at `now`
     /// (`follow_up_at`): its time taken, so the node reads them (`crate::sense::pace::read_again`)
     /// and has it measure, which sets the next while the strain stands.
@@ -1235,8 +1231,7 @@ impl Placer {
             self.asked_keys.insert((peer.to_owned(), epoch, ask.run.clone()), k.clone());
         }
         let key = self.key_here(&ask);
-        if self.strained.is_none()
-            && let Some(m) = &self.last
+        if let Some(m) = &self.last
             && let Some(r) = barred(&ask, key, m)
         {
             let free = self.admission.hint();
@@ -1259,8 +1254,7 @@ impl Placer {
             self.asked_keys.insert((peer.to_owned(), epoch, ask.run.clone()), k.clone());
         }
         let key = self.key_here(&ask);
-        if self.strained.is_none()
-            && let Some(m) = &self.last
+        if let Some(m) = &self.last
             && barred(&ask, key, m).is_some()
         {
             // None here for it, in the word its owner hears (what it holds, under room tokens).
@@ -1981,18 +1975,17 @@ impl Placer {
     /// answer for a size waiting or held here flips, its state, budget or line's counts move, a
     /// dimension's room goes to none or comes back (an owner choosing where to probe by hints
     /// takes a runner with none of what its run asks for one it doesn't fit), or this node's own
-    /// runs that wait. Never per sample. `strained`: why its machine is, if it is (sense's
-    /// health, as the gate's guard sees it).
-    pub fn hint_due(&mut self, now: i64, strained: Option<String>) -> Option<String> {
+    /// runs that wait. Never per sample. Its machine's strain holds nothing back: it takes work,
+    /// its room said as none (`Admission::hint`), so owners place elsewhere first.
+    pub fn hint_due(&mut self, now: i64) -> Option<String> {
         use crate::offers::hint::{Hint, Quote, Quoted, Taking};
         use crate::offers::relevant::{Said, relevant};
-        let state = match (self.admission.taking(), strained) {
-            (Err(kiln_ci::place::msg::Reason::Draining), _) => Taking::Draining,
-            (_, Some(why)) => Taking::Strained { why },
+        let state = match self.admission.taking() {
+            Err(kiln_ci::place::msg::Reason::Draining) => Taking::Draining,
             // Not synced with its machine's capacity keeper (CV11): it takes nothing new, said with
-            // its why in the state every server reads, as the machine's strain is (an offers hint
-            // a server can't read is dropped whole).
-            (Err(kiln_ci::place::msg::Reason::Unsynced { why }), None) => Taking::Strained { why },
+            // its why in the state every server reads as that (an offers hint a server can't read
+            // is dropped whole).
+            Err(kiln_ci::place::msg::Reason::Unsynced { why }) => Taking::Strained { why },
             _ => Taking::Taking,
         };
         let room = kiln_ci::place::ask::amounts(&self.admission.hint());
@@ -2949,15 +2942,15 @@ mod topo_tests {
     fn lb08_an_idle_runner_sends_nothing_for_its_topology() -> anyhow::Result<()> {
         let facts = RunnerFacts { os: "linux".into(), arch: "x86_64".into(), ..RunnerFacts::default() };
         let mut p = Placer::new("me", 1, facts, Vec::new(), Sample::default(), Settings::default(), 0);
-        anyhow::ensure!(p.hint_due(0, None).is_some(), "the first hint after it connects is whole");
+        anyhow::ensure!(p.hint_due(0).is_some(), "the first hint after it connects is whole");
         let word = |h: i64| crate::reach::topo::Word { c: Some(kiln_ci::topo::Announce { c: kiln_ci::topo::Coord { x: [0, 0], h, e: 1 << 30 }, ..Default::default() }), ..Default::default() };
         for (k, h) in [100_000i64, 250_000, 900_000].into_iter().enumerate() {
             p.topo = Some(word(h));
             let at = 1_000 * (i64::try_from(k).unwrap_or(0) + 1);
-            anyhow::ensure!(p.hint_due(at, None).is_none(), "a hint went for the topology alone at {h}");
+            anyhow::ensure!(p.hint_due(at).is_none(), "a hint went for the topology alone at {h}");
         }
         p.hints_anew();
-        let json = p.hint_due(10_000, None).ok_or_else(|| anyhow::anyhow!("no hint when the admission made one due"))?;
+        let json = p.hint_due(10_000).ok_or_else(|| anyhow::anyhow!("no hint when the admission made one due"))?;
         let hint: crate::offers::hint::Hint = serde_json::from_str(&json)?;
         anyhow::ensure!(hint.topo == Some(word(900_000)), "{:?}", hint.topo);
         Ok(())
