@@ -112,24 +112,42 @@ fn tables_in(line: &str, sql: bool) -> (Vec<String>, Vec<String>) {
         let start = at + i + kw.len();
         let tail = line.get(start..).unwrap_or("");
         at = start;
+        // The keyword ends a string literal in Rust (`sql.starts_with("CREATE VIRTUAL TABLE")`):
+        // text kiln compares, not SQL it runs.
+        if !sql && tail.starts_with('"') {
+            continue;
+        }
         if kw == "DROP TABLE" {
             gone.push(ident(after_if(tail)).unwrap_or_else(|| "?".into()));
         } else if kw == "ALTER TABLE" {
             let Some(from) = ident(tail) else { continue };
             let up = tail.to_ascii_uppercase();
-            if let Some(j) = up.find("RENAME TO") {
-                if up.get(..j).is_some_and(|before| !before.contains("COLUMN") && before.trim().split_whitespace().count() == 1) {
-                    if let Some(to) = ident(tail.get(j + "RENAME TO".len()..).unwrap_or("")) {
-                        gone.push(from);
-                        made.push(to);
-                    }
-                }
+            if let Some(j) = up.find("RENAME TO")
+                && up.get(..j).is_some_and(|before| !before.contains("COLUMN") && before.split_whitespace().count() == 1)
+                && let Some(to) = ident(tail.get(j + "RENAME TO".len()..).unwrap_or(""))
+            {
+                gone.push(from);
+                made.push(to);
             }
         } else {
             made.push(ident(after_if(tail)).unwrap_or_else(|| "?".into()));
         }
     }
     (made, gone)
+}
+
+/// The file's string constants (`const MARK: &str = "cluster_mark";`), by lowercased name, so a
+/// table named at run time from one (`{MARK}`) is listed by its value.
+fn str_consts(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let t = line.trim_start().trim_start_matches("pub ").trim_start_matches("pub(crate) ");
+        let Some(rest) = t.strip_prefix("const ") else { continue };
+        let Some((name, value)) = rest.split_once(": &str = \"") else { continue };
+        let Some(value) = value.strip_suffix("\";") else { continue };
+        out.insert(name.trim().to_ascii_lowercase(), value.to_ascii_lowercase());
+    }
+    out
 }
 
 /// `.json` file names written in a file that encodes JSON and writes files.
@@ -168,8 +186,11 @@ fn inventory(root: &Path) -> Result<String, String> {
         let text = std::fs::read_to_string(&path).map_err(|e| format!("{name}: {e}"))?;
         let test_file = name.contains("/tests/") || name.ends_with("/tests.rs") || name.ends_with("_tests.rs");
         let lines = code_lines(&text, sql, test_file);
+        let consts = str_consts(&text);
+        let named = |t: String| t.strip_prefix('{').and_then(|n| n.strip_suffix('}')).and_then(|n| consts.get(n)).cloned().unwrap_or(t);
         for (line, test) in &lines {
             let (made, gone) = tables_in(line, sql);
+            let (made, gone): (Vec<String>, Vec<String>) = (made.into_iter().map(named).collect(), gone.into_iter().map(named).collect());
             for t in made {
                 let e = tables.entry(t).or_insert_with(|| Table { test_only: true, ..Table::default() });
                 e.created.insert(name.clone());
@@ -236,6 +257,8 @@ fn cp_t1_5_the_reader_finds_creates_renames_and_drops() {
     assert_eq!(tables_in("ALTER TABLE a RENAME TO b", true), (vec!["b".to_string()], vec!["a".to_string()]));
     assert_eq!(tables_in("ALTER TABLE a RENAME COLUMN x TO y", true), (vec![], vec![]));
     assert_eq!(tables_in("ALTER TABLE a ADD COLUMN y", true), (vec![], vec![]));
+    assert_eq!(tables_in("sql.to_ascii_uppercase().starts_with(\"CREATE VIRTUAL TABLE\")", false), (vec![], vec![]));
+    assert_eq!(str_consts("pub const MARK: &str = \"cluster_mark\";").get("mark").map(String::as_str), Some("cluster_mark"));
     assert_eq!(code_lines("// CREATE TABLE prose\nx", false, false).len(), 1);
     let lines = code_lines("serde_json::to_vec(&x); fs::write(dir.join(\"state.json\"), b);\n#[cfg(test)]\nlet p = \"t.json\";", false, false);
     assert_eq!(json_names(&lines), vec![("state.json".to_string(), false), ("t.json".to_string(), true)]);
