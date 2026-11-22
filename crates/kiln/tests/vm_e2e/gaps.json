@@ -282,21 +282,21 @@
     ],
     "caveats": [
       {
-        "note": "agy's headless stream-json mode can't be asked anything once started: a tool that needs approval is denied, and a stop ends its process, which kiln starts again on the same conversation (--conversation); a message steered in waits for the turn's end. All as on the host.",
+        "note": "A message steered into a turn under way is taken into it at once: agy acp answers the prompt it joined there and then and goes on in the same turn, the turn's tokens coming with its last answer. A tool that needs approval asks, and a stop is ACP's cancel. In a microVM as on the host.",
         "cites": [
-          "crates/kiln/src/harness/antigravity.rs#flag(\"--conversation\""
+          "crates/kiln/src/harness/acp.rs#Antigravity's ACP server takes a message into its turn too",
+          "crates/kiln/src/harness/acp.rs#fn a_message_steered_into_antigravitys_turn_goes_at_once_and_its_usage_comes_with_the_last()",
+          "docs/research/agy-acp/steer-1.5.14-macos-arm64.log:28"
         ]
       },
       {
-        "note": "agy reads MCP servers only from its own mcp_config.json, in the person's volume and so the same for every session: kiln's launch writes its one entry there, the lane's bridge, naming no session, token or address, and the lane names the session, by the member whose connection it hands the runner. Each session's agy is the one member of a microVM of its own, one lane each, and the runner answers each run's connections as that session; two sessions' agy in one member would not be told apart. Two sessions of one person are held so without a VM, over a stand-in lane (owed: ROOT's run of two isolated Antigravity sessions of one person in real microVMs).",
+        "note": "agy acp takes kiln's MCP server in session/new's mcpServers, as every ACP agent does: in a microVM the lane's bridge alone, naming no session, token or address, and the lane names the session, by the member whose connection it hands the runner. Each session's agy is the one member of a microVM of its own, one lane each, and the runner answers each run's connections as that session; two sessions' agy in one member would not be told apart. Two sessions of one person are held so without a VM, over a stand-in lane (owed: ROOT's run of two isolated Antigravity sessions of one person in real microVMs).",
         "cites": [
-          "crates/kiln/src/harness/isolated/mcp.rs#one fixed entry suits it, as the lane, not the entry, names the session",
-          "crates/kiln/src/sandbox/isolated.rs#async fn offer_mcp(",
+          "crates/kiln/src/harness/kinds.rs#pub fn acp_servers(",
           "crates/kiln/src/sandbox/hexvm.rs#members: vec![driven]",
           "crates/kiln/src/sandbox/isolated.rs#pub fn bridge(",
           "crates/kiln/src/reach/mcp.rs#a call of kiln's MCP over its agent-control lane (D254)",
-          "crates/kiln/src/sandbox/isolated.rs#fn s35_mcp_two_antigravity_sessions_of_one_person_are_each_their_own",
-          "docs/research/s35-every-harness/agy-mcp/probe-1.5.7-linux-x64.log:41"
+          "crates/kiln/src/sandbox/isolated.rs#fn s35_mcp_two_antigravity_sessions_of_one_person_are_each_their_own"
         ]
       },
       {
@@ -306,13 +306,12 @@
         ]
       }
     ],
-    "reason": "Google's Antigravity CLI static musl build, pinned in its Agentfile (step 26); on the host kiln's MCP server put in agy's own config by `agy mcp add`; resumed by --conversation. In a microVM, kiln writes one fixed entry into agy's own mcp_config.json, the same for every session, through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, which names the session (Shards D254).",
+    "reason": "Google's Antigravity CLI static musl build, pinned in its Agentfile (step 26); agy acp, its own ACP server, kiln's MCP server in session/new's mcpServers; agy acp says loadSession (1.5.14, probed on the host; agy's changelog has its sessions reloading since 1.5.4, before the pinned 1.5.7), so a resume loads its session. In a microVM, kiln's MCP comes through the member's bridge (/run/shards/mcp) over the agent-control link's mcp lane, Shards D254.",
     "sources": [
       ".kiln/images/harness-antigravity/pin.json",
-      "crates/kiln/src/reach/mcp.rs#pub fn agy_add(",
-      "crates/kiln/src/harness/isolated/mcp.rs#pub fn agy_config(",
-      "crates/kiln/src/sandbox/isolated.rs#async fn offer_mcp(",
-      "crates/kiln/src/harness/antigravity.rs#flag(\"--conversation\""
+      "crates/kiln/src/harness/kinds.rs#pub fn acp_servers(",
+      "crates/kiln/src/harness/isolated/mcp.rs#Protocol::Acp(_) => Config::Acp(",
+      "docs/research/agy-acp/probe-1.5.14-linux-x64.log:9"
     ]
   },
   "cursor": {

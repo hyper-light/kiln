@@ -75,6 +75,10 @@ pub(crate) fn default_mode(k: &Kind) -> &'static str {
     if k.id == "cursor" {
         return super::kinds::CURSOR_DEFAULT_MODE;
     }
+    // Antigravity's own default asks, as kiln's Ask would.
+    if k.id == "antigravity" {
+        return super::kinds::AGY_DEFAULT_MODE;
+    }
     match k.protocol {
         Protocol::Acp(_) => super::acp::KILN_ASK,
         _ => k.modes().1,
@@ -125,13 +129,6 @@ pub fn level(kind: &str, mode: &str) -> Option<Level> {
             // It edits and runs commands in its folder's sandbox without asking.
             "auto" => Some(Level::Auto),
             "full-access" => Some(Level::Bypass),
-            _ => None,
-        },
-        Protocol::AgyStreamJson => match mode {
-            super::antigravity::PLAN => Some(Level::Plan),
-            super::antigravity::ASK => Some(Level::Ask),
-            super::antigravity::ACCEPT_EDITS => Some(Level::AcceptEdits),
-            super::antigravity::BYPASS => Some(Level::Bypass),
             _ => None,
         },
         // Its modes are the tools it starts with; it asks before none of them.
@@ -262,9 +259,9 @@ fn modes_of(k: &Kind) -> Vec<(String, Level)> {
     let ids: Vec<String> = match k.protocol {
         Protocol::ClaudeStreamJson => super::claude::modes(true).into_iter().map(|m| m.id).collect(),
         Protocol::CodexAppServer => super::codex::modes(true).into_iter().map(|m| m.id).collect(),
-        Protocol::AgyStreamJson => super::antigravity::modes().into_iter().map(|m| m.id).collect(),
         Protocol::PiRpc => super::pi::modes().into_iter().map(|m| m.id).collect(),
         Protocol::Acp(_) if k.id == "cursor" => super::kinds::cursor_modes().into_iter().map(|m| m.id).collect(),
+        Protocol::Acp(_) if k.id == "antigravity" => super::kinds::agy_modes().into_iter().map(|m| m.id).collect(),
         Protocol::Acp(_) if k.id == "devin" => ["plan", "ask", "accept-edits", "smart", "bypass"].map(str::to_owned).to_vec(),
         Protocol::Acp(_) => vec![super::acp::KILN_ASK.to_owned(), super::acp::KILN_BYPASS.to_owned()],
         Protocol::Terminal => Vec::new(),
@@ -276,8 +273,8 @@ fn modes_of(k: &Kind) -> Vec<(String, Level)> {
 /// when it's within it; with none asked, its harness's default when that's within it, else the
 /// most its harness offers that is. Always one, so the harness's own settings (Claude Code's
 /// `defaultMode`) can't start it higher. `bypass_ok`: the parent may use bypass itself. ACP agents
-/// other than Devin and Cursor (whose modes kiln knows before they run) asked for nothing start in
-/// their own default mode (kiln learns their modes as they run).
+/// other than Devin, Cursor and Antigravity (whose modes kiln knows before they run) asked for
+/// nothing start in their own default mode (kiln learns their modes as they run).
 pub fn child_mode(kind: &str, asked: Option<&str>, ceiling: Level, bypass_ok: bool) -> Result<Option<String>, String> {
     let k = Kind::get(kind).ok_or_else(|| format!("unknown harness {kind:?}"))?;
     let known = modes_of(k);
@@ -306,7 +303,7 @@ pub fn child_mode(kind: &str, asked: Option<&str>, ceiling: Level, bypass_ok: bo
             }
             Ok(Some(mode.to_owned()))
         }
-        None if matches!(k.protocol, Protocol::Acp(_)) && k.id != "devin" && k.id != "cursor" && ceiling >= Level::Ask => Ok(None),
+        None if matches!(k.protocol, Protocol::Acp(_)) && !matches!(k.id, "devin" | "cursor" | "antigravity") && ceiling >= Level::Ask => Ok(None),
         None => {
             let default = default_mode(k);
             if within.iter().any(|(id, _)| id == default) {
@@ -2710,8 +2707,10 @@ mod tests {
         assert_eq!(level("codex", "full-access"), Some(Level::Bypass));
         assert_eq!(level("antigravity", "plan"), Some(Level::Plan));
         assert_eq!(level("antigravity", "default"), Some(Level::Ask));
-        assert_eq!(level("antigravity", ""), Some(Level::AcceptEdits));
-        assert_eq!(level("antigravity", "bypass"), Some(Level::Bypass));
+        assert_eq!(level("antigravity", "accept-edits"), Some(Level::AcceptEdits));
+        assert_eq!(level("antigravity", ""), Some(Level::Ask), "Antigravity's own default asks");
+        assert_eq!(level("antigravity", "kiln-bypass"), Some(Level::Bypass));
+        assert_eq!(level("antigravity", "auto"), Some(Level::Auto), "the Auto mode agy acp offers where agy has it");
         assert_eq!(level("gemini", "kiln-ask"), Some(Level::Ask));
         assert_eq!(level("gemini", "kiln-bypass"), Some(Level::Bypass));
         assert_eq!(level("gemini", "yolo"), Some(Level::Bypass));
@@ -2742,6 +2741,7 @@ mod tests {
         assert_eq!(child_mode("codex", None, Level::Plan, true), Ok(Some("read-only".to_owned())));
         assert_eq!(child_mode("codex", None, Level::Bypass, true), Ok(Some("auto".to_owned())), "its default, not the most it could have");
         assert_eq!(child_mode("antigravity", None, Level::Ask, true), Ok(Some("default".to_owned())));
+        assert_eq!(child_mode("antigravity", None, Level::Plan, true), Ok(Some("plan".to_owned())), "its modes are known before it starts, as Devin's and Cursor's are");
         // An ACP agent below ask has nothing kiln knows to start it in.
         assert!(child_mode("gemini", None, Level::Plan, true).is_err());
         assert_eq!(child_mode("gemini", None, Level::Ask, true), Ok(None));

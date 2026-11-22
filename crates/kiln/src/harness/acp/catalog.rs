@@ -1,7 +1,7 @@
-//! The installed Devin's catalog for the existing start dialog, before a person starts a session: asked of the
-//! Devin installed on this machine only where its runner's sessions run on its host ([`sessions_on_host`]). On a
-//! runner whose sessions run in microVMs nothing of a harness runs on the host (kiln goal 3cd82843), and the
-//! catalog stays unknown until a session, in its microVM, tells it (`session`'s `note_models`).
+//! The installed Devin's and Antigravity's catalogs for the existing start dialog, before a person starts a session:
+//! asked of the harness installed on this machine only where its runner's sessions run on its host
+//! ([`sessions_on_host`]). On a runner whose sessions run in microVMs nothing of a harness runs on the host (kiln goal
+//! 3cd82843), and the catalog stays unknown until a session, in its microVM, tells it (`session`'s `note_models`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,6 +51,94 @@ pub(super) fn warm_models() {
     if !sessions_on_host(crate::harness::engine::here().engine) {
         return;
     }
+    warm_devin();
+    warm_agy();
+}
+
+/// Antigravity's catalog before a session tells it (each session's own from then on, `session`'s `note_models`):
+/// what `agy models` lists, folded into the form its ACP server gives a session ([`agy_catalog`]). Its CLI's listing
+/// opens no conversation, where a session of its ACP server, even one never prompted, leaves one in the person's
+/// history (agy 1.5.14, docs/research/agy-acp/live-1.5.14-macos-arm64.log). Asked only where agy signs in itself:
+/// with a sign-in kiln keeps for it (a Gemini API key, Google Cloud's), its CLI's listing isn't its session's, and its
+/// sessions tell it. Bound as a session's own run of its CLI is (`session::RUN_TIMEOUT`).
+#[cfg(not(test))]
+fn warm_agy() {
+    static STATE: std::sync::LazyLock<parking_lot::Mutex<Warmup>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(Warmup::default()));
+    if !STATE.lock().begin(Instant::now()) {
+        return;
+    }
+    let spec = Spec { kind: "antigravity".into(), reach: Some("off".into()), ..Spec::default() };
+    let kind = Kind::get("antigravity").filter(|k| k.find().is_some());
+    let Some(kind) = kind.filter(|_| !crate::harness::kinds::agy_signs_in_as_kiln_keeps(&spec)) else {
+        STATE.lock().finish(Instant::now(), false);
+        return;
+    };
+    crate::rt::spawn(async move {
+        let listed = match kind.cli(&spec, &["models".to_owned()]) {
+            Ok(cmd) => crate::proc::output(cmd, crate::harness::session::RUN_TIMEOUT).await.ok(),
+            Err(_) => None,
+        };
+        let models = listed.filter(|o| o.status.success()).map(|o| agy_catalog(&String::from_utf8_lossy(&o.stdout))).filter(|m| !m.is_empty());
+        if let Some(models) = &models {
+            crate::harness::kinds::note_models("antigravity", models);
+        }
+        STATE.lock().finish(Instant::now(), models.is_some());
+    });
+}
+
+/// The thinking levels agy names its models' ids and names by (`agy --effort`'s low, medium, high, xhigh and max), as
+/// each ends an id (`-<level>`) and a name (` (<Level>)`).
+const AGY_LEVELS: [(&str, &str); 5] = [("low", "Low"), ("medium", "Medium"), ("high", "High"), ("xhigh", "XHigh"), ("max", "Max")];
+
+/// What `agy models` lists (one "id<TAB>name" a line, each model once for each thinking level it takes:
+/// `gemini-4-neon-high`, "Gemini 4 Neon (High)") as agy's ACP server gives a session its models: each once, by its
+/// own id and name, with the thinking levels it takes (its `thought_level` option's), in the order it lists them. A
+/// model listed once is its id and name as they are (its ACP server keeps `gpt-oss-120b-medium` whole). Held to a
+/// session's own list by docs/research/agy-acp/live-1.5.14-macos-arm64.log.
+pub(crate) fn agy_catalog(output: &str) -> Vec<ModelOption> {
+    /// One model of its listing: its id and name past any thinking level, the levels it's listed at, and each line
+    /// that listed it (its id and name as they were).
+    struct Folded {
+        id: String,
+        name: String,
+        levels: Vec<&'static str>,
+        lines: Vec<(String, String)>,
+    }
+    let mut models: Vec<Folded> = Vec::new();
+    for line in output.lines() {
+        let Some((id, name)) = line.split_once('\t') else { continue };
+        let (id, name) = (id.trim(), name.trim());
+        if id.is_empty() || id.contains(' ') {
+            continue;
+        }
+        let level = AGY_LEVELS.iter().find_map(|(level, said)| {
+            let stem = id.strip_suffix(level)?.strip_suffix('-')?;
+            let named = name.strip_suffix(&format!(" ({said})"))?;
+            Some((stem, named, *level))
+        });
+        let (stem, named) = level.map_or((id, name), |(stem, named, _)| (stem, named));
+        let listed = (id.to_owned(), name.to_owned());
+        match models.iter_mut().find(|m| m.id == stem) {
+            Some(m) => {
+                m.levels.extend(level.map(|(_, _, l)| l));
+                m.lines.push(listed);
+            }
+            None => models.push(Folded { id: stem.to_owned(), name: named.to_owned(), levels: level.map(|(_, _, l)| l).into_iter().collect(), lines: vec![listed] }),
+        }
+    }
+    models
+        .into_iter()
+        .map(|m| match m.lines.as_slice() {
+            // Listed once: as it is.
+            [(id, name)] => ModelOption { id: id.clone(), label: name.clone(), ..ModelOption::default() },
+            _ => ModelOption { efforts: AGY_LEVELS.iter().filter(|(l, _)| m.levels.contains(l)).map(|(l, _)| (*l).to_owned()).collect(), id: m.id, label: m.name, ..ModelOption::default() },
+        })
+        .collect()
+}
+
+/// Devin's catalog, asked of the installed Devin in a session of its own ([`discover`]).
+#[cfg(not(test))]
+fn warm_devin() {
     static STATE: std::sync::LazyLock<parking_lot::Mutex<Warmup>> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(Warmup::default()));
     if !STATE.lock().begin(Instant::now()) {
         return;
@@ -226,6 +314,37 @@ fn probe_config(user: &Path) -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// What `agy models` listed on agy 1.5.14, signed in with a Google account
+    /// (docs/research/agy-acp/live-1.5.14-macos-arm64.log, at its end), folds into what its ACP server gave a session
+    /// the same day: the same eleven models, ids, names and order (that log's line 12), each with its own thinking
+    /// levels (Gemini 4 Neon's low to xhigh, Gemini 3.8 Flash's low to high, as its `thought_level` said for each).
+    #[test]
+    fn agy_models_fold_into_the_catalog_its_acp_server_gives_a_session() {
+        let listed = "Fetching available models...\ngemini-4-neon-high\tGemini 4 Neon (High)\ngemini-4-neon-xhigh\tGemini 4 Neon (XHigh)\ngemini-4-neon-medium\tGemini 4 Neon (Medium)\ngemini-4-neon-low\tGemini 4 Neon (Low)\ngemini-4-carbon-medium\tGemini 4 Carbon (Medium)\ngemini-4-carbon-high\tGemini 4 Carbon (High)\ngemini-4-carbon-low\tGemini 4 Carbon (Low)\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\ngemini-4-argon-high\tGemini 4 Argon (High)\ngemini-4-argon-low\tGemini 4 Argon (Low)\ngemini-4-hydrogen-high\tGemini 4 Hydrogen (High)\ngemini-4-hydrogen-xhigh\tGemini 4 Hydrogen (XHigh)\ngemini-4-hydrogen-medium\tGemini 4 Hydrogen (Medium)\ngemini-4-hydrogen-low\tGemini 4 Hydrogen (Low)\ngemini-pro-orchestrator-neon\tOrchestrator (Neon)\ngemini-pro-orchestrator\tOrchestrator (Carbon)\ngemini-pro-orchestrator-argon\tOrchestrator (Argon)\ngemini-3.8-flash-high\tGemini 3.8 Flash (High)\ngemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)\ngemini-3.8-flash-low\tGemini 3.8 Flash (Low)\nclaude-opus-5-5-low\tClaude Opus 5.5 (Low)\nclaude-opus-5-5-medium\tClaude Opus 5.5 (Medium)\nclaude-opus-5-5-high\tClaude Opus 5.5 (High)\nclaude-sonnet-5-5-low\tClaude Sonnet 5.5 (Low)\nclaude-sonnet-5-5-medium\tClaude Sonnet 5.5 (Medium)\nclaude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)\ngpt-oss-120b-medium\tGPT-OSS 120B (Medium)\n";
+        let got: Vec<(String, String, Vec<String>)> = super::agy_catalog(listed).into_iter().map(|m| (m.id, m.label, m.efforts)).collect();
+        let four = ["low", "medium", "high", "xhigh"];
+        let three = ["low", "medium", "high"];
+        let want: Vec<(String, String, Vec<String>)> = [
+            ("gemini-4-neon", "Gemini 4 Neon", &four[..]),
+            ("gemini-4-carbon", "Gemini 4 Carbon", &three[..]),
+            ("gemini-4-argon", "Gemini 4 Argon", &three[..]),
+            ("gemini-4-hydrogen", "Gemini 4 Hydrogen", &four[..]),
+            ("gemini-pro-orchestrator-neon", "Orchestrator (Neon)", &[][..]),
+            ("gemini-pro-orchestrator", "Orchestrator (Carbon)", &[][..]),
+            ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)", &[][..]),
+            ("gemini-3.8-flash", "Gemini 3.8 Flash", &three[..]),
+            ("claude-opus-5-5", "Claude Opus 5.5", &three[..]),
+            ("claude-sonnet-5-5", "Claude Sonnet 5.5", &three[..]),
+            ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", &[][..]),
+        ]
+        .into_iter()
+        .map(|(id, name, levels)| (id.to_owned(), name.to_owned(), levels.iter().map(|l| (*l).to_owned()).collect()))
+        .collect();
+        assert_eq!(got, want);
+        // Not signed in, it lists none.
+        assert!(super::agy_catalog("Fetching available models...\nError: Please sign in to view available models. Launch the CLI without arguments to sign in.\n").is_empty());
+    }
+
     /// kiln goal 3cd82843: on a runner whose sessions run in microVMs, no harness on its host is asked for its
     /// catalog; only one set to `host`, or one that can hold no microVMs, asks its installed Devin.
     #[test]

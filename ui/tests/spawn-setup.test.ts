@@ -223,7 +223,7 @@ test("a runner its commands can prefer is offered by its label, chosen by its na
 const CLAUDE = ["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"];
 const CODEX = ["auto", "read-only", "untrusted", "full-access"];
 const DEVIN = ["accept-edits", "smart", "ask", "plan", "bypass"];
-const AGY = ["default", "accept-edits", "plan", "bypass"];
+const AGY = ["default", "accept-edits", "plan", "kiln-bypass"];
 
 test("a harness switch carries the permissions at the same latitude, never more, as an agent's switch does (handoff.rs)", () => {
   // Read only stays read only; ask stays ask; Claude Code's accept edits is Codex's auto, and back.

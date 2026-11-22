@@ -41,7 +41,6 @@ fn ready(kind: &Kind, adapter: &mut Adapter, core: &mut Core) -> anyhow::Result<
             let opening = request(&opening, method)?;
             line(adapter, core, json!({"id": opening.get("id"), "result": result}));
         }
-        Protocol::AgyStreamJson => line(adapter, core, json!({"event": "init", "conversation_id": "destination", "init": {}})),
         // Pi says its session when asked (`get_state`): it takes prompts from then on.
         Protocol::PiRpc => {
             let state = initial.iter().find(|v| v.get("type").and_then(Value::as_str) == Some("get_state")).ok_or_else(|| anyhow::anyhow!("no get_state: {initial:?}"))?;
@@ -73,7 +72,6 @@ fn finish(kind: &Kind, adapter: &mut Adapter, core: &mut Core, id: &str, sent: &
             line(adapter, core, json!({"method": "turn/completed", "params": {"threadId": "destination", "turn": {"id": turn, "status": "completed", "items": []}}}));
         }
         Protocol::Acp(_) => line(adapter, core, json!({"id": sent.get("id"), "result": {"stopReason": "end_turn"}})),
-        Protocol::AgyStreamJson => line(adapter, core, json!({"event": "result", "result": {"conversation_id": "destination", "status": "SUCCESS", "response": "done", "num_turns": 1}})),
         Protocol::PiRpc => {
             line(adapter, core, json!({"id": sent.get("id"), "type": "response", "command": "prompt", "success": true, "data": {"disposition": "started"}}));
             line(adapter, core, json!({"type": "agent_start"}));

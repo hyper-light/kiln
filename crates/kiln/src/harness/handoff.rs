@@ -1712,7 +1712,7 @@ mod tests {
         let list = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         let (claude, codex) = (list(&["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"]), list(&["auto", "read-only", "untrusted", "full-access"]));
         let devin = list(&["accept-edits", "smart", "ask", "plan", "bypass"]);
-        let agy = list(&["default", "accept-edits", "plan", "bypass"]);
+        let agy = list(&["default", "accept-edits", "plan", "kiln-bypass"]);
         // An ACP agent that says its own only once started: kiln's Ask and Bypass.
         let gemini = list(&["kiln-ask", "kiln-bypass"]);
         let carry = |from: &str, modes: &[&str], to: &str, offered: &[String]| modes.iter().map(|m| mode_for(from, m, to, offered).unwrap_or_default()).collect::<Vec<_>>();
@@ -1721,8 +1721,8 @@ mod tests {
         // Its own default where it named none.
         assert_eq!(carry("devin", &["plan", "ask", "accept-edits", "smart", "bypass", ""], "codex", &codex), ["read-only", "untrusted", "auto", "auto", "full-access", "auto"]);
         // Antigravity has no auto: the next one down.
-        assert_eq!(carry("claude", &["plan", "default", "acceptEdits", "auto", "bypassPermissions"], "antigravity", &agy), ["plan", "default", "accept-edits", "accept-edits", "bypass"]);
-        assert_eq!(carry("antigravity", &["plan", "default", "accept-edits", "bypass"], "devin", &devin), ["plan", "ask", "accept-edits", "bypass"]);
+        assert_eq!(carry("claude", &["plan", "default", "acceptEdits", "auto", "bypassPermissions"], "antigravity", &agy), ["plan", "default", "accept-edits", "accept-edits", "kiln-bypass"]);
+        assert_eq!(carry("antigravity", &["plan", "default", "accept-edits", "kiln-bypass"], "devin", &devin), ["plan", "ask", "accept-edits", "bypass"]);
         // An ACP agent's own words for its modes place them too.
         assert_eq!(carry("gemini", &["autoEdit", "yolo", "kiln-ask", "kiln-bypass"], "claude", &claude), ["acceptEdits", "bypassPermissions", "default", "bypassPermissions"]);
         assert_eq!(carry("codex", &["untrusted", "auto", "full-access"], "gemini", &gemini), ["kiln-ask", "kiln-ask", "kiln-bypass"]);

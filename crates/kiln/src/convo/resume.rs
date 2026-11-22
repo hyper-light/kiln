@@ -81,7 +81,7 @@ fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str
         };
         return Ok(Carry::Native { session: own.to_owned(), words });
     }
-    if matches!(kind.protocol, Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc) {
+    if matches!(kind.protocol, Protocol::Acp(_) | Protocol::PiRpc) {
         return Ok(moving::words(events, note));
     }
     let Some(own) = harness_session.filter(|h| !h.is_empty()) else { return Ok(Carry::Nothing) };
@@ -101,7 +101,7 @@ fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str
             let conv = crate::harness::handoff::codex_of_lines(&files, own).ok_or_else(|| anyhow::anyhow!("the server has no copy of Codex's record of this thread (its machine never sent it)"))?;
             Ok(Carry::Seed { items: crate::harness::handoff::to_codex(&conv, Some(&format!("<kiln_handoff>\n{note}\n</kiln_handoff>"))) })
         }
-        Protocol::Acp(_) | Protocol::AgyStreamJson | Protocol::PiRpc => Ok(moving::words(events, note)),
+        Protocol::Acp(_) | Protocol::PiRpc => Ok(moving::words(events, note)),
         Protocol::Terminal => anyhow::bail!("{}'s sessions can't go on on another machine yet", kind.name),
     }
 }
@@ -227,7 +227,7 @@ mod tests {
             assert_eq!(pkg.version, 5, "{}", k.id);
             match (&pkg.carry, k.protocol) {
                 (Carry::Native { session, words: Some(w) }, Protocol::Acp(_)) => anyhow::ensure!(*session == own && w.contains("half way there"), "{}: {w}", k.id),
-                (Carry::Native { session, words: None }, Protocol::ClaudeStreamJson | Protocol::CodexAppServer | Protocol::AgyStreamJson | Protocol::PiRpc) => anyhow::ensure!(*session == own, "{}", k.id),
+                (Carry::Native { session, words: None }, Protocol::ClaudeStreamJson | Protocol::CodexAppServer | Protocol::PiRpc) => anyhow::ensure!(*session == own, "{}", k.id),
                 (c, _) => anyhow::bail!("{}: {c:?}", k.id),
             }
             let seeded = crate::harness::moving::install(&pkg, "/work/parser").map_err(anyhow::Error::msg)?;

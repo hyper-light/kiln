@@ -190,48 +190,54 @@ pub(crate) fn request(_req: &Request) -> anyhow::Result<Value> {
 }
 
 /// `kiln harness-hook`: a harness's hook before each of its tool calls (Codex's, given by kiln as
-/// it starts it: `codex::hook_args`; Antigravity's, in its hooks.json: `antigravity::hooks_with`).
+/// it starts it: `codex::hook_args`), and Antigravity's from before its ACP server ([`agy_pass`]).
 #[derive(clap::Args, Debug)]
 pub struct HarnessHookArgs {
     /// The harness socket of the runner the session is on (none: the one the harness was given,
     /// `KILN_HARNESS_SOCK`).
     #[arg(long)]
     pub sock: Option<std::path::PathBuf>,
-    /// Antigravity's hook, for this event of its (`antigravity::HOOK_EVENTS`): agy names none in
-    /// its input, and takes an answer of its own form even when kiln holds nothing.
+    /// Antigravity's hook, for this event of its, as kilns before its ACP server put it in agy's
+    /// hooks.json (`kinds::agy_forget_kiln` takes that entry out): answered at once with agy's pass
+    /// ([`agy_pass`]), as kiln holds none of agy's calls by a hook now.
     #[arg(long)]
     pub agy: Option<String>,
+}
+
+/// What lets one of agy's calls, model calls or stops go as agy would without kiln: a tool call is left
+/// to its own rules (`allow`), the rest changes nothing. An entry kilns before agy's ACP server put in
+/// its hooks.json still runs `kiln harness-hook --agy <event>` until it's taken out, and agy fails a
+/// call whose hook fails, so it's answered so.
+fn agy_pass(event: &str) -> Value {
+    match event {
+        "PreToolUse" => serde_json::json!({"decision": "allow"}),
+        "Stop" => serde_json::json!({"decision": ""}),
+        _ => serde_json::json!({}),
+    }
 }
 
 /// The hook's input (stdin) goes to the session it runs in, told by its process, and the session's
 /// answer is printed once it gives it: a call a person holds waits for them, up to a week. What goes
 /// wrong lets the call go (nothing printed): a kiln that can't be reached holds nothing.
-/// Antigravity's is told its event and its conversation's tokens so far, and gets its own pass
-/// (`antigravity::hook_pass`) when kiln has no answer, as when agy runs outside kiln.
+/// Antigravity's, from before its ACP server, is read and answered with its pass at once ([`agy_pass`]).
 #[cfg(unix)]
 pub fn harness_hook(a: HarnessHookArgs) -> anyhow::Result<()> {
-    let pass = || {
-        if let Some(ev) = &a.agy {
-            println!("{}", super::antigravity::hook_pass(ev));
-        }
-    };
     let mut input = String::new();
-    if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
-        eprintln!("kiln: the hook's input was unreadable: {e}");
-        pass();
+    let read = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input);
+    if let Some(ev) = &a.agy {
+        println!("{}", agy_pass(ev));
         return Ok(());
     }
-    let mut input = serde_json::from_str(&input).unwrap_or(Value::Null);
+    if let Err(e) = read {
+        eprintln!("kiln: the hook's input was unreadable: {e}");
+        return Ok(());
+    }
+    let input = serde_json::from_str(&input).unwrap_or(Value::Null);
     // The runner that started the session first (Codex's hook names it), then the machine's.
     let own = a.sock.clone().or_else(own_socket);
     let machine = std::env::var_os("KILN_HARNESS_SOCK").map(std::path::PathBuf::from);
     if own.is_none() && machine.is_none() {
-        pass();
         return Ok(());
-    }
-    if let Some(ev) = &a.agy {
-        let transcript = input.get("transcriptPath").and_then(Value::as_str).and_then(|p| read_small(std::path::Path::new(p)));
-        input = super::antigravity::hook_input(input, ev, transcript.as_deref());
     }
     let (req, wait) = (Request::Hook { input }, std::time::Duration::from_secs(8 * 24 * 3600));
     let asked = match (&own, &machine) {
@@ -240,32 +246,21 @@ pub fn harness_hook(a: HarnessHookArgs) -> anyhow::Result<()> {
         (None, None) => Ok(Value::Null),
     };
     match asked {
-        Ok(v) => match v.get("answer").filter(|a| a.as_object().is_some_and(|o| !o.is_empty())) {
-            Some(answer) => println!("{answer}"),
-            None => pass(),
-        },
-        Err(e) => {
-            eprintln!("kiln: {e:#}");
-            pass();
+        Ok(v) => {
+            if let Some(answer) = v.get("answer").filter(|a| a.as_object().is_some_and(|o| !o.is_empty())) {
+                println!("{answer}");
+            }
         }
+        Err(e) => eprintln!("kiln: {e:#}"),
     }
     Ok(())
-}
-
-/// A file's text, unless it's past 64 MiB (a transcript too long to count). Read whole on each of
-/// the hook's calls (every tool call and model call of the conversation): fine for transcripts as
-/// agy keeps them, a cost that grows with a long one.
-#[cfg(unix)]
-fn read_small(path: &std::path::Path) -> Option<String> {
-    let len = std::fs::metadata(path).ok()?.len();
-    (len <= 64 << 20).then(|| std::fs::read_to_string(path).ok()).flatten()
 }
 
 /// No harness socket on Windows yet: nothing of kiln's holds the call.
 #[cfg(not(unix))]
 pub fn harness_hook(a: HarnessHookArgs) -> anyhow::Result<()> {
     if let Some(ev) = &a.agy {
-        println!("{}", super::antigravity::hook_pass(ev));
+        println!("{}", agy_pass(ev));
     }
     Ok(())
 }
@@ -434,6 +429,16 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// An Antigravity hook entry from before agy's ACP server still runs `kiln harness-hook --agy <event>` until kiln
+    /// takes it out: each event gets agy's own pass (a tool call left to agy's rules, the rest changing nothing), as
+    /// the entry's own guard gave it, since agy fails a call whose hook fails.
+    #[test]
+    fn an_antigravity_hook_from_before_gets_agys_pass() {
+        assert_eq!(agy_pass("PreToolUse"), serde_json::json!({"decision": "allow"}));
+        assert_eq!(agy_pass("Stop"), serde_json::json!({"decision": ""}));
+        assert_eq!(agy_pass("PreInvocation"), serde_json::json!({}));
+    }
 
     /// CP-T3.2: an explicit queue remains available when an agent's default is steering.
     #[test]

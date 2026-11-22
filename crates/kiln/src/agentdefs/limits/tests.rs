@@ -494,8 +494,8 @@ fn p5_4_a_cost_limit_is_refused_for_a_harness_that_says_no_cost() -> anyhow::Res
 }
 
 /// P5.4: a token limit is held only to a harness that says how many tokens its sessions use. Claude Code, Codex,
-/// Antigravity and Pi do; an ACP agent's tokens are its own to give or leave out, so a definition of any of the six
-/// that sets `tokens` is refused as it's saved (422, the reason said; the check says it first), as is a change that
+/// Antigravity (its ACP server says each turn's) and Pi do; any other ACP agent's tokens are its own to give or leave
+/// out, so a definition of any of the six that sets `tokens` is refused as it's saved (422, the reason said; the check says it first), as is a change that
 /// moves a Claude Code agent with a token limit to one. A cost limit refused for an ACP agent is told to limit its
 /// time instead, as its tokens would be refused too; its time limit is kept. Making `Kind::says_tokens` true for ACP,
 /// or taking `check`'s token refusal out, fails this test.

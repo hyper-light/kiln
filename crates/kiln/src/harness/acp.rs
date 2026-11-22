@@ -6,12 +6,19 @@
 //!
 //! kiln advertises no file-system or terminal capabilities, so agents use their own tools.
 //! Steering waits for the turn unless Devin advertises its mid-turn prompt extension.
+//! Antigravity's ACP server takes a message into its turn too: it answers the prompt the message
+//! joined at once, and gives the whole turn's usage with the last (agy 1.5.14,
+//! docs/research/agy-acp/steer-1.5.14-macos-arm64.log).
 //!
 //! Devin CLI (`devin acp`) uses this adapter too, including ACP's session config options.
 //!
 //! So does Cursor's CLI (`agent acp`, cursor.com/docs/cli/acp): its questions
 //! (`cursor/ask_question`) and plans to approve (`cursor/create_plan`), requests of its own that it
 //! waits on, are a person's to answer, and its to-dos (`cursor/update_todos`) are the session's.
+//!
+//! And the Antigravity CLI's own ACP server (`agy acp`, agy 1.5 or newer): it signs in with the ACP
+//! method kiln keeps for it on its machine (`sign_in`) before its session opens, and starts again
+//! on a sign-in from kiln, as agy reads its credentials as it starts.
 
 use std::collections::HashMap;
 
@@ -62,6 +69,26 @@ fn acp_extras(account: bool) -> Vec<SlashCommand> {
     commands
 }
 
+/// `known`, the models a session knows, with what `catalog` says of each (a default where `known` has none, its efforts
+/// where `known` has none for it), and those it alone has.
+fn with_catalog(known: &mut Vec<ModelOption>, catalog: Vec<ModelOption>) {
+    let keep_default = known.iter().any(|m| m.default);
+    for mut model in catalog {
+        if keep_default {
+            model.default = false;
+        }
+        match known.iter_mut().find(|m| m.id == model.id) {
+            Some(kept) => {
+                kept.default |= model.default;
+                if kept.efforts.is_empty() {
+                    kept.efforts = model.efforts;
+                }
+            }
+            None => known.push(model),
+        }
+    }
+}
+
 /// What an ACP agent cannot do from kiln.
 const UNSUPPORTED: &str = "This agent's protocol (ACP) has no way to manage its MCP servers or skills from kiln.";
 
@@ -100,6 +127,9 @@ enum Pending {
     SetConfig(Option<String>, bool),
     /// Cursor's `authenticate` with the sign-in it has on its machine, after a sign-in in kiln.
     Authenticate,
+    /// Antigravity's `authenticate` with the sign-in method kiln keeps for it, before its session
+    /// opens.
+    SignIn,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -248,6 +278,15 @@ pub struct Acp {
     /// (`sandbox::isolated::Seen`): its session opens there.
     #[serde(default)]
     seen: Option<crate::sandbox::isolated::Seen>,
+    /// The ACP sign-in method it authenticates with before its session opens, where it offers that
+    /// one: the one kiln keeps for it on its machine (Antigravity's, `super::kinds::agy_sign_in`).
+    /// None: its own.
+    #[serde(default)]
+    sign_in: Option<String>,
+    /// The usage an answer of the turn under way gave before its own prompt's answer came
+    /// (Antigravity gives a steered turn's with its last answer): the turn's, where its own has none.
+    #[serde(default)]
+    turn_usage: Option<Value>,
 }
 
 fn ready() -> bool {
@@ -333,6 +372,8 @@ impl Acp {
             auth: Vec::new(),
             todo_ids: Vec::new(),
             seen: None,
+            sign_in: None,
+            turn_usage: None,
         }
     }
 
@@ -341,10 +382,15 @@ impl Acp {
         self.kind == "devin" || (self.kind.is_empty() && self.account)
     }
 
+    /// The Antigravity CLI (`agy acp`), which reads its credentials as it starts.
+    fn agy(&self) -> bool {
+        self.kind == "antigravity"
+    }
+
     pub fn from_spec(spec: &super::session::Spec) -> Self {
         let mut a = Self::new(spec.resume.clone()).with_mode(spec.mode.as_deref());
         // Signed in and out through kiln's account card (`crate::accounts`).
-        a.account = matches!(spec.kind.as_str(), "devin" | "cursor");
+        a.account = matches!(spec.kind.as_str(), "devin" | "cursor" | "antigravity");
         a.kind.clone_from(&spec.kind);
         for (category, value) in [("model", &spec.model), ("thought_level", &spec.effort)] {
             if let Some(v) = value.as_ref().filter(|v| !v.is_empty()) {
@@ -355,6 +401,12 @@ impl Acp {
         a.seen = crate::sandbox::isolated::Seen::of(spec);
         a.dirs = spec.dirs.iter().map(|d| d.at.clone()).collect();
         a
+    }
+
+    /// Signs in with this ACP sign-in method before it opens its session, where it offers that one.
+    pub fn with_sign_in(mut self, method: Option<String>) -> Self {
+        self.sign_in = method;
+        self
     }
 
     /// `params` of a session it opens, with the session's folders past its own where it takes them (each must be
@@ -429,7 +481,7 @@ impl Acp {
     }
 
     fn busy(&self, core: &Core) -> bool {
-        self.prompting.is_some() || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _) | Pending::Authenticate)) || !core.state.approvals.is_empty()
+        self.prompting.is_some() || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _) | Pending::Authenticate | Pending::SignIn)) || !core.state.approvals.is_empty()
     }
 
     fn settle(&self, core: &mut Core) {
@@ -524,7 +576,8 @@ impl Acp {
     }
 
     fn capabilities(&mut self, core: &mut Core, result: &Value) {
-        let steering = self.devin() && result.pointer("/agentCapabilities/_meta/cognition.ai~1midTurnPrompts").and_then(Value::as_bool) == Some(true);
+        // Antigravity's takes a message into its turn whatever it advertises (agy 1.5.14).
+        let steering = (self.devin() && result.pointer("/agentCapabilities/_meta/cognition.ai~1midTurnPrompts").and_then(Value::as_bool) == Some(true)) || self.agy();
         self.steering = Some(steering);
         core.meta.features.retain(|f| f != "steer" && f != "queue_steer");
         if steering {
@@ -556,6 +609,7 @@ impl Acp {
         self.held_asks.clear();
         self.compact_prompt = None;
         self.compaction = None;
+        self.turn_usage = None;
         core.state.approvals.clear();
         core.state.exit = Some(ExitInfo::now(code, error));
         core.state.doing = None;
@@ -687,6 +741,11 @@ impl Acp {
             return true;
         }
         self.refresh = false;
+        // Antigravity reads its credentials (and the sign-in method kiln keeps for it) as it starts.
+        if self.agy() {
+            core.effects.push(Effect::Restart { resume_at: None });
+            return true;
+        }
         if let Some(refused) = self.startup_refusal.take() {
             core.state.exit = None;
             core.set_status(Status::Starting);
@@ -704,6 +763,31 @@ impl Acp {
         }
         self.reopen(core);
         true
+    }
+
+    /// Opens its session once it's initialized (and signed in): the one it resumes where it can load
+    /// one, else a new one.
+    fn open_session(&mut self, core: &mut Core) {
+        let cwd = self.cwd(core);
+        match self.resume.clone().filter(|_| self.can_load) {
+            Some(sid) => {
+                // Its own session, loaded: the conversation in words (a crashed session's
+                // resume carries them for an agent that can't load) would say it twice.
+                self.context = None;
+                self.session = Some(sid.clone());
+                core.state.harness_session = Some(sid.clone());
+                let params = self.opening(json!({"sessionId": sid, "cwd": cwd, "mcpServers": self.mcp}));
+                self.request(core, Pending::Session, "session/load", params);
+            }
+            None => {
+                if self.resume.is_some() {
+                    let how = if self.context.is_some() { "starting a new one, given the conversation in words" } else { "starting a new one" };
+                    self.notice(core, Level::Warn, format!("This agent cannot load earlier sessions; {how}."));
+                }
+                let params = self.opening(json!({"cwd": cwd, "mcpServers": self.mcp}));
+                self.request(core, Pending::Session, "session/new", params);
+            }
+        }
     }
 
     /// Its session opened again after a sign-in, as it is now: loaded where it can be, else anew.
@@ -745,7 +829,7 @@ impl Acp {
         if self.changes.is_empty() {
             return false;
         }
-        if self.refresh || self.session.is_none() || (!self.ready && self.failed_setting.is_none()) || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _) | Pending::Authenticate)) {
+        if self.refresh || self.session.is_none() || (!self.ready && self.failed_setting.is_none()) || self.pending.values().any(|p| matches!(p, Pending::Initialize | Pending::Session | Pending::Refresh | Pending::RefreshNew | Pending::SetMode(_) | Pending::SetModel(_) | Pending::SetConfig(_, _) | Pending::Authenticate | Pending::SignIn)) {
             return true;
         }
         while !self.changes.is_empty() {
@@ -813,22 +897,11 @@ impl Acp {
         self.has_config = true;
         self.config = options.to_vec();
         let mut known = std::mem::take(&mut core.meta.models);
-        if self.devin() {
-            let keep_default = known.iter().any(|m| m.default);
-            for mut model in super::kinds::models_of("devin") {
-                if keep_default {
-                    model.default = false;
-                }
-                match known.iter_mut().find(|m| m.id == model.id) {
-                    Some(kept) => {
-                        kept.default |= model.default;
-                        if kept.efforts.is_empty() {
-                            kept.efforts = model.efforts;
-                        }
-                    }
-                    None => known.push(model),
-                }
-            }
+        // The catalog kiln knows of its models (Devin's; Antigravity's, `catalog::agy_catalog`): each one's efforts,
+        // which its session says for the one in use alone.
+        let catalog = if self.devin() { Some("devin") } else if self.agy() { Some("antigravity") } else { None };
+        if let Some(catalog) = catalog {
+            with_catalog(&mut known, super::kinds::models_of(catalog));
         }
         core.meta.modes.clear();
         core.meta.efforts.clear();
@@ -1529,15 +1602,36 @@ impl Acp {
                     core.compacting_over(None);
                 }
             }
+            // The turn's usage is whichever of its answers gives one: Devin gives each prompt of a turn the
+            // turn's own, Antigravity answers the prompt a message steered into at once, with none, and gives
+            // the whole turn's with the last.
+            let usage = v.pointer("/result/usage").cloned();
             if self.prompting.as_deref() == Some(client.as_str()) {
-                self.prompt_result = Some(v.clone());
-            } else if let Some(err) = v.get("error") {
-                self.notice(core, Level::Error, err.get("message").and_then(Value::as_str).unwrap_or("request failed"));
+                let mut own = v.clone();
+                if own.pointer("/result/usage").is_none()
+                    && let (Some(u), Some(r)) = (self.turn_usage.take(), own.get_mut("result").and_then(Value::as_object_mut))
+                {
+                    r.insert("usage".into(), u);
+                }
+                self.prompt_result = Some(own);
+            } else {
+                if let Some(err) = v.get("error") {
+                    self.notice(core, Level::Error, err.get("message").and_then(Value::as_str).unwrap_or("request failed"));
+                }
+                if let Some(u) = usage {
+                    match self.prompt_result.as_mut().and_then(|r| r.get_mut("result")).and_then(Value::as_object_mut) {
+                        Some(r) => {
+                            r.entry("usage").or_insert(u);
+                        }
+                        None => self.turn_usage = Some(u),
+                    }
+                }
             }
             if self.pending.values().any(|p| matches!(p, Pending::Prompt(_))) {
                 return;
             }
             self.cancelling = false;
+            self.turn_usage = None;
             response = self.prompt_result.take().unwrap_or_else(|| v.clone());
             &response
         } else {
@@ -1569,6 +1663,8 @@ impl Acp {
                     let hint = match msg.to_lowercase().contains("auth") {
                         // Cursor's sign-in is kiln's account card's; it goes on once signed in.
                         true if self.kind == "cursor" => " (sign in with /login: it goes on once you're signed in)",
+                        // Antigravity's too; a sign-in from kiln starts it again.
+                        true if self.agy() => " (sign in with /login: it starts again once you're signed in)",
                         true => " (sign in to it in a terminal on this machine first)",
                         false => "",
                     };
@@ -1593,6 +1689,11 @@ impl Acp {
                     let why = err.pointer("/data/message").and_then(Value::as_str).unwrap_or(&msg).to_owned();
                     self.startup_failed(core, Pending::Authenticate, format!("Cursor isn't signed in on this machine ({why}): sign in with /login, and it goes on"));
                 }
+                Pending::SignIn => {
+                    let why = err.pointer("/data/message").and_then(Value::as_str).unwrap_or(&msg).to_owned();
+                    let method = self.sign_in.clone().unwrap_or_default();
+                    self.startup_failed(core, Pending::SignIn, format!("The agent couldn't sign in with {method} ({why}): sign in with /login, and it starts again"));
+                }
                 Pending::Capabilities => {}
                 Pending::SetMode(_) => self.setting_failed(core, id, Some("mode"), &msg),
                 Pending::SetModel(_) => self.setting_failed(core, id, Some("model"), &msg),
@@ -1614,30 +1715,17 @@ impl Acp {
                 core.state.harness_status = status_rows(&result);
                 self.auth = result.get("authMethods").and_then(Value::as_array).into_iter().flatten().filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_owned)).collect();
                 core.touch_state();
-                let cwd = self.cwd(core);
-                match self.resume.clone().filter(|_| self.can_load) {
-                    Some(sid) => {
-                        // Its own session, loaded: the conversation in words (a crashed session's
-                        // resume carries them for an agent that can't load) would say it twice.
-                        self.context = None;
-                        self.session = Some(sid.clone());
-                        core.state.harness_session = Some(sid.clone());
-                        let params = self.opening(json!({"sessionId": sid, "cwd": cwd, "mcpServers": self.mcp}));
-                        self.request(core, Pending::Session, "session/load", params);
-                    }
-                    None => {
-                        if self.resume.is_some() {
-                            let how = if self.context.is_some() { "starting a new one, given the conversation in words" } else { "starting a new one" };
-                            self.notice(core, Level::Warn, format!("This agent cannot load earlier sessions; {how}."));
-                        }
-                        let params = self.opening(json!({"cwd": cwd, "mcpServers": self.mcp}));
-                        self.request(core, Pending::Session, "session/new", params);
-                    }
+                // The sign-in kiln keeps for it, where it offers that one, before its session opens.
+                match self.sign_in.clone().filter(|m| self.auth.contains(m)) {
+                    Some(method) => self.request(core, Pending::SignIn, "authenticate", json!({"methodId": method})),
+                    None => self.open_session(core),
                 }
             }
             Pending::Capabilities => self.capabilities(core, &result),
             // Signed in: its session opens again with it.
             Pending::Authenticate => self.reopen(core),
+            // Signed in as kiln keeps it: its session opens.
+            Pending::SignIn => self.open_session(core),
             Pending::Session | Pending::Refresh | Pending::RefreshNew => {
                 if new_session { core.skills_provider_ready(); }
                 self.close_streams(core);
@@ -3524,6 +3612,111 @@ mod tests {
         assert_eq!(core.state.status, Status::Idle);
         // Devin's own model catalog and mid-turn prompts aren't Cursor's.
         assert!(!a.devin() && a.steering == Some(false));
+        Ok(())
+    }
+
+    /// A session's models take each one's efforts from the catalog kiln knows (Antigravity's: `agy models` folded,
+    /// `catalog::agy_catalog`) where the session says none for it: an ACP agent says them for the model in use alone.
+    #[test]
+    fn a_sessions_models_take_their_efforts_from_the_catalog() {
+        let model = |id: &str, efforts: &[&str]| ModelOption { id: id.into(), label: id.into(), efforts: efforts.iter().map(|e| (*e).to_owned()).collect(), ..ModelOption::default() };
+        let mut known = vec![model("gemini-4-neon", &["low", "high"])];
+        with_catalog(&mut known, vec![model("gemini-4-neon", &["low", "medium", "high", "xhigh"]), model("gemini-3.8-flash", &["low", "medium", "high"])]);
+        let got: Vec<(&str, usize)> = known.iter().map(|m| (m.id.as_str(), m.efforts.len())).collect();
+        assert_eq!(got, [("gemini-4-neon", 2), ("gemini-3.8-flash", 3)], "the session's own for the one in use, the catalog's for the others");
+    }
+
+    /// Antigravity signs in with the ACP method kiln keeps for it before its session opens (where
+    /// it offers that method), takes /login and /logout, and starts again on a sign-in from kiln.
+    #[test]
+    fn antigravity_authenticates_with_kilns_sign_in_and_starts_again_on_a_new_one() -> anyhow::Result<()> {
+        let spec = super::super::session::Spec { kind: "antigravity".into(), ..Default::default() };
+        let methods = json!([{"id": "oauth-personal", "name": "Log in with Google"}, {"id": "gemini-api-key", "name": "Gemini API key"}]);
+        let mut a = Acp::from_spec(&spec).with_sign_in(Some("gemini-api-key".into()));
+        let mut core = Core::new();
+        a.start(&mut core);
+        message(&mut a, &mut core, "first", SendMode::Queue);
+        let init = request(&mut core, "initialize")?;
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": init.get("id"), "result": {"protocolVersion": 1, "authMethods": methods}})]);
+        let w = written(&mut core);
+        let auth = w.iter().find(|v| v.get("method") == Some(&json!("authenticate"))).cloned().ok_or_else(|| anyhow::anyhow!("no authenticate: {w:?}"))?;
+        assert_eq!(auth.pointer("/params/methodId"), Some(&json!("gemini-api-key")));
+        assert!(!w.iter().any(|v| v.get("method") == Some(&json!("session/new"))), "its session waits for the sign-in");
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": auth.get("id"), "result": {}})]);
+        let session = request(&mut core, "session/new")?;
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": session.get("id"), "result": {"sessionId": "s1"}})]);
+        let prompt = request(&mut core, "session/prompt")?;
+        assert_eq!(prompt.pointer("/params/prompt/0/text"), Some(&json!("first")));
+        assert!(core.meta.commands.iter().any(|c| c.name == "login") && core.meta.commands.iter().any(|c| c.name == "logout"));
+        // Devin's own model catalog isn't Antigravity's; it steers all the same (its ACP server takes a message
+        // into its turn).
+        assert!(!a.devin() && a.steering == Some(true));
+        // Signed in from kiln: it starts again, as agy reads its credentials as it starts; not
+        // under a turn.
+        core.effects.clear();
+        a.command(&mut core, Command::Control { id: "account".into(), value: None });
+        assert!(!core.effects.iter().any(|e| matches!(e, Effect::Restart { .. })), "not under a turn");
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": prompt.get("id"), "result": {"stopReason": "end_turn"}})]);
+        assert!(core.effects.iter().any(|e| matches!(e, Effect::Restart { resume_at: None })), "once its turn ends");
+
+        // A method it doesn't offer, or none: its own sign-in.
+        let mut b = Acp::from_spec(&spec).with_sign_in(Some("agent-platform".into()));
+        let mut core = Core::new();
+        b.start(&mut core);
+        let init = request(&mut core, "initialize")?;
+        feed(&mut b, &mut core, &[json!({"jsonrpc": "2.0", "id": init.get("id"), "result": {"protocolVersion": 1, "authMethods": methods}})]);
+        request(&mut core, "session/new")?;
+        // Refused: what it said, and how to sign in from kiln.
+        let mut c = Acp::from_spec(&spec);
+        let mut core = Core::new();
+        c.start(&mut core);
+        let init = request(&mut core, "initialize")?;
+        feed(&mut c, &mut core, &[json!({"jsonrpc": "2.0", "id": init.get("id"), "result": {"protocolVersion": 1}})]);
+        let session = request(&mut core, "session/new")?;
+        feed(&mut c, &mut core, &[json!({"jsonrpc": "2.0", "id": session.get("id"), "error": {"code": -32000, "message": "Authentication required"}})]);
+        let said = core.state.exit.as_ref().and_then(|e| e.error.clone()).unwrap_or_default();
+        assert!(said.contains("Authentication required") && said.contains("/login"), "{said}");
+        // A sign-in from kiln then starts it again.
+        c.command(&mut core, Command::Control { id: "account".into(), value: None });
+        assert!(core.effects.iter().any(|e| matches!(e, Effect::Restart { resume_at: None })));
+        // A sign-in it turns down says so.
+        let mut d = Acp::from_spec(&spec).with_sign_in(Some("gemini-api-key".into()));
+        let mut core = Core::new();
+        d.start(&mut core);
+        let init = request(&mut core, "initialize")?;
+        feed(&mut d, &mut core, &[json!({"jsonrpc": "2.0", "id": init.get("id"), "result": {"protocolVersion": 1, "authMethods": methods}})]);
+        let auth = request(&mut core, "authenticate")?;
+        feed(&mut d, &mut core, &[json!({"jsonrpc": "2.0", "id": auth.get("id"), "error": {"code": -32000, "message": "API key not valid"}})]);
+        let said = core.state.exit.as_ref().and_then(|e| e.error.clone()).unwrap_or_default();
+        assert!(core.state.status == Status::Exited && said.contains("gemini-api-key") && said.contains("API key not valid") && said.contains("/login"), "{said}");
+        Ok(())
+    }
+
+    /// A message steered into Antigravity's turn goes to it at once: agy answers the prompt it joined there and then,
+    /// with no usage, goes on in the same turn, and gives the whole turn's usage with the last answer
+    /// (docs/research/agy-acp/steer-1.5.14-macos-arm64.log). The turn ends once, its tokens counted once.
+    #[test]
+    fn a_message_steered_into_antigravitys_turn_goes_at_once_and_its_usage_comes_with_the_last() -> anyhow::Result<()> {
+        let mut a = Acp::from_spec(&super::super::session::Spec { kind: "antigravity".into(), ..Default::default() });
+        let mut core = Core::new();
+        a.start(&mut core);
+        let init = request(&mut core, "initialize")?;
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": init.get("id"), "result": {"protocolVersion": 1}})]);
+        let session = request(&mut core, "session/new")?;
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": session.get("id"), "result": {"sessionId": "s1"}})]);
+        assert!(core.meta.features.iter().any(|f| f == "steer"), "{:?}", core.meta.features);
+        message(&mut a, &mut core, "count", SendMode::Queue);
+        let first = request(&mut core, "session/prompt")?;
+        message(&mut a, &mut core, "steer", SendMode::Steer);
+        let steered = request(&mut core, "session/prompt")?;
+        assert_eq!(steered.pointer("/params/prompt/0/text"), Some(&json!("steer")), "it goes at once");
+        // agy answers the first at once, with no usage; the turn goes on.
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": first.get("id"), "result": {"stopReason": "end_turn"}})]);
+        assert_eq!((core.state.status, core.state.usage.turns), (Status::Running, 0));
+        // Its last answer, with the whole turn's usage.
+        feed(&mut a, &mut core, &[json!({"jsonrpc": "2.0", "id": steered.get("id"), "result": {"stopReason": "end_turn", "usage": {"inputTokens": 10875, "outputTokens": 90, "cachedReadTokens": 6624}}})]);
+        assert_eq!((core.state.status, core.state.usage.turns, core.state.usage.input_tokens, core.state.usage.output_tokens), (Status::Idle, 1, 10875, 90));
+        assert_eq!((core.state.delivery.get("count"), core.state.delivery.get("steer")), (Some(&Delivery::Completed), Some(&Delivery::Completed)));
         Ok(())
     }
 }

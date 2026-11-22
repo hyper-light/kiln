@@ -1385,21 +1385,21 @@ mod stub {
         Ok(())
     }
 
+    /// Antigravity's stand-in, started as kiln starts agy (`agy acp`, its own ACP server), speaks ACP: a session, a turn.
     #[test]
-    fn s35_antigravity_takes_kilns_mcp_server_into_its_config_and_turns() -> anyhow::Result<()> {
-        let home = tempfile::tempdir()?;
-        let home_dir = home.path().to_string_lossy().into_owned();
-        let added = Command::new("python3").arg(crate::vm_e2e::stub_path()).args(["mcp", "add", "kiln", "/opt/kiln", "reach", "mcp"]).env("VM_STUB_PROTOCOL", "agy").env("HOME", &home_dir).status()?;
-        assert!(added.success());
-        let config: Value = serde_json::from_slice(&std::fs::read(home.path().join(".gemini/config/mcp_config.json"))?)?;
-        assert_eq!(config.pointer("/mcpServers/kiln"), Some(&json!({"command": "/opt/kiln", "args": ["reach", "mcp"]})), "as kiln's agy_has reads it");
-        let mut s = start("agy", &["--input-format", "stream-json", "--output-format", "stream-json", "--conversation", "conv-1"], &[("HOME", &home_dir)], None)?;
-        let init = s.until(|v| at(v, "/event") == "init")?;
-        assert_eq!(init.last().map(|v| at(v, "/conversation_id")), Some("conv-1"));
-        s.send(&json!({"event": "user", "message": {"content": "do it"}}))?;
-        let turn = s.until(|v| at(v, "/event") == "result")?;
-        assert_eq!(said(&turn, "/step_update/text_delta").last().map(String::as_str), Some("STUB_DONE"));
-        assert_eq!(turn.last().map(|v| at(v, "/result/status")), Some("SUCCESS"));
+    fn s35_antigravity_speaks_acp_as_agy_acp() -> anyhow::Result<()> {
+        let mut s = start("agy", &["acp"], &[], None)?;
+        s.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}}))?;
+        let init = s.until(|v| v.get("id") == Some(&json!(1)))?;
+        assert_eq!(init.last().and_then(|v| v.pointer("/result/protocolVersion")), Some(&json!(1)));
+        s.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "session/new", "params": {"cwd": "/", "mcpServers": []}}))?;
+        let opened = s.until(|v| v.get("id") == Some(&json!(2)))?;
+        let session = opened.last().map(|v| at(v, "/result/sessionId").to_owned()).unwrap_or_default();
+        assert!(!session.is_empty());
+        s.send(&json!({"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": {"sessionId": session, "prompt": [{"type": "text", "text": "do it"}]}}))?;
+        let turn = s.until(|v| v.get("id") == Some(&json!(3)))?;
+        assert!(said(&turn, "/params/update/content/text").join("\n").ends_with("STUB_DONE"));
+        assert_eq!(turn.last().map(|v| at(v, "/result/stopReason")), Some("end_turn"));
         Ok(())
     }
 

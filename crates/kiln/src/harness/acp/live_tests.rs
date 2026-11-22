@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::harness::core::Core;
-use crate::harness::model::{Body, Command, Delivery, SendMode, Status};
+use crate::harness::model::{Body, Command, Decision, Delivery, SendMode, Status};
 use crate::harness::session::{self, Files, Session, Spec};
 
 struct Running(Arc<Session>);
@@ -288,6 +288,97 @@ fn installed_devin_reloads_credentials_without_restarting_or_losing_queued_work(
         }
         s.close();
         until(s, "closing after credential refresh", |c| c.state.status == Status::Exited).await?;
+        Ok(())
+    })
+}
+
+/// The Antigravity CLI's own ACP server (`agy acp`) through kiln's session, as kiln starts it: its models its session's
+/// own (by their ids, a model and its thinking levels, not its CLI's listing's id for each level), a model, effort and
+/// mode chosen over ACP, an edit asked about in its Default and denied (no file made), a turn stopped mid-reply (ACP's
+/// cancel), each turn's tokens counted, a stopped one's too (what `Kind::says_tokens` holds a token limit to), a message
+/// steered into a turn under way taken into it, and its conversation loaded again by its id (`session/load`), said once.
+#[test]
+#[ignore = "requires an installed, signed-in Antigravity CLI (agy 1.5 or newer)"]
+fn installed_antigravity_runs_over_its_acp_server_says_its_tokens_and_resumes() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        // Its project outside its temporary folder: agy writes there without asking, whatever its mode (agy 1.5.14).
+        let outside = crate::os::home_dir().join(".cache");
+        std::fs::create_dir_all(&outside)?;
+        let dir = tempfile::Builder::new().prefix("kiln-agy-live-").tempdir_in(&outside)?;
+        let spec = Spec { kind: "antigravity".into(), cwd: Some(dir.path().to_string_lossy().into_owned()), mode: Some("default".into()), reach: Some("off".into()), ..Spec::default() };
+        let running = open(spec, dir.path())?;
+        let s = &running.0;
+        until(s, "opening the session", |c| c.state.status == Status::Idle && c.state.mode == "default" && !c.meta.models.is_empty()).await?;
+        {
+            let core = s.core.lock();
+            let ids: Vec<&str> = core.meta.models.iter().map(|m| m.id.as_str()).collect();
+            assert!(ids.iter().any(|id| id.starts_with("gemini-")) && !ids.iter().any(|id| ["-low", "-high", "-xhigh"].iter().any(|l| id.starts_with("gemini-") && id.ends_with(l))), "{ids:?}");
+        }
+        // The cheapest a turn can be: a flash model at its lowest level.
+        let flash = s.core.lock().meta.models.iter().find(|m| m.id.contains("flash")).map(|m| m.id.clone()).ok_or_else(|| anyhow::anyhow!("no flash model"))?;
+        assert!(s.command(Command::SetModel { model: flash.clone(), kind: None }));
+        until(s, "switching models", |c| c.state.model == flash).await?;
+        assert!(s.command(Command::SetEffort { effort: "low".into() }));
+        until(s, "switching effort", |c| c.state.effort == "low").await?;
+        assert!(s.command(Command::SetMode { mode: "plan".into() }));
+        until(s, "switching modes", |c| c.state.mode == "plan").await?;
+        assert!(s.command(Command::SetMode { mode: "default".into() }));
+        until(s, "returning to its Default", |c| c.state.mode == "default").await?;
+
+        // Its Default asks before an edit: asked, denied, and nothing written.
+        send(s, "edit", "Create a file named kiln_probe.txt in the current folder containing the word hi. Use your file editing tool.");
+        if let Err(e) = until(s, "being asked to go ahead", |c| !c.state.approvals.is_empty()).await {
+            let core = s.core.lock();
+            let said: Vec<String> = core.events().map(|e| format!("{:?}", e.body).chars().take(300).collect()).collect();
+            anyhow::bail!("{e:#}: mode {:?}, model {:?}, effort {:?}, status {:?}, edit {:?}, queued {}, said {said:#?}", core.state.mode, core.state.model, core.state.effort, core.state.status, core.state.delivery.get("edit"), core.state.queue.len());
+        }
+        let asked = s.core.lock().state.approvals.first().map(|a| a.id.clone()).ok_or_else(|| anyhow::anyhow!("no approval"))?;
+        assert!(s.command(Command::Approve { id: asked, decision: Decision::Deny, message: Some("Not in this test.".into()), always: None, answers: None, choices: None }));
+        until(s, "the denied turn's end", |c| c.state.delivery.get("edit") == Some(&Delivery::Completed) && c.state.status == Status::Idle).await?;
+        assert!(!dir.path().join("kiln_probe.txt").exists(), "a denied edit made its file");
+
+        // A turn stopped mid-reply (its reply under way, so its model was called) still says its tokens.
+        let before = s.core.lock().state.usage.tokens();
+        let replies = |c: &Core| c.events().filter(|e| matches!(e.body, Body::Assistant { .. })).count();
+        let replied = replies(&s.core.lock());
+        send(s, "stop", "Without using any tools, write the numbers from 1 to 3000, one per line.");
+        until(s, "its long reply under way", |c| c.state.delivery.get("stop") == Some(&Delivery::Started) && replies(c) > replied).await?;
+        assert!(s.command(Command::Interrupt));
+        until(s, "stopping it", |c| c.state.delivery.get("stop") == Some(&Delivery::Cancelled) && c.state.status == Status::Idle).await?;
+        let stopped = s.core.lock().state.usage.tokens();
+        assert!(stopped > before, "a stopped turn said no tokens: {before}, then {stopped}");
+
+        send(s, "answer", "Reply with exactly KILN_AGY_SMOKE_OK. Do not use tools or access files.");
+        until(s, "completing the answer", |c| c.state.delivery.get("answer") == Some(&Delivery::Completed) && c.state.status == Status::Idle).await?;
+        assert!(s.core.lock().events().any(|e| matches!(&e.body, Body::Assistant { text, streaming: false } if text.trim() == "KILN_AGY_SMOKE_OK")));
+        assert!(s.core.lock().state.usage.tokens() > stopped, "an answered turn said no tokens");
+
+        // A message steered into its turn goes to it at once: the turn goes on with it, its tokens counted once.
+        let (before, turns) = { let c = s.core.lock(); (c.state.usage.tokens(), c.state.usage.turns) };
+        let replied = replies(&s.core.lock());
+        send(s, "long", "Without using any tools, write the numbers from 1 to 3000, one per line.");
+        until(s, "a long reply under way", |c| c.state.delivery.get("long") == Some(&Delivery::Started) && replies(c) > replied).await?;
+        assert!(s.command(Command::Send { id: "steer".into(), text: "Stop counting now. Reply with just the word KILN_AGY_STEERED and nothing else.".into(), mode: SendMode::Steer, attachments: Vec::new(), overrides: None, reply_to: None, task: None }));
+        until(s, "the steered turn's end", |c| c.state.delivery.get("steer") == Some(&Delivery::Completed) && c.state.status == Status::Idle).await?;
+        {
+            let c = s.core.lock();
+            assert!(c.events().any(|e| matches!(&e.body, Body::Assistant { text, .. } if text.contains("KILN_AGY_STEERED"))), "the steered words weren't taken");
+            assert_eq!(c.state.delivery.get("long"), Some(&Delivery::Completed));
+            assert!(c.state.usage.tokens() > before && c.state.usage.turns == turns + 1, "a steered turn: {} tokens over {before}, {} turns", c.state.usage.tokens(), c.state.usage.turns);
+        }
+        let resumed_spec = s.resume_spec();
+        let own = resumed_spec.resume.clone().ok_or_else(|| anyhow::anyhow!("agy gave no session id"))?;
+        s.close();
+        until(s, "closing the first process", |c| c.state.status == Status::Exited).await?;
+
+        let resumed = open(resumed_spec, dir.path())?;
+        until(&resumed.0, "loading its conversation again", |c| c.state.status == Status::Idle && c.state.harness_session.as_deref() == Some(own.as_str())).await?;
+        {
+            let core = resumed.0.core.lock();
+            assert_eq!(core.events().filter(|e| matches!(&e.body, Body::Assistant { text, .. } if text.trim() == "KILN_AGY_SMOKE_OK")).count(), 1, "its conversation said twice");
+        }
+        resumed.0.close();
+        until(&resumed.0, "closing the resumed process", |c| c.state.status == Status::Exited).await?;
         Ok(())
     })
 }
