@@ -102,6 +102,29 @@ fn t07_the_runs_an_mcp_server_followed_go_with_it_with_no_output_id() {
     assert_eq!(stopped, [("r1".to_owned(), String::new()), ("r3".to_owned(), String::new())]);
 }
 
+/// CP-T3.2, LB03: what a run's owner, started again, owes its agent goes as the server takes it: a
+/// wait, a start or never as placement's answer, an end or a lost run as news of the run. Planted:
+/// an end told as an answer was refused by the server (`AnswerNews::of` takes none) and dropped,
+/// and the agent waited on a run that was over.
+#[test]
+fn cp_t3_2_an_owner_started_again_tells_an_end_as_news_not_as_an_answer() {
+    use kiln_ci::place::Answer as A;
+    let _turn = fresh();
+    let asker = |key: &str| Answers { session: "s1".into(), key: key.into(), id: key.into(), command: "make".into(), queued: std::sync::Arc::default() };
+    asker("never").owed(&A::Never { need: "a GPU".into(), nearest: None }, 1);
+    asker("ok").owed(&A::Ended { runner: "box".into(), ok: true }, 1);
+    asker("failed").owed(&A::Ended { runner: "box".into(), ok: false }, 1);
+    asker("lost").owed(&A::Lost { runner: "box".into(), why: "its runner went".into() }, 1);
+    let st = STATE.lock();
+    let how = |key: &str| st.entries.iter().find(|e| e.news.key == key).map(|e| (e.news.event, e.answer));
+    assert_eq!(how("never"), Some((RunEvent::Never, true)), "placement's answer");
+    for key in ["ok", "failed", "lost"] {
+        assert_eq!(how(key), Some((RunEvent::Ended, false)), "{key}: news of the run, which the server takes");
+        let e = st.entries.iter().find(|e| e.news.key == key);
+        assert!(e.is_some_and(|e| crate::harness::told::AnswerNews::of(&e.news).is_none()), "{key}: no answer the server would take");
+    }
+}
+
 /// T3, E2: the outbox is kept in a file and read in by the next runner process: a detached run it
 /// followed on another runner is followed on (its peer and reach session kept); one that ran on
 /// this machine, which can't be, is told as ended, how unknown; news the server hadn't had goes.

@@ -541,19 +541,25 @@ impl Answers {
     /// What its run's owner, started again, owes its agent (LB03): where the run stands now that
     /// its runner said, as news. The process that asked is gone, so nothing waits on it: a start or
     /// a wait is told as it is, and an end, or a run lost (whether it ran isn't known), as ended,
-    /// with why.
+    /// with why. A start, a wait or never is placement's answer; an end is news of the run: the
+    /// server takes only queued, started or never as an answer (`AnswerNews::of`) and refused an
+    /// end told as one, so its agent waited on a run that was over (CP-T3.2).
     pub fn owed(&self, a: &kiln_ci::place::Answer, now: i64) {
         use kiln_ci::place::Answer as A;
         let base = RunNews { key: self.key.clone(), id: self.id.clone(), command: self.command.clone(), how: "run".to_owned(), ..RunNews::default() };
-        let news = match a {
-            A::Queued { place, start, .. } => RunNews { event: RunEvent::Queued, place: place.as_ref().map(|p| p.lo), expected_start: start.soonest, ..base },
-            A::Started { runner, .. } => RunNews { event: RunEvent::Started, on: runner.clone(), started_at: Some(now), ..base },
-            A::Never { .. } => RunNews { event: RunEvent::Never, error: Some(a.words(now)), ..base },
-            A::Ended { ok: true, .. } => RunNews { event: RunEvent::Ended, ..base },
-            A::Ended { .. } | A::Lost { .. } => RunNews { event: RunEvent::Ended, error: Some(a.words(now)), ..base },
+        let (news, answer) = match a {
+            A::Queued { place, start, .. } => (RunNews { event: RunEvent::Queued, place: place.as_ref().map(|p| p.lo), expected_start: start.soonest, ..base }, true),
+            A::Started { runner, .. } => (RunNews { event: RunEvent::Started, on: runner.clone(), started_at: Some(now), ..base }, true),
+            A::Never { .. } => (RunNews { event: RunEvent::Never, error: Some(a.words(now)), ..base }, true),
+            A::Ended { ok: true, .. } => (RunNews { event: RunEvent::Ended, ..base }, false),
+            A::Ended { .. } | A::Lost { .. } => (RunNews { event: RunEvent::Ended, error: Some(a.words(now)), ..base }, false),
             A::Starting { .. } => return,
         };
-        say_answer(&self.session, news);
+        if answer {
+            say_answer(&self.session, news);
+        } else {
+            say(&self.session, news, None);
+        }
     }
 
     /// Placement answered `a`, at `now` (the owner's clock, this machine's).
