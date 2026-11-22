@@ -24,6 +24,112 @@ const OUT: &str = "docs/records-inventory.md";
 /// written again, and not read against the code.
 const BY_HAND: &str = "\n## Designed by hand\n";
 
+/// How each JSON file kiln writes (not tests only) is kept once kiln's records are on Amphora: kiln's own state, which
+/// kiln writes and reads back, as Records (`crates/kiln/src/records/files.rs` carries each, and its test holds this to
+/// it); a format another program reads, lab output, scratch for one leg or push, or a cache, as a file. A new file
+/// fails [`cp_t1_5_every_table_and_json_record_has_its_inventory_entry`] until it has its line here.
+const KEPT: &[(&str, &str)] = &[
+    ("../../ui/tests/bp-measure.json", "lab output: a file"),
+    (".gemini/antigravity-cli/settings.json", "a file: Antigravity's own settings, in its home"),
+    (".gemini/config/hooks.json", "a file: Antigravity's hooks, in its home"),
+    (".gemini/config/mcp_config.json", "a file: Antigravity's MCP configuration, in its home"),
+    (".keep.json", "Records `kiln.files`"),
+    (".sigstore.json", "a file: a Sigstore bundle, for verifiers"),
+    ("/vm.json", "a file: Firecracker's VM configuration"),
+    ("_kiln_build_{idx}.json", "scratch: BuildKit's metadata of one leg's build, gone with it"),
+    ("agent-handover.json", "Records `kiln.files`"),
+    ("agent-limit.json", "Records `kiln.files`"),
+    ("attachments/uploads/{id}.json", "not a file: an upload's metadata, a key in kiln's blob store (kiln-seams' Blobs), which moves with its blobs"),
+    ("bar.json", "lab output: a file"),
+    ("binaries/kiln-{target}.json", "not a file: a release binary's metadata, a key in kiln's blob store (kiln-seams' Blobs), which moves with its blobs"),
+    ("builds.json", "Records `kiln.files`"),
+    ("clouds.json", "Records `kiln.files`"),
+    ("config.json", "a file: Docker's credentials configuration"),
+    ("config.v2.json", "a file: Docker's container configuration, only read"),
+    ("context.json", "scratch: one push's signature check, gone with it"),
+    ("copies.json", "Records `kiln.files`"),
+    ("epochs.json", "Records `kiln.files`"),
+    ("estimates.json", "a file: criterion's output, only read"),
+    ("event.json", "a file: GitHub's event payload, for a leg's actions"),
+    ("eventhubs-{name}.json", "Records `kiln.files`"),
+    ("extension/manifest.json", "a file: a browser extension's manifest"),
+    ("gone.json", "tests only (headroom/pace.rs's tests: the reader takes their item as ended at a brace in a string)"),
+    ("handovers-decided.json", "Records `kiln.files`"),
+    ("handovers-taken.json", "Records `kiln.files`"),
+    ("harness-models.json", "Records `kiln.files`"),
+    ("harness.json", "Records `kiln.files`"),
+    ("hold.json", "lab output: a file"),
+    ("holders.json", "Records `kiln.files`"),
+    ("identity.json", "a file: this device's sign-in and its key, a secret kept 0600 on its machine (`kiln login`)"),
+    ("indexes.json", "Records `kiln.files`"),
+    ("instance.json", "Records `kiln.files`"),
+    ("integrations.json", "scratch: one leg's integrations, for `kiln auth` in it, gone with it"),
+    ("jail.json", "a file: the jailer's configuration of a VM"),
+    ("job.json", "lab output: a file"),
+    ("keep-off.json", "Records `kiln.files`"),
+    ("kiln-mcp.json", "a file: the agents' MCP configuration"),
+    ("kiln-{t}.json", "a file: a binary kept the old way (`<data>/binaries`), taken into kiln's blob store as the server starts"),
+    ("lane.json", "Records `kiln.files`"),
+    ("live.json", "tests only (headroom/pace.rs's tests: the reader takes their item as ended at a brace in a string)"),
+    ("local.json", "Records `kiln.files`"),
+    ("manifest.json", "a file: a browser extension's manifest, or an image's (docker save), only read"),
+    ("member.json", "Records `kiln.files`"),
+    ("members.json", "Records `kiln.files`"),
+    ("mirrors.json", "Records `kiln.files`"),
+    ("moved-git.json", "Records `kiln.files`"),
+    ("names.json", "Records `kiln.files`"),
+    ("next.json", "Records `kiln.files`"),
+    ("openapi.json", "not a file: the API's answer to GET /api/openapi.json"),
+    ("pace.json", "Records `kiln.files`"),
+    ("paced.json", "a file: read once and deleted (headroom::pace::release_left); nothing writes it now"),
+    ("package.json", "scratch: a session's package, taken by Host::adopt_package, gone with it"),
+    ("pins.json", "Records `kiln.files`"),
+    ("plugin.json", "a file: Claude Code's plugin manifest"),
+    ("profile-checks.json", "lab output: a file"),
+    ("provenance.sigstore.json", "a file: a Sigstore bundle, for verifiers"),
+    ("reads.json", "a cache: rustc's reads, under ~/.cache/kiln/rustc, made again when gone"),
+    ("record.json", "lab output: a file"),
+    ("rehydrations.json", "Records `kiln.files`"),
+    ("replaces.json", "Records `kiln.files`"),
+    ("result.json", "lab output: a file"),
+    ("run.json", "lab output: a file"),
+    ("runner-engine.json", "Records `kiln.files`"),
+    ("runs.json", "Records `kiln.files`"),
+    ("sample.json", "a file: criterion's output, only read"),
+    ("sbom.cdx.json", "a file: a CycloneDX SBOM, for other tools"),
+    ("sbom.sigstore.json", "a file: a Sigstore bundle, for verifiers"),
+    ("sbom.spdx.json", "a file: an SPDX SBOM, for other tools"),
+    ("scrapes.json", "Records `kiln.files`"),
+    ("search-meta.json", "Records `kiln.files`"),
+    ("shaped-{}.json", "lab output: a file"),
+    ("supervise-{}.json", "Records `kiln.files`"),
+    ("target/ci-bench.json", "lab output: a file"),
+    ("tasks.json", "Records `kiln.files`"),
+    ("terminal-handover.json", "Records `kiln.files`"),
+    ("times_ms.json", "lab output: a file"),
+    ("told.json", "Records `kiln.files`"),
+    ("ui/package.json", "not written: a check that a folder is kiln's checkout (updates.rs)"),
+    ("update-available.json", "a file: a note that an update is ready, for the person; kiln doesn't read it back"),
+    ("vm.json", "a file: Firecracker's VM configuration"),
+    ("{base}/index.json", "not a file: an image index fetched over HTTP"),
+    ("{dir}.d/osi.json", "a file: a Shards image's configuration, only read"),
+    ("{hex}.config.json", "a cache: an image's configuration beside its root file system, made again when gone"),
+    ("{hex}.json", "a cache: an image's manifest beside its root file system, made again when gone"),
+    ("{id}.json", "Records `kiln.files` (host.rs: archived sessions; visuals.rs); scratch (runtime.rs: a microVM's call)"),
+    ("{key}.json", "Records `kiln.files`"),
+    ("{name}.json", "Records `kiln.files`"),
+    ("{n}.json", "Records `kiln.files`"),
+    ("{owner}.json", "Records `kiln.files`"),
+    ("{project}.json", "Records `kiln.files`"),
+    ("{public_id}.json", "Records `kiln.files`"),
+    ("{safe}-{}.json", "Records `kiln.files`"),
+    ("{safe}.json", "a file: a session's MCP configuration, for its agent"),
+    ("{}-gcp.json", "a file: Google Cloud's credentials, for a leg's tools"),
+    ("{}-{}.json", "Records `kiln.files`"),
+    ("{}.json", "Records `kiln.files` (kept.rs, firecracker.rs, place.rs); scratch (pushsig.rs: a push's verdicts)"),
+    ("{}/.gemini/config/mcp_config.json", "a file: Antigravity's MCP configuration, in its guest's home"),
+];
+
 /// Where each table is created and dropped, and whether only tests make it.
 #[derive(Default)]
 struct Table {
@@ -239,7 +345,9 @@ fn inventory(root: &Path) -> Result<String, String> {
          CP-T1.5 to CP-T1.7 (G9 step 2): what moves to Records on Amphora. Written by\n\
          `scripts/records-inventory.sh`; `crates/kiln-seams/tests/records_inventory.rs` fails when this\n\
          file and the code differ, and says how it reads the code. A table only tests make, or one\n\
-         dropped by a later migration, is listed too, and says so.\n\n## SQLite tables\n\n\
+         dropped by a later migration, is listed too, and says so. Each JSON file says how it's kept on\n\
+         Amphora: as Records (`crates/kiln/src/records/files.rs`), or as a file, and why. The part after\n\
+         \"Designed by hand\" is written by hand.\n\n## SQLite tables\n\n\
          | Table | Created in | Dropped or renamed in | Tests only |\n|---|---|---|---|\n",
     );
     for (name, t) in &tables {
@@ -248,9 +356,19 @@ fn inventory(root: &Path) -> Result<String, String> {
         }
         out.push_str(&format!("| `{name}` | {} | {} | {} |\n", join(&t.created), join(&t.dropped), if t.test_only { "yes" } else { "" }));
     }
-    out.push_str("\n## JSON files kiln writes\n\n| File | Written in | Tests only |\n|---|---|---|\n");
+    out.push_str("\n## JSON files kiln writes\n\n| File | Written in | Tests only | Kept as |\n|---|---|---|---|\n");
+    let kept: BTreeMap<&str, &str> = KEPT.iter().copied().collect();
+    let mut unsaid = Vec::new();
     for (name, (files, test)) in &json {
-        out.push_str(&format!("| `{name}` | {} | {} |\n", join(files), if *test { "yes" } else { "" }));
+        let how = if *test { "" } else { kept.get(name.as_str()).copied().unwrap_or_else(|| { unsaid.push(name.clone()); "?" }) };
+        out.push_str(&format!("| `{name}` | {} | {} | {how} |\n", join(files), if *test { "yes" } else { "" }));
+    }
+    if !unsaid.is_empty() {
+        return Err(format!("JSON files kiln writes with no line in KEPT (say how each is kept): {unsaid:?}"));
+    }
+    let stale: Vec<&&str> = kept.keys().filter(|k| !json.get(**k).is_some_and(|(_, test)| !test)).collect();
+    if !stale.is_empty() {
+        return Err(format!("KEPT names files kiln no longer writes (or only its tests do): {stale:?}"));
     }
     Ok(out)
 }
