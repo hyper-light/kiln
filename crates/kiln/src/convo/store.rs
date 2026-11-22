@@ -28,6 +28,34 @@ use super::telemetry::{CompactView, Compacted, Meter, Pruned, StoreReport, Upkee
 use crate::harness::core::Update;
 use crate::harness::session::{Sink, Taken};
 
+/// Why the store answered no rather than failed (CP-T1.1, the Conversations seam's `Refused` and `Closed`): past its
+/// bound on a wait for its writer or reader ([`READ_WAIT`]), or its writer gone. What isn't one of these is a fault
+/// (the disk's, the engine's), said in their words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Its writer has stopped: closed, or ended on its own.
+    Stopped,
+    /// Its writer stopped after it took an append and before it said whether it was written.
+    StoppedBeforeOutcome,
+    /// No answer within `READ_WAIT`.
+    NoAnswer,
+    /// No word within `READ_WAIT` of whether an append was written: it may yet be, so it's no Ok.
+    NoOutcome,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stopped => "the conversation store has stopped",
+            Self::StoppedBeforeOutcome => "the conversation store stopped before it said whether it was written",
+            Self::NoAnswer => "the conversation store didn't answer in time",
+            Self::NoOutcome => "the conversation store didn't say in time whether it was written",
+        })
+    }
+}
+
+impl std::error::Error for Refusal {}
+
 /// Longest a read waits for the writer.
 pub const READ_WAIT: Duration = Duration::from_secs(10);
 /// The most sessions [`Store::ended`] answers a page.
@@ -332,6 +360,9 @@ pub trait Engine: Send + 'static {
 /// store's reader thread), never behind the writes sent before it; or the writer itself ([`OnWriter`]). For reads of
 /// what was committed a while ago (an older page); one that must see what was just sent goes to the writer.
 pub trait Read {
+    /// As [`Engine::changes`], the page and the number it reads through of one commit (a snapshot): the feed read
+    /// beside the writer, never behind the writes sent before it (CP-T1.1).
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes>;
     /// As [`Engine::events`].
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
     /// As [`Engine::thread`].
@@ -354,6 +385,10 @@ pub trait Read {
 struct OnWriter<'a>(&'a mut dyn Engine);
 
 impl Read for OnWriter<'_> {
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
+        self.0.changes(from, max_bytes, kept, inbox)
+    }
+
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.0.events(session, before, limit)
     }
@@ -471,6 +506,9 @@ pub struct Queue {
     /// The most any sender may let wait before it waits itself ([`Store::room_within`]): what `/metrics` says the
     /// queue may hold.
     within: AtomicUsize,
+    /// The writer has ended (closed, or on its own): set before its watchers are told, so a wait woken by that
+    /// ends Closed rather than hanging on a commit that can't come (CP-T1.1).
+    stopped: std::sync::atomic::AtomicBool,
     /// The writer's wakes from a wait, and the wake it last took rows on (a test's).
     #[cfg(test)]
     woke: AtomicU64,
@@ -570,7 +608,13 @@ impl Store {
             None => None,
         };
         let (w, m, h, q, r) = (watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue), reads.clone());
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &w, upkeep, &m, &h, &q, r.as_ref()))?;
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || {
+            writer(engine, &rx, &w, upkeep, &m, &h, &q, r.as_ref());
+            // However it ended, whoever waits on a commit hears it ([`Store::stopped`]).
+            q.stopped.store(true, Ordering::Release);
+            notify(&w);
+            q.room.notify();
+        })?;
         Ok(Self { tx, queue, id, meter, watchers, hold, reads })
     }
 
@@ -597,8 +641,9 @@ impl Store {
     /// this one stayed behind.
     pub fn close(&self) -> anyhow::Result<()> {
         let (rtx, rrx) = mpsc::channel();
-        self.tx.send(Msg::Close(rtx)).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
-        rrx.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store stopped before it said it let go of its file")))
+        self.tx.send(Msg::Close(rtx)).map_err(|_| anyhow::Error::from(Refusal::Stopped))?;
+        // A writer that ended as this was sent has let go of its file as it ended: stopped, as one gone before.
+        rrx.recv().unwrap_or_else(|_| Err(Refusal::Stopped.into()))
     }
 
     /// Who this store is to its peers.
@@ -679,13 +724,13 @@ impl Store {
         let (tx, rx) = mpsc::channel();
         if self.tx.send(Msg::Committed(rows, bytes, tx)).is_err() {
             self.queue.let_go(bytes, false);
-            anyhow::bail!("the conversation store has stopped");
+            return Err(Refusal::Stopped.into());
         }
         match rx.recv_timeout(READ_WAIT) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(why)) => Err(anyhow::anyhow!("the conversation store couldn't write it: {why}")),
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!("the conversation store didn't say in time whether it was written")),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!("the conversation store stopped before it said whether it was written")),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(Refusal::NoOutcome.into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Refusal::StoppedBeforeOutcome.into()),
         }
     }
 
@@ -734,7 +779,7 @@ impl Store {
             .send(Msg::Run(Box::new(move |e| {
                 let _ = rtx.send(f(e));
             })))
-            .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
+            .map_err(|_| anyhow::Error::from(Refusal::Stopped))?;
         match rrx.recv_timeout(READ_WAIT) {
             Ok(answer) => {
                 self.meter.waited(asked.elapsed());
@@ -742,7 +787,7 @@ impl Store {
             }
             Err(_) => {
                 self.meter.timed_out();
-                Err(anyhow::anyhow!("the conversation store didn't answer in time"))
+                Err(Refusal::NoAnswer.into())
             }
         }
     }
@@ -754,13 +799,13 @@ impl Store {
             .send(Msg::Run(Box::new(move |e| {
                 let _ = rtx.send(f(e));
             })))
-            .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
+            .map_err(|_| anyhow::Error::from(Refusal::Stopped))?;
         match crate::rt::timeout(READ_WAIT, rrx).await {
             Ok(Ok(answer)) => answer,
-            Ok(Err(_)) => Err(anyhow::anyhow!("the conversation store has stopped")),
+            Ok(Err(_)) => Err(anyhow::Error::from(Refusal::Stopped)),
             Err(_) => {
                 self.meter.timed_out();
-                Err(anyhow::anyhow!("the conversation store didn't answer in time"))
+                Err(Refusal::NoAnswer.into())
             }
         }
     }
@@ -782,13 +827,13 @@ impl Store {
     /// writer is done with it. Its feed is told.
     pub async fn inbox_commit(&self, tx: kiln_seams::records::Tx, sessions: Vec<String>, owner: Option<Box<dyn Send + Sync>>) -> anyhow::Result<Result<u64, kiln_seams::records::Refusal>> {
         let (reply, answer) = futures::channel::oneshot::channel();
-        self.tx.send(Msg::Inbox(Box::new(InboxJob { tx, sessions, owner, reply }))).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
+        self.tx.send(Msg::Inbox(Box::new(InboxJob { tx, sessions, owner, reply }))).map_err(|_| anyhow::Error::from(Refusal::Stopped))?;
         match crate::rt::timeout(READ_WAIT, answer).await {
             Ok(Ok(answer)) => answer,
-            Ok(Err(_)) => Err(anyhow::anyhow!("the conversation store has stopped")),
+            Ok(Err(_)) => Err(anyhow::Error::from(Refusal::Stopped)),
             Err(_) => {
                 self.meter.timed_out();
-                Err(anyhow::anyhow!("the conversation store didn't answer in time"))
+                Err(Refusal::NoAnswer.into())
             }
         }
     }
@@ -832,7 +877,7 @@ impl Store {
         if let Some(ReadMsg::Run(job)) = back {
             self.tx
                 .send(Msg::Run(Box::new(move |e| job(&mut OnWriter(e)))))
-                .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
+                .map_err(|_| anyhow::Error::from(Refusal::Stopped))?;
         }
         match rrx.recv_timeout(READ_WAIT) {
             Ok(answer) => {
@@ -841,7 +886,7 @@ impl Store {
             }
             Err(_) => {
                 self.meter.timed_out();
-                Err(anyhow::anyhow!("the conversation store didn't answer in time"))
+                Err(Refusal::NoAnswer.into())
             }
         }
     }
@@ -939,6 +984,12 @@ impl Store {
         self.changes_as(from, max_bytes, false, true)
     }
 
+    /// [`Store::changes`] as committed: read beside the writer at one commit ([`Store::read`], [`Read::changes`]), never
+    /// a turn of the writer's, so a follower's pages don't compete with appends for it (CP-T1.1). Blocking.
+    pub fn changes_committed(&self, from: u64, max_bytes: usize) -> anyhow::Result<Changes> {
+        self.read(move |r| r.changes(from, max_bytes, false, true))
+    }
+
     /// [`Store::changes`], record lines as they are kept when `kept` ([`Engine::changes`]).
     /// Blocking.
     pub fn changes_as(&self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
@@ -996,6 +1047,12 @@ impl Store {
     /// The last number the store gave a write. Blocking.
     pub fn top(&self) -> anyhow::Result<u64> {
         self.run(|e| Ok(e.top()))
+    }
+
+    /// Whether the store's writer has ended (closed, or on its own): set before its watchers are told of it
+    /// ([`Store::watch`]), so a watcher woken that finds it set waits no more.
+    pub fn stopped(&self) -> bool {
+        self.queue.stopped.load(Ordering::Acquire)
     }
 
     /// The newest number committed, as the writer last said before telling its watchers ([`Store::watch`]): never
@@ -1413,7 +1470,9 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 #[cfg(test)]
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::channel();
-    Store { tx, queue: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), reads: None }
+    let queue: Arc<Queue> = Arc::default();
+    queue.stopped.store(true, Ordering::Release);
+    Store { tx, queue, id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), reads: None }
 }
 
 /// An engine that takes `hold` longer than `inner` to let go of its file ([`Engine::release`]), its
@@ -1635,6 +1694,54 @@ mod tests {
         holder.join().map_err(|_| anyhow::anyhow!("the holder's thread panicked"))??;
         assert_eq!(page?.iter().map(|e| e.seq).collect::<Vec<_>>(), (21..=30).collect::<Vec<_>>());
         assert!(took < Duration::from_secs(2), "the read waited for the writer: {took:?}");
+        Ok(())
+    }
+
+    /// CP-T1.1 (seam review 7, lane vendor-amphora-9's leftover): the seam's feed and history read beside the writer at
+    /// a commit, never a turn of the writer's: both answer, with what was committed, while the writer is held (as a
+    /// commit to a disk that stalls holds it), on each engine. And an append then, past the store's wait, is Refused with
+    /// its reason, never Failed (seam review 9). Read on the writer, the page and the history waited for it and were
+    /// refused.
+    #[test]
+    #[cfg_attr(windows, ignore = "Windows has no reader beside the writer: a compaction's swap can't rename over an open file")]
+    fn cp_t1_1_the_feed_and_history_read_beside_a_held_writer() -> anyhow::Result<()> {
+        use kiln_seams::conversations::{Conversations, Entry, Error};
+        for kind in super::super::Kind::ALL {
+            let dir = tempfile::tempdir()?;
+            let store = Store::start(kind.open(&dir.path().join(super::super::FILE))?, Upkeep::default())?;
+            let c = super::super::seam::StoreConversations::new(store.clone());
+            let first = Entry { conversation: "a".into(), id: "m1".into(), seq: 1, text: "committed".into() };
+            c.append(std::slice::from_ref(&first)).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            let top = c.top().map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            let (held_tx, held_rx) = mpsc::channel::<()>();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            // Held until told (or until this test lets go of `go_tx`), however long its own wait for the answer is.
+            let holder = {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store.run(move |_| {
+                        let _ = held_tx.send(());
+                        let _ = go_rx.recv();
+                        Ok(())
+                    })
+                })
+            };
+            held_rx.recv()?;
+            let page = c.changes(0, 1 << 20);
+            let history = c.history("a", None, 10);
+            // Past the store's wait for its writer: refused, said why (once: it's the same on each engine).
+            let refused = if matches!(kind, super::super::Kind::Turso) { Some(c.append(&[Entry { conversation: "a".into(), id: "m2".into(), seq: 2, text: "held".into() }])) } else { None };
+            let _ = go_tx.send(());
+            let _ = holder.join();
+            let page = page.map_err(|e| anyhow::anyhow!("{kind:?}: the feed with the writer held: {e}"))?;
+            anyhow::ensure!(page.changes.iter().map(|ch| &ch.entry).collect::<Vec<_>>() == vec![&first] && page.upto == top, "{kind:?}: the feed with the writer held: {page:?}, the top {top}");
+            let history = history.map_err(|e| anyhow::anyhow!("{kind:?}: the history with the writer held: {e}"))?;
+            anyhow::ensure!(history == vec![first.clone()], "{kind:?}: the history with the writer held: {history:?}");
+            if let Some(refused) = refused {
+                anyhow::ensure!(matches!(&refused, Err(Error::Refused(why)) if why.contains("didn't say in time")), "{kind:?}: an append past the store's wait answered {refused:?}");
+            }
+            c.close().map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+        }
         Ok(())
     }
 

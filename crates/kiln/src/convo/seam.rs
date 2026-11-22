@@ -10,14 +10,16 @@ use kiln_seams::conversations::{Changed, Conversations, Entry, Error, Page};
 use parking_lot::Mutex;
 
 use super::rows::{self, Row};
-use super::store::Store;
+use super::store::{Refusal, Store};
 use crate::harness::core::Update;
 use crate::harness::model::{Body, Event};
 
 /// A [`Store`] as the seam's Conversations: an entry is an assistant's event of its session.
 pub struct StoreConversations {
     store: Store,
-    /// Sessions given their row: a session's row goes before its first event, as kiln's harness writes it.
+    /// Sessions given their row: a session's row goes before its first event, as kiln's harness writes it. One entry
+    /// a conversation this handle appended to, let go of as the handle closes (seam review 8); within a handle's
+    /// life it grows with the conversations it writes, as the store's own sessions do (see the lane's report).
     opened: Mutex<HashSet<String>>,
     closed: AtomicBool,
     /// Told as the handle is let go of: a wait under way hears it and is refused Closed ([`Conversations::wait`]).
@@ -33,15 +35,23 @@ impl StoreConversations {
         if self.closed.load(Ordering::Acquire) { Err(Error::Closed) } else { Ok(()) }
     }
 
-    /// The store's error, or Closed when the handle was let go of meanwhile: what was under way as it closed (its writer
-    /// gone with it) is refused Closed, as what's asked after is, and never written once refused.
+    /// The store's error as the seam's, Closed when the handle was let go of meanwhile or its writer has ended: what
+    /// was under way as it closed (its writer gone with it) is refused Closed, as what's asked after is, and never
+    /// written once refused.
     fn failed(&self, e: anyhow::Error) -> Error {
-        if self.closed.load(Ordering::Acquire) { Error::Closed } else { failed(e) }
+        error_of(self.closed.load(Ordering::Acquire) || self.store.stopped(), e)
     }
 }
 
-fn failed(e: anyhow::Error) -> Error {
-    Error::Failed(format!("{e:#}"))
+/// The store's error as the seam's (seam review 9): a handle closed, or the store's writer gone, is Closed; past one of
+/// its bounds ([`Refusal`]) is Refused with its reason; anything else (the disk, the engine) Failed in its words.
+fn error_of(closed: bool, e: anyhow::Error) -> Error {
+    match e.downcast_ref::<Refusal>() {
+        _ if closed => Error::Closed,
+        Some(Refusal::Stopped | Refusal::StoppedBeforeOutcome) => Error::Closed,
+        Some(r @ (Refusal::NoAnswer | Refusal::NoOutcome)) => Error::Refused(r.to_string()),
+        None => Error::Failed(format!("{e:#}")),
+    }
 }
 
 fn entry_of(r: &rows::EventRow) -> Entry {
@@ -78,7 +88,8 @@ impl Conversations for StoreConversations {
 
     fn history(&self, conversation: &str, before: Option<u64>, limit: usize) -> Result<Vec<Entry>, Error> {
         self.live()?;
-        Ok(self.store.events(conversation, before, limit).map_err(|e| self.failed(e))?.iter().map(entry_of).collect())
+        // Beside the writer, at the last commit: what an append was answered Ok for is in it (CP-T1.1).
+        Ok(self.store.events_committed(conversation, before, limit).map_err(|e| self.failed(e))?.iter().map(entry_of).collect())
     }
 
     fn changes(&self, from: u64, max_bytes: usize) -> Result<Page, Error> {
@@ -86,7 +97,9 @@ impl Conversations for StoreConversations {
         // The store's feed hands on its sessions' rows too: past a page of them alone, on to the next.
         let mut at = from;
         loop {
-            let batch = self.store.changes(at, max_bytes).map_err(|e| self.failed(e))?;
+            // Beside the writer, the page and where it reads through of one commit: a follower's pages never wait
+            // behind appends, nor hold them up (CP-T1.1).
+            let batch = self.store.changes_committed(at, max_bytes).map_err(|e| self.failed(e))?;
             let changes: Vec<Changed> = batch.rows.iter().filter_map(|c| if let Row::Event(e) = &c.row { Some(Changed { rev: c.rev, entry: entry_of(e) }) } else { None }).collect();
             let more = !batch.rows.is_empty() && batch.upto > at;
             at = batch.upto.max(at);
@@ -105,10 +118,14 @@ impl Conversations for StoreConversations {
     fn wait(&self, after: u64) -> Result<u64, Error> {
         // Watching before looking: a commit between the look and the wait leaves its word, so none is missed. The
         // store's writer sets the top it committed, then tells its watchers of each commit (`Store::watch`,
-        // `Store::committed_top`): a reader woken asks nothing of the writer. The handle let go of meanwhile ends it.
+        // `Store::committed_top`): a reader woken asks nothing of the writer. The handle let go of meanwhile ends it,
+        // as the store's writer ending does (it tells its watchers as it ends: `Store::stopped`).
         let commits = self.store.watch();
         loop {
             self.live()?;
+            if self.store.stopped() {
+                return Err(Error::Closed);
+            }
             let top = self.store.committed_top();
             if top > after {
                 return Ok(top);
@@ -122,7 +139,12 @@ impl Conversations for StoreConversations {
             return Ok(());
         }
         self.closing.cancel();
-        self.store.close().map_err(failed)
+        self.opened.lock().clear();
+        // A writer that ended on its own has let go of its files already: nothing more to let go of.
+        match self.store.close() {
+            Err(e) if !matches!(e.downcast_ref::<Refusal>(), Some(Refusal::Stopped)) => Err(error_of(false, e)),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -132,15 +154,29 @@ pub struct Fixture {
     pub kind: super::Kind,
     /// Its folder (None: none could be made, and opening says so).
     pub dir: Option<tempfile::TempDir>,
+    /// While set, the engine's writes fail (CONVO-7): its engine is wrapped in a [`super::store::FailsWrites`].
+    pub failing: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl Fixture {
+    pub fn new(kind: super::Kind, dir: Option<tempfile::TempDir>) -> Self {
+        Self { kind, dir, failing: Arc::new(AtomicBool::new(false)) }
+    }
 }
 
 #[cfg(test)]
 impl kiln_seams::conversations::ConversationsFixture for Fixture {
     fn open(&self) -> Result<Arc<dyn Conversations>, String> {
         let dir = self.dir.as_ref().ok_or_else(|| "no folder for the store".to_owned())?;
-        let engine = self.kind.open(&dir.path().join(super::FILE)).map_err(|e| format!("{e:#}"))?;
+        let inner = self.kind.open(&dir.path().join(super::FILE)).map_err(|e| format!("{e:#}"))?;
+        let engine = Box::new(super::store::FailsWrites { inner, failing: Arc::clone(&self.failing) });
         let store = Store::start(engine, super::store::Upkeep::default()).map_err(|e| format!("{e:#}"))?;
         Ok(Arc::new(StoreConversations::new(store)))
+    }
+
+    fn fail_writes(&self, failing: bool) {
+        self.failing.store(failing, Ordering::Release);
     }
 }
 
@@ -156,7 +192,7 @@ mod tests {
         for kind in super::super::Kind::ALL {
             let report = crate::rt::block_on(kiln_seams::conformance::run("Conversations", &cases::<Fixture>(), || {
                 let dir = tempfile::tempdir().ok();
-                async move { Fixture { kind, dir } }
+                async move { Fixture::new(kind, dir) }
             }));
             report.into_result().map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
         }
@@ -188,6 +224,70 @@ mod tests {
             anyhow::ensure!(b == lost.to_vec(), "{kind:?}: the retry read back as {b:?}");
             c.close().map_err(|e| anyhow::anyhow!("{e}"))?;
         }
+        Ok(())
+    }
+
+    /// CP-T1.1 (lane vendor-amphora-9's leftover): a store whose writer ends on its own (here, let go of through
+    /// another handle to it, not this one) wakes a wait under way, refused Closed, never left hanging on a commit that
+    /// can't come; what's asked after is Closed too, and closing this handle then is Ok (nothing more to let go of).
+    /// Without the writer telling its watchers as it ends, the wait hung.
+    #[test]
+    fn cp_t1_1_a_writer_that_ends_on_its_own_ends_every_wait_closed() -> anyhow::Result<()> {
+        for kind in super::super::Kind::ALL {
+            let dir = tempfile::tempdir()?;
+            let store = Store::start(kind.open(&dir.path().join(super::super::FILE))?, super::super::store::Upkeep::default())?;
+            let c = Arc::new(StoreConversations::new(store.clone()));
+            c.append(&[Entry { conversation: "a".into(), id: "m1".into(), seq: 1, text: "first".into() }]).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            let top = c.top().map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = {
+                let c = Arc::clone(&c);
+                std::thread::spawn(move || {
+                    let _ = tx.send(c.wait(top));
+                })
+            };
+            store.close()?;
+            // A guard against hanging only, not a measure: the store's own bound on a wait for its writer.
+            let woke = rx.recv_timeout(super::super::store::READ_WAIT);
+            anyhow::ensure!(matches!(woke, Ok(Err(Error::Closed))), "{kind:?}: a wait as the store's writer ended answered {woke:?}");
+            let _ = waiter.join();
+            let after = c.append(&[Entry { conversation: "a".into(), id: "m2".into(), seq: 2, text: "after".into() }]);
+            anyhow::ensure!(matches!(after, Err(Error::Closed)), "{kind:?}: an append after the writer ended answered {after:?}");
+            c.close().map_err(|e| anyhow::anyhow!("{kind:?}: closing after the writer ended: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// CP-T1.1 (seam review 9): the store's errors as the seam's: past one of its bounds Refused, saying which; its
+    /// writer gone, or the handle closed, Closed; the disk's or the engine's fault Failed, in their words.
+    #[test]
+    fn cp_t1_1_the_stores_refusals_are_refused_its_faults_failed() {
+        let refused = error_of(false, Refusal::NoAnswer.into());
+        assert!(matches!(&refused, Error::Refused(why) if why == &Refusal::NoAnswer.to_string()), "{refused:?}");
+        let refused = error_of(false, Refusal::NoOutcome.into());
+        assert!(matches!(&refused, Error::Refused(why) if why == &Refusal::NoOutcome.to_string()), "{refused:?}");
+        for gone in [Refusal::Stopped, Refusal::StoppedBeforeOutcome] {
+            let closed = error_of(false, gone.into());
+            assert!(matches!(closed, Error::Closed), "{gone:?}: {closed:?}");
+        }
+        let failed = error_of(false, anyhow::anyhow!("disk I/O error"));
+        assert!(matches!(&failed, Error::Failed(why) if why == "disk I/O error"), "{failed:?}");
+        let closed = error_of(true, anyhow::anyhow!("disk I/O error"));
+        assert!(matches!(closed, Error::Closed), "{closed:?}");
+    }
+
+    /// CP-T1.1 (seam review 8): the sessions a handle gave their row are let go of as it closes, not kept for the
+    /// process's life.
+    #[test]
+    fn cp_t1_1_a_closed_handle_lets_go_of_the_sessions_it_opened() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let kind = super::super::Kind::Turso;
+        let c = StoreConversations::new(Store::start(kind.open(&dir.path().join(super::super::FILE))?, super::super::store::Upkeep::default())?);
+        let batch: Vec<Entry> = (1..=8u64).map(|i| Entry { conversation: format!("c{i}"), id: "m1".into(), seq: 1, text: "words".into() }).collect();
+        c.append(&batch).map_err(|e| anyhow::anyhow!("{e}"))?;
+        anyhow::ensure!(c.opened.lock().len() == batch.len(), "{} sessions held for {} conversations", c.opened.lock().len(), batch.len());
+        c.close().map_err(|e| anyhow::anyhow!("{e}"))?;
+        anyhow::ensure!(c.opened.lock().is_empty(), "{} sessions still held after close", c.opened.lock().len());
         Ok(())
     }
 
@@ -254,7 +354,7 @@ mod tests {
             }
             let status = child.wait()?;
             anyhow::ensure!(killed, "{kind:?}: the child ended ({status}) after {} acknowledged appends, before it was killed", acked.len());
-            let f = Fixture { kind, dir: Some(dir) };
+            let f = Fixture::new(kind, Some(dir));
             let c = kiln_seams::conversations::ConversationsFixture::open(&f).map_err(|e| anyhow::anyhow!("{kind:?}: opened again: {e}"))?;
             let top = c.top().map_err(|e| anyhow::anyhow!("{e}"))?;
             let mut seen = Vec::new();
@@ -298,7 +398,7 @@ mod tests {
         };
         println!("convo-load-platform os={} arch={} cpus={} tmp={}", std::env::consts::OS, std::env::consts::ARCH, std::thread::available_parallelism().map_or(0, |n| n.get()), std::env::temp_dir().display());
         for kind in super::super::Kind::ALL {
-            let reports = kiln_seams::conversations::ladder(&base, &rungs, || Ok(Fixture { kind, dir: Some(tempfile::tempdir().map_err(|e| e.to_string())?) })).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
+            let reports = kiln_seams::conversations::ladder(&base, &rungs, || Ok(Fixture::new(kind, Some(tempfile::tempdir().map_err(|e| e.to_string())?)))).map_err(|e| anyhow::anyhow!("{kind:?}: {e}"))?;
             for (n, r) in reports {
                 anyhow::ensure!(r.appended == n.saturating_mul(base.appends), "{kind:?} at {n}: {r:?}");
                 println!("convo-load {kind:?} rung={n} {r:?}");

@@ -718,7 +718,8 @@ Methods: `abilities`, `open`, `change`, `changes`, `update`, `stack`, `stack_add
 ## Conversations
 
 The store kiln keeps its agents' conversations in (docs/conversations.md; CP-T1.1). Entries are appended
-durably to conversations, each known by its id within its conversation and kept as it was appended last; a
+durably to conversations, a batch all or nothing (an append that answers an error leaves none of its entries
+in any read, save one refused as not knowing in time whether it was written, which may yet be, whole), each known by its id within its conversation and kept as it was appended last; a
 conversation's history reads the newest of them before a sequence, oldest first; and a change feed of
 revisions hands on what was committed after any revision, oldest first, a page of about the bytes asked for,
 with the revision it read through, which kiln's peers and followers read; a follower at the top waits for
@@ -745,6 +746,7 @@ Methods: `append`, `history`, `changes`, `top`, `wait`, `close`.
 - **CONVO-4** what was committed and its revisions stay through a restart: a reader goes on from where it was, nothing missed or seen twice; a closed handle is refused Closed
 - **CONVO-5** a page of one byte holds one change, paging by where each read through reaches the top, and past the top there is nothing
 - **CONVO-6** a wait past a revision answers at once when one is committed past it, else with the commit that passes it; one under way is refused Closed as its handle is let go of
+- **CONVO-7** an append is all or nothing: a batch whose writes failed answers an error and leaves none of its entries in any read, the feed and the top included; made again, it goes in whole
 
 ## Search
 

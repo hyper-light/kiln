@@ -663,6 +663,172 @@ impl Link<'_> {
         Ok(Some(k))
     }
 
+    /// [`super::store::Engine::changes`] on this connection, through `top`, the newest number it sees committed (the
+    /// writer's own; a reader's, read in the same transaction as the page: [`SqlRead`]).
+    fn changes(&self, from: u64, max_bytes: usize, kept: bool, inbox: bool, top: u64) -> anyhow::Result<Changes> {
+        if from >= top {
+            return Ok(Changes { rows: Vec::new(), upto: from });
+        }
+        let s = |r: &TRow, i: usize| r.get::<String>(i).ok();
+        // Each kind's rows after `from`: (rev, session, the rows it makes, its epoch if it says).
+        let pages = [
+            self.feed_page(sql::FEED_SESSIONS, from, max_bytes, |r| {
+                let id = s(r, 0).unwrap_or_default();
+                let epoch = u(r, 7);
+                let closed = r.get::<i64>(6).ok();
+                let mut rows = vec![Row::Session { session: id.clone(), info: s(r, 1), meta: s(r, 2), state: s(r, 3), changes: s(r, 4), epoch: Some(epoch), open: closed.is_none(), at: r.get::<i64>(5).unwrap_or(0) }];
+                if let Some(at) = closed {
+                    rows.push(Row::Closed { session: id.clone(), at });
+                }
+                if let Some(machine) = s(r, 9) {
+                    rows.push(Row::Machine { session: id.clone(), machine });
+                }
+                Ok((u(r, 8), id, rows, Some(epoch)))
+            })?,
+            self.feed_page(sql::FEED_EVENTS, from, max_bytes, |r| {
+                let e = event_of(r)?;
+                Ok((u(r, 12), e.session.clone(), vec![Row::Event(Box::new(e))], None))
+            })?,
+            self.feed_page(sql::FEED_RECORDS, from, max_bytes, |r| {
+                // To a taker that takes them so, a compressed line goes as it is kept.
+                let v = r.get_value(4);
+                let (line, as_kept) = match v.to_blob() {
+                    Some(b) if kept && b.first() == Some(&CODEC_BROTLI) => (String::new(), Some(b.to_vec())),
+                    _ => (unsqueeze(v)?, None),
+                };
+                let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line, kept: as_kept };
+                Ok((u(r, 5), rec.session.clone(), vec![Row::Record(Box::new(rec))], None))
+            })?,
+            // The sessions' inboxes, to a taker that takes them: others read on past their numbers.
+            if inbox { self.feed_inbox(from, max_bytes)? } else { (Vec::new(), false) },
+            self.feed_page(sql::FEED_DROPS, from, max_bytes, |r| {
+                let session = s(r, 1).unwrap_or_default();
+                let at = r.get::<i64>(5).unwrap_or(0);
+                let row = match s(r, 2).as_deref() {
+                    Some("record") => Row::RecordReset { session: session.clone(), source: s(r, 3).unwrap_or_default(), at },
+                    _ => Row::Reset { session: session.clone(), from: r.get::<i64>(4).ok().and_then(|n| u64::try_from(n).ok()), at },
+                };
+                Ok((u(r, 0), session, vec![row], None))
+            })?,
+        ];
+        // Complete through `bound`: a kind that filled its page, or its bytes, may have more after
+        // its last.
+        let mut bound = top;
+        for (p, more) in &pages {
+            if *more && let Some((last, ..)) = p.last() {
+                bound = bound.min(*last);
+            }
+        }
+        let mut all: Vec<(u64, String, Vec<Row>, Option<u64>)> = pages.into_iter().flat_map(|(p, _)| p).filter(|(rev, ..)| *rev <= bound).collect();
+        all.sort_by_key(|(rev, ..)| *rev);
+        let mut epochs: HashMap<String, u64> = HashMap::new();
+        let mut out = Changes { rows: Vec::new(), upto: bound };
+        let mut bytes = 0usize;
+        for (rev, session, rows, epoch) in all {
+            // Never between rows of one number (an inbox commit's): its rows go together.
+            if bytes >= max_bytes && out.rows.last().is_some_and(|c| c.rev != rev) {
+                // The rest next time: read through the last one taken.
+                out.upto = out.rows.last().map_or(from, |c| c.rev);
+                break;
+            }
+            let epoch = match epoch {
+                Some(e) => e,
+                None => match epochs.get(&session) {
+                    Some(e) => *e,
+                    None => {
+                        let e = self.epoch_of(&session)?;
+                        epochs.insert(session.clone(), e);
+                        e
+                    }
+                },
+            };
+            for row in rows {
+                bytes += row.bytes();
+                out.rows.push(Change { rev, epoch, row });
+            }
+        }
+        Ok(out)
+    }
+
+    /// The inbox's rows after `from`, as [`Link::feed_page`] reads a kind's: each commit's rows whole, though they share
+    /// its number (a page cut short reads the rest of the last commit it read).
+    fn feed_inbox(&self, from: u64, max_bytes: usize) -> anyhow::Result<(Vec<(u64, String, Vec<Row>, Option<u64>)>, bool)> {
+        let row_of = |r: &TRow| -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)> {
+            let session = r.get::<String>(0).unwrap_or_default();
+            let row = InboxRow { session: session.clone(), family: r.get::<String>(1).unwrap_or_default(), key: r.get_value(2).to_blob().map(<[u8]>::to_vec).unwrap_or_default(), value: r.get_value(3).to_blob().map(<[u8]>::to_vec) };
+            Ok((u(r, 4), session, vec![Row::Inbox(Box::new(row))], None))
+        };
+        let (mut out, more) = self.feed_page(sql::FEED_INBOX, from, max_bytes, row_of)?;
+        if more && let Some(last) = out.last().map(|(rev, ..)| *rev) {
+            out.retain(|(rev, ..)| *rev != last);
+            let mut rest = self.prepare(sql::FEED_INBOX_AT)?;
+            self.run(&mut rest, &[seq(last)], |r| {
+                out.push(row_of(r)?);
+                Ok(())
+            })?;
+        }
+        Ok((out, more))
+    }
+
+    /// The epoch this store has for `session` (0: none yet).
+    fn epoch_of(&self, session: &str) -> anyhow::Result<u64> {
+        Ok(self.one_int(sql::SESSION_EPOCH, &[txt(session)])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
+    }
+
+    /// The first column of the first row a query answers, as a number (None: no row, or NULL), on this connection.
+    fn one_int(&self, sql: &str, params: &[Value]) -> anyhow::Result<Option<i64>> {
+        let mut stmt = self.prepare(sql)?;
+        let mut out = None;
+        self.run(&mut stmt, params, |r| {
+            if out.is_none() {
+                out = r.get::<i64>(0).ok();
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// The newest number committed as this connection's transaction sees it: the one the store keeps, or past it
+    /// the newest of any kind's rows, as the store reads it when it opens.
+    fn committed_top(&self) -> anyhow::Result<u64> {
+        let mut stmt = self.prepare(sql::META_GET)?;
+        let mut rev = 0u64;
+        self.run(&mut stmt, &[txt("rev")], |r| {
+            rev = r.get::<String>(0).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            Ok(())
+        })?;
+        for q in sql::REV_MAX {
+            rev = rev.max(self.one_int(q, &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0));
+        }
+        Ok(rev)
+    }
+
+    /// Rows of one kind after `from`, each as `(rev, session, rows, epoch)`: a page of them, or
+    /// fewer once they come to `max_bytes` (nothing more is read, or decompressed, than a batch
+    /// takes); and whether more may follow (the page is full, or stopped at the bytes).
+    #[allow(clippy::type_complexity)]
+    fn feed_page(&self, sql: &str, from: u64, max_bytes: usize, each: impl Fn(&TRow) -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)>) -> anyhow::Result<(Vec<(u64, String, Vec<Row>, Option<u64>)>, bool)> {
+        let mut stmt = self.prepare(sql)?;
+        let (mut out, mut bytes, mut full) = (Vec::new(), 0usize, false);
+        self.run_while(&mut stmt, &[seq(from), int(i64::try_from(FEED_PAGE).unwrap_or(512))], |r| {
+            let page = each(r)?;
+            bytes += page.2.iter().map(Row::bytes).sum::<usize>();
+            out.push(page);
+            full = bytes >= max_bytes;
+            Ok(!full)
+        })?;
+        let more = full || out.len() >= FEED_PAGE;
+        Ok((out, more))
+    }
+
+    /// Statements that answer nothing, one after another, on this connection.
+    fn exec(&self, sql: &str) -> anyhow::Result<()> {
+        for one in sql.split(';').map(str::trim).filter(|x| !x.is_empty()) {
+            self.conn.execute(one).map_err(|e| anyhow::anyhow!("{e} (in: {})", one.lines().next().unwrap_or_default()))?;
+        }
+        Ok(())
+    }
+
     /// Run `stmt` with `params`, handing each row to `each`.
     fn run(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<()>) -> anyhow::Result<()> {
         self.run_while(stmt, params, |r| each(r).map(|()| true))
@@ -849,6 +1015,21 @@ impl SqlRead {
 }
 
 impl Read for SqlRead {
+    fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
+        // One read transaction: the page and the top it reads through are of the same commit (CP-T1.1: the feed read
+        // beside the writer, at a committed snapshot, never a turn of the writer's).
+        let link = self.link();
+        link.exec("BEGIN")?;
+        let page = link.committed_top().and_then(|top| link.changes(from, max_bytes, kept, inbox, top));
+        let ended = link.exec("COMMIT");
+        if ended.is_err() {
+            let _ = link.exec("ROLLBACK");
+        }
+        let page = page?;
+        ended?;
+        Ok(page)
+    }
+
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.link().events(session, before, limit)
     }
@@ -1064,47 +1245,9 @@ impl Sql {
         Ok(true)
     }
 
-    /// The inbox's rows after `from`, as [`Sql::feed_page`] reads a kind's: each commit's rows whole, though they share
-    /// its number (a page cut short reads the rest of the last commit it read).
-    fn feed_inbox(&self, from: u64, max_bytes: usize) -> anyhow::Result<(Vec<(u64, String, Vec<Row>, Option<u64>)>, bool)> {
-        let row_of = |r: &TRow| -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)> {
-            let session = r.get::<String>(0).unwrap_or_default();
-            let row = InboxRow { session: session.clone(), family: r.get::<String>(1).unwrap_or_default(), key: r.get_value(2).to_blob().map(<[u8]>::to_vec).unwrap_or_default(), value: r.get_value(3).to_blob().map(<[u8]>::to_vec) };
-            Ok((u(r, 4), session, vec![Row::Inbox(Box::new(row))], None))
-        };
-        let (mut out, more) = self.feed_page(sql::FEED_INBOX, from, max_bytes, row_of)?;
-        if more && let Some(last) = out.last().map(|(rev, ..)| *rev) {
-            out.retain(|(rev, ..)| *rev != last);
-            let mut rest = self.prepare(sql::FEED_INBOX_AT)?;
-            self.run(&mut rest, &[seq(last)], |r| {
-                out.push(row_of(r)?);
-                Ok(())
-            })?;
-        }
-        Ok((out, more))
-    }
-
-    /// The epoch this store has for `session` (0: none yet).
+    /// The epoch this store has for `session` (0: none yet), on its writer's connection.
     fn epoch_of(&self, session: &str) -> anyhow::Result<u64> {
-        Ok(self.one_int(sql::SESSION_EPOCH, &[txt(session)])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
-    }
-
-    /// Rows of one kind after `from`, each as `(rev, session, rows, epoch)`: a page of them, or
-    /// fewer once they come to `max_bytes` (nothing more is read, or decompressed, than a batch
-    /// takes); and whether more may follow (the page is full, or stopped at the bytes).
-    #[allow(clippy::type_complexity)]
-    fn feed_page(&self, sql: &str, from: u64, max_bytes: usize, each: impl Fn(&TRow) -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)>) -> anyhow::Result<(Vec<(u64, String, Vec<Row>, Option<u64>)>, bool)> {
-        let mut stmt = self.prepare(sql)?;
-        let (mut out, mut bytes, mut full) = (Vec::new(), 0usize, false);
-        self.run_while(&mut stmt, &[seq(from), int(i64::try_from(FEED_PAGE).unwrap_or(512))], |r| {
-            let page = each(r)?;
-            bytes += page.2.iter().map(Row::bytes).sum::<usize>();
-            out.push(page);
-            full = bytes >= max_bytes;
-            Ok(!full)
-        })?;
-        let more = full || out.len() >= FEED_PAGE;
-        Ok((out, more))
+        self.link().epoch_of(session)
     }
 
     /// A session changed without a number of its own: while compacting, copied again at the swap.
@@ -1525,88 +1668,7 @@ impl Engine for Sql {
     }
 
     fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
-        if from >= self.rev {
-            return Ok(Changes { rows: Vec::new(), upto: from });
-        }
-        let s = |r: &TRow, i: usize| r.get::<String>(i).ok();
-        // Each kind's rows after `from`: (rev, session, the rows it makes, its epoch if it says).
-        let pages = [
-            self.feed_page(sql::FEED_SESSIONS, from, max_bytes, |r| {
-                let id = s(r, 0).unwrap_or_default();
-                let epoch = u(r, 7);
-                let closed = r.get::<i64>(6).ok();
-                let mut rows = vec![Row::Session { session: id.clone(), info: s(r, 1), meta: s(r, 2), state: s(r, 3), changes: s(r, 4), epoch: Some(epoch), open: closed.is_none(), at: r.get::<i64>(5).unwrap_or(0) }];
-                if let Some(at) = closed {
-                    rows.push(Row::Closed { session: id.clone(), at });
-                }
-                if let Some(machine) = s(r, 9) {
-                    rows.push(Row::Machine { session: id.clone(), machine });
-                }
-                Ok((u(r, 8), id, rows, Some(epoch)))
-            })?,
-            self.feed_page(sql::FEED_EVENTS, from, max_bytes, |r| {
-                let e = event_of(r)?;
-                Ok((u(r, 12), e.session.clone(), vec![Row::Event(Box::new(e))], None))
-            })?,
-            self.feed_page(sql::FEED_RECORDS, from, max_bytes, |r| {
-                // To a taker that takes them so, a compressed line goes as it is kept.
-                let v = r.get_value(4);
-                let (line, as_kept) = match v.to_blob() {
-                    Some(b) if kept && b.first() == Some(&CODEC_BROTLI) => (String::new(), Some(b.to_vec())),
-                    _ => (unsqueeze(v)?, None),
-                };
-                let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line, kept: as_kept };
-                Ok((u(r, 5), rec.session.clone(), vec![Row::Record(Box::new(rec))], None))
-            })?,
-            // The sessions' inboxes, to a taker that takes them: others read on past their numbers.
-            if inbox { self.feed_inbox(from, max_bytes)? } else { (Vec::new(), false) },
-            self.feed_page(sql::FEED_DROPS, from, max_bytes, |r| {
-                let session = s(r, 1).unwrap_or_default();
-                let at = r.get::<i64>(5).unwrap_or(0);
-                let row = match s(r, 2).as_deref() {
-                    Some("record") => Row::RecordReset { session: session.clone(), source: s(r, 3).unwrap_or_default(), at },
-                    _ => Row::Reset { session: session.clone(), from: r.get::<i64>(4).ok().and_then(|n| u64::try_from(n).ok()), at },
-                };
-                Ok((u(r, 0), session, vec![row], None))
-            })?,
-        ];
-        // Complete through `bound`: a kind that filled its page, or its bytes, may have more after
-        // its last.
-        let mut bound = self.rev;
-        for (p, more) in &pages {
-            if *more && let Some((last, ..)) = p.last() {
-                bound = bound.min(*last);
-            }
-        }
-        let mut all: Vec<(u64, String, Vec<Row>, Option<u64>)> = pages.into_iter().flat_map(|(p, _)| p).filter(|(rev, ..)| *rev <= bound).collect();
-        all.sort_by_key(|(rev, ..)| *rev);
-        let mut epochs: HashMap<String, u64> = HashMap::new();
-        let mut out = Changes { rows: Vec::new(), upto: bound };
-        let mut bytes = 0usize;
-        for (rev, session, rows, epoch) in all {
-            // Never between rows of one number (an inbox commit's): its rows go together.
-            if bytes >= max_bytes && out.rows.last().is_some_and(|c| c.rev != rev) {
-                // The rest next time: read through the last one taken.
-                out.upto = out.rows.last().map_or(from, |c| c.rev);
-                break;
-            }
-            let epoch = match epoch {
-                Some(e) => e,
-                None => match epochs.get(&session) {
-                    Some(e) => *e,
-                    None => {
-                        let e = self.epoch_of(&session)?;
-                        epochs.insert(session.clone(), e);
-                        e
-                    }
-                },
-            };
-            for row in rows {
-                bytes += row.bytes();
-                out.rows.push(Change { rev, epoch, row });
-            }
-        }
-        Ok(out)
+        self.link().changes(from, max_bytes, kept, inbox, self.rev)
     }
 
     fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took> {

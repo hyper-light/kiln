@@ -55,7 +55,9 @@ pub enum Error {
 
 /// The conversation store, as kiln uses it.
 pub trait Conversations: Send + Sync + 'static {
-    /// Commits `entries` durably: once it answers Ok they're in every read and stay through a restart.
+    /// Commits `entries` durably, all or nothing: once it answers Ok they're in every read and stay through a restart;
+    /// when it answers an error none of them is, save one Refused as not knowing in time whether they were written,
+    /// after which all of them may yet be. No read, the feed and the top included, ever sees part of a batch.
     fn append(&self, entries: &[Entry]) -> Result<(), Error>;
     /// The newest `limit` entries of `conversation` with a sequence below `before` (any, when None), oldest first.
     fn history(&self, conversation: &str, before: Option<u64>, limit: usize) -> Result<Vec<Entry>, Error>;
@@ -74,6 +76,9 @@ pub trait Conversations: Send + Sync + 'static {
 /// What a case needs: the store, opened (again) where the fixture keeps it, with what was committed before there.
 pub trait ConversationsFixture: Send + Sync {
     fn open(&self) -> Result<Arc<dyn Conversations>, Failure>;
+    /// While `failing`, the store's writes fail as a disk that refuses them would (CONVO-7: a batch that failed
+    /// leaves nothing of itself).
+    fn fail_writes(&self, failing: bool);
 }
 
 /// The entries the simulator holds at most (past them an append is refused): a bound of the simulator's, not of the
@@ -94,12 +99,14 @@ pub struct SimConversations {
     disk: Arc<Mutex<SimDisk>>,
     /// Told of each commit, and of a handle let go of ([`Conversations::wait`]), with the disk's lock held.
     commits: Arc<Condvar>,
+    /// The disk refusing writes ([`ConversationsFixture::fail_writes`]).
+    failing: Arc<AtomicBool>,
     closed: AtomicBool,
 }
 
 impl SimConversations {
-    fn open_on(disk: &Arc<Mutex<SimDisk>>, commits: &Arc<Condvar>) -> Self {
-        Self { disk: Arc::clone(disk), commits: Arc::clone(commits), closed: AtomicBool::new(false) }
+    fn open_on(disk: &Arc<Mutex<SimDisk>>, commits: &Arc<Condvar>, failing: &Arc<AtomicBool>) -> Self {
+        Self { disk: Arc::clone(disk), commits: Arc::clone(commits), failing: Arc::clone(failing), closed: AtomicBool::new(false) }
     }
 
     fn live(&self) -> Result<(), Error> {
@@ -115,6 +122,10 @@ impl Conversations for SimConversations {
     fn append(&self, entries: &[Entry]) -> Result<(), Error> {
         self.live()?;
         let mut d = self.disk.lock();
+        // Refused or failed before any entry goes in: all or nothing.
+        if self.failing.load(Ordering::Acquire) {
+            return Err(Error::Failed("the simulated disk refused the write".to_owned()));
+        }
         let new = entries.iter().filter(|e| !d.entries.contains_key(&(e.conversation.clone(), e.id.clone()))).count();
         if d.entries.len().saturating_add(new) > SIM_ENTRIES {
             return Err(Error::Refused(format!("the simulator holds {SIM_ENTRIES} entries")));
@@ -193,11 +204,16 @@ impl Conversations for SimConversations {
 pub struct SimConversationsFixture {
     disk: Arc<Mutex<SimDisk>>,
     commits: Arc<Condvar>,
+    failing: Arc<AtomicBool>,
 }
 
 impl ConversationsFixture for SimConversationsFixture {
     fn open(&self) -> Result<Arc<dyn Conversations>, Failure> {
-        Ok(Arc::new(SimConversations::open_on(&self.disk, &self.commits)))
+        Ok(Arc::new(SimConversations::open_on(&self.disk, &self.commits, &self.failing)))
+    }
+
+    fn fail_writes(&self, failing: bool) {
+        self.failing.store(failing, Ordering::Release);
     }
 }
 
@@ -435,6 +451,35 @@ fn c6<F: ConversationsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
     })
 }
 
+fn c7<F: ConversationsFixture>(f: &F) -> BoxFuture<'_, Result<(), Failure>> {
+    Box::pin(async move {
+        let c = f.open()?;
+        let kept = entry("a", "m1", 1, "kept");
+        c.append(std::slice::from_ref(&kept)).map_err(err)?;
+        let top = c.top().map_err(err)?;
+        // A batch across two conversations, a new entry, another conversation's first and one entry revised.
+        let batch = vec![entry("a", "m2", 2, "second"), entry("b", "m1", 1, "first of b"), entry("a", "m1", 1, "revised")];
+        f.fail_writes(true);
+        let answer = c.append(&batch);
+        f.fail_writes(false);
+        check(matches!(answer, Err(Error::Failed(_) | Error::Refused(_))), || format!("a batch whose writes failed answered {answer:?}"))?;
+        let now = c.top().map_err(err)?;
+        check(now == top, || format!("a failed batch moved the top from {top} to {now}"))?;
+        let a = c.history("a", None, 10).map_err(err)?;
+        check(a == vec![kept.clone()], || format!("after a failed batch, a's history: {a:?}"))?;
+        let b = c.history("b", None, 10).map_err(err)?;
+        check(b.is_empty(), || format!("after a failed batch, b's history: {b:?}"))?;
+        let page = c.changes(top, 1 << 20).map_err(err)?;
+        check(page.changes.is_empty(), || format!("after a failed batch, the feed handed on {:?}", page.changes))?;
+        // Writing again, the same batch goes in whole.
+        c.append(&batch).map_err(err)?;
+        let a = c.history("a", None, 10).map_err(err)?;
+        check(a == vec![entry("a", "m1", 1, "revised"), entry("a", "m2", 2, "second")], || format!("the batch made again, a's history: {a:?}"))?;
+        let b = c.history("b", None, 10).map_err(err)?;
+        check(b == vec![entry("b", "m1", 1, "first of b")], || format!("the batch made again, b's history: {b:?}"))
+    })
+}
+
 /// The suite: each case a clause of docs/seams.md's Conversations section.
 pub fn cases<F: ConversationsFixture>() -> Vec<Case<F>> {
     vec![
@@ -444,6 +489,7 @@ pub fn cases<F: ConversationsFixture>() -> Vec<Case<F>> {
         Case { id: "CONVO-4", says: "what was committed and its revisions stay through a restart: a reader goes on from where it was, nothing missed or seen twice; a closed handle is refused Closed", check: c4::<F> },
         Case { id: "CONVO-5", says: "a page of one byte holds one change, paging by where each read through reaches the top, and past the top there is nothing", check: c5::<F> },
         Case { id: "CONVO-6", says: "a wait past a revision answers at once when one is committed past it, else with the commit that passes it; one under way is refused Closed as its handle is let go of", check: c6::<F> },
+        Case { id: "CONVO-7", says: "an append is all or nothing: a batch whose writes failed answers an error and leaves none of its entries in any read, the feed and the top included; made again, it goes in whole", check: c7::<F> },
     ]
 }
 
