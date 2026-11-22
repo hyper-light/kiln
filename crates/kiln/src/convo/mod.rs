@@ -133,7 +133,7 @@ const WAL_MAGIC: [u32; 2] = [0x377f_0682, 0x377f_0683];
 pub fn made_by(path: &std::path::Path) -> anyhow::Result<Option<Kind>> {
     use std::io::{Read, Seek, SeekFrom};
     let of = |header: &[u8]| -> Option<Kind> {
-        if header.len() < DB_HEADER || header.get(..DB_MAGIC.len()) != Some(&DB_MAGIC[..]) {
+        if header.len() < DB_HEADER || header.get(..DB_MAGIC.len()) != Some(DB_MAGIC.as_slice()) {
             return None;
         }
         match header.get(RESERVED_AT).copied() {
@@ -153,8 +153,8 @@ pub fn made_by(path: &std::path::Path) -> anyhow::Result<Option<Kind>> {
     };
     match std::fs::File::open(path) {
         Ok(mut f) => {
-            if let Some(h) = read_at(&mut f, 0, DB_HEADER)? {
-                return Ok(of(&h));
+            if let Some(kind) = read_at(&mut f, 0, DB_HEADER)?.as_deref().and_then(of) {
+                return Ok(Some(kind));
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -172,7 +172,7 @@ pub fn made_by(path: &std::path::Path) -> anyhow::Result<Option<Kind>> {
         return Ok(None);
     }
     let page = u64::from(word(&h, 8).unwrap_or(0));
-    if usize::try_from(page).map_or(true, |p| p < DB_HEADER) {
+    if !usize::try_from(page).is_ok_and(|p| p >= DB_HEADER) {
         return Ok(None);
     }
     let len = f.metadata()?.len();
