@@ -208,7 +208,7 @@ static CHANGING: std::sync::LazyLock<Changing> = std::sync::LazyLock::new(Changi
 /// Turns on the goal stacks (G9 step 3, goal a2a44298; T-T1.5.1), in the order they came, with no lock
 /// (`crate::turn`; goal 5, plan 01a1a59c2aae, its top goal). A change to one stack alone takes that stack's
 /// own turn ([`stack_turn!`]): changes to other stacks go beside it. One that spans stacks (a subagent's goal,
-/// a parent's, a plan's steps, a stack forgotten, what's said again across them) takes the turn of every stack
+/// a parent's, a plan's steps, a stack forgotten) takes the turn of every stack
 /// ([`Changing::every`]), alone: one stack's change holds the shared turn as a reader, so none goes beside
 /// one that spans them. Every write to a stack's goals is under its own turn or under every stack's, so a
 /// stack's step (what it decides, its send and the mark that it went) is never beside another change to it:
@@ -1000,60 +1000,60 @@ fn said_due() -> Option<i64> {
 }
 
 /// [`resay`], each agent with a word kept found by its id through `hub` where the driver has one (it's the port then):
-/// its info as the registry shares it, not copied, under the stacks' lock (goal 9, plan 01a1a87b2cec step 3: the
-/// port's `agent` copied each one's whole info).
+/// its info as the registry shares it, not copied (goal 9, plan 01a1a87b2cec step 3: the port's `agent` copied each
+/// one's whole info). Each agent's word alone ([`resay_one`]); the caller holds what keeps the stacks' changes from it.
 async fn resay_on<P>(port: &P, hub: Option<&Hub>, now: i64)
 where
     P: HarnessPort<Agent = Info, Command = Command>,
 {
     let agents: Vec<String> = SAID.lock().keys().cloned().collect();
-    let infos: Vec<(String, Arc<Info>)> = agents
-        .into_iter()
-        .filter_map(|a| {
-            let info = match hub {
-                Some(hub) => hub.harness.info_shared(&a),
-                None => port.agent(&a).map(Arc::new),
-            };
-            info.map(|i| (a, i))
-        })
-        .collect();
-    let mut observed = Vec::new();
+    for agent in &agents {
+        resay_one(port, hub, agent, now).await;
+    }
+}
+
+/// `agent`'s word kept, said again at `now` if it went from its queue before the edit that last changed it was seen
+/// there ([`resay`]); forgotten if it's gone otherwise. An agent not known right now keeps its word. A word is its
+/// agent's alone (its stack's goal, said to it): the driver's round says each with that stack's own turn held, as
+/// each change to the stack says it (G9 step 3, goal a2a44298; T-T1.5.1), not every stack's.
+async fn resay_one<P>(port: &P, hub: Option<&Hub>, agent: &str, now: i64)
+where
+    P: HarnessPort<Agent = Info, Command = Command>,
+{
+    let info = match hub {
+        Some(hub) => hub.harness.info_shared(agent),
+        None => port.agent(agent).map(Arc::new),
+    };
+    let Some(info) = info else { return };
+    let mut observed = None;
     if let Some(hub) = hub {
-        for (agent, info) in &infos {
-            let message = SAID.lock().get(agent).map(|w| w.msg.id.clone());
-            if let Some(message) = message.filter(|id| info.queue_partial && !info.queue.iter().any(|q| &q.id == id) && !info.said.iter().any(|q| &q.id == id))
-                && let Ok(found) = crate::harness::state_reads::lookup(hub, agent, info, &message).await
-            {
-                observed.push((agent.clone(), message, found));
-            }
+        let message = SAID.lock().get(agent).map(|w| w.msg.id.clone());
+        if let Some(message) = message.filter(|id| info.queue_partial && !info.queue.iter().any(|q| &q.id == id) && !info.said.iter().any(|q| &q.id == id))
+            && let Ok(found) = crate::harness::state_reads::lookup(hub, agent, &info, &message).await
+        {
+            observed = Some((message, found));
         }
     }
-    let lost: Vec<(String, Word)> = {
+    let lost: Option<Word> = {
         let mut said = SAID.lock();
-        let mut lost = Vec::new();
-        for (agent, info) in &infos {
-            if said.get_mut(agent).is_some_and(|w| {
-                let known = observed.iter().find(|(a, message, _)| a == agent && message == &w.msg.id);
-                match known {
-                    Some((_, _, found)) => w.msg.look_heard_known(info, found.as_ref(), now) == Now::Gone,
-                    None => w.msg.look_heard(Some(&**info), now) == Now::Gone,
-                }
-            })
-                && let Some(w) = said.remove(agent)
-                && w.msg.lost()
-            {
-                lost.push((agent.clone(), w));
-            }
+        if said.get_mut(agent).is_some_and(|w| match observed.as_ref().filter(|(message, _)| message == &w.msg.id) {
+            Some((_, found)) => w.msg.look_heard_known(&info, found.as_ref(), now) == Now::Gone,
+            None => w.msg.look_heard(Some(&*info), now) == Now::Gone,
+        }) && let Some(w) = said.remove(agent)
+            && w.msg.lost()
+        {
+            Some(w)
+        } else {
+            None
         }
-        lost
     };
-    for (agent, w) in lost {
+    if let Some(w) = lost {
         let c = send(w.msg.text.clone());
-        let (sent, _) = say(port, &agent, w.item.as_deref(), c, now).await;
+        let (sent, _) = say(port, agent, w.item.as_deref(), c, now).await;
         // Not delivered: kept as it was, to say again at the next look (unless something was said since).
         if !sent.has_custody() {
             tracing::info!(%agent, "a goal stack's word, said again, didn't reach its agent");
-            SAID.lock().entry(agent).or_insert(w);
+            SAID.lock().entry(agent.to_owned()).or_insert(w);
         }
     }
 }
@@ -2861,10 +2861,16 @@ where
             subagents::tick(hub, self.metrics).await;
         }
         resume_lifted(self, changing).await;
-        // What the stacks said that an edit may not have got to their agents: said again.
-        {
-            let _one = changing.every().await;
-            resay_on(self.port, self.hub.map(|h| &**h), self.clock.unix_ms()).await;
+        // What the stacks said that an edit may not have got to their agents: said again, each agent's word with its
+        // own stack's turn held, beside the changes to other stacks (G9 step 3, goal a2a44298): with every stack's,
+        // each round, every change to every stack waited for the look at every agent's word.
+        let now = self.clock.unix_ms();
+        let kept: Vec<String> = SAID.lock().keys().cloned().collect();
+        for agent in &kept {
+            let _shared = changing.all.read().await;
+            let entry = changing.each.of(agent);
+            let _own = entry.turn().await;
+            resay_one(self.port, self.hub.map(|h| &**h), agent, now).await;
         }
         let waiting: Vec<String> = self
             .store
