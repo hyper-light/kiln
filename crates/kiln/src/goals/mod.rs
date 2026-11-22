@@ -6025,6 +6025,70 @@ mod tests {
         })
     }
 
+    /// G9 step 3 (goal a2a44298, T-T1.5.1): with rounds stepping only the stacks said changed, an agent that changed
+    /// before a round that didn't step its stack, its news not yet heard, is stepped once its news is: the round's look
+    /// at the agents it steps leaves the others as they were last seen, so the news is news. (Taking every agent in at
+    /// each round, the change was seen there, its news then found nothing new, and its goal, met, waited for its
+    /// reminder.)
+    #[test]
+    fn g9_s3_an_agent_changed_before_a_round_that_skips_its_stack_is_stepped_at_its_news() -> anyhow::Result<()> {
+        use kiln_seams::Clock as _;
+        use kiln_seams::clock::SimClock;
+        use kiln_seams::harness::SimHarness;
+        crate::rt::block_on(async {
+            let clock = SimClock::new();
+            let store = crate::rt::blocking(crate::store::Store::in_memory).await??;
+            let shutdown = crate::rt::Shutdown::new();
+            let port: SimHarness<Info, Command> = SimHarness::new(Arc::new(clock.clone()));
+            let id = "goals-news-after-a-round";
+            let now = clock.unix_ms();
+            // At work on its first goal, sent just now (its reminder 30 s off).
+            let working = Objective { text: "x one".into(), status: "active".into(), reason: None, at: now };
+            anyhow::ensure!(port.open(id, Info { id: id.into(), status: Status::Running, objective: Some(working), ..Info::default() }), "not opened");
+            port.set_catalog(id, json!({"commands": [{"name": "goal", "route": {"kind": "prompt"}}]}));
+            let a = id.to_owned();
+            store
+                .call(move |c| {
+                    touch(c, &a, Some("running"), None, 0)?;
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text, status, how, reminded_at) VALUES ('x1', ?1, 0, 'x one', 'active', 'goal', ?2)", params![a, now])?;
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text, status) VALUES ('x2', ?1, 1, 'x two', 'pending')", params![a])?;
+                    Ok(())
+                })
+                .await?;
+            let metrics = crate::metrics::AgentMetrics::default();
+            let driver = Driver { store: &store, clock: &clock, shutdown: &shutdown, port: &port, hub: None, metrics: &metrics, planner: None };
+            let changing = Changing::stepping(Steps::Stacks);
+            let news = crate::rt::Notify::new();
+            let feed = StoreFeed::new(&store);
+            let test = async {
+                clock.sleeping_since(0, 1).await;
+                anyhow::ensure!(port.heard(id).is_empty(), "sent while at work: {:?}", port.heard(id));
+                // Its harness says its goal met, its turn over; its news not heard yet.
+                port.update(id, |i| {
+                    i.status = Status::Idle;
+                    i.objective = Some(Objective { text: "x one".into(), status: "met".into(), reason: None, at: now + 1 });
+                });
+                // Meanwhile another stack's change: a round that doesn't step this one.
+                let since = clock.registrations();
+                store.changes().say("goals-another-stack");
+                clock.sleeping_since(since, 1).await;
+                let s = stack_of(&store, id).await?;
+                anyhow::ensure!(s.items.first().is_some_and(|i| i.status == "active") && port.heard(id).is_empty(), "stepped by a round not told of it: {s:?}");
+                // Its news, heard: its goal ends met, and the next goes, with no clock moved.
+                let since = clock.registrations();
+                news.notify();
+                clock.sleeping_since(since, 1).await;
+                let heard = port.heard(id);
+                anyhow::ensure!(heard.iter().any(|d| matches!(&d.command, Command::Send { text, .. } if text == "/goal x two")), "its news brought no step: {heard:?}");
+                shutdown.cancel();
+                Ok(())
+            };
+            let (driven, tested) = futures::join!(driver.follow(&changing, &feed, Some(&news), false), test);
+            driven?;
+            tested
+        })
+    }
+
     #[test]
     fn a_goal_sent_as_a_message_is_met_when_the_agent_says_so() {
         let mut said = item("active", Some("message"));
