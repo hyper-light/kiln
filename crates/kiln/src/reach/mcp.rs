@@ -218,8 +218,9 @@ fn agent_tools_of(registry: &[Value], names: Option<&[String]>) -> Option<Vec<Va
     )
 }
 
-/// The operation a tool is, by its name (`agents_start` is `agents.start`), among `tools`.
-#[cfg(test)]
+/// The operation a tool is, by its name (`agents_start` is `agents.start`), among `tools`: the
+/// tests', which run on Unix.
+#[cfg(all(test, unix))]
 fn op_of(tools: &[Value], tool: &str) -> Option<String> {
     tools.iter().find(|t| t.get("name").and_then(Value::as_str) == Some(tool)).and_then(|t| t.get("title")?.as_str().map(str::to_owned))
 }
