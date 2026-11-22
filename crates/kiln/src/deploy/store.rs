@@ -836,8 +836,6 @@ mod tests {
         })
     }
 
-    /// Two servers racing for one release's work: one takes it, the other doesn't, and once the
-    /// lease lapses the other may.
     /// CP-T1.6: what a lease's holder writes holds only while its lease does. The holder whose
     /// lease lapsed and passed on has every write refused, and stays refused; the new holder's go
     /// through, its own writes to the work row moving its fence with them; once it's done (the row
@@ -876,6 +874,8 @@ mod tests {
         })
     }
 
+    /// Two servers racing for one release's work: one takes it, the other doesn't, and once the
+    /// lease lapses the other may.
     #[test]
     fn a_lease_is_one_server_s_until_it_lapses() -> anyhow::Result<()> {
         crate::rt::block_on(async {
