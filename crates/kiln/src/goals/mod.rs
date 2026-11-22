@@ -263,8 +263,9 @@ pub(crate) enum Steps {
     /// Those whose inputs changed: the stacks the changes since the last round said they were to (`store::Said`,
     /// each change's own stack once its writes are in, or every stack for one that spans them), the agents' news
     /// (its agent's stack and its parent's; every stack's for a change to its usage, which programs' rules read),
-    /// and the stacks whose goals wait on plans (whose tables' writes say no stack). A deadline, a stir, a lost
-    /// session event or a restart steps every stack, as the control does.
+    /// the stacks whose goals wait on plans (whose tables' writes say no stack), and those whose reminder came due.
+    /// A stir, a closed session, lost news, a plan step's subagent due to try again, or a restart steps every
+    /// stack, as the control does.
     Stacks,
 }
 
@@ -2819,7 +2820,7 @@ where
             if tend {
                 self.tend(running, waiting).await;
             }
-            let deadline = self.deadline(began, tend).await;
+            let (deadline, due_every) = self.deadline(began, tend).await;
             #[cfg(test)]
             turn_times::ROUNDS.since(round_began, true);
             let now = self.clock.unix_ms();
@@ -2873,15 +2874,15 @@ where
                 }
             };
             // What woke it says which stacks the next round steps ([`Steps`]): the feed and the says, those said
-            // (and those whose goals wait on plans); the agents' news, those it said (`heard_news`); the test's news,
-            // a deadline or a stir, every stack.
+            // (and those whose goals wait on plans); the agents' news, those it said (`heard_news`); a reminder's
+            // deadline, those due; the test's news, a subagent's retry or a stir, every stack.
             let woke = futures::select_biased! {
                 () = self.shutdown.cancelled().fuse() => return Ok(()),
                 _ = feed.after(at).fuse() => Woke::Change,
                 () = self.store.changes().said_after(said_at).fuse() => Woke::Change,
                 () = told.fuse() => Woke::Every,
                 open = heard.fuse() => if open { Woke::Change } else { Woke::Closed },
-                () = due.fuse() => Woke::Every,
+                () = due.fuse() => if due_every { Woke::Every } else { Woke::Change },
                 () = stirred.fuse() => Woke::Every,
             };
             match woke {
@@ -3013,18 +3014,25 @@ where
             })
             .await
             .unwrap_or_default();
-        // Those whose inputs changed ([`Steps::Stacks`]): said so, or with goals that wait on plans, whose tables'
-        // writes say no stack.
+        // Those whose inputs changed ([`Steps::Stacks`]): said so; with goals that wait on plans, whose tables'
+        // writes say no stack; or with a reminder come due (the time its deadline woke the round for).
         let planned = match which {
             Which::All => HashSet::new(),
             Which::Said(_) => self
                 .store
-                .read(|c| {
+                .read(move |c| {
                     let mut st = c.prepare_cached(
                         "SELECT DISTINCT i.agent FROM goal_items i JOIN goal_stacks s ON s.agent = i.agent WHERE s.state = 'running' \
                          AND (i.plan_id IS NOT NULL OR i.plan_run IS NOT NULL OR i.waits_on IS NOT NULL OR i.part_kind IS NOT NULL)",
                     )?;
-                    let v = st.query_map([], |r| r.get(0))?.collect::<Result<HashSet<String>, _>>()?;
+                    let mut v = st.query_map([], |r| r.get(0))?.collect::<Result<HashSet<String>, _>>()?;
+                    let mut st = c.prepare_cached("SELECT i.agent, i.reminded_at, i.reminders FROM goal_items i JOIN goal_stacks s ON s.agent = i.agent WHERE s.state = 'running' AND i.status = 'active' AND i.reminded_at > 0")?;
+                    for r in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))? {
+                        let (agent, at, n) = r?;
+                        if reminder_due(at, n) <= now {
+                            v.insert(agent);
+                        }
+                    }
                     Ok(v)
                 })
                 .await
@@ -3082,8 +3090,14 @@ where
     /// leaves them out with the rest), an agent's turn end settling (keep-going), a child settling or news waiting to be heard (parents told), a paused session's
     /// next look elsewhere, a plan step's subagent that failed to start trying again, a subagent's
     /// settings still to be given let go.
-    async fn deadline(&self, now: i64, riders: bool) -> Option<i64> {
+    ///
+    /// And whether it's a deadline that every stack's step may act on ([`Steps::Stacks`]): a plan step's subagent
+    /// trying again to start (`subagents::due`, what a parent's step hands out). A reminder coming due is its own
+    /// stack's (a round steps those due), a pause running out its own (the round resumes those), and the riders go
+    /// with every round.
+    async fn deadline(&self, now: i64, riders: bool) -> (Option<i64>, bool) {
         let mut soonest = self.stacks_deadline(now).await;
+        let subs = if riders { subagents::due() } else { None };
         let mut add = |t: Option<i64>| {
             if let Some(t) = t {
                 soonest = sooner(soonest, t, now);
@@ -3094,12 +3108,12 @@ where
             add(keep::due());
             add(crate::harness::told::due());
             add(crate::harness::elsewhere::due());
-            add(subagents::due());
+            add(subs);
             if let Some(hub) = self.hub {
                 add(crate::harness::lineage::settings_due(hub).await);
             }
         }
-        soonest
+        (soonest, subs.is_some() && subs == soonest)
     }
 
     /// [`Driver::deadline`]'s part from the stacks' own rows.
