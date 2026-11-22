@@ -36,6 +36,7 @@ pub mod bus;
 pub mod capacity;
 pub mod clock;
 pub mod conformance;
+pub mod conversations;
 pub mod dependencies;
 pub mod forge;
 pub mod harness;

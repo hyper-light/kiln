@@ -6306,7 +6306,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let folder = tmp.path().join("spill");
         let dir = super::super::spill::Dir::open(&folder)?;
-        let store = crate::convo::store::Store::start(Box::new(crate::convo::turso::Turso::open(&tmp.path().join("convo.db"))?), crate::convo::store::Upkeep::default())?;
+        let store = crate::convo::store::Store::start(crate::convo::open_engine(&tmp.path().join("convo.db"))?, crate::convo::store::Upkeep::default())?;
         let mut m = Mirror::new(Info { id: "s".into(), ..Info::default() }, Location::Local, sim_bus());
         let n = u64::try_from(CHUNK * 6 + 9)?;
         let mut rows = Vec::new();

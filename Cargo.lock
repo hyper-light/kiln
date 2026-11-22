@@ -2580,6 +2580,7 @@ name = "kiln"
 version = "0.2.0"
 dependencies = [
  "amphora",
+ "amphora-engine",
  "anyhow",
  "arc-swap",
  "argon2",

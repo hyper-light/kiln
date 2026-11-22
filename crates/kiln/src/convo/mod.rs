@@ -12,6 +12,7 @@
 //! - [`telemetry`]: what each store and feed is doing, for the System page and its dashboards.
 //! - [`board`]: the server's board of every store: their state, series and what happened lately.
 
+pub mod amphora;
 pub mod board;
 pub mod feed;
 pub mod inbox;
@@ -19,6 +20,7 @@ pub mod mirror;
 pub mod record;
 pub mod resume;
 pub mod rows;
+pub mod seam;
 pub mod sql;
 pub mod store;
 pub mod telemetry;
@@ -28,6 +30,54 @@ pub mod turso;
 pub const FILE: &str = "conversations.db";
 /// A mirror's copy of the server's store, beside a runner's own (`mirror`).
 pub const MIRROR_FILE: &str = "mirror.db";
+
+/// Which engine keeps the conversation store (CP-T1.1): Turso, unless `KILN_CONVERSATION_ENGINE` says `amphora`.
+/// Both run the one store kept in SQL (`sqlstore.rs`); Amphora's engine is Turso's lineage with its pages checksummed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Turso,
+    Amphora,
+}
+
+/// The variable that chooses the conversation store's engine ([`Kind::configured`]).
+pub const ENGINE_VAR: &str = "KILN_CONVERSATION_ENGINE";
+
+impl Kind {
+    /// Every engine, for what must hold on each (tests).
+    pub const ALL: [Kind; 2] = [Kind::Turso, Kind::Amphora];
+
+    /// The engine `KILN_CONVERSATION_ENGINE` names (`turso` or `amphora`; unset or empty: Turso). Anything else is an
+    /// error naming what it takes, never a guess.
+    pub fn configured() -> anyhow::Result<Self> {
+        match std::env::var(ENGINE_VAR) {
+            Err(std::env::VarError::NotPresent) => Ok(Self::Turso),
+            Err(e) => Err(anyhow::anyhow!("{ENGINE_VAR}: {e}")),
+            Ok(v) => Self::named(&v),
+        }
+    }
+
+    /// The engine called `name` (`turso` or `amphora`, any case; empty: Turso).
+    pub fn named(name: &str) -> anyhow::Result<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "" | "turso" => Ok(Self::Turso),
+            "amphora" => Ok(Self::Amphora),
+            other => anyhow::bail!("{ENGINE_VAR} is `{other}`: it takes `turso` or `amphora`"),
+        }
+    }
+
+    /// Its store at `path`, made and migrated as needed.
+    pub fn open(self, path: &std::path::Path) -> anyhow::Result<Box<dyn store::Engine>> {
+        Ok(match self {
+            Self::Turso => Box::new(turso::Turso::open(path)?),
+            Self::Amphora => Box::new(amphora::Amphora::open(path)?),
+        })
+    }
+}
+
+/// The store at `path` on the engine configured ([`Kind::configured`]).
+pub fn open_engine(path: &std::path::Path) -> anyhow::Result<Box<dyn store::Engine>> {
+    Kind::configured()?.open(path)
+}
 
 /// This machine's conversation store in `dir`, its writer started: None when it is turned off
 /// (`KILN_CONVERSATIONS=off`) or can't be opened, and the machine runs as it did without one.
@@ -48,7 +98,7 @@ pub fn open_file(dir: &std::path::Path, file: &str, upkeep: store::Upkeep) -> Op
         return None;
     }
     let path = dir.join(file);
-    let opened = turso::Turso::open(&path).and_then(|engine| store::Store::start(Box::new(engine), upkeep));
+    let opened = open_engine(&path).and_then(|engine| store::Store::start(engine, upkeep));
     match opened {
         Ok(s) => {
             tracing::info!(file = %path.display(), "conversations are kept in the store");

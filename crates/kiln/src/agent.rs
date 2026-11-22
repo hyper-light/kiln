@@ -7526,8 +7526,8 @@ mod tests {
             let (blue, green) = (dir.path().join("blue"), dir.path().join("green"));
             std::fs::create_dir_all(&blue)?;
             let hold = READ_WAIT + READ_WAIT / 2;
-            let engine = crate::convo::turso::Turso::open(&blue.join(crate::convo::FILE))?;
-            let st = Store::start(Box::new(SlowToLetGo { inner: Box::new(engine), hold }), Upkeep::default())?;
+            let engine = crate::convo::open_engine(&blue.join(crate::convo::FILE))?;
+            let st = Store::start(Box::new(SlowToLetGo { inner: engine, hold }), Upkeep::default())?;
             st.send("a1", &said("m1", 1, "before the upgrade"));
             let id = st.id().to_owned();
             let (out, _passed) = async_channel::unbounded();

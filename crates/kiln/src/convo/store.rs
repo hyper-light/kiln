@@ -1351,7 +1351,7 @@ pub fn tee_held(next: impl Into<crate::harness::session::To>, store: Option<Stor
 #[cfg(test)]
 pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
     let dir = tempfile::tempdir()?;
-    let store = Store::start(Box::new(super::turso::Turso::open(&dir.path().join(super::FILE))?), Upkeep::default())?;
+    let store = Store::start(super::open_engine(&dir.path().join(super::FILE))?, Upkeep::default())?;
     Ok((dir, store))
 }
 
@@ -1464,7 +1464,7 @@ mod tests {
     #[test]
     fn a_committed_read_answers_while_the_writer_is_held() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = Arc::new(Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join("conversations.db"))?), Upkeep::default())?);
+        let store = Arc::new(Store::start(super::super::open_engine(&dir.path().join("conversations.db"))?, Upkeep::default())?);
         for i in 1..=40u64 {
             store.send("a1", &said(&format!("m{i}"), i, "words"));
         }
@@ -1625,7 +1625,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let (from, to) = (dir.path().join("old").join(super::super::FILE), dir.path().join("new").join(super::super::FILE));
         std::fs::create_dir_all(dir.path().join("old"))?;
-        let st = Store::start(Box::new(super::super::turso::Turso::open(&from)?), Upkeep::default())?;
+        let st = Store::start(super::super::open_engine(&from)?, Upkeep::default())?;
         st.send("a1", &said("m1", 1, "kept across the upgrade"));
         let (id, top) = (st.id().to_owned(), st.top()?);
         st.close()?;
@@ -1643,7 +1643,7 @@ mod tests {
         super::super::move_file(&from, &to)?;
         assert!(!from.exists());
         assert!(super::super::move_file(&from, &to).is_err(), "never over a store that's there");
-        let again = Store::start(Box::new(super::super::turso::Turso::open(&to)?), Upkeep::default())?;
+        let again = Store::start(super::super::open_engine(&to)?, Upkeep::default())?;
         assert_eq!((again.id(), again.top()?), (id.as_str(), top));
         assert_eq!(again.kept("a1", 10)?.map(|k| k.events.into_iter().map(|e| e.text).collect::<Vec<_>>()), Some(vec!["kept across the upgrade".to_owned()]));
         Ok(())
@@ -1679,13 +1679,13 @@ mod tests {
         assert_eq!(std::fs::read(at(".unopened"))?, junk);
         // A store set aside still opens as it is, by its new name, its log by the same name.
         let real = dir.path().join("real.db");
-        let st = Store::start(Box::new(super::super::turso::Turso::open(&real)?), Upkeep::default())?;
+        let st = Store::start(super::super::open_engine(&real)?, Upkeep::default())?;
         st.send("a1", &said("m1", 1, "set aside whole"));
         let id = st.id().to_owned();
         st.close()?;
         let aside = super::super::set_aside(&real)?;
         assert_eq!(aside, dir.path().join("real.db.unopened"));
-        let again = Store::start(Box::new(super::super::turso::Turso::open(&aside)?), Upkeep::default())?;
+        let again = Store::start(super::super::open_engine(&aside)?, Upkeep::default())?;
         assert_eq!(again.id(), id);
         assert_eq!(again.kept("a1", 10)?.map(|k| k.events.len()), Some(1));
         Ok(())
@@ -1855,7 +1855,7 @@ mod tests {
     #[test]
     fn the_writer_lets_go_of_the_records_of_sessions_that_ended_long_ago_while_idle() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None })?;
+        let store = Store::start(super::super::open_engine(&dir.path().join(super::super::FILE))?, Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None })?;
         let now = crate::util::now_ms();
         let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: now };
         let line = |s: &str, n: u64| Row::Record(Box::new(rows::RecordRow { session: s.into(), source: "cc".into(), n, end: n + 1, line: "{}".into(), kept: None }));
@@ -1895,7 +1895,7 @@ mod tests {
     #[test]
     fn a_hold_keeps_the_records_of_sessions_that_ended_at_or_after_it() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None })?;
+        let store = Store::start(super::super::open_engine(&dir.path().join(super::super::FILE))?, Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: None })?;
         let now = crate::util::now_ms();
         let held = now - 3_600_000;
         store.hold_prune(held);
@@ -1924,7 +1924,7 @@ mod tests {
     #[test]
     fn ended_sessions_page_by_close_and_id_together() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let store = Store::start(Box::new(super::super::turso::Turso::open(&dir.path().join(super::super::FILE))?), Upkeep::default())?;
+        let store = Store::start(super::super::open_engine(&dir.path().join(super::super::FILE))?, Upkeep::default())?;
         let t = crate::util::now_ms() - 60_000;
         let session = |s: &str| Row::Session { session: s.into(), info: Some("{}".into()), meta: None, state: None, changes: None, epoch: None, open: true, at: t };
         let closed = |s: &str, at: i64| Row::Closed { session: s.into(), at };
@@ -1943,7 +1943,7 @@ mod tests {
     fn the_writer_makes_the_file_compact_by_itself_once_enough_of_it_is_free_and_goes_on() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join(super::super::FILE);
-        let store = Store::start(Box::new(super::super::turso::Turso::open(&path)?), Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: Some(1) })?;
+        let store = Store::start(super::super::open_engine(&path)?, Upkeep { keep_closed: Some(Duration::from_secs(60)), compact: Some(1) })?;
         let now = crate::util::now_ms();
         // Lines that hardly compress: a file of a few MB.
         let noise = |n: u64| -> String {

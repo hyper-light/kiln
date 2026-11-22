@@ -104,6 +104,7 @@ slates-ipc = { path = "vendor/slates/crates/ipc" }
 # engine's crates take one another by path, as Amphora's root manifest points them.
 amphora = { path = "vendor/amphora/crates/amphora" }
 amphora-api = { path = "vendor/amphora/crates/api" }
+amphora-engine = { path = "vendor/amphora/crates/engine" }
 quiver = { path = "vendor/quiver/crates/quiver" }
 quiver-api = { path = "vendor/quiver/crates/quiver-api" }
 # vorpal, the search across a change (docs/ci.md W26-R07): its crates, the tree-sitter runtime it

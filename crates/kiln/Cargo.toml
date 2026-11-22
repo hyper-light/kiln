@@ -69,6 +69,9 @@ quiver-api = "=0.1.0"
 # The database kiln keeps its records in (CP-T1.1): Amphora, vendored at vendor/amphora; the
 # conversation store moves onto it (CP-T1.1; docs/vendoring.md).
 amphora = "=0.1.0"
+# Its SQL engine, which the conversation store runs on when configured (convo::amphora; CP-T1.1), with the features
+# Amphora itself asks of it.
+amphora-engine = { version = "=0.1.0", default-features = false, features = ["fs", "json", "pure-rust-crypto", "checksum"] }
 # The search across a change (docs/ci.md W26-R07): kiln-seams' Search on vorpal (vendor/vorpal).
 kiln-search = { path = "../kiln-search" }
 # Shards, at kiln's one revision (vendor/shards; docs/shards.md): its Agentfile parser, which checks every Agentfile

@@ -715,6 +715,33 @@ Methods: `abilities`, `open`, `change`, `changes`, `update`, `stack`, `stack_add
 - **FORGE-19** unstacking takes a stack's unmerged changes out of it, leaving those queued in place, and dissolves it once none are left; a host that can't refuses Unsupported
 - **FORGE-20** a change's commits are read oldest first with what the host verified of each signature, and why: one by a key the host has as its signer's Verified, naming them; one by a key it hasn't Unverified; one unsigned Unsigned; a host that verifies none (its abilities say) says Unknown of each; a change never opened is refused NotFound
 
+## Conversations
+
+The store kiln keeps its agents' conversations in (docs/conversations.md; CP-T1.1). Entries are appended
+durably to conversations, each known by its id within its conversation and kept as it was appended last; a
+conversation's history reads the newest of them before a sequence, oldest first; and a change feed of
+revisions hands on what was committed after any revision, oldest first, a page of about the bytes asked for,
+with the revision it read through, which kiln's peers and followers read. Beside the suite, every
+implementation runs the seam's load scenario (`kiln_seams::conversations::load`): many conversations
+written at once, a burst of readers following the feed, a restart mid-stream, reporting append, history and
+feed read latency (p50, p99, p99.9), the feed's lag in revisions, the time to catch up and the memory held.
+
+- **Implementations:** kiln's conversation store (`crates/kiln/src/convo/seam.rs`, a `convo::store::Store`
+  as the seam), on Turso (`vendor/turso`, the default and the control) or on Amphora's engine
+  (`vendor/amphora`, `amphora-engine`), chosen by `KILN_CONVERSATION_ENGINE` (`turso` or `amphora`);
+  `kiln_seams::conversations::SimConversations`, which keeps entries in memory, a million of them at most
+  (past them an append is refused).
+- **Used by:** kiln's conversation store (`crates/kiln/src/convo`).
+- **Passed by:** the simulator, and the store on each engine, every clause (`convo::seam`'s tests).
+
+Methods: `append`, `history`, `changes`, `top`, `close`.
+
+- **CONVO-1** appended entries are read back by their conversation's history, the newest asked for before a sequence, oldest first
+- **CONVO-2** an entry appended again by its id is kept as appended last, once; the same again commits nothing, and the feed hands it on once more only when it changed
+- **CONVO-3** the feed from any revision hands on every entry committed after it exactly once, oldest first, while writers append at once
+- **CONVO-4** what was committed and its revisions stay through a restart: a reader goes on from where it was, nothing missed or seen twice; a closed handle is refused Closed
+- **CONVO-5** a page of one byte holds one change, paging by where each read through reaches the top, and past the top there is nothing
+
 ## Search
 
 A tree's files, searched by their text or by the shape of their code, each hit with the definition

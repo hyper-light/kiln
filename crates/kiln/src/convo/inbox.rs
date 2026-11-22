@@ -308,12 +308,12 @@ mod tests {
             let dir = tempfile::tempdir()?;
             let path = dir.path().join(super::super::FILE);
             {
-                let store = Store::start(Box::new(super::super::turso::Turso::open(&path)?), super::super::store::Upkeep::default())?;
+                let store = Store::start(super::super::open_engine(&path)?, super::super::store::Upkeep::default())?;
                 let records = InboxRecords::new(Source::Store(store.clone()), families(), None);
                 records.commit(Tx { conds: Vec::new(), writes: vec![put("inbox", "s1/m1", "taken")] }).await?;
                 store.close()?;
             }
-            let store = Store::start(Box::new(super::super::turso::Turso::open(&path)?), super::super::store::Upkeep::default())?;
+            let store = Store::start(super::super::open_engine(&path)?, super::super::store::Upkeep::default())?;
             let records = InboxRecords::new(Source::Store(store), families(), None);
             anyhow::ensure!(records.get("inbox", b"s1/m1", Consistency::Linearizable).await?.is_some(), "a take is kept across the store's restart");
             Ok(())

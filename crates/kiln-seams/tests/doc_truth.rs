@@ -79,6 +79,14 @@ fn seams() -> Vec<Seam> {
     let weights = sandbox::Limits::default();
     vec![
         Seam {
+            title: "Conversations",
+            file: "conversations.rs",
+            tr: "Conversations",
+            more: &[],
+            cases: said(&conversations::cases::<conversations::SimConversationsFixture>()),
+            bounds: vec!["a million of them at most (past them an append is refused)".to_owned()],
+        },
+        Seam {
             title: "Clock",
             file: "clock.rs",
             tr: "Clock",
