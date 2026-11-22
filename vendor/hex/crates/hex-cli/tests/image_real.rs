@@ -39,6 +39,9 @@
 //!   D270 slice 4: an OSI artifact of that member's kind for this host's platform, by its manifest digest), at that
 //!   member's path (`/harness/cat` for `image_harness`'s), which HEX-IMG-11 swaps in and out. Unset, HEX-IMG-11 fails
 //!   saying no component is named, as no swap can be held to the contract without one; the other cases run as ever.
+//! - `HEX_IMAGE_HARNESS`: the harness a pinned image's VMs run (its `NAME`), whose network and folders HEX-IMG-12 and
+//!   HEX-IMG-13 change live; a built context's Agentfile names its own (its first `HARNESS NAME`, `cat` for the in-tree
+//!   `image_harness`), and where neither does, the component's harness (`HEX_IMAGE_COMPONENT`) is taken.
 //! - `HEX_IMAGE_NETWORK`: the name of a network this run makes in the node's Shards home, its own (`shards network
 //!   create`, as Shards keeps networks by home), which HEX-IMG-13 connects the image's harness to (kiln plan P6b.3;
 //!   Shards' D285); none, and HEX-IMG-13 fails.
@@ -67,8 +70,8 @@ use std::time::{Duration, Instant};
 
 use hex_api::conformance::{self, Act, Fixture};
 use hex_api::{
-    Allocation, Bounds, BoxId, BoxSpec, Class, ClassSpec, LifecycleCause, Program, Refusal,
-    Runtime, ShardsImage,
+    Allocation, Bounds, BoxId, BoxSpec, Class, ClassSpec, LifecycleCause, Member, MemberKind,
+    Program, Refusal, Runtime, ShardsImage,
 };
 use hex_client::Client;
 
@@ -102,6 +105,8 @@ struct ImageBoxes {
     /// A network this run made in the node's Shards home (`HEX_IMAGE_NETWORK`), which HEX-IMG-13 connects to (Shards'
     /// D285); none, and HEX-IMG-13 fails.
     network: Option<String>,
+    /// The harness its VMs run, which HEX-IMG-12 and HEX-IMG-13 change live: its context's, or `HEX_IMAGE_HARNESS`.
+    harness: Option<String>,
 }
 
 /// The command a run's act is, in the image's own shell: the image cases ask a run to fail with a code (HEX-IMG-3)
@@ -164,6 +169,29 @@ impl Fixture for ImageBoxes {
     fn network(&self) -> Option<String> {
         self.network.clone()
     }
+
+    fn harness(&self) -> Option<Member> {
+        match &self.harness {
+            Some(name) => Some(Member {
+                kind: MemberKind::Harness,
+                name: name.clone(),
+            }),
+            None => self
+                .component
+                .as_ref()
+                .and_then(conformance::Component::harness),
+        }
+    }
+}
+
+/// The first harness an Agentfile names (`HARNESS NAME …`).
+fn harness_of(agentfile: &str) -> Option<String> {
+    agentfile.lines().find_map(|line| {
+        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["HARNESS", name, ..] => Some((*name).to_owned()),
+            _ => None,
+        }
+    })
 }
 
 /// A process as its OS lists it: its pid, its parent's pid, and when it started, which tells it from a later process
@@ -372,6 +400,12 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
     let plugged = work.join("plugged");
     fs::create_dir_all(&plugged).unwrap();
     let network = std::env::var("HEX_IMAGE_NETWORK").ok();
+    let harness = match &source {
+        Source::Context(context) => fs::read_to_string(context.join("Agentfile"))
+            .ok()
+            .and_then(|text| harness_of(&text)),
+        Source::Pinned(_) => std::env::var("HEX_IMAGE_HARNESS").ok(),
+    };
     // A VM's start boots it: a wait past its W* tells its run-out and follows its party (decision 9), and the run's
     // deadline bounds the whole suite.
     assert!(
@@ -416,6 +450,7 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
             component,
             plugged,
             network,
+            harness,
         };
         let begun = Instant::now();
         let failures = conformance::run_image(&client, &fixture);
@@ -449,6 +484,17 @@ fn the_shards_image_class_holds_its_contract_through_a_real_node() {
     );
     assert!(failures.is_empty(), "the image cases failed: {failures:#?}");
     assert!(released.is_ok(), "the release case failed: {released:?}");
+}
+
+/// kiln plan P6b.3 (AC-T7.4.1): HEX-IMG-12 and HEX-IMG-13 change the harness its VMs run live, which a built context's
+/// Agentfile names, with no component asked of the run. Do read the in-tree context's Agentfile, and one naming no
+/// harness. Expect its one harness, `cat`, and none.
+#[test]
+fn a_contexts_live_changes_take_the_harness_its_agentfile_names() {
+    let context = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/image_harness");
+    let agentfile = fs::read_to_string(context.join("Agentfile")).unwrap();
+    assert_eq!(harness_of(&agentfile).as_deref(), Some("cat"));
+    assert_eq!(harness_of("FROM base\nAGENT a FROM ./a\n"), None);
 }
 
 /// Joint plan step 12 (AC-T7.4.1; ROOT's HVF run at c8b4ce6b, whose cases were refused for an image with no member): the

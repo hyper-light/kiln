@@ -1465,7 +1465,7 @@ impl Server {
             }
             // Init's word of whose the host's files are, before any confinement: a share's
             // root, or a file bound alone's directory, takes nothing else.
-            op::SETXATTR if owner_control(body).is_some() => {
+            op::SETXATTR if owner_control(body, state.negotiated & init::SETXATTR_EXT != 0).is_some() => {
                 set_default_owner(&mut state, nodeid, caller, body)
             }
             // A notice of its host's (D235): the file as it is, nothing changed.
@@ -1694,7 +1694,7 @@ impl Server {
                 let umask = a.u32()?;
                 let _ = a.u32()?;
                 let name = a.name()?;
-                let (mode, access, _) = created(s, nodeid, asked, umask, false)?;
+                let Made { mode, access, .. } = created(s, nodeid, asked, umask, false)?;
                 let dir = dir_fd(s, nodeid)?;
                 let taken = reserve_name(s, 0)?;
                 let kind = mode & S_IFMT;
@@ -1751,7 +1751,11 @@ impl Server {
                 let asked = a.u32()?;
                 let umask = a.u32()?;
                 let name = a.name()?;
-                let (mode, access, default) = created(s, nodeid, asked, umask, true)?;
+                let Made {
+                    mode,
+                    access,
+                    default,
+                } = created(s, nodeid, asked, umask, true)?;
                 let dir = dir_fd(s, nodeid)?;
                 let taken = reserve_name(s, 0)?;
                 mkdir_at(dir, &name, host_perm(mode, true))?;
@@ -1865,7 +1869,7 @@ impl Server {
                 let umask = a.u32()?;
                 let _ = a.u32()?;
                 let name = a.name()?;
-                let (mode, access, _) = created(s, nodeid, asked, umask, false)?;
+                let Made { mode, access, .. } = created(s, nodeid, asked, umask, false)?;
                 room_for_handle(s)?;
                 let dir = dir_fd(s, nodeid)?;
                 let flags = host::open_flags(flags) | host::O_CREAT;
@@ -2172,19 +2176,12 @@ impl Server {
             }
             op::SETXATTR => {
                 self.writable(s, nodeid)?;
-                let size = a.u32()?;
-                let flags = a.u32()?;
-                // `fuse_setxattr_in`'s extended form, where it was negotiated: its own flags,
-                // then padding.
-                let setxattr_flags = if s.negotiated & init::SETXATTR_EXT != 0 {
-                    let f = a.u32()?;
-                    let _ = a.u32()?;
-                    f
-                } else {
-                    0
-                };
-                let name = a.cstr()?;
-                let value = a.rest().get(..size as usize).ok_or(EINVAL)?;
+                let SetXattr {
+                    flags,
+                    setxattr_flags,
+                    name,
+                    value,
+                } = setxattr_args(body, s.negotiated & init::SETXATTR_EXT != 0)?;
                 if hidden(&name) {
                     return Err(EOPNOTSUPP);
                 }
@@ -2479,7 +2476,6 @@ impl Server {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// An access ACL set (goal 92, as Linux's `set_posix_acl` and `posix_acl_update_mode`): the
     /// value checked as Linux checks one; the mode takes its owner, mask (or owning group) and
     /// other entries, its set-group-ID bit cleared where the guest's kernel asks
@@ -2497,6 +2493,12 @@ impl Server {
         /// `fuse_setxattr_in`'s `FUSE_SETXATTR_ACL_KILL_SGID`.
         const KILL_SGID: u32 = 1 << 0;
         let parsed = acl::Acl::parse(value).map_err(refused)?;
+        // A directory the server may search alone (memory-19) it changes nothing of, as SETATTR
+        // refuses it a mode (D290): its host refuses the server its reading, which the mode this
+        // sets would widen.
+        if searched_only(s, nodeid) {
+            return Err(EACCES);
+        }
         let gone = |s: &mut State| match remove_attr(s, nodeid, name) {
             Err(ENODATA) => Ok(()),
             done => done,
@@ -2520,6 +2522,7 @@ impl Server {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn chmod(
         &self,
         s: &mut State,
@@ -2618,17 +2621,54 @@ fn node_fd_to_change(s: &mut State, nodeid: u64) -> Result<NodeFd, Errno> {
     node_fd(s, nodeid).map_err(|e| if e == ENODATA { EPERM } else { e })
 }
 
-/// A SETXATTR's value where it names [`shards_abi::SHARE_OWNER_XATTR`]: none for any other
-/// attribute.
-fn owner_control(body: &[u8]) -> Option<&[u8]> {
+/// A SETXATTR's value where it names [`shards_abi::SHARE_OWNER_XATTR`], read in the form its
+/// session took (`ext`, [`setxattr_args`]): none for any other attribute.
+fn owner_control(body: &[u8], ext: bool) -> Option<&[u8]> {
+    let x = setxattr_args(body, ext).ok()?;
+    (x.name.to_bytes() == shards_abi::SHARE_OWNER_XATTR.as_bytes()).then_some(x.value)
+}
+
+/// A SETXATTR's arguments: `fuse_setxattr_in`, then the name and the value. In its extended
+/// form, which a guest's kernel sends once its session took FUSE_SETXATTR_EXT (v6.18
+/// fs/fuse/xattr.c `fuse_setxattr`; D290), its own flags and a padding word follow its size
+/// and flags.
+struct SetXattr<'a> {
+    flags: u32,
+    setxattr_flags: u32,
+    name: CString,
+    value: &'a [u8],
+}
+
+/// `body` read as the SETXATTR it is: in its extended form where its session took it (`ext`),
+/// unless its guest's kernel made it before it read INIT's reply, which it sends in the
+/// short form all the same (`fuse_setxattr` sizes it by `setxattr_ext` as it builds it, and
+/// virtiofs's mount asks INIT in the background: fs/fuse/inode.c `fuse_send_init`; init's
+/// owner word, set as its share is mounted, is one). The two are told apart by bytes 12 to
+/// 16: the extended form's padding, zeros; the short form's name's fifth to eighth bytes,
+/// one of which is not zero in any name the server takes (`namespaced`).
+fn setxattr_args(body: &[u8], ext: bool) -> Result<SetXattr<'_>, Errno> {
+    let ext = ext && body.get(12..16) == Some(&[0u8; 4][..]);
     let mut a = Args(body);
-    let size = a.u32().ok()?;
-    let _flags = a.u32().ok()?;
-    let name = a.cstr().ok()?;
-    if name.to_bytes() != shards_abi::SHARE_OWNER_XATTR.as_bytes() {
-        return None;
-    }
-    a.rest().get(..usize::try_from(size).ok()?)
+    let size = a.u32()?;
+    let flags = a.u32()?;
+    let setxattr_flags = if ext {
+        let own = a.u32()?;
+        let _padding = a.u32()?;
+        own
+    } else {
+        0
+    };
+    let name = a.cstr()?;
+    let value = a
+        .rest()
+        .get(..usize::try_from(size).map_err(|_| EINVAL)?)
+        .ok_or(EINVAL)?;
+    Ok(SetXattr {
+        flags,
+        setxattr_flags,
+        name,
+        value,
+    })
 }
 
 /// Init's word, `UID:GID`, of whose the files are that hold no owner of the guest's (D38):
@@ -2637,7 +2677,7 @@ fn owner_control(body: &[u8]) -> Option<&[u8]> {
 /// request says root), of a read-only share too, and kept on no file. Any other node's is
 /// refused (EINVAL), so that no file holds an attribute of that name.
 fn set_default_owner(s: &mut State, nodeid: u64, caller: (u32, u32), body: &[u8]) -> Result<(), Errno> {
-    let value = owner_control(body).ok_or(EINVAL)?;
+    let value = owner_control(body, s.negotiated & init::SETXATTR_EXT != 0).ok_or(EINVAL)?;
     if caller.0 != 0 {
         return Err(EPERM);
     }
@@ -3869,32 +3909,48 @@ fn set_default_acl(s: &mut State, nodeid: u64, name: &CStr, value: &[u8]) -> Res
 /// takes, and the ACLs it is given (goal 92): under the parent's default ACL what it grants
 /// (`acl::Acl::given`), its access ACL where that says more than its mode, and for a directory
 /// the default too; with none, the umask where the kernel left it to the server
-/// (`FUSE_DONT_MASK`), else the mode as it came.
-fn created(
-    s: &mut State,
-    parent: u64,
-    mode: u32,
-    umask: u32,
-    dir: bool,
-) -> Result<(u32, Option<Vec<u8>>, Option<Vec<u8>>), Errno> {
+/// (`FUSE_DONT_MASK`), else the mode as it came. As Linux's `posix_acl_create` (D290): none,
+/// or a host that keeps no attributes (EOPNOTSUPP), leaves the umask; a default the server
+/// cannot read, or one that is no ACL, refuses what would be made, as D38's owner records fail
+/// closed.
+fn created(s: &mut State, parent: u64, mode: u32, umask: u32, dir: bool) -> Result<Made, Errno> {
     if s.negotiated & init::POSIX_ACL != 0 {
         let fd = node_fd(s, parent)?;
-        let default = host_xattr(&CString::new(acl::DEFAULT).map_err(|_| EINVAL)?)
-            .and_then(|name| fget_xattr(fd.raw(), &name))
-            .ok()
-            .flatten();
-        if let Some(bytes) = default
-            && let Ok(default) = acl::Acl::parse(&bytes)
-            && !default.is_empty()
-        {
-            let (made, access) = default.given(mode);
-            return Ok((made, access.map(|a| a.to_bytes()), dir.then_some(bytes)));
+        let name = host_xattr(&CString::new(acl::DEFAULT).map_err(|_| EINVAL)?)?;
+        let default = match fget_xattr(fd.raw(), &name) {
+            Err(EOPNOTSUPP) => None,
+            read => read?,
+        };
+        if let Some(bytes) = default {
+            let default = acl::Acl::parse(&bytes).map_err(refused)?;
+            if !default.is_empty() {
+                let (made, access) = default.given(mode);
+                return Ok(Made {
+                    mode: made,
+                    access: access.map(|a| a.to_bytes()),
+                    default: dir.then_some(bytes),
+                });
+            }
         }
     }
-    if s.negotiated & init::DONT_MASK != 0 {
-        return Ok((mode & !(umask & 0o777), None, None));
-    }
-    Ok((mode, None, None))
+    let mode = if s.negotiated & init::DONT_MASK != 0 {
+        mode & !(umask & 0o777)
+    } else {
+        mode
+    };
+    Ok(Made {
+        mode,
+        access: None,
+        default: None,
+    })
+}
+
+/// What a node made in a directory takes ([`created`]): its mode, and the access and default
+/// ACLs it is given as it is made ([`inherited`]).
+struct Made {
+    mode: u32,
+    access: Option<Vec<u8>>,
+    default: Option<Vec<u8>>,
 }
 
 /// Gives node `nodeid`, just made, the ACLs [`created`] said it takes.
@@ -5685,7 +5741,7 @@ mod tests {
     /// from outside the file's group clears its set-group-ID bit. Without ACLs negotiated, a
     /// guest's ACL stays its data (`a_guests_acl_is_its_own_data_never_its_host_files_acl`).
     #[test]
-    fn g92_an_access_acl_sets_the_mode_and_is_shown_from_it() {
+    fn an_access_acl_sets_the_mode_and_is_shown_from_it() {
         let (path, s) = dir();
         std::fs::write(path.join("f"), "f").unwrap();
         let took = negotiate(&s, init::ACL_FLAGS);
@@ -5743,7 +5799,7 @@ mod tests {
     /// the default too); elsewhere the server applies the umask the kernel left it
     /// (FUSE_DONT_MASK); and a default ACL is a directory's alone (EACCES).
     #[test]
-    fn g92_a_default_acl_gives_what_is_made_in_it_in_place_of_the_umask() {
+    fn a_default_acl_gives_what_is_made_in_it_in_place_of_the_umask() {
         let (path, s) = dir();
         std::fs::create_dir(path.join("d")).unwrap();
         std::fs::write(path.join("f"), "f").unwrap();
@@ -5802,7 +5858,7 @@ mod tests {
     /// goal 92: what a session negotiated of the ACLs is in its saved tables, so a restored guest,
     /// which sends no INIT, is served as before; tables saved before it read as none.
     #[test]
-    fn g92_a_sessions_acls_are_kept_in_its_saved_tables() {
+    fn a_sessions_acls_are_kept_in_its_saved_tables() {
         let (path, s) = dir();
         negotiate(&s, init::ACL_FLAGS);
         let table = s.save().unwrap();
@@ -5813,6 +5869,136 @@ mod tests {
         let before = Server::new(root_of(&path), false, None).unwrap();
         before.restore(older).unwrap();
         assert_eq!(before.state.lock().unwrap().negotiated, 0);
+    }
+
+    /// D290: once a session takes FUSE_SETXATTR_EXT, its guest's kernel sends every SETXATTR in
+    /// the extended form (v6.18 fs/fuse/xattr.c `fuse_setxattr`), init's owner word (D38) among
+    /// them: the share's host files are the owner it names, and its root keeps no attribute of
+    /// that name.
+    #[test]
+    fn inits_owner_word_is_taken_in_setxattrs_extended_form() {
+        let (path, s) = dir();
+        std::fs::write(path.join("host.txt"), "hi").unwrap();
+        negotiate(&s, init::ACL_FLAGS);
+        let mut word = owner_word("1000:1001");
+        // `fuse_setxattr_in`'s own flags and its padding, after its size and flags.
+        word.splice(8..8, [0u8; 8]);
+        assert_eq!(answer(&s, &req(op::SETXATTR, ROOT, 0, &word)).0, 0);
+        let (_, uid, gid) = owned(&s, ROOT, "host.txt");
+        assert_eq!((uid, gid), (1000, 1001));
+        assert_eq!(getxattr_of(&s, ROOT, shards_abi::SHARE_OWNER_XATTR).0, -ENODATA);
+    }
+
+    /// D290: a SETXATTR its guest's kernel made before it read INIT's reply comes in the short
+    /// form, though the session took FUSE_SETXATTR_EXT: `fuse_setxattr` sizes the request by
+    /// `setxattr_ext` as it builds it, then waits for the reply, which virtiofs's mount asks
+    /// in the background (v6.18 fs/fuse/xattr.c; fs/fuse/inode.c `fuse_send_init`), and init
+    /// sets its owner word as soon as the share is mounted. Each form is read as it is: the
+    /// word is taken, and a guest's own attribute in either form is set by its own name.
+    #[test]
+    fn a_setxattr_made_before_init_was_answered_is_read_in_its_short_form() {
+        let (path, s) = dir();
+        std::fs::write(path.join("host.txt"), "hi").unwrap();
+        negotiate(&s, init::ACL_FLAGS);
+        let short = answer(&s, &req(op::SETXATTR, ROOT, 0, &owner_word("1000:1001"))).0;
+        let (_, uid, gid) = owned(&s, ROOT, "host.txt");
+        assert_eq!((short, uid, gid), (0, 1000, 1001), "the owner word, short");
+        let f = found(&s, ROOT, "host.txt");
+        for (n, ext) in [("user.short", None), ("user.extended", Some(0))] {
+            let set = setxattr_of(n, b"v", ext);
+            assert_eq!(answer(&s, &req(op::SETXATTR, f, 0, &set)).0, 0, "{n}");
+            assert_eq!(getxattr_of(&s, f, n), (0, b"v".to_vec()), "{n}");
+        }
+    }
+
+    /// D290 with D38, in its guest's order: its kernel's INIT asking every flag (as 6.18's
+    /// `fuse_new_init` asks the three among many), init's owner word in the form that session
+    /// takes, then a run of user 1000 makes a directory in the share's root, as a bind's run
+    /// does: its root is that user's, and the directory is made, its mode masked by the
+    /// umask the kernel left the server.
+    #[test]
+    fn a_run_users_directory_is_made_in_a_root_inits_word_gave_it() {
+        let (path, s) = dir();
+        negotiate(&s, u32::MAX);
+        let mut word = owner_word("1000:1000");
+        word.splice(8..8, [0u8; 8]);
+        assert_eq!(answer(&s, &req(op::SETXATTR, ROOT, 0, &word)).0, 0);
+        let (e, attr) = answer(&s, &req(op::GETATTR, ROOT, 1000, &[0u8; 16]));
+        assert_eq!(e, 0);
+        let word_at = |at: usize| u32::from_le_bytes(attr[16 + at..16 + at + 4].try_into().unwrap());
+        assert_eq!((word_at(68), word_at(72)), (1000, 1000), "the root's owner");
+        let mut mkdir = [0o777u32, 0o022]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<u8>>();
+        mkdir.extend(name("out"));
+        assert_eq!(answer(&s, &req(op::MKDIR, ROOT, 1000, &mkdir)).0, 0);
+        let (out, uid, gid) = owned(&s, ROOT, "out");
+        assert_eq!((uid, gid), (1000, 1000));
+        assert_eq!(mode_to_guest(&s, out) & 0o777, 0o755);
+        assert!(path.join("out").is_dir());
+    }
+
+    /// D290: a directory the server may search alone (memory-19) takes no access ACL, as it
+    /// takes no mode (SETATTR's EACCES): the ACL's set would set its host directory's mode,
+    /// giving the server what its host refused it. Root reads every directory, so as root this
+    /// is a SKIP.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_the_server_may_only_search_takes_no_access_acl() {
+        // SAFETY: geteuid reads this process's effective uid.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIP: root reads every directory");
+            return;
+        }
+        let (root, s) = dir();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let mode = |m| {
+            std::fs::set_permissions(root.join("a/b"), std::os::unix::fs::PermissionsExt::from_mode(m))
+                .unwrap();
+        };
+        negotiate(&s, init::ACL_FLAGS);
+        mode(0o111);
+        let a = found(&s, ROOT, "a");
+        let b = found(&s, a, "b");
+        let named = acl_of(&[
+            (USER_OBJ, 7, u32::MAX),
+            (USER, 7, 1000),
+            (GROUP_OBJ, 5, u32::MAX),
+            (MASK, 7, u32::MAX),
+            (OTHER, 5, u32::MAX),
+        ]);
+        let set = setxattr_of("system.posix_acl_access", &named, Some(0));
+        let refused = answer(&s, &req(op::SETXATTR, b, 0, &set)).0;
+        let left = std::fs::metadata(root.join("a/b")).unwrap().permissions();
+        mode(0o755);
+        assert_eq!(
+            (refused, std::os::unix::fs::PermissionsExt::mode(&left) & 0o7777),
+            (-EACCES, 0o111)
+        );
+    }
+
+    /// D290: a directory's default ACL that is no ACL refuses what is made in it, as Linux's
+    /// `posix_acl_create` refuses a default it cannot read and D38's owner records fail closed:
+    /// only none, or a host that keeps no attributes, leaves the umask. No Linux guest's kernel
+    /// sends such a value (its VFS parses every ACL it is given); a session without ACLs keeps
+    /// whatever it is given as data.
+    #[test]
+    fn a_default_acl_that_is_no_acl_refuses_what_is_made_in_it() {
+        let (path, s) = dir();
+        std::fs::create_dir(path.join("d")).unwrap();
+        let d = found(&s, ROOT, "d");
+        let torn = setxattr_of("system.posix_acl_default", &[2, 0, 0, 0, 1], None);
+        assert_eq!(answer(&s, &req(op::SETXATTR, d, 0, &torn)).0, 0);
+        negotiate(&s, init::ACL_FLAGS);
+        let d = found(&s, ROOT, "d");
+        let mut create = [host::O_RDWR as u32, 0o100_666, 0o022, 0]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<u8>>();
+        create.extend(name("made"));
+        let made = answer(&s, &req(op::CREATE, d, 0, &create)).0;
+        assert_eq!((made, path.join("d").join("made").exists()), (-EINVAL, false));
     }
 
     fn found(s: &Server, parent: u64, n: &str) -> u64 {

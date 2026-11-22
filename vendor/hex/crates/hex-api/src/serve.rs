@@ -38,7 +38,11 @@ pub trait Servers: Send + Sync {
     /// [`stream`](Self::stream), and beside it, where this server gives one, the share's resync channel (Shards' D288;
     /// slates' A-316): the end over which a successor of the server, should it die, hands the share a fresh stream, so
     /// that the share outlives its server. Unix's alone; by default none, the stream alone.
-    fn stream_resyncing(&self, id: &BoxId, share: &ServedMount) -> Result<(Stream, Option<Stream>), Refusal> {
+    fn stream_resyncing(
+        &self,
+        id: &BoxId,
+        share: &ServedMount,
+    ) -> Result<(Stream, Option<Stream>), Refusal> {
         Ok((self.stream(id, share)?, None))
     }
 }

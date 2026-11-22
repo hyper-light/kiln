@@ -31,14 +31,16 @@ use hex_testkit::wipes::{self, SECRET};
 #[global_allocator]
 static WIPES: wipes::Watch = wipes::Watch;
 
-/// 32 random bytes: this process's random hash keys, one hash for each byte's place.
-fn secret() -> [u8; SECRET] {
+/// 32 random bytes, made in `out` in place: this process's random hash keys, one hash for each byte's place. Never
+/// handed back whole by value, which leaves copies of the secret on the test's stack that a later move carries into
+/// the heap, for the watch to find as if the node had made them (hex-testkit's `wipes::holds`).
+fn secret(out: &mut [u8; SECRET]) {
     let keys = std::collections::hash_map::RandomState::new();
-    std::array::from_fn(|place| {
+    for (place, byte) in out.iter_mut().enumerate() {
         let mut hash = keys.build_hasher();
         hash.write_usize(place);
-        hash.finish().to_le_bytes()[0]
-    })
+        *byte = hash.finish().to_le_bytes()[0];
+    }
 }
 
 /// A folder of the test's own under the user's cache, never the system's temporary folder.
@@ -241,7 +243,8 @@ fn harness(name: &str) -> BoxSpec {
 /// the secret whole, and no block freed meanwhile, the node's, its socket's or its client's, to have held it.
 #[test]
 fn e6_no_block_freed_holds_a_secret_the_node_carried_on_its_socket() {
-    let secret = secret();
+    let mut secret = [0u8; SECRET];
+    self::secret(&mut secret);
     let dir = scratch();
     let watching = wipes::watch(&secret).unwrap();
     let captured = Arc::new(AtomicBool::new(false));
@@ -313,7 +316,8 @@ fn enrolled(ca: &SimCa, name: &str) -> hex_quic::tls::Credentials {
 /// hex-quic's lanes, so what hyper-quic's send buffer and hyper-transport's receive pool hold of it is ciphertext.
 #[test]
 fn e6_no_block_freed_holds_a_secret_the_node_carried_over_quic() {
-    let secret = secret();
+    let mut secret = [0u8; SECRET];
+    self::secret(&mut secret);
     let dir = scratch();
     let watching = wipes::watch(&secret).unwrap();
     let captured = Arc::new(AtomicBool::new(false));

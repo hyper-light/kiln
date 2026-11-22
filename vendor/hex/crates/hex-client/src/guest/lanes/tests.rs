@@ -302,19 +302,18 @@ fn a_port_the_relay_has_no_socket_for_is_refused_before_a_lane() {
     );
 }
 
-/// D251: the relay's socket closed while Hex still sends is the lane's reset, never its end in order, and Hex reads
-/// the bytes that came before it, then the cut. Do: the relay writes a line, reads a byte of what Hex sends, and closes;
-/// Hex sends past the lane's window and reads. Expect: the line, then an error that is a reset, not `Ok(0)`. On Linux
-/// and macOS alike: this case's stand-in run host runs Shards' unix-lane pump on the test's own host, which told the
-/// socket's end as the lane's end in order before its writer failed (4 of 4 on the Mac Studio, once under the whole
-/// client suite on Linux) until Shards 8754b451f, vendored with Shards 3114e082f.
+/// Shards' D251 as amended: the relay's socket closed while Hex still sends ends the lane's reading in order, after
+/// every byte the relay wrote (its FIN), and refuses Hex's writes (STOP_SENDING). Do: the relay writes a line, reads a
+/// byte of what Hex sends, and closes; Hex sends past the lane's window and reads. Expect: the line, then its end,
+/// `Ok`. Its endpoint reset such a lane until Shards 54291fd13, which could drop the line unsent (RFC 9000 §19.4: a
+/// stream reset abandons what its sender hadn't sent): the review's D-4, on every OS.
 #[test]
-fn a_lane_its_socket_cuts_short_reads_its_bytes_then_the_cut() {
+fn a_lane_its_socket_closes_while_hex_sends_reads_its_bytes_then_its_end() {
     let dir = socket_dir();
     let listener = listen(dir.path(), stream::CONTROL_PORT);
     let relay = std::thread::spawn(move || {
         let mut conn = listener.accept();
-        conn.write_all(b"before the cut\n").unwrap();
+        conn.write_all(b"before the close\n").unwrap();
         let mut one = [0u8];
         conn.read_exact(&mut one).unwrap();
     });
@@ -323,31 +322,38 @@ fn a_lane_its_socket_cuts_short_reads_its_bytes_then_the_cut() {
     let mut writer = conn.try_clone().unwrap();
     let sending = std::thread::spawn(move || {
         let sent = pattern();
-        // Past the relay's close the lane is reset, and so this write fails: the cut is the read's to tell.
+        // Past the relay's close the lane refuses what it hasn't taken, which this write may have handed it all before
+        // then: whether it fails is the buffers' between them, and the next case's to tell.
         let _ = writer.write_all(&sent);
     });
     let mut got = Vec::new();
     let end = conn.read_to_end(&mut got);
     relay.join().unwrap();
     sending.join().unwrap();
-    assert_eq!(got, b"before the cut\n", "the bytes before the cut");
-    let cut = end.expect_err("a cut read as the lane's end in order");
-    assert_eq!(cut.kind(), std::io::ErrorKind::ConnectionReset, "{cut}");
+    assert_eq!(got, b"before the close\n", "the bytes the relay wrote");
+    assert_eq!(
+        end.map_err(|e| e.to_string()),
+        Ok(got.len()),
+        "the lane's end in order"
+    );
 }
 
-/// The review's D-4 (D251; AC-T7.4.1), on every OS: a lane its socket cuts short while Hex still sends, Hex reading
-/// only once a write of its has failed. Do: the relay writes a line, reads a byte of what Hex sends, and closes; Hex
-/// writes a lane's window at a time until a write fails, then reads. Expect the line, then the cut, a reset: no byte
-/// that came before the cut lost to how the bridge ends Hex's socket. (On Windows that socket is one end of a loopback
-/// TCP pair, where a shutdown of receiving resets the connection if bytes wait or come, Winsock's documented
-/// contract for `shutdown(SD_RECEIVE)`.)
+/// The review's D-4 (Shards' D251 as amended; AC-T7.4.1), on every OS: a lane its socket closes while Hex still sends,
+/// Hex reading only once a write of its has failed. Do: the relay writes a line, reads a byte of what Hex sends, and
+/// closes; Hex writes a lane's window at a time until a write fails, then reads. Expect: the write's refusal, then the
+/// line, then the lane's end, `Ok`: no byte the relay wrote lost to how the bridge ends Hex's socket, and no reset in
+/// the end's place. Hex's writes fail as Hex reads a connection gone (`guest::gone`, as its callers do): on Unix once
+/// the pair's other end stops reading, `EPIPE` (macOS's once it closes too, after the lane's end, `EPIPE` or `ENOTCONN`
+/// as its close meets the write: 10 of 30 runs on macOS 26.4); on Windows, whose bridge never shuts the pair's
+/// receiving (Winsock resets a TCP pair whose receiving is shut while bytes wait or come, its documented contract for
+/// `shutdown(SD_RECEIVE)`), with the lane's own refusal, Shards' `Revoked` as I/O reads it (`ConnectionReset`).
 #[test]
-fn a_lane_cut_while_its_owner_sends_keeps_the_bytes_before_the_cut_for_a_later_read() {
+fn a_lane_closed_while_its_owner_sends_refuses_its_writes_and_keeps_its_bytes_for_a_later_read() {
     let dir = socket_dir();
     let listener = listen(dir.path(), stream::CONTROL_PORT);
     let relay = std::thread::spawn(move || {
         let mut conn = listener.accept();
-        conn.write_all(b"before the cut\n").unwrap();
+        conn.write_all(b"before the close\n").unwrap();
         let mut one = [0u8];
         conn.read_exact(&mut one).unwrap();
     });
@@ -362,10 +368,38 @@ fn a_lane_cut_while_its_owner_sends_keeps_the_bytes_before_the_cut_for_a_later_r
     relay.join().unwrap();
     let mut got = Vec::new();
     let end = conn.read_to_end(&mut got);
-    eprintln!("d_4_cut_while_sending refused={refused:?} got={got:?} end={end:?}");
-    assert_eq!(got, b"before the cut\n", "the bytes before the cut");
-    let cut = end.expect_err("a cut read as the lane's end in order");
-    assert_eq!(cut.kind(), std::io::ErrorKind::ConnectionReset, "{cut}");
+    assert!(
+        crate::guest::gone(&refused),
+        "the writes' refusal, as Hex reads a connection gone: {refused:?}"
+    );
+    assert_eq!(got, b"before the close\n", "the bytes the relay wrote");
+    assert_eq!(
+        end.map_err(|e| e.to_string()),
+        Ok(got.len()),
+        "the lane's end in order"
+    );
+}
+
+/// Shards' D251 as amended, at the bridge's socket pair: a lane that refuses Hex's writes while its reading ends in
+/// order leaves Hex reading that end, never a reset, whatever Hex sent that the lane didn't take. A socket pair's end
+/// closed with bytes unread resets it on Linux (`unix_release_sock`'s `ECONNRESET`) and on Windows (a loopback TCP
+/// pair's RST), which its owner would read after the bytes before it, in place of its end. Do: the owner sends and ends
+/// its writing (on Windows the bridge reads what is refused until then); the bridge's end refuses its writes
+/// ([`writes_refused`]) and closes, as the lane's copiers do once its reading has ended. Expect: the owner reads its
+/// end, `Ok(0)`.
+#[test]
+fn a_lanes_pair_closed_once_it_refuses_its_owners_writes_reads_to_its_owner_as_its_end() {
+    let (mut owner, ours) = pair().unwrap();
+    owner.write_all(b"sent before the refusal").unwrap();
+    owner.shutdown(Shutdown::Write).unwrap();
+    writes_refused(&ours, &mut vec![0u8; DATA_BOUND]);
+    drop(ours);
+    let mut got = Vec::new();
+    assert_eq!(
+        owner.read_to_end(&mut got).map_err(|e| e.to_string()),
+        Ok(0),
+        "the pair's end read as its owner's: {got:?}"
+    );
 }
 
 /// The relay's token on its control connection for these cases.

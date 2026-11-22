@@ -81,11 +81,12 @@ impl Acl {
             return Err(Refusal::Version);
         }
         let body = value.get(HEADER_BYTES..).unwrap_or_default();
-        if body.len() % ENTRY_BYTES != 0 {
+        let (whole, torn) = body.as_chunks::<ENTRY_BYTES>();
+        if !torn.is_empty() {
             return Err(Refusal::Invalid);
         }
-        let entries = body
-            .chunks_exact(ENTRY_BYTES)
+        let entries = whole
+            .iter()
             .map(entry_of)
             .collect::<Result<Vec<Entry>, Refusal>>()?;
         valid(&entries)?;
@@ -182,18 +183,12 @@ impl Acl {
 }
 
 /// One entry from its eight bytes, refused for an unknown tag, a permission outside `rwx` or a named entry naming no one.
-fn entry_of(bytes: &[u8]) -> Result<Entry, Refusal> {
-    let word = |at: usize| -> Result<u16, Refusal> {
-        let pair = bytes.get(at..at.saturating_add(2)).ok_or(Refusal::Invalid)?;
-        Ok(u16::from_le_bytes(
-            <[u8; 2]>::try_from(pair).map_err(|_| Refusal::Invalid)?,
-        ))
-    };
-    let id = bytes.get(4..ENTRY_BYTES).ok_or(Refusal::Invalid)?;
+fn entry_of(bytes: &[u8; ENTRY_BYTES]) -> Result<Entry, Refusal> {
+    let [t0, t1, p0, p1, i0, i1, i2, i3] = *bytes;
     let entry = Entry {
-        tag: word(0)?,
-        perm: word(2)?,
-        id: u32::from_le_bytes(<[u8; 4]>::try_from(id).map_err(|_| Refusal::Invalid)?),
+        tag: u16::from_le_bytes([t0, t1]),
+        perm: u16::from_le_bytes([p0, p1]),
+        id: u32::from_le_bytes([i0, i1, i2, i3]),
     };
     if rank(entry.tag).is_none() || entry.perm & !PERMISSIONS != 0 {
         return Err(Refusal::Invalid);

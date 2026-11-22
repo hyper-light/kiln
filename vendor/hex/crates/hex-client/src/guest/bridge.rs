@@ -57,14 +57,25 @@ pub fn pair() -> io::Result<(Local, Local)> {
 pub struct Bridged {
     sock: Arc<Local>,
     cut: Cut,
+    /// What refused the owner's writes, its reading going on in order (a Shards lane's STOP_SENDING, its relay's socket
+    /// closed: Shards' D251 as amended): told to its writes on Windows, where its bridge never shuts the pair's
+    /// receiving; on Unix the pair's other end stops reading, so the owner's writes fail there.
+    refused: Cut,
 }
 
 impl Bridged {
     /// The owner's end `sock` of a bridge whose copier records what cut its connection in `cut`.
     pub fn new(sock: Local, cut: Cut) -> Self {
+        Self::refusing(sock, cut, Cut::default())
+    }
+
+    /// The owner's end `sock` of a bridge whose copiers record what cut its connection in `cut`, and what refused its
+    /// writes alone in `refused` (Shards' D251 as amended: its peer closed, its reading ending in order).
+    pub fn refusing(sock: Local, cut: Cut, refused: Cut) -> Self {
         Self {
             sock: Arc::new(sock),
             cut,
+            refused,
         }
     }
 
@@ -90,11 +101,12 @@ impl Read for Bridged {
 }
 
 impl Write for Bridged {
-    /// On Windows a cut connection's writes fail here, with the cut: its bridge never shuts the pair's receiving, whose
-    /// reset would drop what the owner hasn't read ([`end`]). On Unix the pair's other end stops reading.
+    /// On Windows a cut connection's writes fail here, with the cut, as do a refused one's, with what refused them: its
+    /// bridge never shuts the pair's receiving, whose reset would drop what the owner hasn't read ([`end`]). On Unix the
+    /// pair's other end stops reading.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         #[cfg(windows)]
-        if let Some(cut) = self.cut.error() {
+        if let Some(cut) = self.cut.error().or_else(|| self.refused.error()) {
             return Err(cut);
         }
         let mut sock: &Local = &self.sock;
@@ -113,6 +125,7 @@ impl Duplex for Bridged {
         own_duplex(Bridged {
             sock: Arc::clone(&self.sock),
             cut: self.cut.clone(),
+            refused: self.refused.clone(),
         })
         .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))
     }

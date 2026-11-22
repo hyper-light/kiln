@@ -5683,6 +5683,8 @@ fn d286_a_served_share_is_asked_of_the_nodes_server_as_its_box_boots() {
         )
     );
     assert_eq!(servers.made().unwrap(), 1);
+    // A server that gives no resync channel (Shards' D288) has none handed with the share.
+    assert!(share.resync.is_none());
     let probed = servers
         .probe(&share.stream.as_fd().try_clone_to_owned().unwrap())
         .unwrap();
@@ -5706,6 +5708,67 @@ fn d286_a_served_share_is_asked_of_the_nodes_server_as_its_box_boots() {
         "a boot asked past a refused stream"
     );
     assert_eq!(servers.made().unwrap(), 1);
+}
+
+/// Shards' D288 (slates' A-316; kiln goal 90): a server that gives a share's resync channel beside its stream
+/// (`Servers::stream_resyncing`) has it handed to Shards' image boot with the share, so a successor of the server, should
+/// it die, can hand the share a fresh stream. Do bind a server serving `project` whose every stream comes with a resync
+/// channel of its own, then create and start a VM given `project`. Expect its boot asked of Shards with one served share,
+/// its stream and its resync channel each one the server made for that box, of `project`, two in all.
+#[test]
+fn d288_a_served_shares_resync_channel_goes_to_shards_with_its_stream() {
+    struct Resyncing(hex_api::serve::sim::SimServers);
+    impl hex_api::serve::Servers for Resyncing {
+        fn stream(
+            &self,
+            id: &BoxId,
+            share: &hex_api::ServedMount,
+        ) -> Result<hex_api::serve::Stream, Refusal> {
+            self.0.stream(id, share)
+        }
+        fn stream_resyncing(
+            &self,
+            id: &BoxId,
+            share: &hex_api::ServedMount,
+        ) -> Result<(hex_api::serve::Stream, Option<hex_api::serve::Stream>), Refusal> {
+            Ok((self.0.stream(id, share)?, Some(self.0.stream(id, share)?)))
+        }
+    }
+    let images = ModelImages::new();
+    let (runtime, _owner) = model_runtime(&images, waits());
+    let servers = hex_api::serve::sim::SimServers::new();
+    servers.serve("project").unwrap();
+    runtime
+        .images
+        .bind_servers(Arc::new(Resyncing(servers.clone())))
+        .unwrap();
+    let mut resyncing = spec("image-resync", None);
+    if let ClassSpec::ShardsImage(image) = &mut resyncing.class {
+        image.served = vec![hex_api::ServedMount {
+            source: "project".to_owned(),
+            destination: "/srv/project".to_owned(),
+            read_only: false,
+            members: Vec::new(),
+        }];
+    }
+    let id = runtime.create(resyncing).unwrap().id;
+    runtime.start(&id).unwrap();
+    let asked = images.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1);
+    let [share] = asked[0].served.as_slice() else {
+        panic!("{} served shares asked", asked[0].served.len());
+    };
+    let resync = share.resync.as_ref().expect("the share's resync channel");
+    assert_eq!(servers.made().unwrap(), 2);
+    for stream in [&share.stream, resync] {
+        let probed = servers
+            .probe(&stream.as_fd().try_clone_to_owned().unwrap())
+            .unwrap();
+        assert_eq!(
+            (probed.id.as_str(), probed.source.as_str()),
+            ("image-resync", "project")
+        );
+    }
 }
 
 /// The node VM these tests boot (joint plan step 39): run 1's, Hex's node image, the model's admitted size, one share
