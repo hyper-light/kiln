@@ -385,7 +385,7 @@ a file, and why. The part after "Designed by hand" is written by hand.
 | `hold.json` | `crates/kiln-lab/src/bar.rs` |  | lab output: a file |
 | `holders.json` | `crates/kiln/src/harness/registry.rs` |  | Records `kiln.files` |
 | `hooks/hooks.json` | `crates/kiln/src/skills/place.rs` | yes |  |
-| `identity.json` | `crates/kiln/src/ci/dependency_sources.rs` |  | a file: this device's sign-in and its key, a secret kept 0600 on its machine (`kiln login`) |
+| `identity.json` | `crates/kiln/src/ci/dependency_sources.rs` |  | a file, never Records: this device's sign-in and its key, a secret, and secrets don't go into the record store; kept 0600 on its machine (`kiln login`) |
 | `incidents/9.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
 | `incidents/{}.json` | `crates/kiln/src/observe/incidents/mod.rs` | yes |  |
 | `indexes.json` | `crates/kiln/src/observe/indexes/mod.rs` |  | Records `kiln.files` |
@@ -552,9 +552,9 @@ The JSON files table above lists every `.json` file name in kiln's code. Its las
 - **Not a file:** an HTTP answer, or a key in kiln's blob store (kiln-seams' `Blobs`), which moves
   with its blobs.
 
-One of kiln's own is left a file on purpose: `identity.json`, this device's sign-in and its key, a
-secret kept 0600 on its machine. Records keeps no secrets apart from other values, so it isn't
-copied there.
+One of kiln's own stays a file on purpose, never Records: `identity.json`, this device's sign-in
+and its key, kept 0600 on its machine. It is a secret, and secrets don't go into the record store,
+so it isn't copied there (the coordinator's decision, 2026-11-22).
 
 `records::files::FILES` says where each kind of state file is kept (its base folder, and its paths
 under it) and which code writes and reads it. `kiln records carry` and `compare` carry and compare

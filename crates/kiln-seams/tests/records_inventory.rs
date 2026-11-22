@@ -61,7 +61,7 @@ const KEPT: &[(&str, &str)] = &[
     ("harness.json", "Records `kiln.files`"),
     ("hold.json", "lab output: a file"),
     ("holders.json", "Records `kiln.files`"),
-    ("identity.json", "a file: this device's sign-in and its key, a secret kept 0600 on its machine (`kiln login`)"),
+    ("identity.json", "a file, never Records: this device's sign-in and its key, a secret, and secrets don't go into the record store; kept 0600 on its machine (`kiln login`)"),
     ("indexes.json", "Records `kiln.files`"),
     ("instance.json", "Records `kiln.files`"),
     ("integrations.json", "scratch: one leg's integrations, for `kiln auth` in it, gone with it"),
