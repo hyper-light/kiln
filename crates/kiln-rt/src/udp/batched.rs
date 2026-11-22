@@ -457,7 +457,9 @@ pub struct Batched {
     stats: IoStats,
     /// The latest arrival handed over: none after it arrived before it.
     latest_ns: u64,
-    /// Whether the kernel tells each datagram's local address ([`Arrival::to`]).
+    /// Whether the kernel tells each datagram's local address ([`Arrival::to`]): Linux's and macOS's
+    /// alone.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     local_addresses: bool,
     #[cfg(target_os = "linux")]
     linux: Linux,
@@ -622,6 +624,7 @@ impl Batched {
         )]
         let mut stats = IoStats::default();
         // Whether the kernel tells each datagram's local address (Linux, macOS).
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let local_addresses = match raw {
             #[cfg(target_os = "linux")]
             Some(fd) => linux::enable_local_addresses(fd),
@@ -684,6 +687,7 @@ impl Batched {
             buffers,
             stats,
             latest_ns: 0,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             local_addresses,
             #[cfg(target_os = "linux")]
             linux,
