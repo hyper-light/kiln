@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use kiln_seams::records::{Consistency, KEY_MAX, Records, Refusal, SCAN_MAX, Scan, TX_MAX, Tx, Write};
+use kiln_seams::records::{Consistency, KEY_MAX, Records, Refusal, SCAN_MAX, Scan, TX_MAX, Tx, VALUE_MAX, Write};
 use rusqlite::types::ValueRef;
 use serde::{Deserialize, Serialize};
 
@@ -242,7 +242,10 @@ pub async fn carry(store: &Store, records: &dyn Records) -> anyhow::Result<usize
             carried += rows.len();
             let mut writes = Vec::with_capacity(rows.len());
             for r in rows {
-                writes.push(Write::Put { family: fam.clone(), key: r.key, value: serde_json::to_vec(&r.fields)? });
+                let value = serde_json::to_vec(&r.fields)?;
+                // A row the seam can't hold as one record is named, not lost in a refused commit.
+                anyhow::ensure!(value.len() <= VALUE_MAX, "a row of {} ({}) is {} bytes as a record, over the Records seam's {VALUE_MAX}", table.name, String::from_utf8_lossy(&r.key), value.len());
+                writes.push(Write::Put { family: fam.clone(), key: r.key, value });
             }
             records.commit(Tx { conds: Vec::new(), writes }).await.map_err(|e| anyhow::anyhow!("carrying {}: {}", table.name, refused(e)))?;
             after = next;
@@ -674,6 +677,23 @@ mod tests {
             anyhow::ensure!(listed.contains_key(own) && !found.iter().any(|f| f == own), "{own}: Records' own, in the inventory and not carried");
         }
         Ok(())
+    }
+
+    /// A row too big for one record fails the copy by its table and key, before anything of its
+    /// page is committed.
+    #[test]
+    fn t_t1_5_2_a_row_over_a_records_value_is_named() -> anyhow::Result<()> {
+        crate::rt::block_on(async move {
+            let store = Store::in_memory()?;
+            store.call(|c| Ok(c.execute("INSERT INTO kiln_meta (key, value) VALUES ('big', ?1)", ["x".repeat(VALUE_MAX)])?)).await?;
+            let records = SimRecords::new();
+            let refused = match carry(&store, &records).await {
+                Ok(n) => anyhow::bail!("carried {n} rows with one over the seam's value"),
+                Err(e) => e.to_string(),
+            };
+            anyhow::ensure!(refused.contains("a row of kiln_meta") && refused.contains("big"), "{refused}");
+            Ok(())
+        })
     }
 
     /// Each storage class survives the trip: a real's bits, a text that isn't UTF-8, a blob.
