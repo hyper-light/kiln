@@ -144,7 +144,7 @@ enum Job {
     Count(oneshot::Sender<Result<u64, Refusal>>),
 }
 
-/// Records in a Turso file, its thread answering for it. Dropped, the thread finishes what it was
+/// Records in a file of the engine's, its thread answering for it. Dropped, the thread finishes what it was
 /// given and lets go of the file.
 pub struct SqlRecords {
     jobs: crate::memory::queue::Sender<Job>,
@@ -1179,7 +1179,7 @@ mod tests {
         let all = cases::<Fixture>();
         // A store for each case, made first: one that can't be made fails the test here.
         let mut stores: std::collections::VecDeque<Fixture> = all.iter().map(|_| fixture()).collect::<anyhow::Result<_>>()?;
-        let report = block(run("Records (kiln's Turso store)", &all, || {
+        let report = block(run("Records (kiln's SQL store)", &all, || {
             let f = stores.pop_front().unwrap_or_else(|| Fixture { records: Err(Broken("no store was made for this case".into())), _dir: None });
             async move { f }
         }));

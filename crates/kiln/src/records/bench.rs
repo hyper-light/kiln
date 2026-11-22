@@ -111,7 +111,7 @@ async fn measure(name: &str, records: Arc<dyn Records>, ops: usize, value: usize
 fn cp_t1_5_records_bench() -> anyhow::Result<()> {
     let ops = input("KILN_RECORDS_BENCH_OPS", TINY_OPS)?;
     let value = input("KILN_RECORDS_BENCH_VALUE", TINY_VALUE)?;
-    crate::rt::block_on(async {
+    crate::rt::block_on(async move {
         let dir = tempfile::tempdir()?;
         let kept: Arc<dyn Records> = Arc::new(super::StoreRecords::open(crate::store::Store::open(&dir.path().join("kiln.db"))?)?);
         let mut lines = vec![format!("{ops} operations of each kind, {value}-byte records")];

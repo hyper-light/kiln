@@ -575,7 +575,7 @@ mod tests {
             ("programs/ops.rs", include_str!("programs/ops.rs")),
             ("reach/node.rs", include_str!("reach/node.rs")),
             ("records.rs", include_str!("records.rs")),
-            ("records/turso.rs", include_str!("records/turso.rs")),
+            ("records/sql.rs", include_str!("records/sql.rs")),
             ("research/mod.rs", include_str!("research/mod.rs")),
             ("runner/docker.rs", include_str!("runner/docker.rs")),
             ("runner/runtime.rs", include_str!("runner/runtime.rs")),

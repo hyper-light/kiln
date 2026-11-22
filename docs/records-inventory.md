@@ -199,7 +199,7 @@ dropped by a later migration, is listed too, and says so.
 | `machine_names` | `crates/kiln/src/store/migrations/20261104-1200_machines_names.sql` |  |  |
 | `message_nodes` | `crates/kiln/src/aisessions.rs`, `crates/kiln/src/aisessions/devin.rs` |  | yes |
 | `messages` | `crates/kiln/src/store/storage_tests.rs` |  | yes |
-| `meta` | `crates/kiln/src/convo/sql.rs`, `crates/kiln/src/records/turso.rs` |  |  |
+| `meta` | `crates/kiln/src/convo/sql.rs`, `crates/kiln/src/records/sql.rs` |  |  |
 | `metrics` | `crates/kiln/src/store/migrations/20261018-1600_w16_metrics.sql` |  |  |
 | `migrations` | `crates/kiln/src/store/migrations.rs`, `crates/kiln/src/store/migrations/20261017-0000_ci_baseline.sql` |  |  |
 | `notice_marks` | `crates/kiln/src/store/migrations/20261023-1600_notice_marks.sql` |  |  |
@@ -307,7 +307,7 @@ dropped by a later migration, is listed too, and says so.
 | `user_groups` | `crates/kiln/src/authz/groups.rs`, `crates/kiln/src/store/migrations/20261022-1700_p5_groups.sql` |  |  |
 | `user_identities` | `crates/kiln/src/authz/groups.rs`, `crates/kiln/src/store/migrations/20261019-0080_w23_sso.sql` |  |  |
 | `users` | `crates/kiln/src/store/migrations/20261018-0800_w10_principals.sql` |  |  |
-| `versions` | `crates/kiln/src/records/turso.rs` |  |  |
+| `versions` | `crates/kiln/src/records/sql.rs` |  |  |
 | `viewed_files` | `crates/kiln/src/store/migrations/20261019-0020_w14_review.sql` |  |  |
 | `webhook_deliveries` | `crates/kiln/src/store/migrations/20261018-1800_w19_webhooks.sql` |  |  |
 | `work_flight` | `crates/kiln/src/store/migrations/20261026-0100_w28_flight.sql` |  |  |

@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn t_t1_5_2_goals_and_plans_carry_and_compare_the_same_on_each_engine() -> anyhow::Result<()> {
         for engine in crate::records::Engine::ALL {
-            crate::rt::block_on(async {
+            crate::rt::block_on(async move {
                 let dir = tempfile::tempdir()?;
                 let records = engine.open(&dir.path().join("records.db"))?;
                 let store = Store::in_memory()?;
