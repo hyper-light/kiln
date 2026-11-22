@@ -41,10 +41,11 @@ A child starts with nothing but your prompt. Say:
 - **Where**: `cwd` (by default yours, on your machine), and `on` for work that needs another
   machine: what it needs (`linux/amd64`, `macos`, `+gpu`, `cpus>=16`). kiln's load balancer
   places each child on the machine that suits best (room at its measured speed, where such work
-  last went well, never one under strain) and queues it, telling you, while none has room. That's
-  its work, not yours: don't look over machines' load, give children machines' names to spread
-  them out, or stop one to start it elsewhere because its machine looks busy. Name a machine only
-  when the child must work there (its checkout, its hardware, a person at it).
+  last went well, one under strain only when no other can start it) and queues it, telling you,
+  while none has room. That's its work, not yours: don't look over machines' load, give children
+  machines' names to spread them out, or stop one to start it elsewhere because its machine looks
+  busy. Name a machine only when the child must work there (its checkout, its hardware, a person
+  at it).
 
 ```js
 // code_run: two children on another machine, in two harnesses, then what they concluded

@@ -133,6 +133,51 @@ fn l1_a_strained_runner_offers_nothing_until_a_measure_says_it_isnt() -> Result<
     a.check()
 }
 
+/// An agent session's start, as kiln's server asks one (`harness::lineage::place_agents`).
+fn session(run: &str, spelling: &str) -> Result<Ask, String> {
+    Ok(Ask { class: crate::sched::state::Class::Interactive, key: Some("session:claude".into()), ..ask(run, spelling)? })
+}
+
+/// AUDIT L1 and Ada's word (2026-11-21: kiln never keeps a person from starting a session): a
+/// strained runner holds back what can wait, never an agent session's start. One that fits is
+/// offered as it comes, past the work the strain holds back, its room said as none (as its hint
+/// says it) so that its owner takes a runner free of strain where one offered; one short of room
+/// waits for room alone, and is offered once room frees, the strain still standing. Draining holds
+/// it as ever.
+#[test]
+fn l1_a_strained_runner_still_offers_an_agent_sessions_start() -> Result<(), String> {
+    let mut a = runner(machine(8, 16, 0, 0), false);
+    let mut out = Vec::new();
+    a.strain(Some("its tasks all stalled on memory and I/O 40% of the time".into()), 0, &mut out);
+    let said = probe(&mut a, O1, ask("cmd", "cpus=2")?, None, 1);
+    assert!(matches!(waiting(&said, "cmd"), Some((Reason::Strained { .. }, _))), "a command waits the strain out: {said:?}");
+    let said = probe(&mut a, O1, session("s1", "")?, None, 2);
+    assert!(offer(&said, "o1", "s1").is_some(), "a session's start goes under strain: {said:?}");
+    assert!(said.iter().any(|(_, m)| matches!(m, ToOwner::Offer { run, free, .. } if run == "s1" && *free == Resources::default())), "its room said as none: {said:?}");
+    a.check()?;
+    // One that takes most of the runner starts; the next, short of room, waits for room, not for the strain.
+    let said = probe(&mut a, O2, session("s2", "cpus=6")?, None, 3);
+    let f2 = offer(&said, "o2", "s2").ok_or(format!("s2: {said:?}"))?;
+    run_it(&mut a, O2, "s2", f2, 3)?;
+    let said = probe(&mut a, O3, session("s3", "cpus=4")?, None, 4);
+    assert!(matches!(waiting(&said, "s3"), Some((Reason::Room { .. }, _))), "{said:?}");
+    a.check()?;
+    let said = ended(&mut a, O2, "s2", 5);
+    assert!(offer(&said, "o3", "s3").is_some(), "offered as room frees, strained still: {said:?}");
+    assert!(offer(&said, "o1", "cmd").is_none(), "{said:?}");
+    a.check()?;
+    // Draining, it takes no session's start either.
+    let mut out = Vec::new();
+    a.drain(true, 6, &mut out);
+    let said = probe(&mut a, O1, session("s4", "")?, None, 7);
+    assert!(matches!(waiting(&said, "s4"), Some((Reason::Draining, _))), "{said:?}");
+    a.check()?;
+    let mut out = Vec::new();
+    a.drain(false, 8, &mut out);
+    assert!(offer(&out, "o1", "s4").is_some(), "{out:?}");
+    a.check()
+}
+
 /// A probe that fits the runner's measured room less what it promised is offered at once; one
 /// that doesn't waits with exactly one reason and a place; one it could never run is answered
 /// never, saying why. The runner: 32 CPUs, 64 GiB, others using 20 CPUs and 50 GiB.

@@ -1235,7 +1235,9 @@ impl Placer {
             self.asked_keys.insert((peer.to_owned(), epoch, ask.run.clone()), k.clone());
         }
         let key = self.key_here(&ask);
-        if self.strained.is_none()
+        // Under strain its admission holds back all but agent sessions' starts, saying so: those its
+        // health bars as ever.
+        if (self.strained.is_none() || ask.session())
             && let Some(m) = &self.last
             && let Some(r) = barred(&ask, key, m)
         {
