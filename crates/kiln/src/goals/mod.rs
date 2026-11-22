@@ -238,19 +238,29 @@ impl Changing {
 /// stacks (a goal handed to a subagent, a delegation), under every stack's; so neither goes between
 /// the look and the change, and the change goes as the stack is when it goes. Looked at before the
 /// stack's turn, a change waiting for it behind one that set what a goal waits for went on that
-/// stack, spanning by then, with its own turn alone. A change that makes its plain stack span with
-/// its own turn alone writes that stack and no other: what reaches across stacks (a goal handed to a
-/// subagent, `subagents::mark_out`; a delegation; a subagent let go) takes every stack's turn itself,
-/// so it waits for that change to end, and the next change to that stack looks at it afresh.
+/// stack, spanning by then, with its own turn alone.
+///
+/// `$reaches`: what the change itself will do, said before any turn is taken. A change that starts on
+/// a plain stack and will make it span (what a goal waits for, set by `order` or `update`, so its
+/// goals may go side by side to subagents; parts, by `split`; a goal big enough to be planned first,
+/// added by `set` or `add_at` and planned by the step that sends it; a plan's goals run again, by
+/// `reopen`; side by side or planning first turned on, by `settings`) takes every stack's turn from
+/// the start, alone: with its stack's turn alone, a change to another stack went beside it while it
+/// set its stack spanning and sent from it, and what it planned or handed out was decided with the
+/// other stacks moving under it. Said so, the stack isn't looked at for it.
 macro_rules! stack_turn {
     ($changing:expr, $store:expr, $agent:expr) => {
+        stack_turn!($changing, $store, $agent, false)
+    };
+    ($changing:expr, $store:expr, $agent:expr, $reaches:expr) => {
         let changing: &Changing = $changing;
-        let mut shared = Some(changing.all.read().await);
+        let reaches: bool = $reaches;
+        let mut shared = if reaches { None } else { Some(changing.all.read().await) };
         let entry = changing.each.of(&String::from($agent));
-        let mut own = Some(entry.turn().await);
-        // Spanning: its own turn and the shared one given back (a change waiting for this stack holds
-        // the shared turn as a reader, so every stack's waits for it), then every stack's taken.
-        let _every = if spans($store, $agent).await {
+        let mut own = if reaches { None } else { Some(entry.turn().await) };
+        // Spanning, or about to: its own turn and the shared one given back (a change waiting for this
+        // stack holds the shared turn as a reader, so every stack's waits for it), then every stack's taken.
+        let _every = if reaches || spans($store, $agent).await {
             drop(own.take());
             drop(shared.take());
             Some(changing.every().await)
@@ -262,21 +272,57 @@ macro_rules! stack_turn {
 
 /// Whether a change to `agent`'s stack may reach another's: a goal of it is a plan's (its steps,
 /// its run), waits on others (`needs`, so it may go side by side to a subagent), or is handed to
-/// another agent (a subagent, an assignment); or a goal of another stack is handed to it. Unread,
-/// it may.
+/// another agent (a subagent, an assignment); or a goal of another stack is handed to it; or a goal
+/// still to go is one a step plans first ([`plans_first`]: the stack plans big goals first, and it's
+/// a big one of the agent's own), so the change that sends it makes a plan (G9 step 3, goal a2a44298).
+/// Unread, it may.
 async fn spans(store: &crate::store::Store, agent: &str) -> bool {
     let a = agent.to_owned();
     store
         .read(move |c| {
-            Ok(c.prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM goal_items WHERE agent = ?1 AND (plan_id IS NOT NULL OR plan_run IS NOT NULL OR waits_on IS NOT NULL OR part_kind IS NOT NULL \
-                   OR needs IS NOT NULL OR delegated_to IS NOT NULL OR subagent IS NOT NULL)) \
-                 OR EXISTS(SELECT 1 FROM goal_items WHERE delegated_to = ?1 OR subagent = ?1)",
-            )?
-            .query_row(params![a], |r| r.get::<_, bool>(0))?)
+            let handed: bool = c
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM goal_items WHERE agent = ?1 AND (plan_id IS NOT NULL OR plan_run IS NOT NULL OR waits_on IS NOT NULL OR part_kind IS NOT NULL \
+                       OR needs IS NOT NULL OR delegated_to IS NOT NULL OR subagent IS NOT NULL)) \
+                     OR EXISTS(SELECT 1 FROM goal_items WHERE delegated_to = ?1 OR subagent = ?1)",
+                )?
+                .query_row(params![a], |r| r.get(0))?;
+            if handed {
+                return Ok(true);
+            }
+            // A plain stack's goals still to go that a step would plan first, as `plans_first` says
+            // (the rest of what it asks for, a step, a run, an assignment, spans already above).
+            let mut first = c.prepare_cached(
+                "SELECT i.text FROM goal_items i JOIN goal_stacks s ON s.agent = i.agent \
+                 WHERE i.agent = ?1 AND COALESCE(s.plan_big, 1) AND i.status IN ('pending', 'active') AND i.part_of IS NULL AND i.planned_as IS NULL",
+            )?;
+            let mut texts = first.query(params![a])?;
+            while let Some(r) = texts.next()? {
+                if big(&r.get::<_, String>(0)?) {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         })
         .await
         .unwrap_or(true)
+}
+
+impl NewGoal {
+    /// Whether adding it may reach other stacks (G9 step 3, goal a2a44298; [`stack_turn!`]): it says
+    /// what it waits for, is a plan step's, waits for a run or is a part of another goal, or is big
+    /// enough to be planned first when it goes.
+    fn reaches(&self) -> bool {
+        self.needs.is_some() || self.waits_on.is_some() || self.step.is_some() || self.part_of.is_some() || big(&self.text)
+    }
+}
+
+impl Change {
+    /// Whether it may reach other stacks (G9 step 3, goal a2a44298; [`stack_turn!`]): it says what
+    /// the goal waits for, or rewords it big enough to be planned first.
+    fn reaches(&self) -> bool {
+        self.needs.is_some() || self.text.as_deref().is_some_and(big)
+    }
 }
 
 /// An agent's goal stack.
@@ -1257,7 +1303,7 @@ fn known(hub: &Hub, agent: &str) -> R<Info> {
 pub async fn set(hub: &Hub, agent: &str, given: Vec<Given>) -> R<Stack> {
     let info = known(hub, agent)?;
     let given = given.into_iter().map(|g| Ok((g.id, clean(&g.text)?))).collect::<R<Vec<_>>>()?;
-    stack_turn!(&CHANGING, &hub.store, agent);
+    stack_turn!(&CHANGING, &hub.store, agent, given.iter().any(|(_, t)| big(t)));
     set_locked(hub, &info, agent, given, Vec::new()).await
 }
 
@@ -1417,7 +1463,8 @@ fn arrange(items: &[Item], given: Vec<(Option<String>, String)>) -> (Vec<Row>, V
 /// a plan made from it, run again as goals, gives it its steps again as its parts, before it
 /// (`plans::run_goals`), and it's met once they are ([`met_by_parts`]). One still to go stays as it is.
 pub async fn reopen(hub: &Hub, agent: &str, id: &str) -> R<Stack> {
-    stack_turn!(&CHANGING, &hub.store, agent);
+    // A plan made from it is run again as its goals (`plans::run_goals`).
+    stack_turn!(&CHANGING, &hub.store, agent, true);
     let stack = get(hub, agent).await?;
     let Some(goal) = stack.items.iter().find(|i| i.id == id) else {
         return Err(Error::Bad(format!("no goal {id} here (goals_get lists them)")));
@@ -1455,7 +1502,7 @@ pub async fn add_at(hub: &Hub, agent: &str, goals: Vec<NewGoal>, start: bool, at
     let info = known(hub, agent)?;
     let goals = goals.into_iter().map(|g| Ok(NewGoal { text: clean(&g.text)?, ..g })).collect::<R<Vec<_>>>()?;
     let stack = {
-        stack_turn!(&CHANGING, &hub.store, agent);
+        stack_turn!(&CHANGING, &hub.store, agent, goals.iter().any(NewGoal::reaches));
         let now = get(hub, agent).await?;
         // Asked again under its key (CP-T3.2; its answer lost): the goals it added are there, by
         // the ids the key made, whatever became of them since: none is added again, and the stack
@@ -1668,7 +1715,7 @@ async fn update_counted(hub: &Hub, agent: &str, id: &str, change: Change, by: &B
         return Err(Error::Bad("say what changes: `text`, `before`, `after`, `next`, `needs`, `active` or `remove`".into()));
     }
     release_gone(hub, agent).await?;
-    stack_turn!(&CHANGING, &hub.store, agent);
+    stack_turn!(&CHANGING, &hub.store, agent, change.reaches());
     let stack = get(hub, agent).await?;
     let it = stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?;
     if !matches!(it.status.as_str(), "pending" | "active") {
@@ -1828,7 +1875,8 @@ pub async fn order(hub: &Hub, agent: &str, given: Vec<(String, Vec<String>)>, by
         return Err(Error::Bad("say what at least one goal waits for: `goals`, each {id, needs}".into()));
     }
     release_gone(hub, agent).await?;
-    stack_turn!(&CHANGING, &hub.store, agent);
+    // It sets what goals wait for: they may go side by side to subagents.
+    stack_turn!(&CHANGING, &hub.store, agent, true);
     let stack = get(hub, agent).await?;
     for (k, (id, _)) in given.iter().enumerate() {
         let it = stack.items.iter().find(|i| i.id == *id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?;
@@ -1863,7 +1911,8 @@ pub async fn split(hub: &Hub, agent: &str, id: Option<&str>, parts: Vec<String>)
     let info = known(hub, agent)?;
     let given_parts = parts.iter().map(|p| clean(p)).collect::<R<Vec<_>>>()?;
     release_gone(hub, agent).await?;
-    stack_turn!(&CHANGING, &hub.store, agent);
+    // Its parts are a goal's (`part_kind`), from a plan's step where none are given.
+    stack_turn!(&CHANGING, &hub.store, agent, true);
     let stack = get(hub, agent).await?;
     let target = match id.map(str::trim).filter(|i| !i.is_empty()) {
         Some(id) => stack.items.iter().find(|i| i.id == id).ok_or_else(|| Error::Bad(format!("no goal {id} in this stack (goals_get lists them)")))?,
@@ -3226,7 +3275,7 @@ fn plans_first(stack: &Stack, id: &str) -> bool {
 /// each as given, the other as it was.
 pub async fn settings(hub: &Hub, agent: &str, plan_big: Option<bool>, side_by_side: Option<bool>) -> R<Stack> {
     known(hub, agent)?;
-    stack_turn!(&CHANGING, &hub.store, agent);
+    stack_turn!(&CHANGING, &hub.store, agent, plan_big == Some(true) || side_by_side == Some(true));
     let (a, now) = (agent.to_owned(), now_ms(hub));
     hub.store
         .call(move |c| {
@@ -3924,6 +3973,90 @@ mod tests {
             wrote?;
             assert!(spanning, "what g2 waits for is set: the stack spans");
             assert!(alone, "a change to a stack that spans holds every stack's turn");
+            Ok(())
+        })
+    }
+
+    /// G9 step 3 (goal a2a44298; T-T1.5.1): a change that starts on a plain stack and will make it
+    /// span (here, what a goal waits for, as `order` and `update` set it) takes every stack's turn
+    /// from the start: a change to another plain stack, started meanwhile, waits for it to end. With
+    /// its stack's turn alone (the stack plain as it was looked at), the other went beside it.
+    #[test]
+    fn g9_s3_a_change_that_will_make_its_plain_stack_span_takes_every_stack_first() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory_inline()?;
+            let (a, b) = ("plain-a", "plain-b");
+            store
+                .call(move |c| {
+                    for agent in [a, b] {
+                        for (pos, g) in ["g1", "g2"].into_iter().enumerate() {
+                            c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES (?1, ?2, ?3, ?4)", params![format!("{agent}-{g}"), agent, i64::try_from(pos)?, g])?;
+                        }
+                        touch(c, agent, Some("running"), None, 0)?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            assert!(!spans(&store, a).await && !spans(&store, b).await, "two plain stacks");
+            let change = Change { needs: Some(vec!["plain-a-g1".into()]), ..Change::default() };
+            assert!(change.reaches(), "what a goal waits for, set: it reaches");
+            assert!(!Change { text: Some("g2, reworded".into()), ..Change::default() }.reaches(), "a short rewording doesn't");
+            let changing = Changing::new();
+            let ended = std::sync::atomic::AtomicBool::new(false);
+            // Its change to `a` takes its turn first, gives the other its chance to go, then sets
+            // what g2 waits for: `a` spans from then on.
+            let first = async {
+                stack_turn!(&changing, &store, a, change.reaches());
+                let mut yielded = false;
+                std::future::poll_fn(|cx| {
+                    if yielded {
+                        return std::task::Poll::Ready(());
+                    }
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                })
+                .await;
+                let wrote = store.call(move |c| Ok(c.execute("UPDATE goal_items SET needs = '[\"plain-a-g1\"]' WHERE id = 'plain-a-g2'", []).map(|_| ())?)).await;
+                ended.store(true, std::sync::atomic::Ordering::SeqCst);
+                wrote
+            };
+            // A change to `b`, plain, started meanwhile: it goes once the first has ended.
+            let second = async {
+                stack_turn!(&changing, &store, b);
+                ended.load(std::sync::atomic::Ordering::SeqCst)
+            };
+            let (wrote, after) = futures::join!(first, second);
+            wrote?;
+            assert!(spans(&store, a).await, "what g2 waits for is set: `a` spans");
+            assert!(after, "a change to another stack went beside one that made its stack span");
+            Ok(())
+        })
+    }
+
+    /// G9 step 3 (goal a2a44298; T-T1.5.1): a plain stack that plans big goals first, with a big
+    /// goal of its own still to go, spans: the step that sends it makes a plan. Planning off, or the
+    /// goal short, it doesn't; a goal added big, or reworded so, says it reaches.
+    #[test]
+    fn g9_s3_a_plain_stack_with_a_big_goal_to_plan_first_spans() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let store = crate::store::Store::in_memory_inline()?;
+            let a = "big-first";
+            let long = "Make the parser take every input. Make the lexer take every input. Make the docs say so, with examples of each.";
+            assert!(big(long));
+            store
+                .call(move |c| {
+                    c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES ('g1', ?1, 0, 'tests pass')", params![a])?;
+                    touch(c, a, Some("running"), None, 0)
+                })
+                .await?;
+            assert!(!spans(&store, a).await, "a short goal: plain");
+            store.call(move |c| Ok(c.execute("INSERT INTO goal_items (id, agent, pos, text) VALUES ('g2', ?1, 1, ?2)", params![a, long]).map(|_| ())?)).await?;
+            assert!(spans(&store, a).await, "a big goal to plan first: it spans");
+            store.call(move |c| Ok(c.execute("UPDATE goal_stacks SET plan_big = 0 WHERE agent = ?1", params![a]).map(|_| ())?)).await?;
+            assert!(!spans(&store, a).await, "big goals not planned first: plain");
+            assert!(NewGoal { text: long.into(), ..NewGoal::default() }.reaches() && !NewGoal { text: "docs build".into(), ..NewGoal::default() }.reaches());
+            assert!(Change { text: Some(long.into()), ..Change::default() }.reaches());
             Ok(())
         })
     }
