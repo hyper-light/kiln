@@ -226,6 +226,11 @@ name = "async_channel"
 why = "a runner's front door answering from its replica (docs/p2p.md, P2): its kept connections to the server, on the runner; the server's API takes none"
 
 [[waiting]]
+at = "crates/kiln/src/frontdoor/replica.rs"
+name = "split"
+why = "a session's socket on a runner's front door, relayed to its owner (pipe_session_ws) or served from the runner's own copy while its owner is offline (offline_socket): each socket's task holds both halves: one task, one shard"
+
+[[waiting]]
 at = "crates/kiln/src/frontdoor/runner.rs"
 name = "async_channel"
 why = "a runner's front door's settings and commands, to its one task, on the runner"
@@ -481,6 +486,11 @@ why = "imports the dialer's last address (last_dial, below)"
 at = "crates/kiln/src/net.rs"
 name = "last_dial"
 why = "the address the net thread dialed last (a runner's; the server's net thread doesn't dial), kept across the loops it rebuilds: taken by the net thread alone, never by another thread or a shard"
+
+[[allowed]]
+at = "crates/kiln/src/net.rs"
+name = "leaf"
+why = "the certificate the net thread presents (its spec's, until the server reissues a runner's in its role: Out::Leaf), kept across the loops it rebuilds: taken by the net thread alone, as each loop builds its endpoint and as it takes up a reissued one, never by another thread or a shard"
 
 # The hub.
 

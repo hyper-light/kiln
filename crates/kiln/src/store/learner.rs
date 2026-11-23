@@ -182,7 +182,7 @@ pub struct Learner {
     /// A checkpoint didn't match: the replica is being copied again, and answers nothing meanwhile.
     diverged: Arc<AtomicBool>,
     /// Live copy-fetch bearer token shared with the snapshot fetcher, refreshed on reconnect (`Msg::Join`).
-    token: Arc<parking_lot::Mutex<String>>,
+    token: Arc<crate::rcu::Rcu<String>>,
 }
 
 /// A checkpoint of the log the server sent ([`Msg::Checkpoint`]).
@@ -201,7 +201,7 @@ impl Learner {
     pub fn start(state_dir: &Path, me: &str, member: u64, http: Arc<Client>, server: &str, token: &str) -> anyhow::Result<(Learner, async_channel::Receiver<AgentMsg>)> {
         let d = dir(state_dir);
         let db = d.join("kiln.db");
-        let live_token = Arc::new(parking_lot::Mutex::new(token.to_owned()));
+        let live_token = Arc::new(crate::rcu::Rcu::new(token.to_owned()));
         let group = Arc::new(Group::learner(&db, &d.join("log"), member, fetcher(http, copy_url(server, me), Arc::clone(&live_token)))?);
         let (mut learner, rx) = Self::around(group, db, me)?;
         learner.token = live_token;
@@ -242,7 +242,7 @@ impl Learner {
             next_ask: std::sync::atomic::AtomicU64::new(1),
             checkpoints,
             diverged,
-            token: Arc::new(parking_lot::Mutex::new(String::new())),
+            token: Arc::new(crate::rcu::Rcu::new(String::new())),
         };
         Ok((learner, say_rx))
     }
@@ -250,7 +250,7 @@ impl Learner {
     /// Refresh the snapshot copy bearer token (called on every reconnect `Msg::Join`) so future
     /// snapshot installs never fail with 401 after a token rotation.
     pub fn update_token(&self, token: String) {
-        *self.token.lock() = token;
+        self.token.set(token);
     }
 
     /// Send a lightweight `Msg::Ask { id: 0 }` wake-up to the Raft leader on reconnect so the
@@ -665,9 +665,9 @@ fn escaped(s: &str) -> String {
 /// to it by its SHA-256 (docs/ci.md W27-R08): hashed as it comes, a copy that isn't what kiln handed
 /// on is refused, its receipt of what came the break kiln records, and another fetched, [`COPY_TRIES`]
 /// in all.
-fn fetcher(http: Arc<Client>, url: String, token: Arc<parking_lot::Mutex<String>>) -> Fetch {
+fn fetcher(http: Arc<Client>, url: String, token: Arc<crate::rcu::Rcu<String>>) -> Fetch {
     Arc::new(move |dest: &Path| {
-        let (http, url, token, dest) = (http.clone(), url.clone(), token.lock().clone(), dest.to_path_buf());
+        let (http, url, token, dest) = (http.clone(), url.clone(), String::clone(&token.load()), dest.to_path_buf());
         crate::rt::block_on(async move {
             let url = match crate::runner::custody::cluster_signer_within(SIGNER_WAIT).await {
                 Some(instance) => format!("{url}&instance={}", escaped(&instance)),

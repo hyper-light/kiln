@@ -372,10 +372,11 @@ pub async fn user_may(hub: &Hub, id: &str, capability: &str, target: &Scope) -> 
 /// A read failure keeps sign-in enabled. A Hub cannot reuse another database's cached verdict.
 pub async fn has_users(hub: &Hub) -> bool {
     let rev = hub.store.changes().of(&["users"]);
-    if let Some((seen, value)) = hub.token_cache.lock().users && seen == rev { return value; }
+    if let Some(value) = hub.token_cache.users_at(rev) { return value; }
     let read = hub.store.read(|c| Ok(c.prepare_cached("SELECT EXISTS(SELECT 1 FROM users WHERE disabled_at IS NULL)")?.query_row([], |r| r.get::<_, bool>(0))?)).await;
     let Ok(value) = read else { return true };
-    if hub.store.changes().of(&["users"]) == rev { hub.token_cache.lock().users = Some((rev, value)); }
+    // Kept only when the table didn't change while it was read.
+    if hub.store.changes().of(&["users"]) == rev { hub.token_cache.remember_users(rev, value); }
     value
 }
 
@@ -418,14 +419,112 @@ struct CachedToken {
     last_used_recorded: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
+/// The verified tokens kept at one security revision, within the process's share of memory.
+#[derive(Clone, Default)]
+struct Verified {
+    revision: i64,
+    entries: HashMap<String, std::sync::Arc<CachedToken>>,
+    bytes: usize,
+}
+
+/// W10-R03's caches on every authenticated request, with no lock (goal 5, plan 01a1a59c2aae).
 #[derive(Default)]
 pub(crate) struct TokenCache {
-    revision: i64,
-    users: Option<(u64, bool)>,
-    entries: HashMap<String, CachedToken>,
-    bytes: usize,
-    usage: HashMap<String, i64>,
-    flushing_usage: bool,
+    /// Verified tokens, at the security revision their snapshot read: a copy swapped in whole (`crate::rcu`), each
+    /// change made on the latest copy, so one verified in an older snapshot is never kept under a newer revision.
+    verified: crate::rcu::Rcu<Verified>,
+    /// Whether any users exist, at the users table's change count it was read at.
+    users: crate::rcu::Rcu<Option<(u64, bool)>>,
+    /// Tokens' last use on its way to its writer, started with the first ([`TokenCache::used`]).
+    usage: std::sync::OnceLock<crate::memory::queue::Sender<(String, i64)>>,
+}
+
+impl TokenCache {
+    /// Whether any users exist, as kept at the users table's change count `rev`: none when it was kept at another.
+    fn users_at(&self, rev: u64) -> Option<bool> {
+        (**self.users.load()).filter(|(seen, _)| *seen == rev).map(|(_, value)| value)
+    }
+
+    /// Whether any users exist, `value`, read at the users table's change count `rev`: never kept over one read at a
+    /// later change.
+    fn remember_users(&self, rev: u64, value: bool) {
+        self.users.update(|users| {
+            if users.is_none_or(|(seen, _)| seen <= rev) {
+                *users = Some((rev, value));
+            }
+        });
+    }
+
+    /// A token verified at security revision `rev`, the one read in this snapshot: its verdict at `now` (none once
+    /// it's expired), or none when it isn't kept at that revision.
+    fn cached(&self, rev: i64, hash: &str, now: i64) -> Option<Option<CachedToken>> {
+        let verified = self.verified.load();
+        if verified.revision != rev {
+            return None;
+        }
+        let hit = verified.entries.get(hash)?;
+        Some(hit.expires_at.is_none_or(|exp| exp > now).then(|| CachedToken::clone(hit)))
+    }
+
+    /// `entry`, verified at security revision `rev`: kept when the cache is at that revision (or an older one, which
+    /// starts again at `rev`), never under a newer one; the one kept already for its hash if there's one, so every
+    /// caller of a token shares its last-use stamp. Within the process's share of memory, as before.
+    fn remember(&self, rev: i64, hash: String, entry: CachedToken) -> CachedToken {
+        if self.verified.load().revision > rev {
+            return entry;
+        }
+        let entry = std::sync::Arc::new(entry);
+        let kept = self.verified.update(|verified| {
+            if verified.revision < rev {
+                *verified = Verified { revision: rev, ..Verified::default() };
+            }
+            if verified.revision != rev {
+                return None;
+            }
+            if let Some(hit) = verified.entries.get(&hash) {
+                return Some(std::sync::Arc::clone(hit));
+            }
+            let size = entry.bytes(&hash);
+            let room = crate::memory::room::share();
+            if verified.bytes > room {
+                verified.entries = HashMap::new();
+                verified.bytes = 0;
+            }
+            if size <= room.saturating_sub(verified.bytes) {
+                verified.bytes += size;
+                verified.entries.insert(hash.clone(), std::sync::Arc::clone(&entry));
+            }
+            None
+        });
+        CachedToken::clone(kept.as_deref().unwrap_or(&*entry))
+    }
+
+    /// Token `id` was used at `at`: its writer, started with the first use, records it. Nothing waits on a lock, and
+    /// nothing waiting is stranded: the writer sleeps until the next use comes.
+    fn used(&self, store: &crate::store::Store, id: String, at: i64) {
+        let tx = self.usage.get_or_init(|| {
+            let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+            drop(crate::rt::spawn(write_usage(store.clone(), rx)));
+            tx
+        });
+        let _ = tx.try_send((id, at));
+    }
+}
+
+/// Tokens' last use, written as it comes: each write takes every use waiting, the latest of each token's, in one
+/// transaction; timestamp precision bounds writes for one busy token. Ends as its cache goes.
+async fn write_usage(store: crate::store::Store, rx: crate::memory::queue::Receiver<(String, i64)>) {
+    while let Ok((id, at)) = rx.recv().await {
+        let mut batch = HashMap::from([(id, at)]);
+        while let Ok((id, at)) = rx.try_recv() {
+            batch.entry(id).and_modify(|v: &mut i64| *v = (*v).max(at)).or_insert(at);
+        }
+        if let Err(e) = store.call(move |c| {
+            let mut update = c.prepare_cached("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1 AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at < ?2)")?;
+            for (id, at) in batch { update.execute(params![id, at])?; }
+            Ok(())
+        }).await { tracing::warn!(%e, "could not record token usage"); }
+    }
 }
 
 impl CachedToken {
@@ -456,14 +555,11 @@ impl CachedToken {
 async fn token(hub: &Hub, t: &str) -> Option<Caller> {
     let hash = crate::util::sha256_hex(t.as_bytes());
     let now = crate::util::now_unix();
-    let cache = hub.token_cache.clone();
+    let cache = std::sync::Arc::clone(&hub.token_cache);
     let loaded = hub.store.read(move |c| {
             let rev: i64 = c.prepare_cached("SELECT revision FROM permission_revision WHERE singleton = 1")?.query_row([], |r| r.get(0))?;
-            {
-                let cached = cache.lock();
-                if cached.revision == rev && let Some(hit) = cached.entries.get(&hash) {
-                    return Ok(hit.expires_at.is_none_or(|exp| exp > now).then(|| hit.clone()));
-                }
+            if let Some(verdict) = cache.cached(rev, &hash, now) {
+                return Ok(verdict);
             }
             let row: Option<(String, String, String, Option<String>, String, Option<i64>)> = c
                 .prepare_cached(
@@ -488,52 +584,14 @@ async fn token(hub: &Hub, t: &str) -> Option<Caller> {
             let name = if agent { format!("{principal} for {who}") } else { format!("pat:{short} of {who}") };
             let caller = Caller { kind: if agent { Kind::Agent } else { Kind::Pat }, name, user, token: Some(id), agent: None, rights, limit: Some(limit), turn: None };
             let entry = CachedToken { caller, expires_at, last_used_recorded: std::sync::Arc::default() };
-            let mut cached = cache.lock();
-            if cached.revision < rev {
-                cached.entries = HashMap::new();
-                cached.bytes = 0;
-                cached.revision = rev;
-            }
-            if cached.revision == rev {
-                if let Some(hit) = cached.entries.get(&hash) { return Ok(Some(hit.clone())); }
-                let size = entry.bytes(&hash);
-                let room = crate::memory::room::share();
-                if cached.bytes > room { cached.entries = HashMap::new(); cached.bytes = 0; }
-                if size <= room.saturating_sub(cached.bytes) {
-                    cached.bytes += size;
-                    cached.entries.insert(hash, entry.clone());
-                }
-            }
-            Ok(Some(entry))
+            Ok(Some(cache.remember(rev, hash, entry)))
         }).await.unwrap_or_else(|e| { let _ = store_err(e); None })?;
     let prev = loaded.last_used_recorded.load(std::sync::atomic::Ordering::Relaxed);
     if now > prev && loaded.last_used_recorded.compare_exchange(prev, now, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok()
         && let Some(id) = loaded.caller.token.as_ref()
     {
-        // Timestamp precision bounds writes for one busy token. Batch all tokens observed
-        // while the previous transaction was being written.
-        let flush = {
-            let mut cached = hub.token_cache.lock();
-            cached.usage.entry(id.clone()).and_modify(|v| *v = (*v).max(now)).or_insert(now);
-            !std::mem::replace(&mut cached.flushing_usage, true)
-        };
-        if flush {
-            let (store, cache) = (hub.store.clone(), hub.token_cache.clone());
-            drop(crate::rt::spawn(async move {
-                loop {
-                    let batch = {
-                        let mut c = cache.lock();
-                        if c.usage.is_empty() { c.flushing_usage = false; break; }
-                        std::mem::take(&mut c.usage)
-                    };
-                    if let Err(e) = store.call(move |c| {
-                        let mut update = c.prepare_cached("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1 AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at < ?2)")?;
-                        for (id, at) in batch { update.execute(params![id, at])?; }
-                        Ok(())
-                    }).await { tracing::warn!(%e, "could not record token usage"); }
-                }
-            }));
-        }
+        // Timestamp precision bounds writes for one busy token; its writer batches the uses that came while it wrote.
+        hub.token_cache.used(&hub.store, id.clone(), now);
     }
     Some(loaded.caller)
 }
@@ -760,6 +818,90 @@ mod tests {
 
     fn rights(grants: &[&str]) -> Rights {
         Rights { grants: grants.iter().filter_map(|g| Grant::parse(g).ok()).collect(), custom: HashMap::new() }
+    }
+
+    fn verified(token: &str, expires_at: Option<i64>) -> CachedToken {
+        let caller = Caller { kind: Kind::Pat, name: format!("pat:{token}"), user: None, token: Some(token.into()), agent: None, rights: None, limit: None, turn: None };
+        CachedToken { caller, expires_at, last_used_recorded: std::sync::Arc::default() }
+    }
+
+    /// W10-R03 with no lock (goal 5, plan 01a1a59c2aae): a token verified in an older snapshot and kept after the cache
+    /// moved on is never kept under the newer revision; a verdict is read only at the revision its snapshot read; a
+    /// newer revision keeps nothing from before it; the token kept first for a hash is the one every caller gets, with
+    /// its last-use stamp; an expired one is told none.
+    #[test]
+    fn w10_r03_a_token_verified_in_an_older_snapshot_is_never_kept_under_a_newer_revision() -> anyhow::Result<()> {
+        let (cache, now) = (TokenCache::default(), 100);
+        let kept = cache.remember(6, "h-new".into(), verified("new", None));
+        let older = cache.remember(5, "h-old".into(), verified("old", None));
+        anyhow::ensure!(older.caller.token.as_deref() == Some("old"), "the older snapshot's caller wasn't told its own verdict");
+        anyhow::ensure!(cache.cached(6, "h-old", now).is_none(), "an older snapshot's verdict was kept under the newer revision");
+        anyhow::ensure!(cache.cached(5, "h-new", now).is_none(), "a verdict was read at another revision");
+        anyhow::ensure!(matches!(cache.cached(6, "h-new", now), Some(Some(_))), "the newer revision's verdict wasn't kept");
+        let again = cache.remember(6, "h-new".into(), verified("again", None));
+        anyhow::ensure!(again.caller.token.as_deref() == Some("new") && std::sync::Arc::ptr_eq(&again.last_used_recorded, &kept.last_used_recorded), "a second caller got another token than the one kept");
+        cache.remember(7, "h-seven".into(), verified("seven", None));
+        anyhow::ensure!(cache.cached(7, "h-new", now).is_none(), "a newer revision kept a verdict from before it");
+        cache.remember(7, "h-gone".into(), verified("gone", Some(now - 1)));
+        anyhow::ensure!(matches!(cache.cached(7, "h-gone", now), Some(None)), "an expired token wasn't told none");
+        Ok(())
+    }
+
+    /// W10-R03 with no lock: whether users exist, read at a change count, is never kept over one read at a later change,
+    /// and is read only at the change count it was kept at.
+    #[test]
+    fn w10_r03_whether_users_exist_is_never_kept_over_a_later_change() -> anyhow::Result<()> {
+        let cache = TokenCache::default();
+        cache.remember_users(6, true);
+        cache.remember_users(5, false);
+        anyhow::ensure!(cache.users_at(6) == Some(true) && cache.users_at(5).is_none(), "an earlier read was kept over a later one");
+        cache.remember_users(7, false);
+        anyhow::ensure!(cache.users_at(7) == Some(false) && cache.users_at(6).is_none(), "a later read wasn't kept");
+        Ok(())
+    }
+
+    /// W10-R03's token usage with no lock (goal 5, plan 01a1a59c2aae): uses sent from several tasks while the writer
+    /// writes are each written, the latest of each token's, and none is stranded: the writer ends only once its queue
+    /// is closed and empty.
+    #[test]
+    fn w10_r03_every_token_use_is_written_its_latest_and_none_is_stranded() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let ids = ["pat-a", "pat-b", "pat-c"];
+            hub.store.call(move |c| {
+                for id in ids {
+                    c.execute("INSERT INTO tokens(id,kind,principal,hash,scopes,created_at) VALUES(?1,'pat','owner',?1,'{}',0)", params![id])?;
+                }
+                Ok(())
+            }).await?;
+            let (tx, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
+            let writer = crate::rt::spawn_spread_joined(write_usage(hub.store.clone(), rx));
+            let (tasks, uses) = (4i64, 250i64);
+            let mut sending = Vec::new();
+            for task in 0..tasks {
+                let tx = tx.clone();
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    for n in 0..uses {
+                        for id in ids {
+                            let _ = tx.try_send((id.to_owned(), 1 + task * 1000 + n));
+                        }
+                    }
+                }));
+            }
+            for s in sending {
+                s.await.map_err(|_| anyhow::anyhow!("a sender ended"))?;
+            }
+            drop(tx);
+            writer.await.map_err(|_| anyhow::anyhow!("the writer ended"))?;
+            let latest = 1 + (tasks - 1) * 1000 + (uses - 1);
+            let written: Vec<(String, Option<i64>)> = hub.store.read(|c| {
+                let mut st = c.prepare("SELECT id, last_used_at FROM tokens ORDER BY id")?;
+                let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)))?.collect::<Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }).await?;
+            anyhow::ensure!(written.len() == ids.len() && written.iter().all(|(_, at)| *at == Some(latest)), "written: {written:?}, each should be {latest}");
+            Ok(())
+        })
     }
 
     #[test]
