@@ -46,6 +46,7 @@ Each change is recorded in `vendor/patches/hyper-raft/`, applied in this order o
 | `crates/hyper-raft/src/node.rs`, `crates/hyper-durable/src/replica.rs` | Allow the current leader to resign in its existing term when its detector loses the voting quorum | AD-1 requires a partitioned session leader to step down even if it cannot hear a higher term | `0008-minority-leader-stepdown.patch` |
 | `crates/hyper-durable/src/replica.rs` | Retain an explicit campaign hold across wake and transfer | AD-1 requires a measured voting quorum and an execution-capable candidate | `0009-session-campaign-hold.patch` |
 | `crates/hyper-liveness/src/{lib,pair}.rs` | Expose the process incarnation from the peer’s most recent accepted heartbeat | AD-1 requires a quorum to identify the same owner process before transferring a session | `0010-expose-the-observed-peer-incarnation.patch` |
+| `crates/hyper-durable/src/replica.rs`, `crates/hyper-raft/src/raft.rs`, `crates/hyper-durable/tests/shell.rs` | Serve outstanding snapshot requests after a durable compaction and resume appends when the follower confirms the image | A competing session founder needs the certified winner’s snapshot to recover while its group is idle | `0011-send-requested-snapshots-when-compaction-becomes-durable.patch` |
 
 The first change is Quiver's and kiln's policy, not hyper-raft's, so it isn't offered upstream: hyper-durable
 calls `RamStore` slates' case (each write complete as it's submitted), and gating it in hyper-raft

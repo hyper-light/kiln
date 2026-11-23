@@ -1778,6 +1778,29 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
                 if let Some(stall) = self.stall.as_mut() {
                     stall.freed = true;
                 }
+                // CP-T3.2. A peer may have requested an image before one existed.
+                // A durable compaction can satisfy that request even on a quiet group.
+                if self.is_leader() {
+                    let offered = self
+                        .node
+                        .store()
+                        .snapshot
+                        .as_ref()
+                        .map_or(0, hyper_raft::proto::snapshot_index);
+                    self.waiting.clear();
+                    self.waiting
+                        .extend(self.node.raft.tracker().iter().filter_map(|(peer, p)| {
+                            (p.pending_request_snapshot != 0
+                                && p.pending_request_snapshot <= offered
+                                && p.state != ProgressState::Snapshot)
+                                .then_some(peer)
+                        }));
+                    let sent = self
+                        .waiting
+                        .iter()
+                        .try_for_each(|&peer| self.node.send_append(peer));
+                    self.must(sent)?;
+                }
             }
             return self.tell_durable_commit();
         };

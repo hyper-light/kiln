@@ -3821,13 +3821,18 @@ impl<S: Storage> Raft<S> {
         progress.recent_active = true;
         progress.update_committed(message.commit);
         let paused = progress.is_paused();
-        if !progress.maybe_update(message.index) {
+        let installed =
+            progress.state == ProgressState::Snapshot && message.index >= progress.pending_snapshot;
+        if !progress.maybe_update(message.index) && !installed {
             return Ok(());
         }
         match progress.state {
             ProgressState::Probe => progress.become_replicate(),
             ProgressState::Snapshot => {
-                if progress.is_snapshot_caught_up() {
+                if installed {
+                    // The receiver confirmed installation, even if the transport
+                    // never reports success. The next send follows the image.
+                    progress.pending_request_snapshot = 0;
                     progress.become_probe();
                 }
             }

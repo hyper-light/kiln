@@ -1698,6 +1698,110 @@ fn refused(r: &mut Sim, append: &Message) -> Message {
         .expect("a snapshot for the learner")
 }
 
+/// CP-T3.2. Without ticks, a waiting peer gets its image on durable compaction alone.
+#[test]
+fn durable_compaction_serves_only_outstanding_snapshot_requests_it_covers()
+-> Result<(), ReplicaError> {
+    let mut leader = sole(1, Unbounded, |_| {});
+    for peer in [2, 3, 4] {
+        leader.change(Vec::new(), &change(ConfChangeType::AddLearnerNode, peer))?;
+        pump(&mut leader);
+    }
+    let at = leader.applied().index;
+    for (peer, requested) in [(2, at), (3, at.saturating_add(2))] {
+        leader.step(Message {
+            msg_type: MessageType::MsgAppendResponse,
+            from: peer,
+            to: 1,
+            term: leader.term(),
+            index: at,
+            reject: true,
+            request_snapshot: requested,
+            ..Message::default()
+        })?;
+    }
+    let snapshots = |out: Output<_>| {
+        out.messages
+            .into_iter()
+            .filter(|m| m.msg_type == MessageType::MsgSnapshot)
+            .map(|m| {
+                (
+                    m.to,
+                    m.snapshot.as_deref().map(hyper_raft::proto::snapshot_index),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(snapshots(pump(&mut leader)).is_empty());
+    assert!(leader.compact(0, now(), waker())?);
+    assert_eq!(snapshots(pump(&mut leader)), [(2, Some(at))]);
+    // Peer 2's first snapshot is still in flight, and peer 3's request is
+    // still ahead of this next image. Peer 4 has never requested one.
+    leader.propose(Vec::new(), b"again".to_vec())?;
+    pump(&mut leader);
+    assert!(leader.compact(0, now(), waker())?);
+    assert!(snapshots(pump(&mut leader)).is_empty());
+    // The transport reports no success. The follower confirms the first
+    // image after "again" is compacted, then confirms the newer image.
+    for index in [at, leader.applied().index] {
+        leader.step(Message {
+            msg_type: MessageType::MsgAppendResponse,
+            from: 2,
+            to: 1,
+            term: leader.term(),
+            index,
+            ..Message::default()
+        })?;
+        let sent = snapshots(pump(&mut leader));
+        if index == at {
+            assert_eq!(sent, [(2, Some(leader.applied().index))]);
+        } else {
+            assert!(sent.is_empty(), "a confirmed image was reissued: {sent:?}");
+        }
+    }
+    // A peer can request repair at an index it previously matched. Only an
+    // acknowledgment through the image can release the next ordinary append.
+    let matched = leader.applied().index;
+    leader.step(Message {
+        msg_type: MessageType::MsgAppendResponse,
+        from: 2,
+        to: 1,
+        term: leader.term(),
+        index: matched,
+        reject: true,
+        request_snapshot: matched,
+        ..Message::default()
+    })?;
+    assert_eq!(snapshots(pump(&mut leader)), [(2, Some(matched))]);
+    leader.step(Message {
+        msg_type: MessageType::MsgAppendResponse,
+        from: 2,
+        to: 1,
+        term: leader.term(),
+        index: matched.saturating_sub(1),
+        ..Message::default()
+    })?;
+    leader.propose(Vec::new(), b"next".to_vec())?;
+    let appends_next = |out: Output<_>| {
+        out.messages.iter().any(|m| {
+            m.to == 2
+                && m.msg_type == MessageType::MsgAppend
+                && m.entries.iter().any(|e| e.data == b"next")
+        })
+    };
+    assert!(!appends_next(pump(&mut leader)));
+    leader.step(Message {
+        msg_type: MessageType::MsgAppendResponse,
+        from: 2,
+        to: 1,
+        term: leader.term(),
+        index: matched,
+        ..Message::default()
+    })?;
+    assert!(appends_next(pump(&mut leader)));
+    Ok(())
+}
+
 /// A machine that keeps its owner's checkpoints images the latest, behind what it applied
 /// (focal's): the snapshot a member behind the log's start is sent carries the configuration the
 /// group held at the image's point, never one applied since (Ongaro and Ousterhout 2014, §7). A

@@ -53,6 +53,7 @@ Each change is recorded in `vendor/patches/hex/`, applied in this order on upstr
 | `vendor/patches/hyper-raft/` | Record shared datagram addressing, exact detector history and quorum-loss resignation | AD-1 uses one hyper-raft implementation across Kiln and its consumers | `0004-record-shared-datagram-and-liveness-patches.patch` |
 | `vendor/patches/hyper-raft/` | Preserve a session’s campaign hold across replica wakeups | AD-1 lets only eligible voters campaign | `0005-preserve-shared-campaign-hold.patch` |
 | `vendor/patches/hyper-raft/0010-expose-the-observed-peer-incarnation.patch` | Record the shared detector’s peer incarnation query | AD-1 uses the same process identity evidence across Kiln and its consumers | `0006-record-the-shared-observed-peer-incarnation-patch.patch` |
+| `vendor/patches/hyper-raft/0011-send-requested-snapshots-when-compaction-becomes-durable.patch` | Record delivery of requested snapshots after a durable compaction | The shared Raft shell serves waiting peers when a group is idle | `0007-record-the-shared-snapshot-completion-fix.patch` |
 
 The second, third and fourth changes are kiln's layout alone (`Kiln-only:`). The first is offered to Hex as it stands,
 with what it leaves for Hex and kiln to agree on:
