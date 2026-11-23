@@ -136,6 +136,7 @@ impl Inbox {
         if pending.lease.epoch != promotion.from_epoch && pending.lease.epoch != promotion.to_epoch { return Err(PromotionError::Stale); }
         // An absent sequence means the original row revision, not a later migration write.
         pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
+        pending.accepted_epoch.get_or_insert(pending.lease.epoch);
         pending.lease.epoch = promotion.to_epoch;
         promotion.after = Some(row.key.clone());
         let row_len = accepting::count(session, &pending)?;
@@ -285,7 +286,7 @@ mod tests {
             }
             while inbox.rebind_promotion_step("s", &input).await? != RebindStep::Complete {}
             for (original, revision) in [(first, first_revision), (second, second_revision)] {
-                let mut expected = original.clone(); expected.lease.epoch = 1; expected.accepted_seq = Some(original.accepted_seq.unwrap_or(revision));
+                let mut expected = original.clone(); expected.accepted_epoch = Some(original.accepted_epoch.unwrap_or(original.lease.epoch)); expected.lease.epoch = 1; expected.accepted_seq = Some(original.accepted_seq.unwrap_or(revision));
                 let actual = inbox.pending("s", &original.lease.message).await?.must()?;
                 assert_eq!(serde_json::to_value(actual)?, serde_json::to_value(expected)?);
             }

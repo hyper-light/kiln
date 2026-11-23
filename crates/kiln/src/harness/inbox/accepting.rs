@@ -22,6 +22,8 @@ pub(super) struct PendingWrite<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     disposition: Option<&'a Disposition>,
     accepted_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted_epoch: Option<u64>,
     digest: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     accepted_seq: Option<records::Rev>,
@@ -33,14 +35,14 @@ fn empty_writes(writes: &&[String]) -> bool { writes.is_empty() }
 
 impl<'a> PendingWrite<'a> {
     pub(super) fn original(lease: &'a Lease, command: &'a Command, body_bytes: usize) -> Self {
-        Self { lease, command: Some(command), opaque_writes: &[], origin: Origin::Accepted, current: None, body_bytes: Some(body_bytes), disposition: None, accepted_at: 0, digest: "", accepted_seq: None, status: None }
+        Self { lease, command: Some(command), opaque_writes: &[], origin: Origin::Accepted, current: None, body_bytes: Some(body_bytes), disposition: None, accepted_at: 0, accepted_epoch: None, digest: "", accepted_seq: None, status: None }
     }
     /// A message routed to its session here: kept as routed, with its status key where it's a replaceable status.
     pub(super) fn routed(lease: &'a Lease, command: &'a Command, body_bytes: usize, status: Option<&'a crate::harness::mail::StatusKey>) -> Self {
         Self { origin: Origin::Routed, status, ..Self::original(lease, command, body_bytes) }
     }
     pub(super) fn borrowed(pending: &'a Pending) -> Self {
-        Self { lease: &pending.lease, command: pending.command.as_ref(), opaque_writes: &pending.opaque_writes, origin: pending.origin, current: pending.current.as_ref(), body_bytes: pending.body_bytes, disposition: pending.disposition.as_ref(), accepted_at: pending.accepted_at, digest: &pending.digest, accepted_seq: pending.accepted_seq, status: pending.status.as_ref() }
+        Self { lease: &pending.lease, command: pending.command.as_ref(), opaque_writes: &pending.opaque_writes, origin: pending.origin, current: pending.current.as_ref(), body_bytes: pending.body_bytes, disposition: pending.disposition.as_ref(), accepted_at: pending.accepted_at, accepted_epoch: pending.accepted_epoch, digest: &pending.digest, accepted_seq: pending.accepted_seq, status: pending.status.as_ref() }
     }
     fn receipt(self, at: i64, digest: &'a str) -> Self { Self { accepted_at: at, digest, ..self } }
 }
@@ -103,13 +105,13 @@ pub(super) struct Built {
     pub head: Option<Head>,
 }
 
-pub(super) fn build<'a>(session: &'a str, message: &str, digest: &'a str, at: i64, cached: &Cached, pending: Option<PendingWrite<'a>>, budget: Option<&Input>) -> Result<Built, Refusal> {
-    let kept = KeptWrite { epoch: cached.head.epoch, at, digest };
-    let pending = pending.map(|pending| pending.receipt(at, digest));
-    let head = cached.rev.is_none().then(|| cached.head.clone());
-    let kept_len = count(session, &kept)?;
-    let pending_len = pending.as_ref().map(|pending| count(session, pending)).transpose()?;
-    let head_len = head.as_ref().map(|head| count(session, head)).transpose()?;
+#[derive(Clone, Copy)]
+struct Layout { kept_len: usize, pending_len: Option<usize>, head_len: Option<usize>, conditions: usize, writes: usize, bytes: usize }
+
+fn layout(session: &str, message: &str, kept: &KeptWrite<'_>, pending: Option<&PendingWrite<'_>>, head: Option<&Head>) -> Result<Layout, Refusal> {
+    let kept_len = count(session, kept)?;
+    let pending_len = pending.map(|pending| count(session, pending)).transpose()?;
+    let head_len = head.map(|head| count(session, head)).transpose()?;
     let key_len = session.len().checked_add(1).and_then(|bytes| bytes.checked_add(message.len())).ok_or_else(|| unavailable(session, "inbox key size overflowed"))?;
     let conditions = 2usize.checked_add(usize::from(pending.is_some())).ok_or_else(|| unavailable(session, "inbox condition count overflowed"))?;
     let writes = 1usize.checked_add(usize::from(pending.is_some())).and_then(|n| n.checked_add(usize::from(head.is_some()))).ok_or_else(|| unavailable(session, "inbox write count overflowed"))?;
@@ -130,6 +132,30 @@ pub(super) fn build<'a>(session: &'a str, message: &str, digest: &'a str, at: i6
     // into its statement; SQLite's SQLITE_TRANSIENT copy dies with execute's statement.
     add(driver)?;
     add(size_of::<BufferCharge>())?;
+    Ok(Layout { kept_len, pending_len, head_len, conditions, writes, bytes })
+}
+
+pub(crate) struct RoutedCharge { epoch: u64, head: Option<Head>, layout: Layout }
+
+impl RoutedCharge {
+    pub(crate) fn bytes(&self) -> usize { self.layout.bytes }
+}
+
+pub(super) fn cost<'a>(session: &str, message: &str, digest: &'a str, at: i64, epoch: u64, head: Option<Head>, pending: PendingWrite<'a>) -> Result<RoutedCharge, Refusal> {
+    let kept = KeptWrite { epoch, at, digest };
+    let layout = layout(session, message, &kept, Some(&pending.receipt(at, digest)), head.as_ref())?;
+    Ok(RoutedCharge { epoch, head, layout })
+}
+
+#[allow(clippy::too_many_arguments, reason = "a measured layout accompanies its immutable original until the CAS transaction is built")]
+pub(super) fn build<'a>(session: &'a str, message: &str, digest: &'a str, at: i64, cached: &Cached, pending: Option<PendingWrite<'a>>, budget: Option<&Input>, measured: Option<&RoutedCharge>) -> Result<Built, Refusal> {
+    let kept = KeptWrite { epoch: cached.head.epoch, at, digest };
+    let pending = pending.map(|pending| pending.receipt(at, digest));
+    let head = cached.rev.is_none().then(|| cached.head.clone());
+    let Layout { kept_len, pending_len, head_len, conditions, writes, bytes } = match measured {
+        Some(m) if cached.head.epoch == m.epoch && m.head == head => m.layout,
+        _ => layout(session,message,&kept,pending.as_ref(),head.as_ref())?,
+    };
     let owner = budget.map(|budget| budget.reserve_buffer(bytes).map_err(|_| unavailable(session, "inbox transaction reservation overflowed"))?.ok_or_else(|| unavailable(session, "inbox transaction has no physical byte authority"))).transpose()?;
     let mut tx = Tx::default();
     tx.conds.try_reserve_exact(conditions).map_err(|_| unavailable(session, "inbox condition allocation is unavailable"))?;
@@ -179,13 +205,13 @@ mod tests {
         let input = Input::new(0, Arc::clone(&pool), inbox);
         let cached = Cached { head: Head::default(), rev: None, kept: None };
         let pending = original("actual retained words");
-        let built = build("s", "original", "digest", 12, &cached, Some(PendingWrite::borrowed(&pending)), Some(&input))?;
+        let built = build("s", "original", "digest", 12, &cached, Some(PendingWrite::borrowed(&pending)), Some(&input), None)?;
         let (required, _) = pool.counts();
         assert!(required > 0);
         drop(built);
         assert_eq!(pool.counts().0, 0);
         pool.resize(required.saturating_sub(1));
-        assert!(build("s", "original", "digest", 12, &cached, Some(PendingWrite::borrowed(&pending)), Some(&input)).is_err());
+        assert!(build("s", "original", "digest", 12, &cached, Some(PendingWrite::borrowed(&pending)), Some(&input), None).is_err());
         assert_eq!(pool.counts().0, 0, "a refused count cannot leak input authority");
         let oversized = original("x".repeat(records::VALUE_MAX).as_str());
         assert!(count("s", &PendingWrite::borrowed(&oversized)).is_err(), "record capacity is checked before encoding allocation");

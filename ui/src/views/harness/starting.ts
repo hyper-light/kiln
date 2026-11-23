@@ -8,7 +8,7 @@
  * starts twice; Back puts its message and choices back in Mission control's composer.
  */
 import { create } from "zustand";
-import { harnessApi, sessionStore, type AgentInfo, type Spec } from "@/api/harness";
+import { harnessApi, sessionStore, type AgentInfo, type Spec, type StartSlot } from "@/api/harness";
 import { toast } from "@/components/ui/toast";
 import { harnessSessionsRes } from "@/lib/data";
 import { errorMessage } from "@/lib/hooks";
@@ -31,7 +31,8 @@ export interface Start {
   /** Its first message's id when it waits here with its files (`useHeld`), its page sending it. */
   heldFirst?: string;
   at: number;
-  state: "starting" | "started" | "failed";
+  state: "starting" | "started" | "held" | "failed";
+  slots?: StartSlot[];
   why?: string;
   /** Its agents that started, as the server has them (those of an earlier try too; ids of its own, from a server that makes them itself). */
   started?: AgentInfo[];
@@ -160,10 +161,26 @@ function sayElsewhere(s: Start, why: string) {
 const toStart = (s: Start) => s.ids.filter((id) => !(s.started ?? []).some((a) => a.id === id));
 
 async function go(s: Start) {
-  const asked = toStart(s);
+  // A receipt-bearing server compares the original operation body, including every slot.
+  const asked = s.slots ? s.ids : toStart(s);
   try {
-    const made = await harnessApi.start(s.target, s.spec, asked.length, asked);
-    done(s, [...(s.started ?? []), ...made]);
+    let slots: StartSlot[] | undefined;
+    const made = await harnessApi.start(s.target, s.spec, asked.length, asked, (batch) => {
+      slots = batch;
+    });
+    const started = [...new Map([...(s.started ?? []), ...made].map((info) => [info.id, info])).values()];
+    if (slots && slots.some((slot) => slot.outcome === "held" || slot.outcome === "refused")) {
+      const refused = slots.filter((slot) => slot.outcome === "refused");
+      const pending = slots.filter((slot) => slot.outcome === "held");
+      const why = [...refused, ...pending].map((slot) => `${slot.id.slice(0, 8)}: ${slot.why}`).join(" · ");
+      if (refused.length) failed({ ...s, slots }, started, why);
+      else {
+        put({ ...s, slots, state: "held", why, started });
+        list(started, [], "listed");
+      }
+    } else {
+      done({ ...s, slots }, started);
+    }
   } catch (e) {
     // Refused, or its answer lost: which of them are there, as the server has them now. Some may
     // have started before another couldn't, and one asked again may have got there the first time

@@ -749,6 +749,8 @@ pub struct Frozen {
 }
 
 impl Frozen {
+    pub(super) fn epoch(&self) -> u64 { self.state.epoch }
+
     /// The depth its input learned: where its depth starts in the next image (W20 learned depth).
     pub fn learned_depth(&self) -> Option<usize> {
         super::admission::learned_depth(&self.state)

@@ -243,7 +243,7 @@ classes! {
         AgentMsg::HarnessMailTransfer { .. } => REFUSED,
         AgentMsg::Prebuilt { .. } => Class::State,
         AgentMsg::RunnerRole { .. } => Class::Handshake,
-        AgentMsg::HarnessForward { .. } => Class::Answer,
+        AgentMsg::HarnessForward { .. } | AgentMsg::HarnessRouteReceipt { .. } => Class::Answer,
     }
 }
 
@@ -285,7 +285,7 @@ classes! {
         ServerMsg::JobRerunStep { .. } => REFUSED,
         ServerMsg::JobExec { .. } => REFUSED,
         ServerMsg::Convo { .. } => FEED,
-        ServerMsg::HarnessPackage { .. } => REFUSED,
+        ServerMsg::HarnessPackage { .. } | ServerMsg::ConvoTransferOwnership { .. } => REFUSED,
         ServerMsg::HarnessRelease { .. } => PARKED,
         ServerMsg::UpdateAvailable { .. } => Class::State,
         ServerMsg::Diagnose { .. } => Class::Ask,

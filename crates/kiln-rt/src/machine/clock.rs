@@ -97,6 +97,14 @@ pub fn shard_clock_ns() -> u64 {
     monotonic_ns()
 }
 
+/// The shard clock's resolution in nanoseconds, from the host's timebase.
+pub fn shard_clock_step_ns() -> u64 {
+    #[cfg(target_os = "macos")]
+    { continuous_scale().map_or_else(resolution_ns, |scale| ticks_to_ns(1, scale).max(1)) }
+    #[cfg(not(target_os = "macos"))]
+    { resolution_ns() }
+}
+
 /// Format: the fractional bits of the timebase's fixed-point scale, so a tick converts with one 64×64-bit
 /// multiply and a shift rather than a 128-bit division: `scale = round((numer << 32) / denom)`, off by at
 /// most half of `2⁻³²` of a tick's nanoseconds, a relative error under 10⁻¹¹ for Apple silicon's 125/3.
@@ -620,22 +628,6 @@ mod tests {
             );
         }
         ticks
-    }
-
-    /// The shard clock's least step here, nanoseconds: macOS's continuous time counts the timebase's ticks;
-    /// elsewhere the monotonic clock's reported resolution.
-    #[cfg(all(
-        target_arch = "aarch64",
-        any(target_os = "macos", target_os = "linux"),
-        not(miri)
-    ))]
-    fn shard_clock_step_ns() -> u64 {
-        #[cfg(target_os = "macos")]
-        let step =
-            continuous_scale().map_or_else(resolution_ns, |scale| ticks_to_ns(1, scale).max(1));
-        #[cfg(not(target_os = "macos"))]
-        let step = resolution_ns();
-        step
     }
 
     /// §3.9 by use on this machine: where the shard reads a counter, it runs at the scale the OS or the

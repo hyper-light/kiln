@@ -1,0 +1,186 @@
+Subject: record-shared-datagram-and-liveness-patches
+Why: Quiver must record the same hyper-raft changes as the single copy Kiln builds for its session fleet.
+
+diff --git a/vendor/patches/hyper-raft/0006-hyper-transport-and-its-driver-answer-from-the-address-a.patch b/vendor/patches/hyper-raft/0006-hyper-transport-and-its-driver-answer-from-the-address-a.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..40b201b5f646bcb74cd9bda4f53f4d792716c2de
+--- /dev/null
++++ b/vendor/patches/hyper-raft/0006-hyper-transport-and-its-driver-answer-from-the-address-a.patch
+@@ -0,0 +1,99 @@
++Subject: hyper-transport and its driver answer from the address a datagram reached
++Why: A server bound to the unspecified address on a host with more than one address answered from its route's source, which a QUIC client does not accept from a server (RFC 9000 section 9): the driver hands hyper-transport each datagram's local address (kiln-rt's Arrival::to, from IP_PKTINFO), hyper-transport hands it to hyper-quic (Endpoint::handle_datagram_to, where handle_datagram passed None), and each transmit leaves from its src_ip (kiln-rt's Batched::send_segments_from). kiln goal 90 R2 (2026-11-21): adacachy held 192.168.1.77 beside its advertised 192.168.1.90, and every runner's direct link took no answer and fell to the HTTP tunnel, which dropped on each Wi-Fi blip.
++
++diff --git a/crates/hyper-rt-transport/src/driver.rs b/crates/hyper-rt-transport/src/driver.rs
++index 4bde16ab64bcf88b369835658e1e6b9ab9690aa4..f3591f3752d82aa63e9add9637d17db910a833d3 100644
++--- a/crates/hyper-rt-transport/src/driver.rs
+++++ b/crates/hyper-rt-transport/src/driver.rs
++@@ -38,7 +38,7 @@
++ //! (`docs/transport.md` §4aa).
++ 
++ use std::future::{Future, poll_fn};
++-use std::net::SocketAddr;
+++use std::net::{IpAddr, SocketAddr};
++ use std::pin::Pin;
++ use std::task::{Context, Poll};
++ use std::time::{Duration, Instant};
++@@ -99,6 +99,9 @@ const SEGMENTS_A_TRANSMIT: usize = 64;
++ /// endpoint makes is sent past it.
++ struct Held {
++     to: SocketAddr,
+++    /// The local address it leaves from: the one its peer reached the endpoint at
+++    /// ([`Transmit::src_ip`](hyper_transport::Transmit), from [`Arrival::to`](hyper_rt::udp::Arrival)).
+++    from: Option<IpAddr>,
++     bytes: Vec<u8>,
++     /// The bytes of it sent.
++     done: usize,
++@@ -1112,7 +1115,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
++                     arrival.read_ns.saturating_sub(anchor_ns),
++                 ))
++                 .unwrap_or(anchor);
++-            endpoint.handle_datagram(at, arrival.from, None, bytes);
+++            // The address it reached: what an answer leaves from (a host with more than one).
+++            endpoint.handle_datagram_to(at, arrival.from, arrival.to, None, bytes);
++         })?;
++         let consumed = match (stream_before, stream(endpoint)) {
++             (Some(before), Some(after)) => after.saturating_sub(before),
++@@ -1161,6 +1165,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
++             datagrams = datagrams.saturating_add(outgoing.len().div_ceil(segment));
++             let held = Held {
++                 to: transmit.destination,
+++                from: transmit.src_ip,
++                 bytes: outgoing,
++                 done: 0,
++                 segment,
++@@ -1180,7 +1185,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
++         let rest = held.bytes.get(held.done..).unwrap_or(&[]);
++         let sent = self
++             .socket_for(held.to)
++-            .send_segments(held.to, rest, held.segment);
+++            .send_segments_from(held.to, held.from, rest, held.segment);
++         held.done = held
++             .done
++             .saturating_add(sent.saturating_mul(held.segment))
++diff --git a/crates/hyper-transport/src/endpoint.rs b/crates/hyper-transport/src/endpoint.rs
++index 9760487f2c1222be65990fa569b66b57a2bd6466..c4b947a9d495f27eb602a2098b4c1c1ed467e8ec 100644
++--- a/crates/hyper-transport/src/endpoint.rs
+++++ b/crates/hyper-transport/src/endpoint.rs
++@@ -29,7 +29,7 @@
++ 
++ use std::collections::{HashSet, VecDeque};
++ use std::marker::PhantomData;
++-use std::net::SocketAddr;
+++use std::net::{IpAddr, SocketAddr};
++ use std::num::NonZeroUsize;
++ use std::time::{Duration, Instant};
++ 
++@@ -1027,6 +1027,23 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
++         from: SocketAddr,
++         ecn: Option<EcnCodepoint>,
++         bytes: &[u8],
+++    ) {
+++        self.handle_datagram_to(now, from, None, ecn, bytes);
+++    }
+++
+++    /// A datagram arrived from `from`, sent to this endpoint's local address `local_ip` where the
+++    /// driver knows it (its socket's `IP_PKTINFO`). The connection it opens or belongs to answers
+++    /// from that address ([`Transmit::src_ip`]): a server bound to the unspecified address on a host
+++    /// with more than one address answers from the one its client dialed, which the client accepts
+++    /// (RFC 9000 §9: a server's address does not change), where the kernel's own choice, its route's
+++    /// source, may be another.
+++    pub fn handle_datagram_to(
+++        &mut self,
+++        now: Instant,
+++        from: SocketAddr,
+++        local_ip: Option<IpAddr>,
+++        ecn: Option<EcnCodepoint>,
+++        bytes: &[u8],
++     ) {
++         self.core.now = now;
++         let datagram = self.receive.take(bytes, &mut self.core.budget);
++@@ -1034,7 +1051,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C,
++         buffer.clear();
++         match self
++             .quic
++-            .handle(now, from, None, ecn, datagram, &mut buffer)
+++            .handle(now, from, local_ip, ecn, datagram, &mut buffer)
++         {
++             Some(DatagramEvent::NewConnection(attempt)) => self.attempt(now, attempt, &mut buffer),
++             Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+diff --git a/vendor/patches/hyper-raft/0007-liveness-history-exposure.patch b/vendor/patches/hyper-raft/0007-liveness-history-exposure.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5c6bf9fbb52b7dfc91c3894aec41e6d77ec9ab9
+--- /dev/null
++++ b/vendor/patches/hyper-raft/0007-liveness-history-exposure.patch
+@@ -0,0 +1,19 @@
++Subject: liveness-history-exposure
++Why: AD-1 restores the exact accumulated node time after restart.
++
++diff --git a/crates/hyper-timing/src/folds.rs b/crates/hyper-timing/src/folds.rs
++index 1ea24fe7e52722f46d5e6f0697e5ea4fd7b2d486..5168e11db914696f42d571d674f756bbb6288e67 100644
++--- a/crates/hyper-timing/src/folds.rs
+++++ b/crates/hyper-timing/src/folds.rs
++@@ -298,6 +298,11 @@ impl Exposure {
++         self.failures = self.failures.saturating_add(1);
++     }
++ 
+++    /// Exact accumulated node time, for persisting this evidence alongside its failure count.
+++    pub const fn node_time(&self) -> Duration {
+++        self.exposure
+++    }
+++
++     /// The failures counted.
++     pub const fn failures(&self) -> u64 {
++         self.failures
+diff --git a/vendor/patches/hyper-raft/0008-minority-leader-stepdown.patch b/vendor/patches/hyper-raft/0008-minority-leader-stepdown.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..6557d5daf8a4b5105e4f77d6dc3478472f472d14
+--- /dev/null
++++ b/vendor/patches/hyper-raft/0008-minority-leader-stepdown.patch
+@@ -0,0 +1,47 @@
++Subject: minority-leader-stepdown
++Why: AD-1 lets a session leader relinquish its current term when the shared detector reports loss of its voting quorum.
++
++diff --git a/crates/hyper-durable/src/replica.rs b/crates/hyper-durable/src/replica.rs
++index f8005ed2c4010b53e0b0bb37d4014b6209a80667..1abcc19e7ed2c01fe2f0789a377f445dc37af306 100644
++--- a/crates/hyper-durable/src/replica.rs
+++++ b/crates/hyper-durable/src/replica.rs
++@@ -932,6 +932,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
++         })
++     }
++ 
+++    /// Relinquish a service's lead when its detector says it lacks a quorum.
+++    /// A suspicion on a single link still leaves a three-voter leader a majority.
+++    pub fn resign_without_quorum(&mut self) -> Result<(), ReplicaError> {
+++        self.guarded(|r| {
+++            let resigned = r.node.resign_without_quorum();
+++            r.heard(resigned)
+++        })
+++    }
+++
++     /// The owner's detectors trust `member`'s node again.
++     pub fn trust(&mut self, member: u64) -> Result<(), ReplicaError> {
++         self.guarded(|r| {
++diff --git a/crates/hyper-raft/src/node.rs b/crates/hyper-raft/src/node.rs
++index 7259d9902a032ff3120653d5cd056afcd9da6459..33fb242a0e906c03a49fbc8edc1fc277a17636d0 100644
++--- a/crates/hyper-raft/src/node.rs
+++++ b/crates/hyper-raft/src/node.rs
++@@ -643,6 +643,19 @@ impl<S: Storage> RawNode<S> {
++     pub fn suspect(&mut self, member: NodeId) -> Result<()> {
++         self.operate(|raft| raft.suspect(member))
++     }
+++    /// Give up a service's leadership when its detector no longer trusts a voting
+++    /// quorum. Joint configurations require both majorities. No vote or term changes.
+++    pub fn resign_without_quorum(&mut self) -> Result<()> {
+++        self.operate(|raft| {
+++            if raft.state() == crate::StateRole::Leader
+++                && raft.config().check_quorum
+++                && raft.campaign_state().is_some_and(|s| !s.trusted_quorum)
+++            {
+++                raft.become_follower(raft.term(), 0)?;
+++            }
+++            Ok(())
+++        })
+++    }
++     /// The owner's detectors trust `member`'s node again.
++     pub fn trust(&mut self, member: NodeId) -> Result<()> {
++         self.operate(|raft| raft.trust(member))

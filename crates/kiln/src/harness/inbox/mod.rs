@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 pub mod transfer;
 pub mod promotion;
 pub use promotion::{Promotion, PromotionError, PromotionPhase};
+pub(crate) mod fencing;
 mod accepting;
+pub(crate) use accepting::RoutedCharge;
 
 /// Ids a session keeps: the duplicates of its last this many messages are known.
 pub const KEEP: u64 = 4096;
@@ -92,7 +94,7 @@ pub fn carried_by(session: &str, taken: Vec<(Vec<u8>, Vec<u8>, u64)>, pending: V
                 return None;
             }
             let kept: Kept = serde_json::from_slice(&value).ok()?;
-            Some((rev, message.to_owned(), kept.digest))
+            Some((kept.accepted_seq.unwrap_or(rev), message.to_owned(), kept.digest))
         })
         .collect();
     ids.sort_by_key(|(rev, ..)| *rev);
@@ -107,6 +109,61 @@ pub fn carried_from(store: &crate::convo::store::Store, session: &str) -> anyhow
     let taken = store.inbox_rows(MESSAGES, prefix.clone())?;
     let pending = store.inbox_rows(PENDING, prefix)?;
     Ok(carried_by(session, taken, pending))
+}
+
+pub(crate) fn receipt_sequence(family: &str, value: &[u8]) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Stamp {
+        accepted_seq: Option<u64>,
+    }
+    if !matches!(family, MESSAGES | PENDING) {
+        return None;
+    }
+    serde_json::from_slice::<Stamp>(value).ok()?.accepted_seq
+}
+
+/// The receiving SQLite store assigns its own CAS revisions. Keep the original receipt's
+/// sequence inside the replicated value before the revision which supplied it is lost.
+pub(crate) fn with_receipt_sequence(family: &str, value: &[u8], rev: u64) -> anyhow::Result<Vec<u8>> {
+    #[derive(Deserialize)]
+    struct Receipt {
+        epoch: Option<u64>,
+        at: Option<i64>,
+        lease: Option<serde::de::IgnoredAny>,
+        accepted_seq: Option<u64>,
+    }
+    // Legacy Records collections may contain older opaque values. Preserve their bytes.
+    if !matches!(family, MESSAGES | PENDING)
+        || !serde_json::from_slice::<Receipt>(value).is_ok_and(|r| {
+            r.accepted_seq.is_none()
+                && match family {
+                    MESSAGES => r.epoch.is_some() && r.at.is_some(),
+                    PENDING => r.lease.is_some(),
+                    _ => false,
+                }
+        })
+    {
+        return Ok(value.to_vec());
+    }
+    let end = value
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .filter(|i| value.get(*i) == Some(&b'}'))
+        .ok_or_else(|| anyhow::anyhow!("invalid receipt object"))?;
+    let prefix = br#","accepted_seq":"#;
+    let digits = usize::try_from(rev.checked_ilog10().unwrap_or(0))?.saturating_add(1);
+    let total = end
+        .checked_add(prefix.len())
+        .and_then(|n| n.checked_add(digits))
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("receipt size overflow"))?;
+    let mut stamped = Vec::new();
+    stamped.try_reserve_exact(total)?;
+    stamped.extend_from_slice(value.get(..end).unwrap_or_default());
+    // Both journal record types have required nonempty fields.
+    stamped.extend_from_slice(prefix);
+    std::io::Write::write_fmt(&mut stamped, format_args!("{rev}}}"))?;
+    Ok(stamped)
 }
 
 /// The session a key of one of an inbox's families names: its id's bytes.
@@ -141,6 +198,8 @@ pub struct Pending {
     pub disposition: Option<super::admission::Disposition>,
     #[serde(default)]
     accepted_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_epoch: Option<u64>,
     #[serde(default)]
     digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -164,10 +223,10 @@ pub struct Current { pub revision: u64, pub command: super::model::Command }
 impl Pending {
     pub fn new(lease: super::admission::Lease, command: super::model::Command) -> Self {
         let body_bytes = super::admission::command_bytes(&command).ok();
-        Self { lease, command: Some(command), opaque_writes: Vec::new(), origin: Origin::Accepted, current: None, body_bytes, disposition: None, accepted_at: 0, digest: String::new(), accepted_seq: None, status: None }
+        Self { lease, command: Some(command), opaque_writes: Vec::new(), origin: Origin::Accepted, current: None, body_bytes, disposition: None, accepted_at: 0, accepted_epoch: None, digest: String::new(), accepted_seq: None, status: None }
     }
     pub fn legacy(lease: super::admission::Lease, command: super::model::Command) -> Self { Self { origin: Origin::LegacyRetained, ..Self::new(lease, command) } }
-    pub fn opaque(lease: super::admission::Lease, opaque_writes: Vec<String>) -> Self { Self { lease, command: None, opaque_writes, origin: Origin::LegacyOpaque, current: None, body_bytes: None, disposition: None, accepted_at: 0, digest: String::new(), accepted_seq: None, status: None } }
+    pub fn opaque(lease: super::admission::Lease, opaque_writes: Vec<String>) -> Self { Self { lease, command: None, opaque_writes, origin: Origin::LegacyOpaque, current: None, body_bytes: None, disposition: None, accepted_at: 0, accepted_epoch: None, digest: String::new(), accepted_seq: None, status: None } }
     pub fn current_command(&self) -> Option<&super::model::Command> { self.current.as_ref().map(|current| &current.command).or(self.command.as_ref()) }
     /// The revision its take committed at in its session's store: where it stands among the messages taken there.
     pub fn seq(&self) -> Option<Rev> { self.accepted_seq }
@@ -311,6 +370,8 @@ struct Cached {
 struct Kept {
     epoch: u64,
     at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_seq: Option<Rev>,
     /// What it is ([`digest`]); empty for one brought from another machine, whose words aren't
     /// known here.
     #[serde(default)]
@@ -329,22 +390,83 @@ fn is_first(n: &u32) -> bool {
 /// brought in that commit ([`Kept::n`]). The newest is the greatest.
 type Place = (Rev, u32);
 
+struct KeptRow {
+    key: Vec<u8>,
+    rev: Rev,
+    place: Place,
+    message: String,
+    digest: String,
+}
+
 /// What a message is, for telling a repeat from another message under the same id: its words and
 /// the names of the files it carries (what every hop and retry keeps as it was).
 pub fn digest(text: &str, files: &[&str]) -> String {
-    let mut whole = String::with_capacity(text.len().saturating_add(64));
-    whole.push_str(text);
+    use sha2::{Digest as _, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(text);
+    for f in files { hash.update([0]); hash.update(f); }
+    hex::encode(hash.finalize().split_at(16).0)
+}
+
+/// A request's durable identity. Materializing an uploaded image adds inline bytes and a local
+/// path, so its immutable upload id remains its source on every hop.
+pub(super) fn send_digest(text: &str, files: &[super::model::Attachment]) -> String {
+    use sha2::{Digest as _, Sha256};
+    if files.is_empty() { return digest(text, &[]); }
+    let mut legacy = Sha256::new();
+    legacy.update(text);
+    let mut hash = Sha256::new();
+    let mut field = |value: &[u8]| { hash.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes()); hash.update(value); };
+    field(text.as_bytes());
     for f in files {
-        whole.push('\u{0}');
-        whole.push_str(f);
+        legacy.update([0]); legacy.update(&f.name);
+        field(f.name.as_bytes()); field(f.mime.as_bytes());
+        match &f.file_id {
+            Some(id) => { field(b"upload"); field(id.as_bytes()); }
+            None => { field(b"inline"); field(f.data_base64.as_bytes()); }
+        }
     }
-    let mut h = crate::util::sha256_hex(whole.as_bytes());
-    h.truncate(32);
-    h
+    format!("v2:{}:{}", hex::encode(legacy.finalize().split_at(16).0), hex::encode(hash.finalize()))
+}
+
+/// Bind dispatch choices and the operation type. The legacy digest is carried solely to
+/// validate an old receipt against its retained original body. Serialize metadata directly
+/// into the hash; attachments were already streamed into the payload identity.
+pub(super) fn dispatch_digest(payload: String, dispatch: impl Serialize) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    struct HashWriter(Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut hash = HashWriter(Sha256::new());
+    hash.0.update(b"kiln inbox dispatch v3\0");
+    serde_json::to_writer(&mut hash, &(payload.as_str(), dispatch)).ok()?;
+    Some(format!("v3:{}:{payload}", hex::encode(hash.0.finalize())))
+}
+
+/// This weaker comparison is used only where the exact retained command is also available.
+pub(super) fn same_digest(stored: &str, received: &str) -> bool {
+    if stored == received {
+        return true;
+    }
+    let payload = received.strip_prefix("v3:").and_then(|s| s.split_once(':')).map_or(received, |(_, old)| old);
+    payload == stored
+        || payload
+            .strip_prefix("v2:")
+            .and_then(|s| s.split_once(':'))
+            .is_some_and(|(legacy, _)| legacy == stored)
 }
 
 /// The inboxes of the sessions on one host.
 pub struct Inbox {
+    pub(crate) owner_fences: Arc<fencing::Fences>,
+    authority: parking_lot::RwLock<Option<std::sync::Weak<crate::convo::raft::Manager>>>,
     records: Arc<dyn Records>,
     heads: Mutex<HashMap<String, Cached>>,
     limits: Limits,
@@ -365,8 +487,122 @@ enum Retry {
 }
 
 impl Inbox {
+    /// CP-T3.2. The first prompt belongs to the founding Raft entry, ahead of any later
+    /// send. Only callers founding an empty conversation may use this initial sequence.
+    pub(crate) fn founding_opening_rows(
+        session: &str,
+        epoch: u64,
+        sender: &str,
+        command: &super::model::Command,
+        at: i64,
+    ) -> anyhow::Result<Vec<crate::convo::rows::Row>> {
+        use super::admission::{Lease, Stage};
+        use crate::convo::rows::{InboxRow, Row};
+        check_session(session)?;
+        let (message, digest) = super::host::message_of(command).ok_or_else(|| anyhow::anyhow!("the opening prompt needs a stable message ID"))?;
+        check_message(&message)?;
+        let bytes = super::admission::command_bytes(command).map_err(|e| anyhow::anyhow!("cannot size the opening prompt: {e:?}"))?;
+        let lease = Lease {
+            message: message.clone(),
+            peer: sender.to_owned(),
+            epoch,
+            bytes,
+            stage: Stage::Waiting,
+            token: None,
+            handoff: None,
+        };
+        let cached = Cached {
+            head: Head { epoch, ..Head::default() },
+            rev: None,
+            kept: None,
+        };
+        let body = accepting::PendingWrite::routed(&lease, command, bytes, None);
+        let tx = accepting::build(session, &message, &digest, at, &cached, Some(body), None, None)?.tx;
+        tx.writes
+            .into_iter()
+            .map(|write| {
+                let Write::Put { family, key, value } = write else {
+                    anyhow::bail!("invalid opening inbox transaction");
+                };
+                let stamped = if matches!(family.as_str(), MESSAGES | PENDING) {
+                    with_receipt_sequence(&family, &value, 1)?
+                } else {
+                    value
+                };
+                anyhow::ensure!(stamped.len() <= records::VALUE_MAX, "the opening prompt exceeds record capacity");
+                Ok(Row::Inbox(Box::new(InboxRow {
+                    session: session.to_owned(),
+                    family,
+                    key,
+                    value: Some(stamped),
+                })))
+            })
+            .collect()
+    }
+
+    fn allow_local_send(&self, session: &str, sent: Option<u64>) -> Result<Option<u64>, Refusal> {
+        self.owner_fences.check_epoch(session, sent).map_err(|e| unavailable(session, &e.to_string()))?;
+        let manager = self.session_authority().map_err(|e| unavailable(session, &e.to_string()))?;
+        let Some(manager) = manager else { return Ok(sent) };
+        let (epoch, foreign, writable) = manager.with_status(session, |s| {
+            (
+                s.epoch,
+                s.founded && !s.recovering && !s.execution_held && s.owner.as_deref().is_some_and(|owner| owner != s.node),
+                s.founded && !s.execution_held && !s.recovering && s.is_leader && s.owner.as_deref() == Some(&s.node),
+            )
+        }).ok_or_else(|| unavailable(session, "its local execution owner has not been established"))?;
+        if foreign {
+            return Err(Refusal::Moved {
+                session: session.to_owned(),
+                epoch,
+            });
+        }
+        if !writable {
+            return Err(unavailable(session, "its local execution owner cannot confirm new writes"));
+        }
+        if let Some(sent) = sent {
+            if sent < epoch {
+                return Err(Refusal::StaleEpoch {
+                    session: session.to_owned(),
+                    sent,
+                    current: epoch,
+                });
+            }
+            if sent > epoch {
+                return Err(Refusal::Behind {
+                    session: session.to_owned(),
+                    here: epoch,
+                    sent,
+                });
+            }
+        }
+        Ok(Some(epoch))
+    }
+
+    pub(crate) fn set_raft_authority(&self, manager: &Arc<crate::convo::raft::Manager>) {
+        self.owner_fences.rebind();
+        *self.authority.write() = Some(Arc::downgrade(manager));
+    }
+
+    pub(crate) fn session_authority(&self) -> anyhow::Result<Option<Arc<crate::convo::raft::Manager>>> {
+        self.authority.read().as_ref().map(|weak| weak.upgrade().ok_or_else(|| anyhow::anyhow!("session WAL is changing hands"))).transpose()
+    }
+
+    /// Prove the provider-flight journal is replicated before its bytes can reach a provider.
+    pub(crate) async fn confirm_provider_write(&self, session: &str, epoch: u64) -> anyhow::Result<()> {
+        self.allow_local_send(session,Some(epoch))?;
+        let Some(authority) = self.authority.read().clone() else { return Ok(()) };
+        let mgr = authority.upgrade().ok_or_else(|| anyhow::anyhow!("session WAL is changing hands"))?;
+        let store = mgr.store().ok_or_else(|| anyhow::anyhow!("session store is unavailable"))?;
+        crate::agent::drain_session(&mgr, &store, session, epoch, true).await
+    }
+
     pub fn new(records: Arc<dyn Records>, limits: Limits) -> Self {
-        Self { records, heads: Mutex::new(HashMap::new()), limits, brought: Mutex::new(HashMap::new()) }
+        Self::with_fences(records,limits,Arc::default())
+    }
+
+    pub(crate) fn with_fences(records:Arc<dyn Records>,limits:Limits,owner_fences:Arc<fencing::Fences>)->Self {
+        Self { owner_fences, authority: Default::default(), records, heads: Mutex::new(HashMap::new()), limits, brought: Mutex::new(HashMap::new()) }
     }
 
     /// Session `session` is here at `epoch`, with the ids of the messages it took where it was
@@ -462,6 +698,69 @@ impl Inbox {
         Err(unavailable(session, "its head kept changing"))
     }
 
+    /// A committed Raft ownership change carries the same journal to its elected runner.
+    /// Fence admissions during the rebind. Each page commits with the fence and row revisions,
+    /// so a crash can repeat the walk without overtaking another owner or replaying native input.
+    pub async fn takeover_epoch(&self, session: &str, epoch: u64, _at: i64) -> Result<(), Refusal> {
+        check_session(session)?;
+        self.heads.lock().remove(session);
+        let cached = self.head(session).await?;
+        if cached.head.epoch > epoch {
+            return Err(Refusal::StaleEpoch { session: session.into(), sent: epoch, current: cached.head.epoch });
+        }
+        if cached.head.promotion.as_ref().is_some_and(|p| p.phase != PromotionPhase::Active) {
+            return Err(unavailable(session, "journal promotion has not finished"));
+        }
+        let mut held = cached.head.clone();
+        held.epoch = epoch;
+        held.moved = true;
+        held.handover = false;
+        let rev = self.commit(session, &cached, Vec::new(), Vec::new(), Some(held.clone())).await.map_err(|e| match e {
+            Retry::No(reason) => reason,
+            _ => unavailable(session, "journal ownership changed before takeover"),
+        })?;
+        let fence = Cached { head: held, rev: Some(rev), kept: cached.kept };
+        let mut after = None;
+        loop {
+            let scan = Scan { prefix: session_prefix(session), after, limit: PAGE, at: Consistency::Linearizable };
+            let page = self.records.scan(PENDING, scan).await.map_err(|e| unavailable(session, &e.to_string()))?;
+            let Some(last) = page.rows.last().map(|r| r.key.clone()) else { break };
+            let mut conds = Vec::new();
+            let mut writes = Vec::new();
+            for row in page.rows {
+                let mut pending: Pending = serde_json::from_slice(&row.value).map_err(|e| unavailable(session, &e.to_string()))?;
+                if pending.lease.epoch > epoch {
+                    return Err(Refusal::StaleEpoch { session: session.into(), sent: epoch, current: pending.lease.epoch });
+                }
+                if pending.lease.epoch == epoch {
+                    continue;
+                }
+                pending.accepted_seq = Some(pending.accepted_seq.unwrap_or(row.rev));
+                pending.accepted_epoch.get_or_insert(pending.lease.epoch);
+                pending.lease.epoch = epoch;
+                // Preserve ProviderFlight and its handoff, including when the old process died
+                // between writing to the provider and recording the consumption proof.
+                conds.push(Cond::At { family: PENDING.into(), key: row.key.clone(), rev: row.rev });
+                writes.push(Write::Put { family: PENDING.into(), key: row.key, value: json(session, &pending)? });
+            }
+            if !writes.is_empty() {
+                self.commit(session, &fence, conds, writes, None).await.map_err(|e| match e {
+                    Retry::No(reason) => reason,
+                    _ => unavailable(session, "journal ownership changed during takeover"),
+                })?;
+            }
+            after = Some(last);
+        }
+        let mut active = fence.head.clone();
+        active.moved = false;
+        active.handover = false;
+        self.commit(session, &fence, Vec::new(), Vec::new(), Some(active)).await.map_err(|e| match e {
+            Retry::No(reason) => reason,
+            _ => unavailable(session, "journal ownership changed before takeover completed"),
+        })?;
+        Ok(())
+    }
+
     /// Session `session` is taken back by this host at `epoch`, the epoch it left at: it was handed
     /// to another runner process of this machine (blue/green, which keeps its epoch) and that one
     /// never took it over, so this one goes on with it. A fence at `epoch` is lifted; one at a higher
@@ -493,6 +792,15 @@ impl Inbox {
         self.fence_for(session, epoch, false).await
     }
 
+    pub(crate) async fn fence_old_owner(&self, session: &str, epoch: u64) -> anyhow::Result<()> {
+        let Some(mgr) = self.session_authority()? else {
+            return Ok(self.fence(session, epoch).await?);
+        };
+        let db = mgr.store().ok_or_else(|| anyhow::anyhow!("conversation store is unavailable"))?;
+        let id = session.to_owned();
+        crate::rt::blocking(move || db.confirm_local_owner_fence(&id, epoch)).await?
+    }
+
     /// [`Inbox::fence`]; `handover`: it's handed to this machine's next runner process
     /// (blue/green), and a copy of it this host goes on with at `epoch` takes it back (`open`).
     /// A fence for a move to another machine at the same epoch stays one.
@@ -500,7 +808,9 @@ impl Inbox {
         check_session(session)?;
         for _ in 0..RETRIES {
             let c = self.head(session).await?;
-            if c.head.moved && (c.head.epoch > epoch || (c.head.epoch == epoch && (handover || !c.head.handover))) {
+            // A delayed final command from a retired lane cannot fence the newer
+            // owner's active inbox, even if it became active between our CAS retries.
+            if c.head.epoch > epoch || (c.head.moved && c.head.epoch == epoch && (handover || !c.head.handover)) {
                 return Ok(());
             }
             let head = Head { epoch: c.head.epoch.max(epoch), moved: true, handover: handover && c.head.epoch <= epoch, promotion: c.head.promotion.clone() };
@@ -519,20 +829,27 @@ impl Inbox {
     /// same id; `epoch` is the one it was sent for (none from a sender that doesn't say); `at` is
     /// the host's time (unix ms). A take is one write.
     pub async fn accept(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64) -> Result<Answer, Refusal> {
-        self.accept_inner(session, message, digest, epoch, at, None, None).await
+        self.accept_inner(session, message, digest, epoch, at, None, None, None).await
     }
 
     /// The original body and its admission lease commit with the inbox id, before any ACK or
     /// session handoff. Ordinary deduplication cleanup never touches this family.
     pub async fn accept_pending(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64, pending: &Pending) -> Result<Answer, Refusal> {
-        self.accept_inner(session, message, digest, epoch, at, Some(accepting::PendingWrite::borrowed(pending)), None).await
+        self.accept_inner(session, message, digest, epoch, at, Some(accepting::PendingWrite::borrowed(pending)), None, None).await
     }
 
     /// The owner borrows its immutable original; the counted encoded transaction, rather than
     /// another Pending clone, takes temporary physical authority through the Records worker.
     #[allow(clippy::too_many_arguments)] // Existing inbox identity/epoch/time plus the borrowed immutable body and its physical lease.
     pub async fn accept_input(&self, session: &str, message: &str, digest: &str, epoch: u64, at: i64, lease: &super::admission::Lease, command: &super::model::Command, body_bytes: usize, budget: &super::admission::Input) -> Result<Answer, Refusal> {
-        self.accept_inner(session, message, digest, Some(epoch), at, Some(accepting::PendingWrite::original(lease, command, body_bytes)), Some(budget)).await
+        self.accept_inner(session, message, digest, Some(epoch), at, Some(accepting::PendingWrite::original(lease, command, body_bytes)), Some(budget), None).await
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "use the same borrowed fields and transaction layout as the routed acceptance")]
+    pub(crate) fn routed_charge(&self, session: &str, message: &str, digest: &str, at: i64, lease: &super::admission::Lease, command: &super::model::Command, status: Option<&super::mail::StatusKey>) -> Result<RoutedCharge, Refusal> {
+        let head = self.heads.lock().get(session).map_or_else(|| Some(Head::default()), |c| c.rev.is_none().then(|| c.head.clone()));
+        let pending = accepting::PendingWrite::routed(lease, command, lease.bytes, status);
+        accepting::cost(session, message, digest, at, lease.epoch, head, pending)
     }
 
     /// [`Inbox::accept_input`] for a message routed to its session here (docs/sends.md, "Routed to its session"): its
@@ -541,7 +858,12 @@ impl Inbox {
     /// replaceable status. Taken once: a retry is its repeat, as any message's.
     #[allow(clippy::too_many_arguments, reason = "the routed take binds the session, the message and its identity, the epoch it was sent for, its lease, its original and its status together")]
     pub async fn accept_routed(&self, session: &str, message: &str, digest: &str, epoch: u64, at: i64, lease: &super::admission::Lease, command: &super::model::Command, body_bytes: usize, status: Option<&super::mail::StatusKey>, budget: &super::admission::Input) -> Result<Answer, Refusal> {
-        self.accept_inner(session, message, digest, Some(epoch), at, Some(accepting::PendingWrite::routed(lease, command, body_bytes, status)), Some(budget)).await
+        self.accept_priced_routed(session,message,digest,epoch,at,lease,command,body_bytes,status,budget,None).await
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "use the optional exact size measured for this same routed command")]
+    pub(crate) async fn accept_priced_routed(&self, session: &str, message: &str, digest: &str, epoch: u64, at: i64, lease: &super::admission::Lease, command: &super::model::Command, body_bytes: usize, status: Option<&super::mail::StatusKey>, budget: &super::admission::Input, measured: Option<&RoutedCharge>) -> Result<Answer, Refusal> {
+        self.accept_inner(session, message, digest, Some(epoch), at, Some(accepting::PendingWrite::routed(lease, command, body_bytes, status)), Some(budget), measured).await
     }
 
     /// A routed message still waiting in session `session`'s journal (`epoch`), taken out of it: a newer status from
@@ -559,12 +881,13 @@ impl Inbox {
     }
 
     #[allow(clippy::too_many_arguments)] // Common legacy/durable acceptance path preserves independently validated protocol fields.
-    async fn accept_inner(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64, pending: Option<accepting::PendingWrite<'_>>, budget: Option<&super::admission::Input>) -> Result<Answer, Refusal> {
+    async fn accept_inner(&self, session: &str, message: &str, digest: &str, epoch: Option<u64>, at: i64, pending: Option<accepting::PendingWrite<'_>>, budget: Option<&super::admission::Input>, measured: Option<&RoutedCharge>) -> Result<Answer, Refusal> {
         let storage_failed = |refusal: Refusal| {
             if let Some(input) = budget { let _ = input.controller.lock().unavailable(); }
             refusal
         };
         check_session(session)?;
+        let epoch=self.allow_local_send(session,epoch)?;
         // What it brought from where it was first: a retry of one of those is its repeat here.
         self.take_in(session, at).await.map_err(storage_failed)?;
         check_message(message)?;
@@ -582,15 +905,27 @@ impl Inbox {
             // original message after an ordinary tidy removed its historical id.
             if let Some(row) = self.records.get(PENDING, &message_key(session, message), Consistency::Linearizable).await.map_err(|e| storage_failed(unavailable(session, &e.to_string())))? {
                 let original: Pending = serde_json::from_slice(&row.value).map_err(|e| storage_failed(unavailable(session, &format!("its pending communication is unreadable: {e}"))))?;
-                if original.digest != digest { return Err(Refusal::Reused { session: session.to_owned(), message: message.to_owned() }); }
-                return Ok(Answer { session: session.to_owned(), message: message.to_owned(), epoch: original.lease.epoch, at: original.accepted_at, seq: original.accepted_seq.unwrap_or(row.rev), repeat: true });
+                let legacy_fields = !original.digest.starts_with("v3:") && original.command.as_ref().is_some_and(|c| match c {
+                    super::model::Command::Send { mode, attachments, overrides, reply_to, task, .. } =>
+                        *mode != super::model::SendMode::Queue || overrides.is_some() || reply_to.is_some() || task.is_some()
+                            || (!attachments.is_empty() && !original.digest.starts_with("v2:")),
+                    super::model::Command::SkillRun { .. } => true,
+                    _ => false,
+                });
+                let matches = (original.digest == digest && !legacy_fields) || (same_digest(&original.digest, digest)
+                    && original.command.as_ref().and_then(crate::harness::host::message_of)
+                        .is_some_and(|(id, actual)| id == message && actual == digest));
+                if !matches { return Err(Refusal::Reused { session: session.to_owned(), message: message.to_owned() }); }
+                self.allow_local_send(session,epoch)?;
+                return Ok(Answer { session: session.to_owned(), message: message.to_owned(), epoch: original.accepted_epoch.unwrap_or(original.lease.epoch), at: original.accepted_at, seq: original.accepted_seq.unwrap_or(row.rev), repeat: true });
             }
-            let built = accepting::build(session, message, digest, at, &c, pending, budget)?;
+            let built = accepting::build(session, message, digest, at, &c, pending, budget, measured)?;
             let result = match built.owner {
                 Some(owner) => self.records.commit_owned(built.tx, owner).await,
                 None => self.records.commit(built.tx).await,
             };
             if matches!(&result, Err(records::Refusal::Unavailable(_))) && let Some(input) = budget { let _ = input.controller.lock().unavailable(); }
+            self.allow_local_send(session,epoch)?;
             match self.committed(session, &c, built.head, result) {
                 Ok(rev) => {
                     if let Some(input) = budget {
@@ -605,7 +940,9 @@ impl Inbox {
                     let (first, rev) = self.kept(session, message).await?.ok_or_else(|| unavailable(session, "a message taken before can't be read"))?;
                     // One brought from another machine has no digest here: whatever comes under
                     // its id is its repeat.
-                    if !first.digest.is_empty() && first.digest != digest {
+                    // A legacy names-only receipt cannot certify an attachment's bytes once its
+                    // original body has gone. Keep the id occupied and report the ambiguity.
+                    if first.digest != digest && (!first.digest.is_empty() || digest.starts_with("v2:") || digest.starts_with("v3:")) {
                         return Err(Refusal::Reused { session: session.to_owned(), message: message.to_owned() });
                     }
                     return Ok(Answer { session: session.to_owned(), message: message.to_owned(), epoch: first.epoch, at: first.at, seq: rev, repeat: true });
@@ -624,6 +961,7 @@ impl Inbox {
     /// (`invalid`: `why`), as nothing took it. Its records unreadable now: `unavailable`.
     pub async fn unreadable(&self, session: &str, message: &str, epoch: Option<u64>, why: &str, at: i64) -> Result<Answer, Refusal> {
         check_session(session)?;
+        let epoch=self.allow_local_send(session,epoch)?;
         self.take_in(session, at).await?;
         check_message(message)?;
         let c = self.head(session).await?;
@@ -681,7 +1019,7 @@ impl Inbox {
             None => {
                 pending.accepted_at = at;
                 pending.digest = match &pending.command {
-                    Some(super::model::Command::Send { text, attachments, .. }) => digest(text, &attachments.iter().map(|attachment| attachment.name.as_str()).collect::<Vec<_>>()),
+                    Some(command) => crate::harness::host::message_of(command).filter(|(id, _)| id == &message).map(|(_, digest)| digest).ok_or_else(|| unavailable(session, "legacy queue custody requires its original message id"))?,
                     None if pending.origin == Origin::LegacyOpaque => String::new(),
                     _ => return Err(unavailable(session, "legacy queue custody requires its complete retained communication")),
                 };
@@ -964,7 +1302,7 @@ impl Inbox {
                         continue;
                     }
                     // Its place among those brought with it, the oldest first: they share a revision.
-                    let kept = Kept { epoch: c.head.epoch, at, digest: digest.to_owned(), n: u32::try_from(j).unwrap_or(u32::MAX) };
+                    let kept = Kept { epoch: c.head.epoch, at, accepted_seq: None, digest: digest.to_owned(), n: u32::try_from(j).unwrap_or(u32::MAX) };
                     conds.push(Cond::Absent { family: MESSAGES.into(), key: message_key(session, id) });
                     writes.push(Write::Put { family: MESSAGES.into(), key: message_key(session, id), value: json(session, &kept)? });
                 }
@@ -999,7 +1337,7 @@ impl Inbox {
             if page.is_empty() {
                 break;
             }
-            let writes = page.into_iter().map(|(key, _, _, _)| Write::Delete { family: MESSAGES.into(), key }).collect();
+            let writes = page.into_iter().map(|row| Write::Delete { family: MESSAGES.into(), key: row.key }).collect();
             self.records.commit(Tx { conds: Vec::new(), writes }).await.map_err(|e| unavailable(session, &e.to_string()))?;
         }
         self.records.commit(Tx { conds: Vec::new(), writes: vec![Write::Delete { family: HEADS.into(), key: session.as_bytes().to_vec() }] }).await.map_err(|e| unavailable(session, &e.to_string()))?;
@@ -1027,8 +1365,8 @@ impl Inbox {
         if !whole {
             return Err(unavailable(session, &format!("it keeps more ids than the {} read at once (its tidies failing): it goes once they're tidied", self.limits.read)));
         }
-        all.sort_by_key(|(_, place, _, _)| *place);
-        let ids = all.into_iter().map(|(_, _, m, d)| (m, d)).chain(self.waiting(session));
+        all.sort_by_key(|row| row.place);
+        let ids = all.into_iter().map(|row| (row.message, row.digest)).chain(self.waiting(session));
         // Each id once, at its newest place (one taken in part-way may be in both).
         let mut seen = std::collections::HashSet::new();
         let mut newest: Vec<(String, String)> = ids.rev().filter(|(m, _)| seen.insert(m.clone())).take(limit).collect();
@@ -1094,14 +1432,15 @@ impl Inbox {
     /// failed, the rest go at its next tidies). How many went.
     async fn trim(&self, session: &str) -> Result<usize, Refusal> {
         let (read, whole) = self.read(session).await?;
-        let mut every: Vec<(Vec<u8>, Place)> = read.into_iter().map(|(key, place, _, _)| (key, place)).collect();
-        every.sort_by_key(|(_, place)| *place);
+        let mut every = read;
+        every.sort_by_key(|row| row.place);
         let keep = usize::try_from(self.limits.keep).unwrap_or(usize::MAX);
         let past = every.len().saturating_sub(keep);
         let mut gone = 0usize;
         for chunk in every.get(..past).unwrap_or_default().chunks(PAGE) {
-            let writes: Vec<Write> = chunk.iter().map(|(key, _)| Write::Delete { family: MESSAGES.into(), key: key.clone() }).collect();
-            self.records.commit(Tx { conds: Vec::new(), writes }).await.map_err(|e| unavailable(session, &e.to_string()))?;
+            let writes = chunk.iter().map(|row| Write::Delete { family: MESSAGES.into(), key: row.key.clone() }).collect();
+            let conds = chunk.iter().map(|row| Cond::At { family: MESSAGES.into(), key: row.key.clone(), rev: row.rev }).collect();
+            self.records.commit(Tx { conds, writes }).await.map_err(|e| unavailable(session, &e.to_string()))?;
             gone = gone.saturating_add(chunk.len());
         }
         if let Some(c) = self.heads.lock().get_mut(session) {
@@ -1116,16 +1455,16 @@ impl Inbox {
     /// one (past its bound, its tidies failing, it may keep more than [`Limits::keep`] and
     /// [`Limits::trim`], and its newest must be among what's read for what goes with it when it
     /// moves, whatever their keys' order).
-    async fn read(&self, session: &str) -> Result<(Vec<(Vec<u8>, Place, String, String)>, bool), Refusal> {
+    async fn read(&self, session: &str) -> Result<(Vec<KeptRow>, bool), Refusal> {
         let most = usize::try_from(self.limits.read).unwrap_or(usize::MAX).max(1);
-        let mut out: Vec<(Vec<u8>, Place, String, String)> = Vec::new();
+        let mut out: Vec<KeptRow> = Vec::new();
         let mut after = None;
         // A page reads one at least: `most` pages at the most.
         for _ in 0..most {
             let want = most.saturating_sub(out.len()).min(records::SCAN_MAX);
             let page = self.page(session, after.take(), want).await?;
             let short = page.len() < want;
-            after = page.last().map(|(k, _, _, _)| k.clone());
+            after = page.last().map(|row| row.key.clone());
             out.extend(page);
             if short {
                 return Ok((out, true));
@@ -1141,7 +1480,7 @@ impl Inbox {
 
     /// A page of session `session`'s messages in key order, after `after`: each key, place
     /// ([`Place`]), id and digest (empty where its words aren't known here).
-    async fn page(&self, session: &str, after: Option<Vec<u8>>, limit: usize) -> Result<Vec<(Vec<u8>, Place, String, String)>, Refusal> {
+    async fn page(&self, session: &str, after: Option<Vec<u8>>, limit: usize) -> Result<Vec<KeptRow>, Refusal> {
         let prefix = session_prefix(session);
         let skip = prefix.len();
         let scan = Scan { prefix, after, limit: limit.clamp(1, records::SCAN_MAX), at: Consistency::Linearizable };
@@ -1150,8 +1489,9 @@ impl Inbox {
             .rows
             .into_iter()
             .map(|r| {
-                let (digest, n) = serde_json::from_slice::<Kept>(&r.value).map(|k| (k.digest, k.n)).unwrap_or_default();
-                (r.key.clone(), (r.rev, n), String::from_utf8_lossy(r.key.get(skip..).unwrap_or_default()).into_owned(), digest)
+                let (digest, place) = serde_json::from_slice::<Kept>(&r.value).map(|k| (k.digest,(k.accepted_seq.unwrap_or(r.rev),k.n))).unwrap_or_else(|_| (String::new(),(r.rev,0)));
+                let message = String::from_utf8_lossy(r.key.get(skip..).unwrap_or_default()).into_owned();
+                KeptRow { key: r.key, rev: r.rev, place, message, digest }
             })
             .collect())
     }
@@ -1159,7 +1499,7 @@ impl Inbox {
     /// Message `message` as kept for session `session`, and the revision it was taken at.
     async fn kept(&self, session: &str, message: &str) -> Result<Option<(Kept, Rev)>, Refusal> {
         let row = self.records.get(MESSAGES, &message_key(session, message), Consistency::Linearizable).await.map_err(|e| unavailable(session, &e.to_string()))?;
-        row.map(|r| serde_json::from_slice::<Kept>(&r.value).map(|k| (k, r.rev)).map_err(|e| unavailable(session, &format!("a kept message is unreadable: {e}")))).transpose()
+        row.map(|r| serde_json::from_slice::<Kept>(&r.value).map(|k| { let seq = k.accepted_seq.unwrap_or(r.rev); (k, seq) }).map_err(|e| unavailable(session, &format!("a kept message is unreadable: {e}")))).transpose()
     }
 
     /// Session `session`'s head: as this host has it, else as kept, else a new one.
@@ -1282,6 +1622,91 @@ mod tests {
     fn pending_message(message: &str, text: &str) -> Pending {
         use crate::harness::{admission::{Lease, Stage}, mail::Token, model::{Command, SendMode}};
         Pending::new(Lease { message: message.into(), peer: "peer".into(), epoch: 0, bytes: text.len(), stage: Stage::InboxAccepted, token: Some(Token { revision: 1, generation: 1 }), handoff: None }, Command::Send { id: message.into(), text: text.into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None })
+    }
+
+    #[test]
+    fn cp_t3_2_dispatch_changes_cannot_reuse_a_pending_or_consumed_receipt() -> anyhow::Result<()> {
+        use crate::harness::{
+            host::message_of,
+            model::{Command, SendMode},
+        };
+        let simple = pending_message("m", "same");
+        let mut changed = simple.clone();
+        let Some(Command::Send { mode, task, .. }) = changed.command.as_mut() else {
+            anyhow::bail!("missing test send");
+        };
+        *mode = SendMode::Now;
+        *task = Some("worker".into());
+        let old = digest("same", &[]);
+        let (_, new) = changed.command.as_ref().and_then(message_of).ok_or_else(|| anyhow::anyhow!("missing digest"))?;
+        let first = inbox();
+        block(first.accept_pending("s1", "m", &old, Some(0), 1, &simple))?;
+        assert!(matches!(block(first.accept("s1", "m", &new, Some(0), 2)), Err(Refusal::Reused { .. })));
+        // The exact retained body lets an authentic pre-upgrade retry recover its receipt.
+        let second = inbox();
+        let receipt = block(second.accept_pending("s1", "m", &old, Some(0), 1, &changed))?;
+        assert!(matches!(block(second.accept("s1","m",&old,Some(0),2)),Err(Refusal::Reused{..})));
+        assert_eq!(block(second.accept("s1", "m", &new, Some(0), 2))?, Answer { repeat: true, ..receipt });
+        let consumed = inbox();
+        block(consumed.accept("s1", "m", &new, Some(0), 1))?;
+        assert!(matches!(block(consumed.accept("s1", "m", &old, Some(0), 2)), Err(Refusal::Reused { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_opening_survives_founder_loss_and_repeats_its_first_receipt() -> anyhow::Result<()> {
+        let command = pending_message("opening", "first words")
+            .command
+            .ok_or_else(|| anyhow::anyhow!("missing fixture body"))?;
+        let rows = Inbox::founding_opening_rows("s1", 3, "user", &command, 10)?;
+        let backend = Arc::new(SimRecords::new());
+        let mut tx = Tx::default();
+        for row in rows {
+            let crate::convo::rows::Row::Inbox(cell) = row else {
+                anyhow::bail!("unexpected founding row");
+            };
+            tx.writes.push(Write::Put {
+                family: cell.family,
+                key: cell.key,
+                value: cell.value.ok_or_else(|| anyhow::anyhow!("unexpected tombstone"))?,
+            });
+        }
+        block(backend.commit(tx))?;
+        let next = Inbox::new(backend, Limits::default());
+        block(next.takeover_epoch("s1", 4, 20))?;
+        let pending = block(next.pending("s1", "opening"))?.ok_or_else(|| anyhow::anyhow!("opening prompt lost"))?;
+        assert!(pending.waiting_here());
+        assert_eq!(pending.command, Some(command));
+        assert_eq!(pending.seq(), Some(1));
+        assert_eq!(
+            block(next.accept("s1", "opening", &digest("first words", &[]), Some(4), 30))?,
+            Answer {
+                session: "s1".into(),
+                message: "opening".into(),
+                epoch: 3,
+                at: 10,
+                seq: 1,
+                repeat: true
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_takeover_retains_original_receipt_and_native_uncertainty() -> Result<(), Refusal> {
+        let i = inbox();
+        let hash = digest("original", &[]);
+        let first = block(i.accept_pending("s1", "m", &hash, Some(0), 10, &pending_message("m", "original")))?;
+        block(i.stage_pending("s1", "m", 0, super::super::admission::Stage::ProviderFlight))?;
+        block(i.takeover_epoch("s1", 2, 12))?;
+        block(i.takeover_epoch("s1", 2, 13))?;
+        let saved = block(i.pending("s1", "m"))?.ok_or_else(|| unavailable("s1", "missing flight"))?;
+        assert_eq!(saved.lease.epoch, 2);
+        assert_eq!(saved.lease.stage, super::super::admission::Stage::ProviderFlight);
+        assert!(!saved.waiting_here());
+        assert!(block(i.takeover_epoch("s1", 1, 14)).is_err());
+        assert_eq!(block(i.accept("s1", "m", &hash, Some(2), 15))?, Answer { repeat: true, ..first });
+        Ok(())
     }
 
     #[test]
@@ -1502,6 +1927,8 @@ mod tests {
         assert_eq!(block(i.open("s1", 0))?, 1);
         assert!(matches!(block(i.accept("s1", "m2", &d, None, 2)), Err(Refusal::Moved { .. })));
         assert_eq!(block(i.open("s1", 3))?, 3);
+        block(i.fence("s1", 1))?;
+        assert_eq!(block(i.epoch("s1"))?, Some((3, false)), "a delayed fence cannot close the new owner's inbox");
         assert!(block(i.accept("s1", "m1", &d, Some(3), 3))?.repeat, "what it took before still counts");
         assert!(!block(i.accept("s1", "m2", &d, Some(3), 3))?.repeat);
         Ok(())
@@ -1586,6 +2013,21 @@ mod tests {
         assert_ne!(digest("look", &["a.png"]), digest("look", &["b.png"]));
         assert_ne!(digest("look", &[]), digest("look", &[""]));
         Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_attachment_identity_survives_materialization_and_rejects_changed_bytes() {
+        use crate::harness::model::Attachment;
+        let file = |data: &str| Attachment { name: "image".into(), mime: "image/png".into(), data_base64: data.into(), file_id: None, path: None };
+        let digest_of = |a| send_digest("same words", &[a]);
+        let original = digest_of(file("YQ=="));
+        assert!(!same_digest(&original, &digest_of(file("Yg=="))));
+        let legacy = digest("same words", &["image"]);
+        assert!(same_digest(&legacy, &original));
+        assert!(!same_digest(&original, &legacy));
+        let source = Attachment { file_id: Some("upload-1".into()), ..file("") };
+        let prepared = Attachment { path: Some("/private/image".into()), data_base64: "YQ==".into(), ..source.clone() };
+        assert_eq!(digest_of(source), digest_of(prepared));
     }
 
     /// CP-T3.2: what an inbox keeps is bounded: past its last `keep` ids and `trim` more, the oldest
@@ -1808,7 +2250,6 @@ mod tests {
             format!("reads at most {} of a session's ids at once", count(READ)),
             format!("a stack keeps its newest {} asked under a key", crate::goals::ASKED_MAX),
             format!("sent on at most {} times", crate::harness::route::HOPS_MAX),
-            format!("(at most {} at once, none of them a replaceable status)", super::super::host::ROUTED_BURST_MAX),
         ];
         // As read, however its lines are wrapped.
         let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");

@@ -1412,9 +1412,9 @@ function startScan(cidrs: string[], total: number): ScanState {
 let joinToken = { token: `kj_${randomBytes(18).toString("base64url")}`, expires_at: now() + 86_400 };
 let autojoinPlanned = process.env.MOCK_AUTOJOIN === "0";
 
-function joinInfo(): JoinInfo & { quic: string; manual: string } {
+function joinInfo(invite?: typeof joinToken): JoinInfo & { quic: string; manual: string } {
   if (joinToken.expires_at <= now()) joinToken = { token: `kj_${randomBytes(18).toString("base64url")}`, expires_at: now() + 86_400 };
-  const { token, expires_at } = joinToken;
+  const { token, expires_at } = invite ?? joinToken;
   const install = {
     linux: `curl -fsSL ${SERVER_URL}/install.sh | sh -s -- --token ${token} --labels baremetal,linux`,
     macos: `curl -fsSL ${SERVER_URL}/install.sh | sh -s -- --token ${token} --labels baremetal,macos`,
@@ -2050,6 +2050,10 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/agents/join" && m === "GET") {
       planAutojoin();
       return json(res, 200, joinInfo());
+    }
+
+    if (p === "/api/agents/session-node-invite" && m === "POST") {
+      return json(res, 200, joinInfo({ token: `session-invite.mock.${randomBytes(18).toString("base64url")}`, expires_at: now() + 3600 }));
     }
 
     // ---- joining and discovery ----

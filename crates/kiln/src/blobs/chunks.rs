@@ -28,17 +28,13 @@ pub fn path(root: &Path, digest: &str) -> PathBuf {
     root.join("chunks").join(digest.get(0..2).unwrap_or("00")).join(digest.get(2..4).unwrap_or("00")).join(digest)
 }
 
-/// Flushes a folder, so a name made in it lasts (Unix; Windows has no flush of a folder).
+/// Flush a published name to its directory. On Windows the device layer opens the
+/// directory with backup semantics and write access before calling FlushFileBuffers.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(dir)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
+    hyper_block::file::sync_dir(dir).map_err(|error| match error {
+        hyper_block::DiskError::Io {source, ..} => source,
+        other => io::Error::other(other),
+    })
 }
 
 /// Keeps a chunk unless it's there; the bytes newly written.
@@ -176,6 +172,14 @@ mod tests {
 
     fn noise(n: usize, seed: u64) -> Vec<u8> {
         kiln_seams::blobs::noise(n, seed)
+    }
+
+    #[test]
+    fn cp_t3_2_a_namespace_flush_reports_an_unavailable_directory() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        sync_dir(dir.path())?;
+        assert_eq!(sync_dir(&dir.path().join("missing")).err().map(|e| e.kind()), Some(io::ErrorKind::NotFound));
+        Ok(())
     }
 
     /// docs/ci.md W08-AC05: a changed object stores only its new chunks.

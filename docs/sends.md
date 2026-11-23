@@ -245,18 +245,16 @@ own inbox, never by whichever node it reached first (Ada, 2026-11-20). It carrie
 itself), how many times it was sent on, and, for an explicitly replaceable status (news), its status
 key.
 
-- **The server routes, and keeps nothing.** A person's message (the conversation's composer, Mission
-  Control's message box, the API's command) and an agent's (`agents.send`) to a session on a runner
-  that names `mail-route` (docs/wire.md, "Named features") go there at once, the route beside the
-  command in `HarnessSend`'s JSON, and the server waits for the inbox's answer as for any message
-  (`Answers`, below). Nothing of it is written to the server's store: no ledger row, no pump, no
-  round trip for room. Its sender hears `accepted` as soon as the session's inbox has it synced.
-- **Sent on by whoever isn't its holder.** A runner that gets one for a session it doesn't hold
-  (it moved on, or was never there) sends it on (`AgentMsg::HarnessForward`), one hop further, and the
-  server sends it where the session is now; whoever takes it answers the sender, who waits for that
-  one answer. A message is sent on at most 4 times after it was first routed: past that it's refused
-  `no_session`. A runner that refuses one `moved` or `no_session` anyway (a session on its way out)
-  has it sent once more, by the server, where the session is now.
+- **The selected runner takes custody.** The ingress node forwards a person's, agent's or Kiln's
+  message to the destination over authenticated hyper-quic. A connected server can relay a
+  targeted request to a runner that advertises `mail-route-receipt`. Both paths return the
+  destination inbox's receipt after the session group commits its write. Kiln looks up the
+  committed owner first, then the server's recorded location. A target hint can identify an
+  otherwise unknown session once its holder confirms custody. Retrying the same message ID
+  after an ownership change returns the original receipt.
+  The forwarding node only retains enough information to match the outstanding reply.
+  On the older server relay, an unaddressed message whose session moved may be sent on
+  at most 4 times. A return to the same runner or an exhausted hop count returns `moved`.
 - **Admitted where it waits.** The session's inbox takes a routed message in one synced commit,
   original and all, and its admission (W20's learned depth, held by the session itself) decides at
   once: a person's goes to the session (held to no depth, as ever); an agent's or kiln's goes in its
@@ -268,19 +266,18 @@ key.
   theirs still waiting; one handed on already stays as it went. A routed message's journal row goes
   once its message ends (consumed, cancelled), since no server holds its custody to acknowledge it.
 - **A burst in one commit.** Messages routed to a session that wait one behind another in its lane
-  (at most 64 at once, none of them a replaceable status) are taken together: each is decided in the
-  order it came, their takes go to the conversation store's writer at once, which commits them in one
-  transaction, one sync, and each is then handed on and answered in the order it came. Takes for
-  other sessions that come meanwhile share that commit too.
+  can share a transaction and a disk sync. The lane checks for urgent controls after planning each
+  message. It ends the batch when it reaches the shard’s measured time budget, exhausts physical
+  room for the encoded transactions, or reaches the end of the backlog it saw at the start.
+  A replaceable status has its own turn. Each message is handed on and answered in arrival order.
 - **Carried with its session.** What waits in a session's journal moves with it: a move's, a
   blue/green upgrade's and a hand-over's journal transfer (W20's) carries every row, and the machine it
   goes to admits what waits there. A machine from before routing can't read such a row, so the
   transfer fails and the session stays where it is.
-- **Server custody where routing can't go yet.** A runner from before `mail-route`, or one that's away,
-  gets W20's path: the server takes the message into its custody and hands it over as the session's
-  admission allows once the runner is back. So do kiln's own messages (the goal driver's words, a
-  plan's steps, a program's notices, an agent's news of its children), another agent's words kiln
-  relays, and every message to a session on the server's own host ("What's open", below).
+- **Legacy custody.** An unmanaged session with no remote destination can still use the
+  server’s publication ledger. The receipt for that path records server custody. An addressed
+  send to an unreachable runner returns an unavailable or unknown result. The sender can
+  retry at the destination with the same message ID.
 
 ## Answers
 
@@ -325,6 +322,7 @@ for its answer, as it does for any that doesn't come (`kiln_sends_unanswered_tot
 | `kiln_sends_repeated_total` | messages an inbox had taken already: answered, never delivered again |
 | `kiln_sends_refused_total{reason}` | messages an inbox refused, by reason (the table above) |
 | `kiln_sends_unanswered_total` | messages the server stopped waiting for an answer to |
+| `kiln_sends_stale_target_total` | sends whose target hint disagreed with the session’s committed owner |
 | `kiln_sends_unchecked_total` | messages a host without inboxes handed on (`KILN_INBOX` off, or its records couldn't be opened): not checked for repeats |
 | `kiln_sends_take_seconds` | how long an inbox took to take a message, on the host that took it (its buckets close near the drive's sync floor: 2, 3, 4, 5, 7.5 ms) |
 | `kiln_records_sync_seconds` | for each transaction the host's records store committed (on a runner, each message its inboxes took), how long it waited for its write's sync: the part of a take that's on disk, in the take's buckets |
@@ -441,12 +439,8 @@ host's.
 
 ## What's open
 
-- **Kiln's own messages and the server's own sessions.** What keeps the place of kiln's own messages
-  (a goal's word, a plan run's key, a program's notice, the news `told` edits) reads W20's custody
-  receipts, which a routed message doesn't have: routed, they'd wait for receipts that never come.
-  They stay in the server's custody, as do relayed words and every message to a session on the
-  server's own host (whose goals, plans and programs are those same readers), until those readers
-  take the routed answer and the session's own progress instead.
+- **Remote compatibility.** A runner that cannot confirm a destination receipt returns unavailable.
+  A retry to that destination uses the original message ID and the same sender identity.
 - **Routing at the front door.** A runner's front door still pipes a browser's socket to the server
   (docs/p2p.md, P2), so a message sent through it is routed by the server; nodes routing messages
   themselves, over links of their own, are P5's.

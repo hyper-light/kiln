@@ -41,6 +41,8 @@ const FIND_EVERY: Duration = Duration::from_secs(15);
 pub struct Source {
     /// kiln's id of the session.
     pub session: String,
+    /// The owning provider epoch at which this source was observed.
+    pub epoch: u64,
     /// The harness it runs in now.
     pub kind: &'static Kind,
     /// The environment it runs with (where the harness keeps its files).
@@ -147,6 +149,7 @@ fn nanos(d: Duration) -> u64 {
 
 /// A session's files, as last found.
 struct Found {
+    epoch: u64,
     harness_session: String,
     files: Vec<(String, PathBuf)>,
     at: Instant,
@@ -213,12 +216,15 @@ impl Following {
             // Found again when the harness's session changed, and now and then while there may be
             // more to find: a transcript not there yet, a Codex thread's next rollout.
             let stale = self.found.get(&src.session).is_none_or(|f| {
-                f.harness_session != src.harness_session
+                f.epoch != src.epoch || f.harness_session != src.harness_session
                     || (f.at.elapsed() >= FIND_EVERY && (f.files.is_empty() || src.kind.protocol == Protocol::CodexAppServer || f.files.iter().any(|(_, p)| !p.is_file())))
             });
             if stale {
+                if self.found.get(&src.session).is_some_and(|f| f.epoch != src.epoch) {
+                    self.files.retain(|(session, _), _| session != &src.session);
+                }
                 let files = files_of(src);
-                self.found.insert(src.session.clone(), Found { harness_session: src.harness_session.clone(), files, at: Instant::now() });
+                self.found.insert(src.session.clone(), Found { epoch: src.epoch, harness_session: src.harness_session.clone(), files, at: Instant::now() });
             }
             let Some(found) = self.found.get(&src.session) else { continue };
             if found.files.is_empty() || src.kind.protocol == Protocol::CodexAppServer || found.files.iter().any(|(_, p)| !p.is_file()) {
@@ -227,7 +233,7 @@ impl Following {
             for (source, path) in found.files.clone() {
                 let key = (src.session.clone(), source.clone());
                 if due(self.files.get(&key), src.active_ms, now) {
-                    self.follow(&src.session, &source, &path);
+                    self.follow(&src.session, &source, &path,src.epoch);
                 }
                 match self.files.get(&key) {
                     Some(f) => soonest(f.next),
@@ -240,7 +246,7 @@ impl Following {
         for s in gone {
             if let Some(f) = self.found.remove(&s) {
                 for (source, path) in f.files {
-                    self.follow(&s, &source, &path);
+                    self.follow(&s, &source, &path,f.epoch);
                 }
             }
             self.files.retain(|(sess, _), _| sess != &s);
@@ -266,7 +272,7 @@ impl Following {
     }
 
     /// What `source` of `session` has that the store hasn't, into the store.
-    fn follow(&mut self, session: &str, source: &str, path: &Path) {
+    fn follow(&mut self, session: &str, source: &str, path: &Path, epoch: u64) {
         let key = (session.to_owned(), source.to_owned());
         if !self.files.contains_key(&key) {
             let Some(f) = self.start(session, source, path) else { return };
@@ -278,7 +284,8 @@ impl Following {
             f.path = path.to_owned();
         }
         let mut rows = Vec::new();
-        let (n0, end0) = (f.n, f.end);
+        // read_new consumes the first-look check. Re-read the durable mark on a failed
+        // transaction so a replaced file is recognized again, even if its length grew.
         let began = Instant::now();
         match read_new(f) {
             Ok(Read { replaced, lines }) => {
@@ -291,15 +298,16 @@ impl Following {
             }
             Err(e) => {
                 tracing::debug!(%session, %source, error = %e, "conversation store: the harness's record couldn't be read");
-                f.looked_at(Instant::now(), crate::util::now_ms(), 0, began.elapsed());
+                self.files.remove(&key);
                 return;
             }
         }
         let lines = rows.iter().filter(|r| matches!(r, Row::Record(_))).count();
         // Not handed over (the store is stuck): read again next time.
-        if !self.store.put_wait(rows) {
-            f.n = n0;
-            f.end = end0;
+        if let Err(err) = self.store.record_authored(session,epoch, rows) {
+            tracing::warn!(%session, %source, error = %err, "native transcript could not be journaled");
+            self.files.remove(&key);
+            return;
         }
         f.looked_at(Instant::now(), crate::util::now_ms(), u64::try_from(lines).unwrap_or(u64::MAX), began.elapsed());
     }
@@ -396,11 +404,11 @@ mod tests {
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, "{\"a\":1}\n\n{\"b\":2}\r\n{\"c\":")?;
         let mut r = Following::new(store.clone());
-        r.follow("s1", "t", &path);
+        r.follow("s1", "t", &path,0);
         // The blank line has no number; the line not ended yet isn't read.
         assert_eq!(rows_of(&store, "s1", "t")?, vec![(0, "{\"a\":1}".to_owned()), (1, "{\"b\":2}".to_owned())]);
         std::fs::OpenOptions::new().append(true).open(&path)?.write_all(b"3}\n{\"d\":4}\n")?;
-        r.follow("s1", "t", &path);
+        r.follow("s1", "t", &path,0);
         assert_eq!(rows_of(&store, "s1", "t")?.into_iter().map(|(n, _)| n).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
         assert_eq!(rows_of(&store, "s1", "t")?.get(2).map(|(_, l)| l.clone()), Some("{\"c\":3}".to_owned()));
         Ok(())
@@ -411,18 +419,18 @@ mod tests {
         let (dir, store) = super::super::store::scratch()?;
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, "one\ntwo\n")?;
-        Following::new(store.clone()).follow("s1", "t", &path);
+        Following::new(store.clone()).follow("s1", "t", &path,0);
         store.sync()?;
         let top = store.top()?;
         // Restarted while its store can't answer (busy, or stopped): the file isn't taken to be
         // new to it, read from its top and sent to the store again.
         let mut stuck = Following::new(super::super::store::stopped());
-        stuck.follow("s1", "t", &path);
+        stuck.follow("s1", "t", &path,0);
         assert!(stuck.files.is_empty());
         // Asked again once it answers: it goes on where the store's copy ends.
         std::fs::OpenOptions::new().append(true).open(&path)?.write_all(b"three\n")?;
         let mut again = Following::new(store.clone());
-        again.follow("s1", "t", &path);
+        again.follow("s1", "t", &path,0);
         assert_eq!(rows_of(&store, "s1", "t")?, vec![(0, "one".to_owned()), (1, "two".to_owned()), (2, "three".to_owned())]);
         assert_eq!(store.top()?, top + 1);
         Ok(())
@@ -433,17 +441,17 @@ mod tests {
         let (dir, store) = super::super::store::scratch()?;
         let path = dir.path().join("t.jsonl");
         std::fs::write(&path, "one\ntwo\n")?;
-        Following::new(store.clone()).follow("s1", "t", &path);
+        Following::new(store.clone()).follow("s1", "t", &path,0);
         store.sync()?;
         // Restarted: a new recorder, the file grew meanwhile.
         std::fs::OpenOptions::new().append(true).open(&path)?.write_all(b"three\n")?;
         let mut again = Following::new(store.clone());
-        again.follow("s1", "t", &path);
+        again.follow("s1", "t", &path,0);
         assert_eq!(rows_of(&store, "s1", "t")?, vec![(0, "one".to_owned()), (1, "two".to_owned()), (2, "three".to_owned())]);
         // Replaced by another file of the same length or longer: not the same lines, so it starts over.
         std::fs::write(&path, "uno\ndos\ntres\ncuatro\n")?;
         let mut third = Following::new(store.clone());
-        third.follow("s1", "t", &path);
+        third.follow("s1", "t", &path,0);
         assert_eq!(rows_of(&store, "s1", "t")?.into_iter().map(|(_, l)| l).collect::<Vec<_>>(), vec!["uno", "dos", "tres", "cuatro"]);
         Ok(())
     }
@@ -502,8 +510,8 @@ mod tests {
         let long = "z".repeat(usize::try_from(READ_MAX).unwrap_or(0) + 10);
         std::fs::write(&path, format!("{long}\nshort\n"))?;
         let mut r = Following::new(store.clone());
-        r.follow("s1", "t", &path);
-        r.follow("s1", "t", &path);
+        r.follow("s1", "t", &path,0);
+        r.follow("s1", "t", &path,0);
         let got = rows_of(&store, "s1", "t")?;
         assert_eq!(got.iter().map(|(_, l)| l.len()).collect::<Vec<_>>(), vec![long.len(), 5]);
         Ok(())

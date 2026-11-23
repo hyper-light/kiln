@@ -598,6 +598,8 @@ pub const SEND_BUCKETS: &[f64] = &[0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.003,
 /// Sends (CP-T3.2; docs/sends.md): what sessions' inboxes said of the messages sent them, as the
 /// server heard it, and how long taking one took where it was taken.
 pub struct SendsMetrics {
+    /// UI message destinations superseded by a committed custody decision (CP-T3.2).
+    pub stale_target: Counter,
     /// Messages an inbox took, the first time.
     pub accepted: Counter,
     /// Messages an inbox had taken already: answered with the first time's answer, and never
@@ -630,6 +632,7 @@ impl SendsMetrics {
 pub fn sends() -> &'static SendsMetrics {
     static M: OnceLock<SendsMetrics> = OnceLock::new();
     M.get_or_init(|| SendsMetrics {
+        stale_target: Counter::default(),
         accepted: Counter::default(),
         repeated: Counter::default(),
         refused: CounterVec::new(&["reason"]),
@@ -686,6 +689,7 @@ fn render_sends(o: &mut String) {
         ("kiln_sends_accepted_total", "Messages a session's inbox took, the first time.", m.accepted.get()),
         ("kiln_sends_repeated_total", "Messages a session's inbox had taken already: answered, never delivered again.", m.repeated.get()),
         ("kiln_sends_unanswered_total", "Messages the server stopped waiting for an inbox's answer to.", m.unanswered.get()),
+        ("kiln_sends_stale_target_total", "Message target hints superseded by committed custody.", m.stale_target.get()),
         ("kiln_sends_unchecked_total", "Messages a host without inboxes handed on, not checked for repeats.", m.unchecked.get()),
     ] {
         help(o, name, "counter", h);
@@ -1109,6 +1113,59 @@ pub fn events() -> &'static EventsMetrics {
         delivery_wait: HistogramVec::new(&["kind"], EVENT_DELIVERY_BUCKETS),
         pending: GaugeVec::new(&["kind"]),
     })
+}
+
+/// Per-session conversation Raft WAL replication metrics (`crate::convo::raft`).
+pub struct ConvoRaftMetrics {
+    pub groups: Gauge,
+    pub leading: Gauge,
+    pub dropped_proposals: Counter,
+    pub corrupt_entries: Counter,
+    pub reopened_replicas: Counter,
+    pub retired_groups: Counter,
+    pub stalled_events: Counter,
+    pub snapshots_built: Counter,
+    pub owner_fence_failures: Counter,
+}
+
+pub fn convo_raft() -> &'static ConvoRaftMetrics {
+    static M: OnceLock<ConvoRaftMetrics> = OnceLock::new();
+    M.get_or_init(|| ConvoRaftMetrics {
+        groups: Gauge::default(),
+        leading: Gauge::default(),
+        dropped_proposals: Counter::default(),
+        corrupt_entries: Counter::default(),
+        reopened_replicas: Counter::default(),
+        retired_groups: Counter::default(),
+        stalled_events: Counter::default(),
+        snapshots_built: Counter::default(),
+        owner_fence_failures: Counter::default(),
+    })
+}
+
+fn render_convo_raft(o: &mut String) {
+    let m = convo_raft();
+    let help = |o: &mut String, name: &str, kind: &str, h: &str| {
+        let _ = writeln!(o, "# HELP {name} {h}\n# TYPE {name} {kind}");
+    };
+    help(o, "kiln_convo_raft_owner_fence_failures_total","counter","Failed durable former-owner fencing attempts on this node.");
+    let _ = writeln!(o,"kiln_convo_raft_owner_fence_failures_total {}",m.owner_fence_failures.get());
+    help(o, "kiln_convo_raft_groups", "gauge", "Active per-session conversation Raft groups open on this node.");
+    let _ = writeln!(o, "kiln_convo_raft_groups {}", m.groups.get());
+    help(o, "kiln_convo_raft_leading", "gauge", "Active per-session conversation Raft groups led by this node.");
+    let _ = writeln!(o, "kiln_convo_raft_leading {}", m.leading.get());
+    help(o, "kiln_convo_raft_dropped_proposals_total", "counter", "Conversation Raft proposals dropped due to non-voter refusal, encoding failure, or unflushable shutdown.");
+    let _ = writeln!(o, "kiln_convo_raft_dropped_proposals_total {}", m.dropped_proposals.get());
+    help(o, "kiln_convo_raft_corrupt_entries_total", "counter", "Committed conversation Raft WAL entries that failed to decode or reassemble.");
+    let _ = writeln!(o, "kiln_convo_raft_corrupt_entries_total {}", m.corrupt_entries.get());
+    help(o, "kiln_convo_raft_reopened_replicas_total", "counter", "Fenced conversation Raft replicas reopened from durable state.");
+    let _ = writeln!(o, "kiln_convo_raft_reopened_replicas_total {}", m.reopened_replicas.get());
+    help(o, "kiln_convo_raft_retired_groups_total", "counter", "Closed conversation Raft groups retired and removed from WAL once replicated.");
+    let _ = writeln!(o, "kiln_convo_raft_retired_groups_total {}", m.retired_groups.get());
+    help(o, "kiln_convo_raft_stalled_events_total", "counter", "Conversation Raft WAL stall events triggering compaction.");
+    let _ = writeln!(o, "kiln_convo_raft_stalled_events_total {}", m.stalled_events.get());
+    help(o, "kiln_convo_raft_snapshots_built_total", "counter", "Full-history conversation Raft snapshots built off the owner thread.");
+    let _ = writeln!(o, "kiln_convo_raft_snapshots_built_total {}", m.snapshots_built.get());
 }
 
 /// The `kiln_events_*` families, in the exposition.
@@ -1769,6 +1826,7 @@ pub fn render() -> String {
     render_agents(agents(), &mut o);
     render_blobs(&mut o);
     render_bus(&mut o);
+    render_convo_raft(&mut o);
     render_events(&mut o);
     render_net(&mut o);
     render_wire(&mut o);

@@ -48,7 +48,7 @@ fn config() -> RuntimeConfig {
 /// A batched socket bound to the unspecified address is sent a datagram at `reached` and answers it,
 /// from the datagram's local address when `from_it`, else as the kernel chooses. Returns the local address
 /// the arrival told and the address the answer came from.
-fn answer(reached: Ipv4Addr, from_it: bool) -> (Option<IpAddr>, SocketAddr) {
+fn answer(reached: Ipv4Addr, from_it: bool, connect: bool) -> (Option<IpAddr>, SocketAddr) {
     let mut rt = LocalRuntime::new(&config()).unwrap();
     rt.block_on(async move {
         let mut server = Batched::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), Io { batch: 4 }, false)?;
@@ -64,10 +64,12 @@ fn answer(reached: Ipv4Addr, from_it: bool) -> (Option<IpAddr>, SocketAddr) {
             }
         }
         let arrival = arrived.unwrap();
+        if connect { server.connect(arrival.from)?; }
         let source = if from_it { arrival.to } else { None };
         while server.send_segments_from(arrival.from, source, b"pong", 4) == 0 {
             server.writable().await?;
         }
+        assert_eq!(server.stats().send_errors, 0);
         let mut buf = [0u8; 16];
         let (length, from) = client.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..length], b"pong");
@@ -81,7 +83,7 @@ fn answer(reached: Ipv4Addr, from_it: bool) -> (Option<IpAddr>, SocketAddr) {
 /// tells 127.0.0.1, and the answer (sent with the address as its source) arrives from it.
 #[test]
 fn an_arrival_tells_its_local_address_and_an_answer_from_it_arrives() {
-    let (to, from) = answer(Ipv4Addr::LOCALHOST, true);
+    let (to, from) = answer(Ipv4Addr::LOCALHOST, true, false);
     assert_eq!(to, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     assert_eq!(from.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
 }
@@ -93,9 +95,40 @@ fn an_arrival_tells_its_local_address_and_an_answer_from_it_arrives() {
 #[test]
 fn reached_at_a_second_address_it_answers_from_that_address() {
     let second = Ipv4Addr::new(127, 0, 0, 2);
-    let (to, kernels) = answer(second, false);
+    let (to, kernels) = answer(second, false, false);
     assert_eq!(to, Some(IpAddr::V4(second)), "the arrival tells the address it reached");
     assert_eq!(kernels.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST), "the kernel answers from its route's source");
-    let (_, from) = answer(second, true);
+    let (_, from) = answer(second, true, false);
     assert_eq!(from.ip(), IpAddr::V4(second), "answered from the address it was reached at");
+}
+
+/// CP-T3.2. The session uplink promotes a handshaking socket to a connected peer socket.
+#[test]
+fn a_connected_peer_socket_can_answer_from_the_reached_address() {
+    let (to, from) = answer(Ipv4Addr::LOCALHOST, true, true);
+    assert_eq!(to, Some(from.ip()));
+}
+
+/// CP-T3.2. The largest discovered datagram must leave room for the source address itself:
+/// a permanently blocked datagram would hold all subsequent QUIC control frames.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_path_ceiling_fits_the_source_address_on_a_connected_socket() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let remote = client.local_addr().unwrap();
+        let mut batched = Batched::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), Io { batch: 1 }, false)?;
+        batched.connect(remote)?;
+        let room = usize::from(batched.socket().path_payload_to(remote)?.unwrap());
+        let local = batched.socket().local_addr()?.ip();
+        let data = vec![7; room];
+        assert_eq!(batched.send_segments_from(remote, Some(local), &data, room), 1);
+        assert_eq!(batched.stats().send_errors, 0);
+        let mut buf = vec![0; room];
+        assert_eq!(client.recv(&mut buf).unwrap(), room);
+        assert_eq!(buf, data);
+        Ok::<_, RtError>(())
+    }).unwrap().unwrap();
 }

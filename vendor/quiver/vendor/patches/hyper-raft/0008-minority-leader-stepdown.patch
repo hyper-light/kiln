@@ -1,0 +1,47 @@
+Subject: minority-leader-stepdown
+Why: AD-1 lets a session leader relinquish its current term when the shared detector reports loss of its voting quorum.
+
+diff --git a/crates/hyper-durable/src/replica.rs b/crates/hyper-durable/src/replica.rs
+index f8005ed2c4010b53e0b0bb37d4014b6209a80667..1abcc19e7ed2c01fe2f0789a377f445dc37af306 100644
+--- a/crates/hyper-durable/src/replica.rs
++++ b/crates/hyper-durable/src/replica.rs
+@@ -932,6 +932,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
+         })
+     }
+ 
++    /// Relinquish a service's lead when its detector says it lacks a quorum.
++    /// A suspicion on a single link still leaves a three-voter leader a majority.
++    pub fn resign_without_quorum(&mut self) -> Result<(), ReplicaError> {
++        self.guarded(|r| {
++            let resigned = r.node.resign_without_quorum();
++            r.heard(resigned)
++        })
++    }
++
+     /// The owner's detectors trust `member`'s node again.
+     pub fn trust(&mut self, member: u64) -> Result<(), ReplicaError> {
+         self.guarded(|r| {
+diff --git a/crates/hyper-raft/src/node.rs b/crates/hyper-raft/src/node.rs
+index 7259d9902a032ff3120653d5cd056afcd9da6459..33fb242a0e906c03a49fbc8edc1fc277a17636d0 100644
+--- a/crates/hyper-raft/src/node.rs
++++ b/crates/hyper-raft/src/node.rs
+@@ -643,6 +643,19 @@ impl<S: Storage> RawNode<S> {
+     pub fn suspect(&mut self, member: NodeId) -> Result<()> {
+         self.operate(|raft| raft.suspect(member))
+     }
++    /// Give up a service's leadership when its detector no longer trusts a voting
++    /// quorum. Joint configurations require both majorities. No vote or term changes.
++    pub fn resign_without_quorum(&mut self) -> Result<()> {
++        self.operate(|raft| {
++            if raft.state() == crate::StateRole::Leader
++                && raft.config().check_quorum
++                && raft.campaign_state().is_some_and(|s| !s.trusted_quorum)
++            {
++                raft.become_follower(raft.term(), 0)?;
++            }
++            Ok(())
++        })
++    }
+     /// The owner's detectors trust `member`'s node again.
+     pub fn trust(&mut self, member: NodeId) -> Result<()> {
+         self.operate(|raft| raft.trust(member))

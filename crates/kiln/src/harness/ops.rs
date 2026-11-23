@@ -130,9 +130,62 @@ async fn get(cx: Cx, v: Value) -> Out {
     Ok(json!({"agent": wait::brief(&info), "info": info, "state": state, "live": live, "definition": definition}))
 }
 
-async fn start(cx: Cx, v: Value) -> Out {
-    let ask: Ask = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
-    start_ask(cx, ask).await
+async fn start(cx: Cx, mut v: Value) -> Out {
+    let key = Some(key_of(&v)?.unwrap_or_else(||crate::api::default_start_key(&v)));
+    if let Some(o) = v.as_object_mut() {
+        o.remove("key");
+        if let Some(key) = &key {
+            crate::api::start_ids(o, &start_key(&cx.caller, key),cx.hub.cfg.agents.max_children).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        }
+    }
+    let request = key
+        .as_deref()
+        .map(|key| crate::api::start_digest(&key_scope(&cx.caller), key, true, &v))
+        .transpose()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut ask: Ask = serde_json::from_value(v).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e}")))?;
+    ask.start_request = request;
+    ask.start_key = key.as_ref().map(|key| start_key(&cx.caller, key));
+    let hub = cx.hub.clone();
+    let mut result = match start_ask(cx, ask).await {
+        Ok(result) => result,
+        Err((code, why)) => {
+            let Some(mut slots) = serde_json::from_str::<Value>(&why).ok().filter(|v| v.get("slots").is_some_and(Value::is_array)) else {
+                return Err((code, why));
+            };
+            let confirmed = slots
+                .get("slots")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|s| matches!(s.get("outcome").and_then(Value::as_str), Some("forwarded" | "started")))
+                .collect::<Vec<_>>();
+            let agents = json!(confirmed);
+            if let Some(o) = slots.as_object_mut() {
+                o.insert("agents".into(), agents);
+                o.insert("status".into(), json!(code.as_u16()));
+            }
+            slots
+        }
+    };
+    if let Some(object) = result.as_object_mut() {
+        if !object.contains_key("slots")
+            && object.get("queued").is_none()
+            && let Some(agents) = object.get("agents").and_then(Value::as_array)
+        {
+            let slots = agents
+                .iter()
+                .map(|agent| {
+                    let machine = agent.get("machine").and_then(Value::as_str).unwrap_or("local");
+                    let local = crate::api::started_here(&hub, machine);
+                    json!({"id":agent.get("id"),"target":machine,"outcome":if local{"started"}else{"forwarded"},"why":"the selected node confirmed the start"})
+                })
+                .collect::<Vec<_>>();
+            object.insert("slots".into(), json!(slots));
+        }
+        object.insert("key".into(), json!(key));
+    }
+    Ok(result)
 }
 
 /// `agents.start`'s start of `ask`, which kiln may have made with what only it says (the definition an
@@ -269,12 +322,7 @@ async fn send(cx: Cx, v: Value) -> Out {
     let body = words.clone();
     // CP-T3.2: agent-to-agent messages enter the turn under way instead of waiting behind it.
     let default_mode = if cx.caller.agent.is_some() { "steer" } else { "queue" };
-    let mode: SendMode = match v.get("mode").and_then(Value::as_str).unwrap_or(default_mode) {
-        "queue" => SendMode::Queue,
-        "steer" => SendMode::Steer,
-        "now" => SendMode::Now,
-        other => return Err((StatusCode::BAD_REQUEST, format!("`mode` is queue, steer or now, not {other:?}"))),
-    };
+    let mode = send_mode(&v, default_mode)?;
     let info = known(&cx, &id)?;
     let id = info.id.clone();
     // A message may enter a fellow agent's turn, with its sender named, but cannot stop the turn.
@@ -311,7 +359,7 @@ async fn send(cx: Cx, v: Value) -> Out {
     // its inbox there. Else into the server's custody, as before routing. Fault injection belongs after custody, at
     // wire delivery: the ledger, or the route, carries these exact original words and their original proof, even when
     // a test corrupts the transmission.
-    let sent = cx.hub.harness.command_sent(&cx.hub, &id, command, provenance, owner, sender, status).await;
+    let sent = cx.hub.harness.command_sent(&cx.hub, &id, v.get("target").and_then(Value::as_str), command, provenance, owner, sender, status).await;
     let answer = match sent {
         super::registry::Sent::Published(receipt) => publication_answer(&receipt),
         super::registry::Sent::PublicationRefused(error) => Err(mail_failed(error)),
@@ -339,7 +387,16 @@ fn publication_answer(receipt: &super::mail::Receipt) -> Out {
     serde_json::to_value(Published { sent: true, retained: true, message: &receipt.id, publication: receipt }).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-fn status_of(v: &Value) -> Result<Option<super::mail::StatusKey>, Fail> {
+pub(crate) fn send_mode(v: &Value, default_mode: &str) -> Result<SendMode, Fail> {
+    Ok(match v.get("mode").and_then(Value::as_str).unwrap_or(default_mode) {
+        "queue" => SendMode::Queue,
+        "steer" => SendMode::Steer,
+        "now" => SendMode::Now,
+        other => return Err((StatusCode::BAD_REQUEST, format!("`mode` is queue, steer or now, not {other:?}"))),
+    })
+}
+
+pub(crate) fn status_of(v: &Value) -> Result<Option<super::mail::StatusKey>, Fail> {
     let Some(status) = v.get("status").filter(|v| !v.is_null()) else { return Ok(None) };
     let status: super::mail::StatusKey = serde_json::from_value(status.clone()).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid explicit status scope: {e}")))?;
     if status.key.is_empty() || status.key.chars().any(char::is_control) || status.task.as_deref().is_some_and(|s| s.is_empty() || s.chars().any(char::is_control)) {
@@ -420,6 +477,20 @@ pub fn keyed_id(cx: &Cx, what: &str, agent: &str, key: &str) -> String {
 /// Whose an idempotency key is (CP-T3.2): an agent's by its id, as its name says the machine it's
 /// on, which changes as it moves (a retry after a move is the same request); a person's by theirs;
 /// else the caller's name.
+pub(crate) fn start_key(caller: &crate::authz::Caller, key: &str) -> String {
+    let scope = key_scope(caller);
+    if scope == "admin" { key.to_owned() } else { format!("\0{scope}\0{key}") }
+}
+
+/// The authenticated principal charged for a placed session. A delegated node has
+/// no person's opener; its server-supplied scoped key identifies its own pool.
+pub(crate) fn start_budget_owner(spec:&super::session::Spec)->&str {
+    spec.parent.as_deref().or(spec.opener.as_deref()).or_else(||{
+        let scoped=spec.start_key.as_deref()?.strip_prefix('\0')?;
+        scoped.split_once('\0').map(|(principal,_)|principal)
+    }).unwrap_or("admin")
+}
+
 pub fn key_scope(caller: &crate::authz::Caller) -> String {
     match (&caller.agent, &caller.user) {
         (Some(agent), _) => format!("agent:{agent}"),
@@ -969,13 +1040,23 @@ async fn recover_machine(cx: Cx, v: Value) -> Out {
 async fn commanded(cx: &Cx, v: &Value, c: Command, done: &str) -> Out {
     let info = known(cx, &agent_of(v)?)?;
     may_steer(cx, &info.id).await?;
-    given(cx, &info, c, done).await
+    let key = key_of(v)?;
+    let target = v.get("target").filter(|t| !t.is_null()).map(|t| t.as_str().ok_or_else(|| (StatusCode::BAD_REQUEST, "the target must be text".into()))).transpose()?;
+    let sent = if key.is_some() || target.is_some() {
+        let key = key.unwrap_or_else(crate::util::new_id);
+        cx.hub.harness.command_under_key(&cx.hub,&info.id,&key_scope(&cx.caller),&key,target,c).await
+    } else { cx.hub.harness.command(&cx.hub, &info.id, c).await };
+    given_answer(&info,done,sent)
 }
 
 /// Command `c` given to agent `info`, which the caller may steer: `done` true once its machine has it, else why not.
 async fn given(cx: &Cx, info: &Info, c: Command, done: &str) -> Out {
+    given_answer(info,done,cx.hub.harness.command(&cx.hub,&info.id,c).await)
+}
+
+fn given_answer(info: &Info, done: &str, sent: Sent) -> Out {
     let id = &info.id;
-    match cx.hub.harness.command(&cx.hub, id, c).await {
+    match sent {
         Sent::Published(receipt) => Ok(json!({"publication": receipt})),
         Sent::PublicationRefused(error) => Err(mail_failed(error)),
         Sent::Ok | Sent::Accepted(_) | Sent::Taken | Sent::Parked => Ok(json!({done: true})),
@@ -1565,6 +1646,8 @@ pub mod input {
     #[derive(Debug, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields)]
     pub struct AgentsStart {
+        /// Start the same batch under the same assigned session ids after a lost response.
+        pub key: Option<String>,
         /// The harness: claude, codex, devin, gemini, opencode, goose, amp, antigravity, cursor or pi.
         pub kind: String,
         /// What it needs: linux/amd64, macos, arm64, +gpu, cpus>=16, mem>=32g (kiln's load
@@ -1665,6 +1748,8 @@ pub mod input {
     pub struct AgentsSend {
         /// The agent's id (as agents.list gives it).
         pub agent: String,
+        /// Execute on this runner, at its committed session epoch.
+        pub target: Option<String>,
         pub text: String,
         /// Steer into the turn under way by default for agents; queue after it by default for people.
         pub mode: Option<AgentsSendMode>,
@@ -1742,6 +1827,10 @@ pub mod input {
     pub struct AgentsInterrupt {
         /// The agent's id (as agents.list gives it).
         pub agent: String,
+        /// Execute on this runner, at its committed session epoch.
+        pub target: Option<String>,
+        /// Repeat the original command under this idempotency key.
+        pub key: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -1843,6 +1932,10 @@ pub mod input {
     pub struct AgentsControl {
         /// The agent's id (as agents.list gives it).
         pub agent: String,
+        /// Execute on this runner, at its committed session epoch.
+        pub target: Option<String>,
+        /// Repeat the original command under this idempotency key.
+        pub key: Option<String>,
         /// The control's id: `rename`, `keep_going`, or another its harness offers.
         pub control: String,
         /// Its value (`rename`: the new name; `keep_going`: true or false).
@@ -1854,6 +1947,10 @@ pub mod input {
     pub struct AgentsRestart {
         /// The agent's id (as agents.list gives it).
         pub agent: String,
+        /// Execute on this runner, at its committed session epoch.
+        pub target: Option<String>,
+        /// Repeat the original command under this idempotency key.
+        pub key: Option<String>,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]
@@ -2774,6 +2871,10 @@ for line in sys.stdin:
                 if let (Some(key), Some(object)) = (key, input.as_object_mut()) { object.insert("key".into(), json!(key)); }
                 call(person.clone(), "agents.send", input)
             };
+            let wrong = call(person.clone(), "agents.send", json!({"agent": id, "text":"addressed elsewhere", "key":"other-runner", "target":"unavailable-peer"})).await;
+            anyhow::ensure!(wrong.is_err() && prompts(&heard).is_empty(), "a targeted call reached a different machine");
+            let wrong_id = super::keyed_id(&person, "agents.send", &id, "other-runner");
+            anyhow::ensure!(hub.store.read(move |db| Ok(db.query_row("SELECT count(*) FROM agent_mail WHERE id=?1", [wrong_id], |r| r.get::<_,i64>(0))?)).await? == 0, "a targeted call entered central mail");
             let first = send(Some("deploy-1")).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             let again = send(Some("deploy-1")).await.map_err(|(s, m)| anyhow::anyhow!("{s} {m}"))?;
             let message = first.get("id").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("no publication: {first}"))?.to_owned();

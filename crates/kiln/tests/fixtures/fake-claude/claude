@@ -138,7 +138,7 @@ def main():
         said = os.path.join(os.getcwd(), ".fake-claude-messages")
         if os.path.exists(said):
             with open(said, "a") as f:
-                f.write(json.dumps({"pid": os.getpid(), "uuid": m.get("uuid"), "message": m.get("message")}) + "\n")
+                f.write(json.dumps({"pid": os.getpid(), "at_ns": time.time_ns(), "uuid": m.get("uuid"), "message": m.get("message")}) + "\n")
         act = os.environ.get("FAKE_CLAUDE_ACT")
         if act:
             content = (m.get("message") or {}).get("content")

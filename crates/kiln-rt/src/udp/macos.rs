@@ -252,10 +252,10 @@ pub(crate) fn enable_local_addresses(fd: RawFd) -> bool {
 /// Sends `bytes` to `to` from the local address `from` (an `IP_PKTINFO` or `IPV6_PKTINFO` control
 /// message naming it the source), one datagram with `sendmsg(2)`, without blocking. Returns the
 /// bytes sent.
-pub(crate) fn send_from(fd: RawFd, to: SocketAddr, from: IpAddr, bytes: &[u8]) -> io::Result<usize> {
+pub(crate) fn send_from(fd: RawFd, to: Option<SocketAddr>, from: IpAddr, bytes: &[u8]) -> io::Result<usize> {
     // SAFETY: `sockaddr_storage` is plain integers; all zeroes is a valid value.
     let mut name: libc::sockaddr_storage = unsafe { zeroed() };
-    let name_length = write_name(to, &mut name);
+    let name_length = to.map(|addr| write_name(addr, &mut name));
     let mut control = [0u64; CONTROL_WORDS];
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
@@ -273,8 +273,10 @@ pub(crate) fn send_from(fd: RawFd, to: SocketAddr, from: IpAddr, bytes: &[u8]) -
     }
     // SAFETY: an all-zero `msghdr` is valid: null pointers with zero lengths.
     let mut message: libc::msghdr = unsafe { zeroed() };
-    message.msg_name = ptr::addr_of_mut!(name).cast();
-    message.msg_namelen = name_length;
+    if let Some(length) = name_length {
+        message.msg_name = ptr::addr_of_mut!(name).cast();
+        message.msg_namelen = length;
+    }
     message.msg_iov = &raw mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();

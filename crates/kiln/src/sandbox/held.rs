@@ -184,6 +184,15 @@ impl Held {
         }));
     }
 
+    /// The output pump has observed the run's end and closed its streams.
+    pub(crate) async fn wait_ended(&self) {
+        loop {
+            let changed = self.changed.listen();
+            if self.ended.load(Ordering::Acquire) { return; }
+            changed.await;
+        }
+    }
+
     /// Ends it at once (a microVM's stop).
     pub fn kill(&self) {
         self.run.kill();

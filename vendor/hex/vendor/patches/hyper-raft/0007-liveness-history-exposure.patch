@@ -1,0 +1,19 @@
+Subject: liveness-history-exposure
+Why: AD-1 restores the exact accumulated node time after restart.
+
+diff --git a/crates/hyper-timing/src/folds.rs b/crates/hyper-timing/src/folds.rs
+index 1ea24fe7e52722f46d5e6f0697e5ea4fd7b2d486..5168e11db914696f42d571d674f756bbb6288e67 100644
+--- a/crates/hyper-timing/src/folds.rs
++++ b/crates/hyper-timing/src/folds.rs
+@@ -298,6 +298,11 @@ impl Exposure {
+         self.failures = self.failures.saturating_add(1);
+     }
+ 
++    /// Exact accumulated node time, for persisting this evidence alongside its failure count.
++    pub const fn node_time(&self) -> Duration {
++        self.exposure
++    }
++
+     /// The failures counted.
+     pub const fn failures(&self) -> u64 {
+         self.failures

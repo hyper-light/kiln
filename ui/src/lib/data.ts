@@ -9,7 +9,7 @@
 import { create } from "zustand";
 import { api } from "@/api/client";
 import { events, useServerEvents } from "@/api/events";
-import { listAgentFamily, listAgents, listed, listWaiting } from "@/api/agents-list";
+import { isWaitingAgent, listAgentFamily, listAgents, listed, listWaiting } from "@/api/agents-list";
 import type { AgentInfo } from "@/api/wire";
 import type { Agent, AiSession, HostSample, LeanAgent, MetricsHistory, Overview, Repo, Run, ServerEvent, TerminalSessionInfo, UpdateJob, UpdatesOverview } from "@/api/types";
 import { loaded, preload, recent, useSuspenseResource, type ResourceOptions, type ResourceFetcher } from "./resource";
@@ -214,29 +214,50 @@ export function mergeJobs(data: UpdatesOverview, live: Record<string, UpdateJob>
   return Object.values(all).sort((a, b) => b.started_at - a.started_at);
 }
 
+/** A topology change can bring in relatives outside this compact result. Re-read its authoritative family in that case. */
+export function familyAgentsWith(id: string, list: AgentInfo[], events: readonly ServerEvent[]): AgentInfo[] | undefined {
+  const members = new Map(list.map((a) => [a.id, a]));
+  const parent = members.get(id)?.parent;
+  const updates: ServerEvent[] = [];
+  for (const event of events) {
+    if (event.type === "harness_closed") {
+      if (members.has(event.id) || event.id === id) return undefined;
+    } else if (event.type === "harness") {
+      const next = event.info;
+      const previous = members.get(next.id);
+      if (previous) {
+        if (previous.parent !== next.parent || !listed(next)) return undefined;
+        updates.push(event);
+      } else if (next.id === id || next.id === parent || (next.parent && (next.parent === id || (next.parent !== parent && members.has(next.parent))))) {
+        return undefined;
+      }
+    } else {
+      return undefined;
+    }
+  }
+  return updates.length ? agentsWith(list, updates) : list;
+}
+
 /** Only the agents currently showing shell-level cards (approvals, held goals, stops, usage limits). */
 export const harnessWaitingRes: Res<AgentInfo[]> = {
   key: "harness/waiting",
   fetch: (signal) => {
     const kept = recent<AgentInfo[]>("harness/sessions", 5_000) ?? recent<AgentInfo[]>("harness/agents", 5_000);
-    return kept ? Promise.resolve(kept) : listWaiting(signal);
+    return kept ? Promise.resolve(kept.filter(isWaitingAgent)) : listWaiting(signal);
   },
   opts: {
     on: ["harness", "harness_closed"],
-    applyMany: agentsWith,
+    applyMany: (list, evs) => agentsWith(list, evs, isWaitingAgent),
   },
 };
 
 /** One session, its immediate parent, and its descendants, kept live without fetching all 10k sessions. */
 export const harnessFamilyRes = (id: string): Res<AgentInfo[]> => ({
   key: `harness/family/${id}`,
-  fetch: (signal) => {
-    const kept = recent<AgentInfo[]>("harness/sessions", 5_000) ?? recent<AgentInfo[]>("harness/agents", 5_000);
-    return kept ? Promise.resolve(kept) : listAgentFamily(id, signal);
-  },
+  fetch: (signal) => listAgentFamily(id, signal),
   opts: {
     on: ["harness", "harness_closed"],
-    applyMany: agentsWith,
+    applyMany: (list, evs) => familyAgentsWith(id, list, evs),
   },
 });
 
@@ -266,11 +287,11 @@ export const harnessSessionsRes: Res<AgentInfo[]> = {
  * of E events to N agents looked each up among the N and copied the list E times. An agent no event
  * names keeps its very entry, and a list no event changes is the list itself.
  */
-export function agentsWith(list: AgentInfo[], events: readonly ServerEvent[]): AgentInfo[] | undefined {
+export function agentsWith(list: AgentInfo[], events: readonly ServerEvent[], include: (a: AgentInfo) => boolean = listed): AgentInfo[] | undefined {
   // Each agent's last word: its entry, or null once it's gone.
   const news = new Map<string, AgentInfo | null>();
   for (const ev of events) {
-    if (ev.type === "harness") news.set(ev.info.id, listed(ev.info) ? ev.info : null);
+    if (ev.type === "harness") news.set(ev.info.id, listed(ev.info) && include(ev.info) ? ev.info : null);
     else if (ev.type === "harness_closed") news.set(ev.id, null);
     else return undefined;
   }

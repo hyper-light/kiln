@@ -154,3 +154,46 @@ await test("W21-R15: what the server's events said of a starting agent stands ov
   assert.equal(useStarting.getState().starts[id("7")]?.state, "started");
   for (const key of LISTS) assert.ok(listed(key).includes("777:running"), listed(key).join(" "));
 });
+
+await test("W21-R15: a held start stays visible with its target and waits for link-up without polling", async () => {
+  const slot = id("7");
+  const before = asked.length;
+  answers.push(() => new Response(JSON.stringify({ agents: [], slots: [{ id: slot, outcome: "held", why: "held at west, delivering to east" }] }), { status: 202 }));
+  start([slot]);
+  await settle();
+  assert.equal(useStarting.getState().starts[slot]?.state, "held");
+  assert.match(useStarting.getState().starts[slot]?.why ?? "", /held at west, delivering to east/);
+  assert.equal(asked.length, before + 1);
+});
+
+await test("W21-R15: retrying explicit per-slot results preserves the original complete operation", async () => {
+  const ids = [id("8"), id("9")];
+  const [one, two] = ids;
+  answers.push(
+    () =>
+      new Response(
+        JSON.stringify({
+          agents: [{ id: one }],
+          slots: [
+            { id: one, outcome: "forwarded", why: "started" },
+            { id: two, outcome: "refused", why: "destination declined" },
+          ],
+        }),
+        { status: 207 },
+      ),
+    there(one),
+  );
+  start(ids);
+  await settle();
+  assert.equal(useStarting.getState().starts[two]?.state, "failed");
+  assert.deepEqual(
+    useStarting.getState().starts[two]?.started?.map((info) => info.id),
+    [one],
+  );
+  answers.push(...ok(ids.map((value) => ({ id: value }))));
+  startAgain(two);
+  const retried = asked.at(-1)?.body as { count?: number; ids?: string[] };
+  assert.deepEqual(retried.ids, ids);
+  assert.equal(retried.count, ids.length);
+  await settle();
+});

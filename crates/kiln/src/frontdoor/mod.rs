@@ -24,6 +24,7 @@ pub mod mobileconfig;
 pub mod netinfo;
 pub mod proxy;
 pub mod replica;
+pub(crate) mod start_outbox;
 pub mod runner;
 pub mod tailnet;
 pub mod zone;

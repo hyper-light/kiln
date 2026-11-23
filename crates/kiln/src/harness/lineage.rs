@@ -626,6 +626,10 @@ pub fn live_descendants(all: &[Info], id: &str) -> Vec<Info> {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Ask {
+    #[serde(skip)]
+    pub start_request: Option<String>,
+    #[serde(skip)]
+    pub start_key: Option<String>,
     /// The harness (`claude`, `codex`, …).
     pub kind: String,
     /// Where: what it needs (`linux/amd64`, `+gpu`), placed by the load balancer, or a machine's
@@ -820,20 +824,39 @@ pub fn pick(hub: &Hub, on: Option<&str>, kind: &str, default: Option<&str>) -> R
 
 /// The machine `on` names, as a target (`local`, `agent:<machine>`), when it names one and asks
 /// nothing else of it; `None` when it asks for what a machine must be.
-fn named(hub: &Hub, on: &str) -> Option<Result<String, Refused>> {
-    if let Some(m) = on.strip_prefix("agent:") {
-        return Some(Ok(format!("agent:{}", hub.machine_named(m).unwrap_or_else(|| m.to_owned()))));
+pub(crate) fn named(hub: &Hub, on: &str) -> Option<Result<String, Refused>> {
+    let on = on.trim();
+    if matches!(on, "local" | "server") {
+        return Some(Ok("local".into()));
     }
-    let want = crate::reach::directory::Want::parse(on).ok()?;
-    let name = want.name.clone().filter(|_| want == crate::reach::directory::Want { name: want.name.clone(), ..Default::default() })?;
-    if matches!(name.as_str(), "local" | "server") || (name == crate::os::hostname() && hub.machine_named(&name).is_none()) {
-        return Some(Ok("local".to_owned()));
+    let selected = on
+        .strip_prefix("agent:")
+        .or_else(|| (!crate::frontdoor::replica::needs_placement(Some(on))).then_some(on))?;
+    if let Ok(Some(manager)) = hub.harness.session_consensus()
+        && let Some(node) = crate::frontdoor::replica::local_node().filter(|n| n.machine == manager.node_name())
+    {
+        if let Err(e) = node.selected_peer(selected) {
+            return Some(Err((StatusCode::CONFLICT, e.to_string())));
+        }
+        if node.matches_target(selected) {
+            return Some(Ok("local".into()));
+        }
+        if let Some(reach) = &node.reach {
+            match reach.resolve_session_target(selected) {
+                Ok(Some(id)) => return Some(Ok(format!("agent:{id}"))),
+                Err(e) => return Some(Err((StatusCode::CONFLICT, e.to_string()))),
+                Ok(None) => {}
+            }
+        }
     }
-    let name = hub.machine_named(&name).unwrap_or(name);
+    if selected == crate::os::hostname() && hub.machine_named(selected).is_none() {
+        return Some(Ok("local".into()));
+    }
+    let name = hub.machine_named(selected).unwrap_or_else(|| selected.into());
     Some(match hub.agents.load().get(&name) {
-        Some(a) if a.connected && !a.outpost && !a.ephemeral => Ok(format!("agent:{name}")),
-        Some(a) => Err((StatusCode::CONFLICT, format!("{} isn't connected (or doesn't run agents): pick another machine", a.shown()))),
-        None => Err((StatusCode::CONFLICT, format!("kiln has no machine named {name}"))),
+        Some(a) if !a.outpost && !a.ephemeral => Ok(format!("agent:{name}")),
+        Some(a) => Err((StatusCode::CONFLICT, format!("{} does not run agents", a.shown()))),
+        None => Err((StatusCode::NOT_FOUND, format!("unknown runner {selected}"))),
     })
 }
 
@@ -948,6 +971,15 @@ async fn place_agents(hub: &Hub, parent: Option<&Info>, on: Option<&str>, kind: 
     // Only where its runner's engine is the one it needs (kiln plan 01a1dd2e…, P2.4): a microVM's on a
     // `microvm` runner, a process asked for (`none`) on a `host` one; refused, the engine named.
     let targets = on_engine(hub, targets, want)?;
+    // A host-process start naming its destination needs no placement claim. Even a
+    // disconnected known host owns its queue, so its source may hold a failed forward.
+    if isolation.is_none() && volumes.is_empty()
+        && let [target] = targets.as_slice()
+        && on.is_some_and(|s| named(hub, s).is_some())
+    {
+        return Ok(vec![(target.clone(), None); count]);
+    }
+
     // Chosen by what it needs, not a machine named nor its parent's: only where its harness is signed
     // in and its account has room, as far as kiln knows (2026-11-13). An isolated agent's harness
     // and sign-in are its image's.
@@ -1693,6 +1725,51 @@ pub async fn hold(hub: &Hub, parent: &Info, ask: &Ask, target: &str, count: usiz
 
 /// Start agents for `by`: checked against its parent when it's an agent, on the machine picked,
 /// each recorded with whom it acts for and who started it.
+pub(crate) async fn place_raw(hub: &Hub, by: &Starter, raw: crate::api::HarnessOpen) -> Result<Vec<Info>, Refused> {
+    let spec = raw.spec;
+    let on = match raw.target.trim() {
+        "" => None,
+        "server" => Some("local".into()),
+        s => Some(s.to_owned()),
+    };
+    let ask = Ask {
+        kind: spec.kind.clone(),
+        on,
+        count: raw.count,
+        ids: Some(raw.ids),
+        start_request: spec.start_request.clone(),
+        start_key: spec.start_key.clone(),
+        cwd: spec.cwd.clone(),
+        prompt: spec.prompt.clone(),
+        resume: spec.resume.clone(),
+        model: spec.model.clone(),
+        mode: spec.mode.clone(),
+        name: spec.name.clone(),
+        effort: spec.effort.clone(),
+        speed: spec.speed.clone(),
+        shell: spec.shell.clone(),
+        reach: spec.reach.clone(),
+        isolation: spec.isolation.as_ref().map(|_| "microvm".into()),
+        image: spec.isolation.as_ref().and_then(|i| i.image.clone()),
+        workspace: spec.workspace.as_ref().map(|w| w.kind.clone()),
+        ..Default::default()
+    };
+    // Validation, parent limits, fleet selection, claims, access, audit and inbox admission
+    // are the same operation as agents.start. Preserve the raw HTTP launch options here.
+    start_as(hub, by, ask, move |placed| {
+        placed.program = spec.program;
+        placed.env = spec.env;
+        placed.resume_at = spec.resume_at;
+        placed.fork = spec.fork;
+        placed.takeover_pid = spec.takeover_pid;
+        placed.max_subagents = spec.max_subagents;
+        if spec.container.is_some() {
+            placed.container = spec.container;
+        }
+    })
+    .await
+}
+
 pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refused> {
     // A definition's live experiment (kiln plan 01a1dd2ea7a777a28970a43fc5f766d0 P7.1,
     // `crate::agentdefs::experiments`): each new session of one of its person's own definitions that has one is one
@@ -1702,7 +1779,10 @@ pub async fn start(hub: &Hub, by: &Starter, ask: Ask) -> Result<Vec<Info>, Refus
     let (Some(person), Some(definition)) = (person.filter(|_| fresh), ask.definition.clone()) else {
         return start_as(hub, by, ask, |_| {}).await;
     };
-    let count = ask.count.unwrap_or(1).clamp(1, 16);
+    let count = ask.count.unwrap_or(1);
+    if count==0 {return Err(bad("count must be positive"));}
+    let room = match &by.parent {Some(parent)=>room(hub,parent).await,None=>hub.cfg.agents.max_children.map_or(usize::MAX,|n|n as usize)};
+    if count>room {return Err((StatusCode::CONFLICT,format!("the caller has {room} remaining starts under max_children")));}
     let mut infos = Vec::new();
     let mut refused = None;
     for k in 0..count {
@@ -1914,7 +1994,15 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
         Some(w) => return Err(bad(format!("`workspace` is \"folder\" (its folder itself) or \"volume\" (a Slates volume of its own over the folder, where Slates workspaces are on: `[workspaces] enabled`), not {w:?}"))),
     };
     let volume = workspace.as_ref().is_some_and(|w| w.kind == "volume");
-    let count = ask.count.unwrap_or(1).clamp(1, 16);
+    let count = ask.count.unwrap_or(1);
+    if count == 0 { return Err(bad("count must be positive")); }
+    let remaining = match &by.parent {
+        Some(parent) => room(hub,parent).await,
+        None => hub.cfg.agents.max_children.map_or(usize::MAX,|n|n as usize),
+    };
+    let new_ids=ask.ids().iter().filter(|id|hub.harness.info(id).is_none()).count();
+    let new_slots=if ask.ids().is_empty(){count}else{new_ids};
+    if new_slots>remaining { return Err((StatusCode::CONFLICT,format!("the caller has {remaining} remaining starts under max_children"))); }
     let resume = ask.resume.as_deref().map(str::trim).filter(|r| !r.is_empty()).map(str::to_owned);
     if resume.is_some() && count > 1 {
         return Err(bad("one conversation is taken up by one agent: `resume` starts one (`count` 1)"));
@@ -2021,6 +2109,9 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // Each one's boundary (kiln plan 01a1dd2e…, P2.3): as it asked, or else its runner's engine's.
     // A conversation taken up (`resume`) stays where its harness keeps it.
     let boundary = |target: &str| isolation.clone().or_else(|| (want.is_none() && resume.is_none() && engine_at(hub, target) == Ok(Engine::Microvm)).then(|| sized(Isolation { disk, ..Isolation::microvm() }, &requested(hub, on.as_deref()).request)));
+    static PARENT_STARTS:std::sync::LazyLock<crate::turn::Keyed<String,crate::turn::Gate>>=std::sync::LazyLock::new(crate::turn::Keyed::new);
+    let admission=by.parent.as_ref().map(|p|PARENT_STARTS.of(&p.id));
+    let _parent_turn=match &admission {Some(g)=>Some(g.turn().await),None=>None};
     let checked = async {
         let mut targets: Vec<&str> = placed.iter().map(|(t, _)| t.as_str()).collect();
         targets.dedup();
@@ -2060,7 +2151,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
             Some(p) => {
                 let mut held = (None, None);
                 for target in &targets {
-                    held = hold(hub, p, &ask, target, count).await?;
+                    held = hold(hub, p, &ask, target, new_slots).await?;
                 }
                 Ok::<_, Refused>((held.0, held.1, !p.no_bypass))
             }
@@ -2121,6 +2212,8 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     // Its folder: the one asked for, else its parent's where they share a machine, else home.
     let cwd = ask.cwd.clone().filter(|c| !c.trim().is_empty()).or_else(|| by.parent.as_ref().filter(|p| placed.iter().all(|(t, _)| same_machine(p, t))).map(|p| p.cwd.clone()).filter(|c| !c.is_empty()));
     let mut spec = Spec {
+        start_request: ask.start_request.clone(),
+        start_key: ask.start_key.clone(),
         kind: kind.id.to_owned(),
         cwd,
         model: ask.model.clone().filter(|m| !m.trim().is_empty()),
@@ -2152,6 +2245,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     let mut infos = Vec::new();
     // Where each was placed, by its id: its stack is that machine's.
     let mut placed_on: Vec<(String, String)> = Vec::new();
+    let mut failure = None;
     let mut at = 0;
     while let Some((t, claim)) = placed.get(at) {
         let n = if claim.is_none() { placed.iter().skip(at).take_while(|(u, c)| u == t && c.is_none()).count() } else { 1 };
@@ -2169,7 +2263,7 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
                     if infos.is_empty() {
                         return Err((StatusCode::CONFLICT, format!("{e:#}")));
                     }
-                    tracing::warn!(error = %format!("{e:#}"), "some of the agents asked for didn't start in their pods");
+                    failure = Some((StatusCode::CONFLICT, format!("{e:#}")));
                     break;
                 }
             }
@@ -2182,11 +2276,27 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
                 infos.extend(i);
             }
             Err(e) => {
-                let_go(hub, placed.get(at..).unwrap_or_default()).await;
-                if infos.is_empty() {
-                    return Err((StatusCode::CONFLICT, format!("{e:#}")));
+                if let Some(batch)=e.downcast_ref::<super::registry::StartSlots>() {
+                    let mut slots=crate::api::started_slots(hub, &infos);
+                    slots.extend(batch.0.iter().cloned());
+                    for slot in &batch.0 {
+                        if matches!(slot.get("outcome").and_then(|s|s.as_str()),Some("started"|"forwarded")) && let Ok(info)=serde_json::from_value::<Info>(slot.clone()) {
+                            placed_on.push((info.id.clone(),t.clone())); infos.push(info);
+                        }
+                    }
+                    at+=n;
+                    slots.extend(asked_ids.iter().skip(at).map(|id|json!({"id":id,"outcome":"refused","why":"an earlier placement was incomplete"})));
+                    let_go(hub,placed.get(at..).unwrap_or_default()).await;
+                    let result=super::registry::StartSlots(slots);
+                    failure=Some((result.status(),result.to_string()));
+                    break;
                 }
-                tracing::warn!(error = %format!("{e:#}"), "some of the agents asked for didn't start");
+                let unknown = e.is::<super::registry::StartUnconfirmed>();
+                let first_unused = if unknown { at + n } else { at };
+                let_go(hub, placed.get(first_unused..).unwrap_or_default()).await;
+                let status = if unknown { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::CONFLICT };
+                if infos.is_empty() { return Err((status, format!("{e:#}"))); }
+                failure = Some((status, format!("{e:#}")));
                 break;
             }
         }
@@ -2233,6 +2343,11 @@ async fn start_as(hub: &Hub, by: &Starter, ask: Ask, tune: impl FnOnce(&mut Spec
     crate::api::boxed(|| crate::skills::sync(hub)).await;
     let parent = by.parent.as_ref().map_or_else(String::new, |p| format!(" for {} ({})", p.name, short(&p.id)));
     hub.store.audit(by.actor.clone(), "agent.open".into(), format!("{} {what} on {target}{parent}", infos.len())).await;
+    if let Some((status, why)) = failure {
+        if why.starts_with("{\"slots\":"){return Err((status,why));}
+        let confirmed = infos.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().join(", ");
+        return Err((status, format!("Already confirmed sessions {confirmed}. {why}")));
+    }
     Ok(infos)
 }
 

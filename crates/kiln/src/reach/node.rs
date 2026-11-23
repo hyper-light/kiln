@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use futures::FutureExt as _;
 use futures::channel::oneshot;
 use serde::Serialize;
@@ -60,6 +61,8 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(660);
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub sessions_only: bool,
+    pub session_executor: bool,
     /// This runner's name (its certificate's).
     pub name: String,
     /// Where its identity and pins live (`<state>/reach`).
@@ -167,9 +170,23 @@ enum Missed {
 const ADOPT_PIECE: usize = 1 << 20;
 
 impl Config {
+    fn link_features(&self, detector: bool) -> Vec<String> {
+        use crate::proto::feature as f;
+        let mut features = f::for_session_host(self.session_executor, detector);
+        if self.sessions_only {
+            features.retain(|name| matches!(name.as_str(), f::LINK_FEATURES | f::SESSION_STARTS | f::P2P_MAIL | f::AUTHORITY_MAIL | f::CONVO_RAFT | f::CONVO_RAFT_V2 | f::CONVO_EXECUTOR | f::CONVO_NAME_CHARTER | f::CONVO_LIVENESS));
+            features.push(f::SESSION_LINK_ONLY.to_owned());
+        }
+        features
+    }
+
+    fn accepts_word(&self, word: &Ask) -> bool {
+        !self.sessions_only || matches!(word, Ask::Hello { .. } | Ask::Features { .. } | Ask::Ping { .. } | Ask::Unread { .. } | Ask::HarnessSend { .. } | Ask::ConvoRaft { .. })
+    }
+
     /// A runner's usual settings: identity under `state`, copies under `~/.kiln/reach`.
     pub fn for_runner(name: &str, state: &std::path::Path, accept: bool) -> Self {
-        Self { name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, adopt_policy: crate::harness::moving::stream::StoragePolicy::Unknown, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new(), capacity: None, harness_send: None, convo_raft: None, direct_quic: true }
+        Self { sessions_only: false, session_executor: false, name: name.to_owned(), dir: state.join("reach"), accept, mirrors: crate::os::home_dir().join(".kiln").join("reach"), adopt: None, adopt_policy: crate::harness::moving::stream::StoragePolicy::Unknown, using: Arc::default(), objects: None, sense: true, on_battery: kiln_ci::pace::power::OnBattery::default(), place: kiln_ci::place::runner::Settings::default(), version: wire::VERSION, root: Vec::new(), capacity: None, harness_send: None, convo_raft: None, direct_quic: true }
     }
 }
 
@@ -248,7 +265,9 @@ pub enum In {
 
 /// What local tools ask of the node.
 pub enum Local {
-    Directory { reply: oneshot::Sender<anyhow::Result<Vec<RunnerInfo>>> },
+    Directory { missing: Option<String>, reply: oneshot::Sender<anyhow::Result<Vec<RunnerInfo>>> },
+    /// A snapshot read from the embedded runner’s own authoritative Hub.
+    ServerDirectory { runners: Vec<RunnerInfo>, reply: oneshot::Sender<()> },
     /// A sync of tree `key` to `peer` moved `bytes` in `us` (LB08: the pair's rate, and what the
     /// next sync of the tree is expected to move).
     Transferred { peer: String, key: String, bytes: u64, us: u64 },
@@ -338,9 +357,10 @@ pub enum Local {
     /// Placement's records (`Handle::records`).
     Records { reply: oneshot::Sender<Option<Arc<dyn kiln_seams::Records>>> },
     /// Forward a routed harness message to `peer` over its reach link (relayed fallback when direct `hyper-quic` is unavailable).
-    HarnessSend { peer: String, session: String, epoch: Option<u64>, json: String, reply: oneshot::Sender<anyhow::Result<wire::P2pSendReply>> },
+    HarnessSend { peer: String, session: String, epoch: Option<u64>, json: String, reply: oneshot::Sender<anyhow::Result<wire::P2pSendReply>>, room: super::quic::FrameCharge },
+    CancelHarness(String),
     /// Send a per-session conversation Raft message to `peer` over reach (relayed fallback when direct `hyper-quic` is unavailable).
-    ConvoRaft { peer: String, session: String, bytes: Vec<u8> },
+    ConvoRaft { peer: String, session: String, bytes: Vec<u8>, room: super::quic::FrameCharge },
     /// Connected peer runner names known to this node.
     KnownPeers { reply: oneshot::Sender<Vec<String>> },
 }
@@ -352,6 +372,7 @@ pub enum Local {
 /// frame on its shard and the node waiting on its own.
 #[derive(Clone)]
 pub struct Handle {
+    relay_frames: Arc<super::quic::FrameRoom>,
     net: crate::memory::queue::Sender<In>,
     tx: crate::memory::queue::Sender<In>,
     announce: Arc<Announce>,
@@ -361,8 +382,11 @@ pub struct Handle {
     dir: PathBuf,
     /// kiln's root, for what other runners sign (docs/ci.md W27-R08).
     root: Arc<Vec<u8>>,
+    fleet_key: Option<Arc<aws_lc_rs::signature::ParsedPublicKey>>,
     /// Placement's numbering of this process's boxes that reserve nothing (`Placer::numbering`).
     boxes: kiln_ci::place::holder::Numbering,
+    routes: Arc<crate::fleet::sessions::Routes>,
+    pub(crate) starts: Arc<crate::frontdoor::start_outbox::Outbox>,
     /// Direct server-to-server / runner-to-runner `hyper-quic` forwarding endpoint (when bound).
     quic: Option<super::quic::PeerQuic>,
 }
@@ -379,6 +403,41 @@ pub fn global() -> Option<&'static Handle> {
 }
 
 impl Handle {
+    pub(crate) fn restore_session_members(&self, manager: &crate::convo::raft::Manager) -> anyhow::Result<()> {
+        self.routes.restore(manager)
+    }
+
+    pub(crate) fn sign_session_operation(&self, body: &str) -> anyhow::Result<String> {
+        let state = self.dir.parent().ok_or_else(||anyhow::anyhow!("missing enrollment directory"))?;
+        crate::fleet::sessions::sign_start(state,&self.name,body)
+    }
+
+    pub(crate) fn verify_cached_session_operation(&self,from:&str,body:&str,proof:&str)->anyhow::Result<()> {
+        self.routes.verify_cached(&self.root,from,body,proof)
+    }
+
+    pub(crate) fn verify_fleet_statement(&self, statement: &[u8], signature: &[u8]) -> anyhow::Result<()> {
+        self.fleet_key.as_ref().ok_or_else(|| anyhow::anyhow!("missing fleet signing key"))?
+            .verify_sig(statement, signature).map_err(|_| anyhow::anyhow!("invalid fleet session signature"))
+    }
+
+    pub(crate) fn verify_session_operation(&self, from: &str, body: &str, proof: &str, revoked: &crate::identities::Revoked) -> anyhow::Result<()> {
+        anyhow::ensure!(self.routes.contains(from), "source is absent from the authenticated fleet directory");
+        crate::fleet::sessions::verify_current(&self.root, from, body, proof, revoked)
+    }
+
+    pub(crate) fn resolve_session_target(&self, selected: &str) -> anyhow::Result<Option<String>> { self.routes.resolve_alias(selected) }
+
+    pub(crate) fn authority_mail(&self, peer: &str) -> bool { self.routes.authority_mail(peer) }
+
+    pub(crate) fn start_support(&self, peer: &str) -> Option<bool> {
+        self.routes.start_support(peer)
+    }
+
+    pub(crate) fn cached_members(&self) -> BTreeMap<String,crate::fleet::sessions::Member> { self.routes.members() }
+
+    pub(crate) fn session_peers(&self) -> Vec<String> { self.routes.member_names() }
+
     /// The frame announcing this runner's reach identity, for every (re)connect.
     pub fn hello(&self) -> AgentMsg {
         AgentMsg::ReachHello { json: serde_json::to_string(&*self.announce).unwrap_or_default() }
@@ -403,30 +462,77 @@ impl Handle {
         self.quic.as_ref()
     }
 
-    /// Forward a routed harness message directly to `peer`: tries direct runner-to-runner
-    /// `hyper-quic` first (multiplexed bidirectional QUIC stream, zero central-server hop),
-    /// falling back transparently to the E2E-encrypted relayed reach link if direct UDP is blocked.
-    pub async fn send_harness_message(&self, peer: &str, session: &str, epoch: Option<u64>, json: String) -> anyhow::Result<wire::P2pSendReply> {
-        if let Some(q) = &self.quic
-            && q.has_direct(peer)
-        {
-            match q.send_harness_message(peer, session, epoch, json.clone()).await {
-                Ok(reply) => return Ok(reply),
-                Err(e) => tracing::debug!(%peer, %session, error = %format!("{e:#}"), "direct hyper-quic harness forward failed; falling back to relayed reach link"),
-            }
-        }
-        self.ask(|reply| Local::HarnessSend { peer: peer.to_owned(), session: session.to_owned(), epoch, json, reply }).await?
+    /// Whether `peer` has a direct `hyper-quic` UDP address available (not in firewall cooldown).
+    pub fn has_direct(&self, peer: &str) -> bool {
+        self.quic.as_ref().is_some_and(|q| q.has_direct(peer))
     }
 
-    /// Send a per-session conversation Raft message to `peer`: tries direct `hyper-quic` first,
-    /// falling back to the relayed reach link if direct UDP is unavailable.
-    pub fn send_convo_raft(&self, peer: &str, session: &str, bytes: Vec<u8>) {
-        if let Some(q) = &self.quic
-            && q.send_convo_raft(peer, session, &self.name, bytes.clone())
-        {
-            return;
+    /// Whether a direct `hyper-quic` connection to `peer` is already handshaked and ready right now.
+    pub fn has_connected_direct(&self, peer: &str) -> bool {
+        self.quic.as_ref().is_some_and(|q| q.is_connected(peer))
+    }
+
+    /// Start a non-blocking background direct `hyper-quic` handshake to `peer` so subsequent
+    /// sends can use direct QUIC without stalling an active WebSocket stream.
+    pub fn warm_direct(&self, peer: &str) {
+        if let Some(q) = &self.quic {
+            q.warm_peer(peer);
         }
-        let _ = self.tx.try_send(In::Local(Local::ConvoRaft { peer: peer.to_owned(), session: session.to_owned(), bytes }));
+    }
+
+    /// A single RPC to one verified destination. The caller resolves an epoch before an
+    /// authorized mutation and keeps its request id when the response is uncertain.
+    pub(crate) async fn harness_rpc(&self, peer: &str, session: &str, epoch: Option<u64>, json: String) -> anyhow::Result<wire::P2pSendReply> {
+        self.begin_harness_rpc(peer, session, epoch, json).await?.await
+    }
+
+    pub(crate) async fn begin_harness_rpc(&self, peer: &str, session: &str, epoch: Option<u64>, json: String) -> anyhow::Result<futures::future::BoxFuture<'static, anyhow::Result<wire::P2pSendReply>>> {
+        if let Some(q) = &self.quic && q.has_direct(peer) {
+            return q.begin_harness_message(peer, session, epoch, json);
+        }
+        self.begin_relay_harness_rpc(peer,session,epoch,json).await
+    }
+
+    pub(crate) async fn begin_relay_harness_rpc(&self, peer: &str, session: &str, epoch: Option<u64>, json: String) -> anyhow::Result<futures::future::BoxFuture<'static, anyhow::Result<wire::P2pSendReply>>> {
+        // Establish the relay before submitting. Never replay a queued mutation after link loss.
+        let bytes = json.capacity().saturating_add(session.len()).saturating_add(std::mem::size_of::<Local>());
+        let room = self.relay_frames.reserve(peer, bytes)?;
+        crate::rt::timeout(super::quic::DIAL_TIMEOUT, self.connect(peer)).await??;
+        struct Pending { node: Handle, peer: String, rx: Option<oneshot::Receiver<anyhow::Result<wire::P2pSendReply>>> }
+        impl Pending {
+            async fn wait(mut self, since: Instant) -> anyhow::Result<wire::P2pSendReply> {
+                let rx = self.rx.as_mut().context("reply already taken")?;
+                let result = crate::rt::timeout(super::quic::REQUEST_WAIT.saturating_sub(since.elapsed()), rx).await?.map_err(|_| anyhow::anyhow!("reach stopped"))?;
+                self.rx.take();
+                result
+            }
+        }
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                if self.rx.take().is_some() { let _ = self.node.tx.try_send(In::Local(Local::CancelHarness(self.peer.clone()))); }
+            }
+        }
+        let (reply, rx) = oneshot::channel();
+        let cmd = Local::HarnessSend { peer: peer.to_owned(), session: session.to_owned(), epoch, json, reply, room };
+        self.tx.try_send(In::Local(cmd)).map_err(|_| anyhow::anyhow!("relay queue is unavailable"))?;
+        let pending = Pending { node: self.clone(), peer: peer.to_owned(), rx: Some(rx) };
+        Ok(Box::pin(pending.wait(Instant::now())))
+    }
+
+    /// Send a per-session conversation Raft message to `peer`: ALWAYS prefers direct `hyper-quic`
+    /// when available (including `KRC1` snapshot chunks, so peers replicate directly even when the
+    /// central server is offline!), falling back to the relayed reach link only if direct QUIC is
+    /// unavailable or saturated. Returns `false` if the frame could not be queued so the caller
+    /// reports snapshot failure accurately to Raft.
+    pub fn send_convo_raft(&self, peer: &str, session: &str, bytes: Vec<u8>, _is_snapshot: bool) -> bool {
+        if let Some(q) = &self.quic
+            && q.send_convo_raft(peer, session, &self.name, &bytes)
+        {
+            return true;
+        }
+        let retained = bytes.capacity().saturating_add(session.len()).saturating_add(std::mem::size_of::<Local>());
+        let Ok(room) = self.relay_frames.reserve(peer, retained) else { return false };
+        self.tx.try_send(In::Local(Local::ConvoRaft { peer: peer.to_owned(), session: session.to_owned(), bytes, room })).is_ok()
     }
 
     /// Known peer runner names (excluding self) from the reach directory and active links.
@@ -452,7 +558,15 @@ impl Handle {
     }
 
     pub async fn directory(&self) -> anyhow::Result<Vec<RunnerInfo>> {
-        self.ask(|reply| Local::Directory { reply }).await?
+        self.ask(|reply| Local::Directory { missing: None, reply }).await?
+    }
+
+    pub(crate) async fn start_directory(&self, missing: &str) -> anyhow::Result<Vec<RunnerInfo>> {
+        self.ask(|reply| Local::Directory { missing: Some(missing.to_owned()), reply }).await?
+    }
+
+    pub(crate) async fn server_directory(&self, runners: Vec<RunnerInfo>) -> anyhow::Result<()> {
+        self.ask(|reply| Local::ServerDirectory { runners, reply }).await
     }
 
     /// A sync to `peer` moved `bytes` in `us` (LB08).
@@ -845,22 +959,40 @@ fn answer_keys(s: &Say) -> Vec<String> {
 pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Receiver<AgentMsg>)> {
     let identity = Identity::load_or_create(&cfg.dir, &cfg.name)?;
     let pins = Pins::open(&cfg.dir);
+    let renew_session_after=cfg.dir.parent().and_then(crate::fleet::sessions::renew_after);
+    let routes = Arc::new(crate::fleet::sessions::Routes::open(&cfg.dir, &cfg.name, &cfg.root)?);
+    let starts = crate::frontdoor::start_outbox::Outbox::new(crate::frontdoor::start_outbox::path(&cfg.dir,&cfg.name,&cfg.root));
     let quic = if cfg.direct_quic {
-        match "0.0.0.0:0".parse().ok().and_then(|bind| super::quic::PeerQuic::start(bind, &identity, cfg.harness_send.clone(), cfg.convo_raft.clone()).ok()) {
-            Some(q) => {
+        let port_path = cfg.dir.join("session-quic-port");
+        let port = match std::fs::read_to_string(&port_path) {
+            Ok(s) => s.trim().parse::<u16>()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e.into()),
+        };
+        let open = |port| super::quic::PeerQuic::start_on_node(
+            std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED,port).into(), &identity,
+            cfg.harness_send.clone(),cfg.convo_raft.clone(),Some(&cfg.dir),
+        );
+        // A blue/green successor can briefly overlap the predecessor on the same machine.
+        let endpoint = open(port).or_else(|e| if port != 0 { open(0) } else { Err(e) });
+        match endpoint {
+            Ok(q) => {
+                if port != q.local_addr().port() {
+                    crate::util::write_secret(&port_path, q.local_addr().port().to_string().as_bytes(), 0o600)?;
+                }
+                q.watch_starts(&starts);
+                q.update_peers(routes.entries());
                 tracing::info!(addr = %q.local_addr(), advertised = ?q.advertised_addrs(), "reach direct hyper-quic forwarding ready");
                 Some(q)
             }
-            None => {
-                tracing::debug!("reach direct hyper-quic UDP socket unavailable; using relayed reach links");
+            Err(e) => {
+                tracing::warn!(error=%e, "reach direct hyper-quic UDP socket unavailable");
                 None
             }
         }
-    } else {
-        None
-    };
+    } else { None };
     let quic_addrs = quic.as_ref().map(|q| q.advertised_addrs().to_vec()).unwrap_or_default();
-    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: cfg.version, features: crate::proto::feature::all(), quic_addrs };
+    let announce = Announce { fingerprint: identity.fingerprint.clone(), accept: cfg.accept, version: cfg.version, features: cfg.link_features(quic.as_ref().is_some_and(|q| q.has_liveness())), quic_addrs };
     let (dir, root) = (cfg.dir.clone(), Arc::new(cfg.root.clone()));
     // Each with the bound its channel had: the network's and the node's own unbounded, local tools'
     // 1,024 at most, whatever each carries.
@@ -901,6 +1033,8 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
     };
     tracing::info!(fingerprint = %e2e::short(&identity.fingerprint), accept = cfg.accept, "reach ready");
     let node = Node {
+        starts: starts.clone(),
+        relay_incoming: Arc::new(crate::memory::queue::Room::new(&crate::memory::owners::CHANNELS, super::quic::frame_budget())),
         cfg,
         identity,
         pins,
@@ -911,6 +1045,9 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
         server: false,
         server_unread: false,
         directory: None,
+        routes: routes.clone(),
+        last_directory_req: 0, renew_session_after, legacy_cursor: None, legacy_names: None,
+        directory_tried: None,
         asked: HashMap::new(),
         queries: HashMap::new(),
         next_req: 1,
@@ -975,7 +1112,10 @@ pub fn start(cfg: Config) -> anyhow::Result<(Handle, crate::memory::queue::Recei
             counted.store(node.busy(), Ordering::Relaxed);
         }
     });
-    Ok((Handle { net: net_tx, tx, announce: Arc::new(announce), busy, name: node_name, dir, root, boxes, quic }, out_rx))
+    let fleet_key = x509_parser::parse_x509_certificate(&root).ok().and_then(|(_, cert)| {
+        aws_lc_rs::signature::ParsedPublicKey::new(&aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1, cert.public_key().subject_public_key.data.as_ref()).ok().map(Arc::new)
+    });
+    Ok((Handle { fleet_key, relay_frames: Arc::new(super::quic::FrameRoom::new()), net: net_tx, tx, announce: Arc::new(announce), busy, name: node_name, dir, root, boxes, quic, routes, starts }, out_rx))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1055,7 +1195,7 @@ struct Peer {
     /// Hand-overs to this runner being followed, by id.
     adopts: HashMap<u64, Says>,
     /// Relayed P2P harness sends awaiting a `Say::HarnessSaid` reply, by id.
-    harness_sends: HashMap<u64, oneshot::Sender<anyhow::Result<wire::P2pSendReply>>>,
+    harness_sends: HashMap<u64, (oneshot::Sender<anyhow::Result<wire::P2pSendReply>>, super::quic::FrameCharge)>,
     /// Asks waiting for the link.
     queue: VecDeque<Ask>,
     next_id: u64,
@@ -1280,6 +1420,7 @@ enum Waiting {
 }
 
 struct Node {
+    relay_incoming: Arc<crate::memory::queue::Room>,
     cfg: Config,
     identity: Identity,
     pins: Pins,
@@ -1292,6 +1433,13 @@ struct Node {
     /// The server takes word of a message a link couldn't read ([`In::Unread`]).
     server_unread: bool,
     directory: Option<(Instant, Vec<RunnerInfo>)>,
+    routes: Arc<crate::fleet::sessions::Routes>,
+    pub(crate) starts: Arc<crate::frontdoor::start_outbox::Outbox>,
+    last_directory_req: u64,
+    renew_session_after: Option<i64>,
+    legacy_cursor: Option<String>,
+    legacy_names: Option<Arc<std::collections::BTreeSet<String>>>,
+    directory_tried: Option<Instant>,
     asked: HashMap<u64, Instant>,
     /// Questions local tools asked the server, waiting for its answers.
     queries: HashMap<u64, (Instant, oneshot::Sender<anyhow::Result<String>>)>,
@@ -1381,6 +1529,7 @@ impl Node {
             In::Unread(takes) => self.server_unread = takes,
             In::AdoptPolicy(policy) => self.cfg.adopt_policy = policy,
             In::Server(up) => {
+                if up && !self.server {self.starts.linked("server");}
                 self.server = up;
                 // It says again whether it takes hints once it's back (`Features`).
                 self.hints &= up;
@@ -1400,6 +1549,9 @@ impl Node {
                 self.server_unread &= up;
                 // Whatever the directory said may have changed while away: ask again.
                 self.directory = None;
+                self.asked.clear();
+                self.directory_tried = None;
+                if up && self.cfg.convo_raft.is_some() { self.fetch_directory().await; }
                 if !up {
                     self.cfg.adopt_policy = crate::harness::moving::stream::StoragePolicy::Unknown;
                     let ids: Vec<String> = self.links.keys().cloned().collect();
@@ -1924,6 +2076,15 @@ impl Node {
         self.out.send(m).await.is_ok()
     }
 
+    /// An executing session node keeps authenticated routes for incoming peers even when
+    /// nobody has issued a local command. Reuse the directory's own freshness and retry windows.
+    fn session_directory_due(&self, now: Instant) -> Option<Instant> {
+        if !self.server || self.cfg.convo_raft.is_none() || !self.asked.is_empty() { return None; }
+        let valid = self.directory.as_ref().and_then(|(at,_)| at.checked_add(DIRECTORY_TTL));
+        let retry = self.directory_tried.and_then(directory_due);
+        Some(valid.into_iter().chain(retry).max().unwrap_or(now))
+    }
+
     /// Ask the server for the directory, unless a question is out already.
     async fn fetch_directory(&mut self) {
         if self.asked.values().any(|at| at.elapsed() < Duration::from_secs(5)) {
@@ -1931,15 +2092,62 @@ impl Node {
         }
         let req = self.next_req;
         self.next_req += 1;
-        self.asked.insert(req, Instant::now());
-        self.send_out(AgentMsg::ReachAsk { req, json: json!({"op": "directory"}).to_string() }).await;
+        let now = Instant::now();
+        self.directory_tried = Some(now);
+        self.asked.insert(req, now);
+        let cursor = self.routes.names.cursor();
+        let mut request=json!({"op":"directory","session_revocation_stamp":self.routes.bans_since(),"session_names":cursor});
+        if self.renew_session_after.is_some_and(|due| crate::util::now_unix()>=due) && let Some(state)=self.cfg.dir.parent() {
+            let (dir,name)=(state.to_owned(),self.cfg.name.clone());
+            if let Ok(Ok(renew)) = crate::rt::blocking(move || crate::fleet::sessions::renewal_request(&dir, &name)).await
+                && let Some(obj) = request.as_object_mut() && let Ok(value) = serde_json::to_value(renew) {
+                obj.insert("renew_session_grant".into(), value);
+            }
+        }
+        if let Some(after)=self.legacy_cursor.clone() {
+            if self.legacy_names.is_none() {
+                let (dir,root,machine)=(self.cfg.dir.clone(),self.cfg.root.clone(),self.cfg.name.clone());
+                match crate::rt::blocking(move ||crate::fleet::charter::local_inventory(&dir,&root,&machine)).await {
+                    Ok(Ok(names))=>self.legacy_names=Some(names),
+                    Ok(Err(e))=>tracing::warn!(error=%e,"legacy session name inventory not yet available"),
+                    Err(e)=>tracing::warn!(error=%e,"legacy session name inventory worker unavailable"),
+                }
+            }
+            let room=crate::reach::wire::MAX_MESSAGE.saturating_sub(crate::memory::queue::json_bytes(&request)).saturating_sub(r#","legacy_name_inventory":"#.len());
+            if let Some(names)=&self.legacy_names && let Ok(page)=crate::fleet::charter::inventory_page(names,&after,room)
+                && let Ok(value)=serde_json::to_value(page) && let Some(obj)=request.as_object_mut() {obj.insert("legacy_name_inventory".into(),value);}
+        }
+        self.send_out(AgentMsg::ReachAsk { req, json: request.to_string() }).await;
     }
 
     fn fresh_directory(&self) -> Option<&[RunnerInfo]> {
         self.directory.as_ref().filter(|(at, _)| at.elapsed() < DIRECTORY_TTL).map(|(_, d)| d.as_slice())
     }
 
-    async fn on_answer(&mut self, req: u64, answer: Value) {
+    async fn fetch_name_page(&mut self) {
+        let cursor = self.routes.names.cursor();
+        if !cursor.downloading() || !self.asked.is_empty() { return; }
+        let req = self.next_req;
+        self.next_req = req.wrapping_add(1);
+        let now = Instant::now();
+        self.directory_tried = Some(now);
+        self.asked.insert(req, now);
+        let request = json!({"op":"directory","session_names_only":true,"session_names":cursor});
+        self.send_out(AgentMsg::ReachAsk { req, json: request.to_string() }).await;
+    }
+
+    async fn take_name_page(&self, answer: &mut Value, history: bool) -> bool {
+        let Some(raw) = answer.as_object_mut().and_then(|o| o.remove("session_names")) else { return false; };
+        let routes = self.routes.clone();
+        let mgr = crate::convo::raft::runner_global().filter(|m| m.node_name() == self.cfg.name)
+            .or_else(|| crate::convo::raft::server_global().filter(|m| m.node_name() == self.cfg.name));
+        match crate::rt::blocking(move || routes.names.accept(serde_json::from_value(raw)?, mgr.as_deref(), history)).await {
+            Ok(Ok(next)) => next,
+            result => { tracing::warn!(?result, "could not verify fleet session name page"); false }
+        }
+    }
+
+    async fn on_answer(&mut self, req: u64, mut answer: Value) {
         // A question's answer may carry a run's leased value (`crate::secrets::lessor`), and which one does isn't told
         // apart before here: each one's text made the size it comes to and its tree wiped, and its text where no one
         // is left to take it.
@@ -1951,19 +2159,84 @@ impl Node {
             }
             return;
         }
-        if self.asked.remove(&req).is_none() {
+        if self.asked.remove(&req).is_none() || req < self.last_directory_req {
             return;
         }
-        let runners: Vec<RunnerInfo> = answer.get("runners").cloned().and_then(|r| serde_json::from_value(r).ok()).unwrap_or_default();
+        if answer.get("session_names_only").and_then(Value::as_bool) == Some(true) {
+            self.last_directory_req = req;
+            if self.take_name_page(&mut answer, true).await { self.fetch_name_page().await; }
+            else if !self.waiting.is_empty() { self.fetch_directory().await; }
+            return;
+        }
+        let Some(runners) = answer.get("runners").cloned().and_then(|r| serde_json::from_value::<Vec<RunnerInfo>>(r).ok()) else {
+            tracing::warn!("ignored invalid fleet directory response");
+            return;
+        };
+        self.last_directory_req = req;
+        let cursor=answer.get("need_legacy_names_after").and_then(Value::as_str);
+        let legacy_advanced=cursor.is_some() && self.legacy_cursor.as_deref()!=cursor;
+        self.legacy_cursor=cursor.map(str::to_owned);
+        if self.legacy_cursor.is_none() {self.legacy_names=None;}
+        if let Some(pem)=answer.get("renewed_session_grant").and_then(serde_json::Value::as_str) && let Some(state)=self.cfg.dir.parent() {
+            let (dir,name,root,pem)=(state.to_owned(),self.cfg.name.clone(),self.cfg.root.clone(),pem.to_owned());
+            match crate::rt::blocking(move ||crate::fleet::sessions::save_renewal(&dir,&name,&root,&pem)).await {
+                Ok(Ok(due))=>self.renew_session_after=due,
+                other=>tracing::warn!(error=?other,"could not persist the renewed session grant"),
+            }
+        }
         let server = answer.get("server").cloned().and_then(|s| serde_json::from_value(s).ok());
         self.topo.directory(server, runners.iter().map(|r| (r.name.as_str(), r.topo.as_deref())), crate::util::now_ms());
         self.topo_to_place();
-        self.directory = Some((Instant::now(), runners.clone()));
-        self.sync_quic_peers();
+        let previous = self.directory.replace((Instant::now(), runners.clone()));
+        let bans:Option<crate::fleet::sessions::BansPage> = answer.get("session_revocations").cloned().and_then(|v| serde_json::from_value(v).ok());
+        let next_revocations = bans.as_ref().and_then(crate::fleet::sessions::BansPage::next_cursor);
+        let names_pending = self.take_name_page(&mut answer, false).await;
+        let complete = answer.get("complete").and_then(Value::as_bool) == Some(true);
+        let previous_pins = complete.then(|| self.routes.members());
+        self.sync_quic_peers(bans).await;
+        let connected: std::collections::HashSet<&str> = previous.as_ref().into_iter().flat_map(|(_,peers)|peers).filter(|r|r.connected && !r.stale).map(|r|r.name.as_str()).collect();
+        for r in &runners {
+            if r.connected && !r.stale && r.name!=self.cfg.name && !connected.contains(r.name.as_str()) { self.starts.linked(&r.name); }
+        }
+
+        // A missing local catalog or a failed cache write cannot advance its cursor.
+        // The next scheduled directory refresh retries it without continuously re-reading disk.
+        if legacy_advanced || next_revocations.is_some_and(|next| self.routes.bans_since() == next) {
+            self.fetch_directory().await;
+        } else if names_pending {
+            self.fetch_name_page().await;
+        }
         // Register all connected fleet runners in this node's per-session conversation Raft manager
-        // so conversations led here replicate across every connected peer automatically.
-        if let Some(mgr) = crate::convo::raft::global() {
-            mgr.register_peers(runners.iter().filter(|r| r.connected && r.name != self.cfg.name).map(|r| r.name.clone()));
+        // so conversations led here replicate across every connected peer automatically, and mark
+        // explicitly disconnected peers unreachable so closed-session retirement never wedges.
+        if let Some(mgr) = crate::convo::raft::runner_global().filter(|m| m.node_name() == self.cfg.name)
+            .or_else(||crate::convo::raft::server_global().filter(|m| m.node_name() == self.cfg.name)) {
+            if self.routes.names.needs_install(&mgr) {
+                let (routes, manager) = (self.routes.clone(), mgr.clone());
+                if let Err(e) = crate::rt::blocking(move || routes.names.restore(&manager)).await.and_then(|r| r) {
+                    tracing::warn!(error=%e,"could not restore verified session name history");
+                }
+            }
+            let eligible = |r: &RunnerInfo| !r.stale && crate::proto::feature::speaks(&r.features, crate::proto::feature::CONVO_RAFT) && !r.labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL);
+            mgr.register_members(runners.iter().filter(|r| r.connected && r.name != self.cfg.name && eligible(r)).map(|r| (
+                r.name.clone(), crate::proto::feature::speaks(&r.features,crate::proto::feature::CONVO_RAFT_V2),
+                crate::proto::feature::can_elect(&r.features),
+            )).collect());
+            mgr.note_enrolled(runners.iter().filter(|r| !r.connected && eligible(r)).map(|r| r.name.as_str()));
+            let known: std::collections::HashSet<_> = runners.iter().filter(|r| !r.stale).map(|r| r.name.as_str()).collect();
+            let old = previous.into_iter().flat_map(|(_,rs)|rs.into_iter().map(|r|r.name)).chain(previous_pins.into_iter().flat_map(|ps|ps.into_keys())).collect::<std::collections::HashSet<_>>();
+            for name in old.iter().filter(|n| *n != &self.cfg.name && !known.contains(n.as_str())) {
+                if complete { mgr.forget_member(name); } else { mgr.peer_unreachable(name); }
+                mgr.set_peer_v2(name,false);
+                mgr.set_peer_executor(name,false);
+            }
+            for r in runners.iter().filter(|r| r.name != self.cfg.name) {
+                if (r.connected || r.stale) && !eligible(r) {
+                    mgr.set_peer_v2(&r.name,false);
+                    mgr.set_peer_executor(&r.name,false);
+                }
+                if !r.connected || !eligible(r) { mgr.peer_unreachable(&r.name); }
+            }
         }
         let mut outs = self.place.directory(&runners, crate::util::now_ms());
         // The person's budgets come with it (LB08): none from a server before them.
@@ -1984,20 +2257,48 @@ impl Node {
     }
 
     /// Push the latest known peer fingerprints and direct `hyper-quic` UDP addresses to [`PeerQuic`].
-    fn sync_quic_peers(&self) {
-        let Some(quic) = &self.quic else { return };
-        let mut entries = Vec::new();
-        if let Some((_, runners)) = &self.directory {
-            for r in runners {
-                if !r.connected || r.name == self.cfg.name {
+    async fn sync_quic_peers(&self,bans:Option<crate::fleet::sessions::BansPage>) {
+        use crate::fleet::sessions::Member;
+        let Some((_, runners)) = self.directory.as_ref() else { return };
+        let mut prior = self.routes.members();
+        let mut next = BTreeMap::new();
+        for r in runners {
+            if r.name == self.cfg.name || r.stale { continue; }
+            if !r.connected {
+                // An offline machine stays in the authoritative directory. A removed or stale
+                // machine loses its pin here even if its former address still responds.
+                if let Some(old) = prior.remove(&r.name)
+                    && r.fingerprint.as_ref().is_none_or(|f| f == &old.key)
+                    && self.pins.get(&r.name).is_none_or(|p| p.fingerprint == old.key) {
+                    next.insert(r.name.clone(),old);
                     continue;
                 }
-                let Ok(fp) = self.expected(&r.name) else { continue };
-                let addrs: Vec<std::net::SocketAddr> = r.quic_addrs.iter().filter_map(|s| s.parse().ok()).collect();
-                entries.push(super::quic::PeerEntry { name: r.name.clone(), fingerprint: fp, addrs });
-            }
+                // This process has not met the offline member yet. The authenticated
+                // directory can still carry the reach pin and capabilities observed earlier.
+                if r.fingerprint.is_none() || !crate::proto::feature::speaks(&r.features,crate::proto::feature::CONVO_RAFT) { continue; }
+            } else if !r.reach && !crate::proto::feature::speaks(&r.features, crate::proto::feature::SESSION_LINK_ONLY) { continue; }
+            if r.fingerprint.is_none() { continue; }
+            let Ok(key) = self.expected(&r.name) else { continue };
+            let mut addrs: Vec<std::net::SocketAddr> = r.quic_addrs.iter().filter_map(|s| s.parse().ok()).collect();
+            addrs.sort_unstable();
+            addrs.dedup();
+            let v2 = crate::proto::feature::speaks(&r.features, crate::proto::feature::CONVO_RAFT_V2);
+            let raft = crate::proto::feature::speaks(&r.features, crate::proto::feature::CONVO_RAFT) && !r.labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL);
+            let executor = raft && crate::proto::feature::speaks(&r.features, crate::proto::feature::CONVO_EXECUTOR);
+            let mut aliases:Vec<_> = r.was.iter().chain(r.label.iter()).chain(std::iter::once(&r.hostname)).filter(|a| !a.is_empty() && *a != &r.name).cloned().collect();
+            aliases.sort_unstable();
+            aliases.dedup();
+            let liveness = crate::proto::feature::speaks(&r.features, crate::proto::feature::CONVO_LIVENESS);
+            let charter = executor && crate::proto::feature::speaks(&r.features, crate::proto::feature::CONVO_NAME_CHARTER);
+            next.insert(r.name.clone(),Member { aliases, key, addrs, v2, raft, executor, charter, liveness, authority_mail: crate::proto::feature::speaks(&r.features,crate::proto::feature::AUTHORITY_MAIL), starts:crate::proto::feature::speaks(&r.features,crate::proto::feature::SESSION_STARTS) });
         }
-        quic.update_peers(entries);
+        let routes = Arc::clone(&self.routes);
+        if let Err(e) = crate::rt::blocking(move || routes.replace(next,bans)).await.and_then(|r| r) {
+            tracing::error!(error=%e,"could not persist fleet membership");
+            if let Some(quic)=&self.quic{quic.update_peers(Vec::new());}
+            return;
+        }
+        if let Some(quic)=&self.quic{quic.update_peers(self.routes.entries());}
     }
 
     /// The key a runner must present: its pin, else the directory's. An error when the two
@@ -2140,7 +2441,7 @@ impl Node {
                     for (id, s) in p.adopts.drain() {
                         let _ = s.try_send(Say::Adopted { id, error: Some(format!("interrupted: {why}")) });
                     }
-                    for (_, reply) in p.harness_sends.drain() {
+                    for (_, (reply, _room)) in p.harness_sends.drain() {
                         let _ = reply.send(Err(anyhow::anyhow!("reach link closed: {why}")));
                     }
                 }
@@ -2216,6 +2517,7 @@ impl Node {
         if ready && !l.pinned {
             l.pinned = true;
             let (peer, fp) = (l.peer.clone(), l.fingerprint.clone());
+            if matches!(l.role,Role::Doer){self.starts.linked(&peer);}
             if let Trust::First = self.pins.check(&peer, &fp) {
                 tracing::info!(runner = %peer, fingerprint = %e2e::short(&fp), "pinned a runner's reach key");
             }
@@ -2345,7 +2647,7 @@ impl Node {
             for (id, s) in p.adopts.drain() {
                 let _ = s.send(Say::Adopted { id, error: Some(format!("interrupted: {why}")) }).await;
             }
-            for (_, reply) in p.harness_sends.drain() {
+            for (_, (reply, _room)) in p.harness_sends.drain() {
                 let _ = reply.send(Err(anyhow::anyhow!("{why}")));
             }
         }
@@ -2396,6 +2698,10 @@ impl Node {
     }
 
     async fn on_say(&mut self, link: &str, s: Say) {
+        if self.cfg.sessions_only && !matches!(s, Say::Welcome { .. } | Say::Refused { .. } | Say::Features { .. } | Say::Unread { .. } | Say::Pong { .. } | Say::HarnessSaid { .. } | Say::ConvoRaft { .. }) {
+            self.drop_link(link, "unexpected reply on a session-only fleet link", true).await;
+            return;
+        }
         let Some(name) = self.links.get(link).map(|l| l.peer.clone()) else { return };
         // An answer owed: its round trip measured, its deadline met (LB03).
         let now = crate::util::now_ms();
@@ -2431,7 +2737,7 @@ impl Node {
                         let _ = f.says.send(Say::Exit { id, code: None, signal: None, error: Some(format!("{name} no longer has this run (its runner restarted)")), end: f.got, lost: 0 }).await;
                     }
                 }
-                if negotiates && self.say_on(link, &Ask::Features { names: crate::proto::feature::all() }).await {
+                if negotiates && self.say_on(link, &Ask::Features { names: self.cfg.link_features(self.quic.as_ref().is_some_and(|q| q.has_liveness())) }).await {
                     self.detect.owe(&name, "features", crate::util::now_ms());
                 }
                 let outs = self.place.runner_link(&name, true, crate::util::now_ms());
@@ -2587,16 +2893,19 @@ impl Node {
             }
             // Reply to a relayed P2P harness message forward (`proto::feature::P2P_MAIL`).
             Say::HarnessSaid { id, json } => {
-                if let Some(tx) = self.peers.get_mut(&name).and_then(|p| p.harness_sends.remove(&id)) {
+                if let Some((tx, _room)) = self.peers.get_mut(&name).and_then(|p| p.harness_sends.remove(&id)) {
                     let reply = serde_json::from_str::<wire::P2pSendReply>(&json).unwrap_or_else(|e| wire::P2pSendReply::Error { why: format!("malformed reply: {e}") });
                     let _ = tx.send(Ok(reply));
                 }
             }
             // Per-session conversation Raft message from `name` (`proto::feature::CONVO_RAFT`).
-            Say::ConvoRaft { session, from, bytes } => {
-                if let Some(tx) = &self.cfg.convo_raft {
-                    let sender = if from.is_empty() { name.clone() } else { from };
-                    let _ = tx.try_send(super::quic::ConvoRaftIn { from: sender, session, bytes });
+            // Always bind sender to the mTLS/pinned authenticated reach peer `name`, never the
+            // untrusted `from` string inside `Say::ConvoRaft`.
+            Say::ConvoRaft { session, bytes, .. } => {
+                if let Some(tx) = &self.cfg.convo_raft
+                    && let Some(room) = super::quic::ReadRoom::take(&self.relay_incoming, bytes.capacity().saturating_add(session.capacity()).saturating_add(std::mem::size_of::<super::quic::ConvoRaftIn>()))
+                {
+                    let _ = tx.try_send(super::quic::ConvoRaftIn { from: name.clone(), session, bytes, _room: Some(room) });
                 }
             }
         }
@@ -2651,6 +2960,10 @@ impl Node {
     }
 
     async fn on_ask(&mut self, link: &str, a: Ask) {
+        if !self.cfg.accepts_word(&a) {
+            self.drop_link(link, "this fleet endpoint accepts only session traffic", true).await;
+            return;
+        }
         let Some((peer, session)) = self.links.get(link).map(|l| (l.peer.clone(), l.session.clone())) else { return };
         if let Ask::Hello { version, session, resume } = a {
             // Any version from the oldest up to this runner's: the link runs at the asker's.
@@ -2789,7 +3102,7 @@ impl Node {
                 if let Some(s) = self.served.get_mut(&key) {
                     s.features = names;
                 }
-                self.say_on(link, &Say::Features { names: crate::proto::feature::all() }).await;
+                self.say_on(link, &Say::Features { names: self.cfg.link_features(self.quic.as_ref().is_some_and(|q| q.has_liveness())) }).await;
             }
             // An owner's word to this runner's admission (docs/needs.md E5): only from an asker
             // that said `place` on this link, as only it is answered.
@@ -2830,10 +3143,17 @@ impl Node {
                 if let Some(tx) = self.cfg.harness_send.clone() {
                     let (rtx, rrx) = oneshot::channel();
                     let from = key.0.clone();
-                    if tx.try_send(super::quic::HarnessSendAsk { from, session, epoch, json, reply: rtx }).is_ok() {
+                    let retained = json.capacity().saturating_add(session.capacity()).saturating_add(from.capacity()).saturating_add(std::mem::size_of::<super::quic::HarnessSendAsk>());
+                    if let Some(room) = super::quic::ReadRoom::take(&self.relay_incoming, retained)
+                        && tx.try_send(super::quic::HarnessSendAsk { from, session, epoch, json, reply: rtx, _room: Some(room) }).is_ok()
+                    {
                         let (node_tx, key) = (self.tx.clone(), key);
                         crate::rt::spawn(async move {
-                            let reply = rrx.await.unwrap_or_else(|_| wire::P2pSendReply::Error { why: "target runner dropped send".into() });
+                            let reply = match crate::rt::timeout(super::quic::REQUEST_WAIT, rrx).await {
+                                Ok(Ok(reply)) => reply,
+                                Ok(Err(_)) => wire::P2pSendReply::Error { why: "target runner dropped send".into() },
+                                Err(_) => wire::P2pSendReply::Error { why: "target receipt timed out; retry with the same message id".into() },
+                            };
                             let _ = node_tx.send(In::HarnessSaid { key, id, reply }).await;
                         });
                     } else {
@@ -2846,10 +3166,13 @@ impl Node {
                 }
             }
             // Per-session conversation Raft message (`proto::feature::CONVO_RAFT`).
-            Ask::ConvoRaft { session, from, bytes } => {
-                if let Some(tx) = &self.cfg.convo_raft {
-                    let sender = if from.is_empty() { key.0 } else { from };
-                    let _ = tx.try_send(super::quic::ConvoRaftIn { from: sender, session, bytes });
+            // Always bind sender to the mTLS/pinned authenticated reach peer `key.0`, never the
+            // untrusted `from` string inside `Ask::ConvoRaft`.
+            Ask::ConvoRaft { session, bytes, .. } => {
+                if let Some(tx) = &self.cfg.convo_raft
+                    && let Some(room) = super::quic::ReadRoom::take(&self.relay_incoming, bytes.capacity().saturating_add(session.capacity()).saturating_add(std::mem::size_of::<super::quic::ConvoRaftIn>()))
+                {
+                    let _ = tx.try_send(super::quic::ConvoRaftIn { from: key.0, session, bytes, _room: Some(room) });
                 }
             }
         }
@@ -3287,8 +3610,20 @@ impl Node {
                 });
                 let _ = reply.send(links.collect());
             }
-            Local::Directory { reply } => {
-                if let Some(d) = self.fresh_directory() {
+            Local::ServerDirectory{runners,reply}=>{
+                // Resolving a start must not postpone the ordinary directory/charter/revocation refresh.
+                let at=self.directory.as_ref().map_or_else(Instant::now,|(at,_)|*at);
+                let old=self.directory.replace((at,runners));
+                self.sync_quic_peers(None).await;
+                let connected:std::collections::HashSet<_>=old.as_ref().into_iter().flat_map(|(_,rs)|rs).filter(|r|r.connected&&!r.stale).map(|r|r.name.as_str()).collect();
+                if let Some((_,runners))=&self.directory {
+                    for r in runners.iter().filter(|r|r.connected&&!r.stale && r.name!=self.cfg.name && !connected.contains(r.name.as_str())){self.starts.linked(&r.name);}
+                }
+                if old.is_none() && self.server{self.fetch_directory().await;}
+                let _=reply.send(());
+            }
+            Local::Directory { missing,reply } => {
+                if let Some(d) = self.fresh_directory() && missing.as_ref().is_none_or(|name|d.iter().any(|r|r.name==*name || r.label.as_ref()==Some(name) || r.hostname==*name || r.was.contains(name))) {
                     let _ = reply.send(Ok(d.to_vec()));
                     return;
                 }
@@ -3524,24 +3859,31 @@ impl Node {
                 p.adopts.insert(id, says);
                 let _ = reply.send(id);
             }
-            Local::HarnessSend { peer, session, epoch, json, reply } => {
+            Local::CancelHarness(peer) => {
+                if let Some(p) = self.peers.get_mut(&peer) { p.harness_sends.retain(|_,(r,_)| !r.is_canceled()); }
+            }
+            Local::HarnessSend { peer, session, epoch, json, reply, room } => {
                 if peer == self.cfg.name {
                     let _ = reply.send(Err(anyhow::anyhow!("cannot forward harness message to self")));
                     return;
                 }
-                let p = self.peers.entry(peer.clone()).or_insert_with(Peer::new);
+                if reply.is_canceled() { return; }
+                let Some(p) = self.peers.get_mut(&peer) else { let _ = reply.send(Err(anyhow::anyhow!("relay is unavailable"))); return };
+                let Some(link) = p.link.clone().filter(|_| p.state == PeerState::Ready) else { let _ = reply.send(Err(anyhow::anyhow!("relay is unavailable"))); return };
                 let id = p.next_id;
-                p.next_id += 1;
-                p.harness_sends.insert(id, reply);
-                self.send_or_queue(&peer, Ask::HarnessSend { id, session, epoch, json }).await;
+                p.next_id = id.wrapping_add(1);
+                p.harness_sends.insert(id, (reply, room));
+                if !self.say_on(&link, &Ask::HarnessSend { id, session, epoch, json }).await && let Some((tx, _room)) = self.peers.get_mut(&peer).and_then(|p| p.harness_sends.remove(&id)) {
+                    let _ = tx.send(Err(anyhow::anyhow!("relay write was not confirmed")));
+                }
             }
-            Local::ConvoRaft { peer, session, bytes } => {
+            Local::ConvoRaft { peer, session, bytes, room: _room } => {
                 if peer == self.cfg.name {
                     return;
                 }
                 let from = self.cfg.name.clone();
-                if self.peers.get(&peer).is_some_and(|p| p.state == PeerState::Ready) {
-                    self.send_or_queue(&peer, Ask::ConvoRaft { session, from, bytes }).await;
+                if let Some(link) = self.peers.get(&peer).filter(|p| p.state == PeerState::Ready).and_then(|p| p.link.clone()) {
+                    self.say_on(&link, &Ask::ConvoRaft { session, from, bytes }).await;
                     return;
                 }
                 // Reuse an existing inbound link from `peer` if it speaks `convo-raft`.
@@ -3555,10 +3897,12 @@ impl Node {
                     return;
                 }
                 self.peers.entry(peer.clone()).or_insert_with(Peer::new);
-                self.send_or_queue(&peer, Ask::ConvoRaft { session, from, bytes }).await;
+                // Raft retransmits from its WAL. Keeping old heartbeats and snapshots while
+                // the link is down would retain unbounded data and replay stale terms on reconnect.
+                self.ensure_link(&peer).await;
             }
             Local::KnownPeers { reply } => {
-                let mut set = std::collections::BTreeSet::new();
+                let mut set: std::collections::BTreeSet<_> = self.routes.members().into_keys().collect();
                 if let Some((_, runners)) = &self.directory {
                     for r in runners {
                         if r.connected && r.name != self.cfg.name {
@@ -3665,7 +4009,7 @@ impl Node {
         // A refused commit of placement's records, at its back-off's end: the batch the timer's
         // input makes flushes, and its flush commits ([`Node::place_commit`]).
         let commit = self.refusals.and_then(|r| r.due());
-        asked.chain(queries).chain(waiting).chain(links).chain(peers).chain(served).chain(commit).min()
+        asked.chain(queries).chain(waiting).chain(links).chain(peers).chain(served).chain(commit).chain(self.session_directory_due(now)).min()
     }
 
     /// What came due ([`Node::due`] says when; goal 9), each item at or past its own time: questions
@@ -3675,6 +4019,7 @@ impl Node {
         let now = Instant::now();
         // Questions and waits that went unanswered.
         self.asked.retain(|_, at| !came(directory_due(*at), now));
+        if came(self.session_directory_due(now), now) { self.fetch_directory().await; }
         let late: Vec<u64> = self.queries.iter().filter(|(_, (at, _))| came(query_due(*at), now)).map(|(r, _)| *r).collect();
         for r in late {
             if let Some((_, reply)) = self.queries.remove(&r) {
@@ -3982,6 +4327,22 @@ fn object_window(store: Option<&crate::runner::work::store::Store>, repo: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn w21_r15_embedded_peer_serves_session_operations_without_placement_or_generic_execution() -> anyhow::Result<()> {
+        use crate::proto::feature as f;
+        let state = tempfile::tempdir()?;
+        let cfg = Config { sessions_only: true, session_executor: true, ..Config::for_runner("server", state.path(), true) };
+        let announced = cfg.link_features(true);
+        assert!(f::speaks(&announced, f::SESSION_STARTS) && f::speaks(&announced, f::SESSION_LINK_ONLY));
+        assert!(f::can_elect(&announced));
+        assert!(!f::speaks(&announced, f::PLACE));
+        assert!(cfg.accepts_word(&Ask::HarnessSend { id: 1, session: String::new(), epoch: None, json: String::new() }));
+        assert!(cfg.accepts_word(&Ask::ConvoRaft { from: "peer".into(), session: "s".into(), bytes: vec![] }));
+        assert!(!cfg.accepts_word(&Ask::Place { json: "{}".into() }));
+        assert!(!cfg.accepts_word(&Ask::Stdin { id: 1, data: vec![] }));
+        Ok(())
+    }
 
     /// A run done for another runner as the node records it: `pid` its process once up, `detached`
     /// one its asker may never come back for, its asker last taking output at `taken`.

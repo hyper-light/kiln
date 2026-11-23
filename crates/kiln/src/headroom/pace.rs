@@ -470,16 +470,17 @@ fn run(sh: &Shared<'_>, p: &Paced) {
                 if throttled.get(dir).is_some_and(|(s, _)| *s == *share) {
                     continue;
                 }
-                if let Some(key) = imp::soft_throttle_key(dir) {
+                if let Some(key) = imp::soft_throttle_key(dir, *share, throttled.get(dir).map(|(_, k)| k.as_str())) {
                     let mine = listed.entry(dir.clone()).or_default();
                     if !mine.contains(&key) {
+                        if let Some((_, old)) = throttled.get(dir) { mine.remove(old); }
                         mine.insert(key.clone());
                         if !tell(&mut guard, &listed, p) {
                             unheard = true;
                             break;
                         }
                     }
-                    if imp::apply_soft_throttle(dir, *share) {
+                    if imp::apply_soft_throttle(dir, *share, &key) {
                         if let Some(keys) = held.remove(dir) {
                             keys.iter().for_each(|k| imp::release(k));
                         }
@@ -621,8 +622,15 @@ fn tell(guard: &mut Option<Guard>, listed: &HashMap<PathBuf, BTreeSet<String>>, 
         let _ = std::fs::remove_file(&p.record);
     } else {
         let rec = Record { owner: Some(p.me), guard: guard.as_ref().and_then(|g| g.proc), stopped: all.into_iter().cloned().collect() };
-        if let Err(e) = crate::util::write_secret_unsynced(&p.record, &serde_json::to_vec(&rec).unwrap_or_default(), 0o644) {
-            tracing::warn!(error = %e, "headroom: couldn't note what is paced");
+        let Ok(data) = serde_json::to_vec(&rec) else { return false };
+        let saved = if rec.stopped.iter().any(|key| key.starts_with("cpumax2:")) {
+            crate::util::write_secret(&p.record, &data, 0o600).and_then(|()| p.record.parent().map_or(Ok(()), crate::blobs::chunks::sync_dir))
+        } else {
+            crate::util::write_secret_unsynced(&p.record, &data, 0o644)
+        };
+        if let Err(e) = saved {
+            tracing::warn!(error = %e, "headroom: couldn't record recovery before pacing");
+            return false;
         }
     }
     heard
@@ -768,6 +776,13 @@ pub fn guard(record: &Path) -> std::process::ExitCode {
             read_lists(&tx);
             last = rx.try_iter().filter_map(|w| if let Word::List(l) = w { Some(l) } else { None }).last().unwrap_or_default();
         }
+    }
+    // The pacer can die immediately after persisting a new quota transaction, before its
+    // last complete pipe message is consumed. Verify that the record still names this guard.
+    let durable = std::fs::read(record).ok().and_then(|raw| serde_json::from_slice::<Record>(&raw).ok());
+    if let Some(rec) = durable {
+        if rec.guard.is_some() && rec.guard != Proc::me() { return std::process::ExitCode::SUCCESS; }
+        last.extend(rec.stopped.into_iter().filter(|k| k.starts_with("cpumax2:")));
     }
     last.iter().for_each(|k| imp::release(k));
     let _ = std::fs::remove_file(record);
@@ -1099,37 +1114,132 @@ mod imp {
         keys.iter().filter(|k| freeze(Path::new(k), true).is_ok()).cloned().collect()
     }
 
-    /// Guard key for smooth cgroup v2 `cpu.max` bandwidth throttling when available.
-    pub fn soft_throttle_key(dir: &Path) -> Option<String> {
-        if ELSEWHERE.lock().contains(dir) || !dir.join("cpu.max").exists() {
-            return None;
-        }
-        Some(format!("cpumax:{}", dir.display()))
+    use super::cpu_quota::CpuLimit;
+
+    pub fn soft_throttle_key(dir: &Path, share: u8, previous: Option<&str>) -> Option<String> {
+        if ELSEWHERE.lock().contains(dir) { return None; }
+        super::cpu_quota::key(dir, share, previous)
     }
 
-    /// Smoothly throttles a cgroup v2 group via `cpu.max` (`<quota_us> 100000`) instead of freezing
-    /// processes with `cgroup.freeze`, so demanding builds make continuous progress without lock or
-    /// pipe stalls.
-    pub fn apply_soft_throttle(dir: &Path, share_pct: u8) -> bool {
-        if ELSEWHERE.lock().contains(dir) || share_pct == 0 || share_pct >= 100 {
-            return false;
-        }
-        const PERIOD_US: u64 = 100_000;
-        let cpus = std::thread::available_parallelism().map(std::num::NonZero::get).unwrap_or(1) as u64;
-        let quota_us = (cpus.saturating_mul(PERIOD_US).saturating_mul(u64::from(share_pct)) / 100).max(1_000);
-        fs::write(dir.join("cpu.max"), format!("{quota_us} {PERIOD_US}")).is_ok()
+    pub fn apply_soft_throttle(_dir: &Path, _share: u8, key: &str) -> bool {
+        CpuLimit::decode(key).is_some_and(|limit| limit.change(false).is_ok())
     }
 
     pub fn release(key: &str) {
-        if let Some(path) = key.strip_prefix("cpumax:") {
-            if !ELSEWHERE.lock().contains(Path::new(path)) {
-                let _ = fs::write(Path::new(path).join("cpu.max"), "max 100000");
-            }
+        if let Some(limit) = CpuLimit::decode(key) {
+            if let Err(e) = limit.change(true) { tracing::warn!(error = %e, "headroom: restoring CPU quota"); }
             return;
         }
+        if key.starts_with("cpumax:") || key.starts_with("cpumax2:") { return; }
         if !ELSEWHERE.lock().contains(Path::new(key)) {
             let _ = freeze(Path::new(key), false);
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", all(unix, test)))]
+mod cpu_quota {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// W05-R03. The independent guard and the restart record both receive the exact
+    /// previous setting before a write. A reused path or a later external setting is left alone.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    pub(super) struct CpuLimit {
+        dir: PathBuf,
+        device: u64,
+        inode: u64,
+        original: String,
+        previous: String,
+        intended: String,
+    }
+
+    impl CpuLimit {
+        pub(super) fn decode(key: &str) -> Option<Self> { serde_json::from_str(key.strip_prefix("cpumax2:")?).ok() }
+
+        fn matches(&self, meta: &fs::Metadata) -> bool {
+            use std::os::unix::fs::MetadataExt as _;
+            meta.dev() == self.device && meta.ino() == self.inode
+        }
+
+        pub(super) fn change(&self, restore: bool) -> std::io::Result<()> {
+            use std::io::{Read as _, Seek as _, Write as _};
+            let mut file = fs::OpenOptions::new().read(true).write(true).open(self.dir.join("cpu.max"))?;
+            if !self.matches(&file.metadata()?) { return Err(std::io::Error::other("cgroup changed")); }
+            let mut value = String::new();
+            let bytes_read = file.read_to_string(&mut value)?;
+            let value = value.trim();
+            let replacement = if restore {
+                if value != self.intended && value != self.previous { return Ok(()); }
+                &self.original
+            } else {
+                if value != self.previous { return Err(std::io::Error::other("cgroup quota changed")); }
+                &self.intended
+            };
+            file.rewind()?;
+            file.write_all(replacement.as_bytes())?;
+            // A kernfs attribute accepts one complete command and may report a synthetic file
+            // size. Only a backing file with actual trailing bytes needs truncation.
+            if bytes_read > replacement.len() && file.metadata()?.len() == bytes_read as u64 { file.set_len(replacement.len() as u64)?; }
+            Ok(())
+        }
+    }
+
+    pub(super) fn key(dir: &Path, share: u8, previous: Option<&str>) -> Option<String> {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = dir.join("cpu.max");
+        let meta = fs::metadata(&path).ok()?;
+        let current = fs::read_to_string(&path).ok()?.trim().to_owned();
+        let original = if let Some(prev) = previous.and_then(CpuLimit::decode) {
+            if !prev.matches(&meta) || current != prev.intended { return None; }
+            prev.original
+        } else { current.clone() };
+        let (quota, period) = original.split_once(' ')?;
+        let period = period.parse::<u64>().ok().filter(|p| *p > 0)?;
+        let cpus = fs::read_to_string(dir.join("cpuset.cpus.effective")).ok()
+            .and_then(|s| crate::os::cpu_list(s.trim()).ok()).map(|c| c.len()).filter(|n| *n > 0)
+            .or_else(|| std::thread::available_parallelism().ok().map(std::num::NonZero::get))?;
+        let mut capacity = (cpus as u64).saturating_mul(period);
+        if quota != "max" { capacity = capacity.min(quota.parse().ok()?); }
+        for parent in dir.ancestors().skip(1) {
+            let Ok(limit) = fs::read_to_string(parent.join("cpu.max")) else { break };
+            let (q, p) = limit.trim().split_once(' ')?;
+            if q != "max" {
+                capacity = capacity.min(q.parse::<u64>().ok()?.saturating_mul(period).checked_div(p.parse().ok()?)?);
+            }
+        }
+        // Linux CFS bandwidth requires a quota of at least 1 ms.
+        let target = (capacity.saturating_mul(u64::from(share)) / 100).max(1000);
+        let rec = CpuLimit { dir: dir.into(), device: meta.dev(), inode: meta.ino(), original, previous: current, intended: format!("{target} {period}") };
+        Some(format!("cpumax2:{}", serde_json::to_string(&rec).ok()?))
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn w05_r03_preserves_quota_period_and_external_changes() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let group = root.path().join("group");
+        fs::create_dir(&group)?;
+        fs::write(root.path().join("cpu.max"), "6000 100000")?;
+        let file = group.join("cpu.max");
+        fs::write(&file, "5000 50000")?;
+        fs::write(group.join("cpuset.cpus.effective"), "0-3")?;
+        let first = key(&group, 50, None).ok_or_else(|| anyhow::anyhow!("no first throttle"))?;
+        let limit = CpuLimit::decode(&first).ok_or_else(|| anyhow::anyhow!("malformed quota record"))?;
+        limit.change(false)?;
+        assert_eq!(fs::read_to_string(&file)?, "1500 50000");
+        let second = key(&group, 40, Some(&first)).and_then(|v| CpuLimit::decode(&v)).ok_or_else(|| anyhow::anyhow!("no second throttle"))?;
+        second.change(false)?;
+        second.change(true)?;
+        assert_eq!(fs::read_to_string(&file)?, "5000 50000");
+        limit.change(false)?;
+        fs::write(&file, "4000 50000")?;
+        limit.change(true)?;
+        assert_eq!(fs::read_to_string(&file)?, "4000 50000");
+        fs::rename(&file, group.join("old"))?;
+        fs::write(&file, "1500 50000")?;
+        assert!(limit.change(true).is_err());
+        Ok(())
     }
 }
 
@@ -1216,28 +1326,28 @@ mod imp {
 
     /// Smooth kernel CPU rate-cap key on Windows (Job Object `HARD_CAP`); none on macOS.
     #[cfg(windows)]
-    pub fn soft_throttle_key(dir: &Path) -> Option<String> {
+    pub fn soft_throttle_key(dir: &Path, _share: u8, _previous: Option<&str>) -> Option<String> {
         let d = dir.to_str()?;
         let session = d.strip_prefix(TOOLS).or_else(|| d.strip_prefix(SESSION))?;
         Some(format!("winjob:{session}"))
     }
 
     #[cfg(not(windows))]
-    pub fn soft_throttle_key(_dir: &Path) -> Option<String> {
+    pub fn soft_throttle_key(_dir: &Path, _share: u8, _previous: Option<&str>) -> Option<String> {
         None
     }
 
     /// Applies Windows Job Object `JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP` so demanding builds slow
     /// smoothly in kernel space without suspending any thread (`SuspendThread`).
     #[cfg(windows)]
-    pub fn apply_soft_throttle(dir: &Path, share_pct: u8) -> bool {
+    pub fn apply_soft_throttle(dir: &Path, share_pct: u8, _key: &str) -> bool {
         let Some(d) = dir.to_str() else { return false };
         let Some(session) = d.strip_prefix(TOOLS).or_else(|| d.strip_prefix(SESSION)) else { return false };
         crate::os::contain::set_cpu_cap(session, Some(share_pct))
     }
 
     #[cfg(not(windows))]
-    pub fn apply_soft_throttle(_dir: &Path, _share_pct: u8) -> bool {
+    pub fn apply_soft_throttle(_dir: &Path, _share_pct: u8, _key: &str) -> bool {
         false
     }
 

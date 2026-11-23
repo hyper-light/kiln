@@ -98,7 +98,9 @@ async fn lab3() -> anyhow::Result<Lab3> {
             capacity: None,
             harness_send: None,
             convo_raft: None,
-            direct_quic: false,
+            sessions_only: false,
+            session_executor: true,
+        direct_quic: false,
         };
         let (h, out) = node::start(cfg)?;
         nodes.insert(name, h);

@@ -29,6 +29,8 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
 
 mod batched;
 #[cfg(any(target_os = "linux", test))]
@@ -323,10 +325,15 @@ impl UdpSocket {
     /// to one, a listener. `None` where the platform does not say, or on the simulation fabric.
     pub fn path_payload_to(&self, remote: SocketAddr) -> Result<Option<u16>, RtError> {
         match &self.inner {
-            Inner::Real { .. } => {
+            Inner::Real { socket } => {
                 let asked = netsys::dgram_socket(Family::of(remote))?;
                 netsys::connect(&asked, remote)?;
-                netsys::path_payload(&asked)
+                let path = netsys::path_payload(&asked)?;
+                #[cfg(target_os = "macos")]
+                let path = Some(path.unwrap_or(u16::MAX).min(netsys::source_payload_room(socket)?));
+                #[cfg(not(target_os = "macos"))]
+                let _ = socket;
+                Ok(path)
             }
             Inner::Sim { .. } => Ok(None),
             Inner::Moved => Err(moved()),
@@ -478,11 +485,15 @@ impl UdpSocket {
 
     /// One non-blocking receive.
     fn recv_once(&self, buf: &mut [u8]) -> Result<Outcome<(usize, SocketAddr)>, RtError> {
+        Ok(self.outcome(self.recv_observed(buf)?))
+    }
+
+    fn recv_observed(&self, buf: &mut [u8]) -> Result<netsys::Io<(usize, SocketAddr)>, RtError> {
         match &self.inner {
-            Inner::Real { socket } => Ok(self.outcome(netsys::recv_from(socket, buf)?)),
+            Inner::Real { socket } => netsys::recv_from(socket, buf),
             Inner::Sim { index, .. } => Ok(crate::sim::sim_recv(*index, buf)
-                .map_or(Outcome::NotNow, |(n, from)| {
-                    Outcome::Done((n, SocketAddr::from((Ipv4Addr::LOCALHOST, from))))
+                .map_or(netsys::Io::WouldBlock, |(n, from)| {
+                    netsys::Io::Ready((n, SocketAddr::from((Ipv4Addr::LOCALHOST, from))))
                 })),
             Inner::Moved => Err(moved()),
         }

@@ -1,0 +1,49 @@
+Subject: Record the shared observed peer incarnation patch
+Why: Quiver uses the same hyper-raft detector as Kiln, including its record of the last accepted peer incarnation.
+
+diff --git a/vendor/patches/hyper-raft/0010-expose-the-observed-peer-incarnation.patch b/vendor/patches/hyper-raft/0010-expose-the-observed-peer-incarnation.patch
+new file mode 100644
+index 0000000000000000000000000000000000000000..8459b3fe56b432d7a95121bb8683cf6456a96051
+--- /dev/null
++++ b/vendor/patches/hyper-raft/0010-expose-the-observed-peer-incarnation.patch
+@@ -0,0 +1,40 @@
++Subject: Expose the observed peer incarnation
++Why: AD-1 binds a quorum of process-loss reports to the same execution-owner incarnation before transferring a session.
++
++diff --git a/crates/hyper-liveness/src/lib.rs b/crates/hyper-liveness/src/lib.rs
++index 4b3eb6ee7895b553e423b53cf541059cf86e3aa2..10ee89d41d8dbe6aa8ef2f4c243b8f7f099b060d 100644
++--- a/crates/hyper-liveness/src/lib.rs
+++++ b/crates/hyper-liveness/src/lib.rs
++@@ -1249,6 +1249,16 @@ impl Liveness {
++             .map(|pair| pair.trust_at(&local, self.judged_ns))
++     }
++ 
+++    /// The local incarnation, or the incarnation from the last accepted heartbeat of `peer`.
+++    /// An attached peer from which no heartbeat has arrived has no observed incarnation.
+++    pub fn observed_run(&self, peer: PeerId) -> Option<u64> {
+++        if peer == self.local {
+++            Some(self.run)
+++        } else {
+++            self.pairs.get(&peer).and_then(Pair::observed_run)
+++        }
+++    }
+++
++     /// Whether `peer`'s run announced its stop and no heartbeat of its next run has come
++     /// ([`Change::Stopped`]): what an owner tells a core it gives the peer anew
++     /// (`RawNode::stopped`).
++diff --git a/crates/hyper-liveness/src/pair.rs b/crates/hyper-liveness/src/pair.rs
++index bd26da7ad983f3eb3c012c426a149c37088ed788..cfac17edc11a44a9d323299d64c8c7f9d07e732e 100644
++--- a/crates/hyper-liveness/src/pair.rs
+++++ b/crates/hyper-liveness/src/pair.rs
++@@ -607,6 +607,11 @@ impl Pair {
++         self.stream.next.map(|(_, due)| due)
++     }
++ 
+++    /// The last incarnation accepted from this peer.
+++    pub(crate) fn observed_run(&self) -> Option<u64> {
+++        self.received.run
+++    }
+++
++     /// Whether the peer's run taken last announced its stop.
++     pub(crate) fn stopped(&self) -> bool {
++         self.received.stopped

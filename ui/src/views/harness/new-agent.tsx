@@ -801,6 +801,7 @@ export function NewAgentLoading({ text }: { text: string }) {
 function ManyLine({ start, onOpen }: { start: Start; onOpen: (id: string) => void }) {
   const first = start.started?.[0]?.id ?? start.ids[0];
   const what = `${start.ids.length} ${start.kindName} agents on ${start.machine}`;
+  if (start.state === "held") return <p role="status">{start.why}</p>;
   if (start.state === "failed") {
     const some = start.started?.length ?? 0;
     return (

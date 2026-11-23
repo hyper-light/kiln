@@ -8,6 +8,7 @@ pub mod copies;
 pub mod custody;
 pub mod directory;
 pub mod e2e;
+pub(crate) mod heartbeat;
 pub mod history;
 pub mod keep;
 pub mod keeper;
@@ -52,6 +53,9 @@ pub(crate) fn codex_tool_timeout_sec() -> u64 {
 pub enum Question {
     /// The runners it may reach, and their identities.
     Directory,
+    /// An enrolled session operator requests canonical placement at the original fleet API.
+    SessionPlacement { key:String, agents:bool, body:serde_json::Value, expires:i64, proof:String },
+
     /// kiln's operations and skills, for an agent session's MCP server (`crate::mcp::runner_ask`),
     /// or a person's kiln shell (`terminal`).
     Registry {

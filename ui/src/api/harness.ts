@@ -476,7 +476,13 @@ export function kindsByTarget(read: Record<string, KindInfo[]> | SharedKinds): R
 }
 
 /** What `agents.start` answers: its agents, briefly; `queued`, the words of a start that waits for room on its machine. */
+export interface StartSlot {
+  id: string;
+  outcome: "started" | "forwarded" | "held" | "refused";
+  why: string;
+}
 interface StartAnswer {
+  slots?: StartSlot[];
   agents: { id: string }[];
   parent?: string | null;
   queued?: string;
@@ -510,7 +516,11 @@ const QUEUED_MS = 10 * 60_000;
 
 /** The agents `answer` started, each read whole; one that waits for room is read under its id once it has started there. */
 async function startedOf(answer: StartAnswer, ids: string[]): Promise<AgentInfo[]> {
-  const wanted = answer.agents.length > 0 ? answer.agents.map((a) => a.id) : ids;
+  const wanted = answer.slots
+    ? answer.slots.filter((slot) => slot.outcome === "started" || slot.outcome === "forwarded").map((slot) => slot.id)
+    : answer.agents.length > 0
+      ? answer.agents.map((a) => a.id)
+      : ids;
   const until = Date.now() + QUEUED_MS;
   for (;;) {
     const there = (await Promise.all(wanted.map((id) => harnessApi.session(id).catch(() => null)))).filter((a): a is AgentInfo => a !== null);
@@ -627,12 +637,20 @@ export const harnessApi = {
   /**
    * The op an agent in chat starts one with (`agents.start`, kiln plan 01a1dd2e…, P5.6 S8): one start, whatever asks
    * it. `ids`: one made here for each (`clientId`), so its page can open before it has started (W21-R15); asked again
-   * under them, it's refused (409), never started twice. Each started one read whole, as the lists show it; one that
+   * under them with the same spec, kiln returns their original start. Each started one read whole, as the lists show it; one that
    * waits for room on its machine starts there under its id, read once it has.
    */
-  start: (target: string, spec: Spec, count = 1, ids?: string[]) =>
+  start: (target: string, spec: Spec, count = 1, ids?: string[], report?: (slots: StartSlot[]) => void) =>
     ownAgentAction(
-      call<StartAnswer>("POST", "/api/harness/agents", startAsk(target, spec, count, ids)).then((answer) => startedOf(answer, ids ?? [])),
+      call<StartAnswer>("POST", "/api/harness/agents", startAsk(target, spec, count, ids), undefined, { "idempotency-key": ids?.[0] ?? clientId() })
+        .catch((e: unknown) => {
+          if (e instanceof ApiError && e.body && typeof e.body === "object" && "slots" in e.body && Array.isArray(e.body.slots)) return { agents: [], slots: e.body.slots as StartSlot[] };
+          throw e;
+        })
+        .then((answer) => {
+          if (answer.slots) report?.(answer.slots);
+          return startedOf(answer, ids ?? []);
+        }),
       ids ?? [],
       (started) => started.map((a) => a.id),
     ),
@@ -668,20 +686,22 @@ export const harnessApi = {
    * socket: a message's own (its id is its key), else `key`, one made now unless given, taken once
    * however often it's sent under it (docs/wire.md, "The UI's sockets").
    */
-  command: (id: string, c: Command, key: string = clientId(), target?: string) =>
-    ownAgentAction(
+  command: (id: string, c: Command, key: string = clientId(), target?: string) => {
+    const headers = {
+      ...(c.type === "send" || c.type === "skill_run" ? {} : { "idempotency-key": key }),
+      ...(target ? { "x-kiln-target": target } : {}),
+    };
+    return ownAgentAction(
       // An interrupt, a control and a restart are operations of their own (agents.interrupt, agents.control, agents.restart: kiln plan
       // 01a1dd2e8618733a87f2793aab1322a8 P5.6, S2); the rest go as commands.
       c.type === "interrupt" || c.type === "restart"
-        ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/${c.type}`, {})
+        ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/${c.type}`, {}, undefined, headers)
         : c.type === "control"
-          ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/control`, { control: c.id, value: c.value ?? null })
-          : call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, {
-              ...(c.type === "send" || c.type === "skill_run" ? {} : { "idempotency-key": key }),
-              ...(target ? { "x-kiln-target": target } : {}),
-            }),
+          ? call<void>("POST", `/api/harness/agents/${encodeURIComponent(id)}/control`, { control: c.id, value: c.value ?? null }, undefined, headers)
+          : call<void>("POST", `/api/harness/sessions/${encodeURIComponent(id)}/command`, c, undefined, headers),
       [id],
-    ),
+    );
+  },
   /** Events whose words hold every word of `q`, across conversations (one agent's with `agent`; those before `until`, unix ms), newest first, from the server's conversation store. */
   said: (p: { q: string; agent?: string; until?: number; beforeSeq?: number; limit?: number }) => {
     const qs = new URLSearchParams({ q: p.q });

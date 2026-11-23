@@ -79,7 +79,7 @@ mod key_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(v))
+        s.collect_str(&base64::display::Base64Display::new(v, &base64::engine::general_purpose::STANDARD))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
@@ -114,7 +114,7 @@ mod kept_bytes {
 
     pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
         match v {
-            Some(b) => s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(b)),
+            Some(b) => s.collect_str(&base64::display::Base64Display::new(b, &base64::engine::general_purpose::STANDARD)),
             None => s.serialize_none(),
         }
     }

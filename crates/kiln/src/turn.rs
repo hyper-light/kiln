@@ -87,24 +87,23 @@ impl Gate {
     /// handed comes in a poll of its own. Given back as it's dropped. A wait dropped before its turn comes (a select's
     /// arm another won, a timeout) leaves the line, and a turn handed to it as it went goes on.
     pub async fn turn(&self) -> Turn<'_> {
+        self.acquire().await;
+        Turn { gate: self }
+    }
+
+    async fn acquire(&self) {
         if self.line.is_empty() && self.free.load(Ordering::Acquire) > 0 {
             hyper_rt::coop::consume_budget().await;
-            if let Some(turn) = self.try_turn() {
-                return turn;
-            }
+            if self.line.is_empty() && self.take_free() { return; }
         }
         let mut waiting = Waiting { gate: self, place: Arc::new(Place { stands: AtomicU8::new(WAITING), waker: AtomicWaker::new() }), holds: false };
-        // Unbounded and never closed: the push always goes.
+        // The line is unbounded and never closed. Recheck the count after listing so a turn
+        // given back while the line was empty is observed. Dropping the wait gives any
+        // concurrent handoff to the next waiter.
         let _ = self.line.push(Arc::clone(&waiting.place));
         fence(Ordering::SeqCst);
-        // A turn given back between the look above and the place in line went to the count, the line empty then
-        // (`give`): it's this one's, and its place leaves the line (a turn handed to it meanwhile goes on).
-        if self.take_free() {
-            drop(waiting);
-            return Turn { gate: self };
-        }
+        if self.take_free() { return; }
         std::future::poll_fn(|cx| waiting.poll_given(cx)).await;
-        Turn { gate: self }
     }
 
     /// One turn off the count, if it has one.
@@ -191,6 +190,20 @@ impl Drop for Turn<'_> {
     fn drop(&mut self) {
         self.gate.give();
     }
+}
+
+/// CP-T3.2. An admitted blocking job keeps its FIFO turn even if its caller stops waiting.
+pub(crate) struct OwnedTurn<T: AsRef<Gate>>(Arc<T>);
+
+impl<T: AsRef<Gate>> OwnedTurn<T> {
+    pub(crate) async fn take(owner: Arc<T>) -> Self {
+        owner.as_ref().as_ref().acquire().await;
+        Self(owner)
+    }
+}
+
+impl<T: AsRef<Gate>> Drop for OwnedTurn<T> {
+    fn drop(&mut self) { self.0.as_ref().as_ref().give(); }
 }
 
 impl std::fmt::Debug for Turn<'_> {

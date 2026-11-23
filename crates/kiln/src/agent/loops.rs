@@ -534,6 +534,22 @@ pub(super) async fn send(shared: &Shared, session: String, epoch: u64, command: 
     let known = shared.harness.as_ref().is_some_and(|h| h.get(&session).is_some());
     let relayed = if known { crate::runner::custody::relayed_words(&session, raw.unwrap_or_default(), &shared.root, &shared.name, &shared.instance_id) } else { Ok(()) };
     let route = raw.and_then(crate::harness::route::Route::of);
+    if let Some(request) = raw.and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()).and_then(|v| v.get("receipt_request")?.as_str().map(str::to_owned)) {
+        let send = shared.own.0.clone();
+        let local = crate::frontdoor::replica::local_node();
+        crate::rt::spawn(async move {
+            use crate::reach::wire::P2pSendReply;
+            let reply = match (local, route, relayed) {
+                (Some(local), Some(route), Ok(())) => local.enqueue_local(&session, Some(epoch), command, route).await,
+                (_, _, Err(why)) => P2pSendReply::Error { why },
+                _ => P2pSendReply::NoSession,
+            };
+            if let Ok(json) = serde_json::to_string(&reply) {
+                let _ = send.send(Up::Term(AgentMsg::HarnessRouteReceipt { session, request, json })).await;
+            }
+        });
+        return;
+    }
     match command {
         c if relayed.is_err() => {
             let why = relayed.err().unwrap_or_default();

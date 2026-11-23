@@ -31,11 +31,13 @@ pub const MESSAGE: usize = 768 << 10;
 /// one of them a group in memory ([`super::disk`]).
 pub(crate) const APPEND: u64 = 256 << 10;
 /// The most members a group names: the server and its copies.
-const MEMBERS: usize = 64;
+pub(crate) const MEMBERS: usize = 64;
 /// How often an owner ticks its groups. A leader beats every [`BEAT`] ticks, which tells the copies
 /// what is committed when nothing else moves.
 pub const TICK: Duration = Duration::from_millis(100);
-const BEAT: usize = 10;
+pub(crate) const BEAT: usize = 10;
+/// Maximum `drive` iterations per pump pass.
+pub(crate) const PUMP_MAX: usize = 1024;
 /// What a copy remembers of what its folder did, newest last.
 const OUTCOMES: usize = 200;
 
@@ -90,7 +92,7 @@ pub fn pump<L: LogStore, M: StateMachine>(
     out: &mut Output<M::Answer>,
     messages: &mut Vec<Message>,
 ) -> Result<(), ReplicaError> {
-    for _ in 0..1024 {
+    for _ in 0..PUMP_MAX {
         out.clear();
         let driven = r.drive(now, waker, out)?;
         messages.append(&mut out.messages);

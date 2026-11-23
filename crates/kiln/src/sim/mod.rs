@@ -17,3 +17,6 @@ pub mod moves;
 pub mod sched;
 pub mod sync;
 pub mod transfers;
+
+#[cfg(test)]
+pub(crate) mod session_liveness;

@@ -9,6 +9,8 @@
 //! kind skips it.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -351,42 +353,174 @@ pub fn frames(repo: &str, id: u64, bytes: Vec<u8>) -> Vec<(Msg, Vec<u8>)> {
         .collect()
 }
 
-/// Parts of messages, put back together.
+/// Sparse out-of-order transfer state. A conversation stages its image in an anonymous WAL-side
+/// file. Other lanes retain their small transfers in memory. Only received bytes occupy space.
 #[derive(Default)]
 pub struct Joiner {
+    held: usize,
+    idle_floor: Option<Duration>,
+    next_expiry: Option<Instant>,
     open: HashMap<(String, u64), Joining>,
+    dir: Option<PathBuf>,
 }
 
 struct Joining {
-    parts: Vec<Option<Vec<u8>>>,
-    have: usize,
+    total: u32,
+    parts: BTreeMap<u32, Part>,
+    file: Option<std::fs::File>,
+    bytes: usize,
+    room: usize,
     since: Instant,
+    window: Duration,
+}
+
+enum Part {
+    Memory(Vec<u8>),
+    File { offset: u64, len: usize, checksum: u32 },
+}
+
+fn available_bytes() -> usize {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let host = sys.available_memory();
+    let free = crate::os::cgroup::memory().and_then(|m| m.limit.map(|limit| limit.saturating_sub(m.used))).map_or(host, |limit| host.min(limit));
+    usize::try_from(free).unwrap_or(usize::MAX)
+}
+
+impl Joining {
+    fn charge(&self) -> usize { self.bytes.saturating_add(self.parts.len().saturating_mul(size_of::<(u32, Part)>() )) }
 }
 
 impl Joiner {
-    /// A message's bytes once its last part came (`parts` 0: it came whole). The parts of a message
-    /// whose rest never came are dropped after a while: Raft sends it again.
+    pub fn in_dir(dir: PathBuf, idle_floor: Duration) -> Self { Self { dir: Some(dir), idle_floor: Some(idle_floor), ..Self::default() } }
+
+    pub fn forget_prefix(&mut self, prefix: &str) {
+        self.open.retain(|(source, _), j| {
+            if !source.starts_with(prefix) { return true; }
+            self.held = self.held.saturating_sub(j.charge());
+            false
+        });
+    }
+
+    pub(crate) fn expiry(&self) -> Option<Instant> { self.next_expiry }
+
+    pub fn expire(&mut self) {
+        let now = Instant::now();
+        if self.next_expiry.is_none_or(|until| now < until) { return; }
+        self.next_expiry = None;
+        self.open.retain(|_, j| {
+            let until = j.since + j.window;
+            if now >= until { self.held = self.held.saturating_sub(j.charge()); return false; }
+            self.next_expiry = Some(self.next_expiry.map_or(until, |next| next.min(until)));
+            true
+        });
+    }
+
     pub fn add(&mut self, from: &str, id: u64, part: u32, parts: u32, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        self.add_frame(from, id, part, parts, bytes, 0)?.finish()
+    }
+
+    pub fn add_frame(&mut self, from: &str, id: u64, part: u32, parts: u32, mut bytes: Vec<u8>, start: usize) -> Option<Joined> {
+        let len = bytes.len().checked_sub(start)?;
         if parts <= 1 {
-            return Some(bytes);
+            if part != 0 || len > PART { return None; }
+            if start != 0 { bytes.drain(..start); }
+            return Some(Joined(Completed::Frame(bytes)));
         }
-        self.open.retain(|_, j| j.since.elapsed() < PARTS_WAIT);
+        if part >= parts || len == 0 || len > PART { return None; }
+        self.expire();
         let key = (from.to_owned(), id);
-        if !self.open.contains_key(&key) && self.open.len() >= JOINING {
-            return None;
+        if !self.open.contains_key(&key) {
+            let max_open = if self.dir.is_some() {
+                let frames = (crate::memory::room::share() / PART).max(1);
+                #[cfg(unix)]
+                let frames = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+                    .ok().and_then(|(soft, _)| usize::try_from(soft).ok())
+                    .map_or(frames, |limit| {
+                        // Leave a descriptor for the checkpoint writer, using the process's
+                        // actual open count alongside the kernel's final tempfile allocation.
+                        let open = usize::try_from(crate::host::process_self().open_fds).unwrap_or(usize::MAX);
+                        frames.min(self.open.len().saturating_add(limit.saturating_sub(open).saturating_sub(1)))
+                    });
+                frames
+            } else { JOINING };
+            if self.open.len() >= max_open { return None; }
+            // The contiguous wire buffer and its decoded Raft message coexist at completion.
+            let mut room = available_bytes() / 2;
+            let file = if let Some(dir) = &self.dir {
+                std::fs::create_dir_all(dir).ok()?;
+                room = room.min(usize::try_from(crate::observe::disk_free(dir)?).unwrap_or(usize::MAX));
+                Some(tempfile::tempfile_in(dir).ok()?)
+            } else { None };
+            let since = Instant::now();
+            let window = self.idle_floor.unwrap_or(PARTS_WAIT);
+            self.next_expiry = Some(self.next_expiry.map_or(since + window, |next| next.min(since + window)));
+            self.open.insert(key.clone(), Joining { total: parts, parts: BTreeMap::new(), file, bytes: 0, room, since, window });
         }
-        let total = usize::try_from(parts).ok()?;
-        let j = self.open.entry(key.clone()).or_insert_with(|| Joining { parts: vec![None; total], have: 0, since: Instant::now() });
-        let slot = j.parts.get_mut(usize::try_from(part).ok()?)?;
-        if slot.is_none() {
-            *slot = Some(bytes);
-            j.have += 1;
-        }
-        if j.have < j.parts.len() {
-            return None;
-        }
+        let charge = len.checked_add(size_of::<(u32, Part)>())?;
+        let j = self.open.get_mut(&key)?;
+        if j.total != parts || j.parts.contains_key(&part) || self.held.checked_add(charge)? > j.room { return None; }
+        let stored = if let Some(file) = &mut j.file {
+            let offset = u64::try_from(j.bytes).ok()?;
+            let payload = bytes.get(start..)?;
+            let checksum = crc32fast::hash(payload);
+            if file.seek(SeekFrom::Start(offset)).and_then(|_| file.write_all(payload)).is_err() {
+                self.held = self.held.saturating_sub(j.charge());
+                self.open.remove(&key);
+                return None;
+            }
+            Part::File { offset, len, checksum }
+        } else {
+            if start != 0 { bytes.drain(..start); }
+            Part::Memory(bytes)
+        };
+        self.held += charge;
+        j.parts.insert(part, stored);
+        j.bytes += len;
+        if let Some(floor) = self.idle_floor { j.window = j.window.max(j.since.elapsed().saturating_add(floor)); }
+        j.since = Instant::now();
+        if j.parts.len() != usize::try_from(parts).ok()? { return None; }
         let j = self.open.remove(&key)?;
-        Some(j.parts.into_iter().flatten().flatten().collect())
+        self.held = self.held.saturating_sub(j.charge());
+        Some(Joined(Completed::Parts(j)))
+    }
+}
+
+/// A completed sparse transfer. Its read and verification can run independently of Raft ticks.
+pub struct Joined(Completed);
+
+enum Completed {
+    Frame(Vec<u8>),
+    Parts(Joining),
+}
+
+impl Joined {
+    pub fn encoded_bytes(&self) -> usize {
+        match &self.0 { Completed::Frame(frame) => frame.len(), Completed::Parts(j) => j.bytes }
+    }
+
+    pub fn finish(self) -> Option<Vec<u8>> {
+        let mut j = match self.0 { Completed::Frame(frame) => return Some(frame), Completed::Parts(j) => j };
+        if j.file.is_some() && j.bytes > available_bytes() / 2 { return None; }
+        let mut out = Vec::new();
+        out.try_reserve_exact(j.bytes).ok()?;
+        for chunk in j.parts.into_values() {
+            match chunk {
+                Part::Memory(bytes) => out.extend_from_slice(&bytes),
+                Part::File { offset, len, checksum } => {
+                    let file = j.file.as_mut()?;
+                    file.seek(SeekFrom::Start(offset)).ok()?;
+                    let start = out.len();
+                    let end = start.checked_add(len)?;
+                    if end > j.bytes { return None; }
+                    out.resize(end, 0);
+                    let payload = out.get_mut(start..end)?;
+                    file.read_exact(payload).ok()?;
+                    if crc32fast::hash(payload) != checksum { return None; }
+                }
+            }
+        }
+        Some(out)
     }
 }
 
@@ -409,6 +543,34 @@ mod tests {
         assert_eq!(whole, Some(bytes));
         let small = frames("r", 1, vec![1, 2, 3]);
         assert!(matches!(small.first(), Some((Msg::Raft { parts: 0, .. }, _))));
+    }
+
+    #[test]
+    fn cp_t32_receiver_spool_refuses_same_length_valid_json_corruption() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut join = Joiner::in_dir(dir.path().to_owned(), PARTS_WAIT);
+        assert!(join.add("sender", 1, 0, 2, br#"{"value":"A"#.to_vec()).is_none());
+        let staged = join.open.values_mut().next().and_then(|j| j.file.as_mut()).ok_or_else(|| anyhow::anyhow!("missing staged frame"))?;
+        staged.seek(SeekFrom::End(-1))?;
+        staged.write_all(b"B")?;
+        assert!(serde_json::from_slice::<serde_json::Value>(br#"{"value":"B"}"#).is_ok());
+        assert!(join.add("sender", 1, 1, 2, br#""}"#.to_vec()).is_none());
+        assert!(join.open.is_empty() && join.held == 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t32_snapshot_spool_joins_out_of_order_without_retaining_payloads() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut join = Joiner::in_dir(dir.path().to_owned(), PARTS_WAIT);
+        assert!(join.add("me", 1, 1, 3, vec![2]).is_none());
+        let staged = join.open.values().next().ok_or_else(|| anyhow::anyhow!("missing sparse snapshot"))?;
+        assert!(staged.file.is_some() && staged.parts.values().all(|p| matches!(p, Part::File { .. })));
+        assert!(join.add("me", 1, 1, 3, vec![9]).is_none());
+        assert!(join.add("me", 1, 0, 3, vec![1]).is_none());
+        assert_eq!(join.add("me", 1, 2, 3, vec![3]), Some(vec![1, 2, 3]));
+        assert!(join.open.is_empty());
+        Ok(())
     }
 
     #[test]

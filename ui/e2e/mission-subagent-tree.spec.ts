@@ -51,6 +51,9 @@ test("the subagents' toggle opens the tree under its row, every subagent in the 
   await expect(page.locator('.ms-row[data-agent="fam-tests"] .ms-subs')).toHaveCount(1);
   await expect(page.locator(".ms-tree")).toHaveCount(0);
 
+  // Measure the toggle after the fixture has filled in the composer and row badges above it.
+  await expect(page.getByText("are connected, but their kiln runners are too old", { exact: false }).first()).toBeVisible();
+  await expect(page.locator('.ms-row[data-agent="rev-cicd"]').getByText("microVM", { exact: true })).toBeAttached();
   await toggle.scrollIntoViewIfNeeded();
   const top = await pageTop(row);
   await toggle.click();

@@ -28,6 +28,8 @@ touching the copy Focal, Mantle and Quiver share.
   `docs/sim.md`, `CLAUDE.md`, `scripts/check-contracts.py`): they are hyper-raft's, at that commit, not
   kiln's.
 
+On macOS, a connected QUIC peer socket sends the selected source address as packet info and leaves the destination to the connected socket. Darwin rejects an explicit destination on this path with `EISCONN`. The path ceiling also subtracts the packet-info control size from the socket’s actual send buffer. This keeps a maximum-size reply from blocking every later datagram. The connected loopback regression lives in `tests/udp_local_address.rs`.
+
 ## How kiln builds on it
 
 - kiln's root `Cargo.toml` points the name `hyper-rt` here (`[patch.crates-io]`), for every crate that
@@ -212,3 +214,7 @@ Also made here with it, each found on CI or by widening a window the scheduler o
   (the reads beyond one a step paid for by undecided verdicts; it fails on the per-poll reading, 41
   reads for 32 long polls), two unit tests of the window and the modes; `tests/wake_estimate.rs`'s
   attribution counts unchanged.
+
+AD-1 adds Winsock receive timestamps in `src/udp/windows.rs`. The receiver reads the socket’s ancillary timestamp and receiving interface, then converts the adapter’s clock to the shard clock. Missing or ambiguous timestamps leave `Arrival.kernel` false. The native Windows acceptance test in `tests/udp_windows_stamps.rs` leaves an actual datagram queued and checks its recorded arrival predates the read. The shared drain API distinguishes an empty socket from an interrupted or discarded read on all platforms. See [Microsoft’s packet timestamping documentation](https://learn.microsoft.com/en-us/windows/win32/iphlp/packet-timestamping).
+
+`Arrival.kernel_at_ns` preserves a queued packet’s kernel stamp when a preceding packet lacked metadata. Kiln adds the driver’s fixed `host_epoch_ns` to that stamp so the detector and its disk worker use the same host clock across shard boundaries and scheduling delays.

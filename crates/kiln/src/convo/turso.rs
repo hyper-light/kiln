@@ -15,8 +15,18 @@ use std::collections::HashMap;
 
 use super::rows::{EventRow, InboxRow, RecordRow, Row};
 use super::sql;
-use super::store::{Change, Changes, Compacting, Engine, InboxPage, Kept, Look, Mark, Query, Read, SearchFrom, Took, Unended};
+use super::store::{Change, Changes, Compacting, Engine, InboxPage, Kept, Look, Mark, ProjectionWrite, Query, Read, SearchFrom, Took, Unended};
 use super::telemetry::CompactView;
+
+#[derive(serde::Deserialize)]
+struct HeadEpoch { epoch: u64 }
+
+#[derive(Clone, Copy)]
+enum LocalInbox {
+    Active,
+    Fenced,
+    NeedsHead(u64),
+}
 
 /// Rows of each kind a feed reads at once.
 const FEED_PAGE: usize = 512;
@@ -24,6 +34,15 @@ const FEED_PAGE: usize = 512;
 /// (`rev`), so what is written meanwhile is copied again by its number, and what a drop took away
 /// is taken away from the copy too. The other tables are small, and go whole at the swap.
 const COMPACT_SCANNED: [&str; 5] = ["sessions", "events", "records", "drops", "inbox"];
+/// These tables mutate and delete rows without assigning a conversation revision. A compact
+/// copy keeps their rowids and follows a connection-local dirty set until the file swap.
+const RAFT_COPY: [(&str, &str); 4] = [
+    ("inbox_outbox", "session,rev,ord,family,key,value,epoch,row_body"),
+    ("convo_raft_state", "session,applied,term,complete,inbox_epoch,verify_events,owner,genesis"),
+    ("convo_local_owner_fence", "session,epoch"),
+    ("convo_raft_cells", "session,kind,source,id,n,body,ordinal"),
+];
+
 /// Rows in one step of compacting, at most (a step also stops at its bytes).
 const COMPACT_ROWS: i64 = 4096;
 /// The copy's page cache while compacting.
@@ -43,6 +62,9 @@ pub struct Turso {
     rev: u64,
     /// Record lines written before this number may still be kept uncompressed (0: none are).
     squeeze_below: u64,
+    inbox_replication: bool,
+    local_owner: Option<String>,
+    has_raft_schema: bool,
     /// A mirror's copy is restoring this store (`copied` has sessions): what else writes a
     /// session it brought takes it over from the copy.
     copying: bool,
@@ -53,6 +75,8 @@ pub struct Turso {
     /// Sessions changed while compacting without a number of their own (where they run): copied
     /// again at the swap.
     touched: std::cell::RefCell<std::collections::HashSet<String>>,
+    // Drop after closing the engine, so a handoff cannot publish live SQLite files.
+    _handoff: std::fs::File,
 }
 
 /// A compaction under way: the store copied into `<file>.compact.tmp` a batch at a time, under the
@@ -90,6 +114,8 @@ enum CopyJob {
     /// What was written while copying, in the order it was written ([`Turso::replay`]); the log
     /// as for `Put`.
     Replay(Vec<(u64, &'static str, Vec<Value>)>, bool),
+    /// (source rowid, presence, columns). An absent source row is deleted from the copy.
+    Patch(&'static str, &'static str, Vec<Vec<Value>>, bool),
     /// A small table's rows, the table emptied first.
     Replace(String, Vec<Vec<Value>>),
     /// How many rows each table holds, the copy put on disk first when `true`.
@@ -117,6 +143,9 @@ impl Copier {
                 let done = match job {
                     CopyJob::Put(table, rows, flush) => copy.transaction(|t| t.put_rows(table, &rows)).and_then(|()| if flush { copy.flush() } else { Ok(()) }),
                     CopyJob::Replay(rows, flush) => copy.replay(&rows).and_then(|()| if flush { copy.flush() } else { Ok(()) }),
+                    CopyJob::Patch(table, columns, rows, flush) => {
+                        copy.transaction(|t| t.patch_copy(table, columns, &rows)).and_then(|()| if flush { copy.flush() } else { Ok(()) })
+                    }
                     CopyJob::Replace(table, rows) => copy.transaction(|t| {
                         t.exec(&format!("DELETE FROM {table}"))?;
                         t.put_rows(&table, &rows)
@@ -239,6 +268,12 @@ fn bytes(b: &[u8]) -> anyhow::Result<Value> {
     Value::from_slice(b).map_err(|e| anyhow::anyhow!("a value couldn't be held: {e}"))
 }
 
+fn encoded_row(row: &Row) -> anyhow::Result<Value> {
+    let mut body = turso_core::ValueBlob::default();
+    serde_json::to_writer(&mut body,row)?;
+    Ok(Value::from_blob(body))
+}
+
 /// The first key past every key that starts with `prefix` (None: there's none).
 fn past(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
@@ -299,6 +334,7 @@ impl Turso {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        let handoff = super::file_move::open_guard(path)?;
         finish_compact(path)?;
         let name = path.to_str().ok_or_else(|| anyhow::anyhow!("the store's path isn't UTF-8: {}", path.display()))?;
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().map_err(fail)?);
@@ -308,7 +344,7 @@ impl Turso {
         // It waited up to 15 s for a runner that hadn't let go yet, upgraded.
         let db = Database::open(io.clone(), name, OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new())).map_err(fail)?;
         let conn = db.connect(ConnectOpts::new()).map_err(fail)?;
-        let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0, copying: false, filling: false, compaction: None, touched: std::cell::RefCell::default() };
+        let mut t = Self { io, _db: db, conn, path: path.to_path_buf(), id: String::new(), rev: 0, squeeze_below: 0, inbox_replication: false, local_owner: None, has_raft_schema: schema >= 7, copying: false, filling: false, compaction: None, touched: std::cell::RefCell::default(), _handoff: handoff };
         t.migrate(schema)?;
         if schema < 2 {
             return Ok(t);
@@ -329,6 +365,10 @@ impl Turso {
             rev = rev.max(t.one_int("SELECT MAX(rev) FROM inbox", &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0));
         }
         t.rev = rev;
+        if schema >= 7 {
+            t.inbox_replication = t.meta("inbox_raft_outbox")?.is_some();
+            t.local_owner = t.meta("inbox_raft_owner")?;
+        }
         // Where compressing the lines kept before lines were compressed is (a store that never
         // started: from its newest line down).
         t.squeeze_below = match t.meta("squeeze_below")?.and_then(|v| v.parse::<u64>().ok()) {
@@ -353,12 +393,29 @@ impl Turso {
         let (peer, machine) = (peer.to_owned(), machine.map(str::to_owned));
         self.transaction(|t| {
             let mut w = t.writes()?;
-            let mut epochs: HashMap<String, u64> = HashMap::new();
-            let mut copied: HashMap<String, bool> = HashMap::new();
+            let mut epochs: HashMap<&str, (u64, bool)> = HashMap::new();
+            let mut copied = HashMap::new();
+            let mut raft_groups = HashMap::new();
             let mut took = Took { rev: batch.upto, ..Took::default() };
             let first = t.rev + 1;
             for c in &batch.rows {
                 let session = c.row.session();
+                if t.has_raft_schema {
+                    let grouped = match raft_groups.get(session) {
+                        Some(grouped) => *grouped,
+                        None => {
+                            let grouped = t.one_int("SELECT 1 FROM convo_raft_state WHERE session=?1", &[txt(session)])?.is_some();
+                            raft_groups.insert(session, grouped);
+                            grouped
+                        }
+                    };
+                    if grouped {
+                        // A legacy feed can arrive after a committed tombstone or ownership change.
+                        // Only the session's committed log may advance the working replica.
+                        took.fenced += 1;
+                        continue;
+                    }
+                }
                 if copy {
                     let ours = match copied.get(session) {
                         Some(o) => *o,
@@ -373,7 +430,7 @@ impl Turso {
                                 t.copying = true;
                                 true
                             };
-                            copied.insert(session.to_owned(), o);
+                            copied.insert(session, o);
                             o
                         }
                     };
@@ -383,26 +440,23 @@ impl Turso {
                         continue;
                     }
                 }
-                let current = match epochs.get(session) {
-                    Some(e) => *e,
-                    None => {
-                        let e = t.epoch_of(session)?;
-                        epochs.insert(session.to_owned(), e);
-                        e
-                    }
+                let (current, accepted) = match epochs.entry(session) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => e.insert((t.epoch_of(session)?, false)),
                 };
                 // A former writer's rows (it moved on elsewhere) never count again.
-                if c.epoch < current {
+                if c.epoch < *current {
                     took.fenced += 1;
                     continue;
                 }
-                if c.epoch > current {
+                *accepted = true;
+                if c.epoch > *current {
                     // Its new writer, from here on: said before its rows (it may be new here).
                     t.rev += 1;
                     let r = t.rev;
                     let stmt = Writes::get(&mut w.session, t, sql::SESSION_UPSERT)?;
                     t.run(stmt, &[txt(session), Value::Null, Value::Null, Value::Null, Value::Null, int(now), seq(c.epoch), seq(r)], |_| Ok(()))?;
-                    epochs.insert(session.to_owned(), c.epoch);
+                    *current = c.epoch;
                 }
                 t.rev += 1;
                 let r = t.rev;
@@ -418,9 +472,8 @@ impl Turso {
             // rows, left out, don't say so). A mirror's feed says it in its rows instead.
             if let Some(machine) = &machine {
                 let mut at = t.prepare(sql::SESSION_MACHINE)?;
-                for (session, epoch) in &epochs {
-                    let theirs = batch.rows.iter().any(|c| c.row.session() == session.as_str() && c.epoch >= *epoch);
-                    if theirs {
+                for (session, (_, accepted)) in epochs {
+                    if accepted {
                         t.run(&mut at, &[txt(session), txt(machine)], |_| Ok(()))?;
                         t.touch(session);
                     }
@@ -521,6 +574,17 @@ impl Turso {
         self.link().run(stmt, params, each)
     }
 
+    /// A writer never retries a busy statement. Transfer large values into its bindings once.
+    fn write_bound<const N: usize>(&self, stmt: &mut Statement, values: [Value; N]) -> anyhow::Result<()> {
+        let mut values = Some(values);
+        self.link().bound_rows(stmt, |stmt| {
+            stmt.reset().map_err(fail)?;
+            let values = values.take().ok_or_else(|| anyhow::anyhow!("writer attempted a second binding"))?;
+            for (i,value) in values.into_iter().enumerate() { stmt.bind_at(at(i+1)?,value).map_err(fail)?; }
+            Ok(())
+        }, |_| Ok(true))
+    }
+
     /// [`Turso::run`], stopping once `each` says no more (false).
     fn run_while(&self, stmt: &mut Statement, params: &[Value], each: impl FnMut(&TRow) -> anyhow::Result<bool>) -> anyhow::Result<()> {
         self.link().run_while(stmt, params, each)
@@ -567,8 +631,168 @@ struct Link<'a> {
 }
 
 impl Link<'_> {
+    fn has_legacy_name_catalog(&self)->anyhow::Result<bool> {
+        let mut q=self.prepare("SELECT 1 FROM convo_name_origin o JOIN meta m ON m.key='id' AND m.value=o.store_id")?;
+        let mut present=false;
+        self.run(&mut q,&[],|_| {present=true; Ok(())})?;
+        Ok(present)
+    }
+
+    /// The namespace transition needs every durable name, including partly imported rows
+    /// with no session header. Seek past each name rather than scanning its transcript.
+    fn historical_names(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let control = |sql: &str| self.run(&mut self.prepare(sql)?, &[], |_| Ok(()));
+        control("BEGIN")?;
+        let result = (|| {
+            let mut names=std::collections::BTreeSet::new();
+            for (table, column) in [("sessions","id"),("events","session"),("records","session"),("inbox","session"),
+                ("drops","session"),("convo_raft_state","session"),("inbox_outbox","session")] {
+                let mut q=self.prepare(&format!("SELECT {column} FROM {table} WHERE {column}>?1 ORDER BY {column} LIMIT 1"))?;
+                let mut cursor=String::new();
+                loop {
+                    let mut next=None;
+                    self.run(&mut q,&[txt(&cursor)], |r| {next=Some(r.get::<String>(0).map_err(fail)?);Ok(())})?;
+                    let Some(next)=next else {break};
+                    names.insert(next.clone());
+                    cursor=next;
+                }
+            }
+            Ok(names)
+        })();
+        let close=control("ROLLBACK");
+        close?;
+        result
+    }
+
+    /// Pin one WAL read transaction while importing the prior local format. Another session
+    /// can keep writing and this image still represents one instant.
+    fn founding_rows(&self, session: &str, epoch: u64, owner: &str) -> anyhow::Result<Vec<Row>> {
+        let control = |sql: &str| self.run(&mut self.prepare(sql)?, &[], |_| Ok(()));
+        control("BEGIN")?;
+        let result = (|| {
+            let mut output = Vec::new();
+            let mut owned = 0usize;
+            let mut seen = false;
+            let mut append = |row: Row| -> anyhow::Result<()> {
+                owned = owned
+                    .checked_add(crate::memory::queue::json_bytes(&row))
+                    .ok_or_else(|| anyhow::anyhow!("legacy conversation size overflow"))?;
+                anyhow::ensure!(
+                    owned <= crate::memory::room::share(),
+                    "legacy conversation exceeds the current Raft proposal memory budget"
+                );
+                output.try_reserve(1)?;
+                output.push(row);
+                Ok(())
+            };
+            let mut meta=self.prepare("SELECT info,meta,state,changes,updated_at,closed_at,epoch,machine FROM sessions WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM convo_raft_state WHERE session=?1 AND (applied<>0 OR complete=0))")?;
+            self.run(&mut meta, &[txt(session)], |r| {
+                let text = |i| r.get_value(i).to_text().map(str::to_owned);
+                let machine = text(7);
+                anyhow::ensure!(machine.as_deref().is_none_or(|n| n == owner), "legacy session belongs to another node");
+                let held = u64::try_from(r.get::<i64>(6).map_err(fail)?)?;
+                anyhow::ensure!(held <= epoch, "legacy session has a newer owner");
+                let closed = r.get::<i64>(5).ok();
+                seen = true;
+                append(Row::Session {
+                    session: session.to_owned(),
+                    info: text(0),
+                    meta: text(1),
+                    state: text(2),
+                    changes: text(3),
+                    epoch: Some(epoch),
+                    open: closed.is_none(),
+                    at: r.get::<i64>(4).map_err(fail)?,
+                })?;
+                if let Some(at) = closed {
+                    append(Row::Closed {
+                        session: session.to_owned(),
+                        at,
+                    })?;
+                }
+                Ok(())
+            })?;
+            if !seen {
+                return Ok(output);
+            }
+            let mut events =
+                self.prepare("SELECT session,id,seq,at,parent,by,kind,level,tool,status,text,body FROM events WHERE session=?1 ORDER BY seq,rev,id")?;
+            self.run(&mut events, &[txt(session)], |r| append(Row::Event(Box::new(event_of(r)?))))?;
+            let mut records = self.prepare("SELECT source,n,line_end,line FROM records WHERE session=?1 ORDER BY source,n")?;
+            self.run(&mut records, &[txt(session)], |r| {
+                let stored = r.get_value(3);
+                let (line, kept) = match stored.to_blob() {
+                    Some(b) if b.first() == Some(&CODEC_BROTLI) => (String::new(), Some(b.to_vec())),
+                    _ => (unsqueeze(stored)?, None),
+                };
+                append(Row::Record(Box::new(RecordRow {
+                    session: session.to_owned(),
+                    source: r.get::<String>(0).map_err(fail)?,
+                    n: u(r, 1),
+                    end: u(r, 2),
+                    line,
+                    kept,
+                })))?;
+                Ok(())
+            })?;
+            let mut inbox = self.prepare("SELECT family,key,value,rev FROM inbox WHERE session=?1 ORDER BY rev,rowid")?;
+            self.run(&mut inbox, &[txt(session)], |r| {
+                let family = r.get::<String>(0).map_err(fail)?;
+                let value = r
+                    .get_value(2)
+                    .to_blob()
+                    .map(|v| crate::harness::inbox::with_receipt_sequence(&family, v, u(r, 3)))
+                    .transpose()?;
+                append(Row::Inbox(Box::new(InboxRow {
+                    session: session.to_owned(),
+                    family,
+                    key: r.get_value(1).to_blob().ok_or_else(|| anyhow::anyhow!("invalid legacy inbox key"))?.to_vec(),
+                    value,
+                })))?;
+                Ok(())
+            })?;
+            Ok(output)
+        })();
+        match result {
+            Ok(rows) => {
+                if let Err(e) = control("COMMIT") {
+                    let _ = control("ROLLBACK");
+                    return Err(e);
+                }
+                Ok(rows)
+            }
+            Err(e) => {
+                control("ROLLBACK")?;
+                Err(e)
+            }
+        }
+    }
+
     fn prepare(&self, sql: &str) -> anyhow::Result<Statement> {
         self.conn.prepare(sql).map_err(fail)
+    }
+
+    /// The frontier and projected cells share a single SQLite read view, even when an event's
+    /// ID and sequence are reused by a later edit while a snapshot is being encoded.
+    fn raft_snapshot_rows(&self, session: &str, at: u64, pinned: &mut dyn FnMut()) -> anyhow::Result<Vec<Row>> {
+        let mut stmt = self.prepare("SELECT s.applied,s.complete,c.body FROM convo_raft_state s LEFT JOIN convo_raft_cells c ON c.session=s.session WHERE s.session=?1 ORDER BY c.kind,c.source,c.n,c.ordinal,c.id")?;
+        let mut found = false;
+        let mut rows = Vec::new();
+        self.run(&mut stmt, &[txt(session)], |r| {
+            anyhow::ensure!(r.get::<i64>(1).map_err(fail)? != 0, "legacy Raft group requires a complete committed snapshot");
+            anyhow::ensure!(u(r,0) <= at, "Raft projection advanced beyond snapshot index {at}");
+            if !found {
+                found = true;
+                pinned();
+            }
+            if !matches!(r.get_value(2), Value::Null) {
+                let data = r.get_value(2).to_blob().ok_or_else(|| anyhow::anyhow!("invalid projected row"))?;
+                rows.push(serde_json::from_slice(data)?);
+            }
+            Ok(())
+        })?;
+        anyhow::ensure!(found, "Raft projection is missing for {session}");
+        Ok(rows)
     }
 
     /// As [`super::store::Engine::inbox_get`], on this link's connection.
@@ -677,7 +901,7 @@ impl Link<'_> {
     }
 
     /// [`Link::run`], stopping once `each` says no more (false).
-    fn run_while(&self, stmt: &mut Statement, params: &[Value], mut each: impl FnMut(&TRow) -> anyhow::Result<bool>) -> anyhow::Result<()> {
+    fn run_while(&self, stmt: &mut Statement, params: &[Value], each: impl FnMut(&TRow) -> anyhow::Result<bool>) -> anyhow::Result<()> {
         let bind = |stmt: &mut Statement| -> anyhow::Result<()> {
             stmt.reset().map_err(fail)?;
             for (i, p) in params.iter().enumerate() {
@@ -685,6 +909,10 @@ impl Link<'_> {
             }
             Ok(())
         };
+        self.bound_rows(stmt,bind,each)
+    }
+
+    fn bound_rows(&self, stmt: &mut Statement, mut bind: impl FnMut(&mut Statement) -> anyhow::Result<()>, mut each: impl FnMut(&TRow) -> anyhow::Result<bool>) -> anyhow::Result<()> {
         bind(stmt)?;
         let mut rows = false;
         loop {
@@ -893,6 +1121,15 @@ impl TursoRead {
 }
 
 impl Read for TursoRead {
+    fn has_legacy_name_catalog(&mut self)->anyhow::Result<bool> {self.link().has_legacy_name_catalog()}
+    fn historical_names(&mut self)->anyhow::Result<std::collections::BTreeSet<String>> { self.link().historical_names() }
+    fn founding_rows(&mut self,session:&str,epoch:u64,owner:&str)->anyhow::Result<Vec<Row>> {self.link().founding_rows(session,epoch,owner)}
+    fn raft_snapshot_rows(&mut self, session: &str, at: u64) -> anyhow::Result<Vec<Row>> {
+        self.link().raft_snapshot_rows(session, at, &mut || {})
+    }
+    fn pinned_raft_rows(&mut self, session: &str, at: u64, pinned: &mut dyn FnMut()) -> anyhow::Result<Vec<Row>> {
+        self.link().raft_snapshot_rows(session, at, pinned)
+    }
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.link().events(session, before, limit)
     }
@@ -1037,6 +1274,289 @@ fn unsqueeze(v: &Value) -> anyhow::Result<String> {
 }
 
 impl Turso {
+    fn project_row(&self, session: &str, row: &Row, put: &mut Statement) -> anyhow::Result<()> {
+        let key = match row {
+            Row::Event(e) => Some(("event", bytes(&[])?, bytes(e.id.as_bytes())?, e.seq)),
+            Row::Record(r) => Some(("record", bytes(r.source.as_bytes())?, bytes(&r.n.to_be_bytes())?, r.n)),
+            Row::Inbox(i) if i.value.is_some() => Some(("inbox", bytes(i.family.as_bytes())?, bytes(&i.key)?, 0)),
+            Row::Inbox(i) => {
+                let mut del = self.prepare("DELETE FROM convo_raft_cells WHERE session=?1 AND kind='inbox' AND source=?2 AND id=?3")?;
+                self.run(&mut del, &[txt(session), bytes(i.family.as_bytes())?, bytes(&i.key)?], |_| Ok(()))?;
+                None
+            }
+            Row::RecordReset { source, .. } => {
+                let mut del = self.prepare("DELETE FROM convo_raft_cells WHERE session=?1 AND kind='record' AND source=?2")?;
+                self.run(&mut del, &[txt(session), bytes(source.as_bytes())?], |_| Ok(()))?;
+                None
+            }
+            Row::Reset { from, .. } => {
+                let mut del = self.prepare("DELETE FROM convo_raft_cells WHERE session=?1 AND kind='event' AND n>=?2")?;
+                self.run(&mut del, &[txt(session), seq(from.unwrap_or(0))], |_| Ok(()))?;
+                None
+            }
+            Row::Session { .. } | Row::Closed { .. } | Row::Machine { .. } => None,
+        };
+        if let Some((kind, source, id, n)) = key {
+            self.write_bound(put, [txt(session), txt(kind), source, id, seq(n), encoded_row(row)?,seq(if kind=="event" {self.rev.checked_add(1).ok_or_else(||anyhow::anyhow!("event ordinal exhausted"))?}else{0})])?;
+        }
+        Ok(())
+    }
+
+    fn has_working_overlay(&self, session: &str, epoch: Option<u64>, row: &Row) -> anyhow::Result<bool> {
+        let (family, key) = match row {
+            Row::Inbox(inbox) => (inbox.family.as_str(), inbox.key.as_slice()),
+            Row::Record(r) => ("", r.source.as_bytes()),
+            Row::RecordReset { source, .. } => ("", source.as_bytes()),
+            _ => return Ok(false),
+        };
+        Ok(self
+            .one_int(
+                "SELECT 1 FROM inbox_outbox WHERE session=?1 AND family=?2 AND key=?3 AND COALESCE(epoch,0)=COALESCE(?4,(SELECT inbox_epoch FROM convo_raft_state WHERE session=?1),0) LIMIT 1",
+                &[txt(session), txt(family), bytes(key)?, epoch.map_or(Value::Null,seq)],
+            )?
+            .is_some())
+    }
+
+    fn outbox_row(session: &str, r: &TRow) -> anyhow::Result<Row> {
+        Ok(if let Some(body) = r.get_value(5).to_blob() {
+            serde_json::from_slice(body)?
+        } else {
+            let family = r.get::<String>(1).map_err(fail)?;
+            let value = r
+                .get_value(3)
+                .to_blob()
+                .map(|v| crate::harness::inbox::with_receipt_sequence(&family, v, u(r, 0)))
+                .transpose()?;
+            Row::Inbox(Box::new(InboxRow {
+                session: session.to_owned(),
+                family,
+                key: r.get_value(2).to_blob().ok_or_else(|| anyhow::anyhow!("invalid inbox key"))?.to_vec(),
+                value,
+            }))
+        })
+    }
+
+    /// Snapshot replacement restores committed rows first, then reinstates locally authored
+    /// working custody in original transaction order. Confirmation and CAS remain independent.
+    fn restore_outbox_overlay(&mut self, session: &str, epoch: u64, foreign: bool, writes: &mut Writes) -> anyhow::Result<()> {
+        let mut remove = self.prepare("DELETE FROM inbox_outbox WHERE session=?1 AND COALESCE(epoch,0)<=?2")?;
+        let last_abandoned = i64::try_from(epoch)? - i64::from(!foreign);
+        self.run(&mut remove, &[txt(session), int(last_abandoned)], |_| Ok(()))?;
+        if foreign { return Ok(()); }
+        let mut query =
+            self.prepare("SELECT rev,family,key,value,epoch,row_body FROM inbox_outbox WHERE session=?1 AND COALESCE(epoch,0)=?2 AND (row_body IS NULL OR length(key)>0) ORDER BY rev,ord")?;
+        let mut latest = self.rev;
+        self.run(&mut query, &[txt(session), seq(epoch)], |r| {
+            let row = Self::outbox_row(session, r)?;
+            let rev = latest.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+            if self.write(writes, &row, rev)? {
+                latest = rev;
+            }
+            Ok(())
+        })?;
+        self.rev = latest;
+        Ok(())
+    }
+
+    /// The new committed owner supersedes local writes which never reached quorum. Restore only
+    /// their affected keys from the committed projection, leaving the live CAS view intact for
+    /// any later write at the new epoch. Read one original per key independent of backlog size.
+    fn revert_abandoned_inbox(&mut self, session: &str, epoch: u64, foreign: bool) -> anyhow::Result<()> {
+        let last_abandoned = i64::try_from(epoch)? - i64::from(!foreign);
+        let mut next = self.prepare("SELECT family,key FROM inbox_outbox WHERE session=?1 AND COALESCE(epoch,0)<=?2 ORDER BY rev,ord LIMIT 1")?;
+        let mut cell = self.prepare("SELECT body FROM convo_raft_cells WHERE session=?1 AND kind='inbox' AND source=?2 AND id=?3")?;
+        let mut remove = self.prepare("DELETE FROM inbox_outbox WHERE session=?1 AND family=?2 AND key=?3 AND COALESCE(epoch,0)<=?4")?;
+        let mut writes = self.writes()?;
+        loop {
+            let mut key = None;
+            self.run(&mut next, &[txt(session), int(last_abandoned)], |r| {
+                key = Some((
+                    r.get::<String>(0).map_err(fail)?,
+                    r.get_value(1).to_blob().ok_or_else(|| anyhow::anyhow!("invalid outbox key"))?.to_vec(),
+                ));
+                Ok(())
+            })?;
+            let Some((family, key)) = key else { return Ok(()) };
+            anyhow::ensure!(
+                self.one_int("SELECT complete FROM convo_raft_state WHERE session=?1", &[txt(session)])? == Some(1),
+                "a legacy group needs a complete snapshot before discarding uncommitted journal writes"
+            );
+            self.run(&mut remove, &[txt(session), txt(&family), bytes(&key)?, int(last_abandoned)], |_| Ok(()))?;
+            if self
+                .one_int(
+                    "SELECT 1 FROM inbox_outbox WHERE session=?1 AND family=?2 AND key=?3 AND COALESCE(epoch,0)=?4 LIMIT 1",
+                    &[txt(session), txt(&family), bytes(&key)?, seq(epoch)],
+                )?
+                .is_some()
+            {
+                continue;
+            }
+            if family.is_empty() {
+                if !key.is_empty() {
+                    self.restore_committed_source(session, std::str::from_utf8(&key)?, &mut writes)?;
+                }
+                continue;
+            }
+            let mut committed = None;
+            self.run(&mut cell, &[txt(session), bytes(family.as_bytes())?, bytes(&key)?], |r| {
+                let body = r.get_value(0).to_blob().ok_or_else(|| anyhow::anyhow!("invalid projected inbox row"))?;
+                committed = Some(serde_json::from_slice(body)?);
+                Ok(())
+            })?;
+            let row = committed.unwrap_or_else(|| {
+                Row::Inbox(Box::new(InboxRow {
+                    session: session.to_owned(),
+                    family,
+                    key,
+                    value: None,
+                }))
+            });
+            let rev = self.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+            if self.write(&mut writes, &row, rev)? {
+                self.rev = rev;
+            }
+        }
+    }
+
+    /// Reconcile pre-Raft working rows against the complete projection once, before resuming.
+    /// Only the session being reclaimed is touched. Later local custody is overlaid separately.
+    fn repair_preexisting_history(&mut self, session: &str, replace_header: bool) -> anyhow::Result<()> {
+        if self.one_int("SELECT verify_events FROM convo_raft_state WHERE session=?1", &[txt(session)])? != Some(1) {
+            return Ok(());
+        }
+        anyhow::ensure!(self.raft_projection_complete(session)?, "a legacy group needs a complete snapshot before repairing local history");
+        self.clear_working_history(session, replace_header)?;
+        let mut writes = self.writes()?;
+        let mut read = self.prepare("SELECT body FROM convo_raft_cells WHERE session=?1 ORDER BY kind,source,n,ordinal,id")?;
+        let mut rev = self.rev;
+        self.run(&mut read, &[txt(session)], |r| {
+            let body = r.get_value(0).to_blob().ok_or_else(|| anyhow::anyhow!("invalid committed row"))?;
+            let row = serde_json::from_slice(body)?;
+            let next = rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+            if self.write(&mut writes, &row, next)? { rev = next; }
+            Ok(())
+        })?;
+        self.rev = rev;
+        let mut done = self.prepare("UPDATE convo_raft_state SET verify_events=0 WHERE session=?1")?;
+        self.run(&mut done, &[txt(session)], |_| Ok(()))
+    }
+
+    fn clear_working_history(&mut self, session: &str, replace_header: bool) -> anyhow::Result<()> {
+        let at = crate::util::now_ms();
+        let mut writes = self.writes()?;
+        if self.one_int("SELECT 1 FROM events WHERE session=?1 LIMIT 1", &[txt(session)])?.is_some() {
+            let reset = Row::Reset { session: session.to_owned(), from: None, at };
+            let next = self.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+            self.write(&mut writes, &reset, next)?;
+            self.rev = next;
+        }
+        // RecordReset also tells existing feed readers to discard stale trailing native lines.
+        let mut source = self.prepare("SELECT source FROM records WHERE session=?1 ORDER BY source LIMIT 1")?;
+        loop {
+            let mut name = None;
+            self.run(&mut source, &[txt(session)], |r| { name = Some(r.get::<String>(0).map_err(fail)?); Ok(()) })?;
+            let Some(source) = name else { break };
+            let next = self.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+            self.write(&mut writes, &Row::RecordReset { session: session.to_owned(), source, at }, next)?;
+            self.rev = next;
+        }
+        // Each removed key has its own feed revision. After a large import, a feed page
+        // must not need to materialize an entire session as a single synthetic transaction.
+        let old_tip = self.rev;
+        let mut cursor = (-1_i64, 0_i64);
+        let mut keys = self.prepare("SELECT rev,rowid FROM inbox WHERE session=?1 AND (rev,rowid)>(?2,?3) AND rev<=?4 AND value IS NOT NULL ORDER BY rev,rowid LIMIT 1")?;
+        let mut clear = self.prepare("UPDATE inbox SET value=NULL,rev=?2 WHERE rowid=?1")?;
+        loop {
+            let mut old = None;
+            self.run(&mut keys, &[txt(session), int(cursor.0), int(cursor.1), seq(old_tip)], |r| {
+                old = Some((r.get::<i64>(0).map_err(fail)?,r.get::<i64>(1).map_err(fail)?));
+                Ok(())
+            })?;
+            let Some(found) = old else { break };
+            let next = self.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+            self.run(&mut clear, &[int(found.1),seq(next)], |_| Ok(()))?;
+            self.rev = next;
+            cursor = found;
+        }
+        if replace_header {
+            let mut clear = self.prepare("DELETE FROM sessions WHERE id=?1")?;
+            self.run(&mut clear, &[txt(session)], |_| Ok(()))?;
+        }
+        Ok(())
+    }
+
+    fn restore_committed_source(&mut self, session: &str, source: &str, writes: &mut Writes) -> anyhow::Result<()> {
+        let reset = Row::RecordReset {
+            session: session.to_owned(),
+            source: source.to_owned(),
+            at: crate::util::now_ms(),
+        };
+        let rev = self.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+        self.write(writes, &reset, rev)?;
+        self.rev = rev;
+        let mut read = self.prepare("SELECT body FROM convo_raft_cells WHERE session=?1 AND kind='record' AND source=?2 ORDER BY n,id")?;
+        let mut next = self.rev;
+        self.run(&mut read, &[txt(session), bytes(source.as_bytes())?], |r| {
+            let body = r.get_value(0).to_blob().ok_or_else(|| anyhow::anyhow!("invalid projected record"))?;
+            let row = serde_json::from_slice(body)?;
+            let rev = next.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+            if self.write(writes, &row, rev)? {
+                next = rev;
+            }
+            Ok(())
+        })?;
+        self.rev = next;
+        Ok(())
+    }
+
+    fn local_inbox(&self, session: &str, owner: &str) -> anyhow::Result<LocalInbox> {
+        let mut q = self.prepare(
+            "SELECT s.owner<>?2, s.inbox_epoch, f.epoch FROM (SELECT ?1 AS id) k
+                LEFT JOIN convo_raft_state s ON s.session=k.id LEFT JOIN convo_local_owner_fence f ON f.session=k.id",
+        )?;
+        let mut gate = LocalInbox::Fenced;
+        self.run(&mut q, &[txt(session), txt(owner)], |r| {
+            gate = if r.get::<i64>(0).ok() == Some(1) {
+                LocalInbox::Fenced
+            } else if let Ok(floor) = r.get::<i64>(2) {
+                match r.get::<i64>(1).ok().filter(|epoch| *epoch > floor) {
+                    Some(epoch) => LocalInbox::NeedsHead(u64::try_from(epoch)?),
+                    None => LocalInbox::Fenced,
+                }
+            } else {
+                LocalInbox::Active
+            };
+            Ok(())
+        })?;
+        if let LocalInbox::NeedsHead(epoch) = gate
+            && let Some((bytes, _)) = self.link().inbox_get("inbox-heads", session.as_bytes())?
+            && serde_json::from_slice::<HeadEpoch>(&bytes)?.epoch == epoch
+        {
+            return Ok(LocalInbox::Active);
+        }
+        Ok(gate)
+    }
+
+    fn check_outbox_epoch(&self, session: &str, epoch: u64) -> anyhow::Result<()> {
+        let eligible = self.one_int(
+            "SELECT NOT EXISTS(SELECT 1 FROM convo_raft_state WHERE session=?1 AND (inbox_epoch<>?2 OR owner<>?3))
+                AND NOT EXISTS(SELECT 1 FROM convo_local_owner_fence WHERE session=?1 AND epoch>=?2)",
+            &[txt(session), int(i64::try_from(epoch)?), text(self.local_owner.as_deref())],
+        )?;
+        anyhow::ensure!(eligible==Some(1), "inbox owner or ownership epoch changed");
+        Ok(())
+    }
+
+    /// Receipt placement survives elections even when the former writer's store was much
+    /// busier. Its successor must issue every later receipt above any position it took over.
+    fn observe_receipt(&mut self, family: &str, value: &[u8]) -> anyhow::Result<()> {
+        if let Some(position) = crate::harness::inbox::receipt_sequence(family, value) {
+            anyhow::ensure!(position < i64::MAX as u64, "receipt position exhausts the store revision clock");
+            self.rev = self.rev.max(position);
+        }
+        Ok(())
+    }
+
     fn writes(&self) -> anyhow::Result<Writes> {
         Ok(Writes::default())
     }
@@ -1129,6 +1649,91 @@ impl Turso {
         Ok(true)
     }
 
+    fn changes_for(&mut self, viewer: Option<&str>, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
+        if from >= self.rev {
+            return Ok(Changes { rows: Vec::new(), upto: from });
+        }
+        let s = |r: &TRow, i: usize| r.get::<String>(i).ok();
+        // Each kind's rows after `from`: (rev, session, the rows it makes, its epoch if it says).
+        let pages = [
+            self.feed_page(if viewer.is_some() { sql::VIEW_SESSIONS } else { sql::FEED_SESSIONS }, viewer, from, max_bytes, |r| {
+                let id = s(r, 0).unwrap_or_default();
+                let epoch = u(r, 7);
+                let closed = r.get::<i64>(6).ok();
+                let mut rows = vec![Row::Session { session: id.clone(), info: s(r, 1), meta: s(r, 2), state: s(r, 3), changes: s(r, 4), epoch: Some(epoch), open: closed.is_none(), at: r.get::<i64>(5).unwrap_or(0) }];
+                if let Some(at) = closed {
+                    rows.push(Row::Closed { session: id.clone(), at });
+                }
+                if let Some(machine) = s(r, 9) {
+                    rows.push(Row::Machine { session: id.clone(), machine });
+                }
+                Ok((u(r, 8), id, rows, Some(epoch)))
+            })?,
+            self.feed_page(if viewer.is_some() { sql::VIEW_EVENTS } else { sql::FEED_EVENTS }, viewer, from, max_bytes, |r| {
+                let e = event_of(r)?;
+                Ok((u(r, 12), e.session.clone(), vec![Row::Event(Box::new(e))], None))
+            })?,
+            if viewer.is_some() { (Vec::new(), false) } else { self.feed_page(sql::FEED_RECORDS, None, from, max_bytes, |r| {
+                // To a taker that takes them so, a compressed line goes as it is kept.
+                let v = r.get_value(4);
+                let (line, as_kept) = match v.to_blob() {
+                    Some(b) if kept && b.first() == Some(&CODEC_BROTLI) => (String::new(), Some(b.to_vec())),
+                    _ => (unsqueeze(v)?, None),
+                };
+                let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line, kept: as_kept };
+                Ok((u(r, 5), rec.session.clone(), vec![Row::Record(Box::new(rec))], None))
+            })? },
+            // The sessions' inboxes, to a taker that takes them: others read on past their numbers.
+            if inbox { self.feed_inbox(from, max_bytes)? } else { (Vec::new(), false) },
+            self.feed_page(if viewer.is_some() { sql::VIEW_DROPS } else { sql::FEED_DROPS }, viewer, from, max_bytes, |r| {
+                let session = s(r, 1).unwrap_or_default();
+                let at = r.get::<i64>(5).unwrap_or(0);
+                let row = match s(r, 2).as_deref() {
+                    Some("record") => Row::RecordReset { session: session.clone(), source: s(r, 3).unwrap_or_default(), at },
+                    _ => Row::Reset { session: session.clone(), from: r.get::<i64>(4).ok().and_then(|n| u64::try_from(n).ok()), at },
+                };
+                Ok((u(r, 0), session, vec![row], None))
+            })?,
+        ];
+        // Complete through `bound`: a kind that filled its page, or its bytes, may have more after
+        // its last.
+        let mut bound = self.rev;
+        for (p, more) in &pages {
+            if *more && let Some((last, ..)) = p.last() {
+                bound = bound.min(*last);
+            }
+        }
+        let mut all: Vec<(u64, String, Vec<Row>, Option<u64>)> = pages.into_iter().flat_map(|(p, _)| p).filter(|(rev, ..)| *rev <= bound).collect();
+        all.sort_by_key(|(rev, ..)| *rev);
+        let mut epochs: HashMap<String, u64> = HashMap::new();
+        let mut out = Changes { rows: Vec::new(), upto: bound };
+        let mut bytes = 0usize;
+        for (rev, session, rows, epoch) in all {
+            // Never between rows of one number (an inbox commit's): its rows go together.
+            if bytes >= max_bytes && out.rows.last().is_some_and(|c| c.rev != rev) {
+                // The rest next time: read through the last one taken.
+                out.upto = out.rows.last().map_or(from, |c| c.rev);
+                break;
+            }
+            let epoch = match epoch {
+                Some(e) => e,
+                None => match epochs.get(&session) {
+                    Some(e) => *e,
+                    None => {
+                        let e = self.epoch_of(&session)?;
+                        epochs.insert(session.clone(), e);
+                        e
+                    }
+                },
+            };
+            for row in rows {
+                bytes += row.bytes();
+                out.rows.push(Change { rev, epoch, row });
+            }
+        }
+        Ok(out)
+    }
+
     /// The inbox's rows after `from`, as [`Turso::feed_page`] reads a kind's: each commit's rows whole, though they share
     /// its number (a page cut short reads the rest of the last commit it read).
     fn feed_inbox(&self, from: u64, max_bytes: usize) -> anyhow::Result<(Vec<(u64, String, Vec<Row>, Option<u64>)>, bool)> {
@@ -1137,7 +1742,7 @@ impl Turso {
             let row = InboxRow { session: session.clone(), family: r.get::<String>(1).unwrap_or_default(), key: r.get_value(2).to_blob().map(<[u8]>::to_vec).unwrap_or_default(), value: r.get_value(3).to_blob().map(<[u8]>::to_vec) };
             Ok((u(r, 4), session, vec![Row::Inbox(Box::new(row))], None))
         };
-        let (mut out, more) = self.feed_page(sql::FEED_INBOX, from, max_bytes, row_of)?;
+        let (mut out, more) = self.feed_page(sql::FEED_INBOX, None, from, max_bytes, row_of)?;
         if more && let Some(last) = out.last().map(|(rev, ..)| *rev) {
             out.retain(|(rev, ..)| *rev != last);
             let mut rest = self.prepare(sql::FEED_INBOX_AT)?;
@@ -1158,10 +1763,12 @@ impl Turso {
     /// fewer once they come to `max_bytes` (nothing more is read, or decompressed, than a batch
     /// takes); and whether more may follow (the page is full, or stopped at the bytes).
     #[allow(clippy::type_complexity)]
-    fn feed_page(&self, sql: &str, from: u64, max_bytes: usize, each: impl Fn(&TRow) -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)>) -> anyhow::Result<(Vec<(u64, String, Vec<Row>, Option<u64>)>, bool)> {
+    fn feed_page(&self, sql: &str, viewer: Option<&str>, from: u64, max_bytes: usize, each: impl Fn(&TRow) -> anyhow::Result<(u64, String, Vec<Row>, Option<u64>)>) -> anyhow::Result<(Vec<(u64, String, Vec<Row>, Option<u64>)>, bool)> {
         let mut stmt = self.prepare(sql)?;
         let (mut out, mut bytes, mut full) = (Vec::new(), 0usize, false);
-        self.run_while(&mut stmt, &[seq(from), int(i64::try_from(FEED_PAGE).unwrap_or(512))], |r| {
+        let common = [seq(from), int(i64::try_from(FEED_PAGE).unwrap_or(i64::MAX)), viewer.map_or(Value::Null, txt)];
+        let params = if viewer.is_some() { &common[..] } else { common.get(..2).unwrap_or_default() };
+        self.run_while(&mut stmt, params, |r| {
             let page = each(r)?;
             bytes += page.2.iter().map(Row::bytes).sum::<usize>();
             out.push(page);
@@ -1218,6 +1825,64 @@ impl Turso {
         Ok(())
     }
 
+    fn patch_copy(&self, table: &str, columns: &str, rows: &[Vec<Value>]) -> anyhow::Result<()> {
+        let fields = columns.split(',').count() + 1;
+        let mut put = self.prepare(&format!("INSERT OR REPLACE INTO {table}(rowid,{columns}) VALUES({})", vec!["?";fields].join(",")))?;
+        let mut del = self.prepare(&format!("DELETE FROM {table} WHERE rowid=?1"))?;
+        for row in rows {
+            let [id, present, values @ ..] = row.as_slice() else { anyhow::bail!("invalid compact row") };
+            if matches!(present, Value::Null) {
+                self.run(&mut del, std::slice::from_ref(id), |_| Ok(()))?;
+            } else {
+                // The presence column is the source rowid too. It is already contiguous with
+                // the SQLite values, including large native or event blobs.
+                let data = row.get(1..).ok_or_else(||anyhow::anyhow!("invalid compact parameters"))?;
+                anyhow::ensure!(values.len() + 1 == fields,"invalid compact row width");
+                self.run(&mut put,data, |_| Ok(()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn watch_compact_rows(&mut self) -> anyhow::Result<()> {
+        self.transaction(|t| {
+            t.exec("CREATE TEMP TABLE convo_copy_dirty (tbl TEXT NOT NULL, r INTEGER NOT NULL, PRIMARY KEY(tbl,r))")?;
+            for (table, _) in RAFT_COPY {
+                for (op,side) in [("insert","NEW"),("update","NEW"),("delete","OLD")] {
+                    t.conn.execute(format!("CREATE TEMP TRIGGER convo_copy_{table}_{op} AFTER {op} ON main.{table} BEGIN
+                        INSERT INTO convo_copy_dirty(tbl,r) VALUES('{table}',{side}.rowid) ON CONFLICT(tbl,r) DO NOTHING; END")).map_err(fail)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn unwatch_compact_rows(&self) -> anyhow::Result<()> {
+        for (table, _) in RAFT_COPY {
+            for op in ["insert","update","delete"] {
+                self.exec(&format!("DROP TRIGGER IF EXISTS temp.convo_copy_{table}_{op}"))?;
+            }
+        }
+        self.exec("DROP TABLE IF EXISTS temp.convo_copy_dirty")
+    }
+
+    /// A dirty entry records the identity alone. The current committed value (including a
+    /// deletion) is read once irrespective of how often the key changed during the copy.
+    fn compact_dirty(&self, c: &Compaction, budget: usize, flush: bool) -> anyhow::Result<bool> {
+        for (table, columns) in RAFT_COPY {
+            let sql = format!("SELECT d.r,d.r,t.rowid,t.* FROM convo_copy_dirty d LEFT JOIN {table} t ON t.rowid=d.r
+                               WHERE d.tbl=?1 ORDER BY d.r LIMIT ?2");
+            let (rows,last) = self.rows_from(&sql,&[txt(table),int(COMPACT_ROWS)],budget)?;
+            if !rows.is_empty() {
+                c.copier.give(CopyJob::Patch(table,columns,rows,flush))?;
+                let mut done = self.prepare("DELETE FROM convo_copy_dirty WHERE tbl=?1 AND r<=?2")?;
+                self.run(&mut done, &[txt(table),int(last)], |_| Ok(()))?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether compacting is worth it, with room beside the file for the copy: if so it begins.
     fn compact_begin(&mut self, min_free: u64) -> anyhow::Result<bool> {
         let pages = |p: &str| -> anyhow::Result<u64> { Ok(self.one_int(&format!("PRAGMA {p}"), &[])?.and_then(|n| u64::try_from(n).ok()).unwrap_or(0)) };
@@ -1247,10 +1912,12 @@ impl Turso {
         // with the copy.
         copy.exec(&format!("PRAGMA cache_size = -{}", COMPACT_CACHE >> 10))?;
         let copier = Copier::start(copy)?;
+        self.unwatch_compact_rows()?;
+        self.watch_compact_rows()?;
         self.touched.borrow_mut().clear();
         self.compaction = Some(Box::new(Compaction {
             copier,
-            scans: COMPACT_SCANNED.iter().map(|t| (*t, Some(0))).collect(),
+            scans: COMPACT_SCANNED.iter().copied().chain(RAFT_COPY.iter().map(|(t,_)| *t)).map(|t| (t,Some(0))).collect(),
             through: self.rev,
             before: size,
             held: size - free,
@@ -1278,16 +1945,23 @@ impl Turso {
         }
         if let Some((table, at)) = c.scans.iter_mut().find(|(_, at)| at.is_some()) {
             let began = std::time::Instant::now();
-            let (rows, last) = self.rows_from(&format!("SELECT rowid, * FROM {table} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2"), &[int(at.unwrap_or(0)), int(COMPACT_ROWS)], budget)?;
+            let tracked = RAFT_COPY.iter().find(|(name,_)| *name == *table);
+            let fields = if tracked.is_some() { "rowid,rowid,rowid,*" } else { "rowid,*" };
+            let (rows, last) = self.rows_from(&format!("SELECT {fields} FROM {table} WHERE rowid > ?1 ORDER BY rowid LIMIT ?2"), &[int(at.unwrap_or(0)), int(COMPACT_ROWS)], budget)?;
             if rows.is_empty() {
                 *at = None;
             } else {
                 tracing::debug!(table, rows = rows.len(), read_ms = ms(began.elapsed()), "conversation store: a step of compacting");
-                c.copier.give(CopyJob::Put(table, rows, true))?;
+                let job = match tracked {
+                    Some((name,cols)) => CopyJob::Patch(name,cols,rows,true),
+                    None => CopyJob::Put(table,rows,true),
+                };
+                c.copier.give(job)?;
                 *at = Some(last);
             }
             return Ok(false);
         }
+        if self.compact_dirty(c, budget, true)? { return Ok(false); }
         self.compact_catch_up(c, budget, true)?;
         if c.through < self.rev {
             return Ok(false);
@@ -1437,7 +2111,8 @@ impl Turso {
             c.copier.give(CopyJob::Put("sessions", again, false))?;
         }
         let tables = self.tables()?;
-        for table in tables.iter().filter(|t| !COMPACT_SCANNED.contains(&t.as_str())) {
+        while self.compact_dirty(c, super::store::COMPACT_STEP, false)? {}
+        for table in tables.iter().filter(|t| !COMPACT_SCANNED.contains(&t.as_str()) && !RAFT_COPY.iter().any(|(name,_)| *name == t.as_str())) {
             let (rows, _) = self.rows_from(&format!("SELECT rowid, * FROM {table}"), &[], usize::MAX)?;
             c.copier.give(CopyJob::Replace(table.clone(), rows))?;
         }
@@ -1500,6 +2175,9 @@ impl Turso {
     /// A compaction stopped: the copier ends (the copy closes), and the copy goes.
     fn compact_drop(&mut self) {
         self.compaction = None;
+        if let Err(err) = self.unwatch_compact_rows() {
+            tracing::warn!(error=%err, "could not drop temporary compact change tracking");
+        }
         let part = beside(&self.path, ".compact.tmp");
         for side in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(beside(&part, side));
@@ -1513,8 +2191,236 @@ fn u(r: &TRow, i: usize) -> u64 {
 }
 
 impl Engine for Turso {
+    fn has_legacy_name_catalog(&mut self)->anyhow::Result<bool> {self.link().has_legacy_name_catalog()}
+    fn historical_names(&mut self)->anyhow::Result<std::collections::BTreeSet<String>> { self.link().historical_names() }
+    fn founding_rows(&mut self,session:&str,epoch:u64,owner:&str)->anyhow::Result<Vec<Row>> {self.link().founding_rows(session,epoch,owner)}
     fn id(&self) -> String {
         self.id.clone()
+    }
+
+    fn journal_raft_rows(&mut self, session: &str, epoch: Option<u64>, rows: &[Row], record: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(rows.iter().all(|r| r.session() == session), "outbox contains a foreign session");
+        if record {
+            anyhow::ensure!(rows.iter().all(|r| matches!(r, Row::Record(_) | Row::RecordReset { .. })), "expected recorder rows");
+        }
+        if !self.inbox_replication {
+            anyhow::ensure!(record, "Raft outbox is not initialized");
+            return self.apply(rows);
+        }
+        self.transaction(|t| {
+            let epoch = match epoch {
+                Some(epoch) => epoch,
+                None => t.epoch_of(session)?,
+            };
+            t.check_outbox_epoch(session, epoch)?;
+            let tip = t.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+            let mut put = t.prepare("INSERT INTO inbox_outbox(session,rev,ord,family,key,epoch,row_body) VALUES(?1,?2,?3,'',?4,?5,?6)")?;
+            let mut writes = t.writes()?;
+            for (ord, row) in rows.iter().enumerate() {
+                let source = match row {
+                    Row::Record(r) => r.source.as_bytes(),
+                    Row::RecordReset { source, .. } => source.as_bytes(),
+                    _ => &[],
+                };
+                if record {
+                    let rev = t.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+                    if t.write(&mut writes, row, rev)? {
+                        t.rev = rev;
+                    }
+                }
+                t.write_bound(
+                    &mut put,
+                    [txt(session), seq(tip), int(i64::try_from(ord)?), bytes(source)?, seq(epoch), encoded_row(row)?],
+                )?;
+            }
+            t.rev = t.rev.max(tip);
+            Ok(())
+        })
+    }
+
+    fn enable_inbox_for(&mut self, owner: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(owner.is_empty() || self.local_owner.as_deref().is_none_or(|previous| previous == owner), "conversation store is already bound to another local node");
+        if self.inbox_replication && (owner.is_empty() || self.local_owner.is_some()) { return Ok(()); }
+        self.transaction(|t| {
+            if !owner.is_empty() { t.set_meta("inbox_raft_owner", owner)?; }
+            if t.inbox_replication { return Ok(()); }
+            // Seed all existing live rows AND tombstones exactly once, before a new local
+            // transaction can be accepted. Preserve the original multi-key commit boundaries.
+            let mut seed=t.prepare("INSERT INTO inbox_outbox(session,rev,ord,family,key,value,epoch) SELECT i.session,i.rev,i.rowid,i.family,i.key,i.value,COALESCE(json_extract(CAST(h.value AS TEXT),'$.epoch'),s.epoch,0)
+                 FROM inbox i LEFT JOIN inbox h ON h.family='inbox-heads' AND h.key=CAST(i.session AS BLOB)
+                 LEFT JOIN sessions s ON s.id=i.session WHERE s.machine IS NULL OR s.machine=?1")?;
+            t.run(&mut seed,&[txt(owner)], |_|Ok(()))?;
+            t.set_meta("inbox_raft_outbox", "1")
+        })?;
+        self.inbox_replication = true;
+        if !owner.is_empty() { self.local_owner = Some(owner.to_owned()); }
+        Ok(())
+    }
+
+    fn pending_inbox_sessions(&mut self) -> anyhow::Result<Vec<String>> {
+        // Seek directly past the previous session. SELECT DISTINCT walks each pending row,
+        // including years of offline backlog when another session only needs its next receipt.
+        let mut out: Vec<String> = Vec::new();
+        let mut stmt = self.prepare("SELECT session FROM inbox_outbox WHERE session>?1 ORDER BY session LIMIT 1")?;
+        loop {
+            let mut next = None;
+            self.run(&mut stmt, &[txt(out.last().map_or("", String::as_str))], |r| {
+                next = Some(r.get::<String>(0).map_err(fail)?);
+                Ok(())
+            })?;
+            let Some(session) = next else { break };
+            out.push(session);
+        }
+        Ok(out)
+    }
+
+    fn inbox_outbox_tip(&mut self, session: &str, epoch: u64) -> anyhow::Result<Option<u64>> {
+        anyhow::ensure!(self.inbox_replication, "inbox quorum replication is not initialized");
+        self.check_outbox_epoch(session, epoch)?;
+        self.one_int("SELECT MAX(rev) FROM inbox_outbox WHERE session=?1", &[txt(session)])?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    fn next_inbox_tx(&mut self, session: &str, epoch: u64, through: u64) -> anyhow::Result<Option<(u64, Vec<Row>)>> {
+        self.check_outbox_epoch(session, epoch)?;
+        let mut stmt = self.prepare("SELECT rev,family,key,value,epoch,row_body FROM inbox_outbox WHERE session=?1 AND rev=(SELECT MIN(rev) FROM inbox_outbox WHERE session=?1 AND rev<=?2) ORDER BY ord")?;
+        let mut result = None;
+        self.run(&mut stmt, &[txt(session), seq(through)], |r| {
+            if !matches!(r.get_value(4), Value::Null) {
+                anyhow::ensure!(u(r, 4) == epoch, "inbox transaction belongs to ownership epoch {}, current is {epoch}", u(r, 4));
+            }
+            let row = Self::outbox_row(session, r)?;
+            result.get_or_insert_with(|| (u(r, 0), Vec::new())).1.push(row);
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    fn confirm_inbox_tx(&mut self, session: &str, rev: u64) -> anyhow::Result<()> {
+        self.transaction(|t| {
+            let mut stmt = t.prepare("DELETE FROM inbox_outbox WHERE session=?1 AND rev=?2")?;
+            t.run(&mut stmt, &[txt(session), seq(rev)], |_| Ok(()))
+        })
+    }
+
+    fn confirm_local_owner_fence(&mut self, session: &str, epoch: u64) -> anyhow::Result<bool> {
+        self.conn.set_sync_type(turso_core::io::FileSyncType::FullFsync);
+        let result=self.transaction(|t|{
+            let mut q=t.prepare("INSERT INTO convo_local_owner_fence(session,epoch) VALUES(?1,?2) ON CONFLICT(session) DO UPDATE SET epoch=excluded.epoch WHERE excluded.epoch>convo_local_owner_fence.epoch")?;
+            t.run(&mut q,&[txt(session),int(i64::try_from(epoch)?)],|_|Ok(()))?;
+            Ok(q.n_change()>0)
+        });
+        self.conn.set_sync_type(turso_core::io::FileSyncType::Fsync);
+        result
+    }
+
+    fn raft_projection_origin(&mut self,session:&str) -> anyhow::Result<Option<[u8;32]>> {
+        let mut q = self.prepare("SELECT genesis FROM convo_raft_state WHERE session=?1 AND complete=1 AND genesis IS NOT NULL")?;
+        let mut origin = None;
+        self.run(&mut q, &[txt(session)], |r| {
+            let data = r.get_value(0).to_blob().ok_or_else(|| anyhow::anyhow!("invalid stored founding identity"))?;
+            origin = Some(data.try_into().map_err(|_| anyhow::anyhow!("invalid stored founding identity length"))?);
+            Ok(())
+        })?;
+        Ok(origin)
+    }
+
+    fn has_raft_projection(&mut self, session: &str) -> anyhow::Result<bool> {
+        Ok(self.one_int("SELECT 1 FROM convo_raft_state WHERE session=?1", &[txt(session)])?.is_some())
+    }
+
+    fn raft_projection_frontier(&mut self, session: &str) -> anyhow::Result<Option<(u64, u64)>> {
+        let mut q = self.prepare("SELECT applied,term FROM convo_raft_state WHERE session=?1 AND complete=1")?;
+        let mut frontier = None;
+        self.run(&mut q, &[txt(session)], |r| {
+            frontier = Some((u64::try_from(r.get::<i64>(0).map_err(fail)?)?, u64::try_from(r.get::<i64>(1).map_err(fail)?)?));
+            Ok(())
+        })?;
+        Ok(frontier)
+    }
+
+    fn begin_raft_projection(&mut self, session: &str, previous_index: u64) -> anyhow::Result<()> {
+        self.transaction(|t| {
+            let mut stmt = t.prepare("INSERT INTO convo_raft_state(session,applied,term,complete,verify_events) VALUES(?1,0,0,?2,EXISTS(SELECT 1 FROM events WHERE session=?1) OR EXISTS(SELECT 1 FROM records WHERE session=?1) OR EXISTS(SELECT 1 FROM inbox WHERE session=?1) OR EXISTS(SELECT 1 FROM sessions WHERE id=?1)) ON CONFLICT(session) DO NOTHING")?;
+            t.run(&mut stmt, &[txt(session), int(i64::from(previous_index == 0))], |_| Ok(()))
+        })
+    }
+
+    fn raft_snapshot_rows(&mut self, session: &str, at: u64) -> anyhow::Result<Vec<Row>> {
+        self.link().raft_snapshot_rows(session, at, &mut || {})
+    }
+
+    fn write_raft_rows(&mut self, session: &str, index: u64, term: u64, rows: &[Row], mode: ProjectionWrite, new_epoch: Option<u64>) -> anyhow::Result<()> {
+        let install = mode != ProjectionWrite::Apply;
+        let origin = match mode { ProjectionWrite::Certified { origin, .. } => Some(origin), _ => None };
+        let recover = matches!(mode, ProjectionWrite::Recover | ProjectionWrite::Certified { recover:true, .. });
+        anyhow::ensure!(rows.iter().all(|r| r.session() == session), "Raft entry contains a foreign session");
+        self.conn.set_sync_type(turso_core::io::FileSyncType::FullFsync);
+        let result = self.transaction(|t| {
+            let state=t.one_int("SELECT applied FROM convo_raft_state WHERE session=?1", &[txt(session)])?;
+            let matched_origin = match origin {
+                Some(genesis) if state.is_some() => t.one_int("SELECT genesis=?2 FROM convo_raft_state WHERE session=?1 AND complete=1 AND genesis IS NOT NULL", &[txt(session),bytes(&genesis)?])?,
+                _ => None,
+            };
+            let different_origin = origin.is_some() && matched_origin != Some(1);
+            if !recover && !different_origin && let Some(prior) = state && (!install || t.raft_projection_complete(session)?) {
+                if prior > i64::try_from(index)? { return Ok(()) }
+                if prior == i64::try_from(index)? {
+                    anyhow::ensure!(t.one_int("SELECT term FROM convo_raft_state WHERE session=?1",&[txt(session)])? == Some(i64::try_from(term)?), "Raft projection term mismatch at {index}");
+                    return Ok(())
+                }
+            }
+            anyhow::ensure!(install || state.is_some(), "Raft projection is missing");
+            let owner = rows.iter().rev().find_map(|row| match row { Row::Machine { machine,.. } => Some(machine.as_str()), _ => None });
+            let unmarked_history = recover && origin.is_some() && matched_origin.is_none() && state.is_some_and(|i| i > 0);
+            let prior_owner_confirmed = if unmarked_history {
+                match (t.local_owner.as_deref(), owner) {
+                    (Some(local),Some(committed)) if local == committed =>
+                        t.one_int("SELECT 1 FROM convo_raft_state WHERE session=?1 AND owner=?2", &[txt(session),txt(local)])?.is_some(),
+                    _ => false,
+                }
+            } else { true };
+            let replaced_custody = matched_origin == Some(0) || !prior_owner_confirmed;
+            if replaced_custody {
+                // A different session may have reached a greater epoch under the same name.
+                // Retaining its future rows would make them reappear when this one caught up.
+                let mut clear = t.prepare("DELETE FROM inbox_outbox WHERE session=?1")?;
+                t.run(&mut clear, &[txt(session)], |_| Ok(()))?;
+            }
+            let foreign = replaced_custody || match (t.local_owner.as_deref(), owner) {
+                (Some(local), Some(committed)) => local != committed,
+                (Some(local), None) => t.one_int("SELECT owner<>?2 FROM convo_raft_state WHERE session=?1", &[txt(session), txt(local)])? == Some(1),
+                _ => false,
+            };
+            if install {
+                t.clear_working_history(session, true)?;
+                let mut clear=t.prepare("DELETE FROM convo_raft_cells WHERE session=?1")?;
+                t.run(&mut clear,&[txt(session)], |_| Ok(()))?;
+            } else if let Some(epoch) = new_epoch {
+                t.revert_abandoned_inbox(session, epoch, foreign)?;
+                t.repair_preexisting_history(session, rows.iter().any(|row| matches!(row, Row::Session { .. })))?;
+            }
+            let mut writes=t.writes()?;
+            let mut put=t.prepare("INSERT INTO convo_raft_cells(session,kind,source,id,n,body,ordinal) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(session,kind,source,id) DO UPDATE SET n=excluded.n, body=excluded.body,ordinal=excluded.ordinal WHERE convo_raft_cells.body<>excluded.body")?;
+            let overlay=!foreign && !install && t.one_int("SELECT 1 FROM inbox_outbox WHERE session=?1 LIMIT 1",&[txt(session)])?.is_some();
+            for row in rows {
+                if let Row::Inbox(i)=row && let Some(value)=&i.value { t.observe_receipt(&i.family,value)?; }
+                t.project_row(session,row,&mut put)?;
+                let changed_event=matches!(row,Row::Event(_)) && put.n_change()>0;
+                // Working CAS revisions and recorder offsets can already be ahead of the
+                // acknowledged row. Only the authoritative projection advances in that case.
+                if overlay && t.has_working_overlay(session,new_epoch,row)? { continue; }
+                let rev=t.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
+                if t.write(&mut writes,row,rev)? || changed_event { t.rev=rev; }
+            }
+            if install || new_epoch.is_some() { t.restore_outbox_overlay(session,new_epoch.unwrap_or(0),foreign,&mut writes)?; }
+            let mut mark=t.prepare("INSERT INTO convo_raft_state(session,applied,term,complete,inbox_epoch,verify_events,owner,genesis) VALUES(?1,?2,?3,?4,?5,0,?6,?7) ON CONFLICT(session) DO UPDATE SET genesis=CASE WHEN excluded.complete=1 THEN excluded.genesis ELSE convo_raft_state.genesis END,owner=COALESCE(excluded.owner,convo_raft_state.owner),verify_events=CASE WHEN excluded.complete=1 THEN 0 ELSE convo_raft_state.verify_events END,applied=excluded.applied,term=excluded.term,complete=MAX(convo_raft_state.complete,excluded.complete),inbox_epoch=COALESCE(excluded.inbox_epoch,convo_raft_state.inbox_epoch)")?;
+            t.run(&mut mark,&[txt(session),int(i64::try_from(index)?),int(i64::try_from(term)?),int(i64::from(install)),new_epoch.or_else(|| rows.iter().find_map(|r| match r { Row::Session { epoch, .. } => *epoch, _ => None })).map_or(Value::Null,seq), text(owner),origin.as_ref().map(|g|bytes(g)).transpose()?.unwrap_or(Value::Null)], |_| Ok(()))
+        });
+        self.conn.set_sync_type(turso_core::io::FileSyncType::Fsync);
+        result
     }
 
     fn inbox_get(&mut self, family: &str, key: &[u8]) -> anyhow::Result<Option<(Vec<u8>, u64)>> {
@@ -1534,6 +2440,10 @@ impl Engine for Turso {
             let mut out = Vec::with_capacity(batch.len());
             let mut put = t.prepare(sql::INBOX_PUT)?;
             let mut delete = t.prepare(sql::INBOX_DELETE)?;
+            let mut post = t.inbox_replication.then(|| t.prepare("INSERT INTO inbox_outbox(session,rev,ord,family,key,value,epoch) VALUES(?1,?2,?3,?4,?5,?6,?7)")).transpose()?;
+            #[derive(Default)]
+            struct Custody { writable: Option<LocalInbox>, epoch: Option<u64> }
+            let mut custody: HashMap<&str, Custody> = HashMap::new();
             'commit: for (tx, sessions) in batch {
                 // Each read as the commits before it in this batch left it.
                 for c in &tx.conds {
@@ -1551,13 +2461,61 @@ impl Engine for Turso {
                     out.push(Ok(t.rev));
                     continue;
                 }
-                t.rev += 1;
+                anyhow::ensure!(sessions.len() == tx.writes.len(), "inbox transaction missing a session");
+                if let Some(owner) = &t.local_owner {
+                    for session in sessions.iter() {
+                        let cached = custody.entry(session).or_default();
+                        let gate = match cached.writable {
+                            Some(gate) => gate,
+                            None => *cached.writable.insert(t.local_inbox(session,owner)?),
+                        };
+                        let allowed = match gate {
+                            LocalInbox::Active => true,
+                            LocalInbox::Fenced => false,
+                            // A delayed old-head CAS can still match after Raft commits the new
+                            // owner. Only its matching new head opens the next inbox epoch.
+                            LocalInbox::NeedsHead(epoch) => tx.writes.iter().any(|w| matches!(w,
+                                Write::Put {family,key,value} if family=="inbox-heads" && key.as_slice()==session.as_bytes()
+                                    && serde_json::from_slice::<HeadEpoch>(value).is_ok_and(|h|h.epoch==epoch))),
+                        };
+                        if !allowed {
+                            out.push(Err(Refusal::Unavailable("the local inbox is fenced or awaiting its committed ownership epoch".into())));
+                            continue 'commit;
+                        }
+                    }
+                }
+                for w in &tx.writes {
+                    if let Write::Put { family,value,.. } = w { t.observe_receipt(family,value)?; }
+                }
+                t.rev = t.rev.checked_add(1).ok_or_else(|| anyhow::anyhow!("conversation revision exhausted"))?;
                 let rev = t.rev;
-                for (i, w) in tx.writes.iter().enumerate() {
-                    let session = sessions.get(i).map_or("", String::as_str);
+                for (w, session) in tx.writes.iter().zip(sessions.iter()) {
+                    if post.is_some() && matches!(w, Write::Put { family, .. } | Write::Delete { family, .. } if family == "inbox-heads")
+                        && let Some(cached) = custody.get_mut(session.as_str()) { *cached = Custody::default(); }
                     match w {
-                        Write::Put { family, key, value } => t.run(&mut put, &[txt(family), bytes(key)?, txt(session), bytes(value)?, seq(rev)], |_| Ok(()))?,
+                        Write::Put { family, key, value } => t.write_bound(&mut put, [txt(family), bytes(key)?, txt(session), bytes(value)?, seq(rev)])?,
                         Write::Delete { family, key } => t.run(&mut delete, &[txt(family), bytes(key)?, seq(rev)], |_| Ok(()))?,
+                    }
+                }
+                if let Some(post) = post.as_mut() {
+                    for (ord, (write, session)) in tx.writes.iter().zip(sessions.iter()).enumerate() {
+                        let cached = custody.entry(session).or_default();
+                        let epoch = match cached.epoch {
+                            Some(epoch) => epoch,
+                            None => {
+                                let epoch = match t.link().inbox_get("inbox-heads",session.as_bytes())? {
+                                    Some((head,_)) => serde_json::from_slice::<HeadEpoch>(&head)?.epoch,
+                                    None => t.epoch_of(session)?,
+                                };
+                                cached.epoch = Some(epoch);
+                                epoch
+                            }
+                        };
+                        let (family,key,value) = match write {
+                            Write::Put{family,key,value} => (family,key,bytes(value)?),
+                            Write::Delete{family,key} => (family,key,Value::Null),
+                        };
+                        t.write_bound(post,[txt(session),seq(rev),int(i64::try_from(ord)?),txt(family),bytes(key)?,value,seq(epoch)])?;
                     }
                 }
                 out.push(Ok(rev));
@@ -1584,7 +2542,15 @@ impl Engine for Turso {
         }
         self.transaction(|t| {
             let mut w = t.writes()?;
+            let mut last = None;
             for row in rows {
+                // A provider update is journaled separately by the owning session. Only its
+                // committed Raft entry may mutate the timeline used for restart and recovery.
+                if last.is_none_or(|(id,_)| id != row.session()) {
+                    let managed = t.has_raft_schema && t.one_int("SELECT 1 FROM convo_raft_state WHERE session=?1", &[txt(row.session())])?.is_some();
+                    last = Some((row.session(),managed));
+                }
+                if last.is_some_and(|(_,managed)| managed) { continue; }
                 t.rev += 1;
                 if !t.write(&mut w, row, t.rev)? {
                     t.rev -= 1;
@@ -1595,88 +2561,16 @@ impl Engine for Turso {
     }
 
     fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes> {
-        if from >= self.rev {
-            return Ok(Changes { rows: Vec::new(), upto: from });
-        }
-        let s = |r: &TRow, i: usize| r.get::<String>(i).ok();
-        // Each kind's rows after `from`: (rev, session, the rows it makes, its epoch if it says).
-        let pages = [
-            self.feed_page(sql::FEED_SESSIONS, from, max_bytes, |r| {
-                let id = s(r, 0).unwrap_or_default();
-                let epoch = u(r, 7);
-                let closed = r.get::<i64>(6).ok();
-                let mut rows = vec![Row::Session { session: id.clone(), info: s(r, 1), meta: s(r, 2), state: s(r, 3), changes: s(r, 4), epoch: Some(epoch), open: closed.is_none(), at: r.get::<i64>(5).unwrap_or(0) }];
-                if let Some(at) = closed {
-                    rows.push(Row::Closed { session: id.clone(), at });
-                }
-                if let Some(machine) = s(r, 9) {
-                    rows.push(Row::Machine { session: id.clone(), machine });
-                }
-                Ok((u(r, 8), id, rows, Some(epoch)))
-            })?,
-            self.feed_page(sql::FEED_EVENTS, from, max_bytes, |r| {
-                let e = event_of(r)?;
-                Ok((u(r, 12), e.session.clone(), vec![Row::Event(Box::new(e))], None))
-            })?,
-            self.feed_page(sql::FEED_RECORDS, from, max_bytes, |r| {
-                // To a taker that takes them so, a compressed line goes as it is kept.
-                let v = r.get_value(4);
-                let (line, as_kept) = match v.to_blob() {
-                    Some(b) if kept && b.first() == Some(&CODEC_BROTLI) => (String::new(), Some(b.to_vec())),
-                    _ => (unsqueeze(v)?, None),
-                };
-                let rec = RecordRow { session: s(r, 0).unwrap_or_default(), source: s(r, 1).unwrap_or_default(), n: u(r, 2), end: u(r, 3), line, kept: as_kept };
-                Ok((u(r, 5), rec.session.clone(), vec![Row::Record(Box::new(rec))], None))
-            })?,
-            // The sessions' inboxes, to a taker that takes them: others read on past their numbers.
-            if inbox { self.feed_inbox(from, max_bytes)? } else { (Vec::new(), false) },
-            self.feed_page(sql::FEED_DROPS, from, max_bytes, |r| {
-                let session = s(r, 1).unwrap_or_default();
-                let at = r.get::<i64>(5).unwrap_or(0);
-                let row = match s(r, 2).as_deref() {
-                    Some("record") => Row::RecordReset { session: session.clone(), source: s(r, 3).unwrap_or_default(), at },
-                    _ => Row::Reset { session: session.clone(), from: r.get::<i64>(4).ok().and_then(|n| u64::try_from(n).ok()), at },
-                };
-                Ok((u(r, 0), session, vec![row], None))
-            })?,
-        ];
-        // Complete through `bound`: a kind that filled its page, or its bytes, may have more after
-        // its last.
-        let mut bound = self.rev;
-        for (p, more) in &pages {
-            if *more && let Some((last, ..)) = p.last() {
-                bound = bound.min(*last);
-            }
-        }
-        let mut all: Vec<(u64, String, Vec<Row>, Option<u64>)> = pages.into_iter().flat_map(|(p, _)| p).filter(|(rev, ..)| *rev <= bound).collect();
-        all.sort_by_key(|(rev, ..)| *rev);
-        let mut epochs: HashMap<String, u64> = HashMap::new();
-        let mut out = Changes { rows: Vec::new(), upto: bound };
-        let mut bytes = 0usize;
-        for (rev, session, rows, epoch) in all {
-            // Never between rows of one number (an inbox commit's): its rows go together.
-            if bytes >= max_bytes && out.rows.last().is_some_and(|c| c.rev != rev) {
-                // The rest next time: read through the last one taken.
-                out.upto = out.rows.last().map_or(from, |c| c.rev);
-                break;
-            }
-            let epoch = match epoch {
-                Some(e) => e,
-                None => match epochs.get(&session) {
-                    Some(e) => *e,
-                    None => {
-                        let e = self.epoch_of(&session)?;
-                        epochs.insert(session.clone(), e);
-                        e
-                    }
-                },
-            };
-            for row in rows {
-                bytes += row.bytes();
-                out.rows.push(Change { rev, epoch, row });
-            }
-        }
-        Ok(out)
+        self.changes_for(None, from, max_bytes, kept, inbox)
+    }
+
+    fn viewer_generation(&mut self, session: &str) -> anyhow::Result<(u64,u64)> {
+        let reset = self.one_int("SELECT MAX(rev) FROM drops INDEXED BY drops_by_session_rev WHERE session = ?1 AND what != 'record'", &[txt(session)])?;
+        Ok((self.epoch_of(session)?, reset.and_then(|r| u64::try_from(r).ok()).unwrap_or_default()))
+    }
+
+    fn viewer_changes(&mut self, session: &str, from: u64, max_bytes: usize) -> anyhow::Result<Changes> {
+        self.changes_for(Some(session), from, max_bytes, false, false)
     }
 
     fn take(&mut self, peer: &str, machine: Option<&str>, from: u64, batch: &Changes) -> anyhow::Result<Took> {
@@ -1897,6 +2791,71 @@ impl Engine for Turso {
         self.link().events(session, before, limit)
     }
 
+    fn events_snapshot_page(&mut self, session: &str, max_seq: u64, after: Option<(u64, i64)>, limit: usize) -> anyhow::Result<Vec<(EventRow, i64)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bound = int(i64::try_from(limit).unwrap_or(i64::MAX));
+        let mut out = Vec::new();
+        match after {
+            None => {
+                let mut stmt = self.prepare(sql::EVENTS_SNAPSHOT_FIRST)?;
+                self.run(&mut stmt, &[txt(session), seq(max_seq), bound], |r| {
+                    let ev = event_of(r)?;
+                    let rowid = r.get::<i64>(sql::EVENT_COLUMNS).unwrap_or(0);
+                    out.push((ev, rowid));
+                    Ok(())
+                })?;
+            }
+            Some((after_seq, after_rowid)) => {
+                let mut stmt = self.prepare(sql::EVENTS_SNAPSHOT_AFTER)?;
+                self.run(&mut stmt, &[txt(session), seq(max_seq), seq(after_seq), int(after_rowid), bound], |r| {
+                    let ev = event_of(r)?;
+                    let rowid = r.get::<i64>(sql::EVENT_COLUMNS).unwrap_or(0);
+                    out.push((ev, rowid));
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(out)
+    }
+
+    fn replace_session_snapshot(&mut self, session: &str, rows: &[Row]) -> anyhow::Result<()> {
+        let session = session.to_owned();
+        self.transaction(|t| {
+            anyhow::ensure!(rows.iter().all(|r| r.session() == session), "foreign row in conversation snapshot");
+            anyhow::ensure!(!t.has_raft_schema || t.one_int("SELECT 1 FROM convo_raft_state WHERE session=?1", &[txt(&session)])?.is_none(), "managed conversation requires an indexed Raft snapshot");
+            let mut clear_ev = t.prepare(sql::SNAPSHOT_CLEAR_EVENTS)?;
+            t.run(&mut clear_ev, &[txt(&session)], |_| Ok(()))?;
+            let mut clear_rec = t.prepare(sql::SNAPSHOT_CLEAR_RECORDS)?;
+            t.run(&mut clear_rec, &[txt(&session)], |_| Ok(()))?;
+            let mut clear_inb = t.prepare(sql::SNAPSHOT_CLEAR_INBOX)?;
+            t.run(&mut clear_inb, &[txt(&session)], |_| Ok(()))?;
+            let mut w = t.writes()?;
+            for row in rows {
+                t.rev += 1;
+                let r = t.rev;
+                if !t.write(&mut w, row, r)? {
+                    t.rev -= 1;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn inbox_session_all(&mut self, session: &str) -> anyhow::Result<Vec<(String, Vec<u8>, Option<Vec<u8>>)>> {
+        let mut stmt = self.prepare(sql::INBOX_SESSION_ALL)?;
+        let mut out = Vec::new();
+        self.run(&mut stmt, &[txt(session)], |r| {
+            let family = r.get::<String>(0).map_err(fail)?;
+            let key = r.get_value(1).to_blob().map(<[u8]>::to_vec).ok_or_else(|| anyhow::anyhow!("inbox key is not a blob"))?;
+            let value = r.get_value(2).to_blob().map(<[u8]>::to_vec);
+            out.push((family, key, value));
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     fn thread(&mut self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.link().thread(session, parent, before, limit)
     }
@@ -1925,6 +2884,333 @@ mod tests {
     use super::*;
     use crate::harness::core::Update;
     use crate::harness::model::{Body, Event, State};
+
+    #[test]
+    fn cp_t3_2_durable_former_owner_fence_leaves_the_successors_queue_alone() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("conversation.db");
+        let mut t = Turso::open(&path)?;
+        t.enable_inbox_for("west")?;
+        assert!(!t.has_raft_projection("legacy")?);
+        t.begin_raft_projection("incomplete", 7)?;
+        assert!(t.has_raft_projection("incomplete")?);
+        assert!(t.raft_projection_frontier("incomplete")?.is_none());
+        assert!(t.confirm_local_owner_fence("session", 4)?);
+        assert!(!t.confirm_local_owner_fence("session", 2)?);
+        drop(t);
+        let mut t = Turso::open(&path)?;
+        assert_eq!(
+            t.one_int("SELECT epoch FROM convo_local_owner_fence WHERE session=?1", &[txt("session")])?,
+            Some(4)
+        );
+        assert!(t.pending_inbox_sessions()?.is_empty());
+        assert!(t.inbox_get("inbox-heads", b"session")?.is_none());
+        assert!(t.inbox_outbox_tip("session", 4).is_err());
+        let sessions = ["session".to_string()];
+        let send = kiln_seams::records::Tx {
+            conds: vec![],
+            writes: vec![kiln_seams::records::Write::Put {
+                family: "inbox-pending".into(),
+                key: b"session/message".to_vec(),
+                value: b"body".to_vec(),
+            }],
+        };
+        assert!(matches!(
+            t.inbox_commit_batch(&[(&send, &sessions)])?.as_slice(),
+            [Err(kiln_seams::records::Refusal::Unavailable(_))]
+        ));
+        let claim = Row::Machine {
+            session: "session".into(),
+            machine: "west".into(),
+        };
+        t.write_raft_rows("session", 2, 3, &[claim], ProjectionWrite::Install, Some(5))?;
+        assert!(
+            matches!(
+                t.inbox_commit_batch(&[(&send, &sessions)])?.as_slice(),
+                [Err(kiln_seams::records::Refusal::Unavailable(_))]
+            ),
+            "a delayed send cannot cross the takeover boundary"
+        );
+        let mut open = send.clone();
+        open.writes = vec![kiln_seams::records::Write::Put {
+            family: "inbox-heads".into(),
+            key: b"session".to_vec(),
+            value: br#"{"epoch":5}"#.to_vec(),
+        }];
+        assert!(matches!(
+            t.inbox_commit_batch(&[(&open, &sessions), (&send, &sessions)])?.as_slice(),
+            [Ok(_), Ok(_)]
+        ));
+        assert!(t.next_inbox_tx("session", 5, u64::MAX)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_ordered_outbox_survives_restart_and_preserves_tombstones() -> anyhow::Result<()> {
+        use kiln_seams::records::{Tx, Write};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("conversations.db");
+        let mut t = Turso::open(&path)?;
+        let sessions = vec!["s".to_owned()];
+        let put = |body: &[u8]| Tx { conds: vec![], writes: vec![Write::Put { family: "test".into(), key: b"s/k".to_vec(), value: body.to_vec() }] };
+        let delete = Tx { conds: vec![], writes: vec![Write::Delete { family: "test".into(), key: b"s/k".to_vec() }] };
+        t.inbox_commit_batch(&[(&put(b"old"), &sessions)])?;
+        t.enable_inbox_replication()?;
+        t.inbox_commit_batch(&[(&put(b"new"), &sessions), (&delete, &sessions)])?;
+        t.journal_raft_rows("s", Some(0), &super::super::rows::of("s", &said("m", 1, "event"), 0), false)?;
+        drop(t);
+        let mut t = Turso::open(&path)?;
+        t.enable_inbox_replication()?;
+        let tip = t.inbox_outbox_tip("s", 0)?.ok_or_else(|| anyhow::anyhow!("missing outbox"))?;
+        let mut seen = Vec::new();
+        while let Some((rev, rows)) = t.next_inbox_tx("s", 0, tip)? {
+            assert_eq!(t.next_inbox_tx("s", 0, tip)?, Some((rev, rows.clone())), "same bytes until confirmed");
+            seen.extend(rows);
+            t.confirm_inbox_tx("s", rev)?;
+        }
+        let values: Vec<_> = seen
+            .iter()
+            .filter_map(|row| match row {
+                Row::Inbox(i) => Some(i.value.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values, [Some(b"old".as_slice()), Some(b"new".as_slice()), None]);
+        assert!(matches!(seen.last(), Some(Row::Event(_))));
+        assert!(t.pending_inbox_sessions()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_projection_is_committed_and_claim_reverts_abandoned_work() -> anyhow::Result<()> {
+        use kiln_seams::records::{Tx, Write};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("conversations.db");
+        let mut t = Turso::open(&path)?;
+        t.enable_inbox_replication()?;
+        t.apply(&super::super::rows::of("s1", &said("orphan", 88, "old speculation"), 0))?;
+        t.begin_raft_projection("s1", 0)?;
+        let inbox = |value: &[u8]| {
+            Row::Inbox(Box::new(InboxRow { session: "s1".into(), family: "test".into(), key: b"s1/item".to_vec(), value: Some(value.to_vec()) }))
+        };
+        let timeline = super::super::rows::of("s1", &said("same", 1, "committed"), 0);
+        let mut committed = timeline.clone();
+        committed.extend([record(0, "committed"), inbox(b"committed")]);
+        t.write_raft_rows("s1", 1, 1, &committed, ProjectionWrite::Apply, None)?;
+        t.apply(&super::super::rows::of("s1", &said("same", 1, "uncommitted"), 0))?;
+        t.journal_raft_rows("s1", Some(0), &[record(0, "uncommitted")], true)?;
+        let tx = Tx { conds: vec![], writes: vec![Write::Put { family: "test".into(), key: b"s1/item".to_vec(), value: b"uncommitted".to_vec() }] };
+        t.inbox_commit_batch(&[(&tx, &["s1".to_owned()])])?;
+        let snapshot = t.raft_snapshot_rows("s1", 2)?;
+        assert_eq!(snapshot.len(), committed.len());
+        assert!(committed.iter().all(|row| snapshot.contains(row)));
+        t.write_raft_rows("s1", 3, 2, &[], ProjectionWrite::Apply, Some(1))?;
+        assert!(t.raft_snapshot_rows("s1", 1).is_err());
+        assert_eq!(t.one_int("SELECT count(*) FROM events WHERE session='s1' AND id='orphan'", &[])?, Some(0));
+        assert!(t.pending_inbox_sessions()?.is_empty());
+        assert_eq!(t.inbox_get("test", b"s1/item")?.map(|v| v.0), Some(b"committed".to_vec()));
+        assert_eq!(t.record("s1", "cc", 0, 10)?, [(0, "committed".to_owned())]);
+        assert!(t.inbox_outbox_tip("s1", 0).is_err(), "clearing old queue must not settle a stale receipt");
+        drop(t);
+        let mut t = Turso::open(&path)?;
+        assert_eq!(t.raft_snapshot_rows("s1", 3)?, snapshot);
+        t.begin_raft_projection("legacy", 17)?;
+        assert!(t.raft_snapshot_rows("legacy", 18).is_err());
+        t.write_raft_rows("legacy", 20, 3, &[], ProjectionWrite::Install, None)?;
+        assert_eq!(t.raft_snapshot_rows("legacy", 20)?, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_recreated_catalog_cannot_vouch_for_a_legacy_session_inventory() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let old = dir.path().join("old.db");
+        let mut t = Turso::open_at(&old,11)?;
+        t.apply(&[record(0,"historic native line")])?;
+        drop(t);
+        let mut original = Turso::open(&old)?;
+        assert!(Engine::has_legacy_name_catalog(&mut original)?);
+        assert!(Engine::historical_names(&mut original)?.contains("s1"));
+        let mut fresh = Turso::open(&dir.path().join("new.db"))?;
+        assert!(!Engine::has_legacy_name_catalog(&mut fresh)?);
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_equal_raft_coordinates_from_a_different_founder_replace_contents_and_custody() -> anyhow::Result<()> {
+        let dir=tempfile::tempdir()?;
+        let path=dir.path().join("conversation.db");
+        let mut t=Turso::open(&path)?;
+        t.enable_inbox_for("local")?;
+        let first=ProjectionWrite::Certified {origin:[1;32],recover:false};
+        let second=ProjectionWrite::Certified {origin:[2;32],recover:false};
+        t.write_raft_rows("s1",1,1,&[record(0,"old origin")], first, Some(0))?;
+        t.write_raft_rows("s1",2,1,&[record(1,"old source")],ProjectionWrite::Apply,None)?;
+        t.journal_raft_rows("s1",Some(0),&[record(2,"uncertain message")],true)?;
+        assert_eq!(t.raft_projection_origin("s1")?, Some([1;32]));
+        // A DB restored from the other group may be several ownership epochs ahead.
+        t.transaction(|db| {
+            let mut q=db.prepare("UPDATE inbox_outbox SET epoch=7 WHERE session='s1'")?;
+            db.run(&mut q,&[],|_|Ok(()))
+        })?;
+        let mut t={drop(t);Turso::open(&path)?};
+        t.write_raft_rows("s1",2,1,&[record(0,"other origin")],second,Some(0))?;
+        assert_eq!(t.raft_projection_origin("s1")?,Some([2;32]));
+        assert_eq!(t.record("s1","cc",0,6)?,[(0,"other origin".to_string())]);
+        assert!(t.pending_inbox_sessions()?.is_empty());
+        t.write_raft_rows("s1",2,1,&[record(0,"duplicate")],second,Some(0))?;
+        assert_eq!(t.record("s1","cc",0,6)?,[(0,"other origin".to_string())]);
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_foreign_founding_discards_mirrored_custody_and_fences_local_writes_after_restart() -> anyhow::Result<()> {
+        use kiln_seams::records::{Refusal, Tx, Write};
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("conversation.db");
+        let mut t = Turso::open(&path)?;
+        let tx = Tx { conds: vec![], writes: vec![Write::Put { family: "item".into(), key: b"s1/old".to_vec(), value: b"orphan".to_vec() }] };
+        let sessions = ["s1".to_owned()];
+        t.inbox_commit_batch(&[(&tx, &sessions)])?;
+        t.apply(&[record(1, "stale tail")])?;
+        t.enable_inbox_for("west")?;
+        assert_eq!(t.pending_inbox_sessions()?, ["s1"]);
+        let header = Row::Session { session:"s1".into(), info:Some("{}".into()), meta:None,state:None,changes:None,epoch:Some(0),open:true,at:1 };
+        let committed = [header, Row::Machine {session:"s1".into(), machine:"east".into()}, record(0, "authoritative")];
+        t.write_raft_rows("s1", 2, 1, &committed, ProjectionWrite::Install, Some(0))?;
+        assert_eq!(t.record("s1","cc",0,4)?, [(0,"authoritative".to_owned())]);
+        assert!(t.inbox_get("item", b"s1/old")?.is_none());
+        assert!(t.pending_inbox_sessions()?.is_empty());
+        let mut t = { drop(t); Turso::open(&path)? };
+        assert!(t.journal_raft_rows("s1",Some(0), &[record(1,"wrong owner")],true).is_err());
+        assert!(matches!(t.inbox_commit_batch(&[(&tx,&sessions)])?.as_slice(), [Err(Refusal::Unavailable(_))]));
+        assert!(t.inbox_outbox_tip("s1",0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_takeover_repairs_legacy_native_rows_and_custody_without_a_local_outbox() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("conversation.db"))?;
+        let stale = Row::Inbox(Box::new(InboxRow {session:"s1".into(), family:"item".into(), key:b"s1/orphan".to_vec(),value:Some(b"pending".to_vec())}));
+        t.apply(&[record(5,"speculative tail"), stale])?;
+        t.begin_raft_projection("s1",0)?;
+        t.write_raft_rows("s1",1,1,&[record(0,"valid")], ProjectionWrite::Apply,None)?;
+        t.write_raft_rows("s1",2,2,&[Row::Machine { session:"s1".into(), machine:"west".into() }],ProjectionWrite::Apply,Some(1))?;
+        assert_eq!(t.record("s1","cc",0,8)?,[(0,"valid".to_owned())]);
+        assert!(t.inbox_get("item", b"s1/orphan")?.is_none());
+        let changes=t.changes(0,usize::MAX,true,true)?;
+        assert!(changes.rows.iter().any(|r|matches!(&r.row,Row::RecordReset{source,..} if source=="cc")));
+        assert!(changes.rows.iter().any(|r|matches!(&r.row,Row::Inbox(i) if i.key==b"s1/orphan" && i.value.is_none())));
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_snapshot_preserves_same_epoch_custody_and_fences_older_work() -> anyhow::Result<()> {
+        use kiln_seams::records::{Tx, Write};
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("conversations.db"))?;
+        t.enable_inbox_replication()?;
+        t.begin_raft_projection("s1", 0)?;
+        let tx = Tx { conds: vec![], writes: vec![Write::Put { family: "item".into(), key: b"s1/item".to_vec(), value: b"local".to_vec() }] };
+        t.inbox_commit_batch(&[(&tx,&["s1".to_string()])])?;
+        t.journal_raft_rows("s1", Some(0), &[record(0, "pending line")], true)?;
+        let base = vec![record(0, "committed line"), Row::Inbox(Box::new(InboxRow { session: "s1".into(),family: "item".into(),key: b"s1/item".to_vec(),value: Some(b"committed".to_vec()) }))];
+        t.write_raft_rows("s1", 5, 1, &base, ProjectionWrite::Install, Some(0))?;
+        assert_eq!(t.inbox_get("item",b"s1/item")?.map(|v|v.0),Some(b"local".to_vec()));
+        assert_eq!(t.record("s1","cc",0,10)?,[(0,"pending line".to_string())]);
+        assert!(t.inbox_outbox_tip("s1",0)?.is_some());
+        assert!(base.iter().all(|r| t.raft_snapshot_rows("s1",5).is_ok_and(|rows| rows.contains(r))));
+        t.write_raft_rows("s1", 6, 2, &base, ProjectionWrite::Install, Some(1))?;
+        assert!(t.pending_inbox_sessions()?.is_empty());
+        assert_eq!(t.inbox_get("item",b"s1/item")?.map(|v|v.0),Some(b"committed".to_vec()));
+        assert_eq!(t.record("s1","cc",0,10)?,[(0,"committed line".to_string())]);
+        t.write_raft_rows("s1", 5, 1, &[], ProjectionWrite::Install, Some(0))?;
+        assert!(t.raft_snapshot_rows("s1",5).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_recovering_an_older_image_defers_future_native_work_until_its_epoch() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("conversations.db"))?;
+        t.enable_inbox_replication()?;
+        let baseline = [record(0,"committed")];
+        t.write_raft_rows("s1", 6, 2, &baseline, ProjectionWrite::Install, Some(2))?;
+        t.journal_raft_rows("s1", Some(2), &[record(0,"unconfirmed")],true)?;
+        t.write_raft_rows("s1", 3, 1, &baseline, ProjectionWrite::Recover, Some(1))?;
+        assert_eq!(t.record("s1","cc",0,10)?,[(0,"committed".to_owned())]);
+        t.write_raft_rows("s1", 6, 2, &[], ProjectionWrite::Apply, Some(2))?;
+        assert_eq!(t.record("s1","cc",0,10)?,[(0,"unconfirmed".to_owned())]);
+        assert_eq!(t.raft_snapshot_rows("s1",6)?,baseline);
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_new_owner_issues_receipts_after_the_former_owners_original_sequence() -> anyhow::Result<()> {
+        use kiln_seams::records::{Tx,Write};
+        let dir=tempfile::tempdir()?;
+        let mut t=Turso::open(&dir.path().join("conversations.db"))?;
+        t.enable_inbox_replication()?;
+        t.begin_raft_projection("work",0)?;
+        let former=1_000_000;
+        let value=serde_json::to_vec(&serde_json::json!({"epoch":1,"at":10,"digest":"a","accepted_seq":former}))?;
+        let prior=Row::Inbox(Box::new(InboxRow { session:"work".into(),family:"inbox".into(),key:b"work/a".to_vec(),value:Some(value) }));
+        t.write_raft_rows("work",2,1,&[prior],ProjectionWrite::Install,Some(2))?;
+        let tx=Tx{conds:vec![],writes:vec![Write::Put{family:"inbox".into(),key:b"work/b".to_vec(),value:br#"{"epoch":2,"at":11,"digest":"b"}"#.to_vec()}]};
+        let result=t.inbox_commit_batch(&[(&tx,&["work".to_owned()])])?;
+        assert!(matches!(result.as_slice(),[Ok(n)] if *n>former));
+        let image=t.raft_snapshot_rows("work",2)?;
+        t.journal_raft_rows("work",Some(2),&[Row::RecordReset{session:"work".into(),source:"cc".into(),at:0}],true)?;
+        assert!(t.journal_raft_rows("work",Some(1),&[Row::RecordReset{session:"work".into(),source:"cc".into(),at:0}],true).is_err());
+        assert_eq!(t.raft_snapshot_rows("work",2)?,image);
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_legacy_founding_preserves_same_sequence_winner_and_refuses_foreign_custody() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut t = Turso::open(&dir.path().join("conversation.db"))?;
+        let session = Row::Session {
+            session: "s1".into(),
+            info: Some("{}".into()),
+            meta: None,
+            state: None,
+            changes: None,
+            epoch: Some(0),
+            open: true,
+            at: 1,
+        };
+        let mut input = vec![
+            session,
+            Row::Machine {
+                session: "s1".into(),
+                machine: "west".into(),
+            },
+        ];
+        for id in ["z", "a"] {
+            input.extend(super::super::rows::of("s1", &said(id, 1, id), 1));
+        }
+        input.push(record(0, "native"));
+        t.apply(&input)?;
+        assert!(Engine::founding_rows(&mut t, "s1", 0, "east").is_err());
+        let base = Engine::founding_rows(&mut t, "s1", 0, "west")?;
+        assert!(base.contains(&record(0, "native")));
+        t.begin_raft_projection("s1", 0)?;
+        assert_eq!(Engine::founding_rows(&mut t, "s1", 0, "west")?, base);
+        t.write_raft_rows("s1", 1, 1, &base, ProjectionWrite::Apply, None)?;
+        let image = t.raft_snapshot_rows("s1", 1)?;
+        let ids: Vec<_> = image
+            .iter()
+            .filter_map(|r| match r {
+                Row::Event(e) => Some(e.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["z", "a"]);
+        assert!(Engine::founding_rows(&mut t, "s1", 0, "west")?.is_empty());
+        Ok(())
+    }
 
     fn seq_v(v: u64) -> Value {
         super::seq(v)
@@ -2433,6 +3719,14 @@ mod tests {
             }
             steps += 1;
             anyhow::ensure!(steps < 50_000, "compacting never ended");
+            if steps == 1 {
+                // CP-T3.2. A fence and a certified origin written after the copy began
+                // survive the swap even though neither has its own feed revision.
+                for db in [engine.as_mut(), &mut same as &mut dyn Engine] {
+                    db.confirm_local_owner_fence("former", 3)?;
+                    db.write_raft_rows("group", 1, 1, &[], ProjectionWrite::Certified { origin:[7;32],recover:false }, Some(1))?;
+                }
+            }
             if let Some(rows) = writes.next() {
                 engine.apply(rows)?;
                 same.apply(rows)?;

@@ -799,7 +799,9 @@ mod tests {
             capacity: None,
             harness_send: None,
             convo_raft: None,
-            direct_quic: false,
+            sessions_only: false,
+            session_executor: true,
+        direct_quic: false,
         })?;
         Ok(handle)
     }

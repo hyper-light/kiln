@@ -210,6 +210,9 @@ impl Learner {
 
     /// A learner around its member of the group, on its replica at `db`.
     pub fn around(group: Arc<Group>, db: PathBuf, me: &str) -> anyhow::Result<(Learner, async_channel::Receiver<AgentMsg>)> {
+        if let Some(registrar)=crate::liveness::Shared::get(crate::convo::raft::node_id(me)).registrar.get() {
+            group.bind_liveness(me,registrar)?;
+        }
         let store = super::Store::open_replica(&db)?;
         let (say_tx, say_rx) = async_channel::bounded(1024);
         let out = group.outgoing();
@@ -265,6 +268,10 @@ impl Learner {
     /// The replica, to read.
     pub fn store(&self) -> &super::Store {
         &self.store
+    }
+
+    pub(crate) fn bind_liveness(&self, registrar:&str)->anyhow::Result<()> {
+        self.group.bind_liveness(&self.me,registrar)
     }
 
     /// This machine's name.

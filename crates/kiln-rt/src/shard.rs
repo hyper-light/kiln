@@ -578,6 +578,15 @@ impl ShardContext {
 
     // ------------------------------------------------------------------ what tasks read
 
+    /// The origin of this driver's timestamps on the host's `machine::clock::shard_clock_ns`
+    /// clock. Adding it to a kernel arrival expressed on this shard requires no second clock read.
+    pub fn host_epoch_ns(&self) -> Option<u64> {
+        match self.clock {
+            crate::driver::Clock::Since(epoch) => Some(epoch),
+            crate::driver::Clock::Sim(_) | crate::driver::Clock::Published => None,
+        }
+    }
+
     /// The shard's clock in nanoseconds, read live: from the counter carrying the loop's last reading of
     /// its driver's clock forward where the shard reads one (`machine::clock::counter_ticks`), else from the
     /// driver's clock (the time the loop last published where the driver has none). Never earlier than a

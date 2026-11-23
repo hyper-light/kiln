@@ -1323,11 +1323,38 @@ pub fn revoked_stamp(c: &rusqlite::Connection) -> rusqlite::Result<Stamp> {
 pub struct Revoked {
     pub stamp: Stamp,
     pub list: Arc<[Revocation]>,
+    index: std::sync::OnceLock<RevocationIndex>,
+}
+
+#[derive(Default,Debug)]
+struct RevocationIndex {
+    serials:std::collections::HashMap<String,i64>,
+    keys:std::collections::HashMap<String,i64>,
+}
+
+impl Revoked {
+    /// Check one TLS or delegated session credential against this immutable store revision.
+    pub(crate) fn covers(&self, cert:&crate::pki::Fingerprints, now:i64)->bool {
+        let index=self.index.get_or_init(|| {
+            let mut index=RevocationIndex::default();
+            for row in &*self.list {
+                for (target,table) in [(&row.serial,&mut index.serials),(&row.key,&mut index.keys)] {
+                    if let Some(target)=target {
+                        let earliest=table.entry(target.to_ascii_lowercase()).or_insert(row.at);
+                        *earliest=(*earliest).min(row.at);
+                    }
+                }
+            }
+            index
+        });
+        // fingerprints_der and grant ancestry use lower-case hex.
+        index.serials.get(&cert.serial).is_some_and(|at| *at<=now) || index.keys.get(&cert.key).is_some_and(|at| *at<=now)
+    }
 }
 
 /// Every revocation and its stamp, read now in one call, and kept beside `store` for [`revoked`].
 pub async fn revoked_now(store: &Store) -> anyhow::Result<Arc<Revoked>> {
-    let read = store.call(|c| Ok(Revoked { list: revocations_on(c)?.into(), stamp: revoked_stamp(c)? })).await?;
+    let read = store.call(|c| Ok(Revoked { index:Default::default(), list: revocations_on(c)?.into(), stamp: revoked_stamp(c)? })).await?;
     let read = Arc::new(read);
     // The list kept before let go of on the blocking pool: a revocation a superseded certificate, it grows for as long as
     // kiln runs, and it was freed on the shard that read the new one, once a revocation (goal 9, plan 01a1a87b2cec step 3).
@@ -1363,7 +1390,7 @@ pub async fn revoked_current(store: &Store) -> anyhow::Result<Arc<Revoked>> {
             if Some(now) == stamp {
                 return Ok(None);
             }
-            Ok(Some(Revoked { list: revocations_on(c)?.into(), stamp: now }))
+            Ok(Some(Revoked { index:Default::default(), list: revocations_on(c)?.into(), stamp: now }))
         })
         .await?;
     match (read, kept) {

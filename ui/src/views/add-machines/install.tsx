@@ -43,7 +43,21 @@ export function InstallSection({
   /** The id of the row a join request is shown in. */
   rowOf: (r: JoinRequest) => string;
 }) {
-  const data = info.data;
+  const [sessionInvite, setSessionInvite] = React.useState<JoinInfo | null>(null);
+  const [minting, setMinting] = React.useState(false);
+  const [inviteError, setInviteError] = React.useState<string | null>(null);
+  const mint = async () => {
+    setMinting(true);
+    setInviteError(null);
+    try {
+      setSessionInvite(await api.sessionNodeInvite());
+    } catch (error) {
+      setInviteError(errorMessage(error));
+    } finally {
+      setMinting(false);
+    }
+  };
+  const data = sessionInvite ?? info.data;
   const command = installCommand(data, os);
   const [copied, copy] = useCopy();
 
@@ -66,11 +80,24 @@ export function InstallSection({
         </pre>
       </div>
       <p className="am-note">
-        {os === "windows" ? "In PowerShell on the machine: downloads" : "On the machine: downloads"} kiln from this server, installs it as {SERVICE[os]} and joins as a runner.
-        <Expiry at={data.expires_at} onRenew={info.reload} renewing={info.refreshing} />
+        {os === "windows" ? "In PowerShell on the machine: downloads" : "On the machine: downloads"} kiln from this server, installs it as {SERVICE[os]} and joins as{" "}
+        {sessionInvite ? "a fleet session node. People authorized on this machine can start and message sessions on peer nodes." : "a runner."}
+        <Expiry at={data.expires_at} onRenew={sessionInvite ? mint : info.reload} renewing={sessionInvite ? minting : info.refreshing} />
       </p>
+      <div>
+        {sessionInvite ? (
+          <Button size="xs" onClick={() => setSessionInvite(null)}>
+            Use runner command
+          </Button>
+        ) : (
+          <Button size="xs" disabled={minting} onClick={mint}>
+            Create a one-machine session-node invite
+          </Button>
+        )}
+        {inviteError && <p role="alert">{inviteError}</p>}
+      </div>
       <Status arrived={arrived} asking={asking} rowOf={rowOf} />
-      <Alternatives info={data} os={os} />
+      <Alternatives info={info.data} os={os} />
     </section>
   );
 }

@@ -524,6 +524,40 @@ fn child_pipe<T: IntoRawHandle>(pipe: T) -> File {
 }
 
 impl Duplex {
+    /// CP-T3.2. Wait for the actual owned or adopted Windows process handle after killing its job.
+    pub(crate) async fn stop_fenced(&mut self) -> anyhow::Result<()> {
+        let process = {
+            let mut job = self.job.lock();
+            let raw = match &mut *job {
+                Held::Own(c) => c.inner().as_raw_handle(),
+                Held::Agent(c, _) => c.as_raw_handle(),
+                Held::Adopted { process, .. } => process.as_raw_handle(),
+                Held::Boundary(_) => anyhow::bail!("a boundary confirms its own provider exit"),
+            };
+            let process = duplicate(raw).ok_or_else(io::Error::last_os_error)?;
+            if process_exit(process.as_raw_handle()).is_none() {
+                match &mut *job {
+                    Held::Own(c) => c.kill()?,
+                    Held::Agent(c, g) => { g.kill(); if let Err(e)=c.kill() && process_exit(process.as_raw_handle()).is_none() {return Err(e.into());} }
+                    Held::Adopted { job, .. } => {
+                        // SAFETY: this original job handle is retained until the call returns.
+                        if unsafe { TerminateJobObject(job.as_raw_handle(), 1) } == 0 && process_exit(process.as_raw_handle()).is_none() {
+                            return Err(io::Error::last_os_error().into());
+                        }
+                    }
+                    Held::Boundary(_) => anyhow::bail!("a boundary confirms its own provider exit"),
+                }
+            }
+            process
+        };
+        crate::rt::blocking(move || {
+            // SAFETY: a duplicate of the exact provider process handle, still owned by this closure.
+            if unsafe { WaitForSingleObject(process.as_raw_handle(), u32::MAX) } == WAIT_OBJECT_0 { Ok(()) }
+            else { Err(io::Error::last_os_error()) }
+        }).await??;
+        Ok(())
+    }
+
     /// Windows has no SIGTERM for a job: kill it at once. Held by a boundary, it's ended as its
     /// boundary ends a run ([`crate::sandbox::held::Held::terminate`]).
     pub fn terminate(&self, grace: Duration) {

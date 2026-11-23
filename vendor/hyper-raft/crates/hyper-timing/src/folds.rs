@@ -298,6 +298,11 @@ impl Exposure {
         self.failures = self.failures.saturating_add(1);
     }
 
+    /// Exact accumulated node time, for persisting this evidence alongside its failure count.
+    pub const fn node_time(&self) -> Duration {
+        self.exposure
+    }
+
     /// The failures counted.
     pub const fn failures(&self) -> u64 {
         self.failures

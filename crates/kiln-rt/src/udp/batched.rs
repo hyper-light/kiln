@@ -5,8 +5,7 @@
 //!
 //! - Linux: `sendmmsg(2)` and `recvmmsg(2)`, each message a segmented send (`UDP_SEGMENT`) or a
 //!   coalesced receive (`UDP_GRO`) where the kernel has them ([`super::linux`]).
-//! - macOS and Windows: one datagram a system call (macOS through `recvmsg(2)` when the socket is
-//!   stamped). macOS has no public batched UDP call; Windows' segmentation and coalescing
+//! - macOS and Windows: one datagram per system call (recvmsg on macOS, WSARecvMsg on Windows). macOS has no public batched UDP call; Windows' segmentation and coalescing
 //!   (`UDP_SEND_MSG_SIZE`, `UDP_RECV_MAX_COALESCED_SIZE`) are owed (docs/transport.md §4b).
 //! - The simulation fabric: one datagram a call, stamped with the simulated clock.
 //!
@@ -18,9 +17,9 @@
 //! is carried over by its age: with the stamps' clock read after the receive and the shard's clock after
 //! it, so that a preemption between the two makes the stamp late and never early, the arrival is
 //! `now − (stamps_now − stamp)`. It is held within the read's time and no earlier than the
-//! arrival handed over before it (a socket's queue is first in, first out). On Windows, where only a NIC
-//! miniport stamps and no loopback or virtual NIC does, and in simulation, a datagram is stamped when it
-//! is read.
+//! arrival handed over before it (a socket's queue is first in, first out). On Windows, an active
+//! adapter supplies either QPC ticks or its own clock, converted through measured cross-timestamps.
+//! A packet without usable receive metadata and a simulated datagram carry their read time.
 //!
 //! **Bounds.** The outbox holds at most [`Io::batch`] datagrams; a datagram queued with the outbox full is
 //! dropped and counted. A receive takes at most one batch. Receive buffers: [`Io::batch`] of
@@ -104,8 +103,8 @@ pub struct IoStats {
     pub gso: bool,
     /// Whether coalesced receives are in use.
     pub gro: bool,
-    /// Whether the kernel stamps each datagram received (Linux's `SO_TIMESTAMPNS`, macOS's
-    /// `SO_TIMESTAMP_MONOTONIC`); otherwise a datagram is stamped when it is read.
+    /// Whether receive timestamping is available on a bound interface (Linux SO_TIMESTAMPNS,
+    /// macOS SO_TIMESTAMP_MONOTONIC, Windows SIO_TIMESTAMPING). Each arrival carries its own evidence.
     pub kernel_stamps: bool,
     /// The datagrams the kernel dropped for want of room since the socket was made, as the
     /// datagrams received say (Linux's `SO_RXQ_OVFL`): `Some(0)` until one says more, `None` where
@@ -156,6 +155,9 @@ pub struct Arrival {
     pub at_ns: u64,
     /// Whether `at_ns` is the kernel's stamp.
     pub kernel: bool,
+    /// The original, ordered kernel observation, even if a preceding datagram with
+    /// missing metadata advanced `at_ns` to the later time userspace read the batch.
+    pub kernel_at_ns: Option<u64>,
     /// When it was read, nanoseconds on the shard's clock: `at_ns` or later.
     pub read_ns: u64,
 }
@@ -434,9 +436,9 @@ enum ReceiveStep {
         messages: usize,
         drained: bool,
     },
-    /// A datagram was consumed with nothing to hand over (truncated, or from a non-internet address).
+    /// The call gave no datagram to hand over and did not establish the queue was empty.
     Skipped,
-    /// Nothing waits (or the call was interrupted): await readability.
+    /// No datagram was ready.
     Empty,
     /// The call returned an astray report.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -456,15 +458,16 @@ pub struct Batched {
     buffers: Vec<Vec<u8>>,
     stats: IoStats,
     /// The latest arrival handed over: none after it arrived before it.
-    latest_ns: u64,
-    /// Whether the kernel tells each datagram's local address ([`Arrival::to`]): Linux's and macOS's
-    /// alone.
+    latest_ns: ArrivalTimes,
+    /// Whether the Linux or macOS socket supplies each datagram's local address ([`Arrival::to`]).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     local_addresses: bool,
     #[cfg(target_os = "linux")]
     linux: Linux,
     #[cfg(target_os = "macos")]
     mach: Option<macos::Clock>,
+    #[cfg(windows)]
+    winsock: Option<super::windows::Receiver>,
 }
 
 #[cfg(target_os = "linux")]
@@ -506,23 +509,31 @@ fn shard_now() -> Result<u64, RtError> {
     registry::with_current(|context| context.now_ns()).ok_or(RtError::NotOnShardThread)
 }
 
-/// The arrival handed over for a datagram from `from` read at `now_ns` with the kernel's `stamp_ns`, if
-/// any (both on the shard's clock): within the read's time and no earlier than `latest_ns`, which it
-/// advances.
+#[derive(Debug, Default)]
+struct ArrivalTimes {
+    delivered: u64,
+    kernel: u64,
+}
+
+/// Preserve the receive order presented to existing callers and the kernel's independent
+/// watermark. An unstamped datagram provides no evidence about when its neighbors arrived.
 fn arrival(
-    latest_ns: &mut u64,
+    latest_ns: &mut ArrivalTimes,
     from: SocketAddr,
     to: Option<IpAddr>,
     stamp_ns: Option<u64>,
     now_ns: u64,
 ) -> Arrival {
-    let at_ns = stamp_ns.unwrap_or(now_ns).min(now_ns).max(*latest_ns);
-    *latest_ns = at_ns;
+    let kernel_at_ns = stamp_ns.filter(|n| *n >= latest_ns.kernel && *n <= now_ns);
+    if let Some(at) = kernel_at_ns { latest_ns.kernel = at; }
+    let at_ns = stamp_ns.unwrap_or(now_ns).min(now_ns).max(latest_ns.delivered);
+    latest_ns.delivered = at_ns;
     Arrival {
         from,
         to,
         at_ns,
-        kernel: stamp_ns.is_some(),
+        kernel: kernel_at_ns == Some(at_ns),
+        kernel_at_ns,
         read_ns: now_ns.max(at_ns),
     }
 }
@@ -531,7 +542,8 @@ fn arrival(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn receive_failed(call: &'static str, error: &std::io::Error) -> Result<ReceiveStep, RtError> {
     match error.raw_os_error() {
-        Some(libc::EAGAIN | libc::EINTR) => Ok(ReceiveStep::Empty),
+        Some(libc::EAGAIN) => Ok(ReceiveStep::Empty),
+        Some(libc::EINTR) => Ok(ReceiveStep::Skipped),
         Some(libc::ECONNREFUSED | libc::ECONNRESET | libc::EHOSTUNREACH | libc::ENETUNREACH) => {
             Ok(ReceiveStep::Astray)
         }
@@ -611,18 +623,26 @@ impl Batched {
             bytes: Vec::new(),
             to: unspecified,
         }));
+        #[cfg(not(windows))]
         let raw = match &udp.inner {
             Inner::Real { socket } => Some(socket.raw_id()),
             Inner::Sim { .. } | Inner::Moved => None,
         };
         #[cfg_attr(
-            not(any(target_os = "linux", target_os = "macos")),
+            not(any(target_os = "linux", target_os = "macos", windows)),
             expect(
                 unused_mut,
                 reason = "only Linux and macOS ask the kernel for anything"
             )
         )]
         let mut stats = IoStats::default();
+        #[cfg(windows)]
+        let winsock = match &udp.inner {
+            Inner::Real { socket } => {
+                super::windows::Receiver::open(socket.winsock_handle(), udp.local_addr()?, stamps)
+            }
+            _ => None,
+        };
         // Whether the kernel tells each datagram's local address (Linux, macOS).
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let local_addresses = match raw {
@@ -661,7 +681,12 @@ impl Batched {
             };
             (mach, 1)
         };
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        let buffer_count = {
+            stats.kernel_stamps = winsock.as_ref().is_some_and(super::windows::Receiver::stamps);
+            1
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         let buffer_count = {
             let _ = (raw, stamps);
             1
@@ -686,13 +711,15 @@ impl Batched {
             astray_at: None,
             buffers,
             stats,
-            latest_ns: 0,
+            latest_ns: ArrivalTimes::default(),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             local_addresses,
             #[cfg(target_os = "linux")]
             linux,
             #[cfg(target_os = "macos")]
             mach,
+            #[cfg(windows)]
+            winsock,
         })
     }
 
@@ -977,9 +1004,17 @@ impl Batched {
         let (Inner::Real { socket }, Some(from)) = (&self.udp.inner, from.filter(|_| self.local_addresses)) else {
             return self.send_message_portable(to, bytes);
         };
-        match macos::send_from(socket.raw_id(), to, from, bytes) {
+        // Darwin rejects msg_name on a connected datagram socket (EISCONN). Preserve
+        // source selection on that path and let the kernel use the connected destination.
+        let destination = match self.udp.peer {
+            Some(peer) if peer == to => None,
+            Some(_) => return SendStep::Refused(1),
+            None => Some(to),
+        };
+        match macos::send_from(socket.raw_id(), destination, from, bytes) {
             Ok(_) => SendStep::Took(1),
             Err(error) => match error.raw_os_error() {
+                Some(libc::EAGAIN | libc::ENOBUFS) if crate::netsys::source_payload_room(socket).is_ok_and(|room| bytes.len() > usize::from(room)) => SendStep::Refused(1),
                 Some(libc::EAGAIN | libc::EINTR | libc::ENOBUFS) => SendStep::NotNow,
                 Some(
                     libc::ECONNREFUSED | libc::ECONNRESET | libc::EHOSTUNREACH | libc::ENETUNREACH,
@@ -1076,6 +1111,15 @@ impl Batched {
     /// how many, 0 when none had (await [`Batched::readable`]). At most [`Io::batch`] calls, so a socket
     /// that keeps reporting astray datagrams cannot hold the shard.
     pub fn receive(&mut self, deliver: impl FnMut(Arrival, &mut [u8])) -> Result<usize, RtError> {
+        self.receive_observed(deliver).map(|(n, _)| n)
+    }
+
+    /// AD-1. Takes one batch and reports whether a receive actually found the queue empty.
+    /// Signals, discarded packets and ICMP reports can fill the turn without delivering any data.
+    pub fn receive_observed(
+        &mut self,
+        deliver: impl FnMut(Arrival, &mut [u8]),
+    ) -> Result<(usize, Queued), RtError> {
         if self.buffers.is_empty() {
             return Err(RtError::BadConfig {
                 what: "a lent socket receives into its owner's ring (Batched::receive_with)",
@@ -1092,7 +1136,7 @@ impl Batched {
         deliver: impl FnMut(Arrival, &mut [u8]),
     ) -> Result<usize, RtError> {
         self.lend(ring);
-        let received = self.receive_turns(ring.batch, deliver);
+        let received = self.receive_turns(ring.batch, deliver).map(|(n, _)| n);
         self.lend(ring);
         received
     }
@@ -1143,7 +1187,7 @@ impl Batched {
         let past = Cell::new(false);
         let bytes_taken = Cell::new(0usize);
         let mut handed = |arrival: Arrival, bytes: &mut [u8]| {
-            if stamped && arrival.at_ns > began_ns {
+            if arrival.kernel && arrival.at_ns > began_ns {
                 past.set(true);
             }
             bytes_taken.set(bytes_taken.get().saturating_add(bytes.len()));
@@ -1203,8 +1247,9 @@ impl Batched {
         &mut self,
         turns: usize,
         mut deliver: impl FnMut(Arrival, &mut [u8]),
-    ) -> Result<usize, RtError> {
+    ) -> Result<(usize, Queued), RtError> {
         let mut delivered = 0usize;
+        let mut end = Queued::More;
         for _ in 0..turns {
             match self.receive_some(&mut deliver)? {
                 ReceiveStep::Delivered { datagrams, .. } => {
@@ -1214,13 +1259,16 @@ impl Batched {
                     }
                 }
                 ReceiveStep::Skipped => {}
-                ReceiveStep::Empty => break,
+                ReceiveStep::Empty => {
+                    end = Queued::Emptied;
+                    break;
+                }
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 ReceiveStep::Astray => self.stats.astray = self.stats.astray.saturating_add(1),
             }
         }
         self.stats.received = self.stats.received.saturating_add(as_u64(delivered));
-        Ok(delivered)
+        Ok((delivered, end))
     }
 
     /// Whether one receive call takes a whole batch (Linux's `recvmmsg` on a real socket).
@@ -1360,7 +1408,35 @@ impl Batched {
         })
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    fn receive_some(
+        &mut self,
+        deliver: &mut impl FnMut(Arrival, &mut [u8]),
+    ) -> Result<ReceiveStep, RtError> {
+        use crate::netsys::Io;
+        let (Some(rx), Inner::Real { socket }) = (&mut self.winsock, &self.udp.inner) else {
+            return self.receive_portable(deliver);
+        };
+        let Some(buffer) = self.buffers.first_mut() else { return Ok(ReceiveStep::Empty) };
+        let taken = match rx.receive(socket.winsock_handle(), buffer)? {
+            Io::Ready(Some(taken)) => taken,
+            Io::Ready(None) | Io::Interrupted => return Ok(ReceiveStep::Skipped),
+            Io::WouldBlock => return Ok(ReceiveStep::Empty),
+            Io::Astray => {
+                self.stats.astray = self.stats.astray.saturating_add(1);
+                return Ok(ReceiveStep::Skipped);
+            }
+        };
+        self.stats.receive_calls = self.stats.receive_calls.saturating_add(1);
+        let now = shard_now()?;
+        let stamp = taken.age_ns.and_then(|age| now.checked_sub(age));
+        let arrived = arrival(&mut self.latest_ns, taken.from, taken.to, stamp, now);
+        let Some(bytes) = buffer.get_mut(..taken.bytes) else { return Ok(ReceiveStep::Skipped) };
+        deliver(arrived, bytes);
+        Ok(ReceiveStep::Delivered { datagrams: 1, messages: 1, drained: false })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     fn receive_some(
         &mut self,
         deliver: &mut impl FnMut(Arrival, &mut [u8]),
@@ -1376,9 +1452,9 @@ impl Batched {
         let Some(buffer) = self.buffers.first_mut() else {
             return Ok(ReceiveStep::Empty);
         };
-        let astray_before = self.udp.astray_reports();
-        match self.udp.recv_once(buffer)? {
-            Outcome::Done((length, from)) => {
+        use crate::netsys::Io;
+        match self.udp.recv_observed(buffer)? {
+            Io::Ready((length, from)) => {
                 self.stats.receive_calls = self.stats.receive_calls.saturating_add(1);
                 let now_ns = shard_now()?;
                 let arrived = arrival(&mut self.latest_ns, from, None, None, now_ns);
@@ -1392,11 +1468,12 @@ impl Batched {
                     drained: false,
                 })
             }
-            // The socket counted the report itself; the step only keeps the batch going.
-            Outcome::NotNow if self.udp.astray_reports() != astray_before => {
+            Io::Astray => {
+                self.udp.astray.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(ReceiveStep::Skipped)
             }
-            Outcome::NotNow => Ok(ReceiveStep::Empty),
+            Io::Interrupted => Ok(ReceiveStep::Skipped),
+            Io::WouldBlock => Ok(ReceiveStep::Empty),
         }
     }
 }
@@ -1404,6 +1481,29 @@ impl Batched {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ad_1_an_unstamped_packet_cannot_hide_a_queued_kernel_heartbeat() {
+        let mut times = ArrivalTimes::default();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        let first = arrival(&mut times, addr, None, Some(40), 96);
+        let missing = arrival(&mut times, addr, None, None, 100);
+        let heartbeat = arrival(&mut times, addr, None, Some(48), 105);
+        assert!(first.kernel && missing.kernel_at_ns.is_none());
+        assert_eq!((heartbeat.at_ns, heartbeat.kernel_at_ns), (100, Some(48)));
+        assert!(!heartbeat.kernel);
+        assert!(arrival(&mut times, addr, None, Some(47), 106).kernel_at_ns.is_none());
+        assert!(arrival(&mut times, addr, None, Some(110), 106).kernel_at_ns.is_none());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn ad_1_an_interrupted_kernel_receive_does_not_prove_an_empty_queue() {
+        let signal = std::io::Error::from_raw_os_error(libc::EINTR);
+        let drained = std::io::Error::from_raw_os_error(libc::EAGAIN);
+        assert!(matches!(receive_failed("recvmsg", &signal), Ok(ReceiveStep::Skipped)));
+        assert!(matches!(receive_failed("recvmsg", &drained), Ok(ReceiveStep::Empty)));
+    }
 
     /// A ring for batches of `batch` that holds up to `bound` buffers, as one on Linux does, made
     /// so on every platform: the rule its owner follows is the same wherever it grows.

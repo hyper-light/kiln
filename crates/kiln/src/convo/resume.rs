@@ -84,7 +84,10 @@ fn carry(store: &Store, session: &str, kind: &Kind, harness_session: Option<&str
     if matches!(kind.protocol, Protocol::Acp(_) | Protocol::PiRpc) {
         return Ok(moving::words(events, note));
     }
-    let Some(own) = harness_session.filter(|h| !h.is_empty()) else { return Ok(Carry::Nothing) };
+    let Some(own) = harness_session.filter(|h| !h.is_empty()) else {
+        anyhow::ensure!(kind.protocol != Protocol::Terminal, "{} has no recoverable provider session", kind.name);
+        return Ok(Carry::Nothing);
+    };
     match kind.protocol {
         Protocol::ClaudeStreamJson => {
             let lines = lines_of(store, session, own)?;
@@ -116,17 +119,31 @@ pub fn package(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&
 /// [`package`], `in_place` when it goes on on the machine it was on (a crashed session resumed
 /// there): natively, from its harness's own record there ([`Carry::Native`]).
 pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&str, &str), in_place: bool) -> anyhow::Result<Package> {
+    build_package(store, id, from, cwd, shown, in_place, false)?.map(|(p, _)| p).ok_or_else(|| anyhow::anyhow!("session was closed"))
+}
+
+/// The inbox already lives at the destination. Recover the provider without re-importing messages.
+pub(crate) fn after_election(store: &Store, id: &str, node: &str) -> anyhow::Result<Option<(Package, Option<String>)>> {
+    build_package(store, id, node, None, (node, node), false, true)
+}
+
+fn build_package(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: (&str, &str), in_place: bool, elected: bool) -> anyhow::Result<Option<(Package, Option<String>)>> {
     // Ensure queued writes are committed once, then run all large transcript/event reads on the
     // concurrent `TursoRead` thread so resuming a huge conversation never stalls the writer.
     store.sync()?;
     let kept = store.kept_committed(id, MAX_EVENTS)?.ok_or_else(|| anyhow::anyhow!("the server's store has nothing of this session"))?;
-    let info: Info = kept.info.as_deref().and_then(|j| serde_json::from_str(j).ok()).ok_or_else(|| anyhow::anyhow!("the server's store doesn't say what this session is"))?;
-    let state: State = kept.state.as_deref().and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    if elected && kept.closed_at.is_some() { return Ok(None); }
+    let info: Info = serde_json::from_str(kept.info.as_deref().ok_or_else(|| anyhow::anyhow!("missing session information"))?)?;
+    let state: State = match kept.state.as_deref() {
+        Some(raw) => serde_json::from_str(raw)?,
+        None if !elected => State::default(),
+        None => anyhow::bail!("the session has no committed provider state"),
+    };
     anyhow::ensure!(
         !state.view.as_ref().is_some_and(|view| !view.deferred.is_empty()),
         "the server's store has an incomplete state view; resuming requires the owner's full state record"
     );
-    let events: Vec<Event> = kept.events.iter().filter_map(|e| serde_json::from_str(&e.body).ok()).collect();
+    let events: Vec<Event> = kept.events.iter().map(|e| serde_json::from_str(&e.body)).collect::<Result<_,_>>()?;
     let kind = Kind::get(&info.kind).ok_or_else(|| anyhow::anyhow!("an unknown harness: {}", info.kind))?;
     let from_cwd = if state.cwd.is_empty() { info.cwd.clone() } else { state.cwd.clone() };
     let goes_on_in = cwd.map(str::trim).filter(|c| !c.is_empty()).map_or_else(|| from_cwd.clone(), str::to_owned);
@@ -137,12 +154,22 @@ pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown
     } else {
         format!("This conversation went on from {from_shown} (where it worked in {from_cwd}), which is gone, to {to_shown} (it works in {goes_on_in} now). It was kept on the kiln server.")
     };
+    if elected && own.is_none() && matches!(kind.protocol, Protocol::ClaudeStreamJson | Protocol::CodexAppServer) {
+        anyhow::ensure!(!events.iter().any(|e| matches!(e.body, Body::User { .. } | Body::Assistant { .. })),
+            "the committed conversation has provider turns but no native session identity");
+    }
     let carry = carry(store, id, kind, own.as_deref(), &events, &note, in_place)?;
     // What starts it there: its settings as last chosen. Its environment, where its person chose one, is kiln's
     // to open again for it (`registry::resume_on`, docs/agents.md "Environments"); else it's the machine's it goes
     // to, as it was the machine's it ran on.
     let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_owned());
+    let restrictions = info.recovery.as_deref().cloned().unwrap_or_default();
     let spec = Spec {
+        start_request: info.start_request.clone(),
+        egress_ceiling: restrictions.egress_ceiling,
+        volumes: restrictions.volumes,
+        opener: restrictions.opener,
+        engine_version: restrictions.engine_version,
         kind: kind.id.to_owned(),
         name: non_empty(&info.name),
         model: non_empty(&state.model),
@@ -160,9 +187,19 @@ pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown
         // person, never as a process on its machine (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
         // Its Agentfile's text, a person's own, is kiln's to read again (`registry::resume_on`).
         isolation: info.isolation.clone(),
+        container: info.container.clone(),
+        workspace: info.workspace.clone(),
+        helper: info.helper.clone(),
+        experiment: info.experiment.clone(),
+        variant_of: info.variant_of.clone(),
+        subagent: info.subagent,
+        speed: non_empty(&state.speed),
+        max_subagents: state.max_subagents,
+
         ..Spec::default()
     };
     let mut pkg = moving::pack(id, spec, &goes_on_in, from, &from_cwd, carry, events, state);
+    if elected { return Ok(Some((pkg, info.agentenv.map(|e| e.id)))); }
     // The messages it was sent go with it, so one sent again after it goes on is answered there.
     let timeline = sent_ids(store, id).unwrap_or_else(|e| {
         tracing::warn!(target: "kiln.sends", event = "carry_failed", session = %id, error = %format!("{e:#}"), "the ids of the messages a session was sent couldn't be read from the store: those its timeline shows go with it");
@@ -187,7 +224,7 @@ pub fn package_for(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown
     let ids: Vec<(String, String)> = ids.into_iter().skip(past).collect();
     (pkg.inbox, pkg.inbox_digests) = crate::harness::host::split_kept(ids);
     pkg.waiting = waiting.into_iter().filter_map(|p| Some(moving::Waiting { command: p.current_command()?.clone(), sender: p.lease.peer.clone(), status: p.status.clone() })).collect();
-    Ok(pkg)
+    Ok(Some((pkg, None)))
 }
 
 #[cfg(test)]

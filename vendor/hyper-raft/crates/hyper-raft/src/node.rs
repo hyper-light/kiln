@@ -643,6 +643,19 @@ impl<S: Storage> RawNode<S> {
     pub fn suspect(&mut self, member: NodeId) -> Result<()> {
         self.operate(|raft| raft.suspect(member))
     }
+    /// Give up a service's leadership when its detector no longer trusts a voting
+    /// quorum. Joint configurations require both majorities. No vote or term changes.
+    pub fn resign_without_quorum(&mut self) -> Result<()> {
+        self.operate(|raft| {
+            if raft.state() == crate::StateRole::Leader
+                && raft.config().check_quorum
+                && raft.campaign_state().is_some_and(|s| !s.trusted_quorum)
+            {
+                raft.become_follower(raft.term(), 0)?;
+            }
+            Ok(())
+        })
+    }
     /// The owner's detectors trust `member`'s node again.
     pub fn trust(&mut self, member: NodeId) -> Result<()> {
         self.operate(|raft| raft.trust(member))

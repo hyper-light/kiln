@@ -176,13 +176,20 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
             relayed(ask_server(forward, &asker, &name, input).await)
         }
         // An agent's `kiln spawn`: started by the server, as its children, on this machine.
-        Request::Spawn { kind, count, prompt, model, mode, name, cwd, .. } if agent.is_some() => {
-            let a = as_agent("agents.start", json!({"kind": kind, "count": count, "prompt": prompt, "model": model, "mode": mode, "name": name, "cwd": cwd})).await;
-            if a.get("ok") != Some(&json!(true)) {
-                return a;
+        Request::Spawn { kind,count,prompt,model,mode,name,shell,cwd,.. } => {
+            let asker=match (agent,shell.clone()) {
+                (Some(id),_)=>Asker::Agent(id), (None,Some(t)) if !t.is_empty()=>Asker::Terminal(t),
+                _=>return json!({"ok":false,"error":"a session start requires an authenticated agent or terminal"}),
+            };
+            let key=crate::util::new_id();
+            let mut body=json!({"kind":kind,"key":key});
+            if let Some(o)=body.as_object_mut(){
+                if let Some(n)=count {o.insert("count".into(),json!(n));}
+                for (field,v) in [("prompt",prompt),("model",model),("mode",mode),("name",name),("cwd",cwd),("shell",shell)] {if let Some(v)=v {o.insert(field.into(),json!(v));}}
             }
-            let sessions: Vec<Value> = a.pointer("/result/agents").and_then(Value::as_array).into_iter().flatten().map(|i| json!({"id": i.get("id"), "name": i.get("name"), "kind": i.get("kind")})).collect();
-            json!({"ok": true, "sessions": sessions})
+            let reply=relayed(ask_server(forward,&asker,"agents.start",body).await);
+            if reply.get("ok")!=Some(&json!(true)){return reply;}
+            json!({"ok":true,"key":key,"sessions":reply.pointer("/result/agents"),"slots":reply.pointer("/result/slots")})
         }
         Request::Send { id, text, mode, key } if agent.is_some() => {
             // CP-T3.2: keep an omitted mode omitted until the server knows who sends it.
@@ -191,6 +198,34 @@ pub async fn answer(host: &Host, req: Request, peer: Option<u32>, forward: Optio
                 fields.insert("mode".into(), json!(mode));
             }
             as_agent("agents.send", input).await
+        }
+        Request::Send { id, text, mode, key } => {
+            let manager = match host.inbox().map(|inbox| inbox.session_authority()).transpose() {
+                Ok(Some(Some(m))) => m,
+                Ok(_) => return handle(host, Request::Send { id, text, mode, key }),
+                Err(e) => return json!({"ok":false,"error":e.to_string()}),
+            };
+            let session = if host.get(&id).is_some() { id } else {
+                let mut matches = host.session_ids().into_iter().filter(|s| s.starts_with(&id));
+                let Some(first) = matches.next() else { return json!({"ok":false,"error":"no such local agent"}); };
+                if matches.next().is_some() { return json!({"ok":false,"error":"ambiguous session prefix"}); }
+                first
+            };
+            let Some(epoch) = manager.owned_epoch(&session) else { return json!({"ok":false,"error":"no committed local session owner"}); };
+            let message = key.as_deref().map_or_else(crate::util::new_id, |k| crate::util::derive_id(&["socket.send", &session, k]));
+            let command = Command::Send { id: message.clone(), text, mode: mode.unwrap_or_default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            let route = super::route::Route::new(manager.node_name(), "admin");
+            let Some(rx) = host.command_routed_reply(&session, command, epoch, route) else { return json!({"ok":false,"error":"the session did not accept the command"}); };
+            let mut said = match crate::rt::timeout(super::registry::ANSWER_WAIT, rx).await {
+                Ok(Ok(said)) => said,
+                _ => return json!({"ok":false,"error":"session receipt is unconfirmed","message":message}),
+            };
+            crate::agent::verify_inbox_answer(Some(&manager), manager.store().as_ref(), &session, &mut said).await;
+            match said.answer {
+                Ok(accepted) if accepted.message == message => json!({"ok":true,"message":message,"accepted":accepted}),
+                Ok(_) => json!({"ok":false,"error":"session returned a different receipt"}),
+                Err(refused) => json!({"ok":false,"error":refused.reason(),"refused":refused}),
+            }
         }
         Request::Stop { id: Some(id), .. } if agent.is_some() => as_agent("agents.stop", json!({"agent": id})).await,
         Request::Interrupt { id: Some(id), .. } if agent.is_some() => as_agent("agents.interrupt", json!({"agent": id})).await,
@@ -337,7 +372,8 @@ pub fn handle(host: &Host, req: Request) -> Value {
     };
     match req {
         Request::Spawn { kind, count, prompt, model, mode, name, shell, cwd, env, program } => {
-            let count = count.unwrap_or(1).clamp(1, 16);
+            let count=count.unwrap_or(1);
+            if count==0 {return json!({"ok":false,"error":"count must be positive"});}
             let mut made = Vec::new();
             for i in 0..count {
                 let spec = Spec {

@@ -126,6 +126,8 @@ async fn lab_full(objects: [Option<Arc<crate::runner::work::store::Store>>; 2], 
         capacity: None,
         harness_send: None,
         convo_raft: None,
+        sessions_only: false,
+        session_executor: true,
         direct_quic: false,
     };
     let (mac, mac_out) = node::start(Config { objects: mac_objects, version: mac_version, place: mac_place, ..cfg("mac", dirs.first().ok_or_else(|| anyhow::anyhow!("dir"))?, None) })?;

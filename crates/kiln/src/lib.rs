@@ -61,6 +61,7 @@ pub mod k8s;
 pub mod keep;
 pub mod log_lines;
 pub mod live;
+pub mod liveness;
 pub mod logs;
 pub mod mcp;
 pub mod memory;

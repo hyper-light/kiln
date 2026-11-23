@@ -169,13 +169,20 @@ mod imp {
         let mtu = interface_mtu(head, local.ip());
         // SAFETY: `head` is the list getifaddrs returned, freed here only.
         unsafe { libc::freeifaddrs(head) };
-        // XNU also refuses any datagram past its UDP cap (`net.inet.udp.maxdgram`, 9,216 bytes by
-        // default), below loopback's MTU: what passes both is what the path carries.
-        let payload = mtu.map(|mtu| super::payload_of(mtu, socket.family));
-        Ok(match (payload, udp_datagram_cap()) {
-            (Some(payload), Some(cap)) => Some(payload.min(cap)),
-            (payload, _) => payload,
-        })
+        // XNU includes packet-info control bytes in the atomic send's SO_SNDBUF charge.
+        // At the UDP cap such a send can return EAGAIN forever, even on an empty socket.
+        let source_room = source_payload_room(socket)?;
+        Ok(Some(mtu.map(|n| super::payload_of(n, socket.family)).into_iter()
+            .chain(udp_datagram_cap()).fold(source_room, u16::min)))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn source_payload_room(socket: &Socket) -> Result<u16, RtError> {
+        let send = rustix::net::sockopt::socket_send_buffer_size(&socket.fd).map_err(|e| refused("getsockopt(SO_SNDBUF)", e))?;
+        let size = match socket.family { Family::V4 => size_of::<libc::in_pktinfo>(), Family::V6 => size_of::<libc::in6_pktinfo>() };
+        // SAFETY: CMSG_SPACE computes the aligned space of one fixed-size socket control message.
+        let control = unsafe { libc::CMSG_SPACE(u32::try_from(size).unwrap_or(u32::MAX)) };
+        Ok(u16::try_from(send.saturating_sub(control as usize)).unwrap_or(u16::MAX))
     }
 
     /// The host's cap on a UDP datagram's payload (`net.inet.udp.maxdgram`), if it says.
@@ -637,6 +644,9 @@ pub(crate) mod imp {
     }
 
     impl Socket {
+        /// The live provider socket, at its native width, for Winsock extension calls.
+        pub(crate) fn winsock_handle(&self) -> SOCKET { self.socket }
+
         /// The readiness handle a `crate::readiness` future registers. A Winsock `SOCKET` is pointer-width
         /// but a kernel handle-table value that fits in a positive `i32` in practice; the readiness seam
         /// (and the AFD reactor that reconstructs it) carry it as that `i32`, the width a Unix fd uses.
@@ -1165,3 +1175,6 @@ pub(crate) use imp::{
     queued_bytes, recv_buffer_bytes, recv_from, send, send_to, set_recv_buffer, share_port,
     shares_port,
 };
+
+#[cfg(target_os = "macos")]
+pub(crate) use imp::source_payload_room;

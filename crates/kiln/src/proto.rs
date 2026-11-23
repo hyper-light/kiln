@@ -374,6 +374,8 @@ pub enum AgentMsg {
     /// is the one it was sent for. Only for a message that came with a route, which only a server that named
     /// [`feature::MAIL_ROUTE`] sends. Appended last, after `RunnerRole`: postcard encodes variants by index.
     HarnessForward { session: String, epoch: u64, json: String },
+    /// Receipt for a single destination request. Frame identity and operation nonce are both verified.
+    HarnessRouteReceipt { session: String, request: String, json: String },
 }
 
 /// A grant as the wire names it (docs/ci.md W05-R34): its leg, its attempt, and its fence (the
@@ -879,6 +881,7 @@ pub mod feature {
     /// A server that names it sends such a runner a person's and an agent's message at once, with its route, and keeps
     /// none of it: it holds one in its own custody (W20's) for a runner that didn't name it, or one that's away, and holds
     /// kiln's own there still (docs/sends.md, "What's open").
+    pub const ROUTE_RECEIPT: &str = "mail-route-receipt";
     pub const MAIL_ROUTE: &str = "mail-route";
     /// This runner resets its agents (`harness::model::Command::Reset`, docs/agents.md "Reset"): what each has pending
     /// ends, its intake opens again and its harness starts again fresh. Only a runner that named it is asked to reset one.
@@ -887,13 +890,37 @@ pub mod feature {
     /// `Say::HarnessSaid`): any node receiving a message for a session owned by another runner forwards it directly to that
     /// runner's inbox without enqueueing it locally.
     pub const P2P_MAIL: &str = "p2p-mail";
+    /// CP-T3.2. The destination can check a fleet-authorized user message over Reach.
+    pub const AUTHORITY_MAIL: &str = "p2p-fleet-mail";
     /// Per-session conversation Raft replication (`convo::raft`, `reach::wire::Ask::ConvoRaft`,
     /// `Say::ConvoRaft`, `convo::feed::Msg::Raft`): each session runs its own hyper-raft group led
     /// by the node where the session runs and replicated across connected nodes in the fleet.
     pub const CONVO_RAFT: &str = "convo-raft";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD, MAIL_ROUTE, RESET, P2P_MAIL, CONVO_RAFT];
+    /// Append-only extension of [`CONVO_RAFT`] negotiating chunked `KRC1` snapshot wire framing
+    /// and multi-part `WireEntry::Part` WAL entries for oversized single rows.
+    pub const CONVO_RAFT_V2: &str = "convo-raft-v2";
+    /// A process with a session host can take over execution of a replicated conversation.
+    pub const CONVO_EXECUTOR: &str = "convo-executor";
+    /// CP-T3.2. Can durably witness a fleet session-name claim under a signed charter.
+    /// Destination-confirmed session starts over direct or relayed reach, with per-slot replies.
+    pub const SESSION_STARTS:&str="session-start-receipts";
+    /// Links limited to authenticated conversation traffic, without general Reach execution.
+    pub const SESSION_LINK_ONLY: &str = "session-links-only";
+    pub const CONVO_NAME_CHARTER: &str = "convo-name-charter";
+    /// AD-1. This node has a running, authenticated, kernel-stamped failure detector.
+    pub const CONVO_LIVENESS: &str = "convo-liveness";
+    pub const CONVO_MOVE: &str = "convo-raft-move";
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD, MAIL_ROUTE, RESET, P2P_MAIL, CONVO_RAFT, CONVO_RAFT_V2, ROUTE_RECEIPT, CONVO_MOVE, CONVO_EXECUTOR, CONVO_NAME_CHARTER, CONVO_LIVENESS, SESSION_STARTS, AUTHORITY_MAIL];
 
     /// [`ALL`], as a message carries them.
+    pub fn for_session_host(executable: bool, detector: bool) -> Vec<String> {
+        ALL.iter().filter(|n| (detector || **n != CONVO_LIVENESS) && (executable || !matches!(**n, CONVO_EXECUTOR | CONVO_NAME_CHARTER | SESSION_STARTS))).map(|n| (*n).to_owned()).collect()
+    }
+
+    pub fn can_elect(names: &[String]) -> bool {
+        speaks(names, CONVO_EXECUTOR) && speaks(names, CONVO_LIVENESS)
+    }
+
     pub fn all() -> Vec<String> {
         ALL.iter().map(|n| (*n).to_owned()).collect()
     }
@@ -1328,6 +1355,8 @@ pub enum ServerMsg {
     /// it from its link's next connection on, and says so ([`AgentMsg::RunnerRole`]). Only to runners that named
     /// [`feature::RUNNER_ROLE`]. Appended last, after `UserEnv`: postcard encodes variants by index.
     RunnerRole { cert_pem: String },
+    /// CP-T3.2. The authorized API asks the current session leader to transfer after native staging.
+    ConvoTransferOwnership { session: String, target: String, epoch: u64, digest: String },
 }
 
 /// What the server's copy of one agent session has of its events, said in digests
@@ -2396,6 +2425,7 @@ mod tests {
             ("Prebuilt", AgentMsg::Prebuilt { json: "{}".into() }),
             ("RunnerRole", AgentMsg::RunnerRole { serial: "00".into() }),
             ("HarnessForward", AgentMsg::HarnessForward { session: "s1".into(), epoch: 1, json: "{}".into() }),
+            ("HarnessRouteReceipt", AgentMsg::HarnessRouteReceipt { session: "s1".into(), request: "r".into(), json: "{}".into() }),
         ];
         let mut last = 63u8;
         for (name, m) in agent {
@@ -2423,6 +2453,7 @@ mod tests {
             ("Volumes", ServerMsg::Volumes { req: 1, json: "{}".into() }),
             ("UserEnv", ServerMsg::UserEnv { req: 1, json: "{}".into() }),
             ("RunnerRole", ServerMsg::RunnerRole { cert_pem: String::new() }),
+            ("ConvoTransferOwnership", ServerMsg::ConvoTransferOwnership { session: "s".into(), target: "to".into(), epoch: 1, digest: "a".repeat(64) }),
         ];
         // After main's `HarnessArchive` (69) and `HarnessRestoreCopy` (70).
         let mut last = 70u8;

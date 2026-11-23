@@ -366,9 +366,10 @@ export const api = {
   join: (signal?: AbortSignal) => get<JoinInfo>("/api/agents/join", signal),
   joinRequests: (signal?: AbortSignal) => get<JoinRequest[]>("/api/join-requests", signal),
   /** A one-time invite for an outpost: kiln run on a machine without installing it there. */
+  sessionNodeInvite: () => post<JoinInfo>("/api/agents/session-node-invite"),
   outpostInvite: () => post<OutpostInvite>("/api/outposts/invite"),
   /** `name`: the agent it is now (its machine id, when it sent one); `label`: the name people see then. */
-  approveJoin: (id: string, body: { name?: string; labels?: string[] } = {}) =>
+  approveJoin: (id: string, body: { name?: string; labels?: string[]; session_node?: boolean } = {}) =>
     post<{ id: string; status: string; name: string; label?: string | null; labels: string[] }>(`/api/join-requests/${enc(id)}/approve`, body),
   denyJoin: (id: string) => post<{ id: string; status: string; name: string }>(`/api/join-requests/${enc(id)}/deny`),
   discovery: (signal?: AbortSignal) => get<DiscoveryInfo>("/api/discovery", signal),

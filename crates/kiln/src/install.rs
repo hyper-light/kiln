@@ -450,6 +450,8 @@ async fn install_here(a: &InstallArgs, system: bool, bin: &Path, config_path: &P
         ("kiln", vec!["server".to_owned()])
     };
 
+    crate::fleet::sessions::enroll_session_node(&state_dir)?;
+    say(format!("local session sign-in token file  {}",state_dir.join("session-admin.token").display()));
     let mut sup_args = vec!["supervise".to_owned(), "--".to_owned()];
     sup_args.extend(args);
     let ask = !a.unattended && crate::join::interactive();

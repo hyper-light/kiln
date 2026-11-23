@@ -71,7 +71,7 @@ fn unavailable(e: &anyhow::Error) -> Refusal {
     Refusal::Unavailable(format!("{e:#}"))
 }
 
-fn session_ok(id: &[u8]) -> Option<&str> {
+pub(crate) fn session_ok(id: &[u8]) -> Option<&str> {
     let ok = !id.is_empty() && id.len() <= 64 && id.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
     if ok { std::str::from_utf8(id).ok() } else { None }
 }
@@ -156,7 +156,11 @@ impl InboxRecords {
                 let page = legacy.scan(family, Scan { prefix: Vec::new(), after: after.clone(), limit: SCAN_MAX, at: Consistency::Linearizable }).await?;
                 let Some(last) = page.rows.last().map(|row| row.key.clone()) else { break };
                 for chunk in page.rows.chunks(TX_MAX) {
-                    let tx = Tx { conds: Vec::new(), writes: chunk.iter().map(|row| Write::Put { family: (*family).to_owned(), key: row.key.clone(), value: row.value.clone() }).collect() };
+                    let writes = chunk.iter().map(|row| {
+                        let value = crate::harness::inbox::with_receipt_sequence(family,&row.value,row.rev).map_err(|e| unavailable(&e))?;
+                        Ok(Write::Put { family: (*family).to_owned(), key: row.key.clone(), value })
+                    }).collect::<Result<Vec<_>,Refusal>>()?;
+                    let tx = Tx { conds: Vec::new(), writes };
                     match self.sessions_of(&tx) {
                         Ok(sessions) => {
                             store.inbox_commit(tx, sessions, None).await.map_err(|e| unavailable(&e))??;
