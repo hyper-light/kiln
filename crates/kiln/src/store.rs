@@ -1046,6 +1046,10 @@ fn copy_tables(db: &Path, dest: &Path) -> anyhow::Result<()> {
     src.execute_batch("DETACH DATABASE copy")?;
     let names: std::collections::HashSet<&str> = tables.iter().map(|(n, _)| n.as_str()).collect();
     let d = Connection::open(dest)?;
+    // P2: no journal and no sync, as the passes above. Each connection sets them (they're its own, not the file's), or
+    // each index, trigger and view is a commit with fsyncs of its own: 19 s a copy on a busy disk (2026-11-23). The copy
+    // counts for nothing until `group::stand` makes it durable, all of it at once.
+    d.execute_batch("PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;")?;
     for (kind, _, table, sql) in &objects {
         if kind == "view" || (kind != "table" && names.contains(table.as_str())) {
             d.execute_batch(sql)?;
