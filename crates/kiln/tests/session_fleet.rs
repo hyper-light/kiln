@@ -169,7 +169,7 @@ fn seed_latency_replicas(dir: &Path, count: usize) -> anyhow::Result<()> {
         std::fs::create_dir_all(&wal)?;
         kiln::util::write_secret(&wal.join("node-id"), name.as_bytes(), 0o600)?;
         let store = kiln::convo::open(&data, Default::default()).context("open benchmark conversation store")?;
-        let m = Manager::open_with_policy(&name, &wal, Some(store.clone()), Policy { auto_failover: false })?;
+        let m = Manager::open_with_policy(&name, &wal, Some(store.clone()), Policy { auto_failover: false, ..Policy::default() })?;
         m.set_name_registrar(&server)?;
         managers.insert(name, m);
         stores.push(store);

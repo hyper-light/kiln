@@ -362,6 +362,12 @@ pub struct Joiner {
     next_expiry: Option<Instant>,
     open: HashMap<(String, u64), Joining>,
     dir: Option<PathBuf>,
+    /// No clock (a conversation's, CP-T3.2): a partial message goes only as it completes, as its sender is forgotten
+    /// ([`Joiner::forget_prefix`]), or as room is needed for another, the one that progressed least recently first;
+    /// none goes for time alone.
+    untimed: bool,
+    /// Parts taken so far: the order partial messages last progressed in, which an untimed joiner lets go of by.
+    taken: u64,
 }
 
 struct Joining {
@@ -372,6 +378,8 @@ struct Joining {
     room: usize,
     since: Instant,
     window: Duration,
+    /// When it last took a part, in the joiner's count of parts taken.
+    last: u64,
 }
 
 enum Part {
@@ -394,6 +402,19 @@ impl Joining {
 impl Joiner {
     pub fn in_dir(dir: PathBuf, idle_floor: Duration) -> Self { Self { dir: Some(dir), idle_floor: Some(idle_floor), ..Self::default() } }
 
+    /// A conversation's joiner (CP-T3.2): its parts staged in `dir`, and no clock ([`Joiner::untimed`]).
+    pub fn staged_untimed(dir: PathBuf) -> Self { Self { dir: Some(dir), untimed: true, ..Self::default() } }
+
+    /// An untimed joiner's room: the partial message that progressed least recently, other than `keep`, let go of.
+    /// Whether there was one.
+    fn evict_least_recent(&mut self, keep: &(String, u64)) -> bool {
+        let Some(oldest) = self.open.iter().filter(|(key, _)| *key != keep).min_by_key(|(_, j)| j.last).map(|(key, _)| key.clone()) else { return false };
+        if let Some(j) = self.open.remove(&oldest) {
+            self.held = self.held.saturating_sub(j.charge());
+        }
+        true
+    }
+
     pub fn forget_prefix(&mut self, prefix: &str) {
         self.open.retain(|(source, _), j| {
             if !source.starts_with(prefix) { return true; }
@@ -402,7 +423,6 @@ impl Joiner {
         });
     }
 
-    pub(crate) fn expiry(&self) -> Option<Instant> { self.next_expiry }
 
     pub fn expire(&mut self) {
         let now = Instant::now();
@@ -428,7 +448,7 @@ impl Joiner {
             return Some(Joined(Completed::Frame(bytes)));
         }
         if part >= parts || len == 0 || len > PART { return None; }
-        self.expire();
+        if !self.untimed { self.expire(); }
         let key = (from.to_owned(), id);
         if !self.open.contains_key(&key) {
             let max_open = if self.dir.is_some() {
@@ -444,7 +464,10 @@ impl Joiner {
                     });
                 frames
             } else { JOINING };
-            if self.open.len() >= max_open { return None; }
+            // An untimed joiner makes room by letting go of the partial message that progressed least recently.
+            while self.open.len() >= max_open {
+                if !self.untimed || !self.evict_least_recent(&key) { return None; }
+            }
             // The contiguous wire buffer and its decoded Raft message coexist at completion.
             let mut room = available_bytes() / 2;
             let file = if let Some(dir) = &self.dir {
@@ -454,10 +477,18 @@ impl Joiner {
             } else { None };
             let since = Instant::now();
             let window = self.idle_floor.unwrap_or(PARTS_WAIT);
-            self.next_expiry = Some(self.next_expiry.map_or(since + window, |next| next.min(since + window)));
-            self.open.insert(key.clone(), Joining { total: parts, parts: BTreeMap::new(), file, bytes: 0, room, since, window });
+            if !self.untimed {
+                self.next_expiry = Some(self.next_expiry.map_or(since + window, |next| next.min(since + window)));
+            }
+            self.open.insert(key.clone(), Joining { total: parts, parts: BTreeMap::new(), file, bytes: 0, room, since, window, last: 0 });
         }
         let charge = len.checked_add(size_of::<(u32, Part)>())?;
+        if self.untimed {
+            let room = self.open.get(&key)?.room;
+            while self.held.checked_add(charge)? > room {
+                if !self.evict_least_recent(&key) { break; }
+            }
+        }
         let j = self.open.get_mut(&key)?;
         if j.total != parts || j.parts.contains_key(&part) || self.held.checked_add(charge)? > j.room { return None; }
         let stored = if let Some(file) = &mut j.file {
@@ -477,8 +508,12 @@ impl Joiner {
         self.held += charge;
         j.parts.insert(part, stored);
         j.bytes += len;
-        if let Some(floor) = self.idle_floor { j.window = j.window.max(j.since.elapsed().saturating_add(floor)); }
-        j.since = Instant::now();
+        self.taken = self.taken.wrapping_add(1);
+        j.last = self.taken;
+        if !self.untimed {
+            if let Some(floor) = self.idle_floor { j.window = j.window.max(j.since.elapsed().saturating_add(floor)); }
+            j.since = Instant::now();
+        }
         if j.parts.len() != usize::try_from(parts).ok()? { return None; }
         let j = self.open.remove(&key)?;
         self.held = self.held.saturating_sub(j.charge());
@@ -543,6 +578,28 @@ mod tests {
         assert_eq!(whole, Some(bytes));
         let small = frames("r", 1, vec![1, 2, 3]);
         assert!(matches!(small.first(), Some((Msg::Raft { parts: 0, .. }, _))));
+    }
+
+    /// CP-T3.2, a conversation's joiner with no clock: a partial message arms no expiry and isn't let go for time;
+    /// room for another lets go of the one that progressed least recently, never the one taking the part; a sender
+    /// forgotten takes its partial messages with it; what completes comes back whole.
+    #[test]
+    fn cp_t32_an_untimed_joiner_lets_a_partial_message_go_only_for_room_or_its_sender() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut join = Joiner::staged_untimed(dir.path().to_owned());
+        anyhow::ensure!(join.add("1:a", 1, 0, 2, br#"{"a":"#.to_vec()).is_none() && join.next_expiry.is_none(), "a partial message armed an expiry");
+        anyhow::ensure!(join.add("1:b", 2, 0, 2, br#"{"b":"#.to_vec()).is_none(), "the second partial message wasn't kept");
+        anyhow::ensure!(join.add("2:c", 3, 0, 2, br#"{"c":"#.to_vec()).is_none(), "the third partial message wasn't kept");
+        anyhow::ensure!(join.add("1:b", 2, 1, 3, br#"1}"#.to_vec()).is_none(), "a part of another message's count was taken");
+        let keep = ("2:c".to_owned(), 3);
+        anyhow::ensure!(join.evict_least_recent(&keep), "nothing was let go for room");
+        anyhow::ensure!(!join.open.contains_key(&("1:a".to_owned(), 1)) && join.open.contains_key(&("1:b".to_owned(), 2)) && join.open.contains_key(&keep), "room let go of another than the least recent: {:?}", join.open.keys().collect::<Vec<_>>());
+        join.forget_prefix("2:");
+        anyhow::ensure!(!join.open.contains_key(&keep), "a forgotten sender's partial message stayed");
+        let whole = join.add("1:b", 2, 1, 2, br#"1}"#.to_vec());
+        anyhow::ensure!(whole.as_deref() == Some(br#"{"b":1}"#.as_slice()), "the completed message came back as {whole:?}");
+        anyhow::ensure!(join.open.is_empty() && join.held == 0, "held {} after completing", join.held);
+        Ok(())
     }
 
     #[test]
