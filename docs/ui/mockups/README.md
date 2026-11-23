@@ -6,7 +6,7 @@
 Interactive mockups of the designs in `docs/ui/*.md`, for the person to see and press before anything is
 built. Open any of them in a browser; each links to the others.
 
-- `runners.html`: docs/ui/runners-engine.md (P2.3, P3.2).
+- `runners.html`: docs/ui/runners.md (P3.2).
 - `agents.html`: docs/ui/agents.md (P5.1, P5.2, P5.4).
 - `agentfile.html`: docs/ui/agentfile-structured.md (P4.5, P4.6, P5.3, P5.4).
 - `experiments.html`: docs/ui/experiments.md (P7.1, P7.2).

@@ -368,7 +368,6 @@ const OPS = {
   "sessions.pause": { verb: "Pause", icon: "pause", keys: "P" },
   "sessions.resume": { verb: "Resume", icon: "play", keys: "P" },
   "sessions.restart": { verb: "Restart", icon: "restart", keys: "R" },
-  "runners.engine": { verb: "Switch engine", icon: "host" },
   "runners.drain": { verb: "Drain", icon: "pause" },
   "images.build": { verb: "Build image", icon: "build" },
   "agentfiles.update": { verb: "Save", icon: "check" },

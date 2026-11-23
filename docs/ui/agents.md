@@ -16,8 +16,8 @@ experiment (see [experiments.md](experiments.md)). Rules: [principles.md](princi
     when behind, its variant's swatch and name, its sandbox line, compact CPU and memory bars, pause, stop, open);
   - EXPERIMENT: the split as swatches, its weights, "n · splitting", pause.
   - `?open=ID,…` opens rows' dropdowns.
-- **Every Mission row** says where it runs: engine glyph, runner, start glyph and ms (a session not yet listed: its
-  machine's engine).
+- **Every Mission row** says where it runs: engine glyph, runner, start glyph and ms (a session not yet listed: what
+  its start chose, Host or microVM; never its machine's).
 - **The Agents tab** (agent page): this session's agent first (name, harness, Agentfile, where it runs; its version,
   "Restart on vN" when behind; its variant's swatch, name and weight; its values), then Yours / kiln's: a row per
   definition (name, stand dots, at work, where it runs, Run, ⋯) whose chevron opens the same groups.

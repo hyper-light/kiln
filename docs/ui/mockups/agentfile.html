@@ -90,7 +90,7 @@ function parse(text) {
 }
 
 /* ------------------------------------------------------------ builds on save, per runner (P4.5) */
-const RUNNERS = [["adas-macbook-pro-2.local", "linux/arm64", true], ["adas-mac-studio.local", "linux/arm64", true], ["adas-mac-studio-3.local", "linux/arm64", true], ["adas-mac-studio.local-2", "linux/arm64", true], ["adacachy2", "linux/amd64", true], ["adas-mac-studio-2.local", "linux/arm64", false, "HVF denied"], ["adacachy", "linux/amd64", false, "host engine"]];
+const RUNNERS = [["adas-macbook-pro-2.local", "linux/arm64", true], ["adas-mac-studio.local", "linux/arm64", true], ["adas-mac-studio-3.local", "linux/arm64", true], ["adas-mac-studio.local-2", "linux/arm64", true], ["adacachy2", "linux/amd64", true], ["adas-mac-studio-2.local", "linux/arm64", false, "HVF denied"], ["adacachy", "linux/amd64", true]];
 const B = Object.fromEntries(RUNNERS.map(([n, , ok], i) => [n, !ok ? { s: "none" } : n === "adacachy2" ? { s: "failed", age: "4m" } : n === "adas-mac-studio.local-2" ? { s: "start", step: 6 } : { s: "ok", digest: "7c1e0b9a44d2", age: "4m", took: ["3m12s", "2m58s", "3m05s"][i] ?? "3m" }]));
 const WORDS = "Shards refused the build at line 13 (HARNESS codex): the download for linux/amd64 has SHA-256 4b07e1a9c3d5…, and --checksum=sha256:9f2c55d0b7a1… names another.";
 function runBuilds() {

@@ -10,7 +10,7 @@ sections B, C and D. Decision 2 holds: until Reliquary shares images, each runne
 - **Builds, first**: a bar per runner in kiln's status colours (building drifts in the prism), "n/m built · k
   refused", Build vN. A row per runner: state dot, runner, platform, step meter while building, "serving vN" while a
   newer one isn't built, when; a refused row opens Shards' words in place with Build again; a runner that doesn't
-  build says why in a word or two ("host engine", "no microVMs"). Rows go queued → building → built while shown.
+  build says why in a word or two ("no microVMs", "kiln too old"). Rows go queued → building → built while shown.
 - **Sources**: a row per `HARNESS` or `AGENT` source: kind glyph and word (https, ssh, s3, git, path), the directive
   and name, the source cut short, its pin (sha256, object version, ref → the commit it named, kiln's pin), the
   credential its fetch is handed by name and scope (never a value), and the origin that fetch alone is granted. A row

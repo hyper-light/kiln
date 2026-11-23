@@ -15,13 +15,13 @@
 /* ------------------------------------------------------------ sample data */
 const W = (b, s, seed) => walk(60, b, s, seed);
 const R = [
-  { id: "e301", name: "adas-macbook-pro-2.local", host: "Adas-MacBook-Pro-2.local", plat: "macos/aarch64", engine: "microvm", can: true, hv: "HVF", cores: 18, memG: 128, cpu: W(26, 8, 3), mem: 25, disk: 58, net: 0.4, starts: [9, 2, 1], vcpu: [2, 18],
+  { id: "e301", name: "adas-macbook-pro-2.local", host: "Adas-MacBook-Pro-2.local", plat: "macos/aarch64", can: true, hv: "HVF", cores: 18, memG: 128, cpu: W(26, 8, 3), mem: 25, disk: 58, net: 0.4, starts: [9, 2, 1], vcpu: [2, 18],
     vms: [{ id: "v1", agent: "release-notes", proj: "hyper-light/hex", image: "docs-site v3", start: ["template", 431], up: "41m", state: "idle", cpu: W(4, 3, 11), mem: [1.1, 4], disk: [0.4, 8] }], pools: [], images: [["rust-dev", "rust-dev v8", 1.42, "4m", "ok"], ["harness-claude", "kiln's", 0.61, "2d", "ok"]] },
-  { id: "cec3", name: "adas-mac-studio.local", host: "Adas-Mac-Studio-3.local", plat: "macos/aarch64", engine: "microvm", can: true, hv: "HVF", cores: 14, memG: 36, cpu: W(12, 6, 5), mem: 41, disk: 61, net: 1.2, starts: [31, 9, 4], vcpu: [5, 14], override: ["hyper-light/kiln", "host"],
+  { id: "cec3", name: "adas-mac-studio.local", host: "Adas-Mac-Studio-3.local", plat: "macos/aarch64", can: true, hv: "HVF", cores: 14, memG: 36, cpu: W(12, 6, 5), mem: 41, disk: 61, net: 1.2, starts: [31, 9, 4], vcpu: [5, 14],
     vms: [{ id: "v2", agent: "reviewer", proj: "hyper-light/kiln", image: "rust-dev v8", start: ["warm", 212], up: "6m", state: "run", cpu: W(38, 18, 7), mem: [2.3, 4], disk: [1.1, 8] }],
     pools: [{ agent: "reviewer", size: "2 vCPU · 4 GiB", warm: 1, of: 2, hits: [7, 9], idle: "1m" }], images: [["rust-dev", "rust-dev v8", 1.42, "4m", "ok"], ["harness-claude", "kiln's", 0.61, "2d", "ok"], ["harness-codex", "kiln's", 0.59, "2d", "ok"]] },
-  { id: "b24c", name: "adas-mac-studio-2.local", host: "Adas-Mac-Studio-2.local", plat: "macos/aarch64", engine: "host", can: false, hv: null, why: "HVF denied", whyFull: "Hypervisor.framework refused the VM process (HV_DENIED): shards-vm isn't signed with com.apple.security.hypervisor", cores: 14, memG: 36, cpu: W(13, 5, 9), mem: 21, disk: 74, net: 0.1, starts: [0, 0, 0], vcpu: [0, 14], vms: [], pools: [], images: [] },
-  { id: "2768", name: "adas-mac-studio-3.local", host: "Adas-Mac-Studio-4.local", plat: "macos/aarch64", engine: "microvm", can: true, hv: "HVF", cores: 14, memG: 36, cpu: W(29, 10, 13), mem: 74, disk: 66, net: 3.4, starts: [64, 12, 6], vcpu: [9, 14],
+  { id: "b24c", name: "adas-mac-studio-2.local", host: "Adas-Mac-Studio-2.local", plat: "macos/aarch64", can: false, hv: null, why: "HVF denied", whyFull: "Hypervisor.framework refused the VM process (HV_DENIED): shards-vm isn't signed with com.apple.security.hypervisor", cores: 14, memG: 36, cpu: W(13, 5, 9), mem: 21, disk: 74, net: 0.1, starts: [0, 0, 0], vcpu: [0, 14], vms: [], pools: [], images: [] },
+  { id: "2768", name: "adas-mac-studio-3.local", host: "Adas-Mac-Studio-4.local", plat: "macos/aarch64", can: true, hv: "HVF", cores: 14, memG: 36, cpu: W(29, 10, 13), mem: 74, disk: 66, net: 3.4, starts: [64, 12, 6], vcpu: [9, 14],
     vms: [
       { id: "v3", agent: "reviewer", proj: "hyper-light/kiln", image: "rust-dev v8", start: ["warm", 221], up: "40s", state: "run", cpu: W(62, 20, 17), mem: [3.1, 4], disk: [1.4, 8] },
       { id: "v4", agent: "ci-diagnose", proj: "hyper-light/shards", image: "harness-claude", start: ["warm", 198], up: "2m", state: "idle", cpu: W(6, 4, 19), mem: [1.4, 2], disk: [0.3, 8] },
@@ -29,29 +29,28 @@ const R = [
     ],
     pools: [{ agent: "reviewer", size: "2 vCPU · 4 GiB", warm: 2, of: 3, hits: [41, 47], idle: "40s" }, { agent: "ci-diagnose", size: "2 vCPU · 2 GiB", warm: 1, of: 1, hits: [9, 12], idle: "2m" }, { agent: "pr-triage", size: "1 vCPU · 2 GiB", warm: 0, of: 1, hits: [0, 1], idle: "31m", leaving: true }],
     images: [["rust-dev", "rust-dev v8", 1.42, "4m", "ok"], ["rust-dev", "rust-dev v9", 1.44, "now", "start"], ["harness-claude", "kiln's", 0.61, "2d", "ok"], ["harness-codex", "kiln's", 0.59, "2d", "ok"]] },
-  { id: "d132", name: "adas-mac-studio.local-2", host: "Adas-Mac-Studio.local", plat: "macos/aarch64", engine: "microvm", can: true, hv: "HVF", cores: 32, memG: 96, cpu: W(10, 4, 29), mem: 34, disk: 22, net: 0.2, starts: [3, 1, 2], vcpu: [0, 32], vms: [], pools: [], images: [["harness-claude", "kiln's", 0.61, "2d", "ok"]] },
-  { id: "4513", name: "adacachy", host: "adacachy", plat: "linux/x86_64", engine: "host", can: true, hv: "KVM", owner: true, cores: 32, memG: 123, cpu: W(15, 8, 31), mem: 27, disk: 93, net: 6.1, starts: [0, 0, 0], vcpu: [0, 32], vms: [], pools: [], images: [] },
-  { id: "00aa", name: "adacachy2", host: "adacachy2", plat: "linux/x86_64", engine: "microvm", can: true, hv: "KVM", cores: 32, memG: 123, cpu: W(5, 4, 37), mem: 37, disk: 81, net: 2.2, starts: [22, 6, 3], vcpu: [6, 32],
+  { id: "d132", name: "adas-mac-studio.local-2", host: "Adas-Mac-Studio.local", plat: "macos/aarch64", can: true, hv: "HVF", cores: 32, memG: 96, cpu: W(10, 4, 29), mem: 34, disk: 22, net: 0.2, starts: [3, 1, 2], vcpu: [0, 32], vms: [], pools: [], images: [["harness-claude", "kiln's", 0.61, "2d", "ok"]] },
+  { id: "4513", name: "adacachy", host: "adacachy", plat: "linux/x86_64", can: true, hv: "KVM", owner: true, cores: 32, memG: 123, cpu: W(15, 8, 31), mem: 27, disk: 93, net: 6.1, starts: [0, 0, 0], vcpu: [0, 32], vms: [], pools: [], images: [] },
+  { id: "00aa", name: "adacachy2", host: "adacachy2", plat: "linux/x86_64", can: true, hv: "KVM", cores: 32, memG: 123, cpu: W(5, 4, 37), mem: 37, disk: 81, net: 2.2, starts: [22, 6, 3], vcpu: [6, 32],
     vms: [
       { id: "v6", agent: "opus-kiln-12", proj: "hyper-light/kiln", image: "harness-codex", start: ["cold", 1912], up: "14m", state: "run", cpu: W(44, 16, 41), mem: [2.8, 4], disk: [2.2, 8] },
       { id: "v7", agent: "pr-triage", proj: "hyper-light/hex", image: "rust-dev v8", start: ["warm", 205], up: "3m", state: "failed", cpu: W(2, 2, 43), mem: [2.0, 2], disk: [0.5, 8] },
     ],
     pools: [{ agent: "reviewer", size: "2 vCPU · 4 GiB", warm: 1, of: 2, hits: [12, 15], idle: "5m" }], images: [["rust-dev", "rust-dev v8", 1.42, "6m", "ok"], ["rust-dev", "rust-dev v9", 0, "now", "failed"], ["harness-codex", "kiln's", 0.59, "2d", "ok"]] },
 ];
-const S = { open: OPEN.get() || "2768", owner: true, asking: null, ending: null, moving: {}, vmCharts: new Set(), nodeCharts: false, building: false };
-const vmState = (v, r) => (S.moving[r.id] && r.engine === "microvm" && v.state !== "stopped" ? "drain" : v.state);
+const S = { open: OPEN.get() || "2768", vmCharts: new Set(), nodeCharts: false, building: false };
+const vmState = (v) => v.state;
 const last = (a) => a[a.length - 1];
 
 /* ------------------------------------------------------------ the fleet */
 /** Every table on this page shares one grid: the name, then six slots, then the controls. Like content lines up: name, then kind, then CPU. */
-const GRID = (heads, tips = {}) => [{ h: heads[0], name: true }, { h: narrow() ? "" : heads[1], w: narrow() ? 36 : 104, tip: tips[1] }, { h: heads[2], w: 116, c: "h640", tip: tips[2] }, { h: heads[3], w: narrow() ? 52 : 100 }, { h: heads[4], w: 112, c: "h900" }, { h: heads[5], w: 96, c: "h1100" }, { h: heads[6], w: 72, c: "h900" }, { h: "", w: narrow() ? 92 : 154 }];
+const GRID = (heads, tips = {}) => [{ h: heads[0], name: true }, { h: narrow() ? "" : heads[1], w: narrow() ? 36 : 128, tip: tips[1] }, { h: heads[2], w: 116, c: "h640", tip: tips[2] }, { h: heads[3], w: narrow() ? 52 : 100 }, { h: heads[4], w: 112, c: "h900" }, { h: heads[5], w: 96, c: "h1100" }, { h: heads[6], w: 72, c: "h900" }, { h: "", w: narrow() ? 92 : 154 }];
 const START_TIP3 = "Flame: warm · layers: from template · snowflake: cold";
-const FLEET = () => GRID(["Runner", "Engine", "VMs", "CPU", "Memory", "Disk", "Warm"]);
-function engineCell(r) {
-  const m = S.moving[r.id];
-  if (m) return `<span class="cr">${st("drain", "Switching: draining")}${icon(m.to, ENGINE_TIP[m.to])}<span class="ell h640">${m.to}</span></span>`;
-  if (narrow()) return `<span class="cr"><span class="badge3">${icon(r.engine, ENGINE_TIP[r.engine])}${!r.can ? st("off", r.why) : ""}</span></span>`;
-  return `<span class="cr">${icon(r.engine, ENGINE_TIP[r.engine])}<span class="ell">${r.engine}</span>${!r.can ? st("off", r.why) : ""}</span>`;
+const FLEET = () => GRID(["Runner", "Agents", "VMs", "CPU", "Memory", "Disk", "Warm"]);
+/** What its agents can run in (each session picks Host or microVM: the person's decision, 2026-11-23): host · microVM, or host and ⊘ with why. */
+function agentsCell(r) {
+  if (narrow()) return `<span class="cr"><span class="badge3">${icon(r.can ? "microvm" : "host", r.can ? "host · microVM" : "host")}${!r.can ? st("off", r.why) : ""}</span></span>`;
+  return `<span class="cr"><span class="ell">${r.can ? "host · microVM" : "host"}</span>${!r.can ? st("off", r.why) : ""}</span>`;
 }
 /** One glyph per VM, in its state: the count at a glance. */
 function vmMix(r) { return `<span class="gl">${r.vms.map((v) => st(vmState(v, r), `${v.agent} · ${STATES[vmState(v, r)][1]}`)).join("")}</span>`; }
@@ -60,7 +59,7 @@ function fleetRow(r) {
   const memPct = r.mem, warm = r.pools.reduce((a, p) => a + p.warm, 0), of = r.pools.reduce((a, p) => a + p.of, 0);
   return `<tr class="pick" tabindex="0" data-r="${r.id}" aria-expanded="${open}" aria-selected="${open}">${td3(FLEET(), [
     named(r.draining ? "drain" : "ok", r.name, "", r.draining ? "Draining" : `Connected · ${r.host} · ${r.plat} · kiln 0.9.41`),
-    engineCell(r),
+    agentsCell(r),
     r.vms.length ? vmMix(r) : `<span class="dim">0</span>`,
     spark(r.cpu, `${Math.round(last(r.cpu))}%`, "#3987e5", narrow() ? 0 : 40, 16, `rc:${r.id}`),
     ubar(memPct, `${memPct}%`, 36),
@@ -75,25 +74,14 @@ const VMCOLS = () => GRID(["Agent", "Start", "Image", "CPU", "Memory", "Disk", "
 const POOLCOLS = () => GRID(["Agent", "Warm", "Size", "Hits", "Idle", "", ""]);
 const IMGCOLS = () => GRID(["Image", "Size", "From", "Age", "", "", ""]);
 function detail(r) {
-  const m = S.moving[r.id];
-  const want = m ? m.to : r.engine;
-  const other = r.engine === "microvm" ? "host" : "microvm";
-  const checks = r.can
-    ? [["microVM", "ok", "virt.microvm: true"], ["Isolation", "ok", `isolation.available: true · ${r.hv}`], ["Host check", "ok", `Shards host_check: usable · ${r.hv} · 2m ago`], ["Image class", r.engine === "microvm" ? "ok" : "idle", "Hex node: shards-image"]]
-    : [["microVM", "failed", "virt.microvm: false"], ["Isolation", "failed", `isolation.why_not: ${r.whyFull}`], ["Host check", "failed", "Shards host_check: not usable · HV_DENIED · 4m ago"], ["Image class", "off", "Hex node: no shards-image"]];
   let fr = "";
   if (S.forget === r.id) fr = `<div class="fr">${st("warn")}<span class="lbl hi">Forget ${esc(r.name)}?</span><span class="acts">${ib("check", "Forget", `data-do="forget" data-r="${r.id}"`)}${ib("x", "Keep", 'data-do="noforget"')}</span></div>`;
-  else if (S.asking === r.id) fr = `<div class="fr">${st("warn")}<span class="lbl hi">Switch to ${other}?</span><span class="val dim">${r.vms.length ? `${r.vms.length} VM${r.vms.length > 1 ? "s" : ""} drain` : "nothing running"}</span><span class="acts"><button class="b3 p" data-do="switch" data-r="${r.id}">Switch</button><button class="b3 g" data-do="noswitch">Cancel</button></span></div>`;
-  else if (m && S.ending === r.id) fr = `<div class="fr">${st("warn")}<span class="lbl hi">End ${m.left.length} session${m.left.length > 1 ? "s" : ""}?</span><span class="val dim">conversations kept</span><span class="acts"><button class="b3 d" data-do="endnow" data-r="${r.id}">End</button><button class="b3 g" data-do="noend">Back</button></span></div>`;
-  else if (m) fr = `<div class="fr">${st("drain")}<span class="lbl hi">Draining</span><span class="val dim">${m.left.length} left</span><span class="acts"><button class="b3 d" data-do="askend" data-r="${r.id}">End now</button><button class="b3 g" data-do="cancel" data-r="${r.id}">Cancel</button></span></div>`;
   const used = r.vms.filter((v) => v.state !== "stopped").reduce((a, v) => a + v.mem[1], 0) + r.pools.reduce((a, p) => a + p.warm * parseInt(p.size.split("·")[1]), 0);
-  const room = r.engine === "microvm" ? Math.round((used / r.memG) * 100) : 0;
+  const room = r.can ? Math.round((used / r.memG) * 100) : 0;
   const tot = r.starts.reduce((a, b) => a + b, 0);
   const warm = r.pools.reduce((a, p) => a + p.warm, 0), of = r.pools.reduce((a, p) => a + p.of, 0);
-  return `<div class="ch wrap3">
-      <span class="seg-w">${S.owner ? "" : icon("lock", "Needs runners.manage")}<span class="sg3" role="group" aria-label="Engine">${["microvm", "host"].map((e) => `<button data-do="engine" data-e="${e}" data-r="${r.id}" aria-pressed="${want === e}" ${!S.owner || m || (e === "microvm" && !r.can) ? "disabled" : ""} title="${e === "microvm" && !r.can ? esc(r.why) : ENGINE_TIP[e]}">${icon(e)}${e}</button>`).join("")}</span></span>
-      <span class="checks3">${checks.map(([l, s, tip]) => `<span title="${esc(tip)}">${st(s, tip)}<span class="lbl">${l}</span></span>`).join("")}</span>
-      <span class="acts"><span class="kv3 h640" title="Workspace default · Settings → Runners"><span class="lbl">Default</span><span class="val">microvm</span></span>${r.override ? `<span class="kv3 h1100" title="${esc(`${r.override[0]} asks for ${r.override[1]}`)}">${st("warn", "Project override")}<span class="val">kiln → ${r.override[1]}</span></span>` : ""}</span>
+  return `<div class="ch wrap3" role="group" aria-label="Agents">
+      <span class="lbl">Agents</span><span class="pill3">Host</span><span class="pill3${r.can ? "" : " no"}" title="${esc(r.can ? r.hv : r.whyFull)}">microVM</span>${r.can ? "" : `<span class="val dim ell" title="${esc(r.whyFull)}">${esc(r.why)}</span>`}
     </div>${fr}
     <div class="sum3 body3">
       <div><span class="lbl">Memory</span><span class="v">${ubar(room, `${used.toFixed(1)}/${r.memG}G`, 56)}</span></div>
@@ -130,10 +118,9 @@ function vmRow(v, r) {
 
 /* ------------------------------------------------------------ render, act */
 function render() {
-  const mv = R.filter((r) => r.engine === "microvm").length, vms = R.reduce((a, r) => a + r.vms.length, 0);
-  mockChip(`<span class="sg3" role="group" aria-label="View as">${[["owner", "Owner"], ["viewer", "Viewer"]].map(([v, l]) => `<button data-do="as" data-v="${v}" aria-pressed="${S.owner === (v === "owner")}">${l}</button>`).join("")}</span>`);
+  const mv = R.filter((r) => r.can).length, vms = R.reduce((a, r) => a + r.vms.length, 0);
   $("#page").innerHTML = `${mockBar("runners")}
-    <div class="title3"><h1>Fleet</h1><span class="right"><span class="kv3">${blocks(mv, R.length, "#3987e5", `${mv} of ${R.length} runners run microVMs; ${R.length - mv} run on the host`)}<span class="val">${mv}/${R.length}</span><span class="lbl">microVM</span></span><span class="kv3"><span class="val">${vms}</span><span class="lbl">VMs</span></span></span></div>
+    <div class="title3"><h1>Fleet</h1><span class="right"><span class="kv3">${blocks(mv, R.length, "#3987e5", `${mv} of ${R.length} runners can run microVMs`)}<span class="val">${mv}/${R.length}</span><span class="lbl">microVM</span></span><span class="kv3"><span class="val">${vms}</span><span class="lbl">VMs</span></span></span></div>
     <div class="card3">
       <table class="t3">${th3(FLEET())}<tbody>${R.map(fleetRow).join("")}</tbody></table></div>`;
   liveScan(); fitMiddle();
@@ -150,26 +137,12 @@ function vmDo(id, what, el) {
   const was = v.state;
   press(el, 450, () => { v.state = next; if (next === "paused") toast(`Paused ${v.agent}`, () => { v.state = was; render(); }); if (next === "start") setTimeout(() => { v.state = "run"; v.up = "0s"; render(); }, 1100); render(); const at = $(`[data-peek="vm:${id}"]`); if ($("#peek3") && at) peekAt(at); else $("#peek3")?.remove(); });
 }
-function switchTo(r, to) {
-  if (!r.vms.filter((v) => v.state !== "stopped").length) { r.engine = to; if (to === "host") r.pools = []; render(); return; }
-  S.moving[r.id] = { to, left: r.vms.filter((v) => v.state !== "stopped").map((v) => v.id) }; render();
-  const tick = () => { const m = S.moving[r.id]; if (!m) return; const id = m.left.shift(); const v = r.vms.find((x) => x.id === id); if (v) v.state = "stopped"; if (!m.left.length) { delete S.moving[r.id]; r.engine = to; if (to === "host") r.pools = []; r.vms = r.vms.filter((x) => x.state !== "stopped"); } render(); if (S.moving[r.id]) setTimeout(tick, 9000); };
-  setTimeout(tick, 9000);
-}
 document.addEventListener("click", (e) => {
   const b = e.target.closest("[data-do]");
   const row = e.target.closest("tr.pick");
-  if (!b && row && !e.target.closest("button,a,input,select,[data-peek]")) { S.asking = null; S.open = S.open === row.dataset.r ? null : row.dataset.r; setOpen(S.open, render); return; }
+  if (!b && row && !e.target.closest("button,a,input,select,[data-peek]")) { S.open = S.open === row.dataset.r ? null : row.dataset.r; setOpen(S.open, render); return; }
   if (!b || b.closest("#peek3")) return;
   const d = b.dataset.do, r = R.find((x) => x.id === b.dataset.r);
-  if (d === "as") { S.owner = b.dataset.v === "owner"; S.asking = null; render(); return; }
-  if (d === "engine") { if (b.dataset.e !== r.engine) { S.asking = r.id; render(); } return; }
-  if (d === "noswitch") { S.asking = null; render(); return; }
-  if (d === "switch") { press(b, 500, () => { S.asking = null; switchTo(r, r.engine === "microvm" ? "host" : "microvm"); }); return; }
-  if (d === "askend") { S.ending = r.id; render(); return; }
-  if (d === "noend") { S.ending = null; render(); return; }
-  if (d === "cancel") { delete S.moving[r.id]; r.vms.forEach((v) => { if (v.state === "drain") v.state = "run"; }); render(); return; }
-  if (d === "endnow") { press(b, 600, () => { const m = S.moving[r.id]; delete S.moving[r.id]; S.ending = null; r.engine = m.to; r.vms = []; if (m.to === "host") r.pools = []; render(); }); return; }
   if (d === "drain" || d === "resume") { press(b, 400, () => { r.draining = d === "drain"; if (r.draining) toast(`Draining ${r.name}`, () => { r.draining = false; render(); }); render(); }); return; }
   if (d === "rmore") { menu(b, [{ icon: "terminal", label: "Terminal", run: () => {} }, { icon: "chart", label: "Insights", run: () => {} }, { icon: "trash", label: "Forget", danger: true, run: () => { S.forget = r.id; S.open = r.id; render(); } }]); return; }
   if (d === "forget") { press(b, 500, () => { R.splice(R.indexOf(r), 1); S.forget = null; S.open = null; setOpen(null, render); }); return; }
@@ -204,7 +177,6 @@ peekAct = (id, what, el) => { const [kind, x] = id.split(":"); if (kind === "vm"
 paletteItems = () => fromOps([
   ["sessions.pause", "reviewer · adas-mac-studio-3.local", () => { const [v] = VM("v3"); v.state = "paused"; render(); }, "MicroVMs"],
   ["sessions.restart", "pr-triage · adacachy2", () => { const [v] = VM("v7"); v.state = "run"; render(); }, "MicroVMs"],
-  ["runners.engine", "adas-mac-studio.local → host", () => { S.open = "cec3"; S.asking = "cec3"; setOpen("cec3", render); }, "Runners"],
   ["runners.drain", "adacachy2", () => { R.find((r) => r.id === "00aa").draining = true; render(); }, "Runners"],
   ["images.build", "rust-dev v9 · adacachy2", () => { S.building = true; S.open = "00aa"; setOpen("00aa", render); }, "Images"],
   ["agentdefs.run", "reviewer", () => { location.href = "agents.html?open=reviewer"; }, "Agents"],
