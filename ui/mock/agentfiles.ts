@@ -224,7 +224,7 @@ interface Build {
   took_s: number | null;
   at: number | null;
   step: [number, number] | null;
-  /** Shards' words when it refused or failed; kiln's when a runner doesn't build (can't run microVMs, runs on the host). */
+  /** Shards' words when it refused or failed; kiln's when a runner doesn't build (it can't run microVMs). */
   why: string | null;
   /** While a newer one isn't built: the version its sessions there still start from. */
   serving: number | null;
@@ -234,7 +234,7 @@ const RUNNERS: { runner: string; platform: "linux/amd64" | "linux/arm64" | null;
   { runner: "metal-ryzen-01", platform: "linux/amd64", why: null },
   { runner: "metal-epyc-01", platform: "linux/amd64", why: null },
   { runner: "9c4e2f7a1b8d43c6a0e5f2b7d1c8a4e3", platform: "linux/arm64", why: null },
-  { runner: "metal-ryzen-02", platform: null, why: "runs sessions on the host" },
+  { runner: "metal-ryzen-02", platform: null, why: "can't run microVMs" },
   { runner: "metal-pi-04", platform: null, why: "can't run microVMs" },
 ];
 const G = 2 ** 30;

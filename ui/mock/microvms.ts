@@ -1,10 +1,9 @@
 /**
- * Runners' engines and the sandboxes their sessions run in (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
- * P2.3, P3.2), every harness session of the mock's own given one, so each row and each agent page has
- * its sandbox:
+ * Runners' microVMs and the sandboxes their sessions run in (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
+ * P3.2), every harness session of the mock's own given one, so each row and each agent page has its
+ * sandbox:
  *
- *   GET  /api/microvm/runners/:name               its microVMs, its warm pools, the images built there, its Hex node's room
- *                                                 (a proposal: a runner's engine is the server's GET /api/runners/:name/engine, engine.ts)
+ *   GET  /api/microvm/runners/:name               its microVMs, its warm pools, the images built there, its Hex node's room (a proposal)
  *   GET  /api/microvm/sessions                    every session's sandbox, in short: engine, runner, start, state, CPU and memory now
  *   GET  /api/microvm/sessions/:id                one session's sandbox: its Hex box, its Shards microVM, grants, volumes, secret names, pool, telemetry
  *   POST /api/microvm/sessions/:id/:act           pause | resume | restart | stop its microVM
@@ -24,9 +23,8 @@ interface Ctx {
 
 const G = 2 ** 30;
 /**
- * The Hex node's room on each runner whose agents run in microVMs: what its keeper says is free of its
- * memory and vCPUs. Not a route of the server's yet (a proposal, as `GET /api/microvm/runners/:name`
- * carries it): a runner's engine is `GET /api/runners/:name/engine` (engine.ts).
+ * The Hex node's room on each runner that runs microVMs: what its keeper says is free of its memory and
+ * vCPUs. Not a route of the server's yet (a proposal, as `GET /api/microvm/runners/:name` carries it).
  */
 const ROOMS: Record<string, { memory_free: number; memory_total: number; vcpus_free: number; vcpus_total: number }> = {
   [MAC_MINI]: { memory_free: 21 * G, memory_total: 32 * G, vcpus_free: 7, vcpus_total: 10 },
@@ -171,16 +169,16 @@ const AT: [string, string, string, Kind, number, number, VmState, number, number
   ["tree-s2", "metal-epyc-01", "codex", "template", 652, 2200, "running", 47, 1.8],
   ["rev-big", "metal-epyc-01", "claude", "warm", 221, 4100, "idle", 2, 2.0],
 ];
-/** Sessions on the host, and why: the runner's engine, or a project that asks for the host there. */
-const ON_HOST: [string, string, string, number, number, string | null][] = [
-  // session · runner · harness · CPU % now · memory used (GiB) · the project that asked for the host
-  ["fam-docs", "metal-ryzen-02", "claude", 3, 0.7, null],
-  ["fan-s4", "metal-ryzen-02", "claude", 29, 1.6, null],
-  ["sub-done", "metal-ryzen-02", "claude", 1, 0.5, null],
-  ["tree-s3", "metal-ryzen-02", "claude", 33, 1.8, null],
-  ["tree-s3a", "metal-ryzen-02", "claude", 2, 0.6, null],
-  ["run-freeze", "metal-ryzen-01", "claude", 1, 0.6, "hyper-light/kiln"],
-  ["rev-mode", "adas-macbook-pro-2.local", "claude", 6, 0.9, null],
+/** Sessions on the host, each as its start chose (the person's decision, 2026-11-23: Host or microVM, per session). */
+const ON_HOST: [string, string, string, number, number][] = [
+  // session · runner · harness · CPU % now · memory used (GiB)
+  ["fam-docs", "metal-ryzen-02", "claude", 3, 0.7],
+  ["fan-s4", "metal-ryzen-02", "claude", 29, 1.6],
+  ["sub-done", "metal-ryzen-02", "claude", 1, 0.5],
+  ["tree-s3", "metal-ryzen-02", "claude", 33, 1.8],
+  ["tree-s3a", "metal-ryzen-02", "claude", 2, 0.6],
+  ["run-freeze", "metal-ryzen-01", "claude", 1, 0.6],
+  ["rev-mode", "adas-macbook-pro-2.local", "claude", 6, 0.9],
 ];
 /** Ended: its microVM stopped with it. */
 const ENDED: Record<string, { runner: string; harness: string; kind: Kind; ms: number }> = { "tree-s5": { runner: "metal-ryzen-01", harness: "claude", kind: "template", ms: 620 } };
@@ -372,12 +370,12 @@ function detail(session: string) {
   }
   const h = ON_HOST.find((x) => x[0] === session);
   if (h) {
-    const [, , harness, cpu, used, project] = h;
+    const [, , harness, cpu, used] = h;
     const seed = 97 + session.length * 7;
     const reach = reachOf(session, harness, sessionDef(session)?.agent ?? harness, sessionDef(session)?.agentfile ?? `harness-${harness}`, true);
     return {
       ...b,
-      why: project ? `${project} asks for the host here` : "its owner's choice",
+      why: "chosen as it started",
       up_s: 3000,
       process: { harness, pid: 40000 + (parseInt(hex6(session), 16) % 20000), user: "kiln" },
       hex: null,
@@ -467,16 +465,6 @@ export function sessionOf(id: string): { engine: "microvm" | "host"; harness: st
   if (!b || b.state === "ended") return null;
   const harness = AT.find((a) => a[0] === id)?.[2] ?? ON_HOST.find((h) => h[0] === id)?.[2] ?? "claude";
   return { engine: b.engine, harness, name: id };
-}
-
-/** The sessions on runner `name`, each in a microVM or not, running or not: its engine's view counts them (engine.ts). */
-export function sessionsOn(name: string): { id: string; kind: string; microvm: boolean; running: boolean }[] {
-  const all = [...AT.map((a) => a[0]), ...ON_HOST.map((h) => h[0])];
-  return all.flatMap((id) => {
-    const b = brief(id);
-    const kind = AT.find((a) => a[0] === id)?.[2] ?? ON_HOST.find((h) => h[0] === id)?.[2] ?? "claude";
-    return b && b.runner === name ? [{ id, kind, microvm: b.engine === "microvm", running: b.state !== "ended" }] : [];
-  });
 }
 
 /** Handles the routes above; false when it doesn't know the route. */

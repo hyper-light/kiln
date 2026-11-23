@@ -1,6 +1,6 @@
 /**
  * kiln's operations in the mock (`GET /api/ops`, docs/ci.md W20-R01), as the server lists them: the
- * ones of the agents, runners, sandboxes, secrets and confirmations the UI's surfaces do, each with its
+ * ones of the agents, sandboxes, secrets and confirmations the UI's surfaces do, each with its
  * name, summary and flags as the server's registry has them (crates/kiln/src: agentdefs/ops.rs,
  * doctor.rs, secrets/mine.rs, harness/overrides.rs, confirms.rs). The real list has every operation;
  * the command palette makes entries only of those it knows where to do.
@@ -70,22 +70,6 @@ const OPS = [
     name: "agentdefs.run",
     summary:
       "Run one of your agent definitions: an agent started as agents.start starts one, with its harness and model, in a microVM of its own made from its Agentfile (its harness's own where it names none), first told its instructions and then your `prompt`; `on` and `cwd` as agents.start takes them, `name` its name (by default the definition's). Answers as agents.start does, with the definition's id and version (`agentdef`).",
-    read_only: false,
-    destructive: false,
-    input: { type: "object" },
-  },
-  {
-    name: "runners.engine",
-    summary:
-      "How a runner runs new agent sessions, its engine: `host` (each a process on the machine, no microVM) or `microvm` (each in a Shards microVM of its own, through Hex); where that comes from (its owner set it, or what the runner can do: `microvm` where it can hold microVMs, else `host`) and why; whether it can hold microVMs now and why not; its isolation facts; and how many of its sessions run on its engine and how many on the other, which finish there (`draining`).",
-    read_only: true,
-    destructive: false,
-    input: { type: "object" },
-  },
-  {
-    name: "runners.engine.set",
-    summary:
-      "Set how a runner runs new agent sessions: `host` or `microvm`, or null for what it can do (`microvm` where it can hold microVMs, else `host`). `microvm` is refused, saying why, where the runner can't hold microVMs now. Nothing running stops: its sessions on the other engine finish there, and new sessions take the new one.",
     read_only: false,
     destructive: false,
     input: { type: "object" },

@@ -92,7 +92,6 @@ export function setPaletteOpen(open: boolean) {
  */
 function opPlace(name: string, agent: string | null): { group: string; to: string; icon: React.ReactNode } | null {
   if (name.startsWith("agentdefs.")) return { group: "Agents", to: agent ? `/agents/${agent}?tab=engine` : "/agents", icon: <Bot size={15} /> };
-  if (name.startsWith("runners.engine")) return { group: "Runners", to: "/runners", icon: <Server size={15} /> };
   if (name.startsWith("sessions.")) return { group: "Engine", to: agent ? `/agents/${agent}?tab=engine` : "/agents", icon: <Box size={15} /> };
   if (name.startsWith("secrets.mine.")) return { group: "Your secrets", to: "/settings#secrets.mine", icon: <KeyRound size={15} /> };
   if (name.startsWith("confirms.")) return { group: "Confirms", to: agent ? `/agents/${agent}` : "/agents", icon: <CircleCheck size={15} /> };

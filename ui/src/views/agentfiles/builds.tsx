@@ -38,7 +38,7 @@ const short = (digest: string) => digest.replace(/^sha256:/, "").slice(0, 8);
 const STATUS: Record<AgentfileBuild["state"], string> = { built: "succeeded", building: "running", queued: "queued", failed: "failed", none: "skipped" };
 const WORD: Record<AgentfileBuild["state"], string> = { built: "Built", building: "Building", queued: "Queued", failed: "Refused", none: "Not built here" };
 /** Why a runner doesn't build, in a word or two (its whole reason in the title). */
-const whyShort = (why: string | null) => (!why ? "not built" : /host/.test(why) ? "host engine" : /microVM/i.test(why) ? "no microVMs" : /old|upgrade/.test(why) ? "kiln too old" : "not built");
+const whyShort = (why: string | null) => (!why ? "not built" : /microVM/i.test(why) ? "no microVMs" : /old|upgrade/.test(why) ? "kiln too old" : "not built");
 
 type Change = (fn: (prev: AgentfileBuilds) => AgentfileBuilds) => void;
 
@@ -384,7 +384,11 @@ function SourcePicker({ s, text, onWrite, onCancel }: { s: AgentfileSource; text
         </label>
       )}
       {slots.length > 0 ? (
-        <React.Suspense fallback={slots.map((x) => <SecretPickHold key={x.role} slot={x} />)}>
+        <React.Suspense
+          fallback={slots.map((x) => (
+            <SecretPickHold key={x.role} slot={x} />
+          ))}
+        >
           <SecretPicks slots={slots} chosen={chosen} onChoose={(role, name) => setChosen((c) => ({ ...c, [role]: name }))} />
         </React.Suspense>
       ) : (

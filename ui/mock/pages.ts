@@ -1448,9 +1448,9 @@ function agentLimit(a: Agent): AgentLimitView {
 const POOL_KEEP_MS = 10 * 60_000;
 
 /**
- * The warm pools kiln names on a runner (`GET /api/runners/:name/pools`; kiln plan 01a1dd2e…, P3.2): on the one that
- * starts microVMs, an agent definition's with hits, its deployment experiment's variant's, and another person's agent's,
- * of which nothing is said; none elsewhere.
+ * The warm pools kiln names on a runner (`GET /api/runners/:name/pools`; kiln plan 01a1dd2e…, P3.2): on each that runs
+ * microVMs, an agent definition's with hits, its deployment experiment's variant's, and another person's agent's, of
+ * which nothing is said; none elsewhere.
  */
 function warmPools(a: Agent): WarmPoolsView {
   const at = Date.now();
@@ -1709,7 +1709,7 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
       const n = (await ctx.body<{ max_sessions?: unknown }>(req)).max_sessions;
       if (n === null) agentLimits.delete(a.name);
       else if (typeof n === "number" && Number.isInteger(n) && n >= 1 && n <= 4096) agentLimits.set(a.name, n);
-      else return (err(res, 400, "expected {\"max_sessions\": n}, or {\"max_sessions\": null} for its config's"), true);
+      else return (err(res, 400, 'expected {"max_sessions": n}, or {"max_sessions": null} for its config\'s'), true);
       ctx.emit?.({ type: "agent_limit", runner: a.name });
     }
     return (json(res, 200, agentLimit(a)), true);
@@ -1836,11 +1836,24 @@ export async function handlePages(req: http.IncomingMessage, res: http.ServerRes
       created_at: number;
       updated_at: number;
     };
-    const holds = (r: Kept) => !words || [r.question, ...r.findings.flatMap((f) => [f.claim, ...f.cites.map((c) => c.quote ?? "")]), ...r.sources.flatMap((x) => [x.title, x.locator])].some((t) => t.toLowerCase().includes(words));
+    const holds = (r: Kept) =>
+      !words ||
+      [r.question, ...r.findings.flatMap((f) => [f.claim, ...f.cites.map((c) => c.quote ?? "")]), ...r.sources.flatMap((x) => [x.title, x.locator])].some((t) => t.toLowerCase().includes(words));
     const all = (Object.values(RESEARCH) as Kept[]).filter((r) => (!agent || r.agent === agent) && (!plan || r.plan === plan) && holds(r)).sort((x, y) => y.updated_at - x.updated_at);
     const brief = (r: Kept) => {
       const ranked = [...r.findings].sort((x, y) => y.confidence.score - x.confidence.score);
-      return { id: r.id, question: r.question, agent: r.agent ?? null, by: r.by, plan: r.plan ?? null, summary: r.summary, grades: ranked.map((f) => f.confidence.grade), best: ranked[0]?.claim ?? null, created_at: r.created_at, updated_at: r.updated_at };
+      return {
+        id: r.id,
+        question: r.question,
+        agent: r.agent ?? null,
+        by: r.by,
+        plan: r.plan ?? null,
+        summary: r.summary,
+        grades: ranked.map((f) => f.confidence.grade),
+        best: ranked[0]?.claim ?? null,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+      };
     };
     return (void json(res, 200, { research: url.searchParams.get("brief") === "1" ? all.map(brief) : all }), true);
   }

@@ -2,7 +2,8 @@
  * P3.2 (kiln plan 01a1dd2e…; docs/isolation.md, "Warm pools"): a runner that starts microVMs shows the warm pools kiln
  * names on it in its details, in the production build against the mock's Mac mini: each pool's agent (its definition's
  * name, a deployment experiment's variant after it, and nothing of another person's agent), its size, its hits and
- * when it's let go. A runner that starts none has no such list. Nothing scrolls sideways. On a desktop and a phone.
+ * when it's let go. A runner that runs none (the mock's metal-ryzen-02) has no such list. Nothing scrolls sideways. On a
+ * desktop and a phone.
  */
 import { expect, test, type Page } from "@playwright/test";
 import { MAC_MINI } from "../mock/data.ts";
@@ -56,12 +57,12 @@ test("a runner's details show each warm pool's agent, size and hits", async ({ p
   await page.screenshot({ path: info.outputPath(`warm-pools-${info.project.name}.png`), fullPage: true });
 });
 
-test("a runner that starts no microVMs has no warm pools", async ({ page }) => {
+test("a runner that runs no microVMs has no warm pools", async ({ page }) => {
+  // Its facts say it runs none (ui/mock/data.ts MICROVM_RUNNERS), so its details have no warm pools.
+  const name = "metal-ryzen-02";
   await page.goto("/runners");
-  const other = rows(page).filter({ hasNotText: LABEL }).first();
-  const name = (await other.getAttribute("data-href")) ?? "";
-  await other.click();
-  await expect(page).toHaveURL(/[?&]agent=/);
-  await expect(page.getByRole("region", { name: /in depth$/ })).toBeVisible();
+  await rows(page).filter({ hasText: name }).click();
+  await expect(page).toHaveURL(new RegExp(`[?&]agent=${name}(&|$)`));
+  await expect(details(page, name)).toBeVisible();
   await expect(page.getByRole("list", { name: /^Warm pools on / }), `no warm pools on ${name}`).toHaveCount(0);
 });

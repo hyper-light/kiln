@@ -38,7 +38,7 @@ test("P4.5: its image on each runner, building step by step, refused in Shards' 
       .getByRole("meter", { name: /^Step \d of 9$/ }),
   ).toBeVisible();
   await expect(builds.getByRole("listitem").filter({ hasText: "metal-mac-mini" })).toContainText("queued");
-  await expect(builds.getByRole("listitem").filter({ hasText: "metal-ryzen-02" })).toContainText("host engine");
+  await expect(builds.getByRole("listitem").filter({ hasText: "metal-ryzen-02" })).toContainText("no microVMs");
   await expect(builds.getByRole("listitem").filter({ hasText: "metal-pi-04" })).toContainText("no microVMs");
   const epyc = builds.getByRole("listitem").filter({ hasText: "metal-epyc-01" });
   await expect(epyc).toContainText("refused");

@@ -36,7 +36,7 @@ const HARNESSES = [
   ["pi", "Pi"],
 ] as const;
 
-/** The mock's one machine that starts microVMs (ui/mock/data.ts MICROVM_RUNNERS), running Claude Code and Codex (ui/mock/machines.ts). */
+/** A machine of the mock's that runs microVMs (ui/mock/data.ts MICROVM_RUNNERS), running Claude Code and Codex (ui/mock/machines.ts). */
 const MOCK_VM = "metal-mac-mini";
 
 const sideways = (page: Page) => page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);

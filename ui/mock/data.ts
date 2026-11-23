@@ -420,11 +420,12 @@ export function stepLog(kind: string, run: string, seed: number, ctx: { repo: st
 export const MAC_MINI = "9c4e2f7a1b8d43c6a0e5f2b7d1c8a4e3";
 
 /**
- * The runners that start microVMs (their facts say `virt.microvm`; kiln plan
- * 01a1cd8e862e7169a074db3d5fa33f3d, step 32): an agent started from an Agentfile goes only to one of
- * these, and is refused anywhere else, as the server refuses it (step 31).
+ * The runners that run microVMs (their facts say `virt.microvm`; kiln plan
+ * 01a1cd8e862e7169a074db3d5fa33f3d, step 32): an agent started in a microVM goes only to one of
+ * these, and is refused anywhere else, as the server refuses it (step 31). Each session picks Host or
+ * microVM (the person's decision, 2026-11-23); metal-ryzen-02 and metal-pi-04 run none, each saying why.
  */
-export const MICROVM_RUNNERS: ReadonlySet<string> = new Set([MAC_MINI]);
+export const MICROVM_RUNNERS: ReadonlySet<string> = new Set([MAC_MINI, "metal-ryzen-01", "metal-epyc-01"]);
 
 /* ---------------------------- discovery (Add machines) ---------------------------- */
 

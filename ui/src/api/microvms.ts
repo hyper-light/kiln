@@ -1,53 +1,12 @@
-/** Runners' engines and their microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2.3, P3.2). */
+/** Runners' microVMs and sessions' sandboxes (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P3.2). */
 import type { Res } from "@/lib/data";
 import { ApiError, request } from "./client";
-import type { ContainerFacts, IsolationFacts, LiveAccess, LiveChange, LiveMember, LivePortKey, LiveProtocol, RunnerEngine, RunnerFacts } from "./wire";
+import type { LiveAccess, LiveChange, LiveMember, LivePortKey, LiveProtocol, RunnerFacts } from "./wire";
 
 const enc = encodeURIComponent;
 
-/** Where a runner's agents run: on its host, each in a microVM, or each in a container on its workspace (docs/agentic.md W9). */
-export type Engine = RunnerEngine;
-
-/**
- * A runner's engine as the server says it (`GET|PUT /api/runners/:name/engine`, crates/kiln/src/harness/engine.rs):
- * the engine it holds (none for a runner that hasn't said what it can do), where that comes from (its owner set it
- * on the server, or what it can do decides) and why it's host where it can't be microvm; what its owner set and how
- * many times; whether it can hold microVMs now and why not; its isolation facts; its sessions on that engine, and
- * those of the other, which finish there (`draining`).
- */
-export interface RunnerEngineView {
-  runner: string;
-  engine: Engine | null;
-  from: "server" | "default" | null;
-  why: string | null;
-  asked: Engine | null;
-  version: number;
-  microvm: { usable: boolean; why: string | null } | null;
-  /** Whether its agents can run in containers now, and why not (W9); none from a server before containers. */
-  container?: { usable: boolean; why: string | null } | null;
-  /** Its container facts (W9): the engine, the image its agents run in, and what it lacks. */
-  containers?: ContainerFacts | null;
-  isolation: IsolationFacts | null;
-  virt: { microvm: boolean; kvm: boolean; hvf: boolean } | null;
-  sessions: number;
-  draining: number;
-  /** Each session that drains: it runs on the engine the runner no longer holds, and finishes there (an agent's children first). */
-  draining_sessions: DrainingSession[];
-  /** The switch they drain for, while any drains: what was set before (null: what it can do), to what, and when. */
-  switch: { from: Engine | null; to: Engine | null; at: number } | null;
-}
-
-/** A session still on the engine its runner switched away from (`runners.engine`'s `draining_sessions`). */
-export interface DrainingSession {
-  id: string;
-  name: string;
-  /** Its harness. */
-  kind: string;
-  /** How it stands, as agents.list's `stand` says. */
-  state: string;
-  engine: Engine;
-  created_at: number;
-}
+/** Where a session runs, as it chose when it started (the person's decision, 2026-11-23): on its machine's host, or in a microVM of its own. */
+export type Engine = "host" | "microvm";
 
 export interface MicroVm {
   id: string;
@@ -108,24 +67,6 @@ export const microvmsApi = {
   runner: (name: string, signal?: AbortSignal) => request<RunnerMicrovms>("GET", `/api/microvm/runners/${enc(name)}`, undefined, { signal }),
 };
 
-/** A runner's engine (the server's routes): read, and set (`null`: what it can do decides). */
-export const engineApi = {
-  get: (name: string, signal?: AbortSignal) => request<RunnerEngineView>("GET", `/api/runners/${enc(name)}/engine`, undefined, { signal }),
-  set: (name: string, engine: Engine | null) => request<RunnerEngineView>("PUT", `/api/runners/${enc(name)}/engine`, { engine }),
-  /** Ends its draining sessions now (`runners.engine.end_draining`; destructive): the view after, and those ended. */
-  endDraining: (name: string) => request<RunnerEngineView & { ended: string[] }>("POST", `/api/runners/${enc(name)}/engine/end`),
-  /** Puts back the setting it had before its switch while its sessions drain (`runners.engine.cancel`). */
-  cancel: (name: string) => request<RunnerEngineView>("POST", `/api/runners/${enc(name)}/engine/cancel`),
-};
-/** One runner's engine, kept current while shown (its sessions finish on the engine they started on). */
-export const runnerEngineRes = (name: string): Res<RunnerEngineView> => ({ key: `runner-engine/${name}`, fetch: (s) => engineApi.get(name, s), opts: { pollMs: 5000 } });
-
-/** Where a runner's facts say its agents run now (`isolation.engine`), whether it can hold microVMs, and why not; none from a runner before engines. */
-export function engineOf(facts: { isolation?: IsolationFacts } | null | undefined): { engine: Engine; can: boolean; why: string | null } | null {
-  const i = facts?.isolation;
-  if (!i) return null;
-  return { engine: i.engine ?? (i.available ? "microvm" : "host"), can: i.available, why: i.why_not };
-}
 export const runnerVmsRes = (name: string): Res<RunnerMicrovms> => ({ key: `microvm/runner/${name}`, fetch: (s) => microvmsApi.runner(name, s), opts: { pollMs: 5000 } });
 
 /**
@@ -195,7 +136,7 @@ export interface SandboxComponent {
   built: (ComponentSource & { version: string }) | null;
 }
 export interface SandboxDetail extends SandboxBrief {
-  /** On the host: why (its runner's owner, a project that asks for the host there, or it can't run microVMs). */
+  /** On the host: why, as kiln says it (its start chose the host). */
   why: string | null;
   up_s: number;
   /** On the host: the harness process it runs as. */
