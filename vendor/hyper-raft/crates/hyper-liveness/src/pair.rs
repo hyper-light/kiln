@@ -607,6 +607,11 @@ impl Pair {
         self.stream.next.map(|(_, due)| due)
     }
 
+    /// The last incarnation accepted from this peer.
+    pub(crate) fn observed_run(&self) -> Option<u64> {
+        self.received.run
+    }
+
     /// Whether the peer's run taken last announced its stop.
     pub(crate) fn stopped(&self) -> bool {
         self.received.stopped

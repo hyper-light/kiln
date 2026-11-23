@@ -5,7 +5,7 @@
 //! (`Stage::Waiting`), handed on at the next change of the session's room ([`Host::admit_waiting`]), never on a timer.
 //! Each sender's messages reach the session in the order they came: one never overtakes its sender's still waiting.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use super::{Host, Lane, Said, inbox, message_of};
@@ -40,11 +40,28 @@ pub(super) struct Waiting {
 /// own waiting ones in its turns.
 pub(super) type ServerMail = HashMap<String, (Vec<String>, Vec<Demand>)>;
 
-/// Most routed messages a session's lane takes in one burst ([`Host::take_routed_burst`]): what waits behind each other
-/// in its lane, taken by its inbox together, so its store syncs them in one commit.
-pub(super) const BURST_MAX: usize = 64;
+pub(super) type Reply = Option<futures::channel::oneshot::Sender<Said>>;
+type Routed = (Command, Option<u64>, Route, Reply);
 
-/// How a routed message goes, decided in its turn ([`Host::plan_routed`]).
+/// Pull another command only after planning the previous one. Arrival of a control during a
+/// store read or receipt hash stops the turn. New data cannot continually extend an existing turn.
+pub(super) fn following<'a>(
+    data: &'a crate::memory::queue::Receiver<Lane>, high: &'a crate::memory::queue::Receiver<Lane>, pending: &'a mut Option<Lane>,
+) -> impl FnMut() -> Option<Routed> + 'a {
+    let mut remaining = data.len();
+    move || {
+        if remaining == 0 || !high.is_empty() { return None; }
+        remaining -= 1;
+        match data.try_recv().ok()? {
+            Lane::Routed { c, epoch, at, route, reply } if route.status.is_none() => {
+                crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
+                Some((*c, epoch, *route, reply))
+            }
+            other => { *pending = Some(other); None }
+        }
+    }
+}
+
 enum Plan {
     /// Refused before its inbox took it: what its sender is told.
     Said(Said),
@@ -65,6 +82,7 @@ struct Take {
     c: Command,
     message: String,
     digest: String,
+    charge: Option<inbox::RoutedCharge>,
     sent_for: u64,
     at: i64,
     route: Route,
@@ -75,14 +93,24 @@ impl Host {
     /// newer one replaces), to the session's lane, after whatever it was told before: its inbox takes it and says so
     /// ([`super::Update::Inbox`]). False when there's no session `id` here, or its lane holds its most (said `full`).
     pub fn command_routed(&self, id: &str, c: Command, epoch: Option<u64>, route: Route) -> bool {
+        self.enqueue_routed(id, c, epoch, route, None)
+    }
+
+    pub(crate) fn command_routed_reply(&self, id: &str, c: Command, epoch: u64, route: Route) -> Option<futures::channel::oneshot::Receiver<Said>> {
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.enqueue_routed(id, c, Some(epoch), route, Some(tx)).then_some(rx)
+    }
+
+    fn enqueue_routed(&self, id: &str, c: Command, epoch: Option<u64>, route: Route, reply: Reply) -> bool {
         let operation = self.archive_lock(id);
         let Some(_guard) = operation.try_lock() else { return false };
         let Some(lane) = self.lanes.lock().get(id).map(|l| l.data.clone()) else { return false };
-        match lane.try_send(Lane::Routed { c: Box::new(c), epoch, at: std::time::Instant::now(), route: Box::new(route) }) {
+        match lane.try_send(Lane::Routed { c: Box::new(c), epoch, at: std::time::Instant::now(), route: Box::new(route), reply }) {
             Ok(()) => true,
-            Err(async_channel::TrySendError::Full(Lane::Routed { c, .. })) => {
-                if let Some((message, _)) = message_of(&c) {
+            Err(async_channel::TrySendError::Full(Lane::Routed { c, reply, .. })) => {
+                if let Some(message) = crate::harness::registry::message_id(&c) {
                     let said = Said { message, answer: Err(inbox::Refusal::Full { session: id.to_owned(), limit: super::LANE }) };
+                    if let Some(reply) = reply { let _ = reply.send(said); return true; }
                     let (sink, id) = (self.sink.clone(), id.to_owned());
                     crate::rt::spawn(async move {
                         let _ = sink.send((id, super::Update::Inbox { said: Box::new(said) })).await;
@@ -111,62 +139,64 @@ impl Host {
         taken
     }
 
-    /// Message `c` routed to session `id` here, in its turn down its lane: taken into custody by the session's own
-    /// inbox and answered, then handed to it now or, while its depth holds it back, kept waiting in its journal.
-    pub(super) async fn take_routed(&self, id: &str, c: Command, epoch: Option<u64>, route: Route) {
-        self.take_routed_burst(id, vec![(c, epoch, route)]).await;
-    }
-
-    /// Messages routed to session `id` here that waited in its lane one behind another (a burst: [`BURST_MAX`] at most,
-    /// none of them a replaceable status), each as [`Host::take_routed`] takes one: decided in the order they came, taken
-    /// by its inbox together (the session's own store syncs what it's given at once in one commit), then handed to it
-    /// and answered in the order they came.
-    pub(super) async fn take_routed_burst(&self, id: &str, burst: Vec<(Command, Option<u64>, Route)>) {
+    /// Plan only work already queued, within the shard’s measured step and the session’s actual
+    /// transaction headroom. A single oversize request gets its normal admission verdict.
+    pub(super) async fn take_routed_burst(&self, id: &str, first: Routed, mut more: impl FnMut() -> Option<Routed> + Send) {
+        let start = std::time::Instant::now();
+        let quantum = hyper_rt::futures::step_budget_ns().map(std::time::Duration::from_nanos);
         let s = self.get(id);
         let input = match (&s, self.inbox.clone()) {
             (Some(s), Some(inbox)) => Some(self.input_of(s, inbox)),
             _ => None,
         };
-        // Senders held back already, or by one of theirs earlier in this burst: theirs wait behind.
-        let mut behind: Vec<String> = Vec::new();
-        let mut plans = Vec::with_capacity(burst.len());
-        for (c, epoch, route) in burst {
-            plans.push(self.plan_routed(id, s.as_ref(), input.as_ref(), c, epoch, route, &mut behind).await);
+        let mut behind = HashSet::new();
+        let mut plans = Vec::new();
+        let mut planned_bytes = 0usize;
+        let mut next = Some(first);
+        while let Some((command, epoch, route, reply)) = next.take() {
+            let mut plan = self.plan_routed(id, s.as_ref(), input.as_ref(), command, epoch, route, &mut behind).await;
+            if let (Some(input), Plan::Take(take)) = (&input, &mut plan) {
+                take.charge = input.inbox.routed_charge(id, &take.message, &take.digest, take.at, &take.lease, &take.c, take.route.status.as_ref()).ok();
+                planned_bytes = planned_bytes.saturating_add(take.charge.as_ref().map_or(usize::MAX, inbox::RoutedCharge::bytes));
+            }
+            plans.push((plan, reply));
+            if quantum.is_some_and(|step| start.elapsed() >= step) || input.as_ref().is_some_and(|i| planned_bytes >= i.physical_headroom()) {
+                break;
+            }
+            next = more();
         }
         let takes = match &input {
             Some(input) => {
-                let take_count = plans.iter().filter(|p| matches!(p, Plan::Take(_))).count();
+                let take_count = plans.iter().filter(|(p, _)| matches!(p, Plan::Take(_))).count();
                 // Materialize the session head once before a multi-message concurrent burst so
                 // parallel takes never collide on `Cond::Absent { HEADS }`.
                 if take_count > 1 && !input.inbox.has_head(id) && let Some(s) = &s {
                     let _ = input.inbox.open(id, s.epoch()).await;
                 }
-                // Run concurrent takes in physical-budget-aware sub-batches so simultaneous
-                // temporary transaction `BufferCharge`s never exceed available headroom and fail
-                // with "inbox transaction has no physical byte authority", while still group-
-                // committing the full burst in one fsync whenever headroom permits.
+                // Re-read actual headroom before submitting. Another session may have taken
+                // room since planning, or this turn’s last request may need an entire commit.
                 let mut out: Vec<Option<Result<inbox::Answer, inbox::Refusal>>> = Vec::with_capacity(plans.len());
                 let mut idx = 0usize;
                 while idx < plans.len() {
-                    let avail = input.physical_headroom() / 2;
+                    let avail = input.physical_headroom();
                     let mut end = idx;
-                    let mut batch_est = 0usize;
+                    let mut bytes = 0usize;
                     let mut batch_takes = 0usize;
                     while end < plans.len() {
-                        if let Some(Plan::Take(take)) = plans.get(end) {
-                            let est = take.lease.bytes.saturating_mul(4).saturating_add(4096);
-                            if batch_takes > 0 && batch_est.saturating_add(est) > avail {
+                        if let Some((Plan::Take(take), _)) = plans.get(end) {
+                            let charge = take.charge.as_ref().map_or(usize::MAX, inbox::RoutedCharge::bytes);
+                            if batch_takes > 0 && bytes.saturating_add(charge) > avail {
                                 break;
                             }
-                            batch_est = batch_est.saturating_add(est);
+                            bytes = bytes.saturating_add(charge);
                             batch_takes = batch_takes.saturating_add(1);
                         }
                         end = end.saturating_add(1);
                     }
                     let slice = plans.get(idx..end).unwrap_or_default();
-                    let batch = futures::future::join_all(slice.iter().map(|plan| async move {
+                    let batch = futures::future::join_all(slice.iter().map(|(plan, _)| async move {
                         match plan {
-                            Plan::Take(take) => Some(input.inbox.accept_routed(id, &take.message, &take.digest, take.sent_for, take.at, &take.lease, &take.c, take.lease.bytes, take.route.status.as_ref(), input).await),
+                            Plan::Take(take) => Some(input.inbox.accept_priced_routed(id, &take.message, &take.digest, take.sent_for, take.at, &take.lease, &take.c, take.lease.bytes, take.route.status.as_ref(), input, take.charge.as_ref()).await),
                             _ => None,
                         }
                     }))
@@ -178,8 +208,8 @@ impl Host {
             }
             None => plans.iter().map(|_| None).collect(),
         };
-        for (plan, taken) in plans.into_iter().zip(takes) {
-            match (plan, taken, &s, &input) {
+        for ((plan, reply), taken) in plans.into_iter().zip(takes) {
+            let said = match (plan, taken, &s, &input) {
                 (Plan::Take(take), Some(answer), Some(s), Some(input)) => {
                     let Take { lease, hand, reserved, c, message, route, .. } = *take;
                     match (&answer, hand) {
@@ -201,18 +231,24 @@ impl Host {
                             }
                         }
                     }
-                    self.say(id, Said { message, answer }).await;
+                    Some(Said { message, answer })
                 }
-                (Plan::Said(said), _, _, _) => self.say(id, said).await,
+                (Plan::Said(said), _, _, _) => Some(said),
                 (Plan::Unchecked { c, epoch }, _, Some(s), _) => {
-                    if let Some(said) = super::take_message(None, id, Some(&**s), *c, epoch, self.clock.unix_ms()).await {
-                        self.say(id, said).await;
-                    }
+                    super::take_message(None, id, Some(&**s), *c, epoch, self.clock.unix_ms()).await
                 }
                 (Plan::Command(c), _, Some(s), _) => {
                     s.command(*c);
+                    None
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(said) = said {
+                if let Some(reply) = reply {
+                    let _ = reply.send(said);
+                } else {
+                    self.say(id, said).await;
+                }
             }
         }
     }
@@ -221,7 +257,7 @@ impl Host {
     /// its inbox has it (its admission let it in), or kept waiting in the session's journal (held back, or behind one of
     /// its sender's: `behind`, which a sender held back joins).
     #[allow(clippy::too_many_arguments, reason = "one routed message's decision: the session, its admission, the message, the epoch it was sent for, its route, and the senders held back in its burst")]
-    async fn plan_routed(&self, id: &str, s: Option<&Arc<Session>>, input: Option<&Input>, c: Command, epoch: Option<u64>, route: Route, behind: &mut Vec<String>) -> Plan {
+    async fn plan_routed(&self, id: &str, s: Option<&Arc<Session>>, input: Option<&Input>, c: Command, epoch: Option<u64>, route: Route, behind: &mut HashSet<String>) -> Plan {
         let Some((message, digest)) = message_of(&c) else {
             // Routed, but no message: on to the session as any command.
             return Plan::Command(Box::new(c));
@@ -260,13 +296,13 @@ impl Host {
             // Held back (its depth, another sender's turn, its room, a restore under way), or behind its sender's.
             _ => {
                 if !behind.contains(&route.sender) {
-                    behind.push(route.sender.clone());
+                    behind.insert(route.sender.clone());
                 }
                 (Lease { message: message.clone(), peer: route.sender.clone(), epoch: here, bytes, stage: Stage::Waiting, token: None, handoff: None }, false, false)
             }
         };
         let lease = if hand { Lease { stage: Stage::InboxAccepted, ..lease } } else { lease };
-        Plan::Take(Box::new(Take { lease, hand, reserved, c, message, digest, sent_for, at, route }))
+        Plan::Take(Box::new(Take { lease, hand, reserved, c, message, digest, charge: None, sent_for, at, route }))
     }
 
     /// Session `s`'s admission, made as it's first needed (its depth starting where its own was).
@@ -604,6 +640,25 @@ mod tests {
     }
 
     #[test]
+    fn cp_t3_2_each_routed_call_owns_its_receipt_even_when_a_retry_is_cancelled() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let f = fixture().await?;
+            let route = Route::new("local", "user:ada");
+            let accepted = f.route(send("one", "body"), route.clone()).await??;
+            let ask = |text| f.host.command_routed_reply(&f.id, send("one", text), f.s.epoch(), route.clone())
+                .ok_or_else(|| anyhow::anyhow!("session lane unavailable"));
+            drop(ask("body")?);
+            let wrong = ask("different")?;
+            let same = ask("body")?;
+            let (wrong, same) = futures::join!(wrong, same);
+            anyhow::ensure!(matches!(wrong?.answer, Err(inbox::Refusal::Reused { .. })));
+            let repeat = same?.answer?;
+            anyhow::ensure!(repeat.repeat && repeat.seq == accepted.seq);
+            Ok(())
+        })
+    }
+
+    #[test]
     fn a_persons_routed_message_is_taken_by_its_sessions_inbox_and_handed_on_at_once() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let f = fixture().await?;
@@ -674,6 +729,37 @@ mod tests {
 
     /// A burst routed to one session (what waits in its lane is taken together, its store syncing the takes at once)
     /// reaches it whole and in the order it was sent, each message taken once.
+    #[test]
+    fn cp_t3_2_urgent_control_preempts_a_live_routed_backlog_and_new_arrivals_wait_one_turn() -> anyhow::Result<()> {
+        use super::Lane;
+        let (data, rx) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, super::super::LANE);
+        let (controls, high) = crate::memory::queue::places(&crate::memory::owners::CHANNELS, super::super::CONTROL_LANE);
+        let request = |id: &str| Lane::Routed {
+            c: Box::new(send(id, id)), epoch: Some(1), at: std::time::Instant::now(),
+            route: Box::new(Route::new("here", "user:test")), reply: None,
+        };
+        data.try_send(request("a")).map_err(|_| anyhow::anyhow!("closed data queue"))?;
+        data.try_send(request("b")).map_err(|_| anyhow::anyhow!("closed data queue"))?;
+        let mut pending = None;
+        {
+            let mut more = super::following(&rx, &high, &mut pending);
+            assert!(matches!(more(),Some((Command::Send{id,..},..)) if id=="a"));
+            controls.try_send(Lane::Admit).map_err(|_| anyhow::anyhow!("closed control queue"))?;
+            assert!(more().is_none(), "a control that arrived during planning must end this burst");
+            assert_eq!(rx.len(), 1);
+        }
+        assert!(matches!(high.try_recv(), Ok(Lane::Admit)));
+        {
+            let mut more = super::following(&rx, &high, &mut pending);
+            data.try_send(request("c")).map_err(|_| anyhow::anyhow!("closed data queue"))?;
+            assert!(matches!(more(),Some((Command::Send{id,..},..)) if id=="b"));
+            assert!(more().is_none(), "new input cannot extend an in-flight turn indefinitely");
+        }
+        assert_eq!(rx.len(), 1);
+        assert!(pending.is_none());
+        Ok(())
+    }
+
     #[test]
     fn a_burst_routed_to_a_session_reaches_it_once_each_in_the_order_sent() -> anyhow::Result<()> {
         crate::rt::block_on(async {

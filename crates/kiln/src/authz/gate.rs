@@ -369,33 +369,14 @@ pub async fn user_may(hub: &Hub, id: &str, capability: &str, target: &Scope) -> 
     hub.store.read(move |c| Ok(user_rights(c, &id)?.is_some_and(|(_, r)| r.allows(&capability, &target)))).await.unwrap_or(false)
 }
 
-/// Cached authz state invalidated immediately whenever `users`, `tokens`, `grants` or `roles`
-/// commit a write (`Store::changes()`), plus per-token debounced `last_used_at` tracking.
-struct HasUsersCache {
-    store_ptr: usize,
-    rev: u64,
-    value: bool,
-}
-
-fn has_users_cache() -> &'static crate::rcu::Rcu<Option<HasUsersCache>> {
-    static C: std::sync::OnceLock<crate::rcu::Rcu<Option<HasUsersCache>>> = std::sync::OnceLock::new();
-    C.get_or_init(Default::default)
-}
-
-/// Whether anyone but the owner can sign in here.
+/// A read failure keeps sign-in enabled. A Hub cannot reuse another database's cached verdict.
 pub async fn has_users(hub: &Hub) -> bool {
-    let store_ptr = std::ptr::from_ref(hub.store.changes()) as usize;
     let rev = hub.store.changes().of(&["users"]);
-    if let Some(hit) = has_users_cache().load().as_ref().as_ref().filter(|c| c.store_ptr == store_ptr && c.rev == rev) {
-        return hit.value;
-    }
-    let val = hub
-        .store
-        .read(|c| Ok(c.prepare_cached("SELECT EXISTS(SELECT 1 FROM users WHERE disabled_at IS NULL)")?.query_row([], |r| r.get::<_, bool>(0))?))
-        .await
-        .unwrap_or(true);
-    has_users_cache().set(Some(HasUsersCache { store_ptr, rev, value: val }));
-    val
+    if let Some((seen, value)) = hub.token_cache.lock().users && seen == rev { return value; }
+    let read = hub.store.read(|c| Ok(c.prepare_cached("SELECT EXISTS(SELECT 1 FROM users WHERE disabled_at IS NULL)")?.query_row([], |r| r.get::<_, bool>(0))?)).await;
+    let Ok(value) = read else { return true };
+    if hub.store.changes().of(&["users"]) == rev { hub.token_cache.lock().users = Some((rev, value)); }
+    value
 }
 
 /// Custom roles, by name.
@@ -437,60 +418,58 @@ struct CachedToken {
     last_used_recorded: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
-#[derive(Default, Clone)]
-struct TokenCache {
-    store_ptr: usize,
-    rev: u64,
+#[derive(Default)]
+pub(crate) struct TokenCache {
+    revision: i64,
+    users: Option<(u64, bool)>,
     entries: HashMap<String, CachedToken>,
+    bytes: usize,
+    usage: HashMap<String, i64>,
+    flushing_usage: bool,
 }
 
-const TOKEN_CACHE_MAX: usize = 4096;
-const LAST_USED_DEBOUNCE_S: i64 = 60;
-
-fn token_cache() -> &'static crate::rcu::Rcu<TokenCache> {
-    static C: std::sync::OnceLock<crate::rcu::Rcu<TokenCache>> = std::sync::OnceLock::new();
-    C.get_or_init(Default::default)
+impl CachedToken {
+    fn bytes(&self, hash: &str) -> usize {
+        let mut n = hash.len() + std::mem::size_of::<(String, Self)>() + self.caller.name.capacity();
+        n += [&self.caller.user, &self.caller.token, &self.caller.agent].into_iter().flatten().map(String::capacity).sum::<usize>();
+        for rights in [&self.caller.rights, &self.caller.limit].into_iter().flatten() {
+            n += rights.grants.capacity() * std::mem::size_of::<Grant>();
+            for g in &rights.grants {
+                n += g.what.capacity() + match &g.scope {
+                    Scope::Server => 0, Scope::Org { org } => org.capacity(), Scope::Repo { repo } => repo.capacity(),
+                    Scope::Workflow { repo, path } => repo.capacity() + path.capacity(),
+                    Scope::Environment { repo, environment } => repo.capacity() + environment.capacity(),
+                    Scope::Runner { runner } => runner.capacity(), Scope::Pool { pool } => pool.capacity(),
+                    Scope::Deploy { environment } => environment.capacity(),
+                };
+            }
+            n += rights.custom.capacity() * std::mem::size_of::<(String, Vec<String>)>();
+            for (name, values) in &rights.custom {
+                n += name.capacity() + values.capacity() * std::mem::size_of::<String>() + values.iter().map(String::capacity).sum::<usize>();
+            }
+        }
+        n
+    }
 }
 
-/// A personal access token's or an agent token's caller.
+/// W10-R03. Read the security generation and the rights from the same database snapshot.
 async fn token(hub: &Hub, t: &str) -> Option<Caller> {
     let hash = crate::util::sha256_hex(t.as_bytes());
     let now = crate::util::now_unix();
-    let store_ptr = std::ptr::from_ref(hub.store.changes()) as usize;
-    let rev = hub.store.changes().of(&["tokens", "users", "grants", "roles"]);
-    if let Some(hit) = {
-        let guard = token_cache().load();
-        if guard.store_ptr == store_ptr && guard.rev == rev {
-            guard.entries.get(&hash).cloned()
-        } else {
-            None
-        }
-    } && hit.expires_at.is_none_or(|exp| exp > now)
-    {
-        let prev = hit.last_used_recorded.load(std::sync::atomic::Ordering::Relaxed);
-        if now.saturating_sub(prev) >= LAST_USED_DEBOUNCE_S
-            && hit.last_used_recorded.compare_exchange(prev, now, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok()
-            && let Some(id) = hit.caller.token.clone()
-        {
-            let store = hub.store.clone();
-            drop(crate::rt::spawn(async move {
-                let _ = store.call(move |c| {
-                    c.prepare_cached("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1")?.execute(params![id, now])?;
-                    Ok(())
-                }).await;
-            }));
-        }
-        return Some(hit.caller);
-    }
-    let hash_q = hash.clone();
-    let loaded = hub
-        .store
-        .read(move |c| {
+    let cache = hub.token_cache.clone();
+    let loaded = hub.store.read(move |c| {
+            let rev: i64 = c.prepare_cached("SELECT revision FROM permission_revision WHERE singleton = 1")?.query_row([], |r| r.get(0))?;
+            {
+                let cached = cache.lock();
+                if cached.revision == rev && let Some(hit) = cached.entries.get(&hash) {
+                    return Ok(hit.expires_at.is_none_or(|exp| exp > now).then(|| hit.clone()));
+                }
+            }
             let row: Option<(String, String, String, Option<String>, String, Option<i64>)> = c
                 .prepare_cached(
                     "SELECT id, kind, principal, on_behalf_of, scopes, expires_at FROM tokens WHERE hash = ?1 AND kind IN ('pat', 'agent') AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?2)",
                 )?
-                .query_row(params![hash_q, now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+                .query_row(params![hash, now], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
                 .optional()?;
             let Some((id, kind, principal, behalf, scopes, expires_at)) = row else { return Ok(None) };
             let agent = kind == "agent";
@@ -507,40 +486,56 @@ async fn token(hub: &Hub, t: &str) -> Option<Caller> {
             let limit = Rights { grants: token_grants(&scopes), custom: custom_roles(c)? };
             let short: String = id.chars().take(12).collect();
             let name = if agent { format!("{principal} for {who}") } else { format!("pat:{short} of {who}") };
-            Ok(Some((Caller { kind: if agent { Kind::Agent } else { Kind::Pat }, name, user, token: Some(id), agent: None, rights, limit: Some(limit), turn: None }, expires_at)))
-        })
-        .await
-        .unwrap_or_else(|e| {
-            let _ = store_err(e);
-            None
-        })?;
-    let (caller, expires_at) = loaded;
-    // Record first-use `last_used_at` synchronously so immediate audits/tests observe it, then
-    // capture the post-write authz rev so subsequent requests hit the lockless RCU cache.
-    if let Some(id) = caller.token.clone() {
-        let _ = hub
-            .store
-            .call(move |c| {
-                c.prepare_cached("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1")?.execute(params![id, now])?;
-                Ok(())
-            })
-            .await;
-    }
-    let rev_after = hub.store.changes().of(&["tokens", "users", "grants", "roles"]);
-    let entry = CachedToken {
-        caller: caller.clone(),
-        expires_at,
-        last_used_recorded: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(now)),
-    };
-    token_cache().update(|cache| {
-        if cache.store_ptr != store_ptr || cache.rev != rev_after || cache.entries.len() >= TOKEN_CACHE_MAX {
-            cache.store_ptr = store_ptr;
-            cache.rev = rev_after;
-            cache.entries.clear();
+            let caller = Caller { kind: if agent { Kind::Agent } else { Kind::Pat }, name, user, token: Some(id), agent: None, rights, limit: Some(limit), turn: None };
+            let entry = CachedToken { caller, expires_at, last_used_recorded: std::sync::Arc::default() };
+            let mut cached = cache.lock();
+            if cached.revision < rev {
+                cached.entries = HashMap::new();
+                cached.bytes = 0;
+                cached.revision = rev;
+            }
+            if cached.revision == rev {
+                if let Some(hit) = cached.entries.get(&hash) { return Ok(Some(hit.clone())); }
+                let size = entry.bytes(&hash);
+                let room = crate::memory::room::share();
+                if cached.bytes > room { cached.entries = HashMap::new(); cached.bytes = 0; }
+                if size <= room.saturating_sub(cached.bytes) {
+                    cached.bytes += size;
+                    cached.entries.insert(hash, entry.clone());
+                }
+            }
+            Ok(Some(entry))
+        }).await.unwrap_or_else(|e| { let _ = store_err(e); None })?;
+    let prev = loaded.last_used_recorded.load(std::sync::atomic::Ordering::Relaxed);
+    if now > prev && loaded.last_used_recorded.compare_exchange(prev, now, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed).is_ok()
+        && let Some(id) = loaded.caller.token.as_ref()
+    {
+        // Timestamp precision bounds writes for one busy token. Batch all tokens observed
+        // while the previous transaction was being written.
+        let flush = {
+            let mut cached = hub.token_cache.lock();
+            cached.usage.entry(id.clone()).and_modify(|v| *v = (*v).max(now)).or_insert(now);
+            !std::mem::replace(&mut cached.flushing_usage, true)
+        };
+        if flush {
+            let (store, cache) = (hub.store.clone(), hub.token_cache.clone());
+            drop(crate::rt::spawn(async move {
+                loop {
+                    let batch = {
+                        let mut c = cache.lock();
+                        if c.usage.is_empty() { c.flushing_usage = false; break; }
+                        std::mem::take(&mut c.usage)
+                    };
+                    if let Err(e) = store.call(move |c| {
+                        let mut update = c.prepare_cached("UPDATE tokens SET last_used_at = ?2 WHERE id = ?1 AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at < ?2)")?;
+                        for (id, at) in batch { update.execute(params![id, at])?; }
+                        Ok(())
+                    }).await { tracing::warn!(%e, "could not record token usage"); }
+                }
+            }));
         }
-        cache.entries.insert(hash.clone(), entry.clone());
-    });
-    Some(caller)
+    }
+    Some(loaded.caller)
 }
 
 /// A job token's caller: what its job's `permissions` give (W10-R04), in its repository.
@@ -765,6 +760,33 @@ mod tests {
 
     fn rights(grants: &[&str]) -> Rights {
         Rights { grants: grants.iter().filter_map(|g| Grant::parse(g).ok()).collect(), custom: HashMap::new() }
+    }
+
+    #[test]
+    fn w10_r03_token_usage_does_not_invalidate_rights_and_a_committed_revoke_does() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            let raw = crate::util::random_token();
+            let hash = crate::util::sha256_hex(raw.as_bytes());
+            hub.store.call(move |c| {
+                c.execute("INSERT INTO tokens(id,kind,principal,hash,scopes,created_at) VALUES('pat-1','pat','owner',?1,?2,0)", params![hash, r#"{"grants":[{"what":"runs.read","scope":{"kind":"server"}}]}"#])?;
+                Ok(())
+            }).await?;
+            let allowed = token(&hub, &raw).await.ok_or_else(|| anyhow::anyhow!("missing token rights"))?;
+            assert!(allowed.token_allows("runs.read", &Scope::Server));
+            let revision = |c: &Connection| c.query_row("SELECT revision FROM permission_revision WHERE singleton=1", [], |r| r.get::<_,i64>(0));
+            let before = hub.store.read(move |c| Ok(revision(c)?)).await?;
+            hub.store.call(|c| { c.execute("UPDATE tokens SET last_used_at=17 WHERE id='pat-1'", [])?; Ok(()) }).await?;
+            assert_eq!(hub.store.read(move |c| Ok(revision(c)?)).await?, before);
+            hub.store.call(|c| {
+                c.execute("UPDATE tokens SET last_used_at=18 WHERE id='pat-1'", [])?;
+                c.execute("UPDATE tokens SET revoked_at=19 WHERE id='pat-1'", [])?;
+                Ok(())
+            }).await?;
+            assert!(hub.store.read(move |c| Ok(revision(c)?)).await? > before);
+            assert!(token(&hub, &raw).await.is_none());
+            Ok(())
+        })
     }
 
     /// W10-AC02, generated from the table: for every route, each built-in role (held on the

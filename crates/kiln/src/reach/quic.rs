@@ -10,11 +10,12 @@
 //!   directly between peers over QUIC when UDP reaches them (falling back transparently to relayed
 //!   QUIC on `LANE_REACH` when NAT prevents direct UDP).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::{Future as _, poll_fn};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -47,14 +48,25 @@ const KIND_HARNESS_SEND: u8 = 1;
 const KIND_CONVO_RAFT: u8 = 2;
 /// Maximum payload carried on one direct QUIC stream (matches reach wire limit).
 const MAX_STREAM_PAYLOAD: usize = wire::MAX_MESSAGE;
+const CONNECTION_WINDOW: u32 = 16 << 20;
 /// Datagram batch per syscall.
 const BATCH: usize = 32;
 /// Max turns per poll before yielding to the shard.
 const TURNS: usize = 64;
-/// How long a direct QUIC dial/RPC waits before letting caller fall back to relayed QUIC.
-const DIRECT_SEND_TIMEOUT: Duration = Duration::from_secs(4);
-/// Idle timeout for direct peer QUIC connections.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Max concurrent bidirectional streams per peer QUIC connection.
+const MAX_BIDI_STREAMS: u32 = 128;
+/// Max concurrent unidirectional streams per peer QUIC connection.
+const MAX_UNI_STREAMS: u32 = 64;
+/// A cold path has no measured RTT; use the transport's initial estimate and allow QUIC to retry.
+pub(super) const DIAL_TIMEOUT: Duration = Duration::from_millis(crate::harness::told::Rto::INITIAL_MS).saturating_mul(4);
+/// QUIC NAT keep-alive interval for established direct peer connections.
+const KEEP_ALIVE: Duration = Duration::from_secs(15);
+/// Idle timeout for direct peer QUIC connections (six keep-alive intervals).
+const IDLE_TIMEOUT: Duration = KEEP_ALIVE.saturating_mul(6);
+/// An established RPC may await a durable destination receipt for its entire connection idle window.
+pub(crate) const REQUEST_WAIT: Duration = IDLE_TIMEOUT;
+/// Maximum queued outbound frames per peer: matches one full stream-window wave (bidi + uni).
+const MAX_PENDING_OUT: usize = (MAX_BIDI_STREAMS as usize) + (MAX_UNI_STREAMS as usize);
 
 /// An inbound routed harness message received over direct `hyper-quic` (or relayed reach link).
 pub struct HarnessSendAsk {
@@ -63,6 +75,7 @@ pub struct HarnessSendAsk {
     pub epoch: Option<u64>,
     pub json: String,
     pub reply: oneshot::Sender<P2pSendReply>,
+    pub(super) _room: Option<ReadRoom>,
 }
 
 /// An inbound per-session conversation Raft frame received from a peer node.
@@ -70,6 +83,7 @@ pub struct ConvoRaftIn {
     pub from: String,
     pub session: String,
     pub bytes: Vec<u8>,
+    pub(super) _room: Option<ReadRoom>,
 }
 
 /// Peer addressing metadata learned from the reach directory & TOFU pins.
@@ -189,13 +203,13 @@ impl ServerCertVerifier for PinnedServerVerifier {
 
 fn transport_config() -> TransportConfig {
     let mut t = TransportConfig::default();
-    t.max_concurrent_bidi_streams(VarInt::from_u32(128))
-        .max_concurrent_uni_streams(VarInt::from_u32(64))
-        .receive_window(VarInt::from_u32(16 << 20))
+    t.max_concurrent_bidi_streams(VarInt::from_u32(MAX_BIDI_STREAMS))
+        .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
+        .receive_window(VarInt::from_u32(CONNECTION_WINDOW))
         .stream_receive_window(VarInt::from_u32(4 << 20))
-        .send_window(16 << 20)
+        .send_window(u64::from(CONNECTION_WINDOW))
         .max_idle_timeout(hyper_quic::IdleTimeout::try_from(IDLE_TIMEOUT).ok())
-        .keep_alive_interval(Some(Duration::from_secs(15)));
+        .keep_alive_interval(Some(KEEP_ALIVE));
     t
 }
 
@@ -252,9 +266,8 @@ pub fn advertised_addrs(local: SocketAddr) -> Vec<String> {
                 }
             }
         }
-        let lo = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port).to_string();
-        if !addrs.contains(&lo) {
-            addrs.push(lo);
+        if addrs.is_empty() {
+            addrs.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port).to_string());
         }
     } else {
         addrs.push(local.to_string());
@@ -265,19 +278,22 @@ pub fn advertised_addrs(local: SocketAddr) -> Vec<String> {
 /// Commands into the direct `hyper-quic` driver task.
 enum Cmd {
     UpdatePeers(Vec<PeerEntry>),
+    WarmPeer(String),
+    ReapCanceled(String),
     SendHarness {
         peer: String,
-        payload: Vec<u8>,
+        payload: OutFrame,
         reply: oneshot::Sender<anyhow::Result<P2pSendReply>>,
     },
     SendConvoRaft {
         peer: String,
-        payload: Vec<u8>,
+        payload: OutFrame,
     },
     StreamReply {
         conn_id: usize,
+        incarnation: Arc<()>,
         stream_id: StreamId,
-        bytes: Vec<u8>,
+        frame: Option<ReplyFrame>,
     },
 }
 
@@ -285,12 +301,48 @@ enum Cmd {
 #[derive(Clone)]
 pub struct PeerQuic(Arc<PeerQuicInner>);
 
+/// The reply receiver is dropped first, so even cancellation by the caller can wake the driver
+/// to withdraw work still waiting for stream credit.
+struct CancelRequest { quic: PeerQuic, peer: String, reply: Option<oneshot::Receiver<anyhow::Result<P2pSendReply>>> }
+impl CancelRequest {
+    async fn wait(mut self, since: Instant) -> anyhow::Result<P2pSendReply> {
+        let rx = self.reply.as_mut().context("reply already taken")?;
+        let result = crate::rt::timeout(REQUEST_WAIT.saturating_sub(since.elapsed()), rx).await?
+            .map_err(|_| anyhow::anyhow!("direct QUIC request to {} dropped", self.peer))?;
+        self.reply.take();
+        result
+    }
+}
+impl Drop for CancelRequest {
+    fn drop(&mut self) {
+        if self.reply.take().is_some() {
+            let _ = self.quic.0.tx.try_send(Cmd::ReapCanceled(self.peer.to_owned()));
+            self.quic.0.wake.notify();
+        }
+    }
+}
+
+impl Drop for PeerQuicInner {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        self.wake.notify();
+    }
+}
+
 struct PeerQuicInner {
+    detector: Option<(std::sync::Weak<crate::liveness::Shared>, u64)>,
+    start_liveness:std::sync::OnceLock<crate::liveness::Subscription>,
+    start_waits:Mutex<HashMap<u64,std::sync::Weak<crate::rt::Changed>>>,
+    stopping: Arc<AtomicBool>,
     tx: crate::memory::queue::Sender<Cmd>,
     wake: Arc<crate::rt::Notify>,
     local_addr: SocketAddr,
     advertised: Vec<String>,
     known_peers: Arc<Mutex<HashMap<String, Vec<SocketAddr>>>>,
+    connected_peers: Arc<Mutex<HashSet<String>>>,
+    starts: Arc<std::sync::OnceLock<std::sync::Weak<crate::frontdoor::start_outbox::Outbox>>>,
+    failed_until: Arc<Mutex<HashMap<String, Instant>>>,
+    frames: Arc<FrameRoom>,
 }
 
 impl PeerQuic {
@@ -301,25 +353,51 @@ impl PeerQuic {
         harness_send: Option<crate::memory::queue::Sender<HarnessSendAsk>>,
         convo_raft: Option<crate::memory::queue::Sender<ConvoRaftIn>>,
     ) -> anyhow::Result<Self> {
+        Self::start_on_node(bind, identity, harness_send, convo_raft, None)
+    }
+
+    pub(super) fn start_on_node(
+        bind: SocketAddr, identity: &Identity,
+        harness_send: Option<crate::memory::queue::Sender<HarnessSendAsk>>,
+        convo_raft: Option<crate::memory::queue::Sender<ConvoRaftIn>>,
+        state_dir: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
         let by_fp: Arc<Mutex<HashMap<String, String>>> = Arc::default();
         let server_cfg = build_server_config(identity, Arc::clone(&by_fp))?;
         let client_cfg = build_client_config(identity)?;
         let mut endpoint = Endpoint::new(EndpointConfig::default(), Some(server_cfg), true, None)
             .map_err(|e| anyhow::anyhow!("create p2p hyper-quic endpoint: {e:?}"))?;
         let client_handle = endpoint.insert_client_config(client_cfg).map_err(|e| anyhow::anyhow!("insert p2p client config: {e:?}"))?;
-        let socket = Batched::bind(bind, Io { batch: BATCH }, false).map_err(|e| anyhow::anyhow!("bind p2p hyper-quic socket {bind}: {e}"))?;
+        let socket = Batched::bind(bind, Io { batch: BATCH }, state_dir.is_some()).map_err(|e| anyhow::anyhow!("bind p2p hyper-quic socket {bind}: {e}"))?;
         let local_addr = socket.local_addr().map_err(|e| anyhow::anyhow!("p2p hyper-quic local_addr: {e}"))?;
         let advertised = advertised_addrs(local_addr);
         let (tx, rx) = crate::memory::queue::unbounded::<Cmd>(&crate::memory::owners::CHANNELS);
         let wake = Arc::new(crate::rt::Notify::new());
         let known_peers: Arc<Mutex<HashMap<String, Vec<SocketAddr>>>> = Arc::default();
+        let connected_peers: Arc<Mutex<HashSet<String>>> = Arc::default();
+        let starts = Arc::new(std::sync::OnceLock::new());
+        let failed_until: Arc<Mutex<HashMap<String, Instant>>> = Arc::default();
+        let frames = Arc::new(FrameRoom::new());
+        let incoming = Arc::new(crate::memory::queue::Room::new(&crate::memory::owners::CHANNELS, frame_budget()));
 
+        let stopping = Arc::new(AtomicBool::new(false));
+        let liveness = state_dir.filter(|_| socket.stats().kernel_stamps)
+            .map(|dir| super::heartbeat::Plane::open(dir, identity, &wake)).transpose()?;
+        let detector = liveness.as_ref().map(super::heartbeat::Plane::incarnation);
         let state = DriverState {
+            liveness,
+            stopping: Arc::clone(&stopping),
             endpoint,
             client_handle,
             socket,
             by_fp,
             peers: HashMap::new(),
+            addr_cursor: HashMap::new(),
+            dial_time: HashMap::new(),
+            connected_peers: Arc::clone(&connected_peers),
+            starts: Arc::clone(&starts),
+            failed_until: Arc::clone(&failed_until),
+            incoming,
             conns: Vec::new(),
             by_peer: HashMap::new(),
             dirty: VecDeque::new(),
@@ -337,10 +415,83 @@ impl PeerQuic {
         };
         crate::rt::spawn(async move {
             let mut state = state;
-            let _ = state.run().await;
+            if let Err(error) = state.run().await {tracing::warn!(%error, "reach datagram driver stopped");}
         });
 
-        Ok(Self(Arc::new(PeerQuicInner { tx, wake, local_addr, advertised, known_peers })))
+        Ok(Self(Arc::new(PeerQuicInner { detector, start_liveness:Default::default(),start_waits:Default::default(),stopping, tx, wake, local_addr, advertised, known_peers, connected_peers, starts, failed_until, frames })))
+    }
+
+    pub(crate) fn has_liveness(&self) -> bool {
+        self.0.detector.as_ref().is_some_and(|(service, generation)| service.upgrade()
+            .is_some_and(|s| s.with_generation(*generation, |_| ()).is_some()))
+    }
+
+    pub(crate) fn watch_starts(&self, outbox: &Arc<crate::frontdoor::start_outbox::Outbox>) {
+        if self.0.starts.set(Arc::downgrade(outbox)).is_err() {
+            return;
+        }
+        let Some((shared, _)) = &self.0.detector else {
+            return;
+        };
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let endpoint = Arc::downgrade(&self.0);
+        let watch = shared.subscribe(Arc::new(move |event| {
+            let Some(endpoint) = endpoint.upgrade() else {
+                return;
+            };
+            let crate::liveness::Event::Change(change) = event else {
+                return;
+            };
+            let peer = match change {
+                hyper_liveness::Change::Trusted { peer, .. } | hyper_liveness::Change::Restarted { peer, .. } => peer,
+                hyper_liveness::Change::Suspected(_) | hyper_liveness::Change::Stopped { .. } => {
+                    if let Some(signal) = endpoint.start_waits.lock().remove(&change.peer()).and_then(|weak| weak.upgrade()) {
+                        signal.notify();
+                    }
+                    return;
+                }
+                _ => return,
+            };
+            let name = endpoint.known_peers.lock().keys().find(|name| crate::convo::raft::node_id(name) == peer).cloned();
+            if let Some(name) = name
+                && let Some(outbox) = endpoint.starts.get().and_then(std::sync::Weak::upgrade)
+            {
+                outbox.linked(&name);
+            }
+        }));
+        let _ = self.0.start_liveness.set(watch);
+    }
+
+    /// Stop waiting for an established dead connection when the shared node-pair detector
+    /// has evidence for this peer. A live runner may take longer to commit a founding record.
+    pub(crate) async fn forward_start(&self, peer: &str, body: String) -> anyhow::Result<P2pSendReply> {
+        let Some((shared, generation)) = &self.0.detector else {
+            return self.begin_harness_message(peer, "", None, body)?.await;
+        };
+        let Some(shared) = shared.upgrade() else {
+            return self.begin_harness_message(peer, "", None, body)?.await;
+        };
+        let id = crate::convo::raft::node_id(peer);
+        let signal = {
+            let mut peers = self.0.start_waits.lock();
+            if let Some(active) = peers.get(&id).and_then(std::sync::Weak::upgrade) {
+                active
+            } else {
+                let changed = Arc::new(crate::rt::Changed::new());
+                peers.insert(id, Arc::downgrade(&changed));
+                changed
+            }
+        };
+        let wait = signal.listen();
+        if shared.with_generation(*generation, |l| l.stopped(id) || l.trust(id) == Some(hyper_timing::Trust::Suspected)) == Some(true) {
+            anyhow::bail!("the selected runner is unreachable");
+        }
+        match futures::future::select(self.begin_harness_message(peer, "", None, body)?, wait).await {
+            futures::future::Either::Left((answer, _)) => answer,
+            futures::future::Either::Right(_) => anyhow::bail!("the selected runner's link went down before its receipt"),
+        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -352,7 +503,17 @@ impl PeerQuic {
     }
 
     /// Update the peer directory (fingerprint + direct UDP `quic_addrs`).
-    pub fn update_peers(&self, peers: Vec<PeerEntry>) {
+    pub fn update_peers(&self, mut peers: Vec<PeerEntry>) {
+        let mut by_name = HashMap::new();
+        let mut by_key = HashMap::new();
+        let mut bad_names = HashSet::new();
+        let mut bad_keys = HashSet::new();
+        for entry in &mut peers { entry.fingerprint.make_ascii_lowercase(); }
+        for entry in &peers {
+            if by_name.insert(&entry.name, &entry.fingerprint).is_some_and(|previous| previous != &entry.fingerprint) { bad_names.insert(entry.name.clone()); }
+            if by_key.insert(&entry.fingerprint, &entry.name).is_some_and(|previous| previous != &entry.name) { bad_keys.insert(entry.fingerprint.clone()); }
+        }
+        peers.retain(|p| !bad_names.contains(&p.name) && !bad_keys.contains(&p.fingerprint));
         {
             let mut k = self.0.known_peers.lock();
             k.clear();
@@ -366,40 +527,58 @@ impl PeerQuic {
         self.0.wake.notify();
     }
 
-    /// Whether `peer` currently advertises at least one direct `hyper-quic` UDP endpoint.
+    /// Whether `peer` currently advertises at least one direct `hyper-quic` UDP endpoint and is not
+    /// in post-timeout cooldown (e.g. NAT/firewall blocking direct UDP).
+    pub(crate) fn knows_peer(&self, peer: &str) -> bool {
+        self.0.known_peers.lock().contains_key(peer)
+    }
+
     pub fn has_direct(&self, peer: &str) -> bool {
+        if self.0.failed_until.lock().get(peer).is_some_and(|until| Instant::now() < *until) {
+            return false;
+        }
         self.0.known_peers.lock().get(peer).is_some_and(|a| !a.is_empty())
     }
 
-    /// Forward a routed harness message directly to `peer` over a bidirectional `hyper-quic` stream.
-    pub async fn send_harness_message(&self, peer: &str, session: &str, epoch: Option<u64>, json: String) -> anyhow::Result<P2pSendReply> {
-        let body = postcard::to_allocvec(&DirectHarnessSend { session: session.to_owned(), epoch, json }).context("encode direct QUIC harness send")?;
-        let payload = frame_stream(KIND_HARNESS_SEND, &body)?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.0
-            .tx
-            .try_send(Cmd::SendHarness { peer: peer.to_owned(), payload, reply: reply_tx })
-            .map_err(|_| anyhow::anyhow!("direct QUIC driver stopped"))?;
-        self.0.wake.notify();
-        match crate::rt::timeout(DIRECT_SEND_TIMEOUT, reply_rx).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(_)) => anyhow::bail!("direct QUIC request to {peer} dropped"),
-            Err(_) => anyhow::bail!("direct QUIC send to {peer} timed out"),
+    /// Whether a direct `hyper-quic` connection to `peer` is already handshaked and ready right now
+    /// (zero dial latency).
+    pub fn is_connected(&self, peer: &str) -> bool {
+        self.0.connected_peers.lock().contains(peer)
+    }
+
+    /// Initiate a non-blocking background direct `hyper-quic` handshake to `peer` if eligible so
+    /// subsequent traffic can route over QUIC without stalling a live WebSocket stream.
+    pub fn warm_peer(&self, peer: &str) {
+        if self.has_direct(peer) && !self.is_connected(peer) {
+            let _ = self.0.tx.try_send(Cmd::WarmPeer(peer.to_owned()));
+            self.0.wake.notify();
         }
     }
 
-    /// Send a per-session conversation Raft message directly to `peer` over `hyper-quic` (best-effort;
-    /// returns `false` if `peer` has no known direct QUIC address so caller uses relayed QUIC).
-    pub fn send_convo_raft(&self, peer: &str, session: &str, from: &str, bytes: Vec<u8>) -> bool {
+    /// Forward a routed harness message directly to `peer` over a bidirectional `hyper-quic` stream.
+    pub(crate) fn begin_harness_message(&self, peer: &str, session: &str, epoch: Option<u64>, json: String) -> anyhow::Result<futures::future::BoxFuture<'static, anyhow::Result<P2pSendReply>>> {
+        let payload = self.0.frames.encode(peer, KIND_HARNESS_SEND, &(session, epoch, json.as_str()))?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.0.tx.try_send(Cmd::SendHarness { peer: peer.to_owned(), payload, reply: reply_tx })
+            .map_err(|_| anyhow::anyhow!("direct QUIC driver stopped"))?;
+        self.0.wake.notify();
+        let cancel = CancelRequest { quic: self.clone(), peer: peer.to_owned(), reply: Some(reply_rx) };
+        Ok(Box::pin(cancel.wait(Instant::now())))
+    }
+
+    #[cfg(test)]
+    async fn send_harness_message(&self, peer: &str, session: &str, epoch: Option<u64>, json: String) -> anyhow::Result<P2pSendReply> {
+        self.begin_harness_message(peer, session, epoch, json)?.await
+    }
+
+    /// Send a per-session conversation Raft message directly to `peer` over `hyper-quic`.
+    /// Returns `false` if `peer` has no direct QUIC address, is in cooldown, or its outbound QUIC
+    /// pending queue is saturated (so callers can fall back or report snapshot failure accurately).
+    pub fn send_convo_raft(&self, peer: &str, session: &str, from: &str, bytes: &[u8]) -> bool {
         if !self.has_direct(peer) {
             return false;
         }
-        let Ok(body) = postcard::to_allocvec(&DirectConvoRaft { session: session.to_owned(), from: from.to_owned(), bytes }) else {
-            return false;
-        };
-        let Ok(payload) = frame_stream(KIND_CONVO_RAFT, &body) else {
-            return false;
-        };
+        let Ok(payload) = self.0.frames.encode(peer, KIND_CONVO_RAFT, &(session, from, Octets(bytes))) else { return false };
         let sent = self.0.tx.try_send(Cmd::SendConvoRaft { peer: peer.to_owned(), payload }).is_ok();
         if sent {
             self.0.wake.notify();
@@ -408,31 +587,119 @@ impl PeerQuic {
     }
 }
 
-fn frame_stream(kind: u8, body: &[u8]) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(body.len() <= MAX_STREAM_PAYLOAD, "direct QUIC payload {} exceeds limit", body.len());
-    let len = u32::try_from(body.len())?;
-    let mut out = Vec::with_capacity(5 + body.len());
-    out.push(kind);
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(body);
-    Ok(out)
+// Postcard encodes a byte string identically to Vec<u8>. Borrowing it keeps Raft's original
+// available for relay without a deep clone, and permits size calculation in constant time.
+struct Octets<'a>(&'a [u8]);
+impl Serialize for Octets<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> { s.serialize_bytes(self.0) }
 }
 
-fn frame_reply(reply: &P2pSendReply) -> Vec<u8> {
-    let body = serde_json::to_vec(reply).unwrap_or_else(|_| br#"{"t":"error","why":"encode failed"}"#.to_vec());
-    let len = u32::try_from(body.len()).unwrap_or(0);
-    let mut out = Vec::with_capacity(4 + body.len());
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(&body);
-    out
+pub(super) fn frame_budget() -> usize {
+    crate::memory::room::share().clamp(MAX_STREAM_PAYLOAD + 5, CONNECTION_WINDOW as usize)
+}
+pub(super) struct FrameRoom {
+    bytes: crate::memory::queue::Room,
+    counts: Mutex<HashMap<String, usize>>,
+}
+impl FrameRoom {
+    pub(super) fn new() -> Self {
+        Self { bytes: crate::memory::queue::Room::new(&crate::memory::owners::CHANNELS, frame_budget()), counts: Mutex::default() }
+    }
+
+    pub(super) fn reserve(self: &Arc<Self>, peer: &str, bytes: usize) -> anyhow::Result<FrameCharge> {
+        {
+            let mut counts = self.counts.lock();
+            anyhow::ensure!(counts.get(peer).copied().unwrap_or_default() < MAX_PENDING_OUT && self.bytes.try_take(bytes), "direct QUIC send budget is full");
+            *counts.entry(peer.to_owned()).or_default() += 1;
+        }
+        Ok(FrameCharge { room: Arc::clone(self), peer: peer.to_owned(), bytes })
+    }
+
+    fn encode<T: Serialize>(self: &Arc<Self>, peer: &str, kind: u8, body: &T) -> anyhow::Result<OutFrame> {
+        let size = postcard::experimental::serialized_size(body)?;
+        anyhow::ensure!(size <= MAX_STREAM_PAYLOAD, "direct QUIC payload exceeds limit");
+        let bytes = size.saturating_add(5);
+        let charge = self.reserve(peer, bytes)?;
+        let mut out = Vec::with_capacity(bytes);
+        out.push(kind);
+        out.extend_from_slice(&u32::try_from(size)?.to_be_bytes());
+        Ok(OutFrame { data: postcard::to_extend(body, out)?, charge })
+    }
+}
+struct OutFrame { data: Vec<u8>, charge: FrameCharge }
+pub struct FrameCharge { room: Arc<FrameRoom>, peer: String, bytes: usize }
+impl FrameCharge {
+    fn wrote(&mut self) { self.room.bytes.give(std::mem::take(&mut self.bytes)); }
+}
+impl Drop for FrameCharge {
+    fn drop(&mut self) {
+        if self.bytes != 0 { self.wrote(); }
+        let mut counts = self.room.counts.lock();
+        if let Some(n) = counts.get_mut(&self.peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 { counts.remove(&self.peer); }
+        }
+    }
+}
+pub(super) struct ReadRoom { room: Arc<crate::memory::queue::Room>, bytes: usize }
+impl ReadRoom {
+    pub(super) fn take(room: &Arc<crate::memory::queue::Room>, bytes: usize) -> Option<Self> {
+        room.try_take(bytes).then(|| Self { room: room.clone(), bytes })
+    }
+}
+impl Drop for ReadRoom {
+    fn drop(&mut self) { if self.bytes != 0 { self.room.give(self.bytes); } }
+}
+
+struct ReplyFrame { data: Vec<u8>, charge: ReadRoom }
+impl std::io::Write for ReplyFrame {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let needed = self.data.len().saturating_add(bytes.len());
+        if needed > MAX_STREAM_PAYLOAD + 4 { return Err(std::io::ErrorKind::FileTooLarge.into()); }
+        if needed > self.charge.bytes {
+            let to = needed.next_power_of_two().min(MAX_STREAM_PAYLOAD + 4);
+            if !self.charge.room.try_take(to - self.charge.bytes) { return Err(std::io::ErrorKind::WouldBlock.into()); }
+            self.charge.bytes = to;
+            self.data.try_reserve_exact(to - self.data.len()).map_err(std::io::Error::other)?;
+        }
+        self.data.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+fn frame_reply(reply: &P2pSendReply, room: Arc<crate::memory::queue::Room>) -> Option<ReplyFrame> {
+    use std::io::Write as _;
+    let mut frame = ReplyFrame { data: Vec::new(), charge: ReadRoom {room,bytes:0} };
+    frame.write_all(&[0; 4]).ok()?;
+    if serde_json::to_writer(&mut frame, reply).is_err() {
+        frame.data.truncate(4);
+        frame.write_all(br#"{"t":"error","why":"reply exceeds frame budget"}"#).ok()?;
+    }
+    let len = u32::try_from(frame.data.len().saturating_sub(4)).ok()?;
+    *frame.data.first_chunk_mut::<4>()? = len.to_be_bytes();
+    Some(frame)
+}
+
+fn write_reply(quic: &mut Connection, stream: StreamId, sb: &mut StreamBuf, frame: Option<ReplyFrame>) -> bool {
+    let Some(frame) = frame else {
+        let _ = quic.send_stream(stream).reset(VarInt::from_u32(0));
+        return false;
+    };
+    sb.write = frame.data;
+    sb.read_room = frame.charge;
+    sb.write_pos = 0;
+    sb.finish_write = true;
+    flush_stream_write(quic, stream, sb)
 }
 
 struct PendingOut {
-    payload: Vec<u8>,
+    payload: OutFrame,
     reply: Option<oneshot::Sender<anyhow::Result<P2pSendReply>>>,
 }
 
 struct StreamBuf {
+    send_charge: Option<FrameCharge>,
+    read_room: ReadRoom,
     write: Vec<u8>,
     write_pos: usize,
     finish_write: bool,
@@ -443,21 +710,35 @@ struct StreamBuf {
 }
 
 struct PeerConn {
+    incoming: Arc<crate::memory::queue::Room>,
+    incarnation: Arc<()>,
+    fingerprint: Option<String>,
     handle: ConnectionHandle,
     quic: Connection,
     peer_name: Option<String>,
     connected: bool,
+    dial_timed_out: bool,
+    started_at: Instant,
+    dial_due: Instant,
     dirty: bool,
     pending_out: VecDeque<PendingOut>,
     streams: HashMap<StreamId, StreamBuf>,
 }
 
 struct DriverState {
+    liveness: Option<super::heartbeat::Plane>,
+    stopping: Arc<AtomicBool>,
     endpoint: Endpoint,
     client_handle: ClientConfigHandle,
     socket: Batched,
     by_fp: Arc<Mutex<HashMap<String, String>>>,
     peers: HashMap<String, PeerEntry>,
+    addr_cursor: HashMap<String, usize>,
+    dial_time: HashMap<String, crate::harness::told::Rto>,
+    connected_peers: Arc<Mutex<HashSet<String>>>,
+    starts: Arc<std::sync::OnceLock<std::sync::Weak<crate::frontdoor::start_outbox::Outbox>>>,
+    failed_until: Arc<Mutex<HashMap<String, Instant>>>,
+    incoming: Arc<crate::memory::queue::Room>,
     conns: Vec<Option<PeerConn>>,
     by_peer: HashMap<String, usize>,
     dirty: VecDeque<usize>,
@@ -484,34 +765,76 @@ impl DriverState {
 
     fn poll_step(&mut self, cx: &mut Context<'_>, wake: &Arc<crate::rt::Notify>, wake_fut: &mut Option<Pin<Box<dyn Future<Output = ()> + Send + '_>>>) -> Poll<Result<(), hyper_rt::RtError>> {
         for _ in 0..TURNS {
+            if self.stopping.load(Ordering::Acquire) {
+                if let Some(plane)=&mut self.liveness { plane.drive(hyper_rt::machine::clock::shard_clock_ns(),true); plane.send(&mut self.socket); self.socket.send(); }
+                return Poll::Ready(Ok(()));
+            }
             let now = Instant::now();
             // 1. Process incoming commands from local callers and inbound stream reply tasks.
             let mut moved = false;
-            while let Ok(cmd) = self.cmd_rx.try_recv() {
+            for _ in 0..MAX_PENDING_OUT {
+                let Ok(cmd) = self.cmd_rx.try_recv() else { break };
                 moved = true;
                 self.on_cmd(cmd, now);
             }
 
             // 2. Receive UDP datagrams from the socket.
+            // AD-1. Judge at a time sampled before draining UDP. A scheduling pause after
+            // draining cannot turn an already-arrived heartbeat into apparent silence.
+            let epoch = hyper_rt::registry::with_current(|ctx| ctx.host_epoch_ns()).flatten();
+            let judge_at = hyper_rt::machine::clock::shard_clock_ns();
+            let mut through = None;
             let mut got = 0usize;
             loop {
                 let arrived = &mut self.arrived;
-                let n = match self.socket.receive(|a, bytes| arrived.push((a.from, BytesMut::from(&*bytes)))) {
+                let plane = &mut self.liveness;
+                let (n, observed) = match self.socket.receive_observed(|a, bytes| {
+                    // The driver epoch is fixed. A deschedule before, during or after the
+                    // drain cannot shift the time at which a queued heartbeat arrived.
+                    let heartbeat = super::heartbeat::Plane::recognizes(bytes);
+                    if let Some(stamp) = a.kernel_at_ns.and_then(|at| epoch?.checked_add(at)) {
+                        through = Some(stamp);
+                        if heartbeat && let Some(plane) = plane { plane.receive(a.from,stamp,bytes); }
+                    }
+                    if !heartbeat {
+                        arrived.push((a.from, BytesMut::from(&*bytes)));
+                    }
+                }) {
                     Ok(n) => n,
                     Err(e) => return Poll::Ready(Err(e)),
                 };
                 got += n;
-                if n == 0 || self.arrived.len() >= BATCH * 4 {
+                if observed == hyper_rt::udp::Queued::Emptied {
+                    through = Some(through.map_or(judge_at, |at| judge_at.max(at)));
                     break;
                 }
+                if n == 0 {moved = true; break;}
+                if got >= BATCH * 4 {break;}
             }
-            for (from, data) in std::mem::take(&mut self.arrived) {
-                self.on_datagram(now, from, data);
-            }
+            let mut arrived = std::mem::take(&mut self.arrived);
+            for (from,data) in arrived.drain(..) { self.on_datagram(now,from,data); }
+            if let (Some(at),Some(plane))=(through,&mut self.liveness) { plane.drive(at,false); }
+            self.arrived = arrived;
 
-            // 3. Fire due QUIC connection timers.
-            let ids: Vec<usize> = self.conns.iter().enumerate().filter_map(|(i, c)| c.as_ref().map(|_| i)).collect();
-            for i in ids {
+            // 3. Fire due QUIC connection timers and reap half-open dials past `DIAL_TIMEOUT`
+            // ONCE (setting `dial_timed_out = true` and continuing to service QUIC's close timer so
+            // a timed-out dial never pins the driver loop).
+            for i in 0..self.conns.len() {
+                if let Some(Some(c)) = self.conns.get_mut(i) && !c.connected && !c.dial_timed_out && now >= c.dial_due {
+                    c.dial_timed_out = true;
+                    if let Some(peer) = &c.peer_name {
+                        let timing = self.dial_time.entry(peer.clone()).or_default();
+                        timing.expired();
+                        if self.by_peer.get(peer) == Some(&i) {
+                            self.failed_until.lock().insert(peer.clone(), now + timing.timeout());
+                        }
+                    }
+                    for p in c.pending_out.drain(..) {
+                        if let Some(r) = p.reply { let _ = r.send(Err(anyhow::anyhow!("direct QUIC handshake timed out"))); }
+                    }
+                    c.quic.close(now, VarInt::from_u32(0), bytes::Bytes::from_static(b"dial timeout"));
+                    self.after_conn(i, now);
+                }
                 let due = self.conns.get_mut(i).and_then(|c| c.as_mut()).and_then(|c| c.quic.poll_timeout());
                 if due.is_some_and(|d| d <= now) {
                     if let Some(Some(c)) = self.conns.get_mut(i) {
@@ -522,17 +845,23 @@ impl DriverState {
             }
 
             // 4. Queue endpoint-generated replies (VersionNegotiation / Retry / Refuse) and connection transmits.
-            for (to, bytes) in std::mem::take(&mut self.replies) {
+            for (to, bytes) in self.replies.drain(..) {
                 self.socket.queue(to, &bytes);
             }
             let mut sent = 0usize;
-            while sent < BATCH {
+            while sent < BATCH && self.socket.slot().is_some() {
                 let Some(t) = self.poll_transmit(now) else { break };
                 self.socket.queue(t.destination, self.out_buf.get(..t.size).unwrap_or_default());
                 sent += 1;
             }
             let blocked = self.socket.send() == Sent::Blocked;
-            if moved || got > 0 || (sent == BATCH && !blocked) {
+            let mut beats_wait = false;
+            let mut beat_blocked = false;
+            if let Some(plane) = &mut self.liveness {
+                beats_wait = plane.send(&mut self.socket);
+                if self.socket.pending() && !blocked { beat_blocked = self.socket.send() == Sent::Blocked; }
+            }
+            if moved || got > 0 || ((sent == BATCH || beats_wait) && !blocked && !beat_blocked) {
                 continue;
             }
 
@@ -566,7 +895,7 @@ impl DriverState {
                 *wake_fut = None;
                 continue;
             }
-            if let Some(due) = self.next_timeout() {
+            if let Some(due) = self.next_timeout().into_iter().chain(self.liveness.as_ref().and_then(super::heartbeat::Plane::deadline)).min() {
                 if self.timer.as_ref().is_none_or(|(armed, _)| *armed != due) {
                     let wait = u64::try_from(due.saturating_duration_since(now).as_nanos()).unwrap_or(u64::MAX);
                     self.timer = Some((due, sleep(wait)));
@@ -590,13 +919,46 @@ impl DriverState {
     fn on_cmd(&mut self, cmd: Cmd, now: Instant) {
         match cmd {
             Cmd::UpdatePeers(list) => {
+                if let Some(plane)=&mut self.liveness {plane.directory(&list);}
                 let mut fp_map = self.by_fp.lock();
                 fp_map.clear();
                 self.peers.clear();
                 for p in list {
-                    fp_map.insert(p.fingerprint.clone(), p.name.clone());
+                    let fp = p.fingerprint.to_ascii_lowercase();
+                    fp_map.insert(fp, p.name.clone());
                     self.peers.insert(p.name.clone(), p);
                 }
+                self.dial_time.retain(|p,_| self.peers.contains_key(p));
+                self.addr_cursor.retain(|p,_| self.peers.contains_key(p));
+                self.failed_until.lock().retain(|p,_| self.peers.contains_key(p));
+                drop(fp_map);
+                for cid in 0..self.conns.len() {
+                    let Some(Some(c)) = self.conns.get_mut(cid) else { continue };
+                    if c.connected && c.fingerprint.as_ref().and_then(|fp| self.by_fp.lock().get(fp).cloned()) != c.peer_name {
+                        if let Some(peer) = &c.peer_name { self.connected_peers.lock().remove(peer); }
+                        c.connected = false;
+                        c.dial_timed_out = true;
+                        c.quic.close(now, VarInt::from_u32(0), bytes::Bytes::from_static(b"fleet identity changed"));
+                        self.mark(cid);
+                    }
+                }
+            }
+            Cmd::ReapCanceled(peer) => {
+                for cid in 0..self.conns.len() {
+                    let Some(Some(c)) = self.conns.get_mut(cid) else { continue };
+                    if c.peer_name.as_deref() != Some(peer.as_str()) { continue; }
+                    c.pending_out.retain(|p| !p.reply.as_ref().is_some_and(oneshot::Sender::is_canceled));
+                    c.streams.retain(|id, sb| {
+                        if !sb.reply.as_ref().is_some_and(oneshot::Sender::is_canceled) { return true; }
+                        let _ = c.quic.send_stream(*id).reset(VarInt::from_u32(0));
+                        let _ = c.quic.recv_stream(*id).stop(VarInt::from_u32(0));
+                        false
+                    });
+                    self.mark(cid);
+                }
+            }
+            Cmd::WarmPeer(peer) => {
+                self.warm_peer_conn(&peer, now);
             }
             Cmd::SendHarness { peer, payload, reply } => {
                 self.enqueue_outbound(&peer, PendingOut { payload, reply: Some(reply) }, now);
@@ -604,17 +966,59 @@ impl DriverState {
             Cmd::SendConvoRaft { peer, payload } => {
                 self.enqueue_outbound(&peer, PendingOut { payload, reply: None }, now);
             }
-            Cmd::StreamReply { conn_id, stream_id, bytes } => {
+            Cmd::StreamReply { conn_id, incarnation, stream_id, frame } => {
                 if let Some(Some(c)) = self.conns.get_mut(conn_id)
+                    && Arc::ptr_eq(&incarnation, &c.incarnation)
                     && let Some(sb) = c.streams.get_mut(&stream_id)
                 {
-                    sb.write = bytes;
-                    sb.write_pos = 0;
-                    sb.finish_write = true;
-                    flush_stream_write(&mut c.quic, stream_id, sb);
+                    if !write_reply(&mut c.quic, stream_id, sb, frame) { c.streams.remove(&stream_id); }
                     self.mark(conn_id);
                 }
             }
+        }
+    }
+
+    fn warm_peer_conn(&mut self, peer: &str, now: Instant) {
+        if let Some(&cid) = self.by_peer.get(peer)
+            && let Some(Some(c)) = self.conns.get(cid)
+            && !c.quic.is_closed()
+        {
+            return;
+        }
+        let Some(entry) = self.peers.get(peer).cloned() else { return };
+        if entry.addrs.is_empty() {
+            return;
+        }
+        let cursor = self.addr_cursor.entry(peer.to_owned()).or_insert(0);
+        let idx = *cursor % entry.addrs.len();
+        *cursor = cursor.wrapping_add(1);
+        let Some(addr) = entry.addrs.get(idx).copied() else { return };
+        let Some(sni) = fp_server_name(&entry.fingerprint) else { return };
+        if let Ok((handle, quic)) = self.endpoint.connect(now, self.client_handle, addr, &sni, None) {
+            let cid = handle.0;
+            if self.conns.len() <= cid {
+                self.conns.resize_with(cid + 1, || None);
+            }
+            let pc = PeerConn {
+                incoming: Arc::clone(&self.incoming),
+                incarnation: Arc::new(()),
+                fingerprint: None,
+                handle,
+                quic,
+                peer_name: Some(peer.to_owned()),
+                connected: false,
+                dial_timed_out: false,
+                started_at: now,
+                dial_due: now + self.dial_time.get(peer).map_or(DIAL_TIMEOUT, crate::harness::told::Rto::timeout),
+                dirty: false,
+                pending_out: VecDeque::new(),
+                streams: HashMap::new(),
+            };
+            if let Some(slot) = self.conns.get_mut(cid) {
+                *slot = Some(pc);
+            }
+            self.by_peer.insert(peer.to_owned(), cid);
+            self.after_conn(cid, now);
         }
     }
 
@@ -636,7 +1040,16 @@ impl DriverState {
             }
             return;
         };
-        let Some(addr) = entry.addrs.first().copied() else {
+        if entry.addrs.is_empty() {
+            if let Some(r) = item.reply {
+                let _ = r.send(Err(anyhow::anyhow!("peer {peer} advertises no direct QUIC address")));
+            }
+            return;
+        }
+        let cursor = self.addr_cursor.entry(peer.to_owned()).or_insert(0);
+        let idx = *cursor % entry.addrs.len();
+        *cursor = cursor.wrapping_add(1);
+        let Some(addr) = entry.addrs.get(idx).copied() else {
             if let Some(r) = item.reply {
                 let _ = r.send(Err(anyhow::anyhow!("peer {peer} advertises no direct QUIC address")));
             }
@@ -655,10 +1068,16 @@ impl DriverState {
                     self.conns.resize_with(cid + 1, || None);
                 }
                 let mut pc = PeerConn {
+                    incoming: Arc::clone(&self.incoming),
+                    incarnation: Arc::new(()),
+                    fingerprint: None,
                     handle,
                     quic,
                     peer_name: Some(peer.to_owned()),
                     connected: false,
+                    dial_timed_out: false,
+                    started_at: now,
+                    dial_due: now + self.dial_time.get(peer).map_or(DIAL_TIMEOUT, crate::harness::told::Rto::timeout),
                     dirty: false,
                     pending_out: VecDeque::new(),
                     streams: HashMap::new(),
@@ -704,10 +1123,16 @@ impl DriverState {
                         }
                         if let Some(slot) = self.conns.get_mut(cid) {
                             *slot = Some(PeerConn {
+                                incoming: Arc::clone(&self.incoming),
+                                incarnation: Arc::new(()),
+                                fingerprint: None,
                                 handle,
                                 quic,
                                 peer_name: None,
                                 connected: false,
+                                dial_timed_out: false,
+                                started_at: now,
+                                dial_due: now + DIAL_TIMEOUT,
                                 dirty: false,
                                 pending_out: VecDeque::new(),
                                 streams: HashMap::new(),
@@ -725,7 +1150,7 @@ impl DriverState {
         }
     }
 
-    fn after_conn(&mut self, cid: usize, _now: Instant) {
+    fn after_conn(&mut self, cid: usize, now: Instant) {
         let mut closed_peer: Option<String> = None;
         let mut newly_identified: Option<String> = None;
         {
@@ -733,24 +1158,47 @@ impl DriverState {
             while let Some(ev) = c.quic.poll() {
                 match ev {
                     QuicEvent::Connected => {
-                        c.connected = true;
-                        if c.peer_name.is_none()
-                            && let Some(id_any) = c.quic.crypto_session().peer_identity()
-                            && let Ok(certs) = id_any.downcast::<Vec<CertificateDer<'static>>>()
-                            && let Some(leaf) = certs.first()
-                            && let Some(fp) = e2e::fingerprint_of_cert(leaf)
-                            && let Some(name) = self.by_fp.lock().get(&fp).cloned()
-                        {
-                            c.peer_name = Some(name.clone());
-                            newly_identified = Some(name);
+                        let fingerprint = c.quic.crypto_session().peer_identity()
+                            .and_then(|id| id.downcast::<Vec<CertificateDer<'static>>>().ok())
+                            .and_then(|certs| e2e::fingerprint_of_cert(certs.first()?));
+                        let name = fingerprint.as_ref().and_then(|fp| self.by_fp.lock().get(fp).cloned());
+                        let Some(name) = name.filter(|name| c.peer_name.as_ref().is_none_or(|expected| expected == name)) else {
+                            c.quic.close(now, VarInt::from_u32(0), bytes::Bytes::from_static(b"unknown fleet identity"));
+                            continue;
+                        };
+                        if c.peer_name.is_some() {
+                            self.dial_time.entry(name.clone()).or_default().sample(u64::try_from(now.saturating_duration_since(c.started_at).as_millis()).unwrap_or(u64::MAX));
                         }
+                        c.fingerprint = fingerprint;
+                        c.connected = true;
+                        c.peer_name = Some(name.clone());
+                        newly_identified = Some(name.clone());
+                        self.failed_until.lock().remove(&name);
+                        if self.connected_peers.lock().insert(name.clone()) && let Some(outbox)=self.starts.get().and_then(std::sync::Weak::upgrade) {outbox.linked(&name);}
                         open_pending_streams(c);
+                    }
+                    QuicEvent::Stream(StreamEvent::Available { .. }) if c.connected => open_pending_streams(c),
+                    QuicEvent::Stream(StreamEvent::Finished { id }) => {
+                        if let Some(sb) = c.streams.get_mut(&id) {
+                            // QUIC now knows the peer has the complete frame. Bytes retained
+                            // for retransmission counted against the budget until this event.
+                            if let Some(charge) = &mut sb.send_charge { charge.wrote(); }
+                            if sb.reply.is_none() { c.streams.remove(&id); }
+                        }
+                    }
+                    QuicEvent::Stream(StreamEvent::Stopped { id, .. }) => {
+                        let _ = c.quic.send_stream(id).reset(VarInt::from_u32(0));
+                        if let Some(sb) = c.streams.remove(&id) && let Some(reply) = sb.reply {
+                            let _ = reply.send(Err(anyhow::anyhow!("destination stopped QUIC stream")));
+                        }
                     }
                     QuicEvent::Stream(StreamEvent::Opened { dir }) => {
                         while let Some(s) = c.quic.streams().accept(dir) {
                             c.streams.insert(
                                 s,
                                 StreamBuf {
+                                    send_charge: None,
+                                    read_room: ReadRoom { room: Arc::clone(&c.incoming), bytes: 0 },
                                     write: Vec::new(),
                                     write_pos: 0,
                                     finish_write: false,
@@ -767,11 +1215,11 @@ impl DriverState {
                         drain_stream_read(cid, id, c, &self.harness_send, &self.convo_raft, &self.cmd_tx, &self.wake);
                     }
                     QuicEvent::Stream(StreamEvent::Writable { id }) => {
-                        if let Some(sb) = c.streams.get_mut(&id) {
-                            flush_stream_write(&mut c.quic, id, sb);
-                        }
+                        if let Some(sb) = c.streams.get_mut(&id) && !flush_stream_write(&mut c.quic, id, sb) { c.streams.remove(&id); }
                     }
                     QuicEvent::ConnectionLost { .. } => {
+                        c.connected = false;
+                        c.dial_timed_out = true;
                         closed_peer = c.peer_name.clone();
                         for p in c.pending_out.drain(..) {
                             if let Some(r) = p.reply {
@@ -800,12 +1248,28 @@ impl DriverState {
             }
         }
         if let Some(name) = newly_identified {
-            self.by_peer.entry(name).or_insert(cid);
+            // A restarted member proves the same pin on a new connection while its dead
+            // path can still look established until QUIC's idle timeout. Send fresh frames
+            // on the newer authenticated path. Existing streams finish on their own path.
+            let current = self.by_peer.get(&name).and_then(|i| self.conns.get(*i)?.as_ref());
+            let new = self.conns.get(cid).and_then(Option::as_ref);
+            if let Some(new) = new && current.is_none_or(|old| !old.connected || new.started_at >= old.started_at) {
+                self.by_peer.insert(name, cid);
+            }
         }
-        if let Some(name) = closed_peer
-            && self.by_peer.get(&name) == Some(&cid)
-        {
-            self.by_peer.remove(&name);
+        if let Some(name) = closed_peer && self.by_peer.get(&name) == Some(&cid) {
+            // Crossed dials can leave another healthy authenticated path to the same peer.
+            let other = self.conns.iter().enumerate().filter_map(|(id, slot)| {
+                let peer = slot.as_ref()?;
+                (peer.connected && !peer.quic.is_closed() && peer.peer_name.as_deref() == Some(&name)).then_some((peer.started_at,id))
+            }).max();
+            if let Some((_, id)) = other {
+                self.by_peer.insert(name.clone(), id);
+                self.failed_until.lock().remove(&name);
+            } else {
+                self.by_peer.remove(&name);
+                self.connected_peers.lock().remove(&name);
+            }
         }
         self.mark(cid);
     }
@@ -836,20 +1300,35 @@ impl DriverState {
     }
 
     fn next_timeout(&mut self) -> Option<Instant> {
-        self.conns.iter_mut().filter_map(|c| c.as_mut().and_then(|c| c.quic.poll_timeout())).min()
+        self.conns
+            .iter_mut()
+            .filter_map(|c| {
+                let c = c.as_mut()?;
+                let quic_due = c.quic.poll_timeout();
+                let dial_due = (!c.connected && !c.dial_timed_out).then_some(c.dial_due);
+                match (quic_due, dial_due) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            })
+            .min()
     }
 }
 
 fn open_pending_streams(c: &mut PeerConn) {
-    while let Some(item) = c.pending_out.pop_front() {
+    for _ in 0..c.pending_out.len() {
+        let Some(item) = c.pending_out.pop_front() else { break };
+        if item.reply.as_ref().is_some_and(oneshot::Sender::is_canceled) { continue; }
         let dir = if item.reply.is_some() { Dir::Bi } else { Dir::Uni };
         let Some(stream_id) = c.quic.streams().open(dir) else {
             // Stream credit temporarily full: put back at front and retry when stream closes.
-            c.pending_out.push_front(item);
-            return;
+            c.pending_out.push_back(item);
+            continue;
         };
         let mut sb = StreamBuf {
-            write: item.payload,
+            send_charge: Some(item.payload.charge),
+            read_room: ReadRoom { room: Arc::clone(&c.incoming), bytes: 0 },
+            write: item.payload.data,
             write_pos: 0,
             finish_write: true,
             read: Vec::new(),
@@ -857,29 +1336,33 @@ fn open_pending_streams(c: &mut PeerConn) {
             inbound: false,
             dispatched: false,
         };
-        flush_stream_write(&mut c.quic, stream_id, &mut sb);
-        if sb.reply.is_some() || sb.write_pos < sb.write.len() || sb.finish_write {
-            c.streams.insert(stream_id, sb);
-        }
+        if !flush_stream_write(&mut c.quic, stream_id, &mut sb) { continue; }
+        c.streams.insert(stream_id, sb);
     }
 }
 
-fn flush_stream_write(quic: &mut Connection, id: StreamId, sb: &mut StreamBuf) {
+fn flush_stream_write(quic: &mut Connection, id: StreamId, sb: &mut StreamBuf) -> bool {
     while sb.write_pos < sb.write.len() {
         let slice = sb.write.get(sb.write_pos..).unwrap_or_default();
         match quic.send_stream(id).write(slice) {
-            Ok(0) | Err(WriteError::Blocked) => return,
+            Ok(0) | Err(WriteError::Blocked) => return true,
             Ok(n) => sb.write_pos = sb.write_pos.saturating_add(n),
-            Err(_) => {
+            Err(e) => {
+                if let Some(reply) = sb.reply.take() { let _ = reply.send(Err(anyhow::anyhow!("QUIC stream write failed: {e:?}"))); }
+                sb.write = Vec::new();
+                sb.write_pos = 0;
                 sb.finish_write = false;
-                return;
+                return false;
             }
         }
     }
     if sb.finish_write {
-        let _ = quic.send_stream(id).finish();
+        if quic.send_stream(id).finish().is_err() { return false; }
+        sb.write = Vec::new();
+        sb.write_pos = 0;
         sb.finish_write = false;
     }
+    true
 }
 
 fn drain_stream_read(
@@ -900,9 +1383,16 @@ fn drain_stream_read(
             loop {
                 match chunks.next(64 << 10) {
                     Ok(Some(chunk)) => {
-                        if sb.read.len().saturating_add(chunk.bytes.len()) > MAX_STREAM_PAYLOAD + 16 {
+                        let len = sb.read.len().saturating_add(chunk.bytes.len());
+                        if len > MAX_STREAM_PAYLOAD + 5 {
                             reset = true;
                             break;
+                        }
+                        if len > sb.read_room.bytes {
+                            let to = len.next_power_of_two().min(MAX_STREAM_PAYLOAD + 5);
+                            if !sb.read_room.room.try_take(to - sb.read_room.bytes) { reset = true; break; }
+                            sb.read_room.bytes = to;
+                            if sb.read.try_reserve_exact(to - sb.read.len()).is_err() { reset = true; break; }
                         }
                         sb.read.extend_from_slice(&chunk.bytes);
                     }
@@ -921,6 +1411,8 @@ fn drain_stream_read(
         }
     }
     if reset {
+        let _ = c.quic.recv_stream(stream_id).stop(VarInt::from_u32(0));
+        if stream_id.dir() == Dir::Bi { let _ = c.quic.send_stream(stream_id).reset(VarInt::from_u32(0)); }
         if let Some(mut sb) = c.streams.remove(&stream_id)
             && let Some(r) = sb.reply.take()
         {
@@ -928,9 +1420,7 @@ fn drain_stream_read(
         }
         return;
     }
-    if !fin {
-        return;
-    }
+    if !fin { return; }
     let Some(sb) = c.streams.get_mut(&stream_id) else { return };
     if sb.dispatched {
         return;
@@ -939,6 +1429,10 @@ fn drain_stream_read(
     if !sb.inbound {
         // Client side received reply to HarnessSend.
         let reply = parse_reply(&sb.read);
+        if let Ok(P2pSendReply::Started { status, .. }) = &reply {
+            tracing::debug!(target: "kiln.session_latency", peer = c.peer_name.as_deref(), status,
+                rtt_ns = c.quic.rtt().as_nanos(), "direct session start reply");
+        }
         if let Some(tx) = sb.reply.take() {
             let _ = tx.send(reply);
         }
@@ -946,17 +1440,20 @@ fn drain_stream_read(
         return;
     }
     // Server side received complete inbound stream from peer.
-    let from = c.peer_name.clone().unwrap_or_default();
-    let Some((&kind, rest)) = sb.read.split_first() else {
+    let Some(from) = c.peer_name.clone().filter(|_| c.connected && !c.quic.is_closed()) else {
         c.streams.remove(&stream_id);
         return;
     };
-    let Some(head) = rest.first_chunk::<4>() else {
-        c.streams.remove(&stream_id);
-        return;
-    };
-    let len = usize::try_from(u32::from_be_bytes(*head)).unwrap_or(usize::MAX);
-    let Some(body) = rest.get(4..4 + len) else {
+    let read = std::mem::take(&mut sb.read);
+    let room = Arc::clone(&c.incoming);
+    let admitted = std::mem::replace(&mut sb.read_room, ReadRoom { room: room.clone(), bytes: 0 });
+    let decoded = read.split_first().and_then(|(&kind, rest)| {
+        let (head, body) = rest.split_at_checked(4)?;
+        let len = usize::try_from(u32::from_be_bytes(head.try_into().ok()?)).ok()?;
+        (body.len() == len && matches!((kind, stream_id.dir()), (KIND_HARNESS_SEND, Dir::Bi) | (KIND_CONVO_RAFT, Dir::Uni))).then_some((kind, body))
+    });
+    let Some((kind, body)) = decoded else {
+        if stream_id.dir() == Dir::Bi { let _ = c.quic.send_stream(stream_id).reset(VarInt::from_u32(0)); }
         c.streams.remove(&stream_id);
         return;
     };
@@ -966,41 +1463,37 @@ fn drain_stream_read(
             match (parsed, harness_send) {
                 (Ok(ask), Some(tx)) => {
                     let (rtx, rrx) = oneshot::channel();
-                    let sent = tx.try_send(HarnessSendAsk { from, session: ask.session, epoch: ask.epoch, json: ask.json, reply: rtx }).is_ok();
+                    let sent = tx.try_send(HarnessSendAsk { from, session: ask.session, epoch: ask.epoch, json: ask.json, reply: rtx, _room: Some(admitted) }).is_ok();
+                    let incarnation = Arc::clone(&c.incarnation);
                     let (cmd_tx, wake) = (cmd_tx.clone(), Arc::clone(wake));
                     if sent {
                         crate::rt::spawn(async move {
-                            let reply = rrx.await.unwrap_or_else(|_| P2pSendReply::Error { why: "target runner dropped send".into() });
-                            let _ = cmd_tx.try_send(Cmd::StreamReply { conn_id, stream_id, bytes: frame_reply(&reply) });
+                            let reply = match crate::rt::timeout(REQUEST_WAIT, rrx).await {
+                                Ok(Ok(reply)) => reply,
+                                Ok(Err(_)) => P2pSendReply::Error { why: "target runner dropped send".into() },
+                                Err(_) => P2pSendReply::Error { why: "timed out waiting for target receipt; retry with the same message id".into() },
+                            };
+                            let _ = cmd_tx.try_send(Cmd::StreamReply { conn_id, incarnation, stream_id, frame: frame_reply(&reply, room) });
                             wake.notify();
                         });
                     } else {
-                        sb.write = frame_reply(&P2pSendReply::Error { why: "target runner queue full".into() });
-                        sb.write_pos = 0;
-                        sb.finish_write = true;
-                        flush_stream_write(&mut c.quic, stream_id, sb);
+                        if !write_reply(&mut c.quic, stream_id, sb, frame_reply(&P2pSendReply::Error { why: "target runner queue full".into() }, room)) { c.streams.remove(&stream_id); }
                     }
                 }
                 (Ok(_), None) => {
-                    sb.write = frame_reply(&P2pSendReply::NoSession);
-                    sb.write_pos = 0;
-                    sb.finish_write = true;
-                    flush_stream_write(&mut c.quic, stream_id, sb);
+                    if !write_reply(&mut c.quic, stream_id, sb, frame_reply(&P2pSendReply::NoSession, room)) { c.streams.remove(&stream_id); }
                 }
                 (Err(e), _) => {
-                    sb.write = frame_reply(&P2pSendReply::Error { why: format!("malformed direct QUIC send: {e}") });
-                    sb.write_pos = 0;
-                    sb.finish_write = true;
-                    flush_stream_write(&mut c.quic, stream_id, sb);
+                    if !write_reply(&mut c.quic, stream_id, sb, frame_reply(&P2pSendReply::Error { why: format!("malformed direct QUIC send: {e}") }, room)) { c.streams.remove(&stream_id); }
                 }
             }
         }
         KIND_CONVO_RAFT => {
             if let Ok(msg) = postcard::from_bytes::<DirectConvoRaft>(body)
+                && msg.from == from
                 && let Some(tx) = convo_raft
             {
-                let sender = if !from.is_empty() { from } else { msg.from };
-                let _ = tx.try_send(ConvoRaftIn { from: sender, session: msg.session, bytes: msg.bytes });
+                let _ = tx.try_send(ConvoRaftIn { from, session: msg.session, bytes: msg.bytes, _room: Some(admitted) });
             }
             c.streams.remove(&stream_id);
         }
@@ -1013,7 +1506,7 @@ fn drain_stream_read(
 fn parse_reply(buf: &[u8]) -> anyhow::Result<P2pSendReply> {
     let head = buf.first_chunk::<4>().ok_or_else(|| anyhow::anyhow!("short direct QUIC reply"))?;
     let len = usize::try_from(u32::from_be_bytes(*head))?;
-    let body = buf.get(4..4 + len).ok_or_else(|| anyhow::anyhow!("truncated direct QUIC reply"))?;
+    let body = buf.get(4..).filter(|body| body.len() == len).ok_or_else(|| anyhow::anyhow!("bad direct QUIC reply length"))?;
     serde_json::from_slice(body).context("decode direct QUIC P2pSendReply")
 }
 
@@ -1021,6 +1514,63 @@ fn parse_reply(buf: &[u8]) -> anyhow::Result<P2pSendReply> {
 mod tests {
     use super::*;
     use crate::harness::inbox::Answer;
+
+    #[test]
+    fn cp_t3_2_frames_hold_the_byte_and_peer_budgets_until_release() -> anyhow::Result<()> {
+        let room = Arc::new(FrameRoom::new());
+        let old = DirectConvoRaft {session:"s".into(),from:"p".into(),bytes:(0..=255).collect()};
+        let frame = room.encode("p", KIND_CONVO_RAFT, &("s","p",Octets(&old.bytes)))?;
+        anyhow::ensure!(frame.data.get(5..) == Some(postcard::to_allocvec(&old)?.as_slice()));
+        let mut held = vec![frame];
+        for _ in 1..MAX_PENDING_OUT { held.push(room.encode("p",KIND_CONVO_RAFT,&())?); }
+        anyhow::ensure!(room.encode("p",KIND_CONVO_RAFT,&()).is_err() && room.encode("q",KIND_CONVO_RAFT,&()).is_ok());
+        drop(held);
+        anyhow::ensure!(room.counts.lock().is_empty());
+        let reply = P2pSendReply::Error { why:"a".repeat(1024) };
+        let replies = Arc::new(crate::memory::queue::Room::new(&crate::memory::owners::CHANNELS,128));
+        let frame = frame_reply(&reply,replies.clone()).context("budget refusal frame")?;
+        anyhow::ensure!(matches!(parse_reply(&frame.data)?,P2pSendReply::Error {why} if why.contains("budget")));
+        drop(frame);
+        anyhow::ensure!(replies.try_take(128));
+        replies.give(128);
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_restarted_peer_uses_its_new_authenticated_connection() -> anyhow::Result<()> {
+        use crate::memory::{owners, queue};
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let a = Identity::load_or_create(&dir.path().join("a"), "a")?;
+            let b = Identity::load_or_create(&dir.path().join("b"), "b")?;
+            let open = |id: &Identity| -> anyhow::Result<_> {
+                let (tx, rx) = queue::unbounded::<ConvoRaftIn>(&owners::CHANNELS);
+                Ok((PeerQuic::start("127.0.0.1:0".parse()?, id, None, Some(tx))?, rx))
+            };
+            let peer = |name: &str, id: &Identity, quic: &PeerQuic| PeerEntry {
+                name: name.into(), fingerprint: id.fingerprint.clone(), addrs: vec![quic.local_addr()],
+            };
+            let (source, source_rx) = open(&a)?;
+            let (old, old_rx) = open(&b)?;
+            source.update_peers(vec![peer("b", &b, &old)]);
+            old.update_peers(vec![peer("a", &a, &source)]);
+            anyhow::ensure!(source.send_convo_raft("b", "before", "a", &[1]));
+            anyhow::ensure!(crate::rt::timeout(DIAL_TIMEOUT, old_rx.recv()).await??.session == "before");
+
+            // B reopens with its original key and contacts A before A's old connection expires.
+            let (new, new_rx) = open(&b)?;
+            new.update_peers(vec![peer("a", &a, &source)]);
+            anyhow::ensure!(new.send_convo_raft("a", "reconnected", "b", &[2]));
+            anyhow::ensure!(crate::rt::timeout(DIAL_TIMEOUT, source_rx.recv()).await??.session == "reconnected");
+            anyhow::ensure!(source.send_convo_raft("b", "after", "a", &[3]));
+            let frame = futures::future::select(Box::pin(new_rx.recv()), Box::pin(old_rx.recv()));
+            match crate::rt::timeout(DIAL_TIMEOUT, frame).await? {
+                futures::future::Either::Left((frame, _)) => anyhow::ensure!(frame?.session == "after"),
+                futures::future::Either::Right((frame, _)) => anyhow::bail!("sent {} to the retired connection after replacement handshake", frame?.session),
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn direct_hyper_quic_forwards_harness_message_and_raft_between_two_runners() -> anyhow::Result<()> {
@@ -1062,9 +1612,15 @@ mod tests {
             anyhow::ensure!(matches!(r2, P2pSendReply::NoSession), "expected NoSession: {r2:?}");
 
             // 3. laptop-b sends a per-session conversation Raft frame directly to laptop-a over hyper-quic!
-            anyhow::ensure!(quic_b.send_convo_raft("laptop-a", "sess-1", "laptop-b", vec![1, 2, 3, 4]));
+            anyhow::ensure!(quic_b.send_convo_raft("laptop-a", "forged", "different-runner", &[0]));
+            anyhow::ensure!(quic_b.send_convo_raft("laptop-a", "sess-1", "laptop-b", &[1, 2, 3, 4]));
             let got = crate::rt::timeout(Duration::from_secs(3), a_raft_rx.recv()).await??;
             anyhow::ensure!(got.from == "laptop-b" && got.session == "sess-1" && got.bytes == vec![1, 2, 3, 4], "unexpected raft frame: {} {} {:?}", got.from, got.session, got.bytes);
+            let addr = quic_a.local_addr();
+            drop(quic_a);
+            crate::rt::timeout(Duration::from_secs(3), async {
+                while std::net::UdpSocket::bind(addr).is_err() { crate::rt::sleep(Duration::from_millis(1)).await; }
+            }).await?;
             Ok(())
         })
     }

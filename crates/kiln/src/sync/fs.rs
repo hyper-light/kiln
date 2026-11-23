@@ -222,14 +222,8 @@ impl Fs for Std {
         std::fs::OpenOptions::new().write(true).open(path)?.sync_all()
     }
 
-    #[cfg(unix)]
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
-        std::fs::File::open(dir)?.sync_all()
-    }
-
-    #[cfg(not(unix))]
-    fn sync_dir(&self, _dir: &Path) -> io::Result<()> {
-        Ok(())
+        crate::blobs::chunks::sync_dir(dir)
     }
 
     fn temp_id(&self) -> String {

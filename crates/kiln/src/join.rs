@@ -105,6 +105,9 @@ pub fn pem_der(pem: &str) -> anyhow::Result<Vec<u8>> {
 /// `POST /api/join-requests` (no authentication).
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct NewRequest {
+    /// Request permission to authorize a local operator to start sessions and forward messages to fleet members.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session_node: bool,
     pub name: String,
     #[serde(default)]
     pub hostname: String,
@@ -161,8 +164,12 @@ impl Status {
 /// What an approved machine receives: its certificate and where to connect.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Approval {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_registrar: Option<crate::fleet::charter::Certificate>,
     /// The agent name the certificate carries: the machine's id when it sent one
     /// (docs/machines.md), else the requested name or a free variant of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_node_pem: Option<String>,
     pub name: String,
     pub labels: Vec<String>,
     pub cert_pem: String,
@@ -191,6 +198,7 @@ pub struct Polled {
 #[derive(Serialize, Clone, Debug)]
 pub struct Listed {
     pub id: String,
+    pub session_node: bool,
     pub name: String,
     pub hostname: String,
     pub os: String,
@@ -211,6 +219,8 @@ pub struct Listed {
 /// `POST /api/join-requests/<id>/approve` (optional body).
 #[derive(Deserialize, Default, Debug)]
 pub struct Decision {
+    #[serde(default)]
+    pub session_node: bool,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -255,6 +265,7 @@ impl Refusal {
 /// What an approval needs from a pending request.
 #[derive(Debug, Clone)]
 pub struct Candidate {
+    pub session_node: bool,
     pub name: String,
     pub hostname: String,
     pub machine_id: Option<String>,
@@ -264,6 +275,7 @@ pub struct Candidate {
 
 struct Entry {
     id: String,
+    session_node: bool,
     name: String,
     hostname: String,
     machine_id: Option<String>,
@@ -295,6 +307,7 @@ impl Entry {
 
     fn listed(&self, ca_der: &[u8]) -> Listed {
         Listed {
+            session_node: self.session_node,
             id: self.id.clone(),
             name: self.name.clone(),
             hostname: self.hostname.clone(),
@@ -480,6 +493,7 @@ impl Requests {
         g.entries.insert(
             id.clone(),
             Entry {
+                session_node: req.session_node,
                 id: id.clone(),
                 name,
                 hostname,
@@ -559,7 +573,7 @@ impl Requests {
         if e.secret.is_none() {
             return Err(Refusal::Unconfirmed);
         }
-        Ok(Candidate { name: e.name.clone(), hostname: e.hostname.clone(), machine_id: e.machine_id.clone(), labels: e.labels.clone(), csr: e.csr.clone() })
+        Ok(Candidate { session_node: e.session_node, name: e.name.clone(), hostname: e.hostname.clone(), machine_id: e.machine_id.clone(), labels: e.labels.clone(), csr: e.csr.clone() })
     }
 
     /// Record the approval (the certificate was signed by the caller).
@@ -648,6 +662,7 @@ fn error_text(body: &[u8]) -> String {
 #[allow(clippy::disallowed_methods)] // (b) join request retry, picked
 async fn submit(http: &Client, server: &str, me: &Machine, csr: &str, secret: &str, say: &(dyn Fn(&str) + Send + Sync), shutdown: &Shutdown) -> anyhow::Result<Created> {
     let body = NewRequest {
+        session_node: !me.labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL),
         name: me.name.clone(),
         hostname: me.hostname.clone(),
         os: me.os.clone(),
@@ -760,9 +775,20 @@ async fn quic_address(server: &str, a: &Approval) -> String {
 fn store(state_dir: &Path, server: &str, key_pem: &str, a: &Approval, quic: &str) -> anyhow::Result<()> {
     use crate::util::write_secret;
     std::fs::create_dir_all(state_dir).with_context(|| format!("create {}", state_dir.display()))?;
+    let grant = state_dir.join("session-node.pem");
+    if let Some(cert) = &a.session_registrar {
+        crate::fleet::sessions::Routes::save_enrolled_registrar(state_dir,&pem_der(&a.ca_pem)?,cert)?;
+    }
+    if let Some(pem) = &a.session_node_pem {
+        anyhow::ensure!(crate::pki::cert_matches_key(pem, key_pem) && crate::pki::verify_issued(&pem_der(&a.ca_pem)?,&pem_der(pem)?), "invalid session-node grant for this enrollment");
+    } else if grant.try_exists()? {
+        std::fs::remove_file(&grant)?;
+        crate::blobs::chunks::sync_dir(state_dir)?;
+    }
     write_secret(&state_dir.join("agent.key"), key_pem.as_bytes(), 0o600)?;
     write_secret(&state_dir.join("agent.pem"), a.cert_pem.as_bytes(), 0o644)?;
     write_secret(&state_dir.join("ca.pem"), a.ca_pem.as_bytes(), 0o644)?;
+    if let Some(pem) = &a.session_node_pem { write_secret(&grant,pem.as_bytes(),0o600)?; }
     write_secret(&state_dir.join("quic"), quic.as_bytes(), 0o644)?;
     write_secret(&state_dir.join("server"), server.as_bytes(), 0o644)?;
     write_secret(&state_dir.join("labels"), a.labels.join(",").as_bytes(), 0o644)?;
@@ -1099,6 +1125,10 @@ pub async fn cli(a: JoinArgs, shutdown: Shutdown) -> anyhow::Result<Option<crate
     }
     let me = Machine::this(a.name.clone(), &a.labels);
     let joined = request(&server, &me, &state_dir, &say_stderr, &shutdown).await?;
+    if !joined.labels.iter().any(|l| l == crate::proto::OUTPOST_LABEL) {
+        crate::fleet::sessions::enroll_session_node(&state_dir)?;
+        say_stderr(&format!("Local session sign-in token file: {}",state_dir.join("session-admin.token").display()));
+    }
     if a.no_install {
         say_stderr("Starting the agent in the foreground (Ctrl-C stops it).");
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -1173,6 +1203,7 @@ mod tests {
 
     fn new_request(csr: &str, secret: &str) -> NewRequest {
         NewRequest {
+            session_node: false,
             name: "Bench Box".into(),
             hostname: "bench-box".into(),
             os: "linux".into(),
@@ -1278,7 +1309,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let pki = crate::pki::Pki::open(dir.path())?;
         let cert = pki.sign_csr(&c.csr, &c.name, 365)?;
-        let approval = Approval { name: c.name, labels: c.labels, cert_pem: cert, ca_pem: pki.ca_pem.clone(), quic: "box:7071".into(), quic_port: 7071, label: None };
+        let approval = Approval { session_registrar: None, session_node_pem: None, name: c.name, labels: c.labels, cert_pem: cert, ca_pem: pki.ca_pem.clone(), quic: "box:7071".into(), quic_port: 7071, label: None };
         r.approve(&id, approval, now).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         let (p, _) = r.poll(&id, "s3cret", now, ca).map_err(|e| anyhow::anyhow!("{e:?}"))?;
         assert_eq!(p.status, Status::Approved);
@@ -1371,7 +1402,7 @@ mod tests {
         assert_eq!(host_of("http://[fe80::1]:7070/").as_deref(), Some("fe80::1"));
         assert_eq!(host_of("https://ci.example").as_deref(), Some("ci.example"));
         crate::rt::block_on(async {
-            let a = Approval { name: "n".into(), labels: vec![], cert_pem: String::new(), ca_pem: String::new(), quic: "srv-host:7071".into(), quic_port: 7071, label: None };
+            let a = Approval { session_registrar: None, session_node_pem: None, name: "n".into(), labels: vec![], cert_pem: String::new(), ca_pem: String::new(), quic: "srv-host:7071".into(), quic_port: 7071, label: None };
             // An IP the machine reached HTTP at beats an advertised host name.
             assert_eq!(quic_address("http://192.168.1.7:7070", &a).await, "192.168.1.7:7071");
             assert_eq!(quic_address("http://[fe80::1]:7070", &a).await, "[fe80::1]:7071");

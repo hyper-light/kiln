@@ -1107,7 +1107,7 @@ impl Carries for AgentMsg {
             | AgentMsg::RunnerRole { .. }
             // A message routed to a session the runner doesn't hold, sent on: the registry reads its command and route
             // (`crate::harness::registry::Registry::forward`), and sends on only what it routed there itself.
-            | AgentMsg::HarnessForward { .. }) => return Ok(Carried::Nothing(m)),
+            | AgentMsg::HarnessForward { .. } | AgentMsg::HarnessRouteReceipt { .. }) => return Ok(Carried::Nothing(m)),
         };
         Ok(Carried::Read(read))
     }
@@ -1266,7 +1266,7 @@ impl Carries for ServerMsg {
             | ServerMsg::KeepExtend { .. }
             | ServerMsg::JobRerunStep { .. }
             | ServerMsg::JobExec { .. }
-            | ServerMsg::HarnessPackage { .. }
+            | ServerMsg::HarnessPackage { .. } | ServerMsg::ConvoTransferOwnership { .. }
             | ServerMsg::HarnessRelease { .. }
             | ServerMsg::UpdateAvailable { .. }
             | ServerMsg::Diagnose { .. }

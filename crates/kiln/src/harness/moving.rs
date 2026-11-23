@@ -89,6 +89,8 @@ pub enum Carry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raft_move: Option<RaftMove>,
     pub version: u32,
     /// kiln's id of the session: the same over there.
     pub id: String,
@@ -161,7 +163,61 @@ pub struct Package {
     pub mail: Option<super::mail::TransferManifest>,
 }
 
+/// A staged move carries the existing native package unchanged. A pre-Raft receiver rejects
+/// the outer package version before it can activate the provider.
+pub const RAFT_STAGE: u32 = VERSION + 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaftMove {
+    // First member of the v6 envelope. Its checksum covers the exact transmitted bytes with
+    // this fixed-width slot zeroed, including the target, epoch, and native state.
+    pub digest: String,
+    pub source: String,
+    pub target: String,
+    pub format: u32,
+}
+
+const MOVE_HEADER: &[u8] = br#"{"raft_move":{"digest":""#;
+const MOVE_DIGEST_SLOT: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn move_checksum(bytes: &[u8]) -> Result<(std::ops::Range<usize>, String), String> {
+    use sha2::{Digest as _, Sha256};
+    let slot = MOVE_HEADER.len()..MOVE_HEADER.len() + MOVE_DIGEST_SLOT.len();
+    let tail = bytes.get(slot.end..).filter(|tail| tail.starts_with(b"\"")).ok_or("truncated native move checksum")?;
+    if !bytes.starts_with(MOVE_HEADER) { return Err("missing native move checksum".into()); }
+    let mut checksum = Sha256::new();
+    checksum.update(MOVE_HEADER);
+    checksum.update(MOVE_DIGEST_SLOT);
+    checksum.update(tail);
+    Ok((slot, hex::encode(checksum.finalize())))
+}
+
 impl Package {
+    pub fn move_bytes(&mut self) -> Result<Vec<u8>, String> {
+        let mut bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if let Some(stage) = &mut self.raft_move {
+            let (slot, digest) = move_checksum(&bytes)?;
+            bytes.get_mut(slot).ok_or("missing native move checksum")?.copy_from_slice(digest.as_bytes());
+            stage.digest = digest;
+        }
+        Ok(bytes)
+    }
+
+    pub fn verify_move(&self, bytes: &[u8]) -> Result<(), String> {
+        let stage = self.raft_move.as_ref().ok_or("missing native move checksum")?;
+        let (_, digest) = move_checksum(bytes)?;
+        if digest != stage.digest { return Err("native move package checksum mismatch".into()); }
+        Ok(())
+    }
+
+    pub fn stage_move(&mut self, manager: &crate::convo::raft::Manager, to: &str, in_place: bool) -> Result<String, String> {
+        let status = manager.status(&self.id).ok_or_else(|| "session Raft custody is unavailable".to_owned())?;
+        let source = status.owner.filter(|owner| status.leader_name.as_ref() == Some(owner)).ok_or_else(|| "session has no confirmed Raft leader".to_owned())?;
+        if status.epoch != self.state.epoch || (source == to && !in_place) { return Err("session custody changed while preparing its move".into()); }
+        self.raft_move = Some(RaftMove { digest: MOVE_DIGEST_SLOT.to_owned(), source: source.clone(), target: to.to_owned(), format: self.version });
+        self.version = RAFT_STAGE;
+        Ok(source)
+    }
     /// What its harness keeps for it in its home goes along: a package with something of it to put
     /// in place is version 3.
     #[must_use]
@@ -274,6 +330,7 @@ pub fn pack(id: &str, mut spec: Spec, cwd: &str, from: &str, from_cwd: &str, car
         Carry::Seed { .. } | Carry::Words { .. } | Carry::Nothing => spec.resume = None,
     }
     Package {
+        raft_move: None,
         version: version_of(&carry),
         id: id.to_owned(),
         spec,
@@ -423,6 +480,20 @@ mod tests {
         // Claude Code's and Codex's packages stay as older runners read them.
         let claude = pack("s2", Spec { kind: "claude".into(), ..Spec::default() }, "/w", "a", "/w", Carry::Nothing, vec![], State::default());
         assert_eq!(claude.version, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t32_staged_package_detects_interleaved_or_corrupt_native_state() -> anyhow::Result<()> {
+        let mut pkg = pack("s", Spec::default(), "/to", "a", "/from", Carry::Nothing, vec![], State::default());
+        pkg.raft_move = Some(RaftMove { digest: MOVE_DIGEST_SLOT.into(), source: "a".into(), target: "b".into(), format: pkg.version });
+        pkg.version = RAFT_STAGE;
+        let bytes = pkg.move_bytes().map_err(anyhow::Error::msg)?;
+        let received: Package = serde_json::from_slice(&bytes)?;
+        received.verify_move(&bytes).map_err(anyhow::Error::msg)?;
+        let corrupt = String::from_utf8(bytes)?.replace("/from", "/else");
+        let received: Package = serde_json::from_str(&corrupt)?;
+        assert!(received.verify_move(corrupt.as_bytes()).is_err());
         Ok(())
     }
 

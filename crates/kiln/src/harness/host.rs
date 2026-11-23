@@ -31,9 +31,6 @@ use super::session::{self, Info, Session, Sink, Spec};
 pub(crate) mod transfer;
 mod routed;
 
-/// Most routed messages a session's lane takes in one burst (docs/sends.md, "A burst in one commit").
-pub const ROUTED_BURST_MAX: usize = routed::BURST_MAX;
-
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     /// Agent sessions at work on this machine at once ([`Info::at_work`]): finished, paused and
@@ -737,6 +734,7 @@ pub struct Host {
     changed: crate::rt::Changed,
     /// Its sessions' inboxes (CP-T3.2): none without their records (`KILN_INBOX` off, or they
     /// couldn't be opened), and messages then go on as they come, unchecked.
+    owner_fences: Arc<inbox::fencing::Fences>,
     inbox: Option<Arc<Inbox>>,
     /// What waits in each session's own journal here to be handed to it ([`routed::Waiting`]).
     waiting: Mutex<HashMap<String, routed::Waiting>>,
@@ -803,6 +801,7 @@ enum Lane {
     /// ([`Inbox::bring`]), and its inbox opened; `back`: taken back by this host at the epoch it left
     /// at (its inbox's fence lifted).
     Open { epoch: u64, back: bool },
+    ReplayFounded(u64),
     /// A command or a message for it, sent for `epoch`; `at`: when it was handed to the lane, for its wait there
     /// (`crate::route_latency::InLeg::ToSession`; runner-fan).
     Cmd { c: Box<Command>, epoch: Option<u64>, at: std::time::Instant },
@@ -818,7 +817,7 @@ enum Lane {
     Forget,
     /// A message routed to it (docs/sends.md, "Routed to its session"), sent for `epoch`, with its route: taken into
     /// custody by its own inbox, and handed to it as its admission allows ([`Host::take_routed`]).
-    Routed { c: Box<Command>, epoch: Option<u64>, at: std::time::Instant, route: Box<super::route::Route> },
+    Routed { c: Box<Command>, epoch: Option<u64>, at: std::time::Instant, route: Box<super::route::Route>, reply: routed::Reply },
     /// Its room changed while messages wait in its own journal here: those it has room for now are handed to it
     /// ([`Host::admit_waiting`]).
     Admit,
@@ -1062,6 +1061,7 @@ impl Host {
             |d| d.join("attachments"),
         );
         let handovers = file.as_ref().and_then(|f| f.parent()).map(Handovers::of);
+        let owner_fences=Arc::new(inbox::fencing::Fences::open(file.as_deref().map(inbox::fencing::Fences::location)));
         let host = Arc::new_cyclic(|me| Self {
             input_budgets: super::admission::SessionBudgets::default(),
             sessions: Mutex::new(HashMap::new()),
@@ -1082,7 +1082,8 @@ impl Host {
             saves: AtomicU64::new(0),
             metrics,
             changed: crate::rt::Changed::new(),
-            inbox: records.map(|r| Arc::new(Inbox::new(r, inbox::Limits::default()))),
+            owner_fences:owner_fences.clone(),
+            inbox: records.map(|r| Arc::new(Inbox::with_fences(r, inbox::Limits::default(),owner_fences))),
             waiting: Mutex::new(HashMap::new()),
             server_mail: Mutex::new(HashMap::new()),
             lanes: Mutex::new(HashMap::new()),
@@ -1517,6 +1518,8 @@ impl Host {
         sessions.iter().map(|s| (s.id.clone(), *s.pid.lock())).collect()
     }
 
+    pub(crate) fn session_ids(&self) -> Vec<String> { self.sessions.lock().keys().cloned().collect() }
+
     pub fn list(&self) -> Vec<Info> {
         let mut v: Vec<Info> = self.sessions.lock().values().map(|s| s.info()).collect();
         v.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
@@ -1528,6 +1531,36 @@ impl Host {
     pub fn record_sources(&self) -> Vec<crate::convo::record::Source> {
         let sessions: Vec<Arc<Session>> = self.sessions.lock().values().cloned().collect();
         sessions.iter().filter_map(|s| s.record_source()).collect()
+    }
+
+    /// CP-T3.2. Name delegation may precede normal process restore. Include the active
+    /// record on disk, persisted transfer decisions and fences even when no process runs.
+    pub(crate) fn historical_session_names(&self, names: &mut std::collections::BTreeSet<String>) -> anyhow::Result<()> {
+        names.extend(self.session_ids());
+        if let Some(file) = &self.file {
+            Self::read_session_names(file, names)?;
+            names.extend(self.native_restore_fences().map_err(anyhow::Error::msg)?);
+        }
+        if let Some(handovers) = &self.handovers {
+            let held = handovers.locked()?;
+            names.extend(handovers.read()?.into_keys());
+            names.extend(held.decisions()?.into_values().map(|d| d.session));
+            names.extend(handovers.unwritten.lock().keys().cloned());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_session_names(file: &std::path::Path, names: &mut std::collections::BTreeSet<String>) -> anyhow::Result<()> {
+        #[derive(serde::Deserialize)]
+        struct SessionId { id: String }
+        let file = match std::fs::File::open(file) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let saved: Vec<SessionId> = serde_json::from_reader(std::io::BufReader::new(file))?;
+        names.extend(saved.into_iter().map(|s| s.id));
+        Ok(())
     }
 
     pub fn inventory(&self) -> Inventory {
@@ -1543,6 +1576,18 @@ impl Host {
     /// Start a session (`id` keeps a known one's identity, e.g. one the server named). A subagent
     /// opens as its parent runs here ([`Host::like_its_parent`]).
     pub fn open(&self, id: Option<String>, spec: Spec) -> anyhow::Result<Arc<Session>> {
+        self.open_with_creation(id, spec).map(|(session, _)| session)
+    }
+
+    /// Report creation while holding the same locks that publish the session. A batch may
+    /// compensate only the sessions it actually created (W20).
+    pub(crate) fn open_with_creation(&self, id: Option<String>, spec: Spec) -> anyhow::Result<(Arc<Session>, bool)> {
+        self.open_admitted(id, spec, false)
+    }
+
+    /// A forwarded placement that acquired its claim before launching must not charge it
+    /// a second time when the provider is published.
+    pub(crate) fn open_admitted(&self, id: Option<String>, spec: Spec, claim_held: bool) -> anyhow::Result<(Arc<Session>, bool)> {
         // Its boundary decided under this runner's engine setting as it holds it, or not started: one
         // placed just before a switch never starts on the engine it had (kiln plan 01a1dd2e…, P2.3).
         if let Some(why) = crate::harness::engine::stale(spec.engine_version, crate::harness::engine::here()) {
@@ -1563,14 +1608,14 @@ impl Host {
         }
         let spec = self.like_its_parent(spec);
         let claim = spec.claim.clone();
-        let s = self.open_seeded(id, spec, None, None, Vec::new(), false, true)?;
+        let (s, created) = self.open_with_result(id, spec, None, None, Vec::new(), false, true, None)?;
         // Placed here by a runner's owner: its room is held while it runs, what it uses read from its
         // own group (AUDIT M4). An isolated one's microVM is charged from its group as its launch names
         // it (`crate::reach::place::vm_group`, steps 17 and 32).
-        if let Some(c) = claim {
+        if created && !claim_held && let Some(c) = claim {
             hold_claim(c, crate::reach::place::Group::Session(s.id.clone()));
         }
-        Ok(s)
+        Ok((s, created))
     }
 
     /// A subagent (`Spec::subagent`) whose parent runs on this machine takes what only the machine
@@ -1619,6 +1664,13 @@ impl Host {
         })
     }
 
+    fn move_authority(&self) -> Result<Option<Arc<crate::convo::raft::Manager>>, Refused> {
+        match &self.inbox {
+            Some(inbox) => inbox.session_authority().map_err(|e| Refused::Unsure(e.to_string())),
+            None => Ok(None),
+        }
+    }
+
     fn take_over(&self, from: &str, data: &[u8], leaving: bool) -> Result<(), Refused> {
         // What came, read as every payload is (`crate::wire::payload`): its fields this build
         // doesn't know taken and counted.
@@ -1628,7 +1680,52 @@ impl Host {
             Err(_) if leaving => return Err(Refused::NotTaken(LEAVING.into())),
             Err(e) => return Err(Refused::NotTaken(format!("the session from {from} is unreadable: {e}"))),
         };
+        if pkg.version == super::moving::RAFT_STAGE {
+            if leaving { return Err(Refused::NotTaken(LEAVING.into())); }
+            return self.stage_raft_move(from, &pkg, data);
+        }
+        if !pkg.handover && self.move_authority()?.is_some_and(|m| m.status(&pkg.id).is_some()) {
+            return Err(Refused::NotTaken("managed session requires a staged Raft transfer".into()));
+        }
         self.take_over_package(from, pkg, leaving)
+    }
+
+    fn stage_raft_move(&self, from: &str, pkg: &super::moving::Package, data: &[u8]) -> Result<(), Refused> {
+        use std::io::Write as _;
+        pkg.verify_move(data).map_err(Refused::NotTaken)?;
+        let stage = pkg.raft_move.as_ref().ok_or_else(|| Refused::NotTaken("missing Raft move metadata".into()))?;
+        if crate::convo::inbox::session_ok(pkg.id.as_bytes()).is_none() || pkg.handover || !super::moving::takes(stage.format) {
+            return Err(Refused::NotTaken("invalid native move package".into()));
+        }
+        let manager = self.move_authority()?.ok_or_else(|| Refused::NotTaken("destination has no session Raft manager".into()))?;
+        let st = manager.status(&pkg.id).ok_or_else(|| Refused::NotTaken("destination has not joined the session group".into()))?;
+        let epoch = pkg.state.epoch.checked_add(1).ok_or_else(|| Refused::NotTaken("session epoch overflow".into()))?;
+        let on_source = st.owner.as_ref() == Some(&stage.source) && st.leader_name.as_ref() == Some(&stage.source) && st.epoch == pkg.state.epoch;
+        let already_moved = st.is_leader && st.owner.as_ref() == Some(&stage.target) && st.epoch == epoch && st.native_move_digest.as_ref() == Some(&stage.digest);
+        if stage.target != st.node || (from != "the kiln server" && from != stage.source) || (!on_source && !already_moved) {
+            return Err(Refused::NotTaken("destination cannot confirm the move's source and epoch".into()));
+        }
+        if on_source && stage.source == stage.target && self.get(&pkg.id).is_some_and(|s| !matches!(s.info().status, Status::Crashed | Status::Exited)) {
+            return Err(Refused::NotTaken("the session already has a live provider on this runner".into()));
+        }
+        let path = self.files_dir.join(&pkg.id).join(format!("raft-move-{epoch}-{}.json", stage.digest));
+        let keep = || -> anyhow::Result<()> {
+            let dir = path.parent().ok_or_else(|| anyhow::anyhow!("missing native package directory"))?;
+            std::fs::create_dir_all(dir)?;
+            let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+            tmp.write_all(data)?;
+            tmp.as_file().sync_all()?;
+            match tmp.persist_noclobber(&path) {
+                Ok(_) => {}
+                Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    anyhow::ensure!(std::fs::read(&path)? == data, "another move has already staged different native state at this epoch");
+                }
+                Err(e) => return Err(e.error.into()),
+            }
+            crate::blobs::chunks::sync_dir(dir)?;
+            Ok(())
+        };
+        keep().map_err(|e| Refused::NotTaken(format!("staging native move: {e:#}")))
     }
 
     fn take_over_package(&self, from: &str, pkg: super::moving::Package, leaving: bool) -> Result<(), Refused> {
@@ -1690,7 +1787,7 @@ impl Host {
             taken(&pkg.id)?;
             return Err(Refused::Elsewhere(format!("the machine's note says it went on at epoch {epoch} or later")));
         }
-        if self.taken_before(&pkg.id, epoch)? {
+        if pkg.raft_move.is_none() && self.taken_before(&pkg.id, epoch)? {
             taken(&pkg.id)?;
             tracing::info!(target: "kiln.sends", event = "adopt_again", session = %pkg.id, from = %from, epoch, "a hand-over taken over here before, sent again: answered as taken");
             return Ok(());
@@ -1753,6 +1850,9 @@ impl Host {
         let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: pkg.picks_up, note, restored: false, synced: pkg.synced, local: pkg.handover };
         // Taken over, written so before anything of it runs here: no other process of the machine
         // takes this try over, and the one that handed it over doesn't go on with it.
+        if pkg.raft_move.is_some() && !self.move_authority()?.is_some_and(|mgr| crate::agent::owns_session(&mgr, &id, epoch)) {
+            return Err(Refused::NotTaken("Raft custody changed before native activation".into()));
+        }
         taken(&id)?;
         self.open_seeded(Some(pkg.id), pkg.spec, Some(seed), None, kept_pairs(pkg.inbox, pkg.inbox_digests), false, new).map_err(|e| Refused::NotTaken(format!("{e:#}")))?;
         self.take_carried(&id, waiting);
@@ -1798,6 +1898,254 @@ impl Host {
         if gone.is_some() {
             self.mark_dirty();
         }
+    }
+
+    /// CP-T3.2. Close the old lane and stop the provider even if the inbox disk fails.
+    /// Keep the intent through restart until both the inbox and the host record confirm it.
+    pub async fn fence_stale_owner(&self, id: &str, new_epoch: u64) -> anyhow::Result<()> {
+        let lock = self.archive_lock(id);
+        let _one = lock.lock().await;
+        let live = self.get(id).filter(|s| s.epoch() <= new_epoch);
+        let inbox = self.inbox.clone();
+        let previous = self.owner_fences.get(id);
+        let Some(old) = live
+            .as_ref()
+            .map(|s| s.epoch())
+            .or_else(|| previous.as_ref().filter(|p| !p.confirmed).map(|p| p.old))
+        else {
+            return Ok(());
+        };
+        let target = new_epoch.max(old);
+        if live.is_some()
+            && old == target
+            && let Some(inbox) = &inbox
+            && let Some(mgr) = inbox.session_authority().ok().flatten()
+            && mgr
+                .with_status(id, |s| {
+                    s.founded && !s.recovering && s.epoch == old && s.owner.as_deref() == Some(&s.node) && (s.is_leader || s.execution_held)
+                })
+                .unwrap_or(false)
+            && previous.is_none()
+        {
+            return Ok(());
+        }
+        if let Some(s) = &live {
+            s.stop_taking();
+        }
+        let mut marker = {
+            let mut lanes = self.lanes.lock();
+            let marker = self.owner_fences.begin(id, old, target);
+            self.end_lane_locked(
+                &mut lanes,
+                id,
+                Lane::Fence {
+                    epoch: old,
+                    handover: false,
+                },
+            );
+            marker
+        };
+        let provider_pid = live.as_ref().and_then(|s| *s.pid.lock()).filter(|pid| *pid > 1);
+        if marker.provider.is_none() && let Some(pid) = provider_pid {
+            let captured = live.as_ref().and_then(|s| s.ran.lock().0.as_ref().filter(|r| r.pid == pid).map(|r| r.started));
+            let started = match captured {
+                Some(started) => Some(started),
+                None => crate::rt::blocking(move || crate::os::proc::started_at(pid)).await.ok().flatten(),
+            };
+            marker.provider = started.filter(|born| *born > 0).map(|born| (pid,born));
+        }
+        let save = |f: inbox::fencing::Fence| {
+            let fences = self.owner_fences.clone();
+            crate::rt::blocking(move || fences.save(&f))
+        };
+        let write = async {
+            save(marker.clone()).await??;
+            if !marker.confirmed {
+                let inbox = inbox.as_ref().ok_or_else(|| anyhow::anyhow!("the session has no durable inbox"))?;
+                inbox.fence_old_owner(id, old).await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let stop = async {
+            if let Some(s) = &live { s.fence_and_wait().await?; }
+            if let Some((pid, started)) = marker.provider {
+                // A crash can interrupt the process supervisor. Positively match the saved
+                // provider lifetime before stopping any survivor or allowing a replacement.
+                crate::rt::blocking(move || {
+                    let prior = super::survivors::Ran { pid, started, ppid: 0, command: String::new() };
+                    if !super::survivors::alive(std::slice::from_ref(&prior)).is_empty() {
+                        super::survivors::stop_tree(&prior);
+                        anyhow::ensure!(super::survivors::alive(std::slice::from_ref(&prior)).is_empty(),
+                            "old provider {pid} is still running");
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }).await??;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+        let (written, stopped) = futures::join!(write, stop);
+        let result = async {
+            written?;
+            stopped?;
+            if !marker.confirmed {
+                let mut confirmed = marker.clone();
+                confirmed.confirmed = true;
+                save(confirmed).await??;
+            }
+            Ok::<(),anyhow::Error>(())
+        }.await;
+        if let Err(e) = &result {
+            let mut info = marker.clone();
+            info.cause = Some(format!("{e:#}"));
+            if info.at == 0 {
+                info.at = self.clock.unix_ms();
+            }
+            if let Some(s) = &live {
+                info.seq = s.core.lock().events().next_back().map_or(0, |ev| ev.seq);
+            }
+            self.owner_fences.show(&info);
+            if let Err(why) = save(info).await.and_then(|r| r) {
+                tracing::warn!(session=%id,error=%why,"could not persist the fence diagnostic; admission remains closed");
+            }
+            crate::metrics::convo_raft().owner_fence_failures.inc();
+            tracing::error!(session=%id,old_epoch=old,target_epoch=target,error=%format!("{e:#}"),"durable inbox fence failed; local admission remains closed");
+            if let Some(s) = &live {
+                s.core.lock().upsert(&format!("owner-fence-{old}"),None,super::model::Body::Notice {level:super::model::Level::Warn,text:format!("Inbox fencing failed at epoch {old} while advancing to {target}. The old owner refuses new messages. {e:#}")});
+                s.input_changed();
+            }
+        }
+        self.forget_waiting(id);
+        result.map_err(|e| anyhow::Error::new(inbox::fencing::Pending(format!("durable fence for {id} at {old} pending: {e:#}"))))
+    }
+
+    pub(crate) fn fence_notice(&self, id: &str) -> Option<super::model::Event> {
+        self.owner_fences.notice(id)
+    }
+
+    pub(crate) fn pending_owner_fences(&self) -> Vec<String> {
+        self.owner_fences.pending()
+    }
+
+    pub(crate) fn pending_owner_epoch(&self, id: &str) -> Option<u64> {
+        self.owner_fences.get(id).filter(|f| !f.confirmed).map(|f| f.target)
+    }
+
+    async fn prepare_recovered_owner(&self, id: &str, epoch: u64, mgr: &crate::convo::raft::Manager) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            crate::agent::owns_session(mgr, id, epoch),
+            "no local committed execution owner for {id} at {epoch}"
+        );
+        let running = self.get(id).map(|s| s.epoch());
+        if running.is_some_and(|installed| installed != epoch) || self.pending_owner_epoch(id).is_some() {
+            // A restored journal can be older than this provider. Stop its actual epoch and keep
+            // the durable floor until a later committed owner can safely reopen the session.
+            self.fence_stale_owner(id, running.map_or(epoch, |installed| installed.max(epoch))).await?;
+        }
+        if let Some(i) = &self.inbox
+            && i.owner_fences.get(id).is_some()
+        {
+            let lock = self.archive_lock(id);
+            let _one = lock.lock().await;
+            anyhow::ensure!(
+                crate::agent::owns_session(mgr, id, epoch),
+                "ownership changed before reactivating {id}"
+            );
+            let fs = i.owner_fences.clone();
+            let name = id.to_owned();
+            crate::rt::blocking(move || fs.activate(&name, epoch))
+                .await
+                .and_then(|r| r)
+                .map_err(|e| inbox::fencing::Pending(format!("could not reactivate {id} after fencing: {e:#}")))?;
+        }
+        if let Some(i) = &self.inbox {
+            i.owner_fences.check_epoch(id, Some(epoch)).map_err(|e| inbox::fencing::Pending(format!("cannot recover {id} at {epoch}: {e:#}")))?;
+        }
+        Ok(())
+    }
+
+    /// Automatic Raft failover takeover: called on a node that just won a per-session Raft
+    /// election and claimed `new_epoch` after the previous owning runner died without a handoff.
+    /// Reads the Raft-replicated conversation history and inbox state from `store`, advances this
+    /// node's inbox head to `new_epoch` while preserving every previously accepted message id
+    /// (guaranteeing exact-once deduplication and pending message recovery), and opens/resumes the
+    /// session locally at `new_epoch`.
+    pub async fn resume_from_failover(&self, id: &str, new_epoch: u64, store: &crate::convo::store::Store, manager: &Arc<crate::convo::raft::Manager>, authority: Option<&crate::hub::Hub>) -> anyhow::Result<bool> {
+        self.prepare_recovered_owner(id,new_epoch,manager).await?;
+        if self.get(id).is_some_and(|s| s.epoch() == new_epoch) {
+            if let Some(digest) = manager.status(id).filter(|s| !s.native_move_ready).and_then(|s| s.native_move_digest) {
+                let (mgr, session) = (manager.clone(), id.to_owned());
+                crate::rt::blocking_in(crate::rt::SHARE_SESSION, move || mgr.confirm_native_activation(&session, new_epoch, digest)).await??;
+            }
+            return Ok(false);
+        }
+        anyhow::ensure!(crate::agent::owns_session(manager, id, new_epoch), "local custody changed before provider recovery");
+        anyhow::ensure!(crate::convo::inbox::session_ok(id.as_bytes()).is_some(), "invalid session id");
+        let intent = manager.status(id).and_then(|s| s.native_move_digest);
+        let path = intent.map(|digest| (self.files_dir.join(id).join(format!("raft-move-{new_epoch}-{digest}.json")), digest));
+        let staged = crate::rt::blocking(move || -> anyhow::Result<Option<super::moving::Package>> {
+            let Some((path, expected_digest)) = path else { return Ok(None) };
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    let pkg: super::moving::Package = serde_json::from_slice(&bytes)?;
+                    pkg.verify_move(&bytes).map_err(anyhow::Error::msg)?;
+                    anyhow::ensure!(pkg.raft_move.as_ref().is_some_and(|m| m.digest == expected_digest), "staged native package differs from its committed checksum");
+                    Ok(Some(pkg))
+                }
+                Err(e) => Err(e.into()),
+            }
+        }).await??;
+        if let Some(mut pkg) = staged {
+            let stage = pkg.raft_move.as_ref().ok_or_else(|| anyhow::anyhow!("missing staged native move"))?;
+            anyhow::ensure!(pkg.id == id && pkg.version == super::moving::RAFT_STAGE && stage.target == manager.identity().0 && pkg.state.epoch.checked_add(1) == Some(new_epoch), "native move does not match committed custody");
+            let inbox = self.inbox.as_ref().ok_or_else(|| anyhow::anyhow!("destination has no durable inbox"))?;
+            inbox.takeover_epoch(id, new_epoch, self.clock.unix_ms()).await.map_err(|e| anyhow::anyhow!("inbox takeover: {e}"))?;
+            let (mgr, db, session) = (manager.clone(), store.clone(), id.to_owned());
+            let host = self.me.upgrade().ok_or_else(|| anyhow::anyhow!("session host is closing"))?;
+            let source = stage.source.clone();
+            let digest = stage.digest.clone();
+            pkg.version = stage.format;
+            crate::agent::drain_session(&mgr, &db, &session, new_epoch, true).await?;
+            return crate::rt::blocking_in(crate::rt::SHARE_SESSION, move || -> anyhow::Result<bool> {
+                host.take_over_package(&source, pkg, false).map_err(|why| match why { Refused::NotTaken(s) | Refused::Unsure(s) | Refused::Elsewhere(s) => anyhow::anyhow!(s) })?;
+                anyhow::ensure!(host.get(&session).is_some_and(|s| s.epoch() == new_epoch), "native activation did not install the expected provider");
+                mgr.confirm_native_activation(&session, new_epoch, digest)?;
+                Ok(true)
+            }).await?;
+        }
+        let (database, session, node) = (store.clone(), id.to_owned(), manager.identity().0);
+        let prepared = crate::rt::blocking(move || -> anyhow::Result<_> {
+            let Some((mut pkg, env)) = crate::convo::resume::after_election(&database, &session, &node)? else { return Ok(None); };
+            let volume = crate::workspace::arrived_here(&mut pkg.spec);
+            let cwd = session::resolve_cwd(pkg.spec.cwd.as_deref());
+            anyhow::ensure!(volume || std::path::Path::new(&cwd).is_dir(), "session workspace {cwd} is unavailable on the elected node");
+            Ok(Some((pkg, env, cwd)))
+        }).await??;
+        let Some((mut pkg, env, cwd)) = prepared else { return Ok(false) };
+        if let Some(id_needed) = env {
+            let hub = authority.ok_or_else(|| anyhow::anyhow!("the session credential authority is unavailable"))?;
+            let env = crate::agentenvs::resolve::again(hub, id, pkg.spec.isolation.is_some(), "elected owner restoring session").await.map_err(|e| anyhow::anyhow!(e.said()))?;
+            anyhow::ensure!(env.as_ref().is_some_and(|e| e.id == id_needed), "the required provider environment is unavailable");
+            pkg.spec.agentenv = env;
+        }
+        if let Some(isolation) = pkg.spec.isolation.as_ref()
+            && isolation.image.as_deref().is_some_and(|s| s.starts_with(crate::sandbox::isolated::KEPT)) {
+            let hub = authority.ok_or_else(|| anyhow::anyhow!("this session needs its authorized Agentfile"))?;
+            super::lineage::kept_agentfile(hub, Some(isolation), isolation.person.as_deref()).await.map_err(anyhow::Error::msg)?.into_spec(&mut pkg.spec);
+        }
+        let (mut pkg, items) = crate::rt::blocking(move || -> anyhow::Result<_> {
+            let items = super::moving::install(&pkg, &cwd).map_err(anyhow::Error::msg)?;
+            Ok((pkg, items))
+        }).await??;
+        anyhow::ensure!(crate::agent::owns_session(manager, id, new_epoch), "custody changed during provider recovery");
+        let inbox = self.inbox.as_ref().ok_or_else(|| anyhow::anyhow!("the elected node has no durable inbox"))?;
+        inbox.takeover_epoch(id, new_epoch, self.clock.unix_ms()).await.map_err(|e| anyhow::anyhow!("inbox takeover: {e}"))?;
+        crate::agent::drain_session(manager, store, id, new_epoch, true).await?;
+        pkg.state.epoch = new_epoch;
+        let seed = session::Seed { events: pkg.events, state: pkg.state, items, from: pkg.from, from_cwd: pkg.from_cwd, picks_up: false, note: None, restored: true, synced: pkg.synced, local: true };
+        anyhow::ensure!(crate::agent::owns_session(manager, id, new_epoch), "custody changed before provider start");
+        let live = self.open_seeded(Some(id.to_owned()), pkg.spec, Some(seed), None, Vec::new(), false, false)?;
+        anyhow::ensure!(live.epoch() == new_epoch, "a different owner already holds the provider");
+        Ok(true)
     }
 
     /// What session `id` reaches its host through: its attached files, branches, letting go, and its
@@ -1884,14 +2232,25 @@ impl Host {
 
     #[allow(clippy::too_many_arguments)]
     fn open_seeded_with_input(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>, brought: Vec<(String, String)>, back: bool, new: bool, prepared_input: Option<super::admission::Input>) -> anyhow::Result<Arc<Session>> {
+        self.open_with_result(id, spec, seed, handed, brought, back, new, prepared_input).map(|(s, _)| s)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_with_result(&self, id: Option<String>, spec: Spec, seed: Option<session::Seed>, handed: Option<Box<session::Handed>>, brought: Vec<(String, String)>, back: bool, new: bool, prepared_input: Option<super::admission::Input>) -> anyhow::Result<(Arc<Session>, bool)> {
         if Kind::get(&spec.kind).is_none() {
             anyhow::bail!("unknown harness {:?}", spec.kind);
         }
         let id = id.unwrap_or_else(crate::util::new_id);
+        self.owner_fences.check(&id)?;
+        let start_epoch = match (&handed, &seed) {
+            (Some(h), _) => h.core.epoch(),
+            (_, Some(s)) => s.start_epoch()?,
+            _ => 0,
+        };
         {
             let g = self.sessions.lock();
             if let Some(s) = g.get(&id) {
-                return Ok(Arc::clone(s));
+                return Ok((Arc::clone(s), false));
             }
             // A new one goes to work at once (its harness starting, its first message): it takes a
             // place, refused while the machine is full. Those at work count, and those waiting for
@@ -1928,9 +2287,13 @@ impl Host {
         };
         // Whatever is sent to it waits until it's in and its lane is open, its first word there.
         let mut lanes = self.lanes.lock();
+        if let Err(e)=self.owner_fences.check_epoch(&id,Some(start_epoch)) {
+            if new {self.leave(&id);}
+            return Err(e);
+        }
         // Started meanwhile (by another call, its lock first): that one.
         if let Some(s) = self.sessions.lock().get(&id) {
-            return Ok(Arc::clone(s));
+            return Ok((Arc::clone(s), false));
         }
         let input = prepared_input.or_else(|| self.inbox.clone().map(|inbox| {
             let input = super::admission::Input::new(0, self.input_budgets.budget(), inbox);
@@ -1967,7 +2330,7 @@ impl Host {
         drop(lanes);
         self.mark_dirty();
         self.watch();
-        Ok(s)
+        Ok((s, true))
     }
 
     /// Hands `c` to session `id`; see [`Host::command_at`].
@@ -2014,7 +2377,7 @@ impl Host {
             Ok(()) => true,
             Err(async_channel::TrySendError::Full(Lane::Cmd { c, .. })) => {
                 self.release_unaccepted(id, &c);
-                if let Some((message, _)) = message_of(&c) {
+                if let Some(message) = crate::harness::registry::message_id(&c) {
                     let said = Said { message, answer: Err(inbox::Refusal::Full { session: id.to_owned(), limit: LANE }) };
                     let (sink, id) = (self.sink.clone(), id.to_owned());
                     crate::rt::spawn(async move {
@@ -2047,7 +2410,7 @@ impl Host {
     fn prepare_admit(&self, id: &str, c: &Command) -> bool {
         let Command::Admit { peer, token, epoch, generation, peers, command } = c else { return true };
         let Some(s) = self.get(id) else { return true };
-        let Some((message, _)) = message_of(command) else { return true };
+        let Some(message) = crate::harness::registry::message_id(command) else { return true };
         let mut core = s.core.lock();
         let current_epoch = core.state.epoch;
         let Some(inbox) = self.inbox.clone() else {
@@ -2093,7 +2456,7 @@ impl Host {
 
     fn release_unaccepted(&self, id: &str, c: &Command) {
         let Command::Admit { command, .. } = c else { return };
-        let Some((message, _)) = message_of(command) else { return };
+        let Some(message) = crate::harness::registry::message_id(command) else { return };
         let Some(s) = self.get(id) else { return };
         let input = s.core.lock().input.clone();
         if let Some(input) = input {
@@ -2134,11 +2497,9 @@ impl Host {
             let mut high_open = true;
             let mut data_open = true;
             loop {
-                let item = if let Some(item) = next.take() {
+                let item = if high_open && let Ok(item) = high_rx.try_recv() {
                     item
-                } else if high_open
-                    && let Ok(item) = high_rx.try_recv()
-                {
+                } else if let Some(item) = next.take() {
                     item
                 } else if high_open && data_open {
                     let hi = high_rx.recv();
@@ -2171,29 +2532,10 @@ impl Host {
                 match item {
                     // Routed messages waiting one behind another go on together: the session's own store syncs their
                     // takes in one commit ([`Host::take_routed_burst`]). A replaceable status goes alone, in its turn.
-                    Lane::Routed { c, epoch, at, route } if route.status.is_none() => {
+                    Lane::Routed { c, epoch, at, route, reply } if route.status.is_none() => {
                         crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
-                        let mut burst = vec![(*c, epoch, *route)];
-                        while burst.len() < routed::BURST_MAX {
-                            if high_open
-                                && let Ok(urgent) = high_rx.try_recv()
-                            {
-                                next = Some(urgent);
-                                break;
-                            }
-                            match rx.try_recv() {
-                                Ok(Lane::Routed { c, epoch, at, route }) if route.status.is_none() => {
-                                    crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
-                                    burst.push((*c, epoch, *route));
-                                }
-                                Ok(other) => {
-                                    next = Some(other);
-                                    break;
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        h.take_routed_burst(&id, burst).await;
+                        let more = routed::following(&rx, &high_rx, &mut next);
+                        h.take_routed_burst(&id, (*c, epoch, *route, reply), more).await;
                     }
                     item => h.step(&id, item).await,
                 }
@@ -2211,7 +2553,12 @@ impl Host {
     /// Session `id`'s lane ends with `last` (its inbox fenced, or forgotten), once what's ahead of
     /// it is done.
     fn end_lane(&self, id: &str, last: Lane) {
-        let Some(lane) = self.lanes.lock().remove(id) else { return };
+        let mut lanes = self.lanes.lock();
+        self.end_lane_locked(&mut lanes, id, last);
+    }
+
+    fn end_lane_locked(&self, lanes: &mut HashMap<String, SessionLane>, id: &str, last: Lane) {
+        let Some(lane) = lanes.remove(id) else { return };
         self.ending.lock().insert(id.to_owned(), lane.ended);
         let data = lane.data;
         let high = lane.high;
@@ -2219,6 +2566,11 @@ impl Host {
             let _ = data.send(last).await;
             drop(high);
         });
+    }
+
+    pub(super) async fn replay_founded(&self, id: &str, epoch: u64) {
+        let lane = self.lanes.lock().get(id).map(|l| l.high.clone());
+        if let Some(lane) = lane { let _ = lane.send(Lane::ReplayFounded(epoch)).await; }
     }
 
     /// Once everything session `id`'s lane holds now is done (a message its inbox took and its
@@ -2281,11 +2633,14 @@ impl Host {
                 self.take(id, *c, epoch).await
             }
             Lane::Unread { message, epoch, why } => self.unread(id, message, epoch, &why).await,
-            Lane::Routed { c, epoch, at, route } => {
+            Lane::Routed { c, epoch, at, route, reply } => {
                 crate::route_latency::observe_in(crate::route_latency::InLeg::ToSession, crate::route_latency::InKind::Session, at.elapsed());
-                self.take_routed(id, *c, epoch, *route).await;
+                self.take_routed_burst(id, (*c, epoch, *route, reply), || None).await;
             }
             Lane::Admit => self.admit_waiting(id).await,
+            Lane::ReplayFounded(epoch) => {
+                if let Some(session) = self.get(id).filter(|s| s.epoch() == epoch) { self.replay_session_mail(&session).await; }
+            }
             Lane::Mark(done) => {
                 let _ = done.send(());
             }
@@ -2303,10 +2658,8 @@ impl Host {
                     // What waited in its journal here went with it, its journal's transfer carrying it.
                     self.forget_waiting(id);
                 }
-                if let Some(inbox) = &self.inbox
-                    && self.get(id).is_none()
-                {
-                    if let Err(e) = inbox.fence_for(id, epoch, handover).await {
+                if let Some(inbox) = &self.inbox && self.get(id).is_none() {
+                    if inbox.owner_fences.get(id).is_none() && let Err(e) = inbox.fence_for(id, epoch, handover).await {
                         tracing::warn!(target: "kiln.sends", event = "inbox_fence_failed", session = %id, error = %e, "a session's inbox couldn't be fenced after it went on elsewhere");
                     }
                     // What it brought and hadn't taken in went with it.
@@ -2318,7 +2671,7 @@ impl Host {
                     self.forget_waiting(id);
                 }
                 if let Some(inbox) = &self.inbox
-                    && self.get(id).is_none()
+                    && self.get(id).is_none() && inbox.owner_fences.check(id).is_ok()
                     && let Err(e) = inbox.forget(id).await
                 {
                     tracing::warn!(target: "kiln.sends", event = "inbox_forget_failed", session = %id, error = %e, "an ended session's inbox couldn't be let go of");
@@ -2363,7 +2716,7 @@ impl Host {
         // Held (a new build not promoted yet): a message is refused before anything takes it.
         if self.is_held()
             && let Some(s) = &s
-            && let Some((message, _)) = message_of(&c)
+            && let Some(message) = crate::harness::registry::message_id(&c)
         {
             self.say(id, Said { message, answer: Err(inbox::Refusal::Moved { session: id.to_owned(), epoch: s.epoch() }) }).await;
             return;
@@ -2691,7 +3044,7 @@ impl Host {
 
     /// Blue/green runner instances have their active records in <state>/instances/<id>.
     /// Archives belong to the machine, so a later instance can explicitly restore them.
-    fn archive_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn archive_dir(&self) -> Option<PathBuf> {
         let own = self.file.as_ref()?.parent()?;
         let root = match own.parent() {
             Some(instances) if instances.file_name().is_some_and(|n| n == "instances") => instances.parent().unwrap_or(own),
@@ -2906,10 +3259,14 @@ impl Host {
     /// start brings the ended conversation back ([`ArchivedSession::retire`]). Without a marker there is nothing of an
     /// archive to keep in step with, so no lock is taken. Refused, saying why, while an archive or restore of it is
     /// under way; the person ends it once that's done.
-    pub fn end(&self, id: &str) -> Ended {
+    pub fn end(&self, id: &str) -> Ended { self.end_matching(id, None) }
+
+    pub(crate) fn end_created(&self, session: &Arc<Session>) -> Ended { self.end_matching(&session.id, Some(session)) }
+
+    fn end_matching(&self, id: &str, expected: Option<&Arc<Session>>) -> Ended {
         let operation = self.archive_lock(id);
         let Some(_guard) = operation.try_lock() else { return Ended::Refused("its archive or restore is under way: end it once that's done".into()) };
-        if self.get(id).is_none() { return Ended::NotHere; }
+        if self.get(id).is_none_or(|live| expected.is_some_and(|opened| !Arc::ptr_eq(opened, &live))) { return Ended::NotHere; }
         let mut machine_guard = None;
         if let Ok(path) = self.archive_path(id) && path.exists() {
             let lock = crate::os::with_mode(std::fs::OpenOptions::new().create(true).truncate(false).write(true), 0o600).open(path.with_extension("lock"));
@@ -2923,10 +3280,27 @@ impl Host {
                 return Ended::Refused(format!("its unfinished archive couldn't be retired: {e}"));
             }
         }
-        let s = self.sessions.lock().remove(id);
+        // Open publishes both the process and its lane under this same lock. A changed
+        // incarnation cannot be removed, nor can a late cleanup forget its successor's lane.
+        let mut lanes = self.lanes.lock();
+        let s = {
+            let mut sessions = self.sessions.lock();
+            if sessions.get(id).is_none_or(|live| expected.is_some_and(|opened| !Arc::ptr_eq(opened,live))) { return Ended::NotHere; }
+            sessions.remove(id)
+        };
         self.restore_revisions.lock().remove(id);
-        self.end_lane(id, Lane::Forget);
+        self.end_lane_locked(&mut lanes, id, Lane::Forget);
         self.leave(id);
+        // A stable operation may restart a rolled-back slot immediately. Detach its old
+        // attachment directory before the new slot can publish files under the same id.
+        let dir = self.files_dir.join(id);
+        let retired = self.files_dir.join(format!(".retired-{}",crate::util::new_id()));
+        match std::fs::rename(&dir, &retired) {
+            Ok(()) => { crate::rt::spawn(async move { let _ = crate::rt::blocking(move || std::fs::remove_dir_all(retired)).await; }); }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(session=id,error=%e,"could not detach the ended session's attachment directory"),
+        }
+        drop(lanes);
         let found = s.is_some();
         if let Some(s) = s {
             free_claim(s.spec.lock().claim.clone());
@@ -2968,11 +3342,7 @@ impl Host {
                     }
                 });
             }
-            // Its attachments go with it.
-            let dir = self.files_dir.join(id);
-            crate::rt::spawn(async move {
-                let _ = crate::rt::blocking(move || std::fs::remove_dir_all(dir)).await;
-            });
+
         }
         self.mark_dirty();
         drop(machine_guard);
@@ -3296,6 +3666,10 @@ impl Host {
     /// timeline and state as the conversation store kept them (`crate::convo`), when it kept any;
     /// otherwise as before (a Claude Code session's history from its transcript).
     pub fn restore_from(&self, store: Option<&crate::convo::store::Store>) {
+        self.restore_with_authority(store, None);
+    }
+
+    pub(crate) fn restore_with_authority(&self, store: Option<&crate::convo::store::Store>, manager: Option<&crate::convo::raft::Manager>) {
         tracing::info!(how = %crate::os::contain::how(), "agents' processes are held together by");
         let fenced = match self.native_restore_fences() {
             Ok(fenced) => fenced,
@@ -3352,6 +3726,25 @@ impl Host {
             }
         }
         for record in &saved {
+            if self.owner_fences.check(&record.id).is_err() {foreign_or_busy.insert(record.id.clone());}
+            // A Raft group reopens from its committed state once the election establishes ownership.
+            // The process record is only evidence of a survivor that must be stopped first.
+            if let Some(status)=manager.and_then(|m|m.status(&record.id)) {
+                foreign_or_busy.insert(record.id.clone());
+                if status.owner.as_ref().is_some_and(|owner|owner!=&status.node) && status.epoch>=record.epoch
+                    && let Some(inbox)=&self.inbox && inbox.owner_fences.get(&record.id).is_none() {
+                    // A crash can precede the first loss notification. The former local process
+                    // record and the newer committed owner establish the same durable retry intent.
+                    let mut fence=inbox.owner_fences.begin(&record.id,record.epoch,status.epoch);
+                    fence.provider=record.harness.as_ref().map(|r|(r.pid,r.started));
+                    if let Err(e)=inbox.owner_fences.save(&fence) {tracing::error!(session=%record.id,error=%e,"could not persist the restored former-owner fence");}
+                }
+            } else if manager.is_some()
+                && !matches!(store.map(|db| db.has_raft_projection(&record.id)), Some(Ok(false))) {
+                // An unpublished Raft group needs its durable state and an elected owner.
+                // A failed lookup also withholds local replay until custody is established.
+                foreign_or_busy.insert(record.id.clone());
+            }
             if let Some(revision) = &record.restore_revision { self.restore_revisions.lock().insert(record.id.clone(), revision.clone()); }
         }
         let mut restored = Vec::new();
@@ -3691,7 +4084,6 @@ impl Host {
         self.changed.notify();
         Ok(())
     }
-
 }
 
 /// Whether `KILN_INBOX` turns sessions' inboxes off here (said once as it's read).
@@ -3872,13 +4264,21 @@ pub(crate) async fn carry(inbox: &Inbox, id: &str) -> Result<Vec<(String, String
 
 pub(crate) fn message_of(c: &Command) -> Option<(String, String)> {
     match c {
-        Command::Send { id, text, attachments, .. } if !id.is_empty() => {
-            let names: Vec<&str> = attachments.iter().map(|a| a.name.as_str()).collect();
-            // A message from another agent is its words: kiln's note of who sent it changes as its
-            // sender does, and a retry under its key is the same message.
-            Some((id.clone(), inbox::digest(super::ops::peer_words(text), &names)))
+        Command::Send { id, text, attachments, mode, overrides, reply_to, task } if !id.is_empty() => {
+            let payload = inbox::send_digest(super::ops::peer_words(text), attachments);
+            // Plain queued sends retain their exact historical identity. A command that
+            // changes dispatch cannot answer one of their receipts as a successful repeat.
+            let digest = if *mode == super::model::SendMode::Queue && overrides.is_none() && reply_to.is_none() && task.is_none() {
+                payload
+            } else {
+                inbox::dispatch_digest(payload, ("send", mode, overrides, reply_to, task))?
+            };
+            Some((id.clone(), digest))
         }
-        Command::SkillRun { id: Some(id), name, args, .. } if !id.is_empty() => Some((id.clone(), inbox::digest(&format!("/{name} {}", args.as_deref().unwrap_or_default()), &[]))),
+        Command::SkillRun { id: Some(id), name, args, mode } if !id.is_empty() => {
+            let legacy = inbox::digest(&format!("/{name} {}", args.as_deref().unwrap_or_default()), &[]);
+            Some((id.clone(), inbox::dispatch_digest(legacy, ("skill", name, args, mode))?))
+        }
         _ => None,
     }
 }
@@ -4146,6 +4546,8 @@ pub fn refusal(id: &str, spec: &Spec, error: &str) -> Vec<super::core::Update> {
     let kind = Kind::get(&spec.kind);
     let exit = super::model::ExitInfo::now(None, Some(error.to_owned()));
     let info = Info {
+        start_request: spec.start_request.clone(),
+        recovery: super::session::RecoverySettings::of(spec),
         id: id.to_owned(),
         deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
         kind: spec.kind.clone(),
@@ -6411,6 +6813,11 @@ while True:
     #[derive(Default)]
     struct Stalling {
         inner: kiln_seams::records::SimRecords,
+        fence_fails: AtomicBool,
+        hold_fence: AtomicBool,
+        fence_seen: crate::rt::Changed,
+        fence_go: crate::rt::Notify,
+        attempts: std::sync::atomic::AtomicUsize,
         stalled: std::sync::atomic::AtomicBool,
         waiting: std::sync::atomic::AtomicUsize,
     }
@@ -6425,6 +6832,13 @@ while True:
         fn commit<'a>(&'a self, tx: kiln_seams::records::Tx) -> futures::future::BoxFuture<'a, Result<kiln_seams::records::Rev, kiln_seams::records::Refusal>> {
             use std::sync::atomic::Ordering;
             Box::pin(async move {
+                let fencing=tx.writes.iter().any(|w|matches!(w,kiln_seams::records::Write::Put{family,value,..} if family=="inbox-heads" && serde_json::from_slice::<serde_json::Value>(value).ok().and_then(|v|v.get("moved")?.as_bool())==Some(true)));
+                if fencing {
+                    self.attempts.fetch_add(1,Ordering::SeqCst);
+                    self.fence_seen.notify();
+                    if self.hold_fence.load(Ordering::SeqCst) {self.fence_go.notified().await;}
+                    if self.fence_fails.load(Ordering::SeqCst){return Err(kiln_seams::records::Refusal::Unavailable("injected read-only inbox".into()));}
+                }
                 if self.stalled.load(Ordering::SeqCst) {
                     self.waiting.fetch_add(1, Ordering::SeqCst);
                     while self.stalled.load(Ordering::SeqCst) {
@@ -6457,6 +6871,186 @@ while True:
         fn head(&self) -> futures::future::BoxFuture<'_, Result<kiln_seams::records::Rev, kiln_seams::records::Refusal>> {
             self.inner.head()
         }
+    }
+
+    // CP-T3.2. Exercise the real lane, provider stop path and inbox commit.
+    fn former_host(file: PathBuf, records: Arc<Stalling>) -> (Arc<Host>, async_channel::Receiver<(String, Update)>) {
+        let (tx, rx) = async_channel::unbounded();
+        (
+            Host::with_records(tx, Some(file), Limits::default(), crate::rt::clock(), Some(records)),
+            rx,
+        )
+    }
+    async fn start_former_host(
+        dir: &std::path::Path,
+        id: &str,
+        records: Arc<Stalling>,
+    ) -> anyhow::Result<(Arc<Host>, async_channel::Receiver<(String, Update)>)> {
+        let (host, rx) = former_host(dir.join("sessions.json"), records);
+        host.open(Some(id.to_owned()), no_harness(dir))?;
+        host.settled(id).await;
+        Ok((host, rx))
+    }
+
+    #[test]
+    fn a_returning_former_leader_is_fenced() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let session_id = crate::util::new_id();
+            let id = session_id.as_str();
+            let disk = Arc::new(Stalling::default());
+            let (host, _updates) = start_former_host(dir.path(), id, disk.clone()).await?;
+            host.fence_stale_owner(id, 1).await?;
+            assert!(host.get(id).is_none());
+            assert!(!host.command_at(id, message("late", "old"), Some(0)));
+            assert_eq!(disk.attempts.load(Ordering::SeqCst), 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fence_fails_on_a_store_error() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let session_id = crate::util::new_id();
+            let id = session_id.as_str();
+            let disk = Arc::new(Stalling::default());
+            let (host, updates) = former_host(dir.path().join("sessions.json"), disk.clone());
+            #[cfg(unix)]
+            let spec = Spec {
+                program: Some(stand_in(dir.path())?.0.to_string_lossy().into_owned()),
+                ..no_harness(dir.path())
+            };
+            #[cfg(not(unix))]
+            let spec = no_harness(dir.path());
+            let session = host.open(Some(id.to_owned()), spec)?;
+            host.settled(id).await;
+            #[cfg(unix)]
+            let pid = {
+                mc_attention_wait_idle(&session, &updates).await?;
+                session.pid.lock().ok_or_else(|| anyhow::anyhow!("former provider never started"))?
+            };
+            #[cfg(not(unix))]
+            let _ = (&session, &updates);
+            disk.fence_fails.store(true, Ordering::SeqCst);
+            assert!(host.fence_stale_owner(id, 1).await.is_err());
+            assert!(host.get(id).is_none());
+            #[cfg(unix)]
+            assert!(!crate::os::pid_alive(pid), "the old provider must stop on a failed inbox write");
+            assert!(host.fence_notice(id).is_some());
+            assert!(host.open(Some(id.to_owned()), no_harness(dir.path())).is_err());
+            let inbox = host.inbox().ok_or_else(|| anyhow::anyhow!("missing inbox"))?;
+            assert!(inbox.accept(id, "late", "body", Some(0), 1).await.is_err());
+            disk.fence_fails.store(false, Ordering::SeqCst);
+            host.fence_stale_owner(id, 1).await?;
+            assert!(inbox.owner_fences.get(id).is_some_and(|f| f.confirmed));
+            assert!(inbox.accept(id, "late", "body", Some(0), 2).await.is_err());
+            assert_eq!(disk.attempts.load(Ordering::SeqCst), 2);
+            inbox.owner_fences.activate(id, 1)?;
+            assert!(
+                host.open(Some(id.to_owned()), no_harness(dir.path())).is_err(),
+                "an unseeded open cannot occupy the recovered epoch"
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cp_t3_2_an_unpublished_raft_group_cannot_accept_under_the_old_head() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let (_db_dir, store) = crate::convo::store::scratch()?;
+            let manager = crate::convo::raft::Manager::open("former", &dir.path().join("wal"), Some(store))?;
+            let inbox = inbox::Inbox::new(Arc::new(kiln_seams::records::SimRecords::default()), inbox::Limits::default());
+            inbox.open("missing", 0).await?;
+            inbox.set_raft_authority(&manager);
+            let result = inbox.accept("missing", "late", "body", Some(0), 2).await;
+            manager.shutdown();
+            assert!(matches!(result, Err(inbox::Refusal::Unavailable { .. })));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn power_loss_after_a_failed_fence() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let session_id = crate::util::new_id();
+            let id = session_id.as_str();
+            let disk = Arc::new(Stalling::default());
+            let (host, _updates) = start_former_host(dir.path(), id, disk.clone()).await?;
+            disk.fence_fails.store(true, Ordering::SeqCst);
+            assert!(host.fence_stale_owner(id, 1).await.is_err());
+            drop(host);
+            let (restarted, _updates) = former_host(dir.path().join("sessions.json"), disk.clone());
+            let inbox = restarted.inbox().ok_or_else(|| anyhow::anyhow!("missing inbox"))?;
+            assert_eq!(restarted.pending_owner_fences(), [id]);
+            let notice = restarted
+                .fence_notice(id)
+                .ok_or_else(|| anyhow::anyhow!("restart lost the timeline diagnosis"))?;
+            let mut events = Vec::new();
+            crate::api::append_fence_notice(&mut events, None, Some(notice.clone()))?;
+            crate::api::append_fence_notice(&mut events, None, Some(notice))?;
+            assert_eq!(events.len(), 1, "HTTP timeline pages include a stable fence diagnosis only once");
+            assert!(inbox.accept(id, "after-reboot", "body", Some(0), 3).await.is_err());
+            assert!(restarted.open(Some(id.to_owned()), no_harness(dir.path())).is_err());
+            disk.fence_fails.store(false, Ordering::SeqCst);
+            restarted.fence_stale_owner(id, 1).await?;
+            assert!(inbox.owner_fences.get(id).is_some_and(|f| f.confirmed));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_message_arriving_while_the_fence_fails() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let session_id = crate::util::new_id();
+            let id = session_id.as_str();
+            let disk = Arc::new(Stalling::default());
+            let (host, _updates) = start_former_host(dir.path(), id, disk.clone()).await?;
+            disk.fence_fails.store(true, Ordering::SeqCst);
+            disk.hold_fence.store(true, Ordering::SeqCst);
+            let started = disk.fence_seen.listen();
+            let race = async {
+                started.await;
+                assert!(!host.command_at(id, message("racing", "late"), Some(0)));
+                let inbox = host.inbox().ok_or_else(|| anyhow::anyhow!("missing inbox"))?;
+                assert!(inbox.accept(id, "racing", "body", Some(0), 1).await.is_err());
+                disk.fence_go.notify();
+                Ok::<_, anyhow::Error>(())
+            };
+            let (result, race) = futures::join!(host.fence_stale_owner(id, 1), race);
+            race?;
+            assert!(result.is_err());
+            assert!(host.get(id).is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn fence_retry_waits_for_a_change() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let dir = tempfile::tempdir()?;
+            let session_id = crate::util::new_id();
+            let id = session_id.as_str();
+            let disk = Arc::new(Stalling::default());
+            let (host, _updates) = start_former_host(dir.path(), id, disk.clone()).await?;
+            disk.fence_fails.store(true, Ordering::SeqCst);
+            let mut waits = inbox::fencing::RetryWaits::default();
+            assert!(host.fence_stale_owner(id, 1).await.is_err());
+            waits.park(id.into(), 0);
+            let mut ready = Vec::new();
+            for generation in [0, 0, 1, 1, 1, 2, 2] {
+                waits.writable(generation, |id| ready.push(id));
+                for id in ready.drain(..) {
+                    assert!(host.fence_stale_owner(&id, 1).await.is_err());
+                    waits.park(id, generation);
+                }
+            }
+            assert_eq!(disk.attempts.load(Ordering::SeqCst), 3);
+            Ok(())
+        })
     }
 
     /// T3's second check of typed messages' step 4: a send its runner can't read, its session here

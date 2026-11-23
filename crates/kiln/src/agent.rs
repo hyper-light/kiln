@@ -161,6 +161,10 @@ pub struct RekeyRequest {
 
 #[derive(Serialize, Deserialize)]
 pub struct EnrollResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_registrar: Option<crate::fleet::charter::Certificate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_node_pem: Option<String>,
     pub cert_pem: String,
     pub ca_pem: String,
     pub quic: String,
@@ -252,7 +256,9 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
         std::fs::read_to_string(&key_p),
         std::fs::read_to_string(&ca_p),
     )
-        && (!crate::pki::needs_renewal(&c) || o.join_token.is_none()) {
+        && crate::pki::cert_matches_key(&c,&k)
+        && crate::pki::still_valid(&c)
+        && (o.join_token.is_none() || !crate::pki::needs_renewal(&c) || crate::fleet::sessions::local_admin_file(&o.state_dir).is_some()) {
             let quic = std::fs::read_to_string(&quic_p).ok().map(|s| s.trim().to_owned());
             // Known by its name: it moves to its machine id now, as it starts, holding nothing yet.
             let c = moved_to_its_id(o, &c, &k, &ca, &cert_p).await.unwrap_or(c);
@@ -262,26 +268,40 @@ async fn credentials(o: &Opts, shutdown: &Shutdown) -> anyhow::Result<(Vec<u8>, 
         .join_token
         .clone()
         .ok_or_else(|| anyhow::anyhow!("not enrolled and no join token (pass --token or KILN_JOIN_TOKEN)"))?;
-    let (csr, key_pem) = crate::pki::make_csr(&o.name)?;
+    let invite=crate::fleet::sessions::Invite::parse(&token)?;
+    let (csr, key_pem) = match &invite { Some(invite) => invite.csr(&o.state_dir,&o.name)?, None => crate::pki::make_csr(&o.name)? };
     // Enrollment happens before kiln's CA is known: plain http, or https with a public cert.
     let http = Client::public()?;
     let url = format!("{}/api/agents/enroll", o.server_url.trim_end_matches('/'));
     // Read off the runtime's threads: it may run a program (macOS's `ioreg`).
     let machine_id = crate::rt::blocking(crate::os::machine_id).await.ok().flatten();
+    let mut request=EnrollRequest { token: String::new(), name: o.name.clone(), csr, hostname: crate::config::Config::hostname(), machine_id };
+    request.token = match &invite { Some(invite) => invite.proof(&request)?, None => token.clone() };
     let mut backoff = Duration::from_secs(1);
     loop {
         let r = http
             .post(&url)
-            .json(&EnrollRequest { token: token.clone(), name: o.name.clone(), csr: csr.clone(), hostname: crate::config::Config::hostname(), machine_id: machine_id.clone() })
+            .json(&request)
             .send()
             .await;
         match r {
             Ok(resp) if resp.is_success() => {
                 let e: EnrollResponse = resp.json(1 << 20).await.context("enroll response")?;
+                let grant=o.state_dir.join("session-node.pem");
+                if let Some(invite)=&invite { invite.verify(&e,&key_pem)?; }
+                if let Some(cert)=&e.session_registrar {
+                    crate::fleet::sessions::Routes::save_enrolled_registrar(&o.state_dir,&ca_der(&e.ca_pem)?,cert)?;
+                }
+                if let Some(pem)=e.session_node_pem.as_ref().filter(|_| invite.is_some()) { crate::util::write_secret(&grant,pem.as_bytes(),0o600)?; }
+                else if grant.try_exists()? { std::fs::remove_file(&grant)?; }
                 crate::util::write_secret(&key_p, key_pem.as_bytes(), 0o600)?;
-                crate::util::write_secret(&cert_p, e.cert_pem.as_bytes(), 0o644)?;
                 crate::util::write_secret(&ca_p, e.ca_pem.as_bytes(), 0o644)?;
                 crate::util::write_secret(&quic_p, e.quic.as_bytes(), 0o644)?;
+                crate::util::write_secret(&cert_p, e.cert_pem.as_bytes(), 0o644)?;
+                if let Some(invite)=&invite {
+                    crate::fleet::sessions::enroll_session_node(&o.state_dir)?;
+                    invite.completed(&o.state_dir);
+                }
                 tracing::info!(name = %e.name, "enrolled with server");
                 return Ok((ca_der(&e.ca_pem)?, Leaf { cert_pem: e.cert_pem, key_pem }, Some(e.quic)));
             }
@@ -341,8 +361,11 @@ async fn instance_credentials(o: &Opts, id: &str, shutdown: &Shutdown) -> anyhow
         }
         mine && same
     });
+    // A previously connected runner can boot with a still-valid instance identity while
+    // the fleet issuer is unreachable. Connected role renewal supplies its replacement.
     if let Some(c) = &own
-        && !crate::pki::needs_renewal(c)
+        && crate::pki::still_valid(c)
+        && (!crate::pki::needs_renewal(c) || crate::fleet::sessions::local_admin_file(&o.state_dir).is_some())
     {
         return Ok((ca_der(&ca)?, Leaf { cert_pem: c.clone(), key_pem: key }, quic));
     }
@@ -518,6 +541,7 @@ enum Ev {
     /// A session's update, and when its session handed it on: when this runner took it in (goal 10, plan
     /// 01a1a87b2dae step 5).
     Harness(String, crate::harness::core::Update, Instant),
+    InboxChecked(String, crate::harness::core::Update, Instant),
     /// A retained archive/restore finished while the loop kept delivering Reach exits.
     HarnessApplied(HarnessApplied),
     /// The one event-triggered source-journal replay completed, after its bounded sink drained.
@@ -564,13 +588,14 @@ fn in_kind(ev: &Ev) -> crate::route_latency::InKind {
             _ => InKind::Link,
         },
         Ev::Net(_) => InKind::Link,
-        Ev::Harness(..) => InKind::Update,
+        Ev::Harness(..) | Ev::InboxChecked(..) => InKind::Update,
         Ev::Up(_) => InKind::Own,
         _ => InKind::Rest,
     }
 }
 
 enum HarnessApplied {
+    Inbox(String, crate::harness::core::Update, Instant),
     Command { reply: Option<(String, u64)>, result: Result<(), (crate::wire::channel::Refusal, String)> },
     Native(NativePrepared),
     #[cfg(unix)]
@@ -877,6 +902,8 @@ enum Bg {
     /// Exact source manifest Abort is durable; only this event may stop green and resume blue.
     #[cfg(unix)]
     RollbackAuthorized { job: String, why: String, acks: Vec<Ack> },
+    #[cfg(unix)]
+    ReopenRestoredWal { attempt: i64, device: u64, inode: u64 },
     /// (The new build's runner.) A terminal handed over: take it, and say how it went.
     #[cfg(unix)]
     TakeTerminal { session: String, command: Option<String>, cols: u16, rows: u16, replay: Vec<u8>, fd: std::os::fd::OwnedFd, pid: u32, done: futures::channel::oneshot::Sender<Result<(), String>> },
@@ -922,6 +949,8 @@ enum Ack {
 /// A blue/green upgrade under way on the runner being upgraded (`crate::bluegreen`).
 #[cfg(unix)]
 struct Moving {
+    stopped_green: bool,
+    rollback_attempts: i64,
     green: crate::bluegreen::Green,
     /// The new build's instance (its own directory under `<state>/instances/`).
     instance: String,
@@ -942,12 +971,15 @@ struct Moving {
     relays: bool,
     /// Its conversation stores, given to the new build: a rollback takes them back.
     stores: Option<Given>,
+    /// Its conversation Raft WAL directory (`own_dir/convo-raft`), moved beside `conversations.db`.
+    raft_move: Option<(PathBuf, PathBuf, Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 /// The conversation stores a runner gave the new build ([`Moving::stores`]): each file, moved from
 /// and to, and the tee its own store was taken from, to give it back to.
 #[cfg(unix)]
 struct Given {
+    store_id: String,
     held: crate::convo::store::Held,
     moves: Vec<(PathBuf, PathBuf)>,
     own_dir: PathBuf,
@@ -1313,18 +1345,15 @@ async fn leg_room(reach: Option<&crate::reach::node::Handle>, id: &str, key: Str
 /// `name`, its sockets named by `sock`): the new build once it has taken over, or the old one again
 /// after a rollback (the paths are the same).
 #[cfg(unix)]
-fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, sock: &str, state_dir: &std::path::Path) {
+fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Arc<crate::harness::host::Host>>, name: &str, sock: &str, state_dir: &std::path::Path) -> anyhow::Result<()> {
     crate::browser::set_home(state_dir);
-    if let Some(r) = reach
-        && let Err(e) = crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(sock, state_dir), true,harness.cloned())
-    {
-        tracing::warn!(error = %format!("{e:#}"), "`kiln run` will not be available on this machine");
+    if let Some(r) = reach {
+        crate::reach::local::serve(r.clone(), name.to_owned(), crate::reach::local::path(sock, state_dir), true, harness.cloned()).context("bind the local reach socket")?;
     }
-    if let Some(h) = harness
-        && let Err(e) = crate::harness::socket::serve(h, crate::harness::socket::path(sock, state_dir), true)
-    {
-        tracing::warn!(error = %format!("{e:#}"), "`kiln spawn` will not be available in this machine's terminals");
+    if let Some(h) = harness {
+        crate::harness::socket::serve(h, crate::harness::socket::path(sock, state_dir), true).context("bind the local session socket")?;
     }
+    Ok(())
 }
 
 /// Take back everything handed to the new build (it didn't take over). The new build is killed
@@ -1333,14 +1362,14 @@ fn serve_sockets(reach: Option<&crate::reach::node::Handle>, harness: Option<&Ar
 /// starts again from its record). What couldn't come back.
 #[cfg(unix)]
 async fn roll_back(
-    mv: Moving,
+    mv: &mut Moving,
     acks: &[Ack],
     why: &str,
     harness: Option<&Arc<crate::harness::host::Host>>,
     terms: &mut HashMap<String, (PtySession, Arc<crate::termsess::Session>)>,
     term_tx: &crate::memory::queue::Sender<(String, PtyOut)>,
     state_dir: &std::path::Path,
-) -> (Vec<String>, Option<crate::convo::store::Store>) {
+) -> (Vec<String>, Option<crate::convo::store::Store>, bool, bool) {
     use std::os::fd::IntoRawFd as _;
     let empty = tracing::field::Empty;
     let span = tracing::info_span!(target: "kiln::upgrade", parent: &mv.root, "upgrade.rollback", reason = %why, result = empty, error = empty);
@@ -1348,7 +1377,7 @@ async fn roll_back(
     // a while after its link here ends (`Bg::TakeOverEnded`), and the two would hold the same
     // sessions, each with an inbox of its own (CP-T3.2, the thirteenth adversarial check's). One
     // that can't be stopped keeps what it took over.
-    if !stop_new_build(crate::bluegreen::Supervisor::from_env(), mv.green, Duration::from_secs(5)).await {
+    if !mv.stopped_green && !stop_new_build(crate::bluegreen::Supervisor::from_env(), mv.green, Duration::from_secs(5)).await {
         tracing::error!(pid = mv.green.pid, "the new build couldn't be stopped: what it took over stays with it, and nothing is taken back here");
         let kept: Vec<String> = mv
             .items
@@ -1362,15 +1391,30 @@ async fn roll_back(
         span.record("error", "the new build couldn't be stopped");
         mv.root.record("result", "rolled_back");
         mv.root.record("error", why);
-        return (kept, None);
+        return (kept, None, false, false);
     }
+    mv.stopped_green = true;
     let mut problems = Vec::new();
-    // Its conversation stores first, before what comes back writes into them: moved back out of
-    // the new build's folder (removed below) and opened again, the same ids and numbers. One that
-    // couldn't be moved back keeps that folder.
+    // Its conversation stores and WAL first, before what comes back writes into them: moved back
+    // out of the new build's folder (removed below ONLY once every restore succeeded!).
     let store = mv.stores.as_ref().and_then(|g| take_stores_back(g, &mut problems));
+    let stores_ready = mv.stores.is_none() || store.is_some();
+    let mut wal_ready = mv.raft_move.is_some();
+    if let Some((from_wal, to_wal, moved)) = &mv.raft_move
+        && (moved.load(std::sync::atomic::Ordering::Acquire) || !from_wal.try_exists().unwrap_or(false))
+        && let Err(e) = crate::convo::raft::move_wal_dir_checked(to_wal, from_wal, true)
+    {
+        tracing::error!(from = %to_wal.display(), to = %from_wal.display(), error = %format!("{e:#}"), "conversation Raft WAL rollback move failed");
+        wal_ready = false;
+        problems.push(format!("conversation Raft WAL {}: {e:#}", from_wal.display()));
+    } else if let Some((_, _, moved)) = &mv.raft_move {
+        moved.store(false, std::sync::atomic::Ordering::Release);
+    }
+    if !stores_ready || mv.raft_move.is_some() && !wal_ready {
+        return (problems, store, wal_ready, false);
+    }
     let stranded = !problems.is_empty();
-    for (i, item) in mv.items.into_iter().enumerate() {
+    for (i, item) in mv.items.drain(..).enumerate() {
         match item {
             Item::Terminal { session, state, fd, pid } => {
                 if !take_terminal_back(terms, term_tx, session.clone(), state, fd, pid) {
@@ -1378,7 +1422,7 @@ async fn roll_back(
                 }
             }
             Item::Session { record, kept } => {
-                let Some(h) = harness else { continue };
+                let Some(h) = harness.filter(|_| stores_ready) else { continue };
                 let id = record.id().to_owned();
                 // The new build stopped it (and started it again, now gone with it): it starts again here.
                 let stopped = matches!(acks.get(i), Some(Ack::Refused(_)));
@@ -1408,7 +1452,7 @@ async fn roll_back(
     }
     mv.root.record("result", "rolled_back");
     mv.root.record("error", why);
-    (problems, store)
+    (problems, store, wal_ready, stores_ready)
 }
 
 /// (The runner being upgraded.) Its conversation stores, let go of for the new build
@@ -1467,6 +1511,10 @@ fn take_stores_back(g: &Given, problems: &mut Vec<String>) -> Option<crate::conv
             }
         };
         let there = &there;
+        if let Err(error) = crate::convo::recover_file_move(from, to) {
+            problems.push(format!("recover conversation move {}: {error:#}", from.display()));
+            continue;
+        }
         if there.exists()
             && !from.exists()
             && let Err(e) = crate::convo::move_file(there, from)
@@ -1474,9 +1522,345 @@ fn take_stores_back(g: &Given, problems: &mut Vec<String>) -> Option<crate::conv
             problems.push(format!("conversation store {}: {e:#} (it stays at {})", from.display(), there.display()));
         }
     }
-    let st = crate::convo::open(&g.own_dir, crate::config::Conversations::default().upkeep())?;
+    if let Some(st) = g.held.current().filter(|st| st.id() == g.store_id) {
+        return Some(st);
+    }
+    let path = g.own_dir.join(crate::convo::FILE);
+    let restored = path.is_file().then(|| crate::convo::open(&g.own_dir, crate::config::Conversations::default().upkeep())).flatten();
+    let Some(st) = restored.filter(|st| st.id() == g.store_id) else {
+        problems.push(format!("original conversation store {} could not be recovered at {}", g.store_id, path.display()));
+        return None;
+    };
     g.held.give(st.clone());
     Some(st)
+}
+
+/// Open a runner's WAL-backed per-session conversation Raft manager in `wal_dir` (`own_dir/convo-raft`,
+/// following `conversations.db`) off the async shard so WAL replay never stalls runner startup,
+/// publish it globally, start its outgoing replication loop, and start its automatic failover
+/// ownership listener (resuming harness + inbox on election win, fencing stale owner on step-down).
+#[allow(clippy::too_many_arguments)]
+async fn open_convo_raft(
+    name: String,
+    wal_dir: PathBuf,
+    state_dir: PathBuf,
+    restore: bool,
+    convo: Option<crate::convo::store::Store>,
+    harness: Option<Arc<crate::harness::host::Host>>,
+    upstream_raft_name: Arc<parking_lot::RwLock<String>>,
+    up_raft: crate::memory::queue::Sender<Up>,
+    reach_raft: Option<crate::reach::node::Handle>,
+    shutdown: crate::rt::Shutdown,
+) -> Option<(Arc<crate::convo::raft::Manager>, crate::rt::Shutdown)> {
+    let me = name.clone();
+    let dir = wal_dir.clone();
+    let convo_for_failover = convo.clone();
+    let executable = harness.is_some();
+    let reach_for_roster=reach_raft.clone();
+    let mgr = match crate::rt::blocking(move || -> anyhow::Result<_> {
+        if let Some(store) = &convo { store.enable_inbox_for(&me)?; }
+        let peer_dir=state_dir.join("reach");
+        let dormant=if reach_for_roster.is_none() && peer_dir.join("session-members.json").try_exists()? {
+            let ca=std::fs::read_to_string(state_dir.join("ca.pem"))?;
+            Some(crate::fleet::sessions::Routes::open(&peer_dir,&me,&crate::join::pem_der(&ca)?)?)
+        } else {None};
+        let manager=crate::convo::raft::Manager::open_for_host(&me, &dir, convo, crate::fleet::session_policy(&state_dir)?, executable)?;
+        // A joined member needs its authenticated roster before it can certify a new session.
+        // A bootstrap runs its embedded agent with the fleet manager opened by the server.
+        if state_dir.join("session-node.pem").try_exists()? { manager.require_fleet_roster(); }
+        if let Some(r)=reach_for_roster {r.restore_session_members(&manager)?;}
+        if let Some(r)=dormant {r.restore(&manager)?;}
+        Ok(manager)
+    }).await {
+        Ok(Ok(mgr)) => mgr,
+        Ok(Err(e)) => {
+            tracing::warn!(dir = %wal_dir.display(), error = %format!("{e:#}"), "conversation Raft WAL did not start");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(dir = %wal_dir.display(), error = %format!("{e:#}"), "conversation Raft WAL open task failed");
+            return None;
+        }
+    };
+    crate::convo::raft::set_runner_global(Some(Arc::clone(&mgr)));
+    let loop_stop = crate::rt::Shutdown::new();
+    let (out_rx, mgr_stop, sd_loop, sd_parent) = (mgr.outgoing(), Arc::clone(&mgr), loop_stop.clone(), shutdown.clone());
+    crate::rt::spawn(async move {
+        loop {
+            let next = futures::select_biased! {
+                () = sd_loop.cancelled().fuse() => return,
+                () = sd_parent.cancelled().fuse() => {
+                    crate::convo::raft::set_runner_global(None);
+                    let _ = crate::rt::blocking(move || mgr_stop.shutdown()).await;
+                    return;
+                }
+                m = out_rx.recv().fuse() => m,
+            };
+            let Ok(m) = next else { return };
+            let up_name = upstream_raft_name.read().clone();
+            let delivered = if m.to_name == up_name || m.to_name == "server" {
+                let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Raft {
+                    store: "raft".to_owned(),
+                    session: m.session.clone(),
+                    from: name.clone(),
+                });
+                up_raft.try_send(Up::Convo(AgentMsg::Convo { json, data: m.bytes })).is_ok()
+            } else if let Some(r) = &reach_raft {
+                r.send_convo_raft(&m.to_name, &m.session, m.bytes, m.is_snapshot)
+            } else {
+                false
+            };
+            if m.is_snapshot && (!delivered || m.snapshot_last) {
+                mgr_stop.report_snapshot(&m.session, &m.to_name, delivered);
+            }
+        }
+    });
+    if let (Some(host), Some(store)) = (harness, convo_for_failover) {
+        if let Some(inbox) = host.inbox() { inbox.set_raft_authority(&mgr); }
+        if restore {
+            let (h, db, m) = (host.clone(), store.clone(), mgr.clone());
+            if let Err(e) = crate::rt::blocking(move || h.restore_with_authority(Some(&db), Some(&m))).await {
+                tracing::error!(%e, "session restore failed before Raft reconciliation");
+            }
+        }
+        drive_session_ownership(Arc::clone(&mgr), store, host, None, loop_stop.clone(), shutdown);
+    }
+    Some((mgr, loop_stop))
+}
+
+pub(crate) enum SessionJournal { Current, Founded, Fenced }
+
+pub(crate) async fn journal_session_update(mgr: &Arc<crate::convo::raft::Manager>, store: &crate::convo::store::Store, session: &crate::harness::session::Session, epoch: u64, update: &crate::harness::core::Update) -> anyhow::Result<SessionJournal> {
+    use crate::harness::core::Update;
+    let id = &session.id;
+    let now = crate::util::now_ms();
+    let mut rows = crate::convo::rows::of(id, update, now);
+    if rows.is_empty() { return Ok(SessionJournal::Current); }
+    let epoch = match update {
+        Update::Open { info, .. } => info.epoch,
+        Update::State { state } => state.epoch,
+        _ => epoch,
+    };
+    let opening = matches!(update, Update::Open { .. });
+    let (founding, owned) = mgr.with_status(id, |s| {
+        let founding = opening && !s.founded && !s.recovering && (s.is_leader || s.voters.as_slice() == [s.node_id]);
+        // A healthy log leader can temporarily retain the trusted executor elsewhere while
+        // that executor's disk catches up. Its existing provider output still has local custody.
+        let owned = s.founded && !s.recovering && (s.is_leader || s.execution_held) && s.epoch == epoch && s.owner.as_deref() == Some(&s.node);
+        (founding, owned)
+    }).unwrap_or((opening, false));
+    if !founding && !owned { return Ok(SessionJournal::Fenced); }
+    let (store, id, manager) = (store.clone(), id.clone(), mgr.clone());
+    if founding {
+        // A founder that dies immediately after Start must leave the state and opening prompt
+        // together. The session's normal inbox handles the first prompt, including provider-flight fencing.
+        let state = session.core.lock().state.clone();
+        rows.extend(crate::convo::rows::of(&id, &Update::State { state: Box::new(state) }, now));
+        let opening = {
+            let spec = session.spec.lock();
+            match spec.prompt.as_ref().filter(|p| !p.trim().is_empty()) {
+                Some(text) => {
+                    let send = crate::harness::model::Command::Send { id: crate::harness::session::opening_prompt_id(&id), text: text.clone(), mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+                    crate::harness::inbox::Inbox::founding_opening_rows(&id, epoch, spec.opener.as_deref().unwrap_or("server"), &send, session.created_at)?
+                }
+                None => Vec::new(),
+            }
+        };
+        crate::rt::blocking_in(crate::rt::SHARE_SESSION, move || manager.open_leader_with_seed(&id, epoch, rows, opening)).await??;
+        return Ok(SessionJournal::Founded);
+    }
+    crate::rt::blocking(move || store.journal_raft_rows(&id, epoch, rows)).await??;
+    Ok(SessionJournal::Current)
+}
+
+/// A receipt belongs to the committed owner at exactly the accepting epoch.
+pub(crate) fn owns_session(mgr: &crate::convo::raft::Manager, session: &str, epoch: u64) -> bool {
+    mgr.with_status(session, |s| s.founded && !s.recovering && !s.execution_held && s.is_leader && s.epoch == epoch && s.owner.as_deref() == Some(s.node.as_str())).unwrap_or(false)
+}
+
+pub(crate) async fn drain_session(manager: &Arc<crate::convo::raft::Manager>, store: &crate::convo::store::Store, session: &str, epoch: u64, receipt: bool) -> anyhow::Result<()> {
+    let (mgr, db, id) = (manager.clone(), store.clone(), session.to_owned());
+    store.with_outbox_drain(session, move || {
+        anyhow::ensure!(owns_session(&mgr, &id, epoch), "session {id} has no local committed owner at epoch {epoch}");
+        let mut proved = false;
+        db.replicate_inbox_held(&id, epoch, |rows| {
+            mgr.propose_sync(&id, epoch, rows)?;
+            proved = true;
+            Ok(())
+        })?;
+        // A retry whose original transaction was drained must still confirm the current quorum.
+        if receipt && !proved { mgr.propose_sync(&id, epoch, Vec::new())?; }
+        anyhow::ensure!(owns_session(&mgr, &id, epoch), "session custody changed before the receipt was confirmed");
+        Ok(())
+    }).await
+}
+
+pub(crate) async fn commit_inbox_receipt(mgr: &Arc<crate::convo::raft::Manager>, store: &crate::convo::store::Store, session: &str, epoch: u64, answer: &crate::harness::inbox::Answer) -> anyhow::Result<()> {
+    anyhow::ensure!(answer.session == session && (answer.epoch == epoch || answer.repeat && answer.epoch <= epoch), "the inbox receipt belongs to another session or epoch");
+    drain_session(mgr, store, session, epoch, true).await
+}
+
+pub(crate) async fn verify_inbox_answer(mgr: Option<&Arc<crate::convo::raft::Manager>>, store: Option<&crate::convo::store::Store>, session: &str, said: &mut crate::harness::inbox::Said) {
+    let Ok(answer) = &said.answer else { return };
+    let result = match (mgr, store) {
+        (Some(mgr), Some(store)) if answer.message == said.message => {
+            let epoch = mgr.status(session).map_or(answer.epoch, |s| s.epoch);
+            commit_inbox_receipt(mgr, store, session, epoch, answer).await
+        },
+        _ => Err(anyhow::anyhow!("no authoritative receipt for message {}", said.message)),
+    };
+    if let Err(e) = result {
+        said.answer = Err(crate::harness::inbox::Refusal::Unavailable { session: session.into(), why: format!("{e:#}") });
+    }
+}
+
+/// Reconcile on startup and on changes of custody, including an election won again by the same node.
+/// Store the retry intent in the committed group and the pending transactions in SQLite so a crash
+/// between either write and its notification needs no special replay event.
+pub(crate) fn drive_session_ownership(mgr: Arc<crate::convo::raft::Manager>, store: crate::convo::store::Store, host: Arc<crate::harness::host::Host>, authority: Option<std::sync::Weak<crate::hub::Hub>>, stop: crate::rt::Shutdown, parent: crate::rt::Shutdown) {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum Work { Custody, Outbox }
+
+    crate::rt::spawn(async move {
+        let changed = mgr.changed();
+        let writes = store.watch_outbox();
+        let transitions = mgr.failover_events();
+        let mut roles = changed.listen().fuse();
+        let mut scan_outbox = true;
+        let mut queued: std::collections::HashSet<_> = mgr.watch_custody().into_iter().map(|id| (id, Work::Custody)).collect();
+        queued.extend(host.pending_owner_fences().into_iter().map(|id|(id,Work::Custody)));
+        let writable=store.watch();
+        let mut parked_fences=crate::harness::inbox::fencing::RetryWaits::default();
+        let mut busy = std::collections::HashSet::new();
+        let mut failures = HashMap::<(String, Work), i64>::new();
+        let mut running = futures::stream::FuturesUnordered::new();
+        let mut scan_error = None;
+        loop {
+            if stop.is_cancelled() || parent.is_cancelled() { return; }
+            if scan_outbox {
+                let db = store.clone();
+                match crate::rt::blocking(move || db.pending_inbox_sessions()).await {
+                    Ok(Ok(pending)) => {
+                        queued.extend(pending.into_iter().map(|id| (id, Work::Outbox)));
+                        scan_error = None;
+                    }
+                    error => {
+                        tracing::warn!(?error, "could not list pending session transactions");
+                        let (tries, _) = scan_error.unwrap_or((0i64, Instant::now()));
+                        let tries = tries.saturating_add(1);
+                        scan_error = Some((tries, Instant::now() + crate::events::backoff(tries)));
+                    }
+                }
+                scan_outbox = false;
+            }
+            // Remember changes received during a running operation. Only that session waits for
+            // its earlier work. A provider taking time to stop cannot hold up another's fencing.
+            queued.retain(|key| {
+                if !busy.insert(key.clone()) { return true; }
+                let (mgr, db, host, key, authority) = (mgr.clone(), store.clone(), host.clone(), key.clone(), authority.clone());
+                let attempts = failures.get(&key).copied().unwrap_or_default();
+                if key.1==Work::Custody {parked_fences.ownership(&key.0);}
+                let attempted_at=db.grown();
+                running.push(async move {
+                    if attempts > 0 { crate::rt::sleep_until(Instant::now() + crate::events::backoff(attempts)).await; }
+                    let (id, work) = &key;
+                    let result: anyhow::Result<()> = async {
+                        let state=mgr.status(id);
+                        if matches!(work,Work::Custody) && let Some(epoch)=host.pending_owner_epoch(id) {
+                            host.fence_stale_owner(id,epoch).await?;
+                        }
+                        let Some(s)=state else {
+                            // Retirement or WAL recovery can unpublish a managed group while its
+                            // old provider is still alive. It must never become a legacy writer.
+                            if matches!(work, Work::Custody) && let Some(provider) = host.get(id) {
+                                let (db, session) = (db.clone(), id.to_owned());
+                                let recorded = crate::rt::blocking(move || db.has_raft_projection(&session)).await;
+                                if !matches!(recorded, Ok(Ok(false))) {
+                                    host.fence_stale_owner(id, provider.epoch()).await?;
+                                }
+                            }
+                            return Ok(());
+                        };
+                        if !s.founded {
+                            if s.recovering && matches!(work, Work::Custody) && let Some(provider) = host.get(id) {
+                                host.fence_stale_owner(id, provider.epoch()).await?;
+                            }
+                            return Ok(());
+                        }
+
+                        if s.execution_held && s.owner.as_deref()==Some(&s.node) && host.get(id).is_none_or(|h|h.epoch()==s.epoch) {
+                            // An incumbent keeps its provider and local journal. No new provider,
+                            // proposal or acceptance is authorized while durability is held.
+                            return Ok(());
+                        }
+                        let local = owns_session(&mgr, id, s.epoch);
+                        match work {
+                            Work::Outbox if local => {
+                                drain_session(&mgr, &db, id, s.epoch, false).await?;
+                            }
+                            Work::Custody if local => {
+                                if host.get(id).is_none_or(|h| h.epoch() != s.epoch) || (s.native_move_digest.is_some() && !s.native_move_ready) {
+                                    host.resume_from_failover(id, s.epoch, &db, &mgr, authority.as_ref().and_then(std::sync::Weak::upgrade).as_deref()).await?;
+                                }
+                            }
+                            Work::Custody => {
+                                let until = host.get(id).map_or(s.epoch, |h| s.epoch.max(h.epoch()));
+                                host.fence_stale_owner(id, until).await?;
+                            }
+                            Work::Outbox => {}
+                        }
+                        Ok(())
+                    }.await;
+                    (key, result,attempted_at)
+                });
+                false
+            });
+            // A busy session can continuously publish status while another is waiting to be fenced.
+            // Give ready custody, outbox and completion work the same chance to run.
+            futures::select! {
+                () = stop.cancelled().fuse() => return,
+                () = parent.cancelled().fuse() => return,
+                () = roles => {
+                    roles = changed.listen().fuse();
+                    let ids = mgr.take_custody_changes().unwrap_or_else(|| {
+                        let mut ids = mgr.watch_custody();
+                        ids.extend(host.session_ids());
+                        ids
+                    });
+                    for id in ids {
+                        queued.insert((id.clone(), Work::Custody));
+                        queued.insert((id, Work::Outbox));
+                    }
+                }
+                ev = transitions.recv().fuse() => match ev {
+                    Ok(crate::convo::raft::FailoverEvent::Claimed { session, .. } | crate::convo::raft::FailoverEvent::LostLeadership { session, .. }) => { queued.insert((session, Work::Custody)); }
+                    Err(_) => return,
+                },
+                done = async { if running.is_empty() { futures::future::pending().await } else { running.next().await } }.fuse() => if let Some((key, result,attempted_at)) = done {
+                    busy.remove(&key);
+                    if let Err(e)=&result && e.downcast_ref::<crate::harness::inbox::fencing::Pending>().is_some() {
+                        failures.remove(&key);
+                        if store.grown()!=attempted_at {queued.insert(key);}
+                        else if !queued.contains(&key) {parked_fences.park(key.0,attempted_at);}
+                    } else if let Err(e) = result {
+                        tracing::warn!(session=%key.0, error=%format!("{e:#}"), "session work will retry");
+                        let tries = failures.entry(key.clone()).or_default();
+                        *tries = tries.saturating_add(1);
+                        queued.insert(key);
+                    } else { failures.remove(&key); }
+                },
+                () = async {if parked_fences.is_empty(){futures::future::pending().await}else{writable.notified().await}}.fuse() => {
+                    let now=store.grown();
+                    parked_fences.writable(now,|id| {queued.insert((id,Work::Custody));});
+                }
+                () = writes.notified().fuse() => queued.extend(store.take_changed_outbox().into_iter().map(|id| (id, Work::Outbox))),
+                () = async {
+                    if let Some((_, deadline)) = scan_error { crate::rt::sleep_until(deadline).await; }
+                    else { futures::future::pending().await }
+                }.fuse() => scan_outbox = true,
+            }
+        }
+    });
 }
 
 /// The store's feed to the server (`crate::convo::feed`), and the harnesses' own records followed
@@ -2032,8 +2416,12 @@ const EPHEMERAL_JOB_WAIT: Duration = Duration::from_secs(900);
 /// How long a job's count is kept once its events are let go (a kept leg is let go well within).
 const JOURNAL_KEPT: Duration = Duration::from_secs(86_400);
 
-#[allow(clippy::disallowed_methods)] // (e) picked graces before it acts (a cancel's, a take-over's, an exit's last word) and a test build's delays; its loop's every wait is an event or one item's due time (goal 9)
 pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
+    run_node(o, shutdown, None).await
+}
+
+#[allow(clippy::disallowed_methods)] // (e) picked graces before it acts (a cancel's, a take-over's, an exit's last word) and a test build's delays; its loop's every wait is an event or one item's due time (goal 9)
+pub(crate) async fn run_node(o: Opts, shutdown: Shutdown, embedded: Option<Arc<crate::hub::Hub>>) -> anyhow::Result<()> {
     crate::os::start_reaper();
     // Its binary read beside its first connection, which says its build (`updates::runner_build`).
     crate::updates::open_own();
@@ -2097,6 +2485,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     let root = ca.clone();
     // The machine's certificate, its capacity holder's proof (docs/lb.md "A machine's keeper").
     let machine_leaf = leaf.clone();
+    if let Some(h) = &embedded && crate::fleet::session_policy(&h.cfg.server.data_dir)?.auto_failover {
+        crate::fleet::sessions::bootstrap_authority(&h.pki, &o.state_dir, &name, &machine_leaf.key_pem)?;
+    }
     // What this runner's Slates needs to join kiln's Slates fleet where the server's `[slates_fleet]` chooses it (docs/agentic.md
     // W7; `workspace::slates_fleet`): asked as its machine's instance starts. Never in a job pod or an outpost.
     if !o.ephemeral && !o.outpost {
@@ -2286,6 +2677,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             machine: machine_leaf.clone(),
         });
         let cfg = crate::reach::node::Config {
+            sessions_only: embedded.is_some(),
+            sense: embedded.is_none(),
+            session_executor: !o.ephemeral && !o.outpost && !crate::convo::off() && embedded.as_ref().map_or(o.terminal, |h| h.cfg.terminal.enabled),
             adopt: Some(adopt_tx.clone()),
             objects: None,
             root: root.clone(),
@@ -2649,7 +3043,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             Err(e)=>tracing::warn!(error=%format!("{e:#}"),"`kiln run` will not be available on this machine"),
         }}
     }
-    if let Some(h)=&harness{h.restore_from(convo.as_ref());}
     #[cfg(unix)]
     legacy_progress.request(harness.as_ref(), &mut harness_operations, &bg_tx, LegacyCause::Observe);
     // Which of the machine's processes are its agent sessions' own: a run they ask for elsewhere
@@ -2718,63 +3111,66 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
         });
     }
-    // Parts 1–4: per-session/conversation Raft manager + direct `hyper-quic` P2P forwarding +
-    // unified local HTTP server entrypoint (`0.0.0.0:7070` by default on every runner).
-    let inbox_waiters = Arc::new(crate::frontdoor::replica::InboxWaiters::default());
-    let convo_raft = (!o.ephemeral && !o.outpost).then(|| {
-        let mgr = crate::convo::raft::Manager::new(&name, convo.clone());
-        mgr.register_peers(["server"]);
-        crate::convo::raft::set_global(Some(Arc::clone(&mgr)));
-        // Drive outgoing per-session Raft frames (server via LANE_CONVO, peers via direct hyper-quic first).
-        let (out_rx, up_raft, reach_raft, me_name, stop_raft) = (mgr.outgoing(), own.0.clone(), reach.clone(), name.clone(), shutdown.clone());
-        crate::rt::spawn(async move {
-            loop {
-                let next = futures::select_biased! {
-                    () = stop_raft.cancelled().fuse() => return,
-                    m = out_rx.recv().fuse() => m,
-                };
-                let Ok(m) = next else { return };
-                if m.to_name == "server" {
-                    let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Raft {
-                        store: "raft".to_owned(),
-                        session: m.session,
-                        from: me_name.clone(),
-                    });
-                    let _ = up_raft.try_send(Up::Convo(AgentMsg::Convo { json, data: m.bytes }));
-                } else if let Some(r) = &reach_raft {
-                    r.send_convo_raft(&m.to_name, &m.session, m.bytes);
-                }
+    // Parts 1–4: per-session/conversation Raft manager (always in `own_dir/convo-raft` alongside
+    // `conversations.db`, opened off the async shard and handed over cleanly on blue/green upgrades,
+    // and NEVER opened when `KILN_CONVERSATIONS=off` leaves `convo_held` absent).
+    let upstream_raft_name = Arc::new(parking_lot::RwLock::new("server".to_owned()));
+    #[cfg_attr(not(unix), allow(unused_mut, unused_variables))]
+    let (mut convo_raft, mut convo_raft_stop): (Option<Arc<crate::convo::raft::Manager>>, Option<crate::rt::Shutdown>) =
+        if !o.ephemeral && !o.outpost && convo_held.is_some() && convo.is_some() && take_over_pending.is_none() {
+            match open_convo_raft(name.clone(), own_dir.join("convo-raft"), o.state_dir.clone(), true, convo.clone(), harness.clone(), Arc::clone(&upstream_raft_name), own.0.clone(), reach.clone(), shutdown.clone()).await {
+                Some((mgr, stop)) => (Some(mgr), Some(stop)),
+                None => anyhow::bail!("could not acquire the session WAL at {} for node {name}", own_dir.join("convo-raft").display()),
             }
-        });
-        // Feed inbound per-session Raft frames from peer runners (direct hyper-quic / relayed reach) + periodic tick.
-        let (mgr_in, stop_in) = (Arc::clone(&mgr), shutdown.clone());
+        } else {
+            (None, None)
+        };
+    if let Some(h) = &harness && (convo.is_none() || o.ephemeral || o.outpost) && take_over_pending.is_none() {
+        h.restore_from(convo.as_ref());
+    }
+    if !o.ephemeral && !o.outpost && (convo_held.is_some() || embedded.is_some()) {
+        let server_mgr = embedded.as_ref().and_then(|_| crate::convo::raft::server_global());
+        if let (Some(r), Some(m)) = (reach.clone(), server_mgr.clone()) {
+            crate::rt::blocking(move || r.restore_session_members(&m)).await??;
+        }
+        // Long-lived inbound Raft frame dispatcher reading `convo::raft::runner_global()` dynamically so
+        // blue/green hand-overs and rollbacks seamlessly attach without stale manager handles.
+        let stop_in = shutdown.clone();
         crate::rt::spawn(async move {
             loop {
                 futures::select_biased! {
                     () = stop_in.cancelled().fuse() => return,
                     m = convo_raft_rx.recv().fuse() => match m {
                         Ok(m) => {
-                            let _ = mgr_in.step(&m.from, &m.session, &m.bytes);
+                            if let Some(mgr) = crate::convo::raft::runner_global().or_else(|| server_mgr.clone()) {
+                                let _ = mgr.step_owned(&m.from, &m.session, m.bytes);
+                            }
                         }
                         Err(_) => return,
                     },
-                    () = crate::rt::sleep(crate::convo::raft::TICK).fuse() => {
-                        mgr_in.tick();
-                    }
                 }
             }
         });
-        mgr
-    });
+    }
     let local_node = (!o.ephemeral && !o.outpost).then(|| {
+        let configured=o.config.as_deref().and_then(|p|crate::config::Config::load(p).ok());
+        let max_children=embedded.as_ref().and_then(|h|h.cfg.agents.max_children).or_else(||configured.as_ref().and_then(|c|c.agents.max_children));
+        let configured_key=configured.and_then(|c|c.server.admin_token_file);
+        let enrolled_key = crate::fleet::sessions::local_admin_file(&o.state_dir);
         let ln = crate::frontdoor::replica::LocalNode {
             machine: name.clone(),
+            instance: instance_id.clone(),
+            authority_store: embedded.as_ref().map(|h| h.store.clone()),
+            registry: embedded.as_ref().map(Arc::downgrade),
+            node_admin_key: configured_key.is_none() && enrolled_key.is_some(),
+            max_children,
+            owner_key_file: configured_key.or(enrolled_key),
             label: Some(crate::pki::sanitize_name(&o.name)),
-            host: harness.clone(),
-            waiters: Arc::clone(&inbox_waiters),
+            host: match &embedded { Some(h) => h.cfg.terminal.enabled.then(|| h.harness.local.clone()), None => harness.clone() },
             reach: reach.clone(),
-            convo: convo.clone(),
-            convo_raft: convo_raft.clone(),
+            convo: embedded.as_ref().and_then(|h| h.harness.convo.clone()).or_else(|| convo.clone()),
+            // Resolved dynamically via `convo::raft::global()` so blue/green hand-overs never hold a closed manager.
+            convo_raft: embedded.as_ref().and_then(|_| crate::convo::raft::server_global()),
         };
         crate::frontdoor::replica::set_local_node(Some(ln.clone()));
         // Handle inbound P2P routed harness sends arriving over direct `hyper-quic` (or relayed reach).
@@ -2784,11 +3180,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             while let Ok(ask) = p2p_send_rx.recv().await {
                 let ln = ln_in.clone();
                 crate::rt::spawn(async move {
-                    let route = crate::harness::route::Route::of(&ask.json).unwrap_or_else(|| crate::harness::route::Route::new(&ln.machine, &ask.from));
-                    let reply = match crate::wire::payload::payload::<crate::harness::model::Command>(crate::wire::unread::Wire::ReachLink, "harness.command", &ask.json) {
-                        Ok(cmd) => ln.enqueue_local(&ask.session, ask.epoch, cmd, route).await,
-                        Err(e) => crate::reach::wire::P2pSendReply::Error { why: format!("malformed command: {e}") },
-                    };
+                    let active = crate::frontdoor::replica::local_node();
+                    let reply = active.as_deref().unwrap_or(&ln).receive_harness(&ask).await;
                     let _ = ask.reply.send(reply);
                 });
             }
@@ -2797,22 +3190,15 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
     });
     // Start this runner node's own local HTTP server (`0.0.0.0:7070` by default) unless disabled or
     // taking over during blue/green upgrade. Gracefully yields on `AddrInUse` if co-located with `kiln server`.
-    let _node_http = match (&o.node_http, &local_node) {
-        (Some(addr), Some(ln)) if take_over_pending.is_none() => match crate::frontdoor::proxy::Upstream::parse(&o.server_url, &root) {
-            Ok(upstream) => match crate::frontdoor::replica::listen_node_http(addr, upstream, ln.clone(), shutdown.clone()) {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::warn!(%addr, error = %format!("{e:#}"), "node HTTP server did not start");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(url = %o.server_url, error = %format!("{e:#}"), "node HTTP server skipped: invalid server_url");
-                None
-            }
-        },
-        _ => None,
+    let bind_node = |node: &crate::frontdoor::replica::LocalNode| -> anyhow::Result<Option<crate::frontdoor::proxy::Listening>> {
+        let Some(addr) = &o.node_http else { return Ok(None); };
+        let upstream = crate::frontdoor::proxy::Upstream::parse(&o.server_url, &root)?;
+        let listener = crate::frontdoor::replica::listen_node_http(addr, upstream, node.clone(), shutdown.clone())?;
+        anyhow::ensure!(listener.is_some() || embedded.is_some() || !node.node_admin_key, "enrolled node could not acquire its configured HTTP listener at {addr}");
+        Ok(listener)
     };
+    #[cfg_attr(not(unix), allow(unused_variables, unused_mut))]
+    let mut node_http = if take_over_pending.is_none() { local_node.as_ref().map(bind_node).transpose()?.flatten() } else { None };
     let mut harness_wait: Option<Instant> = None;
     // What it last told the server of its machine's say on upgrades, and the newer kiln it heard of.
     let mut accept_said: Option<bool> = None;
@@ -3186,6 +3572,9 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
             }
             Ev::MailReplayed(held) => mail_replay.finish(harness.as_ref(), held),
             Ev::MailBudget => mail_replay.budget_event(harness.as_ref()),
+            Ev::HarnessApplied(HarnessApplied::Inbox(session, update, at)) => {
+                taken.push_back(Ev::InboxChecked(session, update, at));
+            }
             Ev::HarnessApplied(HarnessApplied::Command { reply, result })=>{
                 if let Some((stream,seq))=reply{
                     let answer=match result{Ok(())=>wire_in.took(&stream,seq),Err((code,why))=>wire_in.refused(&stream,seq,code,why)};
@@ -3337,7 +3726,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                         Err(e) => tx.send_blocking(Bg::Failed { job: j, why: format!("{e:#}") }),
                                     };
                                 });
-                                moving = Some(Moving { green, instance: gid, root, healthy: Some(healthy), handing: false, items: Vec::new(), held: Vec::new(), relays: false, stores: None });
+                                moving = Some(Moving { stopped_green: false, rollback_attempts: 0, green, instance: gid, root, healthy: Some(healthy), handing: false, items: Vec::new(), held: Vec::new(), relays: false, stores: None, raft_move: None });
                                 if let Err(e) = waited {
                                     let _ = bg_tx.try_send(Bg::Failed { job, why: format!("couldn't wait for the new build: {e}") });
                                 }
@@ -3450,6 +3839,22 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // this copy of its own, go on where they are and nothing is sent again.
                         // Its own feed and its copy end here (what the server answers them goes
                         // nowhere now); a rollback brings them back.
+                        if stores { drop(node_http.take()); }
+                        let raft_give = if stores {
+                            if let Some(stop) = convo_raft_stop.take() {
+                                stop.cancel();
+                            }
+                            crate::convo::raft::set_runner_global(None);
+                            let from_wal = own_dir.join("convo-raft");
+                            let to_wal = crate::upgrade::instance_dir(&o.state_dir, &mv.instance).join("convo-raft");
+                            convo_raft.take().map(|mgr| {
+                                let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                mv.raft_move = Some((from_wal.clone(), to_wal.clone(), moved.clone()));
+                                (mgr, from_wal, to_wal, moved)
+                            })
+                        } else {
+                            None
+                        };
                         let giving = match (&convo_held, convo.is_some()) {
                             (Some(held), true) if stores => {
                                 let there = crate::upgrade::instance_dir(&o.state_dir, &mv.instance);
@@ -3463,7 +3868,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 if copy.is_some() {
                                     moves.push((own_dir.join(crate::convo::MIRROR_FILE), there.join(crate::convo::MIRROR_FILE)));
                                 }
-                                mv.stores = Some(Given { held: held.clone(), moves: moves.clone(), own_dir: own_dir.clone(), aside: None });
+                                mv.stores = Some(Given { store_id: own.as_ref().map(|st| st.id().to_owned()).unwrap_or_default(), held: held.clone(), moves: moves.clone(), own_dir: own_dir.clone(), aside: None });
                                 Some((held.clone(), own, copy, moves))
                             }
                             _ => None,
@@ -3473,18 +3878,33 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             let mut acks = Vec::with_capacity(frames.len());
                             let mut broke: Option<String> = None;
                             let mut aside = None;
-                            if let Some((held, own, copy, moves)) = giving {
+                            if let Some((mgr, from_wal, to_wal, moved)) = raft_give {
+                                // Stop WAL owner thread & close every `convo-raft-*.log` fd before moving directory.
+                                // A failed WAL move MUST abort handover and roll back so the new build
+                                // never opens an empty WAL and loses term/vote/log!
+                                mgr.shutdown();
+                                drop(mgr);
+                                if let Err(e) = crate::convo::raft::move_wal_dir_checked(&from_wal, &to_wal, true) {
+                                    tracing::error!(from = %from_wal.display(), to = %to_wal.display(), error = %format!("{e:#}"), "conversation Raft WAL handover move failed; rolling back handover");
+                                    broke = Some(format!("conversation Raft WAL handover move failed: {e:#}"));
+                                } else { moved.store(true, std::sync::atomic::Ordering::Release); }
+                            }
+                            if broke.is_none()
+                                && let Some((held, own, copy, moves)) = giving
+                            {
                                 let said = give_stores(&held, own, copy, &moves);
-                                // The stores never hold an upgrade back: one the new build can't open
-                                // it sets aside, kept whole, and goes on in a new one; one that keeps
-                                // none (it couldn't even open a new one) still takes the rest.
-                                match conn.send(&said, &[]).and_then(|()| conn.recv()) {
+                                let answer = if matches!(&said, Frame::Stores { own: Some(_), .. }) {
+                                    conn.send(&said, &[]).and_then(|()| conn.recv())
+                                } else {
+                                    Err(anyhow::anyhow!("the original conversation store could not be handed over"))
+                                };
+                                match answer {
                                     Ok((Frame::StoresTaken { kept, own_aside, mirror_aside, note }, _)) => {
                                         aside = Some([own_aside.map(PathBuf::from), mirror_aside.map(PathBuf::from)]);
-                                        match (kept, note) {
+                                        match (kept && aside.as_ref().is_some_and(|paths| paths.first().is_some_and(Option::is_none)), note) {
                                             (true, None) => {}
                                             (true, Some(note)) => tracing::warn!(%note, "the new build went on with this runner's conversation stores, not all as they were"),
-                                            (false, note) => tracing::warn!(error = %note.unwrap_or_default(), "the new build keeps no conversation store; the upgrade goes on"),
+                                            (false, note) => broke = Some(note.unwrap_or_else(|| "the new build could not take durable session custody".into())),
                                         }
                                     }
                                     Ok(_) => broke = Some("the new build answered out of turn".to_owned()),
@@ -3697,24 +4117,98 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let records = moving.as_ref().map(|moving| moving.items.iter().filter_map(|item| match item { Item::Session { record, .. } => Some((**record).clone()), Item::Terminal { .. } => None }).collect()).unwrap_or_default();
                         native_handover.prepare(&mut harness_operations, harness.clone(), NativePreparation::Rollback { job, why, acks: Vec::new(), records });
                     }
+                    Bg::ReopenRestoredWal { attempt, device, inode } => {
+                        use std::os::unix::fs::MetadataExt as _;
+                        let wal = own_dir.join("convo-raft");
+                        if convo_raft.is_some() || moving.is_some() || retiring || convo.is_none()
+                            || !std::fs::metadata(&wal).is_ok_and(|m| m.dev() == device && m.ino() == inode) { continue; }
+                        match open_convo_raft(name.clone(), wal, o.state_dir.clone(), false, convo.clone(), harness.clone(), upstream_raft_name.clone(), own.0.clone(), reach.clone(), shutdown.clone()).await {
+                            Some((mgr, stop)) => {
+                                (convo_raft, convo_raft_stop) = (Some(mgr), Some(stop));
+                                if let Some(host) = &harness { host.hold(false); }
+                            }
+                            None => {
+                                let (send, shutdown) = (bg_tx.clone(), shutdown.clone());
+                                crate::rt::spawn(async move {
+                                    if matches!(futures::future::select(shutdown.cancelled().boxed(), crate::rt::sleep(crate::events::backoff(attempt)).boxed()).await, futures::future::Either::Right(_)) {
+                                        let _ = send.send(Bg::ReopenRestoredWal { attempt: attempt.saturating_add(1), device, inode }).await;
+                                    }
+                                });
+                            }
+                        }
+                    }
                     Bg::RollbackAuthorized { job, why, acks } => {
                         if let Some(mut mv) = moving.take() {
                             if let Some(h) = mv.healthy.take() {
                                 h.record("result", "failed");
                                 h.record("error", why.as_str());
                             }
+                            let (mut rb_problems, back, wal_ready, custody_ready) = roll_back(&mut mv, &acks, &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
+                            if !custody_ready {
+                                if let Some(host) = &harness { host.hold(true); }
+                                draining = true;
+                                let reason = rb_problems.join("; ");
+                                if mv.stopped_green {
+                                    mv.rollback_attempts = mv.rollback_attempts.saturating_add(1);
+                                    let delay = crate::events::backoff(mv.rollback_attempts);
+                                    moving = Some(mv);
+                                    let (send, end) = (bg_tx.clone(), shutdown.clone());
+                                    tracing::warn!(%job, %reason, "rollback waiting for its original durable stores");
+                                    crate::rt::spawn(async move {
+                                        if matches!(futures::future::select(end.cancelled().boxed(), crate::rt::sleep(delay).boxed()).await, futures::future::Either::Right(_)) {
+                                            let _ = send.send(Bg::RollbackAuthorized { job, why, acks }).await;
+                                        }
+                                    });
+                                } else {
+                                    own.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("rollback kept this runner fenced after {why}: {reason}")) }).await;
+                                }
+                                continue;
+                            }
                             let held_back = std::mem::take(&mut mv.held);
-                            let (_, back) = roll_back(mv, &acks, &why, harness.as_ref(), &mut terms, &term_tx, &o.state_dir).await;
                             if let Some(st) = back {
+                                if let Some(mgr) = &convo_raft {
+                                    mgr.set_store(st.clone());
+                                }
                                 let ship = start_feed(&st, harness.as_ref(), &uplink.0);
                                 if connected {
                                     ship.link(crate::convo::feed::Link::Up);
                                 }
                                 (convo, shipper) = (Some(st), Some(ship));
                             }
-                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
-                            for d in held_back {
-                                let _ = bg_tx.try_send(Bg::Forwarded(d));
+                            // Only reopen `convo_raft` if rollback actually stopped the incoming
+                            // build and restored our WAL directory (never opening on a live rival!).
+                            if wal_ready && convo_held.is_some() && convo.is_some() && convo_raft.is_none() {
+                                use std::os::unix::fs::MetadataExt as _;
+                                let wal = own_dir.join("convo-raft");
+                                match std::fs::metadata(&wal) {
+                                    Ok(meta) => match open_convo_raft(name.clone(), wal, o.state_dir.clone(), false, convo.clone(), harness.clone(), upstream_raft_name.clone(), own.0.clone(), reach.clone(), shutdown.clone()).await {
+                                        Some((mgr, stop)) => { (convo_raft, convo_raft_stop) = (Some(mgr), Some(stop)); }
+                                        None => {
+                                            rb_problems.push("restored conversation WAL is unavailable, reopening will retry".into());
+                                            taken.push_back(Ev::Bg(Bg::ReopenRestoredWal { attempt: 1, device: meta.dev(), inode: meta.ino() }));
+                                        }
+                                    },
+                                    Err(error) => rb_problems.push(format!("cannot verify restored conversation WAL: {error}")),
+                                }
+                            }
+                            if let Some(node) = &local_node {
+                                let mut node = node.clone();
+                                node.convo = convo.clone();
+                                crate::frontdoor::replica::set_local_node(Some(node.clone()));
+                                if node_http.is_none() {
+                                    match bind_node(&node) { Ok(l) => node_http = l, Err(e) => rb_problems.push(format!("localhost listener: {e:#}")) }
+                                }
+                            }
+                            if let Err(e) = serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir) { rb_problems.push(format!("{e:#}")); }
+                            for data in held_back { taken.push_back(Ev::Forwarded(data)); }
+                            if let Some(host) = &harness { host.hold(wal_ready && convo_raft.is_none()); }
+                            if !rb_problems.is_empty() {
+                                let joined = rb_problems.join("; ");
+                                moved.clear();
+                                draining = false;
+                                tracing::warn!(%job, error = %why, rollback = %joined, "the new build didn't come up; rollback reported problems");
+                                own.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("the new build didn't come up ({why}): {joined}")) }).await;
+                                continue;
                             }
                         }
                         moved.clear();
@@ -3722,16 +4216,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         tracing::warn!(%job, error = %why, "the new build didn't come up; this runner goes on");
                         own.msg(AgentMsg::UpgradeDone { job, ok: false, error: Some(format!("the new build didn't come up ({why}): it was stopped, and this runner goes on as it was")) }).await;
                     }
-                    Bg::Stores { own, mirror: copy, done } => {
-                        // Moved into this runner's folder by the runner it takes over from (its
-                        // copy of the server's beside it, opened when the server first sends it),
-                        // or none came: one of its own, there. One that won't open is set aside,
-                        // kept whole, and a new one takes its place: the stores never hold an
-                        // upgrade back.
+                    Bg::Stores { own: handed_own, mirror: copy, done } => {
+                        // The sender retains custody unless its original session store opens here.
+                        // Its rebuildable mirror may be set aside independently.
                         let here = [own_dir.join(crate::convo::FILE), own_dir.join(crate::convo::MIRROR_FILE)];
                         // Handed where this one doesn't look for them (a build that lays its folder
                         // out otherwise): moved where it does.
-                        for (handed, here) in [own.as_ref(), copy.as_ref()].into_iter().zip(&here) {
+                        if handed_own.as_ref().is_some_and(|p| p != &own_dir.join(crate::convo::FILE) && own_dir.join(crate::convo::FILE).exists()) {
+                            let _ = done.send(Taken { kept: false, note: Some("an unrelated conversation store occupies the destination".into()), ..Taken::default() });
+                            continue;
+                        }
+                        for (handed, here) in [handed_own.as_ref(), copy.as_ref()].into_iter().zip(&here) {
                             if let Some(p) = handed.filter(|p| *p != here && !here.exists())
                                 && let Err(e) = crate::convo::move_file(p, here)
                             {
@@ -3745,7 +4240,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         {
                             let (dir, upkeep, with_copy) = (own_dir.clone(), crate::config::Conversations::default().upkeep(), copy.is_some());
                             let (st, aside, copy_aside) = crate::rt::blocking(move || {
-                                let (st, aside) = crate::convo::open_or_set_aside(&dir, crate::convo::FILE, upkeep);
+                                let st = dir.join(crate::convo::FILE).is_file().then(|| crate::convo::open(&dir, upkeep)).flatten();
                                 // The copy of the server's handed over: tried now, so that one that
                                 // won't open is set aside and the server's next batch starts a new
                                 // copy (opened then, as ever).
@@ -3760,7 +4255,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                 } else {
                                     None
                                 };
-                                (st, aside, copy_aside)
+                                (st, None::<PathBuf>, copy_aside)
                             })
                             .await
                             .unwrap_or_default();
@@ -3774,11 +4269,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             match st {
                                 Some(st) => {
                                     held.give(st.clone());
+                                    if let Some(mgr) = &convo_raft {
+                                        mgr.set_store(st.clone());
+                                    }
                                     let ship = start_feed(&st, harness.as_ref(), &uplink.0);
                                     if connected {
                                         ship.link(crate::convo::feed::Link::Up);
                                     }
-                                    tracing::info!(store = %st.id(), handed = own.is_some(), set_aside = aside.is_some(), "the conversations go on in this store");
+                                    tracing::info!(store = %st.id(), handed = handed_own.is_some(), set_aside = aside.is_some(), "the conversations go on in this store");
                                     (convo, shipper) = (Some(st), Some(ship));
                                     taken.kept = true;
                                 }
@@ -3788,6 +4286,43 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             (taken.own_aside, taken.mirror_aside, taken.note) = (aside, copy_aside, (!notes.is_empty()).then(|| notes.join("; ")));
                         }
                         stores_wait = false;
+                        // Now that the outgoing build closed & handed over `own_dir/convo-raft`,
+                        // open our WAL-backed conversation Raft manager on the same `own_dir`
+                        // (only when conversation storage is enabled and open).
+                        if !o.ephemeral
+                            && !o.outpost
+                            && convo_held.is_some()
+                            && convo.is_some()
+                            && convo_raft.is_none()
+                            && let Some((mgr, stop)) = open_convo_raft(name.clone(), own_dir.join("convo-raft"), o.state_dir.clone(), false, convo.clone(), harness.clone(), Arc::clone(&upstream_raft_name), own.0.clone(), reach.clone(), shutdown.clone()).await
+                        {
+                            (convo_raft, convo_raft_stop) = (Some(mgr), Some(stop));
+                        }
+                        if let Some(node) = local_node.as_ref().filter(|_| taken.kept) {
+                            let mut node = node.clone();
+                            node.convo = convo.clone();
+                            crate::frontdoor::replica::set_local_node(Some(node.clone()));
+                            if node_http.is_none() && o.node_http.is_some() {
+                                match bind_node(&node) {
+                                    Ok(Some(listener)) => node_http = Some(listener),
+                                    other => {
+                                        taken.kept = false;
+                                        taken.note = Some(match other { Err(e) => format!("localhost listener: {e:#}"), _ => "localhost listener remains occupied".into() });
+                                    }
+                                }
+                            }
+                        }
+                        if convo.is_some() && convo_raft.is_none() {
+                            taken.kept = false;
+                            taken.note = Some("conversation WAL could not be opened".into());
+                        }
+
+                        if taken.kept && !sockets_served {
+                            match serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir) {
+                                Ok(()) => sockets_served = true,
+                                Err(e) => { taken.kept = false; taken.note = Some(format!("{e:#}")); }
+                            }
+                        }
                         let _ = done.send(taken);
                     }
                     Bg::TakeTerminal { session, command, cols, rows, replay, fd, pid, done } => {
@@ -3797,25 +4332,31 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         let _ = done.send(r);
                     }
                     Bg::TookOver { sessions, terminals, refused } => {
+                        if convo_held.is_some() && !o.ephemeral && !o.outpost && (convo.is_none() || convo_raft.is_none()) { continue; }
                         took_over = true;
                         tracing::info!(sessions, terminals, refused, "took over from the runner being upgraded");
                         // The server learns they run here now.
                         announce(term_list(&terms), harness.as_ref(), &own).await;
-                        if !std::mem::replace(&mut sockets_served, true) {
-                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
+                        if !sockets_served {
+                            match serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir) {
+                                Ok(()) => sockets_served = true,
+                                Err(e) => tracing::warn!(%e, "local sockets are unavailable after handover"),
+                            }
                         }
                     }
                     Bg::TakeOverEnded => {
-                        if !std::mem::replace(&mut sockets_served, true) {
-                            serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir);
-                        }
-                        // It ended before the runner it upgraded said which conversation store this
-                        // one goes on with (that one died, or their link broke, before its first
-                        // frame): the store in its own folder, with what that one moved there if it
-                        // got that far.
                         if stores_wait {
                             let (done, _) = futures::channel::oneshot::channel();
-                            let _ = bg_tx.try_send(Bg::Stores { own: None, mirror: None, done });
+                            taken.push_front(Ev::Bg(Bg::TakeOverEnded));
+                            taken.push_front(Ev::Bg(Bg::Stores { own: None, mirror: None, done }));
+                            continue;
+                        }
+                        if convo_held.is_some() && !o.ephemeral && !o.outpost && (convo.is_none() || convo_raft.is_none()) { continue; }
+                        if !sockets_served {
+                            match serve_sockets(reach.as_ref(), harness.as_ref(), &name, &sock, &o.state_dir) {
+                                Ok(()) => sockets_served = true,
+                                Err(e) => tracing::warn!(%e, "local sockets are unavailable after handover"),
+                            }
                         }
                         // Its link to the runner it upgraded ended, and no word of its promotion: that
                         // one is gone (one that takes its sessions back stops this one first), whether
@@ -3833,6 +4374,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         }
                     }
                     Bg::Promoted => {
+                        if convo_held.is_some() && !o.ephemeral && !o.outpost && (convo.is_none() || convo_raft.is_none()) {
+                            tracing::warn!("promotion awaits durable session custody");
+                            continue;
+                        }
                         // Joined ranked oldest (new work stayed with the old runner): the newest now.
                         tracing::info!("promoted: this runner is the machine's newest; new work comes here");
                         // Its sessions are its own for good: it takes their messages, and each it
@@ -4214,6 +4759,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 if connected {
                     tracing::warn!(%reason, "disconnected from server");
                     paths.disconnected();
+                    if let Some(mgr) = &convo_raft {
+                        let up_name = upstream_raft_name.read().clone();
+                        mgr.peer_unreachable(&up_name);
+                    }
                     // No word comes for agent sessions on their way to a newer process: they go on here.
                     crate::harness::handing::runner_link_lost();
                 } else {
@@ -4389,7 +4938,10 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             // Asked again for a session it has (the answer to the first ask lost on its
                             // way back, the start asked again under its id): it's there, and nothing is
                             // made or started again, its workspace included.
-                            (Some(h), _) if h.get(&session).is_some() => Ok(()),
+                            (Some(h), ref asked) if let Some(active) = h.get(&session) => {
+                                if asked.start_request.as_ref().is_none_or(|request| active.spec.lock().start_request.as_ref() == Some(request)) { Ok(()) }
+                                else { Err((Refusal::Refused, anyhow::anyhow!("session id is in use by a different start request"))) }
+                            }
                             (Some(h), mut spec) => {
                                 // Started on a shell: in that shell's directory and environment, and in the volume of an
                                 // agent here whose mount that directory lies in (`workspace::from_shell`, W2).
@@ -4577,10 +5129,19 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                     Carried::Read(FromServer::Convo { msg, data }) => {
                         let m = *msg;
-                        if let crate::convo::feed::Msg::Raft { session, from, .. } = &m {
+                        if let crate::convo::feed::Msg::Raft { store, session, from } = &m {
+                            if store == "server-hello" && session.is_empty() && !from.is_empty() {
+                                *upstream_raft_name.write() = from.clone();
+                                if let Some(mgr) = &convo_raft {
+                                    mgr.register_members(vec![(from.clone(), proto::feature::speaks(&server_features, proto::feature::CONVO_RAFT_V2), proto::feature::can_elect(&server_features))]);
+                                }
+                                continue;
+                            }
                             if let Some(mgr) = &convo_raft {
-                                let sender = if from.is_empty() { "server" } else { from.as_str() };
-                                if let Err(e) = mgr.step(sender, session, &data) {
+                                // Always bind server->runner Raft messages to the transport-authenticated
+                                // upstream server identity, never an arbitrary `from` field.
+                                let sender = upstream_raft_name.read().clone();
+                                if let Err(e) = mgr.step_owned(&sender, session, data) {
                                     tracing::debug!(%session, from = %sender, error = %format!("{e:#}"), "convo Raft step from server failed");
                                 }
                             }
@@ -5021,7 +5582,7 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         // It speaks named features: it's told this runner's (docs/wire.md, "Named
                         // features"), and says its own.
                         if caps & proto::CAP_FEATURES != 0 {
-                            own.0.send(Up::Term(AgentMsg::Features { names: proto::feature::all() })).await.ok();
+                            own.0.send(Up::Term(AgentMsg::Features { names: proto::feature::for_session_host(!o.ephemeral && !o.outpost && !crate::convo::off() && embedded.as_ref().map_or(o.terminal, |h| h.cfg.terminal.enabled), reach.as_ref().and_then(|r| r.peer_quic()).is_some_and(|q| q.has_liveness())) })).await.ok();
                         }
                         if server_wire {
                             own.0.send(Up::Term(AgentMsg::Wire(loops::have_of(wire_in.have(), &shared)))).await.ok();
@@ -5339,6 +5900,13 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             r.feed(crate::reach::node::In::Offers(proto::feature::speaks(&names, proto::feature::OFFERS))).await;
                         }
                         server_features = names;
+                        if let Some(mgr) = &convo_raft
+                        {
+                            let up = upstream_raft_name.read().clone();
+                            mgr.set_peer_executor(&up, proto::feature::can_elect(&server_features));
+                            mgr.set_peer_v2(&up, proto::feature::speaks(&server_features, proto::feature::CONVO_RAFT_V2));
+                            if proto::feature::speaks(&server_features, proto::feature::CONVO_RAFT) && (up != "server" || !proto::feature::speaks(&server_features, proto::feature::CONVO_RAFT_V2)) { mgr.register_peers([up]); }
+                        }
                         // Welcome precedes the named feature reply. Re-send through the existing
                         // resumable stream so a quiet session's first oversized state is recovered too:
                         // those whose Open or state went cut or not at all (`SentChanges::cut`), and only
@@ -5615,6 +6183,17 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                             refuse(&mut answer_after, code, why);
                         }
                     }
+                    ServerMsg::ConvoTransferOwnership { session, target, epoch, digest } => {
+                        let reply = answer_after.take().map(|(stream, seq, _)| (stream, seq));
+                        harness_operations.push(async move {
+                            let result = crate::rt::blocking_in(crate::rt::SHARE_SESSION, move || crate::convo::raft::runner_global().is_some_and(|m| m.move_to(&session, &target, epoch, digest).is_ok())).await;
+                            let result = match result {
+                                Ok(true) => Ok(()),
+                                _ => Err((crate::wire::channel::Refusal::Refused, "this node cannot transfer the requested session epoch".to_owned())),
+                            };
+                            HarnessApplied::Command { reply, result }
+                        }.boxed());
+                    }
                     ServerMsg::HarnessPackage { session, offset, data, done } => {
                         // A session going on here from the server's store (its machine is gone).
                         let Some(h) = harness.clone() else {
@@ -5630,12 +6209,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                         match h.receive_package(&session, offset, &data, done) {
                             Ok(Some(path)) => {
                                 let up = uplink.0.clone();
-                                crate::rt::spawn(async move {
+                                let reply = answer_after.take().map(|(stream, seq, _)| (stream, seq));
+                                harness_operations.push(async move {
                                     let h2 = h.clone();
                                     let (handover, taken) = crate::rt::blocking(move || h2.adopt_package(&path, leaving)).await.unwrap_or_else(|e| (false, Err(format!("{e:#}"))));
                                     // Handed over by an older process of this machine: that one
                                     // goes on with it unless this one took it, so it's told either
                                     // way, and nothing else is said here.
+                                    let result = taken.clone().map_err(|why| (crate::wire::channel::Refusal::Refused, why));
                                     if handover {
                                         if let Err(why) = &taken {
                                             tracing::warn!(%session, %why, "couldn't take over an agent session from this machine's older runner process");
@@ -5652,7 +6233,8 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                                             }
                                         }
                                     }
-                                });
+                                    HarnessApplied::Command { reply, result }
+                                }.boxed());
                             }
                             Ok(None) => {}
                             Err(e) => {
@@ -6079,7 +6661,14 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                     }
                 }
             }
-            Ev::Harness(session, u, taken_at) => {
+            Ev::Harness(session, crate::harness::core::Update::Inbox { mut said }, taken_at) if said.answer.is_ok() && convo.is_some() => {
+                let (manager, store) = (convo_raft.clone(), convo.clone());
+                harness_operations.push(async move {
+                    verify_inbox_answer(manager.as_ref(), store.as_ref(), &session, &mut said).await;
+                    HarnessApplied::Inbox(session, crate::harness::core::Update::Inbox { said }, taken_at)
+                }.boxed());
+            }
+            Ev::Harness(session, u, taken_at) | Ev::InboxChecked(session, u, taken_at) => {
                 // Admission/terminal receipts stay in the source journal until acknowledged.
                 // A peer not yet welcomed/negotiated cannot own these events; its next real
                 // connection/feature event replays the journal and current capacity.
@@ -6088,37 +6677,6 @@ pub async fn run(o: Opts, shutdown: Shutdown) -> anyhow::Result<()> {
                 // A session's turn ending is what an upgrade waiting on its sessions waits on.
                 if upgrade_pending && jobs.is_empty() && harness.as_ref().is_some_and(|h| h.busy() == 0) {
                     taken.push_back(Ev::Watchdog);
-                }
-                // Resolve any local HTTP or direct `hyper-quic` P2P caller awaiting this inbox receipt.
-                if let crate::harness::core::Update::Inbox { said } = &u {
-                    inbox_waiters.resolve(&session, said);
-                }
-                // Part 3: per-session/conversation Raft replication — the node where the session
-                // starts and runs leads that session's Raft group and replicates all durable updates
-                // across the connected fleet.
-                if let Some(mgr) = &convo_raft {
-                    let now_ms = crate::util::now_ms();
-                    match &u {
-                        crate::harness::core::Update::Open { info, .. } => {
-                            let rows = crate::convo::rows::of(&session, &u, now_ms);
-                            if let Err(e) = mgr.open_leader(&session, info.epoch, rows) {
-                                tracing::debug!(%session, error = %format!("{e:#}"), "convo Raft open_leader failed");
-                            }
-                        }
-                        crate::harness::core::Update::State { .. }
-                        | crate::harness::core::Update::Meta { .. }
-                        | crate::harness::core::Update::Events { .. }
-                        | crate::harness::core::Update::Changes { .. }
-                        | crate::harness::core::Update::Reset { .. }
-                        | crate::harness::core::Update::Closed => {
-                            let rows = crate::convo::rows::of(&session, &u, now_ms);
-                            if !rows.is_empty() {
-                                let epoch = session_epochs.get(&session).copied().unwrap_or(0);
-                                let _ = mgr.propose(&session, epoch, rows);
-                            }
-                        }
-                        _ => {}
-                    }
                 }
                 // Each session this process holds has an identity at its epoch, asked for until it
                 // has one; one that closed lets go of its keys (docs/ci.md W27-R01).
@@ -7684,7 +8242,7 @@ mod tests {
             assert_eq!(texts(&there)?, vec!["before the upgrade".to_owned()]);
             there.close()?;
             // Rolled back: moved back, opened again, given to the tee, which keeps what passes in it.
-            let g = Given { held: held.clone(), moves, own_dir: blue.clone(), aside: Some([None, None]) };
+            let g = Given { store_id: id.clone(), held: held.clone(), moves, own_dir: blue.clone(), aside: Some([None, None]) };
             let mut problems = Vec::new();
             let back = take_stores_back(&g, &mut problems).ok_or_else(|| anyhow::anyhow!("nothing came back"))?;
             assert!(problems.is_empty(), "{problems:?}");
@@ -7779,7 +8337,7 @@ mod tests {
                 fresh.close()?;
                 let answer = answered.then(|| [Some(aside.clone()), None]);
                 let mut problems = Vec::new();
-                let back = take_stores_back(&Given { held, moves, own_dir: blue.clone(), aside: answer }, &mut problems).ok_or_else(|| anyhow::anyhow!("nothing came back"))?;
+                let back = take_stores_back(&Given { store_id: id.clone(), held, moves, own_dir: blue.clone(), aside: answer }, &mut problems).ok_or_else(|| anyhow::anyhow!("nothing came back"))?;
                 assert!(problems.is_empty(), "{problems:?}");
                 assert_eq!(back.id(), id, "its own store, as it was (answered: {answered})");
                 assert!(!aside.exists());

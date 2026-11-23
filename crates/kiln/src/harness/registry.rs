@@ -31,13 +31,6 @@ use crate::proto::{LANE_TERM, ServerMsg};
 /// a report from the machine that leaves it out ends it.
 const OPEN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Whether command `c` from `sender` to session `id` goes into custody (W20): a message, unless
-/// it's a person's and its session's runner predates mail-flow ([`super::mail_delivery::legacy_owner`]),
-/// when it goes to that runner's inbox, as before.
-fn into_custody(hub: &Hub, id: &str, sender: &str, c: &Command) -> bool {
-    super::session::is_message(c) && (!super::mail::person(sender) || !super::mail_delivery::legacy_owner(hub, id))
-}
-
 /// A message's id (what its session's inbox takes once): none for a command that isn't a message,
 /// or a message without one.
 pub fn message_id(c: &Command) -> Option<String> {
@@ -1669,6 +1662,8 @@ fn route_target(to: &Location) -> String {
 /// A command sent ([`Registry::dispatch`]): how it fared already, or the answer still to come.
 pub enum Pending {
     Now(Sent),
+    /// Dispatched in order. Only the destination and request bound to this future may settle it.
+    Destination(futures::future::BoxFuture<'static, Sent>),
     /// A message on its way, its inbox's answer waited for ([`Registry::settle`]).
     Answer { message: String, rx: futures::channel::oneshot::Receiver<Said> },
     /// A command on its runner's command stream, its answer to come ([`Sent::of`]).
@@ -1991,6 +1986,7 @@ pub enum Restore {
 const RESTORE_ANSWER_MS: i64 = 120_000;
 
 pub struct Registry {
+    session_consensus: std::sync::OnceLock<std::sync::Weak<crate::convo::raft::Manager>>,
     /// Every session's copy, each owned by one shard: changed only by messages to that shard's
     /// owner, read from the views it publishes, no lock guarding any (`super::copies`).
     sessions: Copies,
@@ -2080,8 +2076,11 @@ pub struct Registry {
     /// of their own, no lock (`super::answers`; goal 5, plan 01a1a59c2aae, its top goal). It keeps where each
     /// routed to a runner went too (`super::answers::Routed`), with its wait.
     answers: super::answers::Answers,
+    local_restored: std::sync::atomic::AtomicBool,
     /// The ids starts under way asked for ([`Registry::open_as`]), each until its start is done.
     opening: Rcu<std::collections::HashSet<String>>,
+    /// Concurrent copies of the same operation share the first caller's committed outcome.
+    repeated_starts: crate::turn::Keyed<String, crate::turn::Gate>,
     /// What a viewer's attach waits for while the server starts ([`Registry::returned`]).
     pub returning: super::returning::Returning,
     /// The sessions that may be past one of their agent definitions' limits now, for the task that holds them to those
@@ -2124,17 +2123,139 @@ fn naming<'a>(reported: &'a str, last: &str, kind_name: &str, kept: bool) -> Nam
     }
 }
 
-async fn send_package(hub: &Hub, id: &str, to: &str, bytes: &[u8]) -> Result<(), String> {
+/// W21-R15. A start reached an execution path but its committed result is unavailable.
+/// The stable ids let a caller inspect custody or repeat the same operation after recovery.
+/// W21-R15. Every slot has a result, including successes beside a refused or held slot.
+#[derive(Debug)]
+pub(crate) struct StartSlots(pub Vec<serde_json::Value>);
+
+impl StartSlots {
+    pub(crate) fn status(&self)->http::StatusCode{
+        let mut kinds=self.0.iter().filter_map(|v|v.get("outcome").and_then(|s|s.as_str()));
+        let first=kinds.next();
+        if kinds.any(|kind|Some(kind)!=first) {return http::StatusCode::MULTI_STATUS;}
+        match first {
+            Some("held")=>http::StatusCode::ACCEPTED,
+            Some("refused")=>self.0.first().and_then(|v|v.get("status")).and_then(|v|v.as_u64()).and_then(|n|u16::try_from(n).ok()).and_then(|n|http::StatusCode::from_u16(n).ok()).unwrap_or(http::StatusCode::CONFLICT),
+            _=>http::StatusCode::OK,
+        }
+    }
+}
+impl std::fmt::Display for StartSlots {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"{}",serde_json::json!({"slots":self.0}))}
+}
+impl std::error::Error for StartSlots {}
+
+#[derive(Debug)]
+pub(crate) struct StartUnconfirmed {
+    ids: Vec<String>,
+    why: String,
+}
+
+impl StartUnconfirmed {
+    pub(crate) fn new(ids: Vec<String>, why: impl std::fmt::Display) -> Self {
+        Self { ids, why: why.to_string() }
+    }
+}
+
+impl std::fmt::Display for StartUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "session start outcome is unknown: {}. Retry with the same idempotency key", self.why)?;
+        for id in &self.ids { write!(f, ", or check GET /api/harness/sessions/{id}")?; }
+        Ok(())
+    }
+}
+
+impl std::error::Error for StartUnconfirmed {}
+
+/// W21-R15. A local or remote Start can be acknowledged only once its founder applied the
+/// creation record. Re-read it from the same session group even when the caller retries after
+/// failover and a different machine now owns it.
+pub(crate) async fn confirm_starts(manager: &Arc<crate::convo::raft::Manager>, infos: &mut [Info], request: Option<&str>) -> anyhow::Result<()> {
+    let uncertain = |why: String| StartUnconfirmed::new(infos.iter().map(|i| i.id.clone()).collect(), why);
+    let changed = manager.changed();
+    crate::rt::timeout(crate::hub::COMMAND_WITHIN, async {
+        loop {
+            let notice = changed.listen();
+            let mut all_founded = true;
+            for info in &*infos {
+                let state = manager.with_status(&info.id, |s| (s.founded, s.name_conflict && request.is_some() && s.conflicting_start_request.as_deref() == request));
+                match state {
+                    Some((true, _)) => {}
+                    Some((false, true)) => return Err(IdTaken(info.id.clone())),
+                    _ => all_founded = false,
+                }
+            }
+            if all_founded { return Ok(()); }
+            notice.await;
+        }
+    }).await.map_err(|e| uncertain(e.to_string()))??;
+    let manager = manager.clone();
+    let request = request.map(str::to_owned);
+    let sessions = infos.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
+    let committed = crate::rt::blocking_in(crate::rt::SHARE_STORE, move || {
+        let store = manager.store().ok_or_else(|| anyhow::anyhow!("conversation store closed"))?;
+        let mut committed = Vec::with_capacity(sessions.len());
+        for id in sessions {
+            let mut info = store.kept_committed(&id, 0)?.and_then(|k| k.info).and_then(|s| serde_json::from_str::<Info>(&s).ok())
+                .ok_or_else(|| anyhow::anyhow!("founding record for {id} is unavailable"))?;
+            anyhow::ensure!(info.id == id, "the creation record for {id} names another session");
+            if info.start_request != request { return Err(anyhow::Error::new(IdTaken(id))); }
+            let owner = manager.with_status(&id, |s| s.owner.clone()).flatten().ok_or_else(|| anyhow::anyhow!("session {id} has no committed owner"))?;
+            info.target = format!("agent:{owner}");
+            committed.push(info);
+        }
+        anyhow::Ok(committed)
+    }).await.and_then(|r| r).map_err(|e| if e.is::<IdTaken>() { e } else { uncertain(format!("{e:#}")).into() })?;
+    for (slot, confirmed) in infos.iter_mut().zip(committed) { *slot = confirmed; }
+    Ok(())
+}
+
+/// CP-T3.2. Stage the authorized native package before asking the current Raft leader to hand over.
+async fn move_package(hub: &Hub, pkg: &mut super::moving::Package, to: &str, in_place: bool) -> Result<u64, String> {
+    let session = pkg.id.clone();
+    let epoch = pkg.state.epoch;
+    let next = epoch.checked_add(1).ok_or_else(|| "session epoch overflow".to_owned())?;
+    let manager = hub.harness.session_consensus().map_err(|e| e.to_string())?;
+    let speaks = |name: &str| {
+        let inst = hub.instances.load();
+        inst.newest(name).and_then(|p| inst.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::CONVO_MOVE))
+    };
+    let source = if let Some(mgr) = &manager {
+        if !speaks(to) { return Err(format!("{to} cannot stage a Raft session move")); }
+        let source = pkg.stage_move(mgr, to, in_place)?;
+        if source != mgr.identity().0 && !speaks(&source) { return Err(format!("{source} cannot authorize the session transfer")); }
+        Some(source)
+    } else { None };
+    let bytes = pkg.move_bytes()?;
+    send_package(hub, &session, to, &bytes, source.is_some()).await?;
+    if let (Some(mgr), Some(source), Some(stage)) = (manager, source, &pkg.raft_move) {
+        let digest = stage.digest.clone();
+        if source != mgr.identity().0 {
+            let cmd = ServerMsg::ConvoTransferOwnership { session: session.clone(), target: to.to_owned(), epoch, digest: digest.clone() };
+            if !matches!(hub.command(&source, &cmd, crate::hub::COMMAND_WITHIN).await, crate::wire::commands::Answer::Taken) {
+                return Err(format!("{source} has not confirmed the transfer of {session}"));
+            }
+        }
+        if source == mgr.identity().0 { mgr.begin_move(&session, to, epoch, &digest).await.map_err(|e| e.to_string())?; }
+        mgr.wait_moved(&session, to, epoch, &digest).await.map_err(|e| e.to_string())?;
+    }
+    Ok(next)
+}
+
+async fn send_package(hub: &Hub, id: &str, to: &str, bytes: &[u8], durable: bool) -> Result<(), String> {
     // In pieces that fit a command's frame, each answered before the next goes (docs/wire.md,
     // "Commands"): a move whose machine went away mid-way says so.
     const PIECE: usize = 768 << 10;
-    let pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
+    let pieces = bytes.len().div_ceil(PIECE);
     let mut offset = 0u64;
-    for (n, piece) in pieces.iter().enumerate() {
+    for (n, piece) in bytes.chunks(PIECE).enumerate() {
         use crate::wire::commands::Answer;
-        let msg = ServerMsg::HarnessPackage { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces.len() };
+        let msg = ServerMsg::HarnessPackage { session: id.to_owned(), offset, data: piece.to_vec(), done: n + 1 == pieces };
         match hub.command(to, &msg, crate::hub::COMMAND_WITHIN).await {
-            Answer::Taken | Answer::Sent => {}
+            Answer::Taken => {}
+            Answer::Sent if !durable => {}
+            Answer::Sent => return Err(format!("{} has not confirmed durable native package staging", hub.shown(to))),
             Answer::Refused { why, .. } => return Err(format!("{} couldn't take the session: {why}", hub.shown(to))),
             Answer::Unreachable { .. } | Answer::Parked => return Err(format!("{} went away while the session was on its way", hub.shown(to))),
             Answer::Unanswered { why } => return Err(format!("{} didn't answer while the session was on its way: {why}", hub.shown(to))),
@@ -2177,6 +2298,16 @@ impl Drop for Claim<'_> {
 }
 
 impl Registry {
+    pub(crate) fn bind_session_consensus(&self, manager: &Arc<crate::convo::raft::Manager>) -> anyhow::Result<()> {
+        anyhow::ensure!(self.session_consensus.set(Arc::downgrade(manager)).is_ok(), "session registry already owns a consensus manager");
+        if let Some(inbox) = self.local.inbox() { inbox.set_raft_authority(manager); }
+        Ok(())
+    }
+
+    pub(crate) fn session_consensus(&self) -> anyhow::Result<Option<Arc<crate::convo::raft::Manager>>> {
+        self.session_consensus.get().map(|m| m.upgrade().ok_or_else(|| anyhow::anyhow!("session consensus is unavailable"))).transpose()
+    }
+
     /// A registry of tests: its store in `dir`, its feeds on the bus's simulator.
     #[cfg(test)]
     pub fn new(dir: std::path::PathBuf) -> Self {
@@ -2248,6 +2379,7 @@ impl Registry {
             kinds: Rcu::default(),
             local,
             convo,
+            session_consensus: std::sync::OnceLock::new(),
             feed,
             feed_out,
             copies,
@@ -2280,7 +2412,9 @@ impl Registry {
             ports: super::opened::Tunnels::default(),
             opened: super::opened::Openings::default(),
             answers: super::answers::Answers::new(WAITING_MAX),
+            local_restored: Default::default(),
             opening: Rcu::default(),
+            repeated_starts: Default::default(),
             returning: super::returning::Returning::default(),
             limits: crate::agentdefs::limits::Told::default(),
             #[cfg(test)]
@@ -2313,9 +2447,8 @@ impl Registry {
         self.sessions.with(id, |v| v.rev)
     }
 
-    /// Tests: every session's id, in order.
-    #[cfg(test)]
-    pub fn ids(&self) -> Vec<String> {
+    /// Live and archived registry IDs held here, including those awaiting their first disk record.
+    pub(crate) fn ids(&self) -> Vec<String> {
         let mut ids = self.sessions.ids();
         ids.sort();
         ids
@@ -2812,8 +2945,6 @@ impl Registry {
     }
 
     pub async fn run_local(hub: Arc<Hub>) -> anyhow::Result<()> {
-        // Once a process, however often this loop starts again (it's supervised).
-        static RESTORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         // Sessions of machines that are away: listed from the store.
         Self::list_away(&hub).await;
         let rx = hub.harness.local_rx.clone();
@@ -2821,15 +2952,19 @@ impl Registry {
         hub.harness.kinds.update(|k| k.insert("local".to_owned(), offered.clone()));
         // The accounts to check follow the harnesses offered (`accounts::tick`, on the goal driver).
         crate::goals::stir();
-        if !RESTORED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        if !hub.harness.local_restored.swap(true, std::sync::atomic::Ordering::AcqRel) {
             // Files finished messages mention, kept as they come.
             crate::rt::spawn(Keeper::run(hub.clone()));
             // The server's own sessions back, on the blocking pool: their record read, what
             // outlived them stopped (seconds each), the conversation store asked what it kept of
             // each (up to 10 s): none of it on the runtime's thread, which serves the listener.
             let (local, convo) = (hub.harness.local.clone(), hub.harness.convo.clone());
-            if let Err(e) = crate::rt::blocking(move || local.restore_from(convo.as_ref())).await {
+            let manager = hub.harness.session_consensus()?;
+            if let Err(e) = crate::rt::blocking(move || local.restore_with_authority(convo.as_ref(), manager.as_deref())).await {
                 tracing::warn!(error = %format!("{e:#}"), "the server's own agent sessions couldn't be restored");
+            }
+            if let (Some(mgr), Some(store)) = (hub.harness.session_consensus()?, hub.harness.convo.clone()) {
+                crate::agent::drive_session_ownership(mgr, store, hub.harness.local.clone(), Some(Arc::downgrade(&hub)), hub.shutdown.clone(), hub.shutdown.clone());
             }
             // Each has a copy once this loop takes its Open (below): an attach to one waits for it (`super::returning`).
             hub.harness.returning.own(hub.harness.local.list().into_iter().map(|i| i.id));
@@ -2905,25 +3040,10 @@ impl Registry {
     /// before it, so the owner takes a task's end after all it said.
     pub(crate) async fn take_local(&self, said: super::session::Local) {
         match said {
-            super::session::Local::Said(id, u) => {
-                // Part 3: sessions started locally on the server node elect `"server"` as their
-                // initial per-session Raft leader and replicate across all connected fleet nodes.
-                if let Some(mgr) = crate::convo::raft::global() {
-                    let now_ms = crate::util::now_ms();
-                    match &u {
-                        Update::Open { info, .. } => {
-                            let rows = crate::convo::rows::of(&id, &u, now_ms);
-                            let _ = mgr.open_leader(&id, info.epoch, rows);
-                        }
-                        Update::State { .. } | Update::Meta { .. } | Update::Events { .. } | Update::Changes { .. } | Update::Reset { .. } | Update::Closed => {
-                            let rows = crate::convo::rows::of(&id, &u, now_ms);
-                            if !rows.is_empty() {
-                                let epoch = self.epoch_of(&id);
-                                let _ = mgr.propose(&id, epoch, rows);
-                            }
-                        }
-                        _ => {}
-                    }
+            super::session::Local::Said(id, mut u) => {
+                if let Update::Inbox { said } = &mut u && self.session_consensus.get().is_some() && said.answer.is_ok() {
+                    let manager = self.session_consensus().ok().flatten();
+                    crate::agent::verify_inbox_answer(manager.as_ref(), self.convo.as_ref(), &id, said).await;
                 }
                 self.ingest_from(&Location::Local, &id, u, false).await
             }
@@ -4524,7 +4644,8 @@ impl Registry {
     /// ([`IdTaken`]) before anything starts: asked again under the same ids, as its answer was
     /// lost, a start never starts its sessions twice.
     pub async fn open_as(&self, hub: &Hub, target: &str, mut spec: Spec, count: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
-        let count = count.clamp(1, 16);
+        anyhow::ensure!(count>0,"count must be positive");
+        if let Some(limit)=hub.cfg.agents.max_children {anyhow::ensure!(count<=limit as usize,"batch exceeds max_children {limit}");}
         // The most egress its microVM may be granted live: the org's policy, never what was asked (kiln plan 01a1dd2e…,
         // P6b.4).
         spec.egress_ceiling.clone_from(&hub.cfg.agents.egress_ceiling);
@@ -4547,6 +4668,20 @@ impl Registry {
             crate::harness::lineage::isolation_on(hub, target).map_err(|why| anyhow::anyhow!("an agent can't run isolated there: {why}"))?;
         }
         let loc = Location::of_target(target);
+        // Internal starters such as definitions or plan children reach this same entry
+        // without an HTTP key. Give each such operation a stable set of wire identities.
+        let mut assigned_ids=Vec::new();
+        if spec.start_request.is_none() {
+            let key=crate::util::new_id();
+            if ids.is_empty() {
+                assigned_ids.try_reserve(count)?;
+                for slot in 0..count {assigned_ids.push(crate::util::derive_id(&["fleet-start-v1",&key,&slot.to_string()]));}
+            }
+            let identity=serde_json::to_vec(&("kiln internal start v1",&key,target,&spec.kind))?;
+            spec.start_request=Some(crate::util::sha256_hex(&identity));
+            spec.start_key=Some(key);
+        }
+        let ids=if assigned_ids.is_empty(){ids}else{assigned_ids.as_slice()};
         // Where it works, on its machine's host (docs/agentic.md W2): one whose folder lies in a workspace an agent there
         // works in now works in that one; else its folder, unless its start asked for a volume of its own (the person's
         // ruling, 2026-11-21: Slates workspaces are an option kiln's owner enables, `[workspaces]`, never a default). In
@@ -4590,9 +4725,166 @@ impl Registry {
 
     /// [`Registry::open_as`]'s start of `count` sessions of `spec` at `loc`, once it's checked.
     async fn open_at(&self, hub: &Hub, loc: &Location, spec: Spec, count: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
-        let _held = self.claim(ids)?;
+        let repeat = spec.start_request.as_ref().map(|request| self.repeated_starts.of(request));
+        let _turn = match &repeat {
+            Some(gate) => Some(gate.turn().await),
+            None => None,
+        };
+        let manager = self.session_consensus()?;
+        let mut conflicts=std::collections::HashSet::new();
+        let budget = if let (Some(limit), Some(key), Some(digest), Some(manager)) =
+            (hub.cfg.agents.max_children, spec.start_key.as_ref(), spec.start_request.as_ref(), manager.as_ref())
+            && let Some(node) = crate::frontdoor::replica::local_node().filter(|node| node.bound_to(manager))
+            && let Some(reach) = node.reach.as_ref()
+        {
+            let actor = super::ops::start_budget_owner(&spec).to_owned();
+            let outbox = reach.starts.clone();
+            outbox.bind(key.clone(), digest.clone(), "server placement".into(), actor.clone()).await?;
+            let admission=outbox.admission(key);
+            conflicts=outbox.reserve(actor.clone(), key.clone(), digest.clone(), ids.to_owned(), limit, manager.store()).await?;
+            Some((outbox,actor,key.clone(),digest.clone(),admission))
+        } else {
+            None
+        };
+        let outcome = self.open_admitted(hub, loc, spec, count, ids, &conflicts).await;
+        if let Some((outbox,actor,key,digest,_admission))=budget {
+            let (confirmed,refused)=match &outcome {
+                Ok(infos)=>(crate::api::started_slots(hub, infos),Vec::new()),
+                Err(e) if let Some(slots)=e.downcast_ref::<StartSlots>()=>{
+                    let mut confirmed=Vec::new();
+                    let mut refused=Vec::new();
+                    for s in &slots.0 {
+                        let Some(id)=s.get("id").and_then(Value::as_str) else {continue};
+                        match s.get("outcome").and_then(Value::as_str) {
+                            Some("started"|"forwarded")=>confirmed.push(s.clone()),
+                            Some("refused") if s.get("uncertain").and_then(Value::as_bool)!=Some(true)=>refused.push(id.to_owned()),
+                            _=>{},
+                        }
+                    }
+                    (confirmed,refused)
+                }
+                Err(e) if e.is::<StartUnconfirmed>()=>(Vec::new(),Vec::new()),
+                Err(_)=>(Vec::new(),ids.to_owned()),
+            };
+            if let Err(error)=outbox.answered(key,confirmed).await{tracing::warn!(%error,"start receipt remains pending");}
+            if let Err(error)=outbox.release(actor,digest,refused).await{tracing::error!(%error,"could not release refused session starts");}
+        }
+        outcome
+    }
+
+    async fn open_admitted(&self, hub: &Hub, loc: &Location, spec: Spec, count: usize, ids: &[String], conflicts:&std::collections::HashSet<String>) -> anyhow::Result<Vec<Info>> {
+        if let [id]=ids && conflicts.contains(id){return Err(IdTaken(id.clone()).into());}
+        if count > 1 && ids.len() == count && spec.start_request.is_some() {
+            let mut confirmed = Vec::with_capacity(count);
+            let mut rows = Vec::with_capacity(count);
+            for (i, id) in ids.iter().enumerate() {
+                if conflicts.contains(id){rows.push(serde_json::json!({"id":id,"target":loc.target(),"status":409,"outcome":"refused","why":format!("session {id} belongs to a different start")}));continue;}
+                let mut one = spec.clone();
+                one.name = Some(format!(
+                    "{} {}",
+                    spec.name
+                        .as_deref()
+                        .filter(|n| !n.trim().is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| default_name(&spec.kind)),
+                    i + 1
+                ));
+                match self.open_slots(hub,loc,one,1,std::slice::from_ref(id)).await {
+                    Ok(infos)=>{rows.extend(crate::api::started_slots(hub, &infos));confirmed.extend(infos);}
+                    Err(e) => match e.downcast::<StartSlots>() {
+                        Ok(batch)=>rows.extend(batch.0),
+                        Err(e)=>rows.push(serde_json::json!({"id":id,"target":loc.target(),"outcome":"refused","status": if e.is::<StartUnconfirmed>() {503} else {409}, "uncertain":e.is::<StartUnconfirmed>(), "why":format!("{e:#}")})),
+                    }
+                }
+            }
+            return if confirmed.len() == count { Ok(confirmed) } else { Err(StartSlots(rows).into()) };
+        }
+        self.open_slots(hub, loc, spec, count, ids).await
+    }
+
+    async fn open_slots(&self, hub: &Hub, loc: &Location, spec: Spec, count: usize, ids: &[String]) -> anyhow::Result<Vec<Info>> {
+        let consensus = self.session_consensus()?;
+        if hub.cfg.agents.max_children.is_some() && let (Some(key),Some(digest),Some(manager))=(&spec.start_key,&spec.start_request,&consensus)
+            && let Some(node)=crate::frontdoor::replica::local_node().filter(|n| n.bound_to(manager)) && let Some(reach)=&node.reach {
+            reach.starts.dispatch(key.clone(),ids.to_owned(),loc.target(),digest.clone(),false).await?;
+        }
+        if let Location::Machine(peer) = loc
+            && spec.start_request.is_some()
+            && ids.len() == count
+            && let Some(node) = crate::frontdoor::replica::local_node().filter(|n| n.reach.is_some() && consensus.as_ref().is_some_and(|m| n.bound_to(m)))
+            && peer != &node.machine
+            && node.reach.as_ref().is_some_and(|r| r.start_support(peer) != Some(false))
+        {
+            let mut slots = Vec::with_capacity(count);
+            let mut infos = Vec::with_capacity(count);
+            for (i, id) in ids.iter().enumerate() {
+                let mut slot = spec.clone();
+                if count > 1 {
+                    slot.name = Some(format!(
+                        "{} {}",
+                        slot.name
+                            .as_deref()
+                            .filter(|n| !n.trim().is_empty())
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| default_name(&slot.kind)),
+                        i + 1
+                    ));
+                }
+                let row = match node.placed_slot(&hub.pki, peer, id, slot).await {
+                    Ok(row) => row,
+                    Err(e) => serde_json::json!({"id":id,"outcome":"refused","status":503,"why":e.to_string()}),
+                };
+                if row.get("outcome").and_then(|v| v.as_str()) == Some("forwarded")
+                    && let Ok(info) = serde_json::from_value::<Info>(row.clone())
+                {
+                    let key = info.id.clone();
+                    let mirror = Mirror::new(info.clone(), loc.clone(), self.bus.clone());
+                    self.sessions
+                        .on(&info.id, move |sessions| {
+                            if sessions.get(&key).is_none() {
+                                sessions.insert(key, mirror);
+                            }
+                        })
+                        .await;
+                    infos.push(info);
+                }
+                slots.push(row);
+            }
+            if infos.len() != count {
+                return Err(StartSlots(slots).into());
+            }
+            return Ok(infos);
+        }
+        let mut previous = std::collections::HashMap::new();
+        if let Some(manager) = &consensus && !ids.is_empty() {
+            let store = manager.store().ok_or_else(|| anyhow::anyhow!("conversation store closed"))?;
+            let ids = ids.to_owned();
+            previous = crate::rt::blocking(move || {
+                let mut known = HashMap::new();
+                for id in ids {
+                    if let Some(kept) = store.kept_committed(&id, 0)? {
+                        let info = kept.info.and_then(|s| serde_json::from_str::<Info>(&s).ok()).filter(|i| i.id == id)
+                            .ok_or_else(|| StartUnconfirmed::new(vec![id.clone()], "the saved creation record is unavailable"))?;
+                        known.insert(id, info);
+                    }
+                }
+                anyhow::Ok(known)
+            }).await??;
+        }
+        for id in ids {
+            if !previous.contains_key(id) && let Some(info) = self.info(id) { previous.insert(id.clone(), info); }
+            if let Some(info) = previous.get(id) && (spec.start_request.is_none() || info.start_request != spec.start_request) {
+                return Err(anyhow::Error::new(IdTaken(id.clone())));
+            }
+        }
+        let fresh: Vec<String>;
+        let _held = if previous.is_empty() { self.claim(ids)? } else {
+            fresh = ids.iter().filter(|id| !previous.contains_key(id.as_str())).cloned().collect();
+            self.claim(&fresh)?
+        };
         let mut out = Vec::new();
         for i in 0..count {
+            if let Some(info) = ids.get(i).and_then(|id| previous.remove(id.as_str())) { out.push(info); continue; }
             let mut spec = spec.clone();
             #[cfg(test)]
             if spec.program.is_none() {
@@ -4613,8 +4905,11 @@ impl Registry {
                     let id = ids.get(i).cloned().unwrap_or_else(crate::util::new_id);
                     crate::workspace::prepare(&mut spec, &id).await.map_err(|e| e.context("its workspace"))?;
                     let made = crate::workspace::made_alone(&spec);
-                    let s = match self.local.open(Some(id), spec) {
-                        Ok(s) => s,
+                    let request = spec.start_request.clone();
+                    let s = match self.local.open_with_creation(Some(id.clone()), spec) {
+                        Ok((s,true)) => s,
+                        Ok((s,false)) if request.is_some() && s.info().start_request == request => s,
+                        Ok((_,false)) => return Err(anyhow::Error::new(IdTaken(id))),
                         Err(e) => {
                             // What was made for it goes with it: asked again under its id, it's made anew.
                             // Nothing ran in it, so nothing of it is on its way out: asked to go once.
@@ -4643,12 +4938,18 @@ impl Registry {
                         Answer::Taken | Answer::Sent | Answer::Parked => {}
                         Answer::Refused { why, .. } => anyhow::bail!("{} refused to start it: {why}", hub.shown(machine)),
                         Answer::Unreachable { .. } => anyhow::bail!("machine {} is not connected", hub.shown(machine)),
-                        Answer::Unanswered { why } => anyhow::bail!("{} may or may not have started it: {why}", hub.shown(machine)),
+                        Answer::Unanswered { why } => {
+                            let mut started: Vec<_> = out.iter().map(|i| i.id.clone()).collect();
+                            started.push(id);
+                            return Err(StartUnconfirmed::new(started, format!("{} did not answer: {why}", hub.shown(machine))).into());
+                        }
                     }
                     let now = crate::util::now_ms();
                     let kind = super::kinds::Kind::get(&spec.kind);
                     let info = Info {
                         id: id.clone(),
+                        start_request: spec.start_request.clone(),
+                        recovery: super::session::RecoverySettings::of(&spec),
                         deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
                         admission: None,
                         kind: spec.kind.clone(),
@@ -4726,6 +5027,13 @@ impl Registry {
                 }
             }
         }
+        if let Some(manager) = consensus {
+            confirm_starts(&manager, &mut out, spec.start_request.as_deref()).await?;
+            if matches!(loc, Location::Local) {
+                let local = format!("agent:{}", manager.identity().0);
+                for info in &mut out { if info.target == local { info.target = "local".to_owned(); } }
+            }
+        }
         for info in &out {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
         }
@@ -4748,12 +5056,11 @@ impl Registry {
             match self.open_at(hub, loc, one, 1, ids.get(i..=i).unwrap_or_default()).await {
                 Ok(infos) => out.extend(infos),
                 Err(e) => {
-                    crate::harness::lineage::let_go_claims(hub, claims.get(i..).unwrap_or_default()).await;
-                    if out.is_empty() {
-                        return Err(e);
-                    }
-                    tracing::warn!(error = %format!("{e:#}"), "some of the isolated agents asked for didn't start");
-                    break;
+                    let first_unused = if e.is::<StartUnconfirmed>() { i + 1 } else { i };
+                    crate::harness::lineage::let_go_claims(hub, claims.get(first_unused..).unwrap_or_default()).await;
+                    if out.is_empty() { return Err(e); }
+                    let confirmed = out.iter().map(|i| i.id.as_str()).collect::<Vec<_>>().join(", ");
+                    return Err(e.context(format!("already confirmed sessions {confirmed}")));
                 }
             }
         }
@@ -4999,7 +5306,7 @@ impl Registry {
             },
             _ => {
                 crate::metrics::sends().unanswered.inc();
-                Sent::Ok
+                Sent::Refused(inbox::Refusal::Unavailable { session: id.into(), why: format!("receipt for {message} is unknown; retry the same message id") })
             }
         };
         // Answered, or no longer waited for: where it was routed goes with its wait, and a forward of it from there is
@@ -5035,12 +5342,7 @@ impl Registry {
         if let Some(to) = self.routable_to(hub, id, &c, target_hint) {
             return self.send_routed(hub, id, to, c, sender, sender, None, None).await;
         }
-        if into_custody(hub, id, sender, &c) {
-            return match self.publish_command(hub, id, c, None, sender.to_owned(), sender.to_owned(), None).await {
-                Ok(receipt) => Sent::Published(receipt),
-                Err(error) => Sent::PublicationRefused(error),
-            };
-        }
+        if super::session::is_message(&c) {return Self::unknown_message_owner(id);}
         self.command(hub, id, c).await
     }
 
@@ -5056,10 +5358,11 @@ impl Registry {
     /// record of relaying another agent's words (`provenance`'s `relayed`) carried in its route; else the server's custody
     /// receipt, as before routing (`Published`).
     #[allow(clippy::too_many_arguments, reason = "authenticated custody binds the existing recipient, command, proof, principal, sender and explicit status together")]
-    pub async fn command_sent(&self, hub: &Arc<Hub>, id: &str, command: Command, provenance: Option<Value>, owner: String, sender: String, status: Option<super::mail::StatusKey>) -> Sent {
-        if let Some(to) = self.routable(hub, id, &command) {
+    pub async fn command_sent(&self, hub: &Arc<Hub>, id: &str, target: Option<&str>, command: Command, provenance: Option<Value>, owner: String, sender: String, status: Option<super::mail::StatusKey>) -> Sent {
+        if let Some(to) = self.routable_to(hub, id, &command, target) {
             return self.send_routed(hub, id, to, command, &owner, &sender, status, provenance).await;
         }
+        if super::session::is_message(&command) {return Self::unknown_message_owner(id);}
         match self.publish_command(hub, id, command, provenance, owner, sender, status).await {
             Ok(receipt) => Sent::Published(receipt),
             Err(error) => Sent::PublicationRefused(error),
@@ -5070,6 +5373,10 @@ impl Registry {
     /// custody and coalesced there (W20): news keeps its receipts' progress (`super::told::mail_progress`), which the
     /// routed path doesn't give.
     pub async fn command_status(&self, hub: &Hub, id: &str, command: Command, status: super::mail::StatusKey) -> Sent {
+        if let Some(to) = self.routable(hub, id, &command) {
+            return self.send_routed(hub, id, to, command, "server", "server", Some(status), None).await;
+        }
+        if super::session::is_message(&command) {return Self::unknown_message_owner(id);}
         match self.publish_command(hub, id, command, None, "server".into(), "server".into(), Some(status)).await {
             Ok(receipt) => Sent::Published(receipt),
             Err(error) => Sent::PublicationRefused(error),
@@ -5135,31 +5442,41 @@ impl Registry {
         super::asked::Kind { message, deduped: message && inbox && message_id(c).is_some() }
     }
 
-    /// Where a message to session `id` goes to be taken into custody by the session's own inbox at once (docs/sends.md,
-    /// "Routed to its session"; Ada, 2026-11-20): the server's own host, where it keeps inboxes, or the runner its owner is
-    /// connected from now, when that runner names [`crate::proto::feature::MAIL_ROUTE`]. None: the server holds it in its
-    /// own custody as W20 does (a runner from before routing, or one that's away).
+    /// CP-T3.2. A remote recipient retains custody even when its link is down.
     pub fn routed_to(&self, hub: &Hub, id: &str) -> Option<Location> {
         self.routed_target(hub, id, None)
     }
 
-    /// Resolve the owning runner for session `id` (honoring optional `target_hint` from the UI
-    /// before falling back to recorded `location(id)`), checking both exact session ownership and
-    /// the machine's newest active `MAIL_ROUTE`-capable runner connection so freshly opened or
-    /// reconnected sessions never fall back to the central server's mail table.
+    fn unknown_message_owner(id:&str)->Sent {
+        Sent::Refused(inbox::Refusal::Unavailable {session:id.to_owned(),why:"no committed owner, recorded location or confirmed session holder".into()})
+    }
+
     pub fn routed_target(&self, hub: &Hub, id: &str, target_hint: Option<&str>) -> Option<Location> {
-        let machine = match self.location(id) {
-            // The server's own sessions keep its custody (W20) for now: what reads their receipts (the server's own
-            // goals, plans and programs, and their tests) is W20's (docs/sends.md, "What's open").
-            Some(Location::Local) => return None,
-            Some(Location::Machine(m)) => m,
-            None => crate::frontdoor::replica::normalize_target(target_hint?)?.to_owned(),
-        };
-        let instances = hub.instances.load();
-        let peer = instances.owner(&crate::instances::Owned::Agent(id.to_owned())).or_else(|| instances.newest(&machine))?;
-        let owner = instances.get(peer)?;
-        let routes = owner.name == machine && instances.current_connection(peer) && crate::proto::feature::speaks(&owner.features, crate::proto::feature::MAIL_ROUTE);
-        routes.then_some(Location::Machine(machine))
+        let manager = self.session_consensus().ok()?;
+        let local_name = manager.as_ref().map(|m| m.node_name());
+        let destination = |name: &str| if name == "local" || name == "server" || Some(name) == local_name {
+            Location::Local
+        } else { Location::Machine(name.to_owned()) };
+        let hint = target_hint.map(str::trim).filter(|s| !s.is_empty()).map(|t| t.strip_prefix("agent:").unwrap_or(t));
+        let committed = manager.as_ref().and_then(|m| m.with_status(id, |s| s.owner.as_deref().map(destination)).flatten());
+        if let Some(owner) = committed {
+            if hint.is_some_and(|name| match &owner {
+                Location::Local => !matches!(name,"server"|"local") && Some(name)!=local_name,
+                Location::Machine(machine) => name!=machine,
+            }) { crate::metrics::sends().stale_target.inc(); }
+            return Some(owner);
+        }
+        if let Some(location) = self.location(id) {return Some(location);}
+        let hinted = destination(hint?);
+        match &hinted {
+            Location::Local if self.local.get(id).is_some() => Some(hinted),
+            Location::Machine(machine) => {
+                let live=hub.instances.load();
+                let peer=live.owner(&crate::instances::Owned::Agent(id.to_owned()))?;
+                (live.current_connection(peer) && live.get(peer).is_some_and(|i| &i.name==machine)).then_some(hinted)
+            }
+            _=>None,
+        }
     }
 
     /// [`Registry::routed_to`] for command `c`: only a message with an id is routed (its session's inbox takes it once).
@@ -5168,9 +5485,7 @@ impl Registry {
     }
 
     fn routable_to(&self, hub: &Hub, id: &str, c: &Command, target_hint: Option<&str>) -> Option<Location> {
-        if !super::session::is_message(c) || message_id(c).is_none() {
-            return None;
-        }
+        if !super::session::is_message(c) { return None; }
         self.routed_target(hub, id, target_hint)
     }
 
@@ -5179,125 +5494,116 @@ impl Registry {
     /// of it needs while its answer is waited for ([`super::answers::Routed`]). Another agent's words kiln relayed carry its record of
     /// relaying them (`relayed`, docs/ci.md W27-R08), which that runner checks before the session takes them.
     async fn route(&self, hub: &Hub, id: &str, to: Location, c: Command, route: super::route::Route, relayed: Option<&Value>) -> Pending {
-        let Some(message) = message_id(&c) else { return Pending::Now(Sent::NoSession) };
+        let Some(message) = message_id(&c) else { return Pending::Now(Sent::Refused(inbox::Refusal::Invalid { what: "message id".into(), why: "a routed message needs a stable nonempty id".into() })); };
+        let authority = match self.session_consensus() {
+            Ok(manager) => manager,
+            Err(e) => return Pending::Now(Sent::Refused(inbox::Refusal::Unavailable {session:id.to_owned(),why:e.to_string()})),
+        };
         let c = match self.route_attachments_on(hub, id, &to, c, LANE_TERM).await {
             Ok(c) => c,
             Err(e) => return Pending::Now(e),
         };
-        let epoch = self.epoch_of(id);
-        let wait = self.wait_for(id, &message).await;
-        let went = match &to {
-            Location::Local => self.local.command_routed(id, c, Some(epoch), route),
-            Location::Machine(machine) => match serde_json::to_value(&c).ok().and_then(|v| route.attach(v, relayed)) {
-                Some(json) => {
-                    // Kept with its wait by the waits' owner, told before the message goes (so before any forward of
-                    // it comes back): none for one not waited on.
-                    if wait.is_some() {
-                        self.answers.route(id, &message, Some(super::answers::Routed { to: machine.clone(), json: json.clone(), route }));
+        use crate::reach::wire::P2pSendReply;
+        let committed = authority.as_ref().and_then(|mgr| mgr.with_status(id, |s| s.owner.as_ref().map(|_| s.epoch)).flatten());
+        let epoch = committed.unwrap_or_else(|| self.epoch_of(id));
+        let session = id.to_owned();
+        let unavailable = {
+            let (id, mid) = (session.clone(), message.clone());
+            move || Sent::Refused(inbox::Refusal::Unavailable { session: id.clone(), why: format!("receipt for {mid} is unknown; retry the same message id at the destination") })
+        };
+        let clock = hub.clock.clone();
+        let reply: futures::future::BoxFuture<'static, Option<P2pSendReply>> = match to {
+            Location::Local => {
+                if authority.as_ref().is_some_and(|m| !crate::agent::owns_session(m, id, epoch)) { return Pending::Now(unavailable()); }
+                let Some(rx) = self.local.command_routed_reply(id, c, epoch, route) else { return Pending::Now(unavailable()); };
+                let (store, id) = (self.convo.clone(), session.clone());
+                Box::pin(async move {
+                    let futures::future::Either::Left((Ok(mut said), _)) = futures::future::select(rx, clock.sleep(ANSWER_WAIT)).await else { return None; };
+                    if authority.is_some() { crate::agent::verify_inbox_answer(authority.as_ref(), store.as_ref(), &id, &mut said).await; }
+                    Some(match said.answer {
+                        Ok(answer) => P2pSendReply::Accepted { answer },
+                        Err(refusal) => P2pSendReply::Refused { refusal },
+                    })
+                })
+            }
+            Location::Machine(machine) => {
+                let Some(json) = serde_json::to_value(&c).ok().and_then(|v| route.attach(v, relayed)) else { return Pending::Now(unavailable()); };
+                // The fleet signs the exact authenticated sender, message, destination and epoch.
+                // Earlier peers accept a node operator or an independently signed agent relay.
+                let local = crate::frontdoor::replica::local_node().filter(|l| l.reach.is_some() && authority.as_ref().is_some_and(|m| l.bound_to(m)));
+                let fleet_proof = local.as_ref().is_some_and(|l| {
+                    l.reach.as_ref().is_some_and(|r| r.authority_mail(&machine)) || {
+                        let known = hub.instances.load();
+                        known.newest(&machine).and_then(|p| known.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::AUTHORITY_MAIL))
                     }
-                    let msg = ServerMsg::HarnessSend { session: id.to_owned(), epoch, json };
+                });
+                if let Some(local) = local.filter(|_| fleet_proof || route.sender == "admin" || relayed.is_some()) {
+                    let proof = fleet_proof.then(|| Arc::clone(&hub.pki));
+                    let Ok(answer) = local.begin_authorized_message(&machine, id, committed, json, proof).await else { return Pending::Now(unavailable()); };
+                    Box::pin(async move { answer.await.ok() })
+                } else {
+                    let live = hub.instances.load();
+                    let Some(peer) = live.reaches(&machine, &crate::instances::Owned::Agent(session.clone())).filter(|&p| live.current_connection(p)
+                        && live.get(p).is_some_and(|v| v.name == machine && crate::proto::feature::speaks(&v.features, crate::proto::feature::ROUTE_RECEIPT))) else {
+                        return Pending::Now(Sent::Unreachable);
+                    };
+                    drop(live);
+                    let Some((request, rx)) = self.answers.request(&machine, id) else { return Pending::Now(unavailable()); };
+                    let Ok(mut body) = serde_json::from_str::<Value>(&json) else { return Pending::Now(unavailable()); };
+                    let Some(fields) = body.as_object_mut() else { return Pending::Now(unavailable()); };
+                    fields.insert("receipt_request".into(), Value::String(request.id.clone()));
+                    let msg = ServerMsg::HarnessSend { session: id.into(), epoch, json: body.to_string() };
                     #[cfg(test)]
                     self.routed_sends.lock().push((machine.clone(), msg.clone()));
-                    hub.send_to_agent(machine, LANE_TERM, &msg).await
+                    let Ok(bytes) = crate::proto::encode(&msg) else { return Pending::Now(unavailable()); };
+                    if !hub.net.send(peer, LANE_TERM, crate::net::Kind::Term, bytes).await { return Pending::Now(Sent::Unreachable); }
+                    Box::pin(async move {
+                        let _waiter = request;
+                        match futures::future::select(rx, clock.sleep(ANSWER_WAIT)).await {
+                            futures::future::Either::Left((Ok(reply), _)) => Some(reply),
+                            _ => None,
+                        }
+                    })
                 }
-                None => false,
-            },
-        };
-        if !went {
-            // Not waited for after all: where it was to go goes with its wait.
-            drop(wait);
-            self.unwait(id, &message);
-            // Its session is here and its lane holds its most: refused so, as any message is.
-            if to == Location::Local && self.local.get(id).is_some() {
-                return Pending::Now(Sent::Refused(inbox::Refusal::Full { session: id.to_owned(), limit: super::host::LANE }));
             }
-            return Pending::Now(Sent::Unreachable);
-        }
-        match wait {
-            Some(rx) => Pending::Answer { message, rx },
-            None => Pending::Now(Sent::Ok),
-        }
+        };
+        Pending::Destination(Box::pin(async move {
+            match reply.await {
+                Some(P2pSendReply::Accepted { answer }) if answer.session == session && answer.message == message && committed.is_none_or(|e| answer.epoch == e || answer.repeat && answer.epoch < e) => Sent::Accepted(answer),
+                Some(P2pSendReply::Refused { refusal }) => Sent::Refused(refusal),
+                Some(P2pSendReply::NoSession) => Sent::NoSession,
+                _ => unavailable(),
+            }
+        }))
+    }
+
+    pub(crate) fn routed_receipt(&self, from: &str, session: &str, request: &str, json: &str) {
+        if let Ok(reply) = serde_json::from_str(json) { self.answers.complete(from, session, request, reply); }
     }
 
     /// A pending send's outcome, waited for.
     async fn pending_sent(&self, hub: &Hub, id: &str, pending: Pending) -> Sent {
         match pending {
             Pending::Now(sent) => sent,
+            Pending::Destination(result) => result.await,
             Pending::Answer { message, rx } => self.answer(hub, id, &message, rx).await,
             Pending::Command(p) => Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await),
         }
     }
 
     /// Message `c` from `sender` to session `id`, routed to where it is now (`to`, [`Registry::routed_to`]): sent, and
-    /// what became of it ([`Registry::finish_routed`]).
+    /// return the receipt from that destination.
     #[allow(clippy::too_many_arguments, reason = "a routed message keeps its sender, owner, status and provenance for a retry or the custody it falls back to")]
-    async fn send_routed(&self, hub: &Hub, id: &str, to: Location, c: Command, owner: &str, sender: &str, status: Option<super::mail::StatusKey>, provenance: Option<Value>) -> Sent {
-        let mut command = c.clone();
+    async fn send_routed(&self, hub: &Hub, id: &str, to: Location, c: Command, _owner: &str, sender: &str, status: Option<super::mail::StatusKey>, provenance: Option<Value>) -> Sent {
+        let mut command = c;
         let mut relayed = provenance.as_ref().and_then(|p| p.get("relayed")).cloned();
         if relay_fault(hub, &mut command, &mut relayed, provenance.as_ref()) {
             // chaos dropped it on its way, as it drops a delivery from custody: nothing answers it.
             return Sent::Ok;
         }
-        let route = super::route::Route { status: status.clone(), ..super::route::Route::new(route_target(&to), sender) };
-        let pending = self.route(hub, id, to.clone(), command, route, relayed.as_ref()).await;
-        self.finish_routed(hub, id, &to, c, pending, owner, sender, status, provenance).await
-    }
-
-    /// What became of message `c` from `sender`, routed to session `id` at `sent_to` (`pending`, [`Registry::route`]): its
-    /// inbox's answer where it went. Sent for an epoch the session has since left, it's sent once more for the one its
-    /// inbox named; refused as gone by a holder that didn't send it on, once more where the session is routed now when
-    /// that's somewhere else (it moved meanwhile). One that couldn't be sent at all (its machine's link went as it was
-    /// sent, or where it is now takes no routed messages) goes into the server's custody instead, as before routing, so
-    /// it isn't lost.
-    #[allow(clippy::too_many_arguments, reason = "a routed message keeps its sender, owner, status and provenance for a retry or the custody it falls back to")]
-    async fn finish_routed(&self, hub: &Hub, id: &str, sent_to: &Location, c: Command, pending: Pending, owner: &str, sender: &str, status: Option<super::mail::StatusKey>, provenance: Option<Value>) -> Sent {
-        let mut sent = self.pending_sent(hub, id, pending).await;
-        let again = match &sent {
-            Sent::Refused(r) => match again_for(r) {
-                Some(current) => {
-                    self.raise_epoch(id, current);
-                    true
-                }
-                None => matches!(r, inbox::Refusal::Moved { .. } | inbox::Refusal::NoSession { .. }) && self.routable(hub, id, &c).is_some_and(|now| now != *sent_to),
-            },
-            _ => false,
-        };
-        if again {
-            sent = match self.routable(hub, id, &c) {
-                Some(to) => {
-                    let route = super::route::Route { status: status.clone(), ..super::route::Route::new(route_target(&to), sender) };
-                    let relayed = provenance.as_ref().and_then(|p| p.get("relayed")).cloned();
-                    let pending = self.route(hub, id, to, c.clone(), route, relayed.as_ref()).await;
-                    self.pending_sent(hub, id, pending).await
-                }
-                // Where it is now takes no routed messages: into the server's custody below.
-                None if self.location(id).is_some() => Sent::Unreachable,
-                None => sent,
-            };
-        }
-        // Only fall back to the server's legacy W20 custody table if the session is now on a
-        // runner that predates `MAIL_ROUTE` (or `Location::Local`). For `MAIL_ROUTE`-capable
-        // runners, NEVER enqueue their messages into the server node's local queue!
-        if matches!(sent, Sent::Unreachable) && self.location(id).is_some() && self.routed_to(hub, id).is_none() {
-            let legacy = match self.location(id) {
-                Some(Location::Local) => true,
-                Some(Location::Machine(m)) => {
-                    let instances = hub.instances.load();
-                    instances
-                        .newest(&m)
-                        .and_then(|p| instances.get(p))
-                        .is_some_and(|o| !crate::proto::feature::speaks(&o.features, crate::proto::feature::MAIL_ROUTE))
-                }
-                None => false,
-            };
-            if legacy {
-                return match self.publish_command(hub, id, c, provenance, owner.to_owned(), sender.to_owned(), status).await {
-                    Ok(receipt) => Sent::Published(receipt),
-                    Err(error) => Sent::PublicationRefused(error),
-                };
-            }
-        }
-        sent
+        let route = super::route::Route { status, ..super::route::Route::new(route_target(&to), sender) };
+        let pending = self.route(hub, id, to, command, route, relayed.as_ref()).await;
+        self.pending_sent(hub, id, pending).await
     }
 
     /// A message this server routed to runner `from` for session `id`, sent back by it as it doesn't hold the session (it
@@ -5356,30 +5662,65 @@ impl Registry {
 
     /// [`Registry::send_asked`], honoring optional `target_hint` attached by the UI
     /// (`SessionUp::Under.target` / `X-Kiln-Target`).
+    fn control_targets_recorded_owner(&self, id:&str, hint:Option<&str>) -> bool {
+        let Some(location)=self.location(id) else {return hint.is_none();};
+        let Ok(manager)=self.session_consensus() else {return false;};
+        let names_location=|s:&str| {
+            let name=s.strip_prefix("agent:").unwrap_or(s);
+            match &location {
+                Location::Local=>matches!(name,"local"|"server") || manager.as_ref().is_some_and(|m| m.node_name()==name),
+                Location::Machine(machine)=>machine==name,
+            }
+        };
+        hint.is_none_or(names_location)
+            && manager.as_ref().and_then(|m| m.with_status(id,|s|s.owner.as_deref().is_some_and(names_location))).unwrap_or(true)
+    }
+
+    pub(crate) fn take_command(&self,hub:&Hub,id:&str,scope:&str,key:&str,target:Option<&str>,command:&Command) -> (super::asked::Kind,super::asked::Taken) {
+        let kind = self.kind_of(hub,id,command);
+        if !kind.message && !self.control_targets_recorded_owner(id,target) {
+            let refused=Sent::Rejected { code:crate::wire::channel::Refusal::StaleEpoch, why:"the selected node does not own the session".into() };
+            return (kind,super::asked::Taken::Answered(refused));
+        }
+        self.asked.take_command(id,scope,key,kind,command)
+    }
+
+    pub(crate) async fn command_under_key(&self, hub: &Arc<Hub>, id: &str, scope: &str, key: &str, target: Option<&str>, command: Command) -> Sent {
+        use super::asked::Taken;
+        let rx = match self.take_command(hub,id,scope,key,target,&command) {
+            (_,Taken::Answered(sent)) => return sent,
+            (_,Taken::Waiting(rx)) => rx,
+            (_,Taken::New(rx)) => {
+                self.send_asked_to(hub,id,scope,key,target,command).await;
+                rx
+            }
+        };
+        rx.await.unwrap_or_else(|_| Sent::Unanswered("the server let go of the command before its answer came".into()))
+    }
+
     pub async fn send_asked_to(&self, hub: &Arc<Hub>, id: &str, scope: &str, cmd: &str, target_hint: Option<&str>, c: Command) {
         use std::time::Instant;
+        if !super::session::is_message(&c) && !self.control_targets_recorded_owner(id,target_hint) {
+            let refused = Sent::Rejected { code:crate::wire::channel::Refusal::StaleEpoch, why:"the selected node does not own the session".into() };
+            self.asked.answered(id,scope,cmd,&refused,Instant::now());
+            return;
+        }
         // Routed to its session (docs/sends.md, "Routed to its session"; Ada, 2026-11-20): sent now to where the session
         // is, whose own inbox takes it into custody as its sender's; its answer waited for off this caller's way, so
         // what the caller sends next goes on behind it, in order.
         if let Some(to) = self.routable_to(hub, id, &c, target_hint) {
             let route = super::route::Route::new(route_target(&to), scope);
-            let pending = self.route(hub, id, to.clone(), c.clone(), route, None).await;
+            let pending = self.route(hub, id, to, c, route, None).await;
             let (h, session, scope, cmd) = (Arc::clone(hub), id.to_owned(), scope.to_owned(), cmd.to_owned());
             crate::rt::spawn(async move {
-                let sent = h.harness.finish_routed(&h, &session, &to, c, pending, &scope, &scope, None, None).await;
+                let sent = h.harness.pending_sent(&h, &session, pending).await;
                 h.harness.asked.answered(&session, &scope, &cmd, &sent, Instant::now());
             });
             return;
         }
-        // A message goes into custody (W20), a person's in a queue of its own, unless it's a
-        // person's and its session's runner predates mail-flow: then it goes to that runner's
-        // inbox, as before, through `dispatch` below ([`super::mail_delivery::legacy_owner`]).
-        if into_custody(hub, id, scope, &c) {
-            let sent = match self.publish_command(hub, id, c, None, scope.to_owned(), scope.to_owned(), None).await {
-                Ok(receipt) => Sent::Published(receipt),
-                Err(error) => Sent::PublicationRefused(error),
-            };
-            self.asked.answered(id, scope, cmd, &sent, Instant::now());
+        if super::session::is_message(&c) {
+            let sent=Self::unknown_message_owner(id);
+            self.asked.answered(id,scope,cmd,&sent,Instant::now());
             return;
         }
         let pending = self.dispatch(hub, id, c.clone()).await;
@@ -5401,6 +5742,7 @@ impl Registry {
     pub async fn resolve(&self, hub: &Hub, id: &str, c: Command, p: Pending) -> Sent {
         match p {
             Pending::Now(sent) => sent,
+            Pending::Destination(result) => result.await,
             Pending::Answer { message, rx } => self.settle(hub, id, c, &message, rx).await,
             Pending::Command(p) => Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await),
         }
@@ -5430,6 +5772,7 @@ impl Registry {
     async fn command_once(&self, hub: &Hub, id: &str, c: Command) -> Sent {
         match self.dispatch(hub, id, c).await {
             Pending::Now(sent) => sent,
+            Pending::Destination(result) => result.await,
             Pending::Answer { message, rx } => self.answer(hub, id, &message, rx).await,
             Pending::Command(p) => Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await),
         }
@@ -5438,6 +5781,14 @@ impl Registry {
     /// Sends command `c` to session `id` now, after whatever was sent before: how it fared, or (a
     /// message) its inbox's answer to wait for ([`Registry::settle`]), so a sender that goes on
     /// meanwhile (a viewer's socket) waits for nothing.
+    pub(crate) async fn dispatch_from(&self, hub: &Hub, id: &str, sender: &str, c: Command) -> Pending {
+        if let Some(to) = self.routable(hub,id,&c) {
+            let route = super::route::Route::new(route_target(&to),sender);
+            return self.route(hub,id,to,c,route,None).await;
+        }
+        self.dispatch(hub,id,c).await
+    }
+
     pub async fn dispatch(&self, hub: &Hub, id: &str, c: Command) -> Pending {
         // A person's pause of a session holds the subagents kiln started under it too, and resuming
         // it lets them go: each still going is sent its own, its answer not waited for.
@@ -5480,6 +5831,7 @@ impl Registry {
                 self.raise_epoch(id, current);
                 return match self.dispatch_relayed(hub, id, c, Some(&relayed)).await {
                     Pending::Now(sent) => sent,
+            Pending::Destination(result) => result.await,
                     Pending::Answer { message, rx } => self.answer(hub, id, &message, rx).await,
                     Pending::Command(p) => Sent::of(p.answer_or_parked(crate::hub::COMMAND_WITHIN).await),
                 };
@@ -5615,20 +5967,11 @@ impl Registry {
             }
             tracing::warn!(target: "kiln.agentenvs", session = %id, %why, "a session stopped by force goes on with the environment it had: its own couldn't be opened again");
         }
-        // A person's message, or kiln's own, to a runner that predates mail-flow goes to its
-        // inbox below, as before W20: that runner never pushes the capacity custody waits for.
-        // An agent's relayed words stay in custody, bounded, until it's upgraded.
-        if super::session::is_message(&c) && (relayed.is_some() || !super::mail_delivery::legacy_owner(hub, id)) {
-            // Kiln's own (the goal driver's words, a plan's steps, a program's notices) and another agent's relayed words
-            // stay in the server's custody (W20) even where the session's runner takes routed messages: what keeps their
-            // place (a goal's word, a plan run's key, a notice) reads the custody receipts routing doesn't give yet
-            // (docs/sends.md, "What's open").
-            let provenance = relayed.map(|proof| json!({"relayed": proof}));
-            return Pending::Now(match self.publish_command(hub, id, c, provenance, "server".into(), "server".into(), None).await {
-                Ok(receipt) => Sent::Published(receipt),
-                Err(error) => Sent::PublicationRefused(error),
-            });
+        if let Some(to) = self.routable(hub, id, &c) {
+            let route = super::route::Route::new(route_target(&to), "server");
+            return self.route(hub, id, to, c, route, relayed).await;
         }
+        if super::session::is_message(&c) {return Pending::Now(Self::unknown_message_owner(id));}
         let Some(loc) = self.location(id) else { return Pending::Now(Sent::NoSession) };
         // Kiln's own (`goals::keep`), kept here: its harness has nothing to do with it.
         if let Command::Control { id: control, value } = &c
@@ -5741,7 +6084,7 @@ impl Registry {
     /// count: that machine lets go of it if it comes back. Ok once the package is on its way.
     pub async fn resume_on(&self, hub: &Hub, id: &str, to: &str, cwd: Option<String>) -> Result<(), String> {
         let store = self.convo.clone().ok_or_else(|| "this server keeps no conversations (KILN_CONVERSATIONS is off)".to_owned())?;
-        let (from, epoch) = self.sessions.with(id, |v| (Location::clone(&v.location), v.state.get::<u64>("epoch").unwrap_or(0))).ok_or_else(|| "no such agent session".to_owned())?;
+        let (from, former_epoch) = self.sessions.with(id, |v| (Location::clone(&v.location), v.info.epoch)).ok_or_else(|| "no such agent session".to_owned())?;
         let from_name = match &from {
             Location::Local => return Err("it runs on the server itself, which is up: move it instead".into()),
             Location::Machine(m) => m.clone(),
@@ -5764,7 +6107,9 @@ impl Registry {
         // The package, and its timeline for kiln's take of it (every event's digest), made on the blocking pool (goal 9,
         // plan 01a1a87b2cec step 3).
         let in_place = from_name == to;
-        let (mut pkg, timeline) = crate::rt::blocking(move || crate::convo::resume::package_for(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown), in_place).map(|p| {
+        let legacy = self.session_consensus().map_err(|e| e.to_string())?.is_none();
+        let (mut pkg, timeline) = crate::rt::blocking(move || crate::convo::resume::package_for(&st, &i, &f, cwd.as_deref(), (&from_shown, &to_shown), in_place).map(|mut p| {
+            if legacy { p.state.epoch = p.state.epoch.max(former_epoch); }
             let t = crate::custody::timeline(&i, p.state.epoch, &p.events);
             (p, t)
         }))
@@ -5802,10 +6147,9 @@ impl Registry {
             inst.newest(to).and_then(|p| inst.get(p)).is_some_and(|i| crate::proto::feature::speaks(&i.features, crate::proto::feature::MAIL_ROUTE))
         };
         let held = if routes { Vec::new() } else { std::mem::take(&mut pkg.waiting) };
-        let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
+        let next = move_package(hub, &mut pkg, to, in_place).await?;
         // Its copy where it was doesn't count from now on: not here, not in the store (rows that
         // machine still sends are left out).
-        let next = epoch.max(pkg.state.epoch) + 1;
         self.raise_epoch(id, next);
         store.put(vec![crate::convo::rows::Row::Session { session: id.to_owned(), info: None, meta: None, state: None, changes: None, epoch: Some(next), open: false, at: crate::util::now_ms() }]);
         let (sid, there) = (id.to_owned(), Location::Machine(to.to_owned()));
@@ -5826,18 +6170,15 @@ impl Registry {
         if let Some(info) = info {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info.clone()) });
         }
-        tracing::info!(session = %id, from = %from_name, %to, bytes = bytes.len(), "agent session goes on on another machine, from the server's store");
+        tracing::info!(session = %id, from = %from_name, %to, "agent session goes on on another machine, from the server's store");
         // Given its environment in the process it goes to: announcing it with it there asks nothing more.
         crate::agentenvs::resolve::given(hub, id, &format!("agent:{to}"));
-        let sent = send_package(hub, id, to, &bytes).await;
-        if sent.is_ok() {
-            for w in held {
+        for w in held {
                 if let Err(e) = self.publish_command(hub, id, w.command, None, w.sender.clone(), w.sender, w.status).await {
                     tracing::warn!(target: "kiln.sends", event = "resume_waiting_lost", session = %id, error = %e, "a message that waited where the session was couldn't be held for it here");
                 }
-            }
         }
-        sent
+        Ok(())
     }
 
     pub fn never_started(&self, id: &str) -> bool {
@@ -5869,13 +6210,11 @@ impl Registry {
             (core.events().cloned().collect::<Vec<_>>(), core.state.clone())
         };
         let had = self.sessions.with(id, |v| v.state.get::<u64>("epoch")).flatten().unwrap_or(0);
-        let next = had.max(state.epoch) + 1;
-        state.epoch = next - 1;
+        state.epoch = had.max(state.epoch);
         let from_cwd = state.cwd.clone();
-        let pkg = super::moving::pack(id, spec, cwd, "the kiln server", &from_cwd, super::moving::Carry::Nothing, events, state);
-        let bytes = serde_json::to_vec(&pkg).map_err(|e| e.to_string())?;
+        let mut pkg = super::moving::pack(id, spec, cwd, "the kiln server", &from_cwd, super::moving::Carry::Nothing, events, state);
+        let next = move_package(hub, &mut pkg, to, false).await?;
         crate::agentenvs::resolve::given(hub, id, &format!("agent:{to}"));
-        send_package(hub, id, to, &bytes).await?;
         self.raise_epoch(id, next);
         if let Some(store) = &self.convo {
             store.put(vec![crate::convo::rows::Row::Session { session: id.to_owned(), info: None, meta: None, state: None, changes: None, epoch: Some(next), open: false, at: crate::util::now_ms() }]);
@@ -5900,7 +6239,7 @@ impl Registry {
             hub.emit(&crate::wire::events::ServerEvent::Harness { info: Box::new(info) });
         }
         self.local.let_go(id);
-        tracing::info!(session = %id, %to, bytes = bytes.len(), "an agent whose harness never started on the server goes on on a runner");
+        tracing::info!(session = %id, %to, "an agent whose harness never started on the server goes on on a runner");
         Ok(())
     }
 
@@ -6214,6 +6553,41 @@ mod tests {
             assert_eq!(one.first().map(|i| i.id.as_str()), Some(c.as_str()));
             assert!(crate::util::is_id(&crate::util::new_id()) && !crate::util::is_id("../../etc") && !crate::util::is_id(&a.to_uppercase()));
             Ok(())
+        })
+    }
+
+    #[test]
+    fn w21_r15_canonical_batch_keeps_every_slot_after_one_id_conflicts() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub_with(|c| c.conversations.off = true).await?;
+            hub.harness.set_test_program("/nonexistent/kiln-test-no-harness");
+            let dir = tempfile::tempdir()?;
+            let ids = (0..5).map(|_| crate::util::new_id()).collect::<Vec<_>>();
+            let occupied = ids.get(2).ok_or_else(|| anyhow::anyhow!("missing third fixture slot"))?;
+            let spec = Spec {
+                kind: "claude".into(),
+                cwd: Some(dir.path().display().to_string()),
+                ..Spec::default()
+            };
+            hub.harness.open_as(&hub, "local", spec.clone(), 1, std::slice::from_ref(occupied)).await?;
+            let batch = Spec {
+                start_request: Some(crate::util::sha256_hex(b"canonical batch")),
+                ..spec
+            };
+            for _ in 0..2 {
+                let err = hub
+                    .harness
+                    .open_as(&hub, "local", batch.clone(), ids.len(), &ids)
+                    .await
+                    .err()
+                    .ok_or_else(|| anyhow::anyhow!("occupied slot unexpectedly accepted"))?;
+                let slots = err.downcast::<StartSlots>()?;
+                assert_eq!(slots.status(), http::StatusCode::MULTI_STATUS);
+                let outcomes = slots.0.iter().filter_map(|v| v.get("outcome").and_then(Value::as_str)).collect::<Vec<_>>();
+                assert_eq!(outcomes, ["started", "started", "refused", "started", "started"]);
+                assert_eq!(hub.harness.list().len(), 5);
+            }
+            anyhow::Ok(())
         })
     }
 
@@ -9708,91 +10082,38 @@ mod tests {
         Ok(())
     }
 
-    /// A person's message to an agent whose runner predates mail-flow goes to that runner's inbox,
-    /// as it did before W20, and is answered there: the runner never pushes the capacity custody
-    /// waits for, so custody refused it ("waiting for capacity") for as long as the runner was old.
-    /// An agent's message to it stays in custody's hands (W20's bound), taken and waiting there:
-    /// none is refused for an owner whose capacity is pending (Ada, 2026-11-12; 2e1a968d055c).
-    /// Once the runner speaks mail-flow, a person's is queued in custody, in a queue of its own,
-    /// before the agent's capacity has come; an agent's and kiln's own are taken and wait for it.
+    /// CP-T3.2. A remote runner without destination receipts cannot acknowledge a fleet send.
     #[test]
-    fn w20_a_persons_message_reaches_a_runner_from_before_mail_flow_through_its_inbox() -> anyhow::Result<()> {
-        use super::super::asked::Taken;
-        use super::super::model::SendMode;
+    fn w20_remote_legacy_runner_cannot_accept_work_into_the_forwarders_queue() -> anyhow::Result<()> {
         use crate::proto::{AgentMsg, CAP_INBOX, CAP_UNREAD, CAP_WIRE};
         crate::rt::block_on(async {
             let hub = crate::hub::tests::hub_with_runner(crate::rt::clock(), "old-mac", CAP_UNREAD | CAP_WIRE | CAP_INBOX).await?;
             let open = Update::Open { info: Box::new(Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
             crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 1, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&open)? }).await?;
-            anyhow::ensure!(hub.harness.located_on("s1", "old-mac"), "s1 opened on old-mac");
-            anyhow::ensure!(super::super::mail_delivery::legacy_owner(&hub, "s1"), "a runner that names no mail-flow is from before it");
-            let send = |id: &str| Command::Send { id: id.into(), text: "what is this section?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
-            let asked = |scope: &str, cmd: &str, id: &str| {
-                let kind = hub.harness.kind_of(&hub, "s1", &send(id));
-                match hub.harness.asked.take("s1", scope, cmd, kind, std::time::Instant::now()) {
-                    (_, Taken::New(rx)) => Ok(rx),
-                    (_, other) => Err(anyhow::anyhow!("{cmd} came before: {other:?}")),
-                }
-            };
-            // A person's, from the page's socket: on to its inbox, which answers it.
-            let person = asked("user:ada", "c1", "m1")?;
-            hub.harness.send_asked(&hub, "s1", "user:ada", "c1", send("m1")).await;
-            anyhow::ensure!(super::super::mail::receipt(&hub.store, "user:ada".into(), "user:ada".into(), "s1".into(), "m1".into()).await?.is_none(), "not held in custody");
-            let took = Update::Inbox { said: Box::new(Said { message: "m1".into(), answer: Ok(Answer { session: "s1".into(), message: "m1".into(), epoch: 0, at: 1, seq: 1, repeat: false }) }) };
-            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 2, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&took)? }).await?;
-            let sent = person.await?;
-            anyhow::ensure!(matches!(sent, Sent::Accepted(ref a) if a.message == "m1"), "its inbox took it: {sent:?}");
-            // Kiln's own and a person's through the API go there too.
-            anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m2")).await, Pending::Answer { ref message, .. } if message == "m2"), "to its inbox");
-            // An agent's stays with custody: taken, and waiting there while the runner pushes no capacity.
-            let waiting = |sent: &Sent| matches!(sent, Sent::Published(r) if r.disposition == super::super::mail::Disposition::Waiting);
-            let agent = asked("agent:a1", "c3", "m3")?;
-            hub.harness.send_asked(&hub, "s1", "agent:a1", "c3", send("m3")).await;
-            let sent = agent.await?;
-            anyhow::ensure!(waiting(&sent), "an agent's is held to custody, taken and waiting: {sent:?}");
-            // Its runner upgraded, speaking mail-flow, its capacity not come yet: a person's is
-            // queued in custody, in the person's own queue; an agent's and kiln's wait for it.
-            hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned()]));
-            anyhow::ensure!(!super::super::mail_delivery::legacy_owner(&hub, "s1"), "a runner naming mail-flow isn't from before it");
-            let person = asked("user:ada", "c4", "m4")?;
-            hub.harness.send_asked(&hub, "s1", "user:ada", "c4", send("m4")).await;
-            let sent = person.await?;
-            anyhow::ensure!(matches!(sent, Sent::Published(ref r) if r.disposition == super::super::mail::Disposition::Waiting), "queued for the agent: {sent:?}");
-            let agent = asked("agent:a1", "c5", "m5")?;
-            hub.harness.send_asked(&hub, "s1", "agent:a1", "c5", send("m5")).await;
-            let sent = agent.await?;
-            anyhow::ensure!(waiting(&sent), "an agent's is taken and waits for its capacity: {sent:?}");
-            let Pending::Now(own) = hub.harness.dispatch(&hub, "s1", send("m6")).await else { anyhow::bail!("kiln's own went on to an inbox, not to custody") };
-            anyhow::ensure!(waiting(&own), "and kiln's own: {own:?}");
+            for (sender, id) in [("user:ada", "m1"), ("agent:a1", "m2"), ("server", "m3")] {
+                let sent = hub.harness.command_from(&hub, "s1", sender, routed_message(id)).await;
+                anyhow::ensure!(!sent.went(), "a legacy destination acknowledged {id}: {sent:?}");
+                anyhow::ensure!(super::super::mail::receipt(&hub.store, sender.into(), sender.into(), "s1".into(), id.into()).await?.is_none());
+            }
             Ok(())
         })
     }
 
-    /// Kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 35: a message an API call sends (`POST
-    /// /api/harness/sessions/:id/command`, no idempotency key) goes into custody as its sender's,
-    /// never as kiln's own (`server`). A person's (`admin`, `user:<id>`) waits in the persons' part,
-    /// held to no depth and taking no agent's turn; an agent's is held to the recipient's depth.
     #[test]
-    fn s35_an_api_message_goes_into_custody_as_its_senders_a_persons_held_to_no_depth() -> anyhow::Result<()> {
-        use super::super::model::SendMode;
-        use crate::proto::{AgentMsg, CAP_INBOX, CAP_UNREAD, CAP_WIRE};
+    fn s35_a_remote_api_message_carries_the_authenticated_senders_queue_identity() -> anyhow::Result<()> {
+        use super::super::asked::Taken;
         crate::rt::block_on(async {
-            let hub = crate::hub::tests::hub_with_runner(crate::rt::clock(), "mac", CAP_UNREAD | CAP_WIRE | CAP_INBOX).await?;
-            hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned()]));
-            let open = Update::Open { info: Box::new(Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
-            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 1, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&open)? }).await?;
-            anyhow::ensure!(!super::super::mail_delivery::legacy_owner(&hub, "s1"), "its runner speaks mail-flow");
-            let send = |id: &str| Command::Send { id: id.into(), text: "how far along is it?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
+            let hub = crate::hub::tests::scratch_hub().await?;
+            routing_runner(&hub, 1, "mac", "s1", 0, 1).await?;
             for (sender, id) in [("user:ada", "m1"), ("admin", "m2"), ("agent:a1", "m3")] {
-                let sent = hub.harness.command_from(&hub, "s1", sender, send(id)).await;
-                anyhow::ensure!(matches!(sent, Sent::Published(ref r) if r.disposition == super::super::mail::Disposition::Waiting), "{sender}'s is taken and waits: {sent:?}");
+                let kind = hub.harness.kind_of(&hub, "s1", &routed_message(id));
+                let (_, Taken::New(answer)) = hub.harness.asked.take("s1", sender, id, kind, std::time::Instant::now()) else { anyhow::bail!("expected a fresh command for {id}"); };
+                hub.harness.send_asked(&hub, "s1", sender, id, routed_message(id)).await;
+                anyhow::ensure!(routed_to_machines(&hub, "s1").iter().any(|(node, route, msg)| node == "mac" && route.sender == sender && msg == id));
+                settle_destination(&hub, "mac", id, &request_for(&hub, "mac", id)?)?;
+                anyhow::ensure!(matches!(answer.await?, Sent::Accepted(a) if a.message == id));
+                anyhow::ensure!(super::super::mail::receipt(&hub.store, sender.into(), sender.into(), "s1".into(), id.into()).await?.is_none());
             }
-            let demand = super::super::mail::waiting_peers(&hub.store, "s1".into(), 0, super::super::state_view::FRAME).await?;
-            let mut senders: Vec<String> = demand.items.iter().map(|head| head.peer.clone()).collect();
-            senders.sort();
-            anyhow::ensure!(senders == ["admin", "agent:a1", "user:ada"], "each waits as its sender's, none as kiln's own: {senders:?}");
-            let persons: Vec<&str> = senders.iter().map(String::as_str).filter(|s| super::super::mail::person(s)).collect();
-            anyhow::ensure!(persons == ["admin", "user:ada"], "the persons' are held to no depth, the agent's to the depth: {persons:?}");
             Ok(())
         })
     }
@@ -9809,124 +10130,125 @@ mod tests {
         }).collect()
     }
 
-    /// Waits until a routed send of `message` to session `id` has gone (it goes on a task of its own).
-    async fn routed_went(hub: &Hub, id: &str, message: &str) -> anyhow::Result<()> {
-        for _ in 0..500 {
-            if routed_to_machines(hub, id).iter().any(|(_, _, m)| m == message) {
-                return Ok(());
-            }
-            crate::rt::sleep(std::time::Duration::from_millis(2)).await;
-        }
-        anyhow::bail!("{message} wasn't routed to {id}'s runner")
-    }
-
     /// A runner that names `mail-route` at peer `peer` holding session `id` at `epoch` (its Open heard).
     async fn routing_runner(hub: &Arc<Hub>, peer: hyper_transport::PeerId, name: &str, id: &str, epoch: u64, seq: u64) -> anyhow::Result<()> {
         use crate::proto::{AgentMsg, CAP_INBOX, CAP_UNREAD, CAP_WIRE};
         if hub.instances.load().get(peer).is_none() {
             crate::hub::tests::join_runner(hub, peer, name, CAP_UNREAD | CAP_WIRE | CAP_INBOX);
         }
-        hub.instances.update(|i| i.set_features(peer, vec![crate::proto::feature::MAIL_FLOW.to_owned(), crate::proto::feature::MAIL_ROUTE.to_owned()]));
+        hub.instances.update(|i| i.set_features(peer, vec![crate::proto::feature::MAIL_FLOW.to_owned(), crate::proto::feature::MAIL_ROUTE.to_owned(), crate::proto::feature::ROUTE_RECEIPT.to_owned()]));
         let open = Update::Open { info: Box::new(Info { id: id.into(), kind: "claude".into(), epoch, ..Default::default() }), since: None };
         crate::hub::tests::hear_item(hub, peer, &format!("s:{id}#{name}"), seq, &AgentMsg::Harness { session: id.into(), json: serde_json::to_string(&open)? }).await
     }
 
-    fn inbox_took(id: &str, message: &str, epoch: u64) -> Update {
-        Update::Inbox { said: Box::new(Said { message: message.into(), answer: Ok(Answer { session: id.into(), message: message.into(), epoch, at: 1, seq: 1, repeat: false }) }) }
+    fn request_for(hub: &Hub, machine: &str, message: &str) -> anyhow::Result<String> {
+        hub.harness.routed_sends.lock().iter().rev().find_map(|(peer, msg)| {
+            let ServerMsg::HarnessSend { json, .. } = msg else { return None; };
+            let command: Value = serde_json::from_str(json).ok()?;
+            (peer == machine && command.get("id").and_then(Value::as_str) == Some(message)).then(|| command.get("receipt_request")?.as_str().map(str::to_owned)).flatten()
+        }).ok_or_else(|| anyhow::anyhow!("no request to {machine} for {message}"))
     }
 
-    /// Ada, 2026-11-20 (docs/sends.md, "Routed to its session"): a person's message, an API caller's and kiln's own go at
-    /// once to the runner the session is on, `route` beside the command (its target, its sender), and nothing of them
-    /// goes into the server's custody; the session's inbox there answers each sender. A runner that doesn't name
-    /// `mail-route` keeps the server's custody (W20's), as before.
+    fn settle_destination(hub: &Hub, machine: &str, message: &str, request: &str) -> anyhow::Result<()> {
+        let reply = crate::reach::wire::P2pSendReply::Accepted { answer: Answer { session: "s1".into(), message: message.into(), epoch: 0, at: 1, seq: 1, repeat: false } };
+        hub.harness.routed_receipt(machine, "s1", request, &serde_json::to_string(&reply)?);
+        Ok(())
+    }
+
+    fn routed_message(id: &str) -> Command {
+        Command::Send { id: id.into(), text: "is it done?".into(), mode: super::super::model::SendMode::Queue, attachments: vec![], overrides: None, reply_to: None, task: None }
+    }
+
     #[test]
-    fn routed_a_message_goes_to_its_sessions_runner_with_its_route_and_none_into_custody() -> anyhow::Result<()> {
+    fn cp_t3_2_routed_user_and_internal_messages_only_enter_the_destination_queue() -> anyhow::Result<()> {
         use super::super::asked::Taken;
-        use super::super::model::SendMode;
-        use crate::proto::{AgentMsg, CAP_INBOX, CAP_UNREAD, CAP_WIRE};
         crate::rt::block_on(async {
-            let hub = crate::hub::tests::hub_with_runner(crate::rt::clock(), "mac", CAP_UNREAD | CAP_WIRE | CAP_INBOX).await?;
-            hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned()]));
-            let open = Update::Open { info: Box::new(Info { id: "s1".into(), kind: "claude".into(), ..Default::default() }), since: None };
-            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 1, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&open)? }).await?;
-            anyhow::ensure!(hub.harness.routed_to(&hub, "s1").is_none(), "a runner that names no mail-route keeps the server's custody");
-            hub.instances.update(|i| i.set_features(1, vec![crate::proto::feature::MAIL_FLOW.to_owned(), crate::proto::feature::MAIL_ROUTE.to_owned()]));
-            anyhow::ensure!(hub.harness.routed_to(&hub, "s1") == Some(Location::Machine("mac".into())), "routed to its runner");
-            let send = |id: &str| Command::Send { id: id.into(), text: "how far along is it?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
-            // A person's, from the page's socket.
-            let kind = hub.harness.kind_of(&hub, "s1", &send("m1"));
-            let (_, Taken::New(person)) = hub.harness.asked.take("s1", "user:ada", "c1", kind, std::time::Instant::now()) else { anyhow::bail!("c1 came before") };
-            hub.harness.send_asked(&hub, "s1", "user:ada", "c1", send("m1")).await;
-            let sends = routed_to_machines(&hub, "s1");
-            let Some((machine, route, _)) = sends.iter().find(|(_, _, m)| m == "m1") else { anyhow::bail!("m1 wasn't routed: {}", sends.len()) };
-            anyhow::ensure!(machine == "mac" && route.target == "mac" && route.sender == "user:ada" && route.hops == 0 && route.status.is_none(), "{machine} {route:?}");
-            anyhow::ensure!(super::super::mail::receipt(&hub.store, "user:ada".into(), "user:ada".into(), "s1".into(), "m1".into()).await?.is_none(), "nothing of it in the server's custody");
-            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 2, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&inbox_took("s1", "m1", 0))? }).await?;
-            let sent = person.await?;
-            anyhow::ensure!(matches!(sent, Sent::Accepted(ref a) if a.message == "m1"), "its sender hears its inbox took it: {sent:?}");
-            // Kiln's own (a goal's word, a plan's step) stays in the server's custody: what keeps its place reads custody
-            // receipts, which routing doesn't give yet.
-            anyhow::ensure!(matches!(hub.harness.dispatch(&hub, "s1", send("m2")).await, Pending::Now(Sent::Published(ref r)) if r.id == "m2"), "kiln's own stays in custody");
-            anyhow::ensure!(!routed_to_machines(&hub, "s1").iter().any(|(_, _, m)| m == "m2"), "kiln's own isn't routed");
-            // An agent's through agents.send's path: its inbox's answer, nothing in custody.
-            let h = Arc::clone(&hub);
-            let agent = crate::rt::spawn(async move { h.harness.command_sent(&h, "s1", send("m3"), None, "agent:a1".into(), "agent:a1".into(), None).await });
-            routed_went(&hub, "s1", "m3").await?;
-            crate::hub::tests::hear_item(&hub, 1, "s:s1#a1", 3, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&inbox_took("s1", "m3", 0))? }).await?;
-            let sent = agent.await?;
-            anyhow::ensure!(matches!(sent, Sent::Accepted(ref a) if a.message == "m3"), "agents.send hears its inbox's answer: {sent:?}");
-            anyhow::ensure!(super::super::mail::receipt(&hub.store, "agent:a1".into(), "agent:a1".into(), "s1".into(), "m3".into()).await?.is_none(), "nor any of the agent's");
+            let hub = crate::hub::tests::scratch_hub().await?;
+            routing_runner(&hub, 1, "mac", "s1", 0, 1).await?;
+            let kind = hub.harness.kind_of(&hub, "s1", &routed_message("m1"));
+            let (_, Taken::New(person)) = hub.harness.asked.take("s1", "user:ada", "c1", kind, std::time::Instant::now()) else { anyhow::bail!("expected a new request"); };
+            hub.harness.send_asked(&hub, "s1", "user:ada", "c1", routed_message("m1")).await;
+            let req = request_for(&hub, "mac", "m1")?;
+            settle_destination(&hub, "mac", "m1", &req)?;
+            anyhow::ensure!(matches!(person.await?, Sent::Accepted(a) if a.message == "m1"));
+            let pending = hub.harness.dispatch(&hub, "s1", routed_message("m2")).await;
+            settle_destination(&hub, "mac", "m2", &request_for(&hub, "mac", "m2")?)?;
+            anyhow::ensure!(matches!(hub.harness.pending_sent(&hub, "s1", pending).await, Sent::Accepted(a) if a.message == "m2"));
+            for (sender, message) in [("user:ada","m1"),("server","m2")] {
+                anyhow::ensure!(super::super::mail::receipt(&hub.store, sender.into(), sender.into(), "s1".into(), message.into()).await?.is_none());
+            }
             Ok(())
         })
     }
 
-    /// A message routed to a runner that doesn't hold its session any more goes on (`AgentMsg::HarnessForward`) to where
-    /// the session is now, a hop further, the words the server routed (never what the runner says they were), and the
-    /// new holder's inbox answers its sender, who still waits. A forward from a runner it wasn't routed to is let go of,
-    /// and one back to where the server still says the session is tells its sender it was refused as gone.
     #[test]
-    fn routed_a_message_for_a_session_that_moved_on_goes_on_a_hop_to_its_holder() -> anyhow::Result<()> {
-        use super::super::asked::Taken;
-        use super::super::model::SendMode;
-        use crate::proto::AgentMsg;
+    fn cp_t3_2_routed_receipts_are_bound_to_the_request_and_the_selected_destination() -> anyhow::Result<()> {
         crate::rt::block_on(async {
             let hub = crate::hub::tests::scratch_hub().await?;
             routing_runner(&hub, 1, "mac", "s1", 0, 1).await?;
-            let send = |id: &str| Command::Send { id: id.into(), text: "is it done?".into(), mode: SendMode::Queue, attachments: Vec::new(), overrides: None, reply_to: None, task: None };
-            let kind = hub.harness.kind_of(&hub, "s1", &send("m1"));
-            let (_, Taken::New(person)) = hub.harness.asked.take("s1", "user:ada", "c1", kind, std::time::Instant::now()) else { anyhow::bail!("c1 came before") };
-            hub.harness.send_asked(&hub, "s1", "user:ada", "c1", send("m1")).await;
-            let Some((_, _, _)) = routed_to_machines(&hub, "s1").into_iter().find(|(machine, _, m)| machine == "mac" && m == "m1") else { anyhow::bail!("m1 wasn't routed to mac") };
-            // The session goes on on linux (moved) before mac takes the message: mac sends it on.
-            routing_runner(&hub, 2, "linux", "s1", 1, 1).await?;
-            anyhow::ensure!(hub.harness.routed_to(&hub, "s1") == Some(Location::Machine("linux".into())), "s1 is on linux now: {:?}", hub.harness.location("s1"));
-            let forged = super::super::route::Route::new("mac", "admin").onward("mac").and_then(|r| r.attach(json!({"type": "send", "id": "m1", "text": "words of the runner's own", "mode": "queue"}), None)).ok_or_else(|| anyhow::anyhow!("no route"))?;
-            // A forward from a runner the message wasn't routed to is let go of.
-            hub.harness.forward(&hub, "linux", "s1", &forged).await;
-            anyhow::ensure!(!routed_to_machines(&hub, "s1").iter().any(|(machine, _, m)| machine == "linux" && m == "m1"), "linux wasn't sent it on its own word");
-            crate::hub::tests::hear(&hub, 1, crate::proto::LANE_TERM, &AgentMsg::HarnessForward { session: "s1".into(), epoch: 0, json: forged.clone() }).await?;
-            let mut onward = None;
-            for _ in 0..500 {
-                onward = routed_to_machines(&hub, "s1").into_iter().find(|(machine, _, m)| machine == "linux" && m == "m1");
-                if onward.is_some() { break; }
-                crate::rt::sleep(std::time::Duration::from_millis(2)).await;
-            }
-            let Some((_, route, _)) = onward else { anyhow::bail!("m1 didn't go on to linux") };
-            anyhow::ensure!(route.target == "linux" && route.hops == 1 && route.sender == "user:ada", "a hop further, its sender kept: {route:?}");
-            let sent_on = hub.harness.routed_sends.lock().iter().rev().find_map(|(machine, m)| match m { ServerMsg::HarnessSend { json, .. } if machine == "linux" => Some(json.clone()), _ => None }).unwrap_or_default();
-            anyhow::ensure!(sent_on.contains("is it done?") && !sent_on.contains("the runner's own"), "the server's words went on, not the runner's: {sent_on}");
-            crate::hub::tests::hear_item(&hub, 2, "s:s1#linux", 2, &AgentMsg::Harness { session: "s1".into(), json: serde_json::to_string(&inbox_took("s1", "m1", 1))? }).await?;
-            let sent = person.await?;
-            anyhow::ensure!(matches!(sent, Sent::Accepted(ref a) if a.message == "m1"), "the new holder's inbox answered its sender: {sent:?}");
-            // linux sends back one routed to it while the server still says it's there: its sender is told it's gone.
-            let kind = hub.harness.kind_of(&hub, "s1", &send("m2"));
-            let (_, Taken::New(again)) = hub.harness.asked.take("s1", "user:ada", "c2", kind, std::time::Instant::now()) else { anyhow::bail!("c2 came before") };
-            hub.harness.send_asked(&hub, "s1", "user:ada", "c2", send("m2")).await;
-            let back = routed_to_machines(&hub, "s1").into_iter().find(|(machine, _, m)| machine == "linux" && m == "m2").ok_or_else(|| anyhow::anyhow!("m2 wasn't routed to linux"))?;
-            let json = back.1.onward("linux").and_then(|r| r.attach(json!({"type": "send", "id": "m2", "text": "is it done?", "mode": "queue"}), None)).ok_or_else(|| anyhow::anyhow!("no route"))?;
-            hub.harness.forward(&hub, "linux", "s1", &json).await;
-            let sent = again.await?;
-            anyhow::ensure!(matches!(sent, Sent::Refused(inbox::Refusal::Moved { .. })), "its sender is told it's gone, and keeps it to send again: {sent:?}");
+            let first = hub.harness.dispatch(&hub, "s1", routed_message("m1")).await;
+            let older = request_for(&hub, "mac", "m1")?;
+            let next = hub.harness.dispatch(&hub, "s1", routed_message("m1")).await;
+            let later = request_for(&hub, "mac", "m1")?;
+            anyhow::ensure!(older != later);
+            settle_destination(&hub, "wrong-node", "m1", &later)?;
+            drop(first);
+            settle_destination(&hub, "mac", "m1", &older)?;
+            settle_destination(&hub, "mac", "m1", &later)?;
+            anyhow::ensure!(matches!(hub.harness.pending_sent(&hub, "s1", next).await, Sent::Accepted(a) if a.message == "m1"));
+            let send=hub.harness.command_from_to(&hub,"s1","person",Some("offline"),routed_message("offline-msg"));
+            let observe=async {
+                loop {
+                    if let Ok(request)=request_for(&hub,"mac","offline-msg") {
+                        return settle_destination(&hub,"mac","offline-msg",&request);
+                    }
+                    hyper_rt::futures::yield_now().await;
+                }
+            };
+            let (sent,settled)=crate::rt::timeout(ANSWER_WAIT,futures::future::join(send,observe)).await?;
+            settled?;
+            anyhow::ensure!(matches!(sent,Sent::Accepted(answer) if answer.message=="offline-msg"));
+            anyhow::ensure!(super::super::mail::receipt(&hub.store,"person".into(),"person".into(),"s1".into(),"offline-msg".into()).await?.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cp_t3_2_a_brand_new_session_only_the_hint_knows() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub=crate::hub::tests::scratch_hub().await?;
+            crate::hub::tests::join_runner(&hub,1,"a",crate::proto::CAP_INBOX);
+            let known=crate::instances::Owned::Agent("new".into());
+            anyhow::ensure!(hub.harness.routed_target(&hub,"new",Some("agent:a")).is_none());
+            hub.instances.update(|i|i.own(known.clone(),1));
+            anyhow::ensure!(hub.harness.routed_target(&hub,"new",Some("agent:a"))==Some(Location::Machine("a".into())));
+            anyhow::ensure!(hub.harness.routed_target(&hub,"new",Some("agent:b")).is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cp_t3_2_no_owner_no_location_no_hint() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub=crate::hub::tests::scratch_hub().await?;
+            let sent=hub.harness.command_from_to(&hub,"unknown","person",None,routed_message("never-queued")).await;
+            anyhow::ensure!(matches!(sent,Sent::Refused(inbox::Refusal::Unavailable{why,..}) if why.contains("no committed owner")));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cp_t3_2_a_hint_for_a_server_held_session() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub=crate::hub::tests::scratch_hub().await?;
+            let dir=tempfile::tempdir()?;
+            let (_data,store)=crate::convo::store::scratch()?;
+            let mgr=crate::convo::raft::Manager::open("test-server",dir.path(),Some(store))?;
+            mgr.open_leader("at-server",1,Vec::new())?;
+            hub.harness.bind_session_consensus(&mgr)?;
+            let before=crate::metrics::sends().stale_target.get();
+            anyhow::ensure!(hub.harness.routed_target(&hub,"at-server",Some("agent:wrong"))==Some(Location::Local));
+            anyhow::ensure!(crate::metrics::sends().stale_target.get()>before);
             Ok(())
         })
     }

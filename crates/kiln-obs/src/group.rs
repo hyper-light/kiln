@@ -153,7 +153,7 @@ pub fn change(member: u64, kind: ConfChangeType) -> ConfChangeV2 {
 }
 
 /// The members a leader has out of step now: dropped, and probed until they answer; none off the lead.
-pub fn away<L: LogStore, M: StateMachine>(r: &Replica<L, M>) -> u64 {
+pub fn away<L: LogStore, M: StateMachine, B: hyper_durable::Budget>(r: &Replica<L, M, B>) -> u64 {
     if !r.is_leader() {
         return 0;
     }

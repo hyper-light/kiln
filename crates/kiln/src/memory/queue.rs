@@ -358,6 +358,10 @@ impl Room {
         self.try_take(n).then_some(true)
     }
 
+    /// Arm a synchronous owner before rechecking its required credit. Multiple frames
+    /// can share one reusable place without reserving bytes for an unsent frame.
+    pub(crate) fn on_release(&self, place:&Arc<Place>, waker:&Waker) { self.freed.wait(place,waker); }
+
     /// Takes `n` bytes, waiting (a task's wait: its thread goes on with others) until they fit; false when
     /// the queue closed first. Room there, as a send mostly finds it, is taken with no place made for a wait
     /// (goal 9, plan 01a1a87b2cec step 5: every send made one, an allocation and a free on the sender's shard).

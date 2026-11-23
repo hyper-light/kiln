@@ -35,6 +35,9 @@ pub struct SpawnArgs {
     /// for the server), when it must be that one.
     #[arg(long)]
     pub on: Option<String>,
+    /// Reuse this operation key after a lost response.
+    #[arg(long)]
+    pub key: Option<String>,
     /// Their folder there (with --on; by default its home).
     #[arg(long)]
     pub cwd: Option<String>,
@@ -63,6 +66,9 @@ pub enum AgentsCmd {
     Send {
         id: String,
         text: Vec<String>,
+        /// Machine whose inbox should receive the message.
+        #[arg(long, alias = "target")]
+        on: Option<String>,
         /// Wait until the current turn ends.
         #[arg(long, conflicts_with_all = ["steer", "now"])]
         queue: bool,
@@ -280,39 +286,55 @@ fn print(s: &str) {
     let _ = writeln!(std::io::stdout(), "{s}");
 }
 
-pub fn spawn(a: SpawnArgs) -> anyhow::Result<()> {
+pub async fn spawn(a: SpawnArgs) -> anyhow::Result<()> {
+    let managed = ["KILN_HARNESS_SOCK", "KILN_RUNNER_SOCK", "KILN_SESSION", "KILN_TERM_SESSION"]
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()));
+    let endpoint = if managed {
+        None
+    } else {
+        std::env::var("KILN_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .zip(std::env::var("KILN_ADMIN_TOKEN").ok().filter(|s| !s.is_empty()))
+    };
+    let key = a.key.unwrap_or_else(crate::util::new_id);
     let prompt = a.prompt.join(" ");
-    // On another machine: the kiln server picks it and starts them there.
-    if let Some(on) = a.on.clone() {
-        let input = serde_json::json!({"kind": a.kind, "on": on, "cwd": a.cwd, "prompt": (!prompt.trim().is_empty()).then_some(prompt), "model": a.model, "mode": a.mode, "name": a.name, "count": a.count, "effort": a.effort});
-        let v = op("agents.start", input, std::time::Duration::from_secs(60))?;
-        for s in v.get("agents").and_then(Value::as_array).cloned().unwrap_or_default() {
-            let g = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
-            print(&format!("started {} ({}) on {}{}", g("name"), short(&g("id")), g("machine"), if g("mode").is_empty() { String::new() } else { format!(", in {}", g("mode")) }));
+    let mut input = serde_json::json!({"kind":a.kind,"count":a.count,"key":key});
+    if let Some(object) = input.as_object_mut() {
+        for (field, value) in [
+            ("on", a.on),
+            ("cwd", a.cwd),
+            ("prompt", (!prompt.trim().is_empty()).then_some(prompt)),
+            ("model", a.model),
+            ("mode", a.mode),
+            ("name", a.name),
+            ("effort", a.effort),
+            ("shell", shell()),
+        ] {
+            if let Some(value) = value {
+                object.insert(field.into(), Value::String(value));
+            }
         }
-        print("`kiln agents wait <id>` waits for them; `kiln agents result <id>` says what they concluded");
-        return Ok(());
     }
-    let cwd = a.cwd.clone().or_else(|| std::env::current_dir().ok().map(|d| d.to_string_lossy().into_owned()));
-    let env: Vec<(String, String)> = std::env::vars().collect();
-    let v = request(&Request::Spawn {
-        kind: a.kind,
-        count: Some(a.count),
-        prompt: (!prompt.trim().is_empty()).then_some(prompt),
-        model: a.model,
-        mode: a.mode,
-        name: a.name,
-        shell: shell(),
-        cwd,
-        env,
-        program: None,
-    })?;
-    for s in v.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default() {
-        let id = s.get("id").and_then(Value::as_str).unwrap_or("");
-        let name = s.get("name").and_then(Value::as_str).unwrap_or("");
-        print(&format!("started {name} ({})", short(id)));
+    let result = if let Some((url, bearer)) = endpoint {
+        crate::ci::cli::Api::local(&url, &bearer)?
+            .call_api(crate::http::client::Method::Post, "/api/ops/agents.start", Some(input))
+            .await
+    } else {
+        crate::rt::blocking(move || op("agents.start", input, std::time::Duration::from_secs(60))).await?
+    };
+    let result = result.map_err(|e| anyhow::anyhow!("start {key}: {e:#}"))?;
+    print(&format!("start {key}"));
+    if let Some(words) = result.get("queued").and_then(Value::as_str) {
+        print(words);
     }
-    print("open kiln's Agents page to work with them, or `kiln agents` here");
+    for row in result.get("slots").or_else(|| result.get("agents")).and_then(Value::as_array).into_iter().flatten() {
+        let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+        let outcome = row.get("outcome").and_then(Value::as_str).unwrap_or("started");
+        let why = row.get("why").or_else(|| row.get("machine")).and_then(Value::as_str).unwrap_or("");
+        print(&format!("{outcome} {id} {why}"));
+    }
     Ok(())
 }
 
@@ -320,7 +342,7 @@ fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
+pub async fn agents(a: AgentsArgs) -> anyhow::Result<()> {
     let scope = if a.all { None } else { shell() };
     match a.cmd.unwrap_or(AgentsCmd::List) {
         AgentsCmd::List => {
@@ -347,7 +369,7 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
             let v = request(&Request::Interrupt { id, shell: scope })?;
             print(&format!("interrupted {}", v.get("interrupted").and_then(Value::as_u64).unwrap_or(0)));
         }
-        AgentsCmd::Send { id, text, queue, steer, now, key } => {
+        AgentsCmd::Send { id, text, on, queue, steer, now, key } => {
             let mode = if now {
                 Some(SendMode::Now)
             } else if steer {
@@ -357,7 +379,29 @@ pub fn agents(a: AgentsArgs) -> anyhow::Result<()> {
             } else {
                 None
             };
-            request(&Request::Send { id, text: text.join(" "), mode, key })?;
+            let text = text.join(" ");
+            // A managed shell authenticates via its process identity. Outside a shell an
+            // explicitly configured endpoint and bearer can reach an enrolled node directly.
+            let managed = ["KILN_HARNESS_SOCK", "KILN_RUNNER_SOCK", "KILN_SESSION", "KILN_TERM_SESSION"].iter().any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()));
+            let endpoint = if !managed {
+                std::env::var("KILN_URL").ok().filter(|v| !v.is_empty()).zip(std::env::var("KILN_ADMIN_TOKEN").ok().filter(|v| !v.is_empty()))
+            } else { None };
+            if on.is_some() || endpoint.is_some() {
+                let mut input = serde_json::json!({"agent":id, "text":text});
+                if let Some(fields) = input.as_object_mut() {
+                    if let Some(target) = on { fields.insert("target".into(), serde_json::json!(target)); }
+                    if let Some(key) = key { fields.insert("key".into(), serde_json::json!(key)); }
+                    if let Some(mode) = mode { fields.insert("mode".into(), serde_json::json!(mode)); }
+                }
+                if let Some((url, bearer)) = endpoint {
+                    let api = crate::ci::cli::Api::local(&url, &bearer)?;
+                    api.call_api(crate::http::client::Method::Post, "/api/ops/agents.send", Some(input)).await?;
+                } else {
+                    op("agents.send", input, std::time::Duration::from_secs(30))?;
+                }
+            } else {
+                request(&Request::Send { id, text, mode, key })?;
+            }
             print("sent");
         }
         AgentsCmd::Wait { ids, timeout, any, change, json } => {

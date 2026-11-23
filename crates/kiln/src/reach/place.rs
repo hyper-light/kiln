@@ -1906,6 +1906,12 @@ impl Placer {
     /// its reserve's grant alone: none while that waits, answered then as [`Out::Session`]
     /// (docs/lb.md "A machine's keeper").
     pub fn session_start(&mut self, c: &Claim, at: Option<Group>, now: i64) -> (Option<bool>, Vec<Out>) {
+        use kiln_ci::place::handoff::Held;
+        let held = self.admission.holding(Peer { name: &c.owner, epoch: c.epoch }, &c.run);
+        let already = matches!(held,Some(Held::Running{fence,..}) if fence==c.fence);
+        if matches!(held, Some(Held::Ended { .. })) || matches!(held, Some(Held::Running { .. })) && !already || c.owner == self.me && (self.epoch != c.epoch || !already) {
+            return (Some(false), Vec::new());
+        }
         if let Some(at) = at {
             self.grouped(&c.owner, c.epoch, &c.run, at);
         }
@@ -2642,6 +2648,19 @@ mod durable_tests {
     }
 
     /// A node started (again) in `epoch` from what `records` hold.
+    #[test]
+    fn w21_r15_a_held_start_cannot_run_under_a_missing_local_placement() {
+        let mut placer = node("owner", 2);
+        let claim = Claim {
+            owner: "owner".into(),
+            epoch: 1,
+            run: "lost-placement".into(),
+            fence: Default::default(),
+        };
+        let (admitted, _) = placer.session_start(&claim, None, 10);
+        assert_eq!(admitted, Some(false));
+    }
+
     async fn boot(name: &str, epoch: u64, records: &Arc<dyn kiln_seams::Records>, peers: &[&str]) -> anyhow::Result<(Placer, Vec<Out>)> {
         let mut p = node(name, epoch);
         p.keep_in(Arc::clone(records));

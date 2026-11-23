@@ -14,8 +14,11 @@
 
 pub mod board;
 pub mod feed;
+mod file_move;
 pub mod inbox;
 pub mod mirror;
+mod custody;
+pub(crate) mod liveness;
 pub mod raft;
 pub mod record;
 pub mod resume;
@@ -62,32 +65,7 @@ pub fn open_file(dir: &std::path::Path, file: &str, upkeep: store::Upkeep) -> Op
     }
 }
 
-/// Move a store's file at `from`, once let go of ([`store::Store::close`]), to `to`, with its log
-/// beside it: for the process that goes on with it there (a new build taking over from the runner
-/// being upgraded keeps that runner's store, `crate::bluegreen`). Never over a file at `to`.
-pub fn move_file(from: &std::path::Path, to: &std::path::Path) -> anyhow::Result<()> {
-    for s in ["", "-wal", "-shm"] {
-        anyhow::ensure!(!beside(to, s).exists(), "{} is there already", beside(to, s).display());
-    }
-    if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::rename(from, to).map_err(|e| anyhow::Error::from(e).context(format!("move {} to {}", from.display(), to.display())))?;
-    for s in ["-wal", "-shm"] {
-        match std::fs::rename(beside(from, s), beside(to, s)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(anyhow::Error::from(e).context(format!("move {}", beside(from, s).display()))),
-        }
-    }
-    // The renames themselves on disk (not on Windows, which opens no folder).
-    if let Some(dir) = to.parent()
-        && let Ok(d) = std::fs::File::open(dir)
-    {
-        let _ = d.sync_all();
-    }
-    Ok(())
-}
+pub use file_move::{move_file, recover_file_move};
 
 /// What a store's file set aside is called, after its own name ([`set_aside`]): the first such.
 pub const SET_ASIDE: &str = ".unopened";
@@ -103,12 +81,27 @@ fn beside(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
 /// beside it as `<file>.unopened` (`.unopened.2` and on, if that's taken), its log by the same name
 /// and `-wal`, so that it still opens as it is there; never over a file. Where it went.
 pub fn set_aside(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-    let to = (1..=100u32)
-        .map(|i| beside(path, &if i == 1 { SET_ASIDE.to_owned() } else { format!("{SET_ASIDE}.{i}") }))
-        .find(|to| ["", "-wal", "-shm"].iter().all(|s| !beside(to, s).exists()))
-        .ok_or_else(|| anyhow::anyhow!("no name beside {} is free to set it aside under", path.display()))?;
-    move_file(path, &to)?;
-    Ok(to)
+    let mut n = 1u64;
+    loop {
+        let suffix = if n == 1 { SET_ASIDE.to_owned() } else { format!("{SET_ASIDE}.{n}") };
+        let to = beside(path, &suffix);
+        let mut occupied = false;
+        for side in ["", "-wal", "-shm", ".handoff.json"] {
+            match std::fs::symlink_metadata(beside(&to, side)) {
+                Ok(_) => {
+                    occupied = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if !occupied {
+            file_move::move_aside(path, &to)?;
+            return Ok(to);
+        }
+        n = n.checked_add(1).ok_or_else(|| anyhow::anyhow!("no number for another store set aside"))?;
+    }
 }
 
 /// The store in file `file` of `dir`, as [`open_file`] opens it. One that won't open is set aside
@@ -141,9 +134,13 @@ pub fn open_or_set_aside(dir: &std::path::Path, file: &str, upkeep: store::Upkee
         tracing::warn!(file = %path.display(), aside = %aside.display(), "a conversation store that wouldn't open is set aside, kept whole; a new one takes its place");
         return (Some(st), Some(aside));
     }
-    // Not even a new one: what that began goes, and the one set aside goes back where it was.
-    for s in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(beside(&path, s));
+    // A failed replacement can still have created a file. Preserve it before restoring
+    // the original, and let the move's exclusive custody check protect any concurrent open.
+    if path.exists()
+        && let Err(e) = set_aside(&path)
+    {
+        tracing::warn!(file=%path.display(), error=%e, "could not preserve the failed replacement; the original stays set aside");
+        return (None, Some(aside));
     }
     if let Err(e) = move_file(&aside, &path) {
         tracing::warn!(file = %path.display(), aside = %aside.display(), error = %format!("{e:#}"), "a conversation store set aside couldn't be put back where it was; it stays set aside");

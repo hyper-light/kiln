@@ -1343,7 +1343,10 @@ the `Idempotency-Key` header does too) and a call with the same key is the same 
 gets it once, and every call names the same committed publication, `repeat` on the ones after.
 A key is its caller's: an agent's is the same on whichever machine it runs, so its retry after it
 moves is the same message. Without a key, each call is a message of its own. A key given to other
-words is refused (409). From a kiln shell: `kiln agents send <id> --key <key> <text>`.
+words is refused (409). In a kiln shell, `kiln agents send <id> --on <machine> --key <key> <text>`
+addresses that runner. A person can omit `--on` to use the local harness socket. Outside a kiln
+shell, set `KILN_URL` to the enrolled node's API and supply its bearer in `KILN_ADMIN_TOKEN`.
+The command can then follow the committed owner or address the runner named by `--on`.
 Use `--queue`, `--steer` or `--now` to choose the mode explicitly.
 
 ### Messages between agents

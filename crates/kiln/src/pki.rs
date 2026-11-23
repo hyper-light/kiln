@@ -27,11 +27,11 @@ use time::{Duration, OffsetDateTime};
 /// The DNS name agents expect in the server certificate (sent as SNI).
 pub const SERVER_NAME: &str = "kiln-server";
 const CA_YEARS: i64 = 10;
-const LEAF_DAYS: i64 = 365;
+pub(crate) const LEAF_DAYS: i64 = 365;
 /// Ephemeral pod agents get short-lived certificates.
 pub const EPHEMERAL_DAYS: i64 = 2;
 /// Renew a leaf when it has less than this left.
-const RENEW_DAYS: i64 = 30;
+pub(crate) const RENEW_DAYS: i64 = 30;
 /// An outpost's certificate (`kiln outpost`). A new invite renews it, never the outpost itself,
 /// so it lasts well past [`RENEW_DAYS`].
 pub const OUTPOST_DAYS: i64 = 90;
@@ -486,6 +486,51 @@ impl Pki {
         .signed_by(&self.issuer)
         .context("sign CSR")?;
         Ok(signed.pem())
+    }
+
+    pub(crate) fn sign_fleet_statement(&self, payload: &[u8]) -> anyhow::Result<Vec<u8>> {
+        use rcgen::SigningKey as _;
+        Ok(self.issuer.key().sign(payload)?)
+    }
+
+    /// A separately approved session node may validate a person at its local front door and
+    /// delegate destination-bound session starts and messages. Ordinary leaves carry no such URI.
+    pub(crate) fn sign_session_node(&self, csr_pem: &str, machine: &str, days: i64) -> anyhow::Result<String> {
+        self.session_node_leaf(csr_pem, machine, days, None, &[])
+    }
+
+    pub(crate) fn session_node_leaf(&self, csr_pem:&str, machine:&str, days:i64, prior:Option<&[u8]>, ancestors:&[String])->anyhow::Result<String> {
+        let mut params = machine_params(sanitize_name(machine), days)?;
+        params.serial_number=Some(random_serial());
+        let csr=CertificateSigningRequestParams::from_pem(csr_pem).context("parse session node CSR")?;
+        if let Some(prior)=prior {
+            let (_,old)=x509_parser::parse_x509_certificate(prior).map_err(|e|anyhow::anyhow!("invalid session grant: {e}"))?;
+            anyhow::ensure!(csr.public_key.der_bytes()==old.public_key().subject_public_key.data.as_ref(),"renewal CSR uses another key");
+            let validity=old.validity().not_after.timestamp().saturating_sub(old.validity().not_before.timestamp());
+            params.not_after=params.not_after.min(params.not_before + Duration::seconds(validity));
+        }
+        let uri = crate::fleet::sessions::start_uri(machine);
+        params.subject_alt_names = vec![rcgen::SanType::URI(uri.as_str().try_into()?)];
+        for serial in ancestors {
+            let uri=format!("{}{serial}",crate::fleet::sessions::GRANT_PARENT);
+            params.subject_alt_names.push(rcgen::SanType::URI(uri.try_into()?));
+        }
+        params.extended_key_usages.clear();
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        let signed = CertificateSigningRequestParams { params, public_key: csr.public_key }.signed_by(&self.issuer)?;
+        Ok(signed.pem())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn aging_session_grant(&self, csr:&str, machine:&str)->anyhow::Result<String> {
+        let csr=CertificateSigningRequestParams::from_pem(csr)?;
+        let mut params=machine_params(sanitize_name(machine),LEAF_DAYS)?;
+        params.serial_number=Some(random_serial());
+        params.not_before-=Duration::days(LEAF_DAYS-1);
+        params.not_after-=Duration::days(LEAF_DAYS-1);
+        params.subject_alt_names=vec![rcgen::SanType::URI(crate::fleet::sessions::start_uri(machine).try_into()?)];
+        params.extended_key_usages.clear();
+        Ok(CertificateSigningRequestParams{params,public_key:csr.public_key}.signed_by(&self.issuer)?.pem())
     }
 
     /// One more certificate for a machine that is already enrolled: for a second runner process

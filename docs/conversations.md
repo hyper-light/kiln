@@ -4,8 +4,9 @@
 > is built. Phase 1, pausing at a usage limit and going on at the reset, is in
 > [agents.md](agents.md) ("Usage limits: pause and resume").
 
-An agent's conversation is kept per event, on disk, as it happens. Each runner keeps its own
-sessions, and sends them to the server, which keeps every session from every machine. So a
+Each enrolled session node keeps its conversations on disk. The machine selected when a session
+starts leads that session's Raft group. Connected members replicate its committed events, inbox
+and provider records. The server's conversation feed also supplies fleet-wide search. A
 conversation can be:
 
 - **resumed** after any restart, exactly as it was, with every event's id, order and time;
@@ -160,10 +161,62 @@ what it took, and says through where it has it.
 - **What the server keeps from where.** A runner that sends its store is the one source of its
   sessions in the server's store. The server stops keeping them from their updates, which a
   reconnect sends again in full. A runner from before the feed is kept from its updates, as in C1.
-- **Why not a Raft group per session.** The server is the one voter, so Raft would add a second log
-  beside the store and whole-store images, without making anything safer. The feed gives the same
-  guarantees: ordered delivery, catching up, and fencing. Raft (hyper-raft) is the plan for
-  replicating the server itself.
+- **Session ownership.** The machine selected at Start founds a Raft group for that conversation.
+  Connected members replicate its committed history and inbox. Members that can run sessions vote
+  under the group's declared failover policy. Losing a quorum fences the old writer. An elected owner
+  commits a new epoch and recovers the provider and pending messages from the committed records.
+  A retry with the same message ID and content returns the original receipt, including its
+  sequence, timestamp and accepting epoch. If the previous provider may have acted before it
+  died, Kiln keeps that turn for reconciliation. Replaying it automatically could repeat an
+  external action.
+  A provider that needs missing credentials, workspace files or a native transcript reports the
+  missing prerequisite and retries recovery. The store feed still serves older peers and mirrors.
+- **Election timing.** Each pair of nodes with a session group in common exchanges one stream
+  of authenticated, kernel-timestamped heartbeats. An idle group sends no packets. The detector
+  measures link delays and disk writes, and keeps its failure history across restarts. A group
+  that loses trust in its leader can elect a successor once it has timing and a voting quorum.
+  A stalled disk can cost a node log leadership while its running agent keeps custody. Automatic
+  agent takeover requires the failover policy (`KILN_CONVO_FAILOVER=1` to opt in).
+- **Starting a session during an outage.** The original enrollment authority reserves new session
+  IDs until three eligible executors can take over. It signs a fixed list of those voters and the
+  names already reserved. After a node verifies that record, two of the three voters can confirm
+  a new ID while the enrollment authority is offline. The selected runner still leads the new
+  session. Adding a machine to the fleet does not change who can reserve an ID. If the voters
+  cannot reach a majority during an outage, the caller can retry the same request and ID when
+  they reconnect. Each voter records one founding decision per ID. If three different starts
+  race for the same explicit ID and each receives one vote, that ID stays reserved. Kiln
+  returns a conflict once a majority reports incompatible votes. A different ID can start
+  normally. A timeout leaves the outcome unknown until the caller reads the session status
+  or retries the original request.
+  During an upgrade, Kiln must account for names already held by older runners. An offline
+  holder can therefore delay fresh starts until its history is recovered. Existing sessions
+  continue under their committed voting configuration.
+- **Starting a session.** A named machine receives the start over direct QUIC or, if that
+  path fails, over the authenticated Reach relay. The selected machine checks admission and
+  confirms its committed founding record. An omitted target, `server`, or a request for
+  machine capabilities goes through fleet placement. If a known destination cannot answer, the
+  source keeps the request on disk and returns HTTP 202 with the source and destination names.
+  A restart releases capacity reserved by its previous process for slots it never dispatched.
+  If dispatch had begun, the source shows the slot as `unconfirmed` until it learns its
+  committed outcome or the same keyed request is answered. A missing reply keeps that slot charged.
+  A restored link triggers delivery under the original key. The source reports held slots at
+  `GET /api/harness/start-requests/<key>`. A mixed batch returns HTTP 207 with a result for
+  each slot. Repeating the same key and content returns the original sessions. The CLI accepts
+  that key as `kiln spawn --key`. A session-node login dispatches from the contacted node.
+  A fleet user or scoped token uses the server's current permission check and dispatches from
+  that server. An enrolled node also holds a placement request when its authenticated server
+  link is down. Reconnection submits each slot to the server under its original key and ID.
+  The source encrypts held payloads and binds each to its destination and slot. It opens
+  named environments and build secrets again at delivery. A process takeover requires a
+  live destination because a saved process ID can be reused.
+- **Connecting session nodes.** A fleet owner can approve a machine as a session node or issue a
+  one-machine installation invitation. Its local owner token authorizes a person on that machine.
+  Its session-node certificate allows that machine to forward session starts and messages over
+  direct hyper-quic links to known peers. Previously connected nodes retain the peer keys,
+  addresses and revocations they last received. During a partition, a new revocation takes effect
+  on each node when it learns it. The online issuer renews a valid grant before expiry using the
+  same key and permissions. An expired grant requires fresh approval. Revoking the original also
+  revokes its renewals.
 
 ## Fencing: epochs
 

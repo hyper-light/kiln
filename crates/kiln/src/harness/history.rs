@@ -124,14 +124,14 @@ pub fn recent(events: &[Arc<Value>], state: &Value, limits: Limits, token: Strin
 /// Transient selection metadata read off the shard from each canonical encoded event. Text and
 /// tool bodies are skipped by serde, never materialized into a second event tree or retained cache.
 #[derive(Default, serde::Deserialize)]
-pub(super) struct Row {
+pub(crate) struct Row {
     id: Option<String>, seq: Option<u64>, kind: Option<String>, parent: Option<String>,
     reply_to: Option<String>, tool_id: Option<String>, status: Option<String>, streaming: Option<bool>,
     #[serde(skip)] bytes: usize,
 }
 
 impl Row {
-    pub(super) fn read(text: &str) -> Self {
+    pub(crate) fn read(text: &str) -> Self {
         let mut row = serde_json::from_str::<Self>(text).unwrap_or_default();
         row.bytes = text.len();
         row
@@ -141,7 +141,7 @@ impl Row {
 
 /// The same policy as `recent`, over lightweight headers of immutable, chunked Copies. Returned
 /// indices refer to that exact held view; snapshot writing still uses its original encoded entries.
-pub(super) fn select(rows: &[Row], state: &Value, limits: Limits, token: String, durable: bool) -> (Vec<usize>, Window) {
+pub(crate) fn select(rows: &[Row], state: &Value, limits: Limits, token: String, durable: bool) -> (Vec<usize>, Window) {
     let floor = state.get("cleared").and_then(Value::as_u64).unwrap_or(1).max(1);
     let visible = |row: &Row| row.seq.is_some_and(|n| n >= floor);
     let mut required = HashSet::<String>::new();

@@ -89,6 +89,7 @@ pub enum Taken {
 #[derive(Debug)]
 struct Entry {
     kind: Kind,
+    digest: Option<blake3::Hash>,
     /// When it came, or was last answered.
     at: Instant,
     state: State,
@@ -146,21 +147,35 @@ impl Asked {
     /// caller's), at `now`: where it stands, and what it is (as it was when it first came, for what
     /// its answers mean).
     pub fn take(&self, session: &str, scope: &str, id: &str, kind: Kind, now: Instant) -> (Kind, Taken) {
+        self.take_bound(session, scope, id, kind, now, None)
+    }
+
+    pub(crate) fn take_command(&self, session: &str, scope: &str, id: &str, kind: Kind, command: &super::model::Command) -> (Kind, Taken) {
+        let mut hash = blake3::Hasher::new();
+        if serde_json::to_writer(&mut hash, command).is_err() {
+            return (kind, Taken::Answered(Sent::Rejected { code: crate::wire::channel::Refusal::Malformed, why: "command could not be encoded".into() }));
+        }
+        self.take_bound(session, scope, id, kind, Instant::now(), Some(hash.finalize()))
+    }
+
+    fn take_bound(&self, session: &str, scope: &str, id: &str, kind: Kind, now: Instant, digest: Option<blake3::Hash>) -> (Kind, Taken) {
         let key = format!("{scope}\u{1f}{id}");
         let mut g = self.sessions.lock();
         let log = g.entry(session.to_owned()).or_default();
         log.tidy(now);
-        let (tx, rx) = oneshot::channel();
         match log.entries.get_mut(&key) {
+            Some(e) if digest.is_some() && e.digest != digest => (kind, Taken::Answered(Sent::Rejected { code: crate::wire::channel::Refusal::Refused, why: "command id already belongs to a different operation".into() })),
             Some(e) => match &mut e.state {
                 State::Answered(sent) => (e.kind, Taken::Answered(sent.clone())),
                 State::Waiting(waiting) => {
+                    let (tx, rx) = oneshot::channel();
                     waiting.push(tx);
                     (e.kind, Taken::Waiting(rx))
                 }
             },
             None => {
-                log.entries.insert(key.clone(), Entry { kind, at: now, state: State::Waiting(vec![tx]) });
+                let (tx, rx) = oneshot::channel();
+                log.entries.insert(key.clone(), Entry { kind, digest, at: now, state: State::Waiting(vec![tx]) });
                 log.order.push_back(key);
                 log.tidy(now);
                 (kind, Taken::New(rx))
@@ -300,6 +315,21 @@ mod tests {
         // The same id from another caller, or for another session, is another command.
         anyhow::ensure!(matches!(asked.take("s1", "u2", "c1", COMMAND, now), (_, Taken::New(_))));
         anyhow::ensure!(matches!(asked.take("s2", "u1", "c1", COMMAND, now), (_, Taken::New(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_a_control_id_only_answers_its_original_command() -> anyhow::Result<()> {
+        use super::super::model::Command;
+        let asked = Asked::default();
+        let take = |command| asked.take_command("session", "operator", "key", COMMAND, command).1;
+        let Taken::New(mut first) = take(&Command::Interrupt) else { anyhow::bail!("first submission") };
+        let Taken::Waiting(mut repeat) = take(&Command::Interrupt) else { anyhow::bail!("duplicate submission") };
+        anyhow::ensure!(matches!(take(&Command::Restart), Taken::Answered(Sent::Rejected { .. })));
+        asked.answered("session", "operator", "key", &Sent::Taken, Instant::now());
+        anyhow::ensure!(first.try_recv()? == Some(Sent::Taken) && repeat.try_recv()? == Some(Sent::Taken));
+        anyhow::ensure!(matches!(take(&Command::Interrupt), Taken::Answered(Sent::Taken)));
+        anyhow::ensure!(matches!(take(&Command::Restart), Taken::Answered(Sent::Rejected { .. })));
         Ok(())
     }
 

@@ -748,18 +748,24 @@ run out, and two lines can't take the same one by accident as they could a bit.
   (docs/sends.md, "Routed to its session"; Ada, 2026-11-20). The server sends a runner that names it
   a person's and an agent's message at once, `route` beside the command in `HarnessSend`'s JSON (the
   runner it's for, its sender, its hops), and keeps none of it: the session's own inbox there takes it
-  and answers, and the runner admits it to the session itself. A runner that gets one for a session it
-  doesn't hold sends it on, a hop further (`AgentMsg::HarnessForward`), and the server sends the words
-  it routed there on to where the session is now. A runner that didn't name it, or one that's away,
-  gets messages from the server's custody (W20's), as before; so does kiln's own (docs/sends.md,
-  "What's open").
+  and answers after commit. A send with an explicit destination stays with that destination on a
+  retry.
+  `mail-route-receipt`: the targeted runner answers the request nonce with its committed receipt.
   `harness.reset`: the runner resets its agents (`Command::Reset`, docs/agents.md "Reset"): what each has
   pending ends, its intake opens again and its harness starts again fresh; a runner that didn't name it is
   asked to reset none.
   `p2p-mail`: peer-to-peer routed harness messages forwarded directly between runners (`reach::wire::Ask::HarnessSend`,
   `Say::HarnessSaid`, and direct `hyper-quic` runner-to-runner streams) without enqueueing locally on a non-owning node.
   `convo-raft`: per-session conversation Raft replication (`convo::raft`, `reach::wire::Ask::ConvoRaft`, `Say::ConvoRaft`,
-  and `convo::feed::Msg::Raft`), led initially by the node where each session starts and runs and replicated across the fleet.
+  and `convo::feed::Msg::Raft`), led initially by the node where each session starts and runs and replicated across the fleet. The selected host founds the group.
+  `convo-raft-v2`: versioned conversation log entries and snapshots.
+  `convo-executor`: the member can run a session.
+  `convo-liveness`: the member has opened its authenticated, kernel-timestamped heartbeat socket.
+  Each datagram signs the sending and receiving node IDs, the receiver's run counter, and the heartbeat.
+  A peer first learns the sender's run from a signed datagram. Only a heartbeat addressed to its current
+  run can change its detector's judgment, so delayed packets cannot carry evidence across a receiver restart.
+  Eligible session voters advertise both execution and liveness. Older members can still receive replicated sessions.
+  `convo-raft-move`: the member can stage provider state and transfer session leadership.
 
 ## Registry
 
@@ -807,6 +813,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `AgentMsg` | 73 | `Prebuilt` | | main (kiln plan 01a1dd2e…, P4.5): where a build of an Agentfile asked ahead of its sessions is, JSON, to a server that named `agentfiles.prebuild` |
 | `AgentMsg` | 74 | `RunnerRole` | | this line (docs/agentic.md W10): the runner took the certificate reissued in its role (its serial), to a server that named `runner-role` |
 | `AgentMsg` | 75 | `HarnessForward` | | this line (docs/sends.md, "Routed to its session"): a message routed to the runner for a session it doesn't hold, sent on a hop further, its JSON as it came with its route a hop on; only for a message that came with a route |
+| `AgentMsg` | 76 | `HarnessRouteReceipt` | | negotiated by `mail-route-receipt`, the targeted runner returns the request nonce and result after committing custody |
 | `AgentMsg` | 58–62 | `Amphora`, `JobFinishedV2`, `RunnerProcess`, `JobLogChunkV1`, `JobLogEndV1` | | in flight (fb1bf362), on a main older than 861bbe60: each collides, and goes after main's last when it lands |
 | `AgentMsg` | 58 | `SampleWithPressure` | | in flight (`placement/pressure`), on an older main: goes after the last when it lands |
 | `ServerMsg` | 0–66 | `Welcome` … `Custody` | | main |
@@ -831,6 +838,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 85 | `Volumes` | | this line (kiln plan 01a1dd2e…, P6.2): agent volumes of a runner's microVMs' store listed by their names, or one cleared, JSON, to a runner that named `agents.volumes` |
 | `ServerMsg` | 86 | `UserEnv` | | this line (docs/agents.md, "Environments"): which variables a runner's user has, by name and where each is set, JSON, to a runner that named `agentenv` |
 | `ServerMsg` | 87 | `RunnerRole` | | this line (docs/agentic.md W10): a certificate in the runner's role for a runner's key and name, reissued over its link in place of its dual-usage one, PEM, to a runner that named `runner-role` |
+| `ServerMsg` | 88 | `ConvoTransferOwnership` | | CP-T3.2: a staged native session move, addressed to its committed owner at an exact epoch; requires `convo-raft-move` |
 | `ServerMsg` | 65–68 | `Amphora`, `ReceivedV2`, `RetainedReceived`, `JobLogReplyV1` | | in flight (fb1bf362): collide; go after the last when they land |
 | `reach::wire::Ask` | 0–11 | `Hello` … `Unread` | reach links | main |
 | `reach::wire::Ask` | 12 | `Custody` | reach links | main (ci.md W27-R08; on a link at reach version `CUSTODY`, 2, or later) |

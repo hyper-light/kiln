@@ -68,18 +68,22 @@ fn signed_expiring(hub: &Hub, purpose: &str, ttl: i64) -> String {
 }
 
 fn verify_expiring(hub: &Hub, purpose: &str, value: &str) -> bool {
+    verify_expiring_with(&hub.admin_token, purpose, value)
+}
+
+fn verify_expiring_with(key: &str, purpose: &str, value: &str) -> bool {
     let Some((exp, sig)) = value.split_once('.') else { return false };
     let Ok(e) = exp.parse::<i64>() else { return false };
-    e > crate::util::now_unix() && signed(hub, purpose, exp, sig)
+    e > crate::util::now_unix() && signed(key, purpose, exp, sig)
 }
 
 /// Whether `sig` is [`sign`]'s signature of `payload` for `purpose`, worked out as the signature is made (the HMAC of
 /// `purpose:payload` under the admin token, in hex) but on the stack: checking a session's cookie, which every request
 /// a signed-in browser sends does, made a string to sign, the signature's hex and a copy of the cookie (goal 9, plan
 /// 01a1a87b2cec step 5: authorization's work a request).
-fn signed(hub: &Hub, purpose: &str, payload: &str, sig: &str) -> bool {
+fn signed(key: &str, purpose: &str, payload: &str, sig: &str) -> bool {
     use hmac::{KeyInit as _, Mac as _};
-    let Ok(mut mac) = hmac::Hmac::<sha2::Sha256>::new_from_slice(hub.admin_token.as_bytes()) else { return false };
+    let Ok(mut mac) = hmac::Hmac::<sha2::Sha256>::new_from_slice(key.as_bytes()) else { return false };
     mac.update(purpose.as_bytes());
     mac.update(b":");
     mac.update(payload.as_bytes());
@@ -107,12 +111,16 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 fn authed(hub: &Hub, headers: &HeaderMap) -> bool {
-    if let Some(t) = bearer(headers)
-        && crate::util::ct_eq(t.as_bytes(), hub.admin_token.as_bytes())
-    {
-        return true;
-    }
-    cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring(hub, "session", c))
+    owner_authorized(&hub.admin_token, headers)
+}
+
+/// Check against the current local fleet authority. Joined nodes use this only when their
+/// operator has explicitly provisioned the fleet's server credential there.
+pub(crate) fn owner_authorized(key: &str, headers: &HeaderMap) -> bool {
+    if key.is_empty() { return false; }
+    bearer(headers).is_some_and(|t| crate::util::ct_eq(t.as_bytes(), key.as_bytes()))
+        || cookie(headers, SESSION_COOKIE).is_some_and(|c| verify_expiring_with(key, "session", c))
+
 }
 
 /// The cookie a sign-in sets; `Secure` when the browser reached kiln over HTTPS.
@@ -122,8 +130,25 @@ fn session_cookie(hub: &Hub, secure: bool) -> String {
 
 /// The session cookie carrying `value` (the owner's, or a user's: `crate::authz::gate`).
 fn cookie_for(value: &str, secure: bool) -> String {
+    named_cookie(SESSION_COOKIE, value, secure)
+}
+
+fn named_cookie(name: &str, value: &str, secure: bool) -> String {
     let secure = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}{secure}")
+    format!("{name}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_TTL}{secure}")
+}
+
+pub(crate) const NODE_SESSION: &str = "kiln_node_session";
+
+pub(crate) fn node_session_cookie(key: &str, machine: &str, secure: bool) -> String {
+    let exp = crate::util::now_unix().saturating_add(SESSION_TTL);
+    let sig = crate::util::hmac_hex(key.as_bytes(), format!("session-node/{machine}:{exp}").as_bytes());
+    named_cookie(NODE_SESSION, &format!("{exp}.{sig}"), secure)
+}
+
+pub(crate) fn node_session_authorized(key: &str, machine: &str, headers: &HeaderMap) -> bool {
+    !key.is_empty() && cookie(headers, NODE_SESSION).is_some_and(|v| verify_expiring_with(key, &format!("session-node/{machine}"), v))
+
 }
 
 /// Who a request is: the owner (the admin token, the owner's session), else a token or a user's
@@ -361,9 +386,14 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::POST, ["api", "ops", name]) => {
             let Some(caller) = boxed(|| caller_of(&hub, req.headers())).await else { return Err(err(StatusCode::UNAUTHORIZED, "authentication required")) };
             let name = (*name).to_owned();
-            let input: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null);
+            let header_key=idempotency_key(&req);
+            let mut input: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.unwrap_or(serde_json::Value::Null);
+            if name=="agents.start" && let Some(key)=header_key && let Some(o)=input.as_object_mut(){
+                if o.get("key").is_some_and(|v|!v.is_null() && v.as_str()!=Some(&key)){return Err(err(StatusCode::BAD_REQUEST,"header and body start keys differ"));}
+                o.insert("key".into(),json!(key));
+            }
             let cx = crate::ops::Cx { hub: Arc::clone(&hub), caller };
-            return boxed(|| crate::ops::call(cx, &name, input)).await.map(|v| srv::json(StatusCode::OK, &v)).map_err(|(c, m)| err(c, m));
+            return boxed(|| crate::ops::call(cx, &name, input)).await.map(|v| srv::json(if name=="agents.start"{start_status(&v)}else{StatusCode::OK}, &v)).map_err(|(c, m)| err(c, m));
         }
         (&Method::POST, ["api", "auth", "login"]) => return boxed(|| login(&hub, req)).await,
         // SSO with GitHub, GitLab and Bitbucket (docs/ci.md W23-R08).
@@ -523,7 +553,6 @@ async fn route(hub: Arc<Hub>, req: Request) -> R {
         (&Method::GET, ["__live", file]) if crate::live::lab_dir().is_some() => return Ok(boxed(|| crate::live::lab_file(file)).await),
         (&Method::GET, ["readyz"]) => return Ok(boxed(|| readyz(&hub)).await),
         (&Method::GET, ["healthz", "server"]) => return Ok(server_health(&hub)),
-        (&Method::GET, ["api", "convo", "raft"]) => return Ok(convo_raft_health()),
         (&Method::GET, ["healthz", "delay"]) => return Ok(shard_delay()),
         (&Method::GET, ["healthz", "strain"]) => return Ok(strain(&req)),
         (&Method::GET, ["dl", "kiln"]) => return boxed(download_binary).await,
@@ -725,6 +754,7 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             let body: serde_json::Value = boxed(|| srv::body_json(req.into_body(), JSON_LIMIT)).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             boxed(|| crate::ship::ready(&hub, &caller, &body)).await.map_err(|(c, m)| err(c, m))
         }
+        (&Method::GET, ["api", "convo", "raft"]) => Ok(convo_raft_health(&hub)),
         (_, ["api", "cd", rest @ ..]) => boxed(|| crate::cd::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (_, ["api", "deploy", rest @ ..]) => boxed(|| crate::deploy::api::route(&hub, rest, &q, req)).await.map_err(|(c, m)| err(c, m)),
         (&Method::GET, ["api", "ci", "legs", id, "terminal"]) => {
@@ -871,7 +901,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         }
         (&Method::POST, ["api", "reach", "keep", "now"]) => boxed(|| keep_now(&hub, &caller, None)).await,
         (&Method::POST, ["api", "reach", "keep", "runners", name, "now"]) => boxed(|| keep_now(&hub, &caller, Some(name))).await,
-        (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub)),
+        (&Method::GET, ["api", "agents", "join"]) => Ok(join_info(&hub,&hub.join_token,None)),
+        (&Method::POST, ["api", "agents", "session-node-invite"]) => {
+            if !caller.is_owner() { return Err(err(StatusCode::FORBIDDEN,"only the fleet owner may delegate session authority")); }
+            let (token,until)=crate::fleet::sessions::mint_invite(&hub.store,&hub.pki.ca_der,crate::util::now_unix()).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR,format!("{e:#}")))?;
+            Ok(join_info(&hub,&token,Some(until)))
+        }
         (&Method::POST, ["api", "outposts", "invite"]) => Ok(outpost_invite(&hub)),
         (&Method::GET, ["api", "discovery"]) => Ok(boxed(|| discovery(&hub)).await),
         (&Method::POST, ["api", "discovery", "scan"]) => boxed(|| discovery_scan(&hub, req)).await,
@@ -1545,7 +1580,13 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         // Agents that run agents (`agents.*`, docs/agents.md): each operation is its route.
         (&Method::GET, ["api", "harness", "agents"]) => boxed(|| own_op(&hub, &caller, "agents.list", query_value(&q))).await,
         (&Method::POST, ["api", "harness", "agents"]) => {
-            let body = boxed(|| body_value(req)).await?;
+            let key = idempotency_key(&req);
+            let mut body = boxed(|| body_value(req)).await?;
+            if let Some(o) = body.as_object_mut() && let Some(key) = key {
+                if o.get("key").is_some_and(|v| !v.is_null() && v.as_str() != Some(&key)) { return Err(err(StatusCode::BAD_REQUEST,"the header and body specify different keys")); }
+                if key.len() > crate::harness::ops::KEY_MAX || key.chars().any(char::is_control) { return Err(err(StatusCode::BAD_REQUEST,"invalid Idempotency-Key")); }
+                o.insert("key".into(), json!(key));
+            }
             boxed(|| own_op(&hub, &caller, "agents.start", body)).await
         }
         (&Method::POST, ["api", "harness", "agents", "wait"]) => {
@@ -1574,13 +1615,22 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         }
         (&Method::POST, ["api", "harness", "agents", id, what @ ("send" | "interrupt" | "control" | "restart" | "reset" | "stop" | "change" | "land" | "about" | "credential" | "pin" | "unpin" | "park" | "unpark" | "archive" | "restore")]) => {
             let (id, name) = ((*id).to_owned(), format!("agents.{what}"));
-            // A send's idempotency key may come as the standard header (CP-T3.2).
+            let keyed = matches!(*what, "send" | "interrupt" | "control" | "restart");
             let key = idempotency_key(&req);
+            let target = req.headers().get(crate::frontdoor::replica::TARGET_HEADER).map(|v| v.to_str().map(str::to_owned))
+                .transpose().map_err(|_| err(StatusCode::BAD_REQUEST,"the target header must be text"))?;
             let mut body = boxed(|| body_value(req)).await?;
             if let Some(o) = body.as_object_mut() {
                 o.insert("agent".into(), json!(id));
-                if let Some(k) = key.filter(|_| *what == "send" && !o.contains_key("key")) {
-                    o.insert("key".into(), json!(k));
+                if keyed {
+                    for (field, header) in [("key",key),("target",target)] {
+                        if let Some(header) = header {
+                            if o.get(field).is_some_and(|v| !v.is_null() && v.as_str() != Some(header.as_str())) {
+                                return Err(err(StatusCode::BAD_REQUEST,format!("the header and body specify different {field} values")));
+                            }
+                            o.insert(field.into(),json!(header));
+                        }
+                    }
                 }
             }
             boxed(|| own_op(&hub, &caller, &name, body)).await
@@ -1598,6 +1648,12 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
             None if q.get("lean").is_some_and(|lean| lean == "1") => Ok(boxed(|| harness_sessions_lean(&hub, &caller)).await),
             None => Ok(boxed(|| harness_sessions(&hub, &caller)).await),
         },
+        (&Method::GET,["api","harness","start-requests",key])=>{
+            let mgr=hub.harness.session_consensus().map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,e.to_string()))?;
+            let reach=crate::frontdoor::replica::local_node().filter(|node|mgr.as_ref().is_some_and(|m|m.node_name()==node.machine)).and_then(|n|n.reach.clone()).ok_or_else(||err(StatusCode::SERVICE_UNAVAILABLE,"source start ledger is unavailable"))?;
+            let slots=reach.starts.visible(crate::harness::ops::start_key(&caller,key)).await.map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,e.to_string()))?;
+            Ok(srv::json(StatusCode::OK,&json!({"key":key,"slots":slots})))
+        }
         (&Method::POST, ["api", "harness", "sessions"]) => boxed(|| harness_open(&hub, req)).await,
         // As its owner encoded it once (goal 10, plan 01a1a87b2dae step 2).
         (&Method::GET, ["api", "harness", "sessions", id]) => match hub.harness.info_json(id) {
@@ -4419,9 +4475,8 @@ pub async fn probe_agent(hub: &Hub, name: &str) -> Result<Response, crate::ci::F
     }
 }
 
-fn join_info(hub: &Hub) -> Response {
+fn join_info(hub: &Hub, token: &str, expires_at: Option<i64>) -> Response {
     let url = hub.cfg.server.public_url.trim_end_matches('/').to_owned();
-    let token = hub.join_token.clone();
     srv::json(
         StatusCode::OK,
         &json!({
@@ -4444,8 +4499,7 @@ fn join_info(hub: &Hub) -> Response {
                 "macos": format!("curl -fsSL {url}/install.sh | sh -s -- --token={token} --labels baremetal,macos"),
                 "windows": format!("& ([scriptblock]::Create((irm '{url}/install.ps1'))) -Token '{token}' -Labels 'baremetal,windows'"),
             },
-            // The join token is kept in <data>/join.token and does not expire.
-            "expires_at": serde_json::Value::Null,
+            "expires_at": expires_at,
         }),
     )
 }
@@ -4479,7 +4533,8 @@ fn outpost_invite(hub: &Hub) -> Response {
 #[allow(clippy::disallowed_methods)] // (e) a refused enrollment's picked delay (slows guessing)
 async fn enroll(hub: &Hub, req: Request) -> R {
     let r: EnrollRequest = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let persistent = crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
+    let grant=crate::fleet::sessions::claim_invite(&hub.store,&r,crate::util::now_unix()).await.map_err(|e| err(StatusCode::BAD_REQUEST,format!("invalid session node enrollment: {e:#}")))?;
+    let persistent = grant || crate::util::ct_eq(r.token.as_bytes(), hub.join_token.as_bytes());
     // A `k8s` pool's executor pod (docs/ci.md W13-R07): its runner is the pod's name and that
     // executor's, whatever it asks to be.
     let pod = if persistent { None } else { hub.executor_tokens.update(|t| t.remove(&r.token)).filter(|(_, _, exp)| *exp > std::time::Instant::now()) };
@@ -4547,7 +4602,12 @@ async fn enroll(hub: &Hub, req: Request) -> R {
         hub.store.audit(name.clone(), what.into(), shown(&name, label.as_deref())).await;
         tracing::info!(agent = %name, label = label.as_deref().unwrap_or(""), outpost, "agent enrolled");
     }
-    Ok(srv::json(StatusCode::OK, &EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name, label }))
+    let session_node_pem=if grant {
+        let pem=hub.pki.sign_session_node(&r.csr,&name,days).map_err(|e|err(StatusCode::BAD_REQUEST,format!("{e:#}")))?;
+        crate::identities::record(&hub.store,"session-node",&name,&pem).await.map_err(|e|err(StatusCode::INTERNAL_SERVER_ERROR,format!("{e:#}")))?;
+        Some(pem)
+    } else { None };
+    Ok(srv::json(StatusCode::OK, &EnrollResponse { session_registrar: hub.name_issuer.registrar().ok(), session_node_pem, cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic, name, label }))
 }
 
 /// `GET /api/reach/runners?want=linux/amd64`: reach's directory, ranked for `want` (every runner
@@ -4788,7 +4848,7 @@ async fn enroll_instance(hub: &Hub, req: Request) -> R {
     tracing::info!(agent = %name, "issued a certificate for a second runner process");
     Ok(srv::json(
         StatusCode::OK,
-        &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name, label: None },
+        &crate::agent::EnrollResponse { session_registrar: hub.name_issuer.registrar().ok(), session_node_pem: None, cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name, label: None },
     ))
 }
 
@@ -4833,7 +4893,7 @@ async fn rekey_agent(hub: &Hub, req: Request) -> R {
         hub.store.audit("kiln".into(), "agent.certificate".into(), format!("{} has its certificate for its machine id {to}", hub.shown(&to))).await;
         return Ok(srv::json(
             StatusCode::OK,
-            &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name: to.clone(), label: Some(hub.shown(&to)) },
+            &crate::agent::EnrollResponse { session_registrar: hub.name_issuer.registrar().ok(), session_node_pem: None, cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name: to.clone(), label: Some(hub.shown(&to)) },
         ));
     }
     let agents = hub.agent_list().await;
@@ -4872,7 +4932,7 @@ async fn rekey_agent(hub: &Hub, req: Request) -> R {
     }
     Ok(srv::json(
         StatusCode::OK,
-        &crate::agent::EnrollResponse { cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name: to, label: Some(label) },
+        &crate::agent::EnrollResponse { session_registrar: hub.name_issuer.registrar().ok(), session_node_pem: None, cert_pem: cert, ca_pem: hub.pki.ca_pem.clone(), quic: hub.cfg.server.quic_advertise.clone(), name: to, label: Some(label) },
     ))
 }
 
@@ -5253,7 +5313,9 @@ fn shown(name: &str, label: Option<&str>) -> String {
 
 /// `POST /api/join-requests/:id/approve`: sign the machine's CSR exactly as enrollment does.
 async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
+    let owner=req.extensions().get::<crate::authz::Caller>().is_some_and(crate::authz::Caller::is_owner);
     let decision: crate::join::Decision = srv::body_json(req.into_body(), JSON_LIMIT).await.unwrap_or_default();
+    if decision.session_node && !owner { return Err(err(StatusCode::FORBIDDEN,"only the fleet owner may delegate session authority")); }
     let c = match hub.joins.candidate(id, Instant::now()) {
         Ok(c) => c,
         Err(r) => return Ok(refused(&r)),
@@ -5284,7 +5346,14 @@ async fn approve_join(hub: &Hub, id: &str, req: Request, by: &str) -> R {
     {
         tracing::warn!(agent = %name, label = %l, error = %format!("{e:#}"), "couldn't keep the approved machine's label");
     }
+    let session_node_pem = if decision.session_node && c.session_node && !outpost {
+        let pem = hub.pki.sign_session_node(&c.csr, &name, days).map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+        crate::identities::record(&hub.store, "session-node", &name, &pem).await.map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+        Some(pem)
+    } else { None };
     let approval = crate::join::Approval {
+        session_registrar: hub.name_issuer.registrar().ok(),
+        session_node_pem,
         name: name.clone(),
         labels: labels.clone(),
         cert_pem: cert,
@@ -6420,7 +6489,7 @@ fn harness_kinds(hub: &Hub, q: &HashMap<String, String>) -> Response {
 /// its own (`targets`). Machines of one kind offer the same harnesses with the same models, so written a
 /// target at a time the answer is as many copies of one list as there are machines: 68 KB for twelve targets
 /// where one list is 6 KB (`kiln-lab bar`, 2026-11-14).
-fn shared_kinds(all: &HashMap<String, Vec<crate::harness::kinds::KindInfo>>) -> serde_json::Value {
+pub(crate) fn shared_kinds(all: &HashMap<String, Vec<crate::harness::kinds::KindInfo>>) -> serde_json::Value {
     let mut lists: Vec<&Vec<crate::harness::kinds::KindInfo>> = Vec::new();
     let mut targets = std::collections::BTreeMap::new();
     for (target, kinds) in all {
@@ -6598,7 +6667,7 @@ fn lean_session(row: &mut serde_json::Map<String, serde_json::Value>) {
 
 /// The sessions' list `whole` (`GET /api/harness/sessions`'s JSON), lean: each session without [`LEAN_WITHOUT`],
 /// as columns, and what was left out said (`without`).
-fn lean_sessions(whole: &[u8]) -> anyhow::Result<bytes::Bytes> {
+pub(crate) fn lean_sessions(whole: &[u8]) -> anyhow::Result<bytes::Bytes> {
     let mut rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(whole)?;
     rows.iter_mut().for_each(lean_session);
     let mut lean = crate::wire::columns::pack(&rows.iter().collect::<Vec<_>>());
@@ -6627,11 +6696,16 @@ async fn harness_summaries(hub: &Arc<Hub>, caller: &crate::authz::Caller, ids: &
 /// `GET /api/harness/sessions?family=<id>`: only session `id`, its immediate parent (if any), and
 /// its descendants, so cold-loading an Agent Chat page never downloads all 10k sessions over 3G.
 async fn harness_family(hub: &Arc<Hub>, caller: &crate::authz::Caller, id: &str) -> Response {
+    let keep = session_family(&hub.harness.list_shared(), id);
+    let visible = crate::harness::lineage::seen(hub, caller, keep).await;
+    srv::json(StatusCode::OK, &visible)
+}
+
+pub(crate) fn session_family(all: &[Arc<crate::harness::session::Info>], id: &str) -> Vec<crate::harness::session::Info> {
     use std::collections::{HashMap, HashSet};
-    let all = hub.harness.list_shared();
     let mut by_id: HashMap<&str, &Arc<crate::harness::session::Info>> = HashMap::with_capacity(all.len());
     let mut by_parent: HashMap<&str, Vec<&Arc<crate::harness::session::Info>>> = HashMap::new();
-    for info in &all {
+    for info in all {
         if info.helper.is_some() {
             continue;
         }
@@ -6664,30 +6738,26 @@ async fn harness_family(hub: &Arc<Hub>, caller: &crate::authz::Caller, id: &str)
             }
         }
     }
-    let visible = crate::harness::lineage::seen(hub, caller, keep).await;
-    srv::json(StatusCode::OK, &visible)
+    keep
 }
 
 /// `GET /api/harness/waiting`: only the agents currently showing a shell card (open approvals,
 /// held goals, stopped with error, or paused at a usage limit), so non-Mission-Control pages
 /// (`/ship`, `/runners`, `/agents/:id`) never download 10k sessions just to render shell toasts.
 async fn harness_waiting(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Response {
-    use crate::harness::model::Status;
-    let mut notable = Vec::new();
-    for info in hub.harness.list_shared() {
-        if info.helper.is_some() {
-            continue;
-        }
-        let has_approval = !info.approvals.is_empty();
-        let has_held = info.held.is_some();
-        let stopped_err = info.status == Status::Exited && info.exit.as_ref().is_some_and(|e| e.error.is_some());
-        let at_limit = info.pause.is_some() && !matches!(info.status, Status::Running | Status::Exited | Status::Disconnected);
-        if has_approval || has_held || stopped_err || at_limit {
-            notable.push(crate::harness::session::Info::clone(&info));
-        }
-    }
+    let notable = hub.harness.list_shared().into_iter().filter(|i| session_waiting(i)).map(|i| (*i).clone()).collect();
     let visible = crate::harness::lineage::seen(hub, caller, notable).await;
     srv::json(StatusCode::OK, &visible)
+}
+
+pub(crate) fn session_waiting(info: &crate::harness::session::Info) -> bool {
+    use crate::harness::model::Status;
+    if info.helper.is_some() { return false; }
+    let has_approval = !info.approvals.is_empty();
+    let has_held = info.held.is_some();
+    let stopped_err = info.status == Status::Exited && info.exit.as_ref().is_some_and(|e| e.error.is_some());
+    let at_limit = info.pause.is_some() && !matches!(info.status, Status::Running | Status::Exited | Status::Disconnected);
+    has_approval || has_held || stopped_err || at_limit
 }
 
 /// A cursor reader asks for a bounded canonical page; legacy callers retain their pre-encoded
@@ -6765,6 +6835,12 @@ async fn conversation_events(hub: &Hub, id: &str, q: &HashMap<String, String>, c
     // The page asked for without a `limit` is what each session's copy keeps in memory, whatever else of it is
     // spilled (goal 11, plan 01a1a87b2e56 step 5).
     let limit = q.get("limit").and_then(|l| l.parse::<usize>().ok()).unwrap_or(crate::harness::copies::EVENTS_PAGE).clamp(1, 1000);
+    if let Some(notice)=hub.harness.local.fence_notice(id) {
+        let session=id.to_owned();
+        let bytes=crate::rt::blocking(move ||stored_events_with_notice(&store.events_committed(&session,before,limit)?,before,Some(notice))).await
+            .and_then(|v|v).map_err(|e|err(StatusCode::SERVICE_UNAVAILABLE,e.to_string()))?;
+        return Ok(pre_encoded(bytes));
+    }
     // From the session's copy when it holds them all: the events' texts as each was written once,
     // neither the store read nor anything encoded (goal 10, plan 01a1a87b2dae step 2), sent in the
     // pieces they're kept in, nothing inflated or joined for this read (step 5). On the request's shard
@@ -6828,9 +6904,42 @@ async fn harness_thread(hub: &Hub, caller: &crate::authz::Caller, id: &str, q: &
 
 /// `GET /api/harness/sessions/{id}/events` as the conversation store's `rows` say it: `{events}`, each row's body read
 /// as JSON (one that isn't is left out) and written out as `srv::json` writes an answer, compact.
-fn stored_events(rows: &[crate::convo::rows::EventRow]) -> anyhow::Result<Bytes> {
+pub(crate) fn stored_events(rows: &[crate::convo::rows::EventRow]) -> anyhow::Result<Bytes> {
     let events: Vec<serde_json::Value> = rows.iter().filter_map(|r| serde_json::from_str(&r.body).ok()).collect();
     crate::reads::encode(&json!({ "events": events }))
+}
+
+pub(crate) fn append_fence_notice(
+    events: &mut Vec<serde_json::Value>,
+    before: Option<u64>,
+    notice: Option<crate::harness::model::Event>,
+) -> anyhow::Result<()> {
+    let Some(n) = notice else { return Ok(()) };
+    if before.is_some_and(|cut| n.seq >= cut)
+        || events.first().and_then(|r| r.get("seq")?.as_u64()).is_some_and(|first| first > n.seq)
+        || events.iter().any(|r| r.get("id").and_then(serde_json::Value::as_str) == Some(n.id.as_str()))
+    {
+        return Ok(());
+    }
+    let i = events.partition_point(|r| r.get("seq").and_then(serde_json::Value::as_u64).is_some_and(|seq| seq <= n.seq));
+    events.insert(i, serde_json::to_value(n)?);
+    Ok(())
+}
+
+pub(crate) fn stored_events_with_notice(
+    rows: &[crate::convo::rows::EventRow],
+    before: Option<u64>,
+    notice: Option<crate::harness::model::Event>,
+) -> anyhow::Result<Bytes> {
+    if notice.is_none() {
+        return stored_events(rows);
+    }
+    let mut events = rows
+        .iter()
+        .map(|r| serde_json::from_str(&r.body))
+        .collect::<Result<Vec<serde_json::Value>, _>>()?;
+    append_fence_notice(&mut events, before, notice)?;
+    crate::reads::encode(&json!({"events":events}))
 }
 
 /// `GET /api/harness/sessions/:id/timeline?before=<seq>&lean=1`: the page of a session's events
@@ -6846,7 +6955,7 @@ async fn harness_timeline(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R
     let Some(before) = q.get("before").and_then(|b| b.parse::<u64>().ok()) else { return Err(err(StatusCode::BAD_REQUEST, "before is the number of the first event the viewer has")) };
     let lean = q.get("lean").is_some_and(|v| v == "1");
     let page = hub.harness.page(id, before, lean).await.map_err(|e| err(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")))?;
-    let page = match page.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such agent session"))? {
+    let mut page = match page.ok_or_else(|| err(StatusCode::NOT_FOUND, "no such agent session"))? {
         Paged::Page { events, window } => TimelinePage { events: events.iter().filter_map(|t| serde_json::from_str(t).ok()).collect(), window },
         Paged::Store { before, floor } => {
             let Some(store) = hub.harness.convo.clone() else { return Ok(srv::json(StatusCode::OK, &TimelinePage { events: Vec::new(), window: EventsWindow::default() })) };
@@ -6859,6 +6968,7 @@ async fn harness_timeline(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R
             store_page(events, read, floor)
         }
     };
+    append_fence_notice(&mut page.events,Some(before),hub.harness.local.fence_notice(id)).map_err(|e|err(StatusCode::INTERNAL_SERVER_ERROR,e.to_string()))?;
     Ok(srv::json(StatusCode::OK, &page))
 }
 
@@ -6866,7 +6976,7 @@ async fn harness_timeline(hub: &Hub, id: &str, q: &HashMap<String, String>) -> R
 /// first, `read` of them asked for, the timeline beginning at `floor`): as many as a page holds,
 /// whole turns where they fit. More before it when it left some of them out, or the store had
 /// as many as were asked for (it may have more).
-fn store_page(events: Vec<serde_json::Value>, read: usize, floor: u64) -> crate::wire::ui::TimelinePage {
+pub(crate) fn store_page(events: Vec<serde_json::Value>, read: usize, floor: u64) -> crate::wire::ui::TimelinePage {
     use crate::harness::window;
     let begin = window::start(&events, events.len(), window::PAGE_TURNS, |e| serde_json::to_string(e).map_or(0, |t| t.len()), window::begins_turn);
     let before = events.get(begin).and_then(|e| e.get("seq")).and_then(serde_json::Value::as_u64);
@@ -7054,11 +7164,23 @@ async fn programs_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, 
 
 /// One of kiln's own operations (agents, plans, goal stacks) as its HTTP route, which the route
 /// table let through (and the audit trail records): `crate::ops::own`.
+pub(crate) fn start_status(value: &serde_json::Value) -> StatusCode {
+    value
+        .get("status")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u16::try_from(n).ok())
+        .and_then(|n| StatusCode::from_u16(n).ok())
+        .unwrap_or(StatusCode::OK)
+}
+
 async fn own_op(hub: &Arc<Hub>, caller: &crate::authz::Caller, name: &str, input: serde_json::Value) -> R {
     let cx = crate::ops::Cx { hub: Arc::clone(hub), caller: caller.clone() };
     let id = input.get("id").and_then(serde_json::Value::as_str).map(str::to_owned);
     match crate::ops::run_own(cx, name, input).await {
-        Ok(v) => Ok(srv::json(StatusCode::OK, &v)),
+        Ok(v) => {
+            let code=if name=="agents.start"{start_status(&v)}else{StatusCode::OK};
+            Ok(srv::json(code,&v))
+        }
         // A refusal with a code (`crate::agentenvs::Refusal::said`, docs/agents.md "Environments"): its words and its
         // code apart, as the page reads them; an environment in use names the sessions that run with it.
         Err((c, m)) => match crate::agentenvs::typed(&m) {
@@ -7124,21 +7246,23 @@ async fn body_value(req: Request) -> Result<serde_json::Value, ApiError> {
 }
 
 #[derive(Deserialize)]
-struct HarnessOpen {
-    target: String,
-    spec: crate::harness::session::Spec,
+pub(crate) struct HarnessOpen {
     #[serde(default)]
-    count: Option<usize>,
+    pub(crate) target: String,
+    pub(crate) spec: crate::harness::session::Spec,
+    #[serde(default)]
+    pub(crate) count: Option<usize>,
     /// The ids to start them under, one each, made by the client (`crate::util::is_id`), so its
     /// page can open the first one's own page at once (W21-R15); asked again under the same ids, a
     /// start is refused (409) rather than started twice.
     #[serde(default)]
-    ids: Vec<String>,
+    pub(crate) ids: Vec<String>,
 }
 
 /// What an agent's start takes of the spec it was asked with: what's kiln's to say is kiln's.
-fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::authz::Caller>) {
+pub(crate) fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::authz::Caller>) {
     // Ending a process found running is asked for with a take-over, never with a spec.
+    spec.start_request = None;
     spec.takeover_stop = false;
     // Who started an agent, the plan run it works for, and whether it's that agent's subagent are
     // kiln's to say (`agents.start`, `plans.run`, a goal stack's steps side by side), never what's
@@ -7173,11 +7297,94 @@ fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<&crate::aut
     spec.opener = caller.and_then(crate::harness::lineage::person_of);
 }
 
-async fn harness_open(hub: &Hub, req: Request) -> R {
-    let attention_at = crate::util::now_ms();
+async fn harness_open(hub: &Arc<Hub>, req: Request) -> R {
     let caller = caller_of(hub, req.headers()).await;
-    let mut body: HarnessOpen = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let key = idempotency_key(&req);
+    let body = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let key=key.unwrap_or_else(||default_start_key(&body));
+    let reply = harness_open_body(hub, caller, Some(key.clone()), body).await?;
+    Ok(srv::with_header(reply,http::header::HeaderName::from_static("idempotency-key"),&key))
+}
+
+/// W21-R15. The signed runner link supplies its verified caller to the same placement and
+/// authorization entry points used by the server's HTTP and MCP callers.
+pub(crate) async fn placement_result(hub: &Arc<Hub>, caller: crate::authz::Caller, key: String, agents: bool, mut body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    if agents {
+        let Some(o) = body.as_object_mut() else {
+            return (StatusCode::BAD_REQUEST, json!({"error":"expected a start object"}));
+        };
+        if o.get("on").and_then(|v| v.as_str()).is_some_and(|s| s.trim() == "server") {
+            o.insert("on".into(), json!("local"));
+        }
+        o.insert("key".into(), json!(key));
+        let cx = crate::ops::Cx { hub: hub.clone(), caller };
+        return match crate::ops::call(cx, "agents.start", body).await {
+            Ok(value) => (start_status(&value), value),
+            Err((code, why)) => (code, json!({"error":why})),
+        };
+    }
+    match harness_open_body(hub, Some(caller), Some(key), body).await {
+        Err(ApiError(code, why)) => (code, json!({"error":why})),
+        Ok(reply) => {
+            let code = reply.status();
+            use http_body_util::BodyExt as _;
+            let value = async { anyhow::Ok(serde_json::from_slice::<serde_json::Value>(&reply.into_body().collect().await?.to_bytes())?) }.await;
+            match value {
+                Ok(value) => (code, value),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, json!({"error":e.to_string()})),
+            }
+        }
+    }
+}
+
+pub(crate) fn started_here(hub: &Hub, target: &str) -> bool {
+    let machine = target.strip_prefix("agent:").unwrap_or(target);
+    if matches!(machine, "" | "local" | "server") { return true; }
+    hub.harness.session_consensus().ok().flatten().is_some_and(|manager| {
+        machine == manager.node_name() || crate::frontdoor::replica::local_node().is_some_and(|node| node.bound_to(&manager) && node.matches_target(machine))
+    })
+}
+
+pub(crate) fn started_slots(hub: &Hub, infos: &[crate::harness::session::Info]) -> Vec<serde_json::Value> {
+    infos
+        .iter()
+        .map(|info| {
+            let mut row = json!(info);
+            if let Some(o) = row.as_object_mut() {
+                o.insert("outcome".into(), json!(if started_here(hub, &info.target) { "started" } else { "forwarded" }));
+                o.insert("why".into(), json!("the selected node confirmed the start"));
+            }
+            row
+        })
+        .collect()
+}
+
+async fn harness_open_body(hub:&Arc<Hub>,caller:Option<crate::authz::Caller>,key:Option<String>,mut body:serde_json::Value)->R{
+    let attention_at = crate::util::now_ms();
+    if let Some(key) = key.as_deref() {
+        if key.len() > crate::harness::ops::KEY_MAX || key.chars().any(char::is_control) { return Err(err(StatusCode::BAD_REQUEST,"invalid Idempotency-Key")); }
+        let scoped=caller.as_ref().map_or_else(||key.to_owned(),|c|crate::harness::ops::start_key(c,key));
+        if let Some(o) = body.as_object_mut() { start_ids(o,&scoped,hub.cfg.agents.max_children).map_err(|e|err(StatusCode::BAD_REQUEST,e.to_string()))?; }
+    }
+    let request = key.as_deref().map(|key| start_digest(&caller.as_ref().map(crate::harness::ops::key_scope).unwrap_or_else(|| "admin".into()), key, false, &body))
+        .transpose().map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut body: HarnessOpen = serde_json::from_value(body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     as_asked(&mut body.spec, caller.as_ref());
+    body.spec.start_request=request;
+    body.spec.start_key=key.map(|k|caller.as_ref().map_or_else(||k.clone(),|c|crate::harness::ops::start_key(c,&k)));
+    if crate::frontdoor::replica::needs_placement(Some(&body.target)) {
+        let caller=caller.unwrap_or_else(crate::authz::Caller::owner);
+        let cx=crate::ops::Cx{hub:hub.clone(),caller};
+        let who=crate::harness::ops::starter(&cx).map_err(|(c,m)|err(c,m))?;
+        let verdict=crate::harness::lineage::place_raw(hub,&who,body).await;
+        return match verdict {
+            Ok(infos)=>Ok(srv::json(StatusCode::OK,&started_slots(hub, &infos))),
+            Err((code,why))=>match serde_json::from_str::<serde_json::Value>(&why).ok().and_then(|v|v.get("slots").cloned()){
+                Some(slots)=>Ok(srv::json(code,&slots)),None=>Err(err(code,why)),
+            }
+        };
+    }
+    if let Some(selected)=crate::harness::lineage::named(hub,&body.target) {body.target=selected.map_err(|(c,m)|err(c,m))?;}
     // A workspace is asked for by its kind alone (its machine makes a volume), a volume only of a machine that can make
     // one: one that can't would let it work in the folder itself, unasked. Asked nothing, it gets a volume where its
     // machine can make one (`Registry::open_as`); the folder itself is a choice kept as made. One that will run isolated,
@@ -7224,7 +7431,7 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
     crate::harness::lineage::kept_agentfile(hub, body.spec.isolation.as_ref(), person.as_deref()).await.map_err(|why| err(StatusCode::BAD_REQUEST, why))?.into_spec(&mut body.spec);
     let count = body.count.unwrap_or(1);
     if !body.ids.is_empty() {
-        let n = count.clamp(1, 16);
+        let n = count;
         if body.ids.len() != n {
             return Err(err(StatusCode::BAD_REQUEST, format!("`ids` names one id for each agent it starts: {n}, not {}", body.ids.len())));
         }
@@ -7236,15 +7443,24 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
             return Err(err(StatusCode::BAD_REQUEST, "`ids` names each agent's id once"));
         }
     }
-    hub.store.audit("admin".into(), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
+    hub.store.audit(caller.as_ref().map_or_else(||"admin".into(),|c|c.name.clone()), "agent.open".into(), format!("{} on {}", body.spec.kind, body.target)).await;
     let attention_kind = if body.spec.prompt.is_some() { "message" } else { "command" };
-    let infos = hub.harness.open_as(hub, &body.target, body.spec, count, &body.ids).await.map_err(|e| {
-        // Taken already, or its machine can't give it a workspace of its own (what it lacks named): a conflict with how
-        // things stand, not a bad request.
-        let conflict = e.downcast_ref::<crate::harness::registry::IdTaken>().is_some() || e.downcast_ref::<crate::harness::lineage::NoWorkspace>().is_some();
-        let status = if conflict { StatusCode::CONFLICT } else { StatusCode::BAD_REQUEST };
-        err(status, format!("{e:#}"))
-    })?;
+    let infos = match hub.harness.open_as(hub, &body.target, body.spec, count, &body.ids).await {
+        Ok(infos)=>infos,
+        Err(e)=>{
+            if let Some(batch)=e.downcast_ref::<crate::harness::registry::StartSlots>(){
+                if let Some(c)=&caller {
+                    let confirmed=batch.0.iter().filter(|s|matches!(s.get("outcome").and_then(|v|v.as_str()),Some("started"|"forwarded"))).filter_map(|v|serde_json::from_value(v.clone()).ok()).collect::<Vec<_>>();
+                    opened_by(hub,c,&confirmed).await;
+                    for info in &confirmed {crate::harness::attention_hooks::record(hub,c,&info.id,attention_kind,&info.id,attention_at).await;}
+                }
+                return Ok(srv::json(batch.status(),&batch.0));
+            }
+            let conflict=e.is::<crate::harness::registry::IdTaken>() || e.is::<crate::harness::lineage::NoWorkspace>();
+            let code=if conflict{StatusCode::CONFLICT}else if e.is::<crate::harness::registry::StartUnconfirmed>(){StatusCode::SERVICE_UNAVAILABLE}else{StatusCode::BAD_REQUEST};
+            return Err(err(code,format!("{e:#}")));
+        }
+    };
     // Whom each acts for when its MCP server asks kiln for something (`crate::mcp::runner_ask`), and
     // whose it is.
     if let Some(c) = &caller {
@@ -7253,7 +7469,7 @@ async fn harness_open(hub: &Hub, req: Request) -> R {
             crate::harness::attention_hooks::record(hub, c, &info.id, attention_kind, &info.id, attention_at).await;
         }
     }
-    Ok(srv::json(StatusCode::OK, &infos))
+    Ok(srv::json(StatusCode::OK, &started_slots(hub, &infos)))
 }
 
 /// The agents the request's caller acts on (docs/agents.md, "Whose agents"), what a broadcast's preview picks among.
@@ -7321,8 +7537,69 @@ async fn harness_broadcast_preview(hub: &Arc<Hub>, req: Request) -> R {
 
 
 /// A request's `Idempotency-Key` header, when it has one (CP-T3.2).
-fn idempotency_key(req: &Request) -> Option<String> {
+pub(crate) fn default_start_key(body:&serde_json::Value)->String{
+    if let Some(ids)=body.get("ids").and_then(|v|v.as_array())
+        && let Some(first)=ids.first().and_then(|v|v.as_str()).filter(|id|crate::util::is_id(id)){
+        return first.to_owned();
+    }
+    crate::util::new_id()
+}
+
+pub(crate) fn start_ids(object: &mut serde_json::Map<String, serde_json::Value>, op: &str, limit: Option<u32>) -> anyhow::Result<()> {
+    let count = object
+        .get("count")
+        .filter(|v| !v.is_null())
+        .map(|v| {
+            v.as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| anyhow::anyhow!("count must be a positive integer"))
+        })
+        .transpose()?
+        .unwrap_or(1);
+    if object.get("ids").is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty)) {
+        if let Some(limit) = limit {
+            anyhow::ensure!(count <= limit as usize, "batch exceeds max_children {limit}");
+        }
+        // The only admission policy is the caller's child budget. When an unbounded
+        // request exceeds one frame, the sender splits it into individually sized slots.
+        // Reserve only addressable storage the host can actually provide.
+        let bytes = count
+            .checked_mul(std::mem::size_of::<serde_json::Value>() + 32)
+            .ok_or_else(|| anyhow::anyhow!("the slot list exceeds addressable memory"))?;
+        if bytes > crate::reach::wire::MAX_MESSAGE
+            && let Some(free) = hyper_rt::machine::facts::Facts::memory_available_now()
+        {
+            anyhow::ensure!(u64::try_from(bytes).is_ok_and(|n| n <= free), "the slot list exceeds available memory");
+        }
+        let mut ids = Vec::new();
+        ids.try_reserve(count)?;
+        for slot in 0..count {
+            ids.push(json!(crate::util::derive_id(&["fleet-start-v1", op, &slot.to_string()])));
+        }
+        object.insert("ids".into(), serde_json::Value::Array(ids));
+    }
+    Ok(())
+}
+
+pub(crate) fn start_digest(scope: &str, op: &str, agents: bool, body: &serde_json::Value) -> serde_json::Result<String> {
+    serde_json::to_vec(&("kiln-session-start-v1", scope, op, agents, body)).map(|b| crate::util::sha256_hex(&b))
+}
+
+pub(crate) fn idempotency_key(req: &Request) -> Option<String> {
     req.headers().get("idempotency-key").and_then(|v| v.to_str().ok()).map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned)
+}
+
+pub(crate) fn apply_command_key(c: &mut crate::harness::model::Command, sender: &str, session: &str, key: Option<&str>) {
+    if let Some(k) = key {
+        let made = crate::util::derive_id(&["api.command", sender, session, k]);
+        match c {
+            crate::harness::model::Command::Send { id: mid, .. } => *mid = made,
+            // Delivered like a message: through the session's inbox too.
+            crate::harness::model::Command::SkillRun { id: mid, .. } => *mid = Some(made),
+            _ => {}
+        }
+    }
 }
 
 /// `POST /api/harness/sessions/:id/command`: one command for one session. A message's `id` is its
@@ -7335,12 +7612,20 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
         return Err(err(StatusCode::BAD_REQUEST, format!("an Idempotency-Key is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX)));
     }
     let caller = req.extensions().get::<crate::authz::Caller>().cloned().unwrap_or_else(crate::authz::Caller::owner);
-    let target_hint = req
-        .headers()
-        .get(crate::frontdoor::replica::TARGET_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let mut c: crate::harness::model::Command = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    #[derive(serde::Deserialize)]
+    struct AddressedCommand {
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(flatten)]
+        command: crate::harness::model::Command,
+    }
+    let header_target = req.headers().get(crate::frontdoor::replica::TARGET_HEADER).map(|v| v.to_str().map(str::to_owned)).transpose()
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "the target header must be text"))?;
+    let AddressedCommand { target, command: mut c } = srv::body_json(req.into_body(), JSON_LIMIT).await.map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    if matches!((&header_target, &target), (Some(a), Some(b)) if a != b) {
+        return Err(err(StatusCode::BAD_REQUEST, "the header and command specify different target nodes"));
+    }
+    let target_hint = header_target.or(target);
     // The Agents page's interrupt, controls and restart are operations (kiln plan 01a1dd2e8618733a87f2793aab1322a8
     // P5.6, S2): one way in for each, held to what every operation is held to.
     let op = match &c {
@@ -7355,34 +7640,13 @@ async fn harness_command(hub: &Arc<Hub>, id: &str, req: Request) -> R {
     // An agent never raises its own permission, nor another's past its own (the person's rule, 2026-11-18; docs/agentic.md
     // W6): refused before anything is sent.
     crate::harness::lineage::may_command(hub, &caller, id, &c).map_err(|(code, why)| err(code, why))?;
-    if let Some(k) = &key {
-        let made = crate::util::derive_id(&["api.command", &crate::harness::ops::key_scope(&caller), id, k]);
-        match &mut c {
-            crate::harness::model::Command::Send { id: mid, .. } => *mid = made,
-            // Delivered like a message: through the session's inbox too.
-            crate::harness::model::Command::SkillRun { id: mid, .. } => *mid = Some(made),
-            _ => {}
-        }
-    }
+    apply_command_key(&mut c, &crate::harness::ops::key_scope(&caller), id, key.as_deref());
     let message = crate::harness::registry::message_id(&c);
     let attention = crate::harness::attention_hooks::prepare_from_info(&c,key.as_deref(),attention_at,hub.harness.info(id).as_ref());
     // Any other command under a key is taken once (docs/wire.md, "The UI's sockets"): asked again
     // under it, it's answered as it was the first time. A message is its inbox's to take once.
     let sent = match key.filter(|_| !crate::harness::session::is_message(&c)) {
-        Some(k) => {
-            use crate::harness::asked::Taken;
-            let scope = crate::harness::ops::key_scope(&caller);
-            let kind = hub.harness.kind_of(hub, id, &c);
-            let rx = match hub.harness.asked.take(id, &scope, &k, kind, Instant::now()) {
-                (_, Taken::New(rx)) => {
-                    hub.harness.send_asked_to(hub, id, &scope, &k, target_hint.as_deref(), c).await;
-                    rx
-                }
-                (_, Taken::Waiting(rx)) => rx,
-                (_, Taken::Answered(sent)) => return answer_command(sent, message),
-            };
-            rx.await.unwrap_or_else(|_| crate::harness::registry::Sent::Unanswered("the server let go of it before its answer came".into()))
-        }
+        Some(k) => hub.harness.command_under_key(hub,id,&crate::harness::ops::key_scope(&caller),&k,target_hint.as_deref(),c).await,
         None => hub.harness.command_from_to(hub, id, &crate::harness::ops::key_scope(&caller), target_hint.as_deref(), c).await,
     };
     if sent.kept_for_person() && let Some(attention)=attention {
@@ -7740,7 +8004,7 @@ fn synced() -> String {
 
 /// What a viewer of an agent session takes, as its socket's query says.
 #[derive(Debug, Clone, Copy, Default)]
-struct Takes {
+pub(crate) struct Takes {
     /// `z=gzip`: each snapshot packed. What a long conversation sends on attach is most of what it
     /// ever sends, and on a slow link a tenth of it arrives ten times sooner.
     packed: bool,
@@ -7754,14 +8018,14 @@ struct Takes {
     /// settled tool calls without their bodies (docs/wire.md, "Windows").
     view: crate::harness::registry::View,
     /// `recent_turns`: cursor history negotiated in addition to legacy window/body hydration.
-    history: Option<crate::harness::history::Limits>,
+    pub(crate) history: Option<crate::harness::history::Limits>,
     /// `timing=1`: each live frame followed by the server's times with it ([`timing_frame`]), as an API read that asks
     /// is told its own (`Kiln-Timing`): goal 10, plan 01a1a87b2dae step 5, the lab's frames split frame by frame.
     timing: bool,
 }
 
 impl Takes {
-    fn of(query: Option<&str>) -> Self {
+    pub(crate) fn of(query: Option<&str>) -> Self {
         let has = |p: &str| query.is_some_and(|q| q.split('&').any(|x| x == p));
         let after = query
             .and_then(|q| q.split('&').find_map(|x| x.strip_prefix("after=")))
@@ -8527,8 +8791,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                     Ok(SessionUp::Under { id: cmd, c, target, .. }) => {
                         use crate::harness::asked::{Taken, frame};
                         hyper_rt::futures::label(&VIEWER_COMMAND);
-                        let kind = hub.harness.kind_of(&hub, &id, &c);
-                        match hub.harness.asked.take(&id, &scope, &cmd, kind, Instant::now()) {
+                        match hub.harness.take_command(&hub, &id, &scope, &cmd, target.as_deref(), &c) {
                             (kind, Taken::New(rx)) => {
                                 audit_command(&hub, &mut audit, &who, &id, &c).await;
                                 let attention = SocketAttention::of(&hub, caller.as_ref(), &id, &c, Some(&cmd));
@@ -8545,7 +8808,7 @@ async fn harness_attach(hub: Arc<Hub>, id: String, socket: ws::WebSocket, takes:
                         hyper_rt::futures::label(&VIEWER_COMMAND);
                         audit_command(&hub, &mut audit, &who, &id, &c).await;
                         let attention = SocketAttention::of(&hub, caller.as_ref(), &id, &c, None);
-                        let pending = hub.harness.dispatch(&hub, &id, c.clone()).await;
+                        let pending = hub.harness.dispatch_from(&hub, &id, &scope, c.clone()).await;
                         let (h, session) = (Arc::clone(&hub), id.clone());
                         let (result, output) = futures::channel::oneshot::channel();
                         drop(crate::rt::spawn(async move {
@@ -8891,18 +9154,35 @@ fn server_health(hub: &Hub) -> Response {
                 "away": hub.store.group().map_or(0, crate::store::group::Group::away),
                 "cache": hub.store.group().map(|g| json!({ "bytes": g.cache(), "next": g.cache(), "file_reads": g.log_reads() })),
             })),
-            "convo_raft": crate::convo::raft::global().map_or(json!({ "enabled": false }), |m| {
+            "convo_raft": hub.harness.session_consensus().ok().flatten().map_or(json!({ "enabled": false }), |m| {
                 let (groups, leading, following) = m.summary();
-                json!({ "enabled": true, "groups": groups, "leading": leading, "following": following })
+                let st = crate::convo::raft::stats();
+                json!({
+                    "enabled": true,
+                    "groups": groups,
+                    "leading": leading,
+                    "following": following,
+                    "dropped_proposals": st.dropped_proposals,
+                    "corrupt_entries": st.corrupt_entries,
+                    "reopened_replicas": st.reopened_replicas,
+                    "retired_groups": st.retired_groups,
+                    "stalled_events": st.stalled_events,
+                    "snapshots_built": st.snapshots_built,
+                })
             }),
         }),
     )
 }
 
-/// `GET /api/convo/raft`: per-session conversation Raft group states on this node.
-fn convo_raft_health() -> Response {
-    let groups = crate::convo::raft::global().map_or_else(Vec::new, |m| m.all_status());
-    srv::json(StatusCode::OK, &json!({ "node": "server", "groups": groups }))
+/// `GET /api/convo/raft`: per-session conversation Raft group states and durability counters on this node.
+fn convo_raft_health(hub: &Hub) -> Response {
+    let manager = match hub.harness.session_consensus() {
+        Ok(manager) => manager,
+        Err(e) => return srv::text(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+    };
+    let groups = manager.as_ref().map_or_else(Vec::new, |m| m.all_status());
+    let node = manager.map(|m| m.identity().0);
+    srv::json(StatusCode::OK, &json!({ "node": node, "stats": crate::convo::raft::stats(), "groups": groups }))
 }
 
 /// The share of the runners connected before a start that are connected now, to three places:

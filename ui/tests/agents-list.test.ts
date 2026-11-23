@@ -52,7 +52,7 @@ Object.assign(globalThis, {
 });
 
 const { loaded, resourceData } = await import("../src/lib/resource.ts");
-const { harnessSessionsRes, agentsWith } = await import("../src/lib/data.ts");
+const { harnessSessionsRes, agentsWith, familyAgentsWith } = await import("../src/lib/data.ts");
 const { useAuth } = await import("../src/lib/auth.ts");
 const { events } = await import("../src/api/events.ts");
 const { preloadAgents } = await import("../src/views/harness/use-agents.ts");
@@ -124,4 +124,14 @@ await test("W21-R02: the page, Mission control and the shell's cards read the ag
   assert.equal(lists, before, "and no read of the list for it");
   off();
   events.stop();
+});
+
+await test("W26-R15 reparenting refetches the family and unrelated activity preserves it", () => {
+  const root = { ...agent("root"), parent: "before" };
+  const list = [info(root), info(agent("before")), info({ ...agent("child"), parent: "root" } as Info)];
+  const moved = { ...root, parent: "after" };
+  assert.equal(familyAgentsWith("root", list, [harness(moved)]), undefined);
+  assert.equal(familyAgentsWith("root", list, [harness(agent("unrelated"))]), list);
+  const grandchild = { ...agent("new"), parent: "child" };
+  assert.equal(familyAgentsWith("root", list, [harness(grandchild)]), undefined);
 });

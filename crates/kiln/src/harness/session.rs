@@ -341,6 +341,12 @@ fn whole_notice(runs: &Runs) -> Option<String> {
 /// What to start.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Spec {
+    /// The caller-scoped key for its source-side delivery record. Only the authorizing server sets it.
+    #[serde(skip)]
+    pub start_key: Option<String>,
+    /// Digest of the locally authorized batch that created this session, retained across takeover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_request: Option<String>,
     /// Harness id ("claude", "codex", ...).
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -535,6 +541,8 @@ impl Spec {
 impl Default for Spec {
     fn default() -> Self {
         Self {
+            start_key: None,
+            start_request: None,
             claim: None,
             engine_version: None,
             kind: String::new(),
@@ -698,11 +706,37 @@ pub struct Held {
     pub since: i64,
 }
 
+/// The original non-secret launch restrictions an elected owner needs in addition to conversation state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoverySettings {
+    #[serde(default)]
+    pub egress_ceiling: Vec<String>,
+    #[serde(default)]
+    pub volumes: Vec<crate::agentdefs::volumes::Given>,
+    #[serde(default)]
+    pub opener: Option<String>,
+    #[serde(default)]
+    pub engine_version: Option<u64>,
+}
+
+impl RecoverySettings {
+    pub(crate) fn of(s: &Spec) -> Option<Box<Self>> {
+        let settings = Self { egress_ceiling: s.egress_ceiling.clone(), volumes: s.volumes.clone(), opener: s.opener.clone(), engine_version: s.engine_version };
+        (settings != Self::default()).then(|| Box::new(settings))
+    }
+}
+
 /// A session as lists show it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[cfg_attr(test, ts(rename = "AgentInfo"))]
 pub struct Info {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(skip))]
+    pub start_request: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional, type = "unknown"))]
+    pub recovery: Option<Box<RecoverySettings>>,
     /// Omitted detail fields in the owner's bounded control projection.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     #[cfg_attr(test, ts(as = "Option<std::collections::BTreeMap<String, crate::harness::state_view::Descriptor>>", optional))]
@@ -1087,8 +1121,9 @@ impl Info {
     /// took (goal 4, plan 01a1a59c2a9c step 5: about 1,700 a second in the lab's many-sessions profile).
     /// Every field is named, so one added to `Info` is said here too, or this doesn't build.
     pub fn differs(&self, o: &Self) -> bool {
-        let Self { admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, container, agentenv, runs, starts } = self;
-        !(*deferred == o.deferred
+        let Self { start_request, recovery, admission, deferred, id, kind, kind_name, target, name, shell, cwd, tree, created_at, status, title, model, mode, harness_session, approvals, queued, queue: _, queue_partial, queue_revision, queue_next: _, said: _, tasks_running, subagents, cost_usd, activity, last_activity: _, exit, goal, objective, summary, doing, epoch, todos_done, todos_total, files_changed, lines_added, lines_removed, context_pct, turn_started, limits, account, plan, left_behind, reach, pause, frozen, perms, room_wait, last_turn, keep_off, held, refused, move_on_limit, wait_at_limit, move_plan, pause_at, max_subagents, parent, plan_run, experiment, helper, subagent, variant_of, no_bypass, launched, workspace, isolation, container, agentenv, runs, starts } = self;
+        !(*start_request == o.start_request && *recovery == o.recovery
+            && *deferred == o.deferred
             && *admission == o.admission
             && *queue_partial == o.queue_partial
             && (!*queue_partial || *queue_revision == o.queue_revision)
@@ -1221,6 +1256,37 @@ async fn said(q: &crate::memory::queue::Sender<Local>, (session, update): (Strin
 impl Sink {
     /// Hands an update on, waiting while there's no room for it: an error, with it, once no one takes
     /// updates any more. A runner's sink notes when ([`To::Stamped`]), and keeps it in its store first ([`Sink::Kept`]).
+    /// A provider's updates retain its epoch and order through local persistence. While one
+    /// provider waits for its founder commit or disk, the runner can still process Raft frames.
+    async fn send_for(&self, s: &Session, update: Update) -> Result<(), async_channel::SendError<(String, Update)>> {
+        let Some(host) = s.host.as_ref().and_then(std::sync::Weak::upgrade) else { return self.send((s.id.clone(), update)).await; };
+        let Some(inbox) = host.inbox() else { return self.send((s.id.clone(), update)).await; };
+        let epoch = s.epoch();
+        let mut tries = 0i64;
+        loop {
+            if s.fencing.load(std::sync::atomic::Ordering::Acquire) { return Ok(()); }
+            let manager = match inbox.session_authority() {
+                Ok(None) => return self.send((s.id.clone(), update)).await,
+                Ok(Some(manager)) => manager,
+                Err(_) => return Err(async_channel::SendError((s.id.clone(), update))),
+            };
+            let Some(store) = manager.store() else { return Err(async_channel::SendError((s.id.clone(), update))); };
+            match crate::agent::journal_session_update(&manager, &store, s, epoch, &update).await {
+                Ok(crate::agent::SessionJournal::Fenced) => return Ok(()),
+                Ok(crate::agent::SessionJournal::Founded) => { host.replay_founded(&s.id, epoch).await; break; }
+                Ok(crate::agent::SessionJournal::Current) => break,
+                Err(e) => {
+                    tries = tries.saturating_add(1);
+                    tracing::warn!(session=%s.id, %epoch, error=%format!("{e:#}"), "retrying the provider's session journal");
+                    crate::rt::sleep_until(std::time::Instant::now() + crate::events::backoff(tries)).await;
+                }
+            }
+        }
+        let next = match self { Sink::To(next) => next, Sink::Kept(tee) => tee.next() };
+        let taken = Taken { session: s.id.clone(), update, at: std::time::Instant::now() };
+        next.send_taken(taken).await.map_err(|e| async_channel::SendError((e.0.session, e.0.update)))
+    }
+
     pub async fn send(&self, update: (String, Update)) -> Result<(), async_channel::SendError<(String, Update)>> {
         let (to, t) = match self {
             Sink::To(To::Bounded(q)) => return said(q, update).await,
@@ -1356,6 +1422,13 @@ pub struct Seed {
     /// Not from another machine: an older runner process of this one handed it over, taking its
     /// leave (`super::handing`). Same folder, same record: only the process holding it changed.
     pub local: bool,
+}
+
+impl Seed {
+    pub(super) fn start_epoch(&self) -> anyhow::Result<u64> {
+        if self.restored { return Ok(self.state.epoch); }
+        self.state.epoch.checked_add(1).ok_or_else(|| anyhow::anyhow!("session ownership epoch exhausted"))
+    }
 }
 
 /// A preparation failure never converts a communication into a text-only prompt.
@@ -1757,6 +1830,7 @@ async fn preparation_failed(s: &Session, failure: PreparationFailure) {
 
 enum Ctl {
     Cmd(Box<Command>),
+    OwnedControl { manager: std::sync::Weak<crate::convo::raft::Manager>, epoch: u64, command: Box<Command>, reply: futures::channel::oneshot::Sender<bool> },
     /// Owned Reach state or its input's admission changed; publish through this driver, never a
     /// stale parallel snapshot. A session takes it as [`Ctl::Room`] too: what its input held may go
     /// now, and a start asked while its harness was down may happen.
@@ -1805,7 +1879,11 @@ struct Adopt {
 
 /// A running session, as its machine holds it.
 pub struct Session {
+    node_controls: super::asked::Asked,
     pub id: String,
+    host: Option<std::sync::Weak<super::host::Host>>,
+    fencing: std::sync::atomic::AtomicBool,
+    fence_error: Mutex<Option<futures::channel::oneshot::Sender<String>>>,
     pub spec: Mutex<Spec>,
     pub created_at: i64,
     pub core: Mutex<Core>,
@@ -1851,6 +1929,8 @@ impl Session {
     pub(crate) fn idle_for_tests(id: &str, epoch: u64) -> (Self, Box<dyn std::any::Any + Send>) {
         let (ctl, rx) = crate::memory::queue::unbounded::<Ctl>(&crate::memory::owners::CHANNELS);
         let s = Session {
+            node_controls: Default::default(),
+            host: None, fencing: Default::default(), fence_error: Default::default(),
             id: id.into(),
             spec: Mutex::new(Spec::default()),
             created_at: 0,
@@ -1982,6 +2062,34 @@ impl Session {
         self.ctl.try_send(Ctl::Cmd(Box::new(c))).is_ok()
     }
 
+    /// A node operator's native control is checked by this session's actor at execution.
+    pub(crate) async fn owned_control(self: &Arc<Self>, manager: &Arc<crate::convo::raft::Manager>, epoch: u64, id: &str, command: Command) -> super::registry::Sent {
+        use super::{asked::{Kind, Taken}, registry::Sent};
+        let scope = format!("node-control:{epoch}");
+        let (_, previous) = self.node_controls.take_command(&self.id, &scope, id, Kind::default(), &command);
+        let rx = match previous {
+            Taken::Answered(sent) => return sent,
+            Taken::Waiting(rx) => rx,
+            Taken::New(rx) => {
+                let (reply, result) = futures::channel::oneshot::channel();
+                let queued = self.ctl.try_send(Ctl::OwnedControl { manager: Arc::downgrade(manager), epoch, command: Box::new(command), reply }).is_ok();
+                let (s, id) = (self.clone(), id.to_owned());
+                crate::rt::spawn(async move {
+                    let sent = if queued {
+                        match crate::rt::timeout(crate::hub::COMMAND_WITHIN, result).await {
+                            Ok(Ok(true)) => Sent::Taken,
+                            Ok(Ok(false)) => Sent::Rejected { code: crate::wire::channel::Refusal::StaleEpoch, why: "session no longer handles controls at this epoch".into() },
+                            _ => Sent::Unanswered("session control outcome is unknown".into()),
+                        }
+                    } else { Sent::Unreachable };
+                    s.node_controls.answered(&s.id,&scope,&id,&sent,Instant::now());
+                });
+                rx
+            }
+        };
+        rx.await.unwrap_or_else(|_| Sent::Unanswered("session control receipt closed".into()))
+    }
+
     pub fn close(&self) {
         self.stop_owned_reach(None);
         let _ = self.ctl.try_send(Ctl::Close);
@@ -2023,6 +2131,24 @@ impl Session {
     pub async fn close_wait(&self) {
         self.stop_owned_reach(None);
         let _ = self.ctl.send(Ctl::Close).await;
+        self.wait_for_end().await;
+    }
+
+    pub(crate) async fn fence_and_wait(&self) -> anyhow::Result<()> {
+        self.fencing.store(true, std::sync::atomic::Ordering::Release);
+        self.stop_owned_reach(None);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        *self.fence_error.lock() = Some(tx);
+        let _ = self.ctl.send(Ctl::LetGo).await;
+        let result = futures::select! {
+            () = self.wait_for_end().fuse() => Ok(()),
+            why = rx.fuse() => Err(anyhow::anyhow!("{}",why.unwrap_or_else(|_| "provider fence reply closed".into()))),
+        };
+        drop(self.fence_error.lock().take());
+        result
+    }
+
+    async fn wait_for_end(&self) {
         loop {
             let ended = self.ended_changed.listen();
             if self.ended.load(Ordering::Acquire) {
@@ -2132,7 +2258,7 @@ impl Session {
         let kind = harness.as_deref().and_then(|name| Kind::all().iter().find(|k| k.name == name)).or_else(|| Kind::get(&first))?;
         let harness_session = own.filter(|h| !h.is_empty())?;
         let active_ms = self.info.lock().last_activity;
-        Some(crate::convo::record::Source { session: self.id.clone(), kind, env, harness_session, active_ms })
+        Some(crate::convo::record::Source { session: self.id.clone(), epoch: self.epoch(), kind, env, harness_session, active_ms })
     }
 
     pub fn resume_spec(&self) -> Spec {
@@ -2677,9 +2803,10 @@ pub(super) fn start_seeded_input(id: String, spec: Spec, sink: impl Into<Sink>, 
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
     } else if let Some(sd) = seed {
+        let epoch = sd.start_epoch()?;
         core.adopt(sd.events, sd.state);
         // A new writer of its conversation: what the machine it left still says no longer counts.
-        core.state.epoch += 1;
+        core.state.epoch = epoch;
         core.state.model = spec.model.clone().unwrap_or_default();
         core.state.mode = spec.mode.clone().unwrap_or_default();
         core.harness = Some(kind.name.to_owned());
@@ -2757,6 +2884,8 @@ fn begin(id: String, mut spec: Spec, kind: &'static Kind, mut core: Core, sink: 
     core.room = Some(Arc::clone(&files.room));
     let cwd = core.state.cwd.clone();
     let info = Info {
+        start_request: spec.start_request.clone(),
+        recovery: RecoverySettings::of(&spec),
         deferred: Default::default(),
         id: id.clone(),
         kind: kind.id.to_owned(),
@@ -2835,6 +2964,8 @@ fn begin(id: String, mut spec: Spec, kind: &'static Kind, mut core: Core, sink: 
     // Its environment, out of its spec before anything can record it.
     let agentenv = spec.agentenv.take();
     let s = Arc::new(Session {
+        node_controls: Default::default(),
+        host: files.host.clone(), fencing: Default::default(), fence_error: Default::default(),
         id,
         spec: Mutex::new(spec),
         created_at: now,
@@ -3025,6 +3156,7 @@ async fn flush_input(s: &Session) -> bool {
         core.touch_state();
     }
     let mut write_ready = input.controller.lock().writes_ready();
+    let mut flight = Vec::new();
     for message in stages {
         let epoch = input.controller.lock().lease(&message).map(|l| l.epoch);
         let Some(epoch) = epoch else {
@@ -3040,6 +3172,16 @@ async fn flush_input(s: &Session) -> bool {
             };
             s.core.lock().input_stages.push(message);
             if !deferred { let _ = input.controller.lock().unavailable(); }
+            write_ready = false;
+        } else {
+            flight.push(message);
+        }
+    }
+    if !flight.is_empty() {
+        let epoch = s.epoch();
+        if let Err(e) = input.inbox.confirm_provider_write(&s.id, epoch).await {
+            tracing::warn!(session=%s.id, epoch, error=%e, "provider input remains held until its journal commits");
+            s.core.lock().input_stages.extend(flight);
             write_ready = false;
         }
     }
@@ -3194,7 +3336,7 @@ async fn flush(s: &Session, sink: &Sink, stdin: Option<&crate::memory::queue::Se
         crate::convo::record::active(now);
     }
     for u in updates {
-        if sink.send((s.id.clone(), u)).await.is_err() {
+        if sink.send_for(s, u).await.is_err() {
             break;
         }
     }
@@ -3224,6 +3366,18 @@ enum Ev {
     Tick,
     /// Headroom has room for work it held (docs/headroom.md).
     Room,
+}
+
+/// Resolve the epoch in the actor's own turn, after any earlier handover or fence.
+fn owned_event(s: &Session, ev: Ev) -> Option<(Ev, Option<futures::channel::oneshot::Sender<bool>>)> {
+    if let Ev::Ctl(Some(Ctl::OwnedControl { manager, epoch, command, reply })) = ev {
+        if reply.is_canceled() || s.is_moving() || s.epoch() != epoch || !manager.upgrade().is_some_and(|m| m.owned_epoch(&s.id) == Some(epoch)) {
+            let _ = reply.send(false);
+            return None;
+        }
+        return Some((Ev::Ctl(Some(Ctl::Cmd(command))), Some(reply)));
+    }
+    Some((ev, None))
 }
 
 /// The agent-control link a boundary's run is driven over (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
@@ -3569,6 +3723,32 @@ fn whole_lines(buf: &mut Vec<u8>, scanned: &mut usize) -> Vec<Vec<u8>> {
     buf.drain(..taken.min(buf.len()));
     *scanned = buf.len();
     lines
+}
+
+async fn end_fenced_group(group: &crate::os::contain::Group) -> anyhow::Result<()> {
+    // Finish this session's cleanup before another provider can reuse its containment group.
+    let group = group.clone();
+    crate::rt::blocking(move || {
+        group.kill();
+        anyhow::ensure!(
+            !group.pids().into_iter().any(|pid| crate::os::proc::started_at(pid).is_some()),
+            "the old provider still has live containment group members"
+        );
+        group.remove();
+        Ok::<(),anyhow::Error>(())
+    }).await?
+}
+
+async fn retry_provider_fence(s: &Session, ctl: &crate::memory::queue::Receiver<Ctl>, error: anyhow::Error) -> bool {
+    if let Some(report) = s.fence_error.lock().take() { let _ = report.send(format!("{error:#}")); }
+    // Retain the original handle, discard provider work and wait for the next explicit attempt.
+    loop {
+        match ctl.recv().await {
+            Ok(Ctl::LetGo | Ctl::Close) => return true,
+            Ok(_) => continue,
+            Err(_) => return false,
+        }
+    }
 }
 
 /// An ending agent's group of processes, after `after` (its harness's time to stop): whatever is
@@ -4396,7 +4576,7 @@ async fn carry_over(s: &Arc<Session>, from: &'static Kind, sw: Switch, left: usi
     }
     // Everyone sees it as the harness it is now.
     for u in s.snapshot() {
-        let _ = sink.send((s.id.clone(), u)).await;
+        let _ = sink.send_for(s, u).await;
     }
     tracing::info!(session = %s.id, from = from.id, to = to.id, model = %sw.model, dropped, "agent session switched harness");
     Some((to, seed))
@@ -4865,6 +5045,7 @@ async fn files_in(s: &Session, sink: &Sink, mark: &crate::sync::runner::Mark, ct
                 Ok(Ctl::Room) => {}
                 Ok(Ctl::OwnedChanged) => {flush(s,sink,None).await;}
                 Ok(Ctl::Promotion) => { progress_promotion(s, files).await; flush(s,sink,None).await; }
+                Ok(Ctl::OwnedControl { reply, .. }) => { let _ = reply.send(false); }
                 Ok(Ctl::ArchiveQuiet(reply)) => {let _=reply.send(false);}
                 Ok(Ctl::Epoch(e)) => raise_epoch(s, files, e).await,
                 // No harness of its runs here to hold a call.
@@ -5187,7 +5368,19 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
         Err(e) => return Err(unfenced(s, fence, format!("its inbox couldn't be read, so it stays here: {e}")).await),
     };
     (pkg.inbox, pkg.inbox_digests) = super::host::split_kept(kept);
-    let bytes = match serde_json::to_vec(&pkg) {
+    let raft_move = s.core.lock().input.as_ref().map(|i| i.inbox.session_authority()).transpose().map_err(|e| e.to_string())?.flatten();
+    if let Some(manager) = &raft_move {
+        match pkg.stage_move(manager, &mv.to, false) {
+            Ok(source) if source == manager.identity().0 => {}
+            Ok(_) => return Err("only the committed owner can move this session".into()),
+            Err(why) => {
+                let (authority, id, epoch) = (manager.clone(), s.id.clone(), pkg.state.epoch);
+                let retained = crate::rt::blocking_in(crate::rt::SHARE_SESSION, move || authority.propose_sync(&id, epoch, Vec::new())).await.is_ok_and(|r| r.is_ok());
+                return Err(if retained { unfenced(s, fence, why).await } else { why });
+            }
+        }
+    }
+    let bytes = match pkg.move_bytes() {
         Ok(bytes) => bytes,
         Err(e) => return Err(unfenced(s, fence, e.to_string()).await),
     };
@@ -5197,19 +5390,37 @@ async fn hand_over(s: &Arc<Session>, kind: &'static Kind, mv: &Move, ids: &Carri
     // message it takes there too, so it doesn't: its inbox stays fenced, and it asks that runner
     // again until it says (it runs it: moved; it takes it now: moved; it refuses it: it stays).
     let mut pause = UNKNOWN_FIRST;
-    while let Err(crate::reach::node::NotAdopted::Unknown(why)) = &handed {
+    while raft_move.is_none() && let Err(crate::reach::node::NotAdopted::Unknown(why)) = &handed {
         tracing::warn!(target: "kiln.sends", event = "move_unknown", session = %s.id, to = %mv.to, error = %why, "a session's move got no answer: it takes no messages here until the runner it went to says whether it took it over");
         moving_note(s, &format!("Moving to {}: no answer came ({why}), so it may run there now. It takes no messages here until {} says; asking again", mv.to, mv.to));
         crate::rt::sleep(pause).await;
         pause = (pause * 2).min(UNKNOWN_MOST);
         handed = reach.adopt(&mv.to, &bytes, true).await;
     }
-    if handed.is_err()
+    let can_reopen = if handed.is_err() && let Some(manager) = raft_move.clone() {
+        let (id, epoch) = (s.id.clone(), pkg.state.epoch);
+        crate::rt::blocking_in(crate::rt::SHARE_SESSION, move || manager.propose_sync(&id, epoch, Vec::new())).await.is_ok_and(|result| result.is_ok())
+    } else { handed.is_err() };
+    if can_reopen
         && let Err(e) = fence(s.id.clone(), false).await
     {
         tracing::warn!(target: "kiln.sends", event = "unfence_failed", session = %s.id, error = %e, "a session whose move failed couldn't take messages again: its inbox stays fenced until it's moved");
     }
     let handed = handed.map_err(|e| e.to_string());
+    if handed.is_ok() && let (Some(manager), Some(stage)) = (raft_move, pkg.raft_move) {
+        let (id, destination, epoch) = (s.id.clone(), mv.to.clone(), pkg.state.epoch);
+        // The destination has fsynced the native package. It activates it only upon applying
+        // the elected owner's claim. An ambiguous transfer leaves this source fenced.
+        let decision = async {
+            manager.begin_move(&id, &destination, epoch, &stage.digest).await?;
+            manager.wait_moved(&id, &destination, epoch, &stage.digest).await
+        }.await;
+        if let Err(error) = decision {
+            let why = error.to_string();
+            let retained = crate::rt::blocking_in(crate::rt::SHARE_SESSION, move || manager.cancel_move(&id, epoch, &destination, stage.digest)).await.is_ok_and(|r| r.is_ok());
+            return Err(if retained { unfenced(s, fence, why).await } else { why });
+        }
+    }
     if let (Some(x), Err(e)) = (&synced, &handed) {
         tell_move(news(&x.mark.repo, x.mark.index, "failed", Some(e)));
     }
@@ -5323,7 +5534,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
         if stored && matches!(u, Update::Reset { .. } | Update::Events { .. }) {
             continue;
         }
-        let _ = sink.send((s.id.clone(), u)).await;
+        let _ = sink.send_for(&s, u).await;
     }
     let mut first = !handed;
     // Its process ending never ends it: when it starts again by itself, whether its next start is
@@ -5356,7 +5567,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             if let_go {
                 (files.release)(&s.id);
             } else {
-                let _ = sink.send((s.id.clone(), Update::Closed)).await;
+                let _ = sink.send_for(&s, Update::Closed).await;
             }
             on_change();
             return;
@@ -5638,7 +5849,8 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     core.set_status(Status::Starting);
                     core.touch_state();
                     adapter.start(&mut core);
-                    if !s.prompted.swap(true, std::sync::atomic::Ordering::Relaxed) && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
+                    let managed = s.host.as_ref().and_then(std::sync::Weak::upgrade).and_then(|h| h.inbox().cloned()).is_some_and(|i| !matches!(i.session_authority(), Ok(None)));
+                    if !s.prompted.swap(true, std::sync::atomic::Ordering::Relaxed) && !managed && let Some(prompt) = spec.prompt.clone().filter(|p| !p.trim().is_empty()) {
                         // Its id is the session's own (CP-T3.2): made once, the same if it's ever made again.
                         let id = opening_prompt_id(&s.id);
                         adapter.command(&mut core, Command::Send { id, text: prompt, mode: Default::default(), attachments: Vec::new(), overrides: None, reply_to: None, task: None });
@@ -5717,7 +5929,9 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         _ = crate::rt::sleep_until(next_tick).fuse() => Ev::Tick,
                         () = held_room(&s.core).fuse() => Ev::Room,
                     };
+                    let Some((ev, control)) = owned_event(&s, ev) else { continue };
                     match ev {
+                        Ev::Ctl(Some(Ctl::OwnedControl { reply, .. })) => { let _ = reply.send(false); }
                         Ev::Out(Some(chunk)) => {
                             buf.extend_from_slice(&chunk);
                             let mut core = s.core.lock();
@@ -5800,7 +6014,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                             Command::Snapshot => {
                                 for u in s.snapshot() {
-                                    let _ = sink.send((s.id.clone(), u)).await;
+                                    let _ = sink.send_for(&s, u).await;
                                 }
                             }
                             // What one who changed its files did alone: the session keeps that, whatever its harness.
@@ -6083,7 +6297,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             }
                             let (updates, core) = { let mut core = s.core.lock(); (core.take_out(), core.freeze()) };
                             for u in updates {
-                                let _ = sink.send((s.id.clone(), u)).await;
+                                let _ = sink.send_for(&s, u).await;
                             }
                             *s.pid.lock() = None;
                             use base64::Engine as _;
@@ -6092,12 +6306,13 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                             return;
                         }
                         Ev::Ctl(ctl @ (Some(Ctl::Close | Ctl::LetGo) | None)) => {
+                            let fenced = s.fencing.load(Ordering::Acquire);
                             s.stop_owned_reach(None);
                             // Ending the agent ends what it left running: stopped through the
                             // harness first, then whatever is still under it (shells and
                             // terminals that left its process group included), then the harness.
                             // Letting go of it (it went on elsewhere) ends what ran here alike.
-                            if s.core.lock().state.tasks.iter().any(super::model::Task::live) {
+                            if !fenced && s.core.lock().state.tasks.iter().any(super::model::Task::live) {
                                 adapter.command(&mut s.core.lock(), Command::StopTasks);
                                 let _ = flush(&s, &sink, Some(&p.stdin)).await;
                                 crate::rt::sleep(Duration::from_millis(1500)).await;
@@ -6115,22 +6330,41 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                     (None, Some(root)) => descendants(root).into_iter().map(|(pid, _)| pid).collect(),
                                     (None, None) => Vec::new(),
                                 };
-                                crate::os::stop_processes(&pids, root, Duration::from_secs(2));
+                                let grace = if fenced { Duration::ZERO } else { Duration::from_secs(2) };
+                                crate::os::stop_processes(&pids, root, grace);
                                 for r in &left {
                                     super::survivors::stop_tree(r);
                                 }
                             })
                             .await;
-                            p.terminate(Duration::from_secs(3));
-                            // A container's run ends only once its container is let go: read ended after that.
-                            if s.spec.lock().container.is_some() {
-                                let _ = crate::rt::timeout(ended_within(true), &mut p.exit).await;
+                            if fenced {
+                                // A queued stop request is not proof of process exit. Close the output
+                                // pumps first: a boundary reports exit behind its final output.
+                                p.stdout.close();
+                                p.stderr.close();
+                                if let Some(held) = p.boundary() {
+                                    held.kill();
+                                    held.wait_ended().await;
+                                } else {
+                                    while let Err(e) = p.stop_fenced().await {
+                                        if !retry_provider_fence(&s, &ctl_rx, e).await { return; }
+                                    }
+                                }
+                            } else {
+                                p.terminate(Duration::from_secs(3));
+                                if s.spec.lock().container.is_some() {
+                                    let _ = crate::rt::timeout(ended_within(true), &mut p.exit).await;
+                                }
                             }
                             *s.pid.lock() = None;
                             keep_ran_in(&s, &files, kept_in.as_deref()).await;
                             s.ended_run(None, p.boundary());
                             if let Some(g) = group {
-                                end_group(g, Duration::from_millis(3500));
+                                if fenced {
+                                    while let Err(e) = end_fenced_group(&g).await {
+                                        if !retry_provider_fence(&s, &ctl_rx, e).await { return; }
+                                    }
+                                } else { end_group(g, Duration::from_millis(3500)); }
                             }
                             if matches!(ctl, Some(Ctl::LetGo)) {
                                 tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
@@ -6144,7 +6378,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                                     end_tasks(&mut core);
                                 }
                                 let _ = flush(&s, &sink, None).await;
-                                let _ = sink.send((s.id.clone(), Update::Closed)).await;
+                                let _ = sink.send_for(&s, Update::Closed).await;
                             }
                             on_change();
                             return;
@@ -6211,6 +6445,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                         break;
                     }
                     jobs = flush(&s, &sink, Some(&p.stdin)).await;
+                    if let Some(reply) = control { let _ = reply.send(true); }
                     let listed = {
                         let core = s.core.lock();
                         (core.meta.models != models_seen).then(|| core.meta.models.clone())
@@ -6475,6 +6710,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
             };
             // A start asked for: kiln's own, its wait over, or a person's (a restart, a message),
             // which the restart rule reads apart ([`Ran::again`]).
+            let Some((ev, mut control)) = owned_event(&s, ev) else { continue };
             if let Ev::Ctl(Some(Ctl::Cmd(c))) = &ev && matches!(**c, Command::Restart | Command::Reset { .. } | Command::Send { task: None, .. } | Command::SkillRun { .. }) {
                 ours = woke;
             }
@@ -6491,6 +6727,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     Command::Restart => {
                         if s.core.lock().has_room() {
+                            if let Some(reply) = control.take() { let _ = reply.send(true); }
                             break;
                         }
                         start_asked = true;
@@ -6532,7 +6769,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     }
                     Command::Snapshot => {
                         for u in s.snapshot() {
-                            let _ = sink.send((s.id.clone(), u)).await;
+                            let _ = sink.send_for(&s, u).await;
                         }
                     }
                     Command::OwnEdits { client, by } => s.core.lock().ask_own(client, &by),
@@ -6717,7 +6954,11 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     // both kiln processes share a cgroup (a test's server and its runners), its
                     // harness starting there, and isn't ended from here.
                     if let Some(g) = crate::os::contain::Group::existing(&s.id).filter(|_| ran_here || !matches!(ctl, Some(Ctl::LetGo))) {
-                        end_group(g, Duration::ZERO);
+                        if s.fencing.load(Ordering::Acquire) {
+                            while let Err(e) = end_fenced_group(&g).await {
+                                if !retry_provider_fence(&s, &ctl_rx, e).await { return; }
+                            }
+                        } else { end_group(g, Duration::ZERO); }
                     }
                     if matches!(ctl, Some(Ctl::LetGo)) {
                         tracing::info!(session = %s.id, "agent session went on on another machine; this one lets go of it");
@@ -6725,7 +6966,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                     } else {
                         end_tasks(&mut s.core.lock());
                         let _ = flush(&s, &sink, None).await;
-                        let _ = sink.send((s.id.clone(), Update::Closed)).await;
+                        let _ = sink.send_for(&s, Update::Closed).await;
                     }
                     on_change();
                     return;
@@ -6734,6 +6975,7 @@ async fn drive(s: Arc<Session>, kind: &'static Kind, ctl_rx: crate::memory::queu
                 _ => {}
             }
             flush(&s, &sink, None).await;
+            if let Some(reply) = control { let _ = reply.send(true); }
             if let Some(at) = effects(&s, kind, &files, &fx_tx) {
                 rewind_to = Some(at);
                 break;
@@ -6913,6 +7155,8 @@ mod tests {
     fn idle(id: &str) -> (Session, crate::memory::queue::Receiver<Ctl>) {
         let (ctl, rx) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
         let s = Session {
+            node_controls: Default::default(),
+            host: None, fencing: Default::default(), fence_error: Default::default(),
             id: id.into(),
             spec: Mutex::new(Spec::default()),
             created_at: 0,
@@ -8958,6 +9202,8 @@ sys.exit(1)
     #[test]
     fn info_follows_state() {
         let mut i = Info {
+            start_request: None,
+            recovery: None,
             id: "a".into(),
             deferred: Default::default(), queue_partial: false, queue_revision: None, queue_next: None,
             kind: "claude".into(),

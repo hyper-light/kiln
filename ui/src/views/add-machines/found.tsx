@@ -522,12 +522,13 @@ function InstanceAction({
 /** The verification code and the decision. The code is the check: approve only when the machine shows the same. */
 function Decide({ request: r, onDecided }: { request: JoinRequest; onDecided: () => void }) {
   // The decision pressed says it's on its way (W21-R15); pressing the other meanwhile does nothing.
+  const [grantSessions, setGrantSessions] = React.useState(true);
   const [chose, setChose] = React.useState<"approve" | "deny" | null>(null);
   const [decide, deciding] = useAction(async (what: "approve" | "deny") => {
     setChose(what);
     try {
       if (what === "approve") {
-        const res = await api.approveJoin(r.id);
+        const res = await api.approveJoin(r.id, { session_node: r.session_node === true && grantSessions });
         // Known by its machine id, it's shown by the name it asked for.
         noteLabels([res]);
         toast.success(`${shownName(res)} approved`, "It connects as a runner in a moment.");
@@ -552,8 +553,22 @@ function Decide({ request: r, onDecided }: { request: JoinRequest; onDecided: ()
       ) : (
         <span className="am-quiet">waiting for it to confirm…</span>
       )}
-      <button type="button" className="am-act" data-tone="ok" {...sendingProps(busy === "approve")} disabled={!r.code} onClick={() => decide("approve")} aria-label={`Approve ${r.name}`}>
-        <Check aria-hidden="true" /> {busy === "approve" ? "Approving…" : "Approve"}
+      {r.session_node && (
+        <label className="am-hint">
+          <input type="checkbox" checked={grantSessions} disabled={deciding} onChange={(e) => setGrantSessions(e.currentTarget.checked)} /> Allow its local operators to start sessions and send
+          messages on fleet members
+        </label>
+      )}
+      <button
+        type="button"
+        className="am-act"
+        data-tone="ok"
+        {...sendingProps(busy === "approve")}
+        disabled={!r.code}
+        onClick={() => decide("approve")}
+        aria-label={r.session_node && grantSessions ? `Approve ${r.name} as a fleet session node` : `Approve ${r.name}`}
+      >
+        <Check aria-hidden="true" /> {busy === "approve" ? "Approving…" : r.session_node && grantSessions ? "Approve as session node" : "Approve"}
       </button>
       <button type="button" className="am-act" data-tone="danger" {...sendingProps(busy === "deny")} onClick={() => decide("deny")} aria-label={`Deny ${r.name}`}>
         {busy === "deny" ? "Denying…" : "Deny"}

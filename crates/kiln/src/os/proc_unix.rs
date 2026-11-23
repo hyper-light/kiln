@@ -416,6 +416,24 @@ impl Duplex {
         use std::os::fd::IntoRawFd as _;
         Some(Detached { pid: self.pid, stdin: input.into_raw_fd(), stdout: out.into_raw_fd(), stderr: err.into_raw_fd(), foreign: self.foreign })
     }
+    /// CP-T3.2. Kill the local provider group and wait for its own reaper (or the adopted
+    /// process's original lifetime). A delayed kill by group number can strike a successor.
+    pub(crate) async fn stop_fenced(&mut self) -> anyhow::Result<()> {
+        let pid = self.pid;
+        let born = crate::rt::blocking(move || started_at(pid)).await?;
+        if let Ok(group) = i32::try_from(self.pid)
+            && group > 1
+            && let Err(error) = killpg(Pid::from_raw(group), Signal::SIGKILL)
+            && error != nix::errno::Errno::ESRCH
+        {
+            return Err(error.into());
+        }
+        let _ = (&mut self.exit).await;
+        if let Some(born) = born { wait_exit_of(self.pid, born).await; }
+        else if crate::os::pid_alive(self.pid) { wait_foreign_exit(self.pid).await; }
+        Ok(())
+    }
+
     /// SIGTERM the group, then SIGKILL whatever is left after `grace` (without waiting here). Held by
     /// a boundary, it's ended as its boundary ends a run ([`crate::sandbox::held::Held::terminate`]).
     #[allow(clippy::disallowed_methods)] // (e) SIGTERM's grace before SIGKILL: an operation's deadline

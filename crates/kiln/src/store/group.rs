@@ -50,11 +50,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, bail};
 use hyper_block::buf::Alignment;
 use hyper_block::file::{CachingRequest, DeviceFile};
-use hyper_durable::{Fatal, GroupStore, LogStore as _, OpenError, Output, Point, Replica, Settings, StateMachine, Unbounded};
+use hyper_durable::{Fatal, GroupStore, LogStore as _, OpenError, Output, Point, Replica, Settings, StateMachine, Bytes};
 use hyper_log::{Config as LogConfig, Facts, Log};
 use hyper_raft::proto::{ConfChangeV2, ConfState, Message, MessageType};
 use hyper_raft::wire::Record as _;
-use hyper_raft::{Config, Elections, Limits, Stated, Timing};
+use hyper_raft::{Config, Elections, Limits, Stated};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension as _};
 use serde::{Deserialize, Serialize};
@@ -115,19 +115,6 @@ const DISK: u64 = 4 << 30;
 const CADENCE: (u64, u64) = (4096, 256 << 20);
 /// Changes waiting for the log, at most: past them a write waits its turn.
 pub(super) const QUEUED: usize = 1024;
-/// How often the server's member beats while it has learners: a learner hears what's committed
-/// when no write moves.
-const BEAT: Duration = Duration::from_secs(1);
-/// What the group's elections and the leader's own beat are timed by, until hyper-liveness measures
-/// the paths between kiln's nodes (P3e, `Replica::measure`). Without one, the leader's beat never
-/// runs: nothing counts how long a member hasn't answered, so a probe or an append lost on the way
-/// with nobody saying so is never sent again, and that member waits until the leader restarts
-/// (adacachy's learner, 2026-10-25, for hours). A follower draws no delay to campaign without one
-/// either. A campaign is drawn over half a second, a vote round is half a second (a leader with
-/// work in flight beats that often), and an election is expected to take two.
-const TIMING: Timing = Timing { span: Duration::from_millis(500), round: Duration::from_millis(500), election: Duration::from_secs(2) };
-/// A change of learners that hasn't applied in this long is proposed again.
-const CHANGE_PATIENCE: Duration = Duration::from_secs(30);
 /// The group's messages waiting for the links to the runners, at most (past them, they're
 /// dropped: Raft sends what's needed again). Kept where the group's thread, their one sender, sends
 /// them: their queue makes its places as it fills (goal 11, plan 01a1a87b2e56 step 5: a bounded one
@@ -379,7 +366,7 @@ fn entries(seq: u64, change: Change) -> anyhow::Result<Vec<Vec<u8>>> {
     groups.into_iter().enumerate().map(|(i, rows)| postcard::to_allocvec(&Entry { seq, part: u32::try_from(i).unwrap_or(u32::MAX), parts, rows }).context("encoding an entry")).collect()
 }
 
-type Member = Replica<GroupStore<DeviceFile>, Machine, Unbounded>;
+type Member = Replica<GroupStore<DeviceFile>, Machine, Bytes>;
 
 /// What the group's thread is asked.
 enum Request {
@@ -395,6 +382,7 @@ enum Request {
     Unreachable(u64),
     /// Prompt the leader to heartbeat learners immediately (e.g. on runner connect/reconnect or ReadIndex Ask).
     Beat,
+    Bind(Arc<crate::liveness::Shared>, u64, mpsc::SyncSender<Result<(), String>>),
     /// A learner's: a copy of the database now, over what it applied (a checkpoint of the log that
     /// didn't match what it holds).
     CopyAgain(mpsc::SyncSender<Result<(), String>>),
@@ -415,6 +403,7 @@ impl Wake for Unpark {
 
 /// The group: its thread, which owns the log and the replica.
 pub struct Group {
+    liveness_binding: Mutex<Option<(u64,u64)>>,
     tx: mpsc::SyncSender<Request>,
     thread: Thread,
     join: Option<JoinHandle<()>>,
@@ -532,9 +521,8 @@ impl Group {
             // Driven by events: what's proposed is written at the first lull, together.
             quiet: Duration::ZERO,
             elections: Elections::Suspicion,
-            // Today's: a member's heartbeats wait on its flush proof, and a leader applies only
-            // what a majority's disks hold, its own among them (hyper-durable's `Disk`).
-            disk: hyper_durable::Disk::Flushed,
+            // The physical detector judges the process and its disk independently.
+            disk: hyper_durable::Disk::Apart,
         };
         let (tx, rx) = mpsc::sync_channel(QUEUED);
         let (out_tx, outgoing) = crate::memory::queue::unbounded(&crate::memory::owners::CHANNELS);
@@ -551,7 +539,7 @@ impl Group {
             .name("kiln-cluster".into())
             .spawn(move || {
                 let waker = Waker::from(Arc::new(Unpark(thread::current())));
-                let mut replica = match Replica::open(&settings, store, machine, Unbounded) {
+                let replica = match Replica::open(&settings, store, machine, Bytes::new(crate::memory::room::share() as u64)) {
                     Ok(r) => r,
                     Err(OpenError::StartPastMachine { .. }) if learner => {
                         ready_tx.send(Err(Opening::LogPastCopy)).ok();
@@ -562,10 +550,6 @@ impl Group {
                         return;
                     }
                 };
-                if let Err(e) = replica.set_timing(TIMING) {
-                    ready_tx.send(Err(Opening::Failed(anyhow::anyhow!("timing the cluster group's beat: {e:?}")))).ok();
-                    return;
-                }
                 let mut d = Driver {
                     replica,
                     _log: log,
@@ -573,7 +557,9 @@ impl Group {
                     rx,
                     pending: std::collections::HashMap::new(),
                     next: 1,
-                    start: Instant::now(),
+                    membership: None,
+                    evidence: Arc::default(),
+                    subscription: None,
                     since: 0,
                     image: 0,
                     broken: None,
@@ -587,7 +573,7 @@ impl Group {
                     server: !learner,
                     wanted: None,
                     changing: None,
-                    beat: Instant::now(),
+
                     held: Held::default(),
                     away: away2,
                     log_reads: log_reads2,
@@ -602,7 +588,29 @@ impl Group {
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(failed(anyhow::anyhow!("the cluster group didn't start within 60 s"))),
         }
-        Ok(Group { tx, thread, join: Some(join), seq, applied, applied_notify, point, log_start, outgoing, stopped, leaves, away, log_reads, term })
+        Ok(Group { liveness_binding: Mutex::default(), tx, thread, join: Some(join), seq, applied, applied_notify, point, log_start, outgoing, stopped, leaves, away, log_reads, term })
+    }
+
+    /// Bind the fixed WAL voter to its physical, authenticated bootstrap identity.
+    pub fn bind_liveness(&self, local_machine: &str, bootstrap_machine: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!local_machine.is_empty() && !bootstrap_machine.is_empty(), "missing database group node identity");
+        let pair = (crate::convo::raft::node_id(local_machine),crate::convo::raft::node_id(bootstrap_machine));
+        let mut bound = self.liveness_binding.lock();
+        if *bound == Some(pair) { return Ok(()); }
+        self.bind_detector(crate::liveness::Shared::get(pair.0), pair.1)?;
+        *bound = Some(pair);
+        Ok(())
+    }
+
+    fn bind_detector(&self, stream: Arc<crate::liveness::Shared>, bootstrap: u64) -> anyhow::Result<()> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(Request::Bind(stream, bootstrap, tx))
+            .context("database group stopped")?;
+        self.thread.unpark();
+        rx.recv()
+            .context("database group stopped during liveness binding")?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Notifier woken whenever the group's applied index or `seq` advances (eliminates polling in `Learner::current`).
@@ -611,7 +619,7 @@ impl Group {
     }
 
     /// Prompt the leader to send a Raft heartbeat to learners right away (e.g. when a runner connects
-    /// or asks where `kiln.db` stands), avoiding up to a full `BEAT` (1 s) catch-up stall.
+    /// or asks where `kiln.db` stands). Idle groups send no periodic heartbeat.
     pub fn beat_now(&self) {
         if self.tx.try_send(Request::Beat).is_ok() {
             self.thread.unpark();
@@ -867,7 +875,9 @@ struct Driver {
     /// Proposals answered once applied: the barrier and flushes.
     pending: std::collections::HashMap<u64, mpsc::SyncSender<Result<(), String>>>,
     next: u64,
-    start: Instant,
+    membership: Option<crate::convo::liveness::Membership>,
+    evidence: Arc<Mutex<crate::convo::liveness::Inbox>>,
+    subscription: Option<crate::liveness::Subscription>,
     /// What was applied at the last compaction, or where the log started as it opened.
     since: u64,
     /// kiln.db's bytes as last read ([`Driver::retain`]).
@@ -894,8 +904,7 @@ struct Driver {
     wanted: Option<BTreeSet<u64>>,
     /// A change of learners under way: the learner, added or not, and when it was proposed.
     changing: Option<(u64, bool, Instant)>,
-    /// When the server's member last beat.
-    beat: Instant,
+
     /// Writes' parts and barriers waiting for room in the log, in order.
     held: Held,
     /// The learners out of step now, the server's, for [`Group::away`].
@@ -906,7 +915,7 @@ struct Driver {
 
 impl Driver {
     fn now(&self) -> u64 {
-        u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        hyper_rt::machine::clock::shard_clock_ns()
     }
 
     fn run(&mut self, ready: mpsc::Sender<Result<(), Opening>>) {
@@ -925,9 +934,23 @@ impl Driver {
         self.since = self.replica.log_mut().bounds().map_or(0, |(start, _)| start.index);
         ready.send(Ok(())).ok();
         let mut stopping: Option<Instant> = None;
+        let mut verdicts=Vec::new();
         loop {
             // A copy a learner couldn't take over entries that came changed: its group stops.
             let mut failed: Option<anyhow::Error> = None;
+            if let Some(m) = &mut self.membership {
+                self.evidence.lock().take(&mut verdicts);
+                for ev in verdicts.drain(..) {
+                    let applied = match ev {
+                        crate::liveness::Event::Change(c) => m.belief(&mut self.replica,c).map_err(anyhow::Error::from),
+                        crate::liveness::Event::Timing(p) if m.peers.iter().any(|pair| pair.1 == p) => m.measure(&mut self.replica),
+                        crate::liveness::Event::LocalDisk => m.yield_stalled_log(&mut self.replica, |_| true).map(|_|()).map_err(anyhow::Error::from),
+                        crate::liveness::Event::Ready => m.reconcile(&mut self.replica,true).map(|_|()),
+                        _ => Ok(()),
+                    };
+                    if let Err(error) = applied { failed = Some(error); break; }
+                }
+            }
             while let Ok(req) = self.rx.try_recv() {
                 match req {
                     Request::Append(seq, change) => self.append(seq, change),
@@ -941,9 +964,24 @@ impl Driver {
                     Request::Unreachable(member) => {
                         self.replica.report_unreachable(member).ok();
                     }
+                    Request::Bind(stream, bootstrap, answer) => {
+                        self.subscription.take();
+                        self.membership.take();
+                        // A callback already in flight on the retired subscription can
+                        // only write into the old evidence queue.
+                        self.evidence = Arc::default();
+                        let evidence = self.evidence.clone();
+                        let thread = thread::current();
+                        self.subscription = Some(stream.subscribe(Arc::new(move |event| {
+                            if evidence.lock().push(event) { thread.unpark(); }
+                        })));
+                        let mut membership = crate::convo::liveness::Membership::new(stream, 0, Some((SERVER,bootstrap)), self.server);
+                        let result = membership.reconcile(&mut self.replica,true).map(|_|()).map_err(|e| e.to_string());
+                        self.membership = Some(membership);
+                        let _ = answer.send(result);
+                    }
                     Request::Beat => {
                         if self.server && !self.replica.configuration().learners.is_empty() {
-                            self.beat = Instant::now();
                             self.replica.beat().ok();
                         }
                     }
@@ -993,9 +1031,10 @@ impl Driver {
                 }
                 return;
             }
+            let was_changing = self.changing;
             if self.server {
                 self.reconcile();
-                self.beat_learners();
+
                 // A new term while it leads (a leader again, elected anew): the CI engine's next
                 // epoch (docs/ci.md W05-R25).
                 if self.replica.is_leader() {
@@ -1007,20 +1046,28 @@ impl Driver {
             if let Ok((start, _)) = self.replica.log_mut().bounds() {
                 self.log_start.store(start.index, Ordering::SeqCst);
             }
+            let before_compaction=self.since;
             self.retain();
-            // What waited for room goes in now there's some, in order.
+            // A proposed configuration or newly admitted work needs a drive before parking.
+            let was_held = self.held.items.len();
             self.propose_held();
+            if was_changing != self.changing || before_compaction!=self.since || was_held != self.held.items.len() { continue; }
             if let Some(since) = stopping {
                 if since.elapsed() >= STOP_PATIENCE {
                     self.give_up_held("the log had no room before the group stopped");
+                    for (_,reply) in self.pending.drain() {
+                        let _ = reply.send(Err("database group stopped before its durable commit was confirmed".to_owned()));
+                    }
                 }
                 if self.pending.is_empty() {
                     self.replica.machine_mut().persist().ok();
                     return;
                 }
             }
-            let wait = self.replica.deadline().map(|d| Duration::from_nanos(d.saturating_sub(self.now()))).unwrap_or(Duration::from_millis(100)).min(Duration::from_millis(100));
-            thread::park_timeout(wait.max(Duration::from_micros(50)));
+            let wait = self.replica.deadline().map(|d| Duration::from_nanos(d.saturating_sub(self.now())))
+                .into_iter().chain(self.changing.and_then(|(_,_,at)| self.membership.as_ref()?.election().map(|e|e.saturating_sub(at.elapsed()))))
+                .chain(stopping.map(|start|STOP_PATIENCE.saturating_sub(start.elapsed()))).min();
+            if let Some(wait) = wait { thread::park_timeout(wait); } else { thread::park(); }
         }
     }
 
@@ -1028,6 +1075,7 @@ impl Driver {
     /// of its own) applies, and with it everything before (the log's writes kiln.db didn't hold),
     /// so the store serves what's committed.
     fn lead(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.replica.configuration().voters.as_slice() == [self.replica.id()], "database startup requires its established sole voter");
         self.replica.campaign().map_err(|e| anyhow::anyhow!("campaigning: {e:?}"))?;
         let until = Instant::now() + Duration::from_secs(30);
         loop {
@@ -1035,7 +1083,7 @@ impl Driver {
             if self.replica.is_leader() || Instant::now() >= until {
                 break;
             }
-            thread::park_timeout(Duration::from_millis(1));
+            thread::park_timeout(until.saturating_duration_since(Instant::now()));
         }
         if !self.replica.is_leader() {
             bail!("the cluster group's sole voter didn't elect itself");
@@ -1081,7 +1129,7 @@ impl Driver {
         let conf = self.replica.configuration();
         if let Some((member, add, at)) = self.changing {
             let done = conf.learners.contains(&member) == add;
-            if !done && at.elapsed() < CHANGE_PATIENCE {
+            if !done && self.membership.as_ref().and_then(|m|m.election()).is_none_or(|span|at.elapsed()<span) {
                 return;
             }
             self.changing = None;
@@ -1093,14 +1141,6 @@ impl Driver {
         {
             tracing::info!(member, add, "the cluster group's learners change");
             self.changing = Some((member, add, Instant::now()));
-        }
-    }
-
-    /// The server's member beats while it has learners: they hear what's committed.
-    fn beat_learners(&mut self) {
-        if self.beat.elapsed() >= BEAT && !self.replica.configuration().learners.is_empty() {
-            self.beat = Instant::now();
-            self.replica.beat().ok();
         }
     }
 
@@ -1175,7 +1215,7 @@ impl Driver {
                 bail!("the cluster group didn't apply its log within 120 s");
             }
             if !self.pending.is_empty() {
-                thread::park_timeout(Duration::from_millis(1));
+                thread::park_timeout(until.saturating_duration_since(Instant::now()));
             }
         }
         Ok(())
@@ -1184,9 +1224,13 @@ impl Driver {
     /// Drives the replica until it rests, answering what applied and sending its messages.
     fn drive(&mut self) -> anyhow::Result<()> {
         let mut out: Output<Answer> = Output::default();
-        for _ in 0..1024 {
+        for turn in 0..1024 {
             out.clear();
             let driven = self.replica.drive(self.now(), &self.waker, &mut out).map_err(|e| anyhow::anyhow!("driving the cluster group: {e:?}"))?;
+            if let Some(m) = &mut self.membership {
+                m.io(&driven);
+                m.reconcile(&mut self.replica,false)?;
+            }
             for (id, result) in out.answers.drain(..) {
                 if let Some(reply) = self.pending.remove(&id) {
                     reply.send(result).ok();
@@ -1201,9 +1245,8 @@ impl Driver {
                     self.replica.report_snapshot(to, sent).ok();
                 }
             }
-            if !driven.more {
-                break;
-            }
+            if !driven.more { break; }
+            if turn == 1023 { thread::current().unpark(); }
         }
         let at = self.replica.applied();
         let prev = self.applied.swap(at.index, Ordering::SeqCst);
@@ -1494,8 +1537,8 @@ impl StateMachine for Machine {
         &self.configuration
     }
 
-    fn acts_at_start(&self, _entry: &hyper_durable::EntryRef<'_>) -> bool {
-        false
+    fn acts_at_start(&self, entry: &hyper_durable::EntryRef<'_>) -> bool {
+        !entry.data.is_empty() || !entry.context.is_empty()
     }
 
     fn image(&mut self, into: &mut Vec<u8>) -> Result<(Point, ConfState), Fatal> {
@@ -1610,36 +1653,14 @@ mod tests {
         let (up, done, noting) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
         let pages = Arc::new(Mutex::new(Vec::<(Instant, u64)>::new()));
         let links = {
-            let (server, learner, up, done, noting, pages) = (server.clone(), learner.clone(), up.clone(), done.clone(), noting.clone(), pages.clone());
-            thread::spawn(move || {
-                let Some(g) = server.group() else { return };
-                let (to_learner, to_server) = (g.outgoing(), learner.outgoing());
-                while !done.load(Ordering::SeqCst) {
-                    let mut moved = false;
-                    while let Ok((to, m)) = to_learner.try_recv() {
-                        moved = true;
-                        if to == member && up.load(Ordering::SeqCst) {
-                            if noting.load(Ordering::SeqCst)
-                                && let Ok(m) = Message::decode(&m)
-                                && m.msg_type == MessageType::MsgAppend
-                                && let Some(first) = m.entries.first()
-                            {
-                                pages.lock().push((Instant::now(), first.index));
-                            }
-                            learner.step(&m).ok();
-                        }
-                    }
-                    while let Ok((_, m)) = to_server.try_recv() {
-                        moved = true;
-                        if up.load(Ordering::SeqCst) {
-                            g.step(&m).ok();
-                        }
-                    }
-                    if !moved {
-                        thread::sleep(Duration::from_millis(1));
-                    }
+            let (noting,pages)=(noting.clone(),pages.clone());
+            observed_link(server.clone(),learner.clone(),member,up.clone(),done.clone(),move |bytes| {
+                if noting.load(Ordering::SeqCst)
+                    && let Ok(m)=Message::decode(bytes)
+                    && m.msg_type==MessageType::MsgAppend && let Some(first)=m.entries.first() {
+                    pages.lock().push((Instant::now(),first.index));
                 }
-            })
+            })?
         };
         set(&server, "in", "x")?;
         until("the learner in step", || Ok(read("in")?.as_deref() == Some("x")))?;
@@ -2048,15 +2069,97 @@ mod tests {
 
     /// The links between the server's member and a learner, in a thread: each one's messages to the
     /// other, while `up` (a runner away misses them).
-    fn link(server: Store, learner: Arc<Group>, member: u64, up: Arc<std::sync::atomic::AtomicBool>, done: Arc<std::sync::atomic::AtomicBool>) -> thread::JoinHandle<()> {
-        thread::spawn(move || {
+    fn link(
+        server: Store,
+        learner: Arc<Group>,
+        member: u64,
+        up: Arc<std::sync::atomic::AtomicBool>,
+        done: Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<thread::JoinHandle<()>> {
+        observed_link(server, learner, member, up, done, |_| {})
+    }
+
+    fn observed_link(
+        server: Store,
+        learner: Arc<Group>,
+        member: u64,
+        up: Arc<std::sync::atomic::AtomicBool>,
+        done: Arc<std::sync::atomic::AtomicBool>,
+        observed: impl Fn(&[u8]) + Send + 'static,
+    ) -> anyhow::Result<thread::JoinHandle<()>> {
+        let g = server.group().context("database group missing")?;
+        let server_live = crate::liveness::Shared::isolated(SERVER);
+        let learner_live = crate::liveness::Shared::isolated(member);
+        for (stream, id) in [(&server_live, SERVER), (&learner_live, member)] {
+            stream.initialize_for_test(hyper_liveness::Settings {
+                local: id,
+                run: 1,
+                max_peers: 1,
+                history: hyper_timing::Exposure::new(),
+                resolution: Duration::from_nanos(1),
+            })?;
+        }
+        g.bind_detector(server_live.clone(), SERVER)?;
+        learner.bind_detector(learner_live.clone(), SERVER)?;
+        Ok(thread::spawn(move || {
             let Some(g) = server.group() else { return };
             let (to_learner, to_server) = (g.outgoing(), learner.outgoing());
+            let nodes = [(SERVER, server_live), (member, learner_live)];
+            let mut wire = Vec::new();
+            let mut flushes = std::collections::HashMap::new();
+            let mut measured = BTreeSet::new();
             while !done.load(Ordering::SeqCst) {
+                // The database messages below can be lost independently of the node
+                // liveness stream. Derive retransmission timing from actual echoes.
+                for (id, stream) in &nodes {
+                    let now = stream.now_ns();
+                    let mut beats = crate::sim::session_liveness::Beats::default();
+                    let mut recalibrate = None;
+                    stream.with(|l| {
+                        if let Some(start) = flushes.remove(id) {
+                            l.on_durable(hyper_liveness::Write::Liveness, start, now);
+                        }
+                        wire.retain(|(from, to, data): &(u64, u64, Vec<u8>)| {
+                            if to != id {
+                                return true;
+                            }
+                            let previous = l.round_trip(*from).is_some_and(|r| r.samples() > 0);
+                            let before = l.report(*from).map(|r| r.configurations);
+                            let _ = l.on_heartbeat(*from, data, now, &mut beats);
+                            if before != l.report(*from).map(|r| r.configurations)
+                                || !previous && l.round_trip(*from).is_some_and(|r| r.samples() > 0)
+                            {
+                                recalibrate = Some(*from);
+                            }
+                            false
+                        });
+                        if let Some(due) = l.wake()
+                            && now >= due
+                        {
+                            l.on_wait(due, now);
+                        }
+                        l.poll(now, &mut beats);
+                        let other = if *id == SERVER { member } else { SERVER };
+                        if l.granularity().is_some() && l.round_trip(other).is_some_and(|r| r.samples() > 0) && measured.insert(*id) {
+                            recalibrate = Some(other);
+                        }
+                    });
+                    if beats.flush {
+                        flushes.entry(*id).or_insert(now);
+                    }
+                    for c in beats.changes {
+                        stream.notify(crate::liveness::Event::Change(c));
+                    }
+                    if let Some(peer) = recalibrate {
+                        stream.notify(crate::liveness::Event::Timing(peer));
+                    }
+                    wire.extend(beats.messages.into_iter().map(|(to, msg)| (*id, to, msg)));
+                }
                 let mut moved = false;
                 while let Ok((to, m)) = to_learner.try_recv() {
                     moved = true;
                     if to == member && up.load(Ordering::SeqCst) {
+                        observed(&m);
                         learner.step(&m).ok();
                     }
                 }
@@ -2070,7 +2173,7 @@ mod tests {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
-        })
+        }))
     }
 
     /// A log that has room for `left` more proposals, then none until given more; what it took,
@@ -2177,7 +2280,7 @@ mod tests {
         };
         assert_eq!(read("before")?.as_deref(), Some("1"), "the copy holds what was written before it");
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone())?;
         set(&server, "after", "2")?;
         until("the write after the copy on the learner", || Ok(read("after")?.as_deref() == Some("2")))?;
         assert_eq!(learner.standing().0, server.group_standing().map_or(0, |s| s.0), "the learner holds the server's last write");
@@ -2256,7 +2359,7 @@ mod tests {
             Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
         };
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone())?;
         let value = "v".repeat(64 << 10);
         // Away while the server overwrites one row `writes` times, back once the log kept what it lacks (or, `left`
         // behind, once the log starts past it): the copies it took to catch up.
@@ -2326,7 +2429,7 @@ mod tests {
             Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
         };
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone())?;
         set(&server, "after", "2")?;
         until("the write after the copy on the learner", || Ok(read("after")?.as_deref() == Some("2")))?;
         assert_eq!(copies.load(Ordering::SeqCst), 1, "it started from a copy");
@@ -2384,7 +2487,7 @@ mod tests {
         let follow = |k: &str| -> anyhow::Result<()> {
             let learner = Arc::new(Group::learner(&replica, &logs, member, fetch.clone())?);
             let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-            let links = link(server.clone(), learner.clone(), member, up, done.clone());
+            let links = link(server.clone(), learner.clone(), member, up, done.clone())?;
             let held = until(&format!("{k} on the learner"), || Ok(read(k)?.is_some()));
             done.store(true, Ordering::SeqCst);
             links.join().ok();
@@ -2447,7 +2550,7 @@ mod tests {
             Ok(c.query_row("SELECT v FROM kv WHERE k = ?1", [k], |r| r.get(0)).ok())
         };
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone())?;
         for i in 0..50 {
             set(&server, &format!("w{i}"), "x")?;
         }
@@ -2460,7 +2563,7 @@ mod tests {
         let server = Store::open_grouped(&db, &logs)?;
         *current.lock() = Some(server.clone());
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        let links = link(server.clone(), learner.clone(), member, up, done.clone())?;
         set(&server, "after", "2")?;
         let followed = until("a write after the restart on the learner", || Ok(read("after")?.as_deref() == Some("2")));
         done.store(true, Ordering::SeqCst);
@@ -2500,7 +2603,7 @@ mod tests {
         };
         let learner = Arc::new(Group::learner(&replica, &learner_logs, member, fetch.clone())?);
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        let links = link(server.clone(), learner.clone(), member, up, done.clone())?;
         for i in 0..50 {
             set(&server, &format!("w{i}"), "x")?;
         }
@@ -2518,7 +2621,7 @@ mod tests {
         drop(learner);
         let learner = Arc::new(Group::learner(&replica, &learner_logs, member, fetch)?);
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        let links = link(server.clone(), learner.clone(), member, up, done.clone())?;
         set(&server, "after", "2")?;
         let followed = until("a write after both restarts on the learner", || Ok(read("after")?.as_deref() == Some("2")));
         eprintln!("copies {}, learner standing {:?}, server {:?}", copies.load(Ordering::SeqCst), learner.standing(), server.group_standing());
@@ -2560,7 +2663,7 @@ mod tests {
         };
         let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        let links = link(server.clone(), learner.clone(), member, up, done.clone())?;
         set(&server, "w", "x")?;
         until("a write on the learner", || Ok(read("w")?.as_deref() == Some("x")))?;
         done.store(true, Ordering::SeqCst);
@@ -2571,7 +2674,7 @@ mod tests {
         let server = Store::open_grouped(&db, &logs)?;
         *current.lock() = Some(server.clone());
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone());
+        let links = link(server.clone(), learner.clone(), member, up.clone(), done.clone())?;
         set(&server, "lost", "y")?;
         thread::sleep(Duration::from_millis(500));
         up.store(true, Ordering::SeqCst);
@@ -2612,7 +2715,7 @@ mod tests {
         let replica = dir.path().join("runner").join("kiln.db");
         let learner = Arc::new(Group::learner(&replica, &dir.path().join("runner").join("cluster"), member, fetch)?);
         let (up, done) = (Arc::new(std::sync::atomic::AtomicBool::new(true)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let links = link(server.clone(), learner.clone(), member, up, done.clone());
+        let links = link(server.clone(), learner.clone(), member, up, done.clone())?;
         assert_eq!(learner.stopped(), None, "it follows");
         // A write kiln.db holds and the log lacks: the learner meets a gap it can't copy over.
         let lost = g.next_seq();

@@ -1226,6 +1226,13 @@ pub fn relayed_words(session: &str, json: &str, root: &[u8], machine: &str, inst
     let Ok(signed) = statement::verify(&act, root, &[], at) else {
         return fail(Unrelayed::Changed { relay: relay.clone(), thing: "the sender's act".into(), algorithm: "signature".into(), was: "its signer's".into(), now: "no one's".into() });
     };
+    // A route controls queue priority and who may replace work. A valid relay of one
+    // agent's words cannot publish those words as a different agent or as a person.
+    if let Some(scope) = v.pointer("/route/sender").and_then(Value::as_str)
+        && !matches!(&signed.signer.identity.actor, kiln_ci::identity::chain::Actor::Agent { agent, .. } if scope.strip_prefix("agent:") == Some(agent.as_str()))
+    {
+        return fail(unreadable("the routed sender differs from the signer of these words".into()));
+    }
     let ask_digest: String = <sha2::Sha256 as sha2::Digest>::digest(ask.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
     let covers = signed.statement.subject.iter().any(|t| t.digest.get("sha256").is_some_and(|d| d.eq_ignore_ascii_case(&ask_digest)));
     let asked: Value = serde_json::from_str(ask).unwrap_or_default();
@@ -1764,6 +1771,11 @@ mod tests {
         let relayed_of = |p2: &Value, act: &Value| serde_json::json!({ "act": act.to_string(), "ask": crate::custody::signed_part(&sent), "passed_on": [p1.to_string(), p2.to_string()] });
         let message = |text: &str, relayed: &Value| serde_json::json!({ "type": "send", "id": "m1", "text": text, "relayed": relayed }).to_string();
         let p2 = kilns(1, &act_b)?;
+        for sender in ["admin".to_owned(), format!("agent:{a}")] {
+            let mut forged: Value = serde_json::from_str(&message(words, &relayed_of(&p2, &act_b)))?;
+            if let Some(object) = forged.as_object_mut() { object.insert("route".into(), serde_json::json!({"sender":sender})); }
+            anyhow::ensure!(relayed_words(a,&forged.to_string(),&pki.ca_der,machine,"blue").is_err());
+        }
         relayed_words(a, &message(words, &relayed_of(&p2, &act_b)), &pki.ca_der, machine, "blue").map_err(|e| anyhow::anyhow!(e))?;
         // A fellow agent's words reach it wrapped in what kiln says of them: the same words.
         let p2b = kilns(2, &act_b)?;

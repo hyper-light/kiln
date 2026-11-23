@@ -939,10 +939,15 @@ pub fn http(port: u16, method: &str, path: &str, token: &str, body: Option<&Valu
 
 /// [`http`], its answer waited for up to `within`.
 pub fn http_within(port: u16, method: &str, path: &str, token: &str, body: Option<&Value>, within: Duration) -> anyhow::Result<(u16, String)> {
+    http_with_key(port, method, path, token, body, within, None)
+}
+
+pub fn http_with_key(port: u16, method: &str, path: &str, token: &str, body: Option<&Value>, within: Duration, key: Option<&str>) -> anyhow::Result<(u16, String)> {
     let mut s = TcpStream::connect(("127.0.0.1", port))?;
     s.set_read_timeout(Some(within))?;
     let payload = body.map(Value::to_string).unwrap_or_default();
-    write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len())?;
+    let header = key.map(|id| format!("Idempotency-Key: {id}\r\n")).unwrap_or_default();
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n{header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len())?;
     let mut raw = Vec::new();
     s.read_to_end(&mut raw)?;
     let text = String::from_utf8_lossy(&raw).into_owned();
@@ -1320,12 +1325,7 @@ work_dir = {work}
 
 {kubernetes}
 {terminal}
-[discovery]
-enabled = false
-announce = false
-browse = false
-join_requests = false
-tailscale = false
+{discovery}
 
 {cd}
 [ci]
@@ -1343,6 +1343,7 @@ tailscale = false
         // W27-R03), unless the test says otherwise: tests push with plain git.
         signatures = if o.ci.contains("signatures") { "" } else { "signatures = \"warn\"\n" },
         extra = extra,
+        discovery = if o.extra.contains("[discovery]") { "" } else { "[discovery]\nenabled = false\nannounce = false\nbrowse = false\njoin_requests = false\ntailscale = false\n" },
         // CD stays off unless the test asks for it (`start_cd`) or has a `[cd]` of its own.
         cd = if o.extra.contains("[cd]") {
             ""

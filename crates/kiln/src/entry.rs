@@ -1037,8 +1037,8 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
             out(&config::Config::render_default());
             Ok(())
         }
-        Cmd::Spawn(a) => kiln::harness::cli::spawn(a),
-        Cmd::Agents(a) => kiln::harness::cli::agents(a),
+        Cmd::Spawn(a) => boxed(||kiln::harness::cli::spawn(a)).await,
+        Cmd::Agents(a) => boxed(|| kiln::harness::cli::agents(a)).await,
         Cmd::HarnessHook(a) => kiln::harness::cli::harness_hook(a),
         Cmd::Run(a) => {
             shutdown_on_signals(shutdown.clone());

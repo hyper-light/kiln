@@ -81,6 +81,8 @@ async fn round_trip(loopback: SocketAddr) -> Result<Received, RtError> {
         bytes[0] = index as u8;
         assert!(sender.queue(to, &bytes), "the outbox holds a batch");
     }
+    let host_epoch = hyper_rt::registry::with_current(|ctx| ctx.host_epoch_ns()).flatten().expect("real UDP has a host clock epoch");
+    let host_before = hyper_rt::machine::clock::shard_clock_ns();
     let before_send_ns = now_ns();
     while sender.send() == Sent::Blocked {
         sender.writable().await?;
@@ -96,6 +98,11 @@ async fn round_trip(loopback: SocketAddr) -> Result<Received, RtError> {
         if taken == 0 {
             receiver.readable().await?;
         }
+    }
+    let host_after = hyper_rt::machine::clock::shard_clock_ns();
+    for stamp in arrivals.iter().filter_map(|a| a.kernel_at_ns) {
+        let seen = host_epoch.checked_add(stamp).expect("host timestamp fits");
+        assert!((host_before..=host_after).contains(&seen), "kernel arrival {seen} outside {host_before}..={host_after}");
     }
     Ok(Received {
         order,
@@ -134,6 +141,10 @@ fn a_batch_crosses(loopback: SocketAddr) {
         );
         assert!(arrival.at_ns >= latest, "nor before the one before it");
         latest = arrival.at_ns;
+        #[cfg(windows)]
+        // A provider can deliver an individual datagram without a stamp on an enabled socket.
+        assert!(!arrival.kernel || received.stats.kernel_stamps);
+        #[cfg(not(windows))]
         assert_eq!(arrival.kernel, received.stats.kernel_stamps);
     }
     if cfg!(any(target_os = "linux", target_os = "macos")) {
@@ -169,6 +180,32 @@ fn a_batch_crosses_ipv4_loopback() {
 #[test]
 fn a_batch_crosses_ipv6_loopback() {
     a_batch_crosses(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)));
+}
+
+#[test]
+fn ad_1_a_full_receive_turn_needs_an_empty_read_to_certify_drain() {
+    let mut rt = LocalRuntime::new(&config()).unwrap();
+    rt.block_on(async {
+        let mut socket = Batched::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            Io { batch: 1 },
+            false,
+        )?;
+        let to = socket.local_addr()?;
+        assert!(socket.queue(to, b"probe"));
+        while socket.send() == Sent::Blocked {
+            socket.writable().await?;
+        }
+        socket.readable().await?;
+        assert_eq!(
+            socket.receive_observed(|_, bytes| assert_eq!(bytes, b"probe"))?,
+            (1, Queued::More)
+        );
+        assert_eq!(socket.receive_observed(|_, _| {})?, (0, Queued::Emptied));
+        Ok::<(), RtError>(())
+    })
+    .unwrap()
+    .unwrap();
 }
 
 /// Do: bind an IPv6 socket to the unspecified address, then an IPv4 one to the same port. Expect: both

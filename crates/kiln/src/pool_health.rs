@@ -26,7 +26,7 @@ use hyper_rt::compute::Observed;
 use crate::metrics::{Histogram, STALL_BUCKETS};
 
 /// The blocking pool's shares, as `crate::rt` names them, in the order of their histograms.
-const SHARES: [&str; 3] = [hyper_rt::dns::SHARE, crate::rt::SHARE_STORE, crate::rt::SHARE_FS];
+const SHARES: [&str; 4] = [hyper_rt::dns::SHARE, crate::rt::SHARE_STORE, crate::rt::SHARE_FS, crate::rt::SHARE_SESSION];
 
 /// kiln.db's writer (`crate::store`), as its series name it beside the blocking pool's shares: a thread
 /// of its own, one place, its calls taken in turn (goal 5 of the API runtime program, plan 01a1a59c2aae).
@@ -198,7 +198,7 @@ pub struct Queue {
 /// The pools [`queues`] reads, by name, in its order: the compute pool, the blocking pool's shares, then
 /// kiln.db's writer, whose backlog of writes sheds as a share's does (goal 5 moved them off the `store`
 /// share, which its reads keep).
-pub const QUEUES: [&str; 2 + SHARES.len()] = ["compute", SHARES[0], SHARES[1], SHARES[2], STORE_WRITE];
+pub const QUEUES: [&str; 2 + SHARES.len()] = ["compute", SHARES[0], SHARES[1], SHARES[2], SHARES[3], STORE_WRITE];
 
 /// Each pool of [`QUEUES`] as it stands: lock-free reads of atomics the pools' threads write as they go.
 pub fn queues() -> [Queue; QUEUES.len()] {
@@ -253,8 +253,9 @@ pub fn render(o: &mut String) {
     }
     p.store_write_run.render(o, "kiln_blocking_run_seconds", &format!("share=\"{STORE_WRITE}\""));
     help(o, "kiln_blocking_places", "gauge", "Each of the blocking pool's shares: the most of its jobs that run at once (crate::rt::Profile); store_write, kiln.db's writer: one.");
-    let (dns, store, fs) = crate::rt::profile().pool;
-    for (share, places) in SHARES.iter().zip([dns, store, fs]).chain([(&STORE_WRITE, 1)]) {
+    let profile = crate::rt::profile();
+    let (dns, store, fs) = profile.pool;
+    for (share, places) in SHARES.iter().zip([dns, store, fs, usize::from(profile.shards)]).chain([(&STORE_WRITE, 1)]) {
         let _ = writeln!(o, "kiln_blocking_places{{share=\"{share}\"}} {places}");
     }
     help(o, "kiln_store_commit_seconds", "histogram", "How long each of kiln.db's group commits took: the calls waiting for its writer, run in one transaction, then its number kept with the cluster group, COMMIT, its changes handed to the log and its callers told.");
@@ -277,6 +278,7 @@ mod tests {
         compute_job(Observed::Waited(3_000_000));
         compute_job(Observed::Ran(200_000));
         blocking_job(crate::rt::SHARE_STORE, 1_000, 40_000_000);
+        blocking_job(crate::rt::SHARE_SESSION, 500, 800);
         blocking_job("no such share", 1, 1);
         let mut o = String::new();
         render(&mut o);
@@ -287,6 +289,7 @@ mod tests {
             o.lines().find(|l| l.starts_with(&format!("{name}_count{{share=\"{share}\"}}"))).and_then(|l| l.rsplit(' ').next()).and_then(|v| v.parse::<u64>().ok())
         };
         assert!(count("kiln_blocking_run_seconds", crate::rt::SHARE_STORE).is_some_and(|n| n >= 1), "the store's job: {o}");
+        assert!(count("kiln_blocking_run_seconds", crate::rt::SHARE_SESSION).is_some_and(|n| n >= 1));
         assert!(!o.contains("no such share"));
     }
 

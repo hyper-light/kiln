@@ -206,6 +206,61 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     if !cfg.ci.local {
         hub.harness.returning.arm(runners_before, kiln_seams::clock::later(hearing, hub.comeback.grace()));
     }
+    if !cfg.ci.local && !cfg.conversations.off {
+        let store = hub.harness.convo.clone().context("the configured session store is unavailable")?;
+        let wal = cfg.data("convo-raft");
+        let db = store.clone();
+        let state_dir = cfg.server.data_dir.clone();
+        let executable = cfg.terminal.enabled;
+        let enrolled_node = cfg.local_agent.enabled.then(|| cfg.local_agent_key());
+        let reach_dir = cfg.data("local-agent").join("reach");
+        let fleet_ca = hub.pki.ca_der.clone();
+        let manager = crate::rt::blocking(move || -> anyhow::Result<_> {
+            let configured = std::env::var("KILN_SERVER_RAFT_ID").ok();
+            let name = match configured.as_deref().map(str::trim) {
+                Some("unique") => crate::convo::raft::server_node_name(&wal)?,
+                Some(id) if !id.is_empty() => id.to_owned(),
+                _ if !wal.join("node-id").try_exists()? && wal.join("sessions.json").try_exists()? => "server".into(),
+                _ if !wal.join("node-id").try_exists()? && enrolled_node.is_some() => {
+                    let id = enrolled_node.unwrap_or_default();
+                    std::fs::create_dir_all(&wal)?;
+                    crate::util::write_secret(&wal.join("node-id"), id.as_bytes(), 0o600)?;
+                    crate::blobs::chunks::sync_dir(&wal)?;
+                    id
+                }
+                _ => crate::convo::raft::server_node_name(&wal)?,
+            };
+            db.enable_inbox_for(&name)?;
+            let peers = crate::fleet::sessions::Routes::open(&reach_dir, &name, &fleet_ca)?;
+            let manager = crate::convo::raft::Manager::open_for_host(name, &wal, Some(db), crate::fleet::session_policy(&state_dir)?, executable)?;
+            peers.restore(&manager)?;
+            Ok(manager)
+        }).await??;
+        crate::fleet::charter::initialize(&hub, &manager).await?;
+        hub.harness.bind_session_consensus(&manager)?;
+        if let Some(group)=hub.store.group() {group.bind_liveness(manager.node_name(),manager.node_name())?;}
+        crate::convo::raft::set_server_global(Some(manager.clone()));
+        let (out, h, sd) = (manager.outgoing(), hub.clone(), shutdown.clone());
+        let (name, _) = manager.identity();
+        crate::rt::spawn(async move {
+            loop {
+                futures::select_biased! {
+                    () = sd.cancelled().fuse() => break,
+                    m = out.recv().fuse() => {
+                        let Ok(m) = m else { break };
+                        let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Raft {
+                            store: "server".into(), session: m.session.clone(), from: name.clone(),
+                        });
+                        let msg = crate::proto::ServerMsg::Convo { json, data: m.bytes };
+                        let sent = h.send_to_agent(&m.to_name, crate::proto::LANE_CONVO, &msg).await;
+                        if m.is_snapshot && (!sent || m.snapshot_last) { manager.report_snapshot(&m.session, &m.to_name, sent); }
+                    }
+                }
+            }
+            crate::convo::raft::set_server_global(None);
+            let _ = crate::rt::blocking(move || manager.shutdown()).await;
+        });
+    }
     // Transport events, on the hub's loops (goal 10, plan 01a1a87b2dae step 4; `crate::wire::fan`): the control loop placed
     // as the one loop was, and each shard's session loop on that shard, beside its owner of agent sessions' copies. Each
     // message is handled in isolation; the streams themselves never end while the net thread lives (it restarts its
@@ -292,34 +347,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         }
         child!("sync", h => h.sync_loop());
         child!("cluster", h => h.cluster_loop());
-        // Part 2 & 3: per-session/conversation Raft manager on the server node ("server", id 1),
-        // replicating conversations started on any runner/server across the entire connected fleet.
-        {
-            let convo_raft = crate::convo::raft::Manager::new("server", hub.harness.convo.clone());
-            crate::convo::raft::set_global(Some(Arc::clone(&convo_raft)));
-            let (h, sd) = (hub.clone(), shutdown.clone());
-            crate::rt::spawn(async move {
-                let out_rx = convo_raft.outgoing();
-                loop {
-                    futures::select_biased! {
-                        () = sd.cancelled().fuse() => return,
-                        m = out_rx.recv().fuse() => {
-                            let Ok(m) = m else { return };
-                            let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Raft {
-                                store: "server".to_owned(),
-                                session: m.session,
-                                from: "server".to_owned(),
-                            });
-                            let msg = crate::proto::ServerMsg::Convo { json, data: m.bytes };
-                            let _ = h.send_to_agent(&m.to_name, crate::proto::LANE_CONVO, &msg).await;
-                        }
-                        () = crate::rt::sleep(crate::convo::raft::TICK).fuse() => {
-                            convo_raft.tick();
-                        }
-                    }
-                }
-            });
-        }
         // Checkpoints of the cluster group's log, to the learners that check them (docs/ci.md
         // W27-R08).
         child!("cluster-custody", h => crate::custody::cluster::checkpoints_loop(h));
@@ -706,7 +733,9 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
             credentials: Some(creds),
             instance: None,
             config: None,
-            reach: None,
+            // W21-R15. The embedded agent is the server's authenticated fleet session endpoint.
+            // Its peer links accept session traffic only; ordinary Reach runs keep their existing admission.
+            reach: (!crate::convo::off()).then_some(true),
             // The server holds the group's store itself.
             observe: false,
             outpost: false,
@@ -717,7 +746,8 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
         };
         // `kiln workflow run`'s server stops its runner itself, once the runs it follows ended.
         let agent_down = if cfg.ci.local { shutdown.clone() } else { shutdown_child() };
-        sup::spawn(reg, "local-agent", shutdown.clone(), move || crate::agent::run(opts.clone(), agent_down.clone()));
+        let local_hub = hub.clone();
+        sup::spawn(reg, "local-agent", shutdown.clone(), move || crate::agent::run_node(opts.clone(), agent_down.clone(), Some(local_hub.clone())));
     }
 
     tracing::info!(

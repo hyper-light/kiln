@@ -585,6 +585,7 @@ struct Arrived {
 }
 
 pub struct Hub {
+    pub(crate) name_issuer: crate::fleet::charter::Issuer,
     pub cfg: Arc<Config>,
     pub store: Store,
     /// The fleet's per-core speeds, refit as each run is kept (W05-R26).
@@ -715,6 +716,7 @@ pub struct Hub {
     /// again as its uptime goes on (goal 9, plan 01a1a87b2cec step 5).
     pub started_ms: i64,
     pub generation: u64,
+    pub(crate) token_cache: Arc<parking_lot::Mutex<crate::authz::gate::TokenCache>>,
     /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
     pub runners_before: AtomicU64,
     /// How long a runner is given to come back, learned from how long runners took to ([`crate::comeback`]).
@@ -940,6 +942,7 @@ impl Hub {
         let mut fast_legs = legs::Legs::default();
         fast_legs.set_auction(cfg.reach.auction);
         let hub = Arc::new(Self {
+            name_issuer: Default::default(),
             cfg,
             store,
             pace: crate::reach::speeds::Speeds::default(),
@@ -986,6 +989,7 @@ impl Hub {
             started: Instant::now(),
             started_ms: crate::util::now_ms(),
             generation,
+            token_cache: Arc::default(),
             runners_before: AtomicU64::new(0),
             comeback: crate::comeback::Comeback::default(),
             admission: admission::Admission::new(clock.now()),
@@ -1425,7 +1429,8 @@ impl Hub {
     /// microVMs' harnesses their sign-ins from it, which none could have from a broker that isn't open (plan step 33).
     pub fn features(&self) -> Vec<String> {
         let leases = self.lessors.get().is_some();
-        proto::feature::ALL.iter().filter(|name| leases || **name != proto::feature::LEASES).map(|name| (*name).to_owned()).collect()
+        let detector = self.harness.session_consensus().ok().flatten().is_some_and(|m| crate::liveness::Shared::get(crate::convo::raft::node_id(m.node_name())).with(|_| ()).is_some());
+        proto::feature::for_session_host(self.cfg.terminal.enabled && self.harness.convo.is_some(), detector).into_iter().filter(|name| leases || name != proto::feature::LEASES).collect()
     }
 
     /// The machine a runner that names itself `name` is (docs/machines.md, "One record a machine"):
@@ -2412,6 +2417,7 @@ impl Hub {
         self.reach.forget(agent);
         metrics::agent_samples().update(|m| m.remove(agent));
         self.store.delete_agent(agent.to_owned()).await?;
+        if let Ok(Some(mgr)) = self.harness.session_consensus() { mgr.forget_member(agent); }
         self.front_doors.forget(&self.store, agent).await;
         self.agent_limits.forget(&self.store, agent).await;
         self.engines.forget(&self.store, agent).await;
@@ -2804,14 +2810,38 @@ impl Hub {
     /// Reach's directory as runners and tools read it (`kiln runners`, MCP): [`Hub::reach_directory`],
     /// and the records that are stale (docs/machines.md), so they're shown for a person to forget.
     pub async fn directory(&self) -> Vec<crate::reach::directory::RunnerInfo> {
+        self.complete_reach_directory().await.unwrap_or_else(|_| self.reach_directory())
+    }
+
+    /// Absence from a complete directory can retire an enrollment. Preserve proven offline
+    /// machines and refuse an incomplete read before making that assertion to another node.
+    pub(crate) async fn complete_reach_directory(&self) -> anyhow::Result<Vec<crate::reach::directory::RunnerInfo>> {
+        use crate::reach::directory::RunnerInfo;
+        let records = self.store.read(crate::store::agent_rows).await?;
         let mut out = self.reach_directory();
-        for a in self.agent_list().await.into_iter().filter(|a| a.stale) {
-            match out.iter_mut().find(|r| r.name == a.name) {
-                Some(r) => r.stale = true,
-                None => out.push(crate::reach::directory::RunnerInfo { name: a.name, hostname: a.hostname, label: a.label, os: a.os, arch: a.arch, stale: true, ..crate::reach::directory::RunnerInfo::default() }),
+        let mut positions: HashMap<String,usize> = out.iter().enumerate().map(|(i,r)| (r.name.clone(),i)).collect();
+        let peers = std::cell::OnceCell::new();
+        for row in records.rows.into_iter().filter(|r| !r.ephemeral) {
+            let maybe = positions.remove(&row.name).and_then(|i| out.get_mut(i));
+            let entry = if let Some(r) = maybe { r } else {
+                out.push(RunnerInfo { name:row.name.clone(),hostname:row.hostname,label:records.labels.get(&row.name).cloned(),os:row.os,arch:row.arch,labels:row.labels,..Default::default() });
+                let Some(r) = out.last_mut() else { continue }; r
+            };
+            if entry.connected { continue; }
+            entry.stale = !crate::join::is_machine_key(&row.name) && !records.machines.contains_key(&row.name) && !entry.facts.as_ref().is_some_and(|f| f.machine_id.is_some());
+            if !entry.stale && entry.features.is_empty() && let Some(member) = peers.get_or_init(|| {
+                self.harness.session_consensus().ok().flatten()
+                    .and_then(|mgr| crate::frontdoor::replica::local_node().filter(|n| n.bound_to(&mgr)))
+                    .and_then(|local| local.reach.as_ref().map(|r| r.cached_members())).unwrap_or_default()
+            }).get(&row.name) {
+                for (speaks, feature) in [(member.raft, crate::proto::feature::CONVO_RAFT),(member.v2, crate::proto::feature::CONVO_RAFT_V2),(member.executor, crate::proto::feature::CONVO_EXECUTOR),(member.charter, crate::proto::feature::CONVO_NAME_CHARTER),(member.liveness, crate::proto::feature::CONVO_LIVENESS),(member.starts,crate::proto::feature::SESSION_STARTS)] {
+                    if speaks { entry.features.push(feature.to_owned()); }
+                }
+                entry.fingerprint = Some(member.key.clone());
+                entry.quic_addrs = member.addrs.iter().map(ToString::to_string).collect();
             }
         }
-        out
+        Ok(out)
     }
 
     /// Reach's directory (`crate::reach::directory`): every runner that is not a job pod — what it
@@ -2846,7 +2876,7 @@ impl Hub {
                     arch: a.arch.clone(),
                     labels: a.labels.clone(),
                     connected: a.connected,
-                    reach: a.connected && ann.is_some_and(|x| x.accept),
+                    reach: a.connected && ann.is_some_and(|x| x.accept && !crate::proto::feature::speaks(&x.features, crate::proto::feature::SESSION_LINK_ONLY)),
                     fingerprint: ann.map(|x| x.fingerprint.clone()),
                     features: ann.map(|x| x.features.clone()).unwrap_or_default(),
                     quic_addrs: ann.map(|x| x.quic_addrs.clone()).unwrap_or_default(),
@@ -3404,6 +3434,9 @@ impl Hub {
         metrics::agent_samples().update(|m| m.remove(name));
         // Its agent sessions keep running there too; they are announced again on reconnect.
         self.harness.machine_lost(self, name).await;
+        if let Ok(Some(mgr)) = self.harness.session_consensus() {
+            mgr.peer_unreachable(name);
+        }
         if self.ai_sessions.update(|m| m.remove(name)).is_some() {
             self.emit(&ServerEvent::AiSessions { machine: name.to_owned() });
         }
@@ -3765,10 +3798,23 @@ impl Hub {
             AgentMsg::Features { names } => {
                 let skills = proto::feature::speaks(&names, crate::skills::FEATURE);
                 self.instances.update(|i| i.set_features(peer, names.clone()));
-                if proto::feature::speaks(&names, proto::feature::CONVO_RAFT)
-                    && let Some(mgr) = crate::convo::raft::global()
-                {
-                    mgr.register_peers([agent.as_ref()]);
+                if let Ok(Some(mgr)) = self.harness.session_consensus() {
+                    let raft = proto::feature::speaks(&names, proto::feature::CONVO_RAFT);
+                    let v2 = raft && proto::feature::speaks(&names, proto::feature::CONVO_RAFT_V2);
+                    mgr.set_peer_executor(&agent, raft && proto::feature::can_elect(&names));
+                    mgr.set_peer_v2(&agent, v2);
+                    if raft { mgr.register_peers([agent.as_ref()]); } else { mgr.peer_unreachable(&agent); }
+                    if v2 {
+                        let (server_name, _) = mgr.identity();
+                        let json = crate::convo::feed::encode(&crate::convo::feed::Msg::Raft {
+                            store: "server-hello".to_owned(),
+                            session: String::new(),
+                            from: server_name,
+                        });
+                        if let Ok(b) = proto::encode(&ServerMsg::Convo { json, data: Vec::new() }) {
+                            self.net.send(peer, proto::LANE_CONVO, Kind::Control, b).await;
+                        }
+                    }
                 }
                 // One that takes its engine is told what its owner set (`crate::harness::engine`).
                 crate::harness::engine::on_features(self, &agent, peer, &names).await;
@@ -3844,6 +3890,9 @@ impl Hub {
             AgentMsg::HarnessMailTransfer { json } => crate::api::boxed(|| crate::harness::mail_transfer::heard(self, peer, json)).await,
             // A message this server routed to the runner for a session it doesn't hold (it moved on, or was never there):
             // sent on to where the session is now, off this loop's way (docs/sends.md, "Routed to its session").
+            AgentMsg::HarnessRouteReceipt { session, request, json } => {
+                self.harness.routed_receipt(&agent, &session, &request, &json);
+            }
             AgentMsg::HarnessForward { session, epoch: _, json } => {
                 let (hub, from) = (Arc::clone(self), String::from(&*agent));
                 drop(crate::rt::spawn(async move { hub.harness.forward(&hub, &from, &session, &json).await }));
@@ -4232,12 +4281,13 @@ impl Hub {
                 // runner's own store's feed.
                 match (&self.harness.copies, *msg) {
                     // Per-session conversation Raft message from a runner (`proto::feature::CONVO_RAFT`).
-                    (_, crate::convo::feed::Msg::Raft { session, from, .. }) => {
-                        if let Some(mgr) = crate::convo::raft::global() {
-                            let sender = if from.is_empty() { agent } else { from.as_str() };
-                            if let Err(e) = mgr.step(sender, &session, &data) {
-                                tracing::debug!(%session, from = %sender, error = %format!("{e:#}"), "convo Raft step from runner failed");
-                            }
+                    // Always pass the authenticated transport `agent` identity, never the untrusted
+                    // `from` string inside the message payload.
+                    (_, crate::convo::feed::Msg::Raft { session, .. }) => {
+                        if let Ok(Some(mgr)) = self.harness.session_consensus()
+                            && let Err(e) = mgr.step_owned(agent, &session, data)
+                        {
+                            tracing::debug!(%session, from = %agent, error = %format!("{e:#}"), "convo Raft step from runner failed");
                         }
                     }
                     // What a runner's store is doing, for the board.
@@ -4356,22 +4406,65 @@ impl Hub {
                 }
             }
             FromRunner::ReachAsk { req, ask, raw } => match *ask {
+                crate::reach::Question::SessionPlacement {key,agents,body,expires,proof}=>{
+                    let hub=self.clone();
+                    let source=agent.to_owned();
+                    crate::rt::spawn(async move{
+                        let (status,answer)=crate::frontdoor::replica::place_at_server(&hub,&source,key,agents,body,expires,proof).await;
+                        hub.send_peer(peer,&ServerMsg::ReachAnswer{req,json:serde_json::json!({"status":status.as_u16(),"answer":answer}).to_string()}).await;
+                    });
+                }
                 crate::reach::Question::Directory => {
-                    let runners = self.directory().await;
-                    let server = self.topo.load().server();
-                    if self.cfg.ci.budgets.is_empty() {
-                        let answer = serde_json::json!({ "runners": runners, "server": server });
-                        self.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
-                    } else {
-                        // With the person's budgets and each period's split, kept before it's sent
-                        // (LB08, `crate::reach::budget`).
+                    let names_capable = self.agents.load().get(agent).is_some_and(|r| !r.ephemeral && !r.labels.iter().any(|l| l == proto::OUTPOST_LABEL))
+                        && self.instances.load().get(peer).is_some_and(|i| proto::feature::speaks(&i.features, proto::feature::CONVO_NAME_CHARTER));
+                    let name_cursor = raw.get("session_names").filter(|_| names_capable).cloned().and_then(|c| serde_json::from_value(c).ok());
+                    if raw.get("session_names_only").and_then(serde_json::Value::as_bool) == Some(true) {
                         let hub = Arc::clone(self);
                         crate::rt::spawn(async move {
-                            let budgets = crate::reach::budget::for_directory(&hub.cfg, &*hub.records, &runners).await;
-                            let answer = serde_json::json!({ "runners": runners, "server": server, "budgets": budgets });
-                            hub.send_peer(peer, &ServerMsg::ReachAnswer { req, json: answer.to_string() }).await;
+                            let mut answer = serde_json::json!({"session_names_only":true});
+                            crate::fleet::charter_cache::add_page(&hub,&[],&mut answer,name_cursor,true).await;
+                            hub.send_peer(peer,&ServerMsg::ReachAnswer {req,json:answer.to_string()}).await;
                         });
+                        return Ok(());
                     }
+                    let runners = match self.complete_reach_directory().await {
+                        Ok(runners) => runners,
+                        Err(e) => {
+                            tracing::warn!(error=%e,"fleet directory could not read its enrolled machines");
+                            self.send_peer(peer,&ServerMsg::ReachAnswer {req,json:serde_json::json!({"error":"fleet directory unavailable"}).to_string()}).await;
+                            return Ok(());
+                        }
+                    };
+                    let server = self.topo.load().server();
+                    let inventory=raw.get("legacy_name_inventory").cloned().and_then(|v|serde_json::from_value::<crate::fleet::charter::InventoryPage>(v).ok());
+                    let old_holder=agent.to_owned();
+                    let since=raw.get("session_revocation_stamp").and_then(serde_json::Value::as_i64);
+                    let renewal=raw.get("renew_session_grant").cloned().and_then(|v|serde_json::from_value::<crate::fleet::sessions::Renewal>(v).ok()).map(|r|(agent.to_owned(),r));
+                    let hub=Arc::clone(self);
+                    crate::rt::spawn(async move {
+                        let mut answer=if hub.cfg.ci.budgets.is_empty() {
+                            serde_json::json!({"runners":runners,"server":server,"complete":true})
+                        } else {
+                            let budgets=crate::reach::budget::for_directory(&hub.cfg,&*hub.records,&runners).await;
+                            serde_json::json!({"runners":runners,"server":server,"budgets":budgets,"complete":true})
+                        };
+                        if let Some((machine,request))=renewal {
+                            match crate::fleet::sessions::renew_grant(&hub.store,&hub.pki,&machine,request).await {
+                                Ok(cert)=>if let Some(obj)=answer.as_object_mut() {obj.insert("renewed_session_grant".into(),cert.into());},
+                                Err(e)=>tracing::warn!(machine=%machine,error=%e,"session grant renewal refused"),
+                            }
+                        }
+                        if names_capable && hub.name_issuer.waiting_for_legacy() {
+                            match crate::fleet::charter::observe_legacy(&hub,old_holder,inventory).await {
+                                Ok(Some(after))=>if let Some(obj)=answer.as_object_mut(){obj.insert("need_legacy_names_after".into(),after.into());},
+                                Ok(None)=>{},
+                                Err(e)=>tracing::warn!(error=%e,"could not advance legacy session inventory"),
+                            }
+                        }
+                        crate::fleet::charter_cache::add_page(&hub,&runners,&mut answer,name_cursor,false).await;
+                        crate::fleet::sessions::add_bans(&hub.store,&mut answer,since).await;
+                        hub.send_peer(peer,&ServerMsg::ReachAnswer{req,json:answer.to_string()}).await;
+                    });
                 }
                 // What the runner holds of other runners' trees and let go: kept, and answered
                 // with the rules it weighs them with (docs/reach.md §5.1).
@@ -8190,6 +8283,9 @@ pub(crate) mod tests {
             let list = hub.agent_list().await;
             let stale: Vec<&str> = list.iter().filter(|a| a.stale).map(|a| a.name.as_str()).collect();
             anyhow::ensure!(stale == ["old-box"], "{stale:?}");
+            let complete = hub.complete_reach_directory().await?;
+            anyhow::ensure!([ID,"said-box"].iter().all(|id| complete.iter().any(|r| r.name == *id && !r.connected && !r.stale)));
+            anyhow::ensure!(complete.iter().any(|r| r.name == "old-box" && r.stale) && !complete.iter().any(|r| r.name == "kiln-abc-1"));
             for a in &list {
                 let v = serde_json::to_value(a)?;
                 anyhow::ensure!(v.get("stale") == a.stale.then_some(&serde_json::Value::Bool(true)), "{}: {v}", a.name);

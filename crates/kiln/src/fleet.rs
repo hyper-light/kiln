@@ -28,6 +28,11 @@
 //! (`<data>/binaries/builds.json`). A runner on a commit off the release branch, or on a local
 //! build that knows no commit, runs something on purpose and is left alone.
 
+pub(crate) mod sessions;
+pub(crate) mod charter_cache;
+pub(crate) mod charter;
+pub use sessions::session_policy;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;

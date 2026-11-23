@@ -1249,6 +1249,16 @@ impl Liveness {
             .map(|pair| pair.trust_at(&local, self.judged_ns))
     }
 
+    /// The local incarnation, or the incarnation from the last accepted heartbeat of `peer`.
+    /// An attached peer from which no heartbeat has arrived has no observed incarnation.
+    pub fn observed_run(&self, peer: PeerId) -> Option<u64> {
+        if peer == self.local {
+            Some(self.run)
+        } else {
+            self.pairs.get(&peer).and_then(Pair::observed_run)
+        }
+    }
+
     /// Whether `peer`'s run announced its stop and no heartbeat of its next run has come
     /// ([`Change::Stopped`]): what an owner tells a core it gives the peer anew
     /// (`RawNode::stopped`).

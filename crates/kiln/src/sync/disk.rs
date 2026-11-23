@@ -17,18 +17,23 @@ pub type Store = GroupStore<DeviceFile>;
 /// The log's id, the same in every kiln's file.
 const LOG_ID: u128 = u128::from_be_bytes(*b"kiln-repo-sync-1");
 /// The block the file is written in.
-const BLOCK: usize = 4096;
+pub(crate) const BLOCK: usize = 4096;
 /// Groups one log holds at most: repos on the server, copies on a runner.
 pub const GROUPS: usize = 32;
 /// Bytes the file may take (it grows as it is used).
-const DISK: u64 = 2 << 30;
+pub(crate) const DISK: u64 = 2 << 30;
+/// Entries between a group's checkpoints the log is laid out for.
+pub(crate) const CADENCE_ENTRIES: u64 = 2048;
+/// Uncommitted entry and byte headroom past cadence.
+pub(crate) const UNCOMMITTED_ENTRIES: u64 = 512;
+pub(crate) const UNCOMMITTED_BYTES: u64 = 4 << 20;
 /// Recent entries the log keeps in memory, shared evenly by its groups: one append a group (goal 11, plan
 /// 01a1a87b2e56 step 5), 8 MiB, as it was. A replica keeps past its share whatever it has yet to apply and
 /// whatever a copy in step has yet to acknowledge (hyper-durable's `Replica::keep`, through
 /// `LogStore::keep_after`), so the share serves only a copy out of step, one that dropped and probes or one the
 /// apply point has passed: its next append, at most [`super::group::APPEND`], comes from memory, and one further
 /// behind takes an append's entries from the file at a time.
-const CACHE_BYTES: u64 = GROUPS as u64 * super::group::APPEND;
+pub(crate) const CACHE_BYTES: u64 = GROUPS as u64 * super::group::APPEND;
 
 /// What the log is laid out by. Every value is fixed: a log reopens with the facts it was made with.
 fn config(align: Alignment) -> anyhow::Result<Config> {
@@ -40,10 +45,10 @@ fn config(align: Alignment) -> anyhow::Result<Config> {
         disk_bytes: DISK,
         max_groups: GROUPS,
         // An owner compacts a group well within this ([`due`]).
-        cadence_entries: 2048,
+        cadence_entries: CADENCE_ENTRIES,
         cadence_bytes: CADENCE_BYTES,
-        uncommitted_entries: 512,
-        uncommitted_bytes: 4 << 20,
+        uncommitted_entries: UNCOMMITTED_ENTRIES,
+        uncommitted_bytes: UNCOMMITTED_BYTES,
         cache_bytes: CACHE_BYTES,
     })
     .map_err(|e| anyhow::anyhow!("the sync log's settings: {e:?}"))
@@ -77,7 +82,7 @@ pub fn remove(log: &SyncLog, id: u128) -> anyhow::Result<()> {
 
 /// Bytes of entries between a group's checkpoints the log is laid out for: it retains two of these
 /// and what is uncommitted, and refuses a group's writes past that until the group compacts.
-const CADENCE_BYTES: u64 = 16 << 20;
+pub(crate) const CADENCE_BYTES: u64 = 16 << 20;
 /// Entries and bytes a compaction leaves for copies a little behind, at the most: whatever is
 /// kept stays within the log's room, so a compaction always frees some.
 const KEEP_ENTRIES: u64 = 256;
@@ -86,17 +91,17 @@ const KEEP_BYTES: u64 = 2 << 20;
 /// Whether a group's log is due to be compacted: by the thesis's rule weighed against its last
 /// image, at the latest once it holds half of what the log retains for a group, and at once when
 /// it is stalled for room.
-pub fn due<M: hyper_durable::StateMachine>(r: &hyper_durable::Replica<Store, M>, since: u64) -> bool {
+pub fn due<M: hyper_durable::StateMachine, B: hyper_durable::Budget>(r: &hyper_durable::Replica<Store, M, B>, since: u64) -> bool {
     r.is_stalled()
         || r.compaction_due(hyper_durable::Compaction { expansion: 4 })
-        || r.applied().index.saturating_sub(since) >= 1024
+        || r.applied().index.saturating_sub(since) >= CADENCE_ENTRIES / 2
         || r.compactable_bytes() >= CADENCE_BYTES / 2
 }
 
 /// How many applied entries a compaction keeps for copies a little behind (`since`: where the log
 /// was last compacted to): as many as fit [`KEEP_BYTES`] at the entries' mean size, none when the
 /// group is stalled for room, then they take an image.
-pub fn keep<M: hyper_durable::StateMachine>(r: &hyper_durable::Replica<Store, M>, since: u64) -> u64 {
+pub fn keep<M: hyper_durable::StateMachine, B: hyper_durable::Budget>(r: &hyper_durable::Replica<Store, M, B>, since: u64) -> u64 {
     if r.is_stalled() {
         return 0;
     }

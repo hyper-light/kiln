@@ -47,23 +47,28 @@ export function listAgents(signal?: AbortSignal): Promise<AgentInfo[]> {
   });
 }
 
-/** Compact waiting-cards list (~300 B even at 10k sessions), falling back to full list on older servers. */
-export function listWaiting(signal?: AbortSignal): Promise<AgentInfo[]> {
-  return call<unknown>("GET", WAITING_READ, undefined, signal)
-    .then((read) => (Array.isArray(read) ? (read as AgentInfo[]).filter(listed) : listAgents(signal)))
-    .catch((error: unknown) => {
-      if (signal?.aborted) throw error;
-      if (error instanceof ApiError && error.status === 404) return listAgents(signal);
-      return [];
-    });
+/** W21-R02. Keep the same attention predicate when a previous server supplies the full list. */
+export function isWaitingAgent(a: AgentInfo): boolean {
+  return (
+    listed(a) &&
+    (a.approvals.length > 0 ||
+      a.held != null ||
+      (a.status === "exited" && a.exit?.error != null) ||
+      (a.pause != null && a.status !== "running" && a.status !== "exited" && a.status !== "disconnected"))
+  );
 }
 
-/** Only one session, its parent, and its descendants (~400 B even at 10k sessions). */
-export function listAgentFamily(id: string, signal?: AbortSignal): Promise<AgentInfo[]> {
-  return call<AgentInfo[]>("GET", `/api/harness/sessions?family=${encodeURIComponent(id)}`, undefined, signal)
-    .then((read) => read.filter(listed))
-    .catch((error: unknown) => {
-      if (signal?.aborted) throw error;
-      return [];
-    });
+export async function listWaiting(signal?: AbortSignal): Promise<AgentInfo[]> {
+  try {
+    const read = await call<unknown>("GET", WAITING_READ, undefined, signal);
+    if (Array.isArray(read)) return (read as AgentInfo[]).filter(isWaitingAgent);
+  } catch (error) {
+    if (signal?.aborted || !(error instanceof ApiError && error.status === 404)) throw error;
+  }
+  return (await listAgents(signal)).filter(isWaitingAgent);
+}
+
+export async function listAgentFamily(id: string, signal?: AbortSignal): Promise<AgentInfo[]> {
+  const rows = await call<AgentInfo[]>("GET", `/api/harness/sessions?family=${encodeURIComponent(id)}`, undefined, signal);
+  return rows.filter(listed);
 }

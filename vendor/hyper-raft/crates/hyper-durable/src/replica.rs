@@ -341,6 +341,7 @@ pub struct Replica<L: LogStore, M: StateMachine, B: Budget = Unbounded> {
     quiet: Duration,
     writes: VecDeque<Out>,
     stall: Option<Stall>,
+    owner_holds_campaigns: bool,
     /// The hard state of the last write submitted, or what the log held at open.
     issued: HardState,
     /// The commit the durable writes stated.
@@ -537,6 +538,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
             quiet: settings.quiet,
             writes,
             stall: None,
+            owner_holds_campaigns: false,
             issued: view.hard_state,
             logged_commit: view.hard_state.commit,
             applied: durable,
@@ -932,6 +934,15 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         })
     }
 
+    /// Relinquish a service's lead when its detector says it lacks a quorum.
+    /// A suspicion on a single link still leaves a three-voter leader a majority.
+    pub fn resign_without_quorum(&mut self) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let resigned = r.node.resign_without_quorum();
+            r.heard(resigned)
+        })
+    }
+
     /// The owner's detectors trust `member`'s node again.
     pub fn trust(&mut self, member: u64) -> Result<(), ReplicaError> {
         self.guarded(|r| {
@@ -1136,11 +1147,22 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         if self.node.raft.config().elections == Elections::Ticks {
             return Ok(());
         }
-        let held = self.stall.is_some();
+        let held = self.stall.is_some() || self.owner_holds_campaigns;
         let told = self.node.hold_campaigns(held);
         self.must(told)?;
         let woken = self.node.wake(now);
         self.must(woken).map(drop)
+    }
+
+    /// Hold this node's own campaigns while its owner lacks a measurement for the
+    /// current electorate or cannot execute locally. It can still vote for another member.
+    pub fn hold_campaigns(&mut self, held: bool) -> Result<(), ReplicaError> {
+        self.guarded(|r| {
+            let set = r.node.hold_campaigns(held || r.stall.is_some());
+            r.heard(set)?;
+            r.owner_holds_campaigns = held;
+            Ok(())
+        })
     }
 
     /// A message from the network, bound to its authenticated sender by the transport. One the
@@ -1151,6 +1173,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// CP-T2.2, the liveness harness's `judged_apart_no_hand_over_while_every_other_disk_is_slow`).
     pub fn step(&mut self, message: Message) -> Result<(), ReplicaError> {
         self.guarded(|r| {
+            if r.owner_holds_campaigns && message.msg_type == MessageType::MsgTimeoutNow {
+                return Err(ReplicaError::Refused(hyper_raft::Error::NotPromotable));
+            }
             r.takes()?;
             if !r.takes_without_room(&message) {
                 r.reserve(bytes(proto::message_bytes(&message)))?;
@@ -1173,6 +1198,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
     /// member's log may lack keeps it from leading (`docs/durable.md` §5).
     pub fn campaign(&mut self) -> Result<(), ReplicaError> {
         self.guarded(|r| {
+            if r.owner_holds_campaigns { return Err(ReplicaError::Refused(hyper_raft::Error::NotPromotable)); }
             r.takes()?;
             match r.node.campaign() {
                 Err(hyper_raft::Error::Lost) => Err(ReplicaError::Marked),

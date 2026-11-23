@@ -761,7 +761,13 @@ pub fn disk_available(path: &Path) -> Option<u64> {
 /// and inode are on Unix (None: unknown).
 #[cfg(windows)]
 pub fn file_change(path: &Path) -> Option<(i64, u64)> {
-    win32::file_change(path).ok()
+    win32::file_info(path).ok().map(|(changed, _, index)| (changed, index))
+}
+
+/// Device and file index survive hard-link publication across a process restart.
+#[cfg(windows)]
+pub(crate) fn file_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    win32::file_info(path).map(|(_, volume, index)| (volume, index))
 }
 
 /// Keep git from ever prompting (terminal, askpass helper, or Git Credential Manager's window):

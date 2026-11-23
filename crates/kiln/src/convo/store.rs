@@ -49,7 +49,7 @@ pub const COMPACT_MIN_FREE: u64 = 256 << 20;
 /// Each step of compacting copies about this much, as often as compressing goes: the memory it
 /// takes, and about how long the writer is held (a copy of the whole file in one go took more
 /// memory than the first server had, which killed it over and over, 2026-10-18).
-const COMPACT_STEP: usize = 4 << 20;
+pub(super) const COMPACT_STEP: usize = 4 << 20;
 /// This often the writer looks at its file for its telemetry ([`Engine::look`]), whatever else it
 /// does; its sessions it counts every `COUNT_EVERY`.
 const LOOK_FILE: Duration = Duration::from_secs(2);
@@ -221,6 +221,10 @@ pub struct Look {
     pub compacting: Option<CompactView>,
 }
 
+/// How an authoritative set of Raft rows advances its local projection.
+#[derive(Clone,Copy,PartialEq,Eq)]
+pub enum ProjectionWrite { Apply, Install, Recover, Certified { origin: [u8;32], recover: bool } }
+
 /// A database the store keeps conversations in.
 pub trait Engine: Send + 'static {
     /// Who the store is to its peers: made once, kept in the database.
@@ -231,6 +235,45 @@ pub trait Engine: Send + 'static {
     fn kept(&mut self, session: &str, last: usize) -> anyhow::Result<Option<Kept>>;
     /// A session's events before `before` (its event numbers), the newest `limit`, oldest first.
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
+    /// Ascending `(seq, rowid)` keyset page of all events for `session` with `seq <= max_seq`
+    /// past `after`, for complete Raft snapshot pagination with zero omissions on duplicate `seq` ties.
+    fn events_snapshot_page(&mut self, session: &str, max_seq: u64, after: Option<(u64, i64)>, limit: usize) -> anyhow::Result<Vec<(EventRow, i64)>> {
+        let _ = (session, max_seq, after, limit);
+        anyhow::bail!("events_snapshot_page not supported by this engine")
+    }
+    fn journal_raft_rows(&mut self, _session: &str, _epoch: Option<u64>, rows: &[Row], record: bool) -> anyhow::Result<()> {
+        if record { self.apply(rows) } else { anyhow::bail!("no Raft outbox") }
+    }
+    fn enable_inbox_for(&mut self, _owner:&str) -> anyhow::Result<()> { Err(no_inbox()) }
+    fn enable_inbox_replication(&mut self) -> anyhow::Result<()> {self.enable_inbox_for("")}
+    fn pending_inbox_sessions(&mut self) -> anyhow::Result<Vec<String>> { Err(no_inbox()) }
+    fn inbox_outbox_tip(&mut self, _session: &str, _epoch: u64) -> anyhow::Result<Option<u64>> { Err(no_inbox()) }
+    fn next_inbox_tx(&mut self, _session: &str, _epoch: u64, _through: u64) -> anyhow::Result<Option<(u64, Vec<Row>)>> { Err(no_inbox()) }
+    fn confirm_inbox_tx(&mut self, _session: &str, _rev: u64) -> anyhow::Result<()> { Err(no_inbox()) }
+    fn has_legacy_name_catalog(&mut self)->anyhow::Result<bool> {Ok(false)}
+    fn historical_names(&mut self) -> anyhow::Result<std::collections::BTreeSet<String>> { anyhow::bail!("no durable conversation catalog") }
+    fn founding_rows(&mut self,_session:&str,_epoch:u64,_owner:&str)->anyhow::Result<Vec<Row>> { anyhow::bail!("no founding projection") }
+    fn confirm_local_owner_fence(&mut self,_session:&str,_epoch:u64)->anyhow::Result<bool>{anyhow::bail!("local durable fencing unavailable")}
+    fn has_raft_projection(&mut self, session: &str) -> anyhow::Result<bool> { self.raft_projection_complete(session) }
+    fn raft_projection_origin(&mut self, _session: &str) -> anyhow::Result<Option<[u8;32]>> { Ok(None) }
+    fn raft_projection_frontier(&mut self, _session: &str) -> anyhow::Result<Option<(u64,u64)>> { Ok(None) }
+    fn raft_projection_complete(&mut self, session: &str) -> anyhow::Result<bool> { Ok(self.raft_projection_frontier(session)?.is_some()) }
+    fn begin_raft_projection(&mut self, _session: &str, _previous_index: u64) -> anyhow::Result<()> { anyhow::bail!("no Raft projection") }
+    fn write_raft_rows(&mut self, _session: &str, _index: u64, _term: u64, _rows: &[Row], _mode: ProjectionWrite, _new_epoch: Option<u64>) -> anyhow::Result<()> { anyhow::bail!("no Raft projection") }
+    fn raft_snapshot_rows(&mut self, _session: &str, _at: u64) -> anyhow::Result<Vec<Row>> { anyhow::bail!("no Raft projection") }
+    /// Atomically replace all stored events, records, and inbox rows for `session` with `rows`
+    /// inside a single transaction (so installing a Raft snapshot never leaves deleted inbox keys
+    /// or deleted record sources behind and confirms SQLite commit before returning).
+    fn replace_session_snapshot(&mut self, session: &str, rows: &[Row]) -> anyhow::Result<()> {
+        let _ = session;
+        self.apply(rows)
+    }
+    /// Every inbox row for `session` including `value == None` delete tombstones, ordered oldest
+    /// first by `rev`, so Raft replication propagates inbox deletions cleanly across failovers.
+    fn inbox_session_all(&mut self, session: &str) -> anyhow::Result<Vec<(String, Vec<u8>, Option<Vec<u8>>)>> {
+        let _ = session;
+        anyhow::bail!("inbox_session_all not supported by this engine")
+    }
     /// A session's events under call `parent` (a subagent's thread) before `before` (None: all of
     /// them), the newest `limit`, oldest first.
     fn thread(&mut self, session: &str, parent: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
@@ -243,6 +286,15 @@ pub trait Engine: Send + 'static {
     /// for a taker that takes them so; else as text.
     /// `inbox`: the sessions' inbox rows too ([`Row::Inbox`]), for a taker that takes them; else read past.
     fn changes(&mut self, from: u64, max_bytes: usize, kept: bool, inbox: bool) -> anyhow::Result<Changes>;
+    fn viewer_generation(&mut self, _session: &str) -> anyhow::Result<(u64,u64)> {
+        anyhow::bail!("conversation store cannot certify a history cursor")
+    }
+
+    fn viewer_changes(&mut self, session: &str, from: u64, max_bytes: usize) -> anyhow::Result<Changes> {
+        let mut batch = self.changes(from, max_bytes, false, false)?;
+        batch.rows.retain(|change| change.row.session() == session);
+        Ok(batch)
+    }
     /// Take a batch of `peer`'s feed, which follows number `from` of it, in one transaction:
     /// numbered here as this store's own writes, a session's rows from its latest writer alone.
     /// `machine`: the machine of the feed, where the sessions it brings run (None: its rows say,
@@ -339,6 +391,15 @@ pub trait Engine: Send + 'static {
 /// store's reader thread), never behind the writes sent before it; or the writer itself ([`OnWriter`]). For reads of
 /// what was committed a while ago (an older page); one that must see what was just sent goes to the writer.
 pub trait Read {
+    fn has_legacy_name_catalog(&mut self)->anyhow::Result<bool> {Ok(false)}
+    fn historical_names(&mut self) -> anyhow::Result<std::collections::BTreeSet<String>> { anyhow::bail!("no durable conversation catalog") }
+    fn founding_rows(&mut self,_session:&str,_epoch:u64,_owner:&str)->anyhow::Result<Vec<Row>> { anyhow::bail!("no founding projection") }
+    fn raft_snapshot_rows(&mut self, _session: &str, _at: u64) -> anyhow::Result<Vec<Row>> { anyhow::bail!("no Raft projection") }
+    fn pinned_raft_rows(&mut self, session: &str, at: u64, pinned: &mut dyn FnMut()) -> anyhow::Result<Vec<Row>> {
+        let rows = self.raft_snapshot_rows(session, at)?;
+        pinned();
+        Ok(rows)
+    }
     /// As [`Engine::events`].
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>>;
     /// As [`Engine::thread`].
@@ -367,6 +428,11 @@ pub trait Read {
 struct OnWriter<'a>(&'a mut dyn Engine);
 
 impl Read for OnWriter<'_> {
+    fn has_legacy_name_catalog(&mut self)->anyhow::Result<bool> {self.0.has_legacy_name_catalog()}
+    fn historical_names(&mut self)->anyhow::Result<std::collections::BTreeSet<String>> { self.0.historical_names() }
+    fn founding_rows(&mut self,session:&str,epoch:u64,owner:&str)->anyhow::Result<Vec<Row>> {self.0.founding_rows(session,epoch,owner)}
+    fn raft_snapshot_rows(&mut self, session: &str, at: u64) -> anyhow::Result<Vec<Row>> { self.0.raft_snapshot_rows(session, at) }
+
     fn events(&mut self, session: &str, before: Option<u64>, limit: usize) -> anyhow::Result<Vec<EventRow>> {
         self.0.events(session, before, limit)
     }
@@ -412,7 +478,7 @@ enum ReadMsg {
     /// Run on the reader, at the last commit.
     Run(ReadJob),
     /// Drop the current reader connection before a compaction file swap so `-wal`/`-shm` have no
-    /// open readers; replies once dropped, and buffers incoming `Run` jobs until `Use` arrives.
+    /// open readers; replies once dropped. The route sends new reads to the writer until `Use`.
     Detach(mpsc::Sender<()>),
     /// Read with this one from now on: its engine's file is new (a compaction's copy took the old one's place).
     Use(Box<dyn Read + Send>),
@@ -420,29 +486,41 @@ enum ReadMsg {
     Stop(mpsc::Sender<()>),
 }
 
+/// The gate orders admission and file ownership on the same FIFO. While detached, reads go
+/// straight to the writer. A timed-out detach is followed by Use on that FIFO before it reopens.
+struct ReaderRoute {
+    tx: mpsc::Sender<ReadMsg>,
+    accepting: parking_lot::Mutex<bool>,
+}
+
+impl ReaderRoute {
+    fn send(&self, msg: ReadMsg) -> Result<(), mpsc::SendError<ReadMsg>> {
+        let mut accepting = self.accepting.lock();
+        match &msg {
+            ReadMsg::Run(_) if !*accepting => return Err(mpsc::SendError(msg)),
+            ReadMsg::Detach(_) | ReadMsg::Stop(_) => *accepting = false,
+            ReadMsg::Use(_) => *accepting = true,
+            ReadMsg::Run(_) => {}
+        }
+        self.tx.send(msg)
+    }
+}
+
 /// The reader thread: what's asked of the reader beside the writer, in turn.
 fn read_on(reader: Box<dyn Read + Send>, rx: &mpsc::Receiver<ReadMsg>) {
     let mut reader = Some(reader);
-    let mut deferred: Vec<ReadJob> = Vec::new();
     while let Ok(msg) = rx.recv() {
         match msg {
-            ReadMsg::Run(job) => match reader.as_mut() {
-                Some(r) => job(&mut **r),
-                None => deferred.push(job),
-            },
+            ReadMsg::Run(job) => {
+                if let Some(r) = reader.as_mut() { job(&mut **r); }
+            }
             ReadMsg::Detach(done) => {
                 reader = None;
                 let _ = done.send(());
             }
-            ReadMsg::Use(mut next) => {
-                for job in deferred.drain(..) {
-                    job(&mut *next);
-                }
-                reader = Some(next);
-            }
+            ReadMsg::Use(next) => reader = Some(next),
             ReadMsg::Stop(done) => {
                 drop(reader);
-                drop(deferred);
                 let _ = done.send(());
                 return;
             }
@@ -477,6 +555,9 @@ type InboxQueue = Arc<parking_lot::Mutex<InboxState>>;
 enum Msg {
     /// Rows, and the bytes [`Queue`] counts them at.
     Rows(Vec<Row>, usize),
+    /// Rows with an exact per-batch commit receipt (`true` iff this batch committed to SQLite),
+    /// preventing concurrent producers from satisfying another caller's watermark prematurely.
+    RowsAck(Vec<Row>, usize, mpsc::Sender<bool>),
     /// Wakes the writer when the priority inbox queue transitions from empty to non-empty.
     InboxWake,
     /// Run on the engine, between commits (whatever was sent before it is committed first).
@@ -500,10 +581,33 @@ fn notify(watchers: &Watchers) {
     });
 }
 
+/// One ownership driver per store. Keep only session IDs, so an unrelated session's
+/// writes need no index walk or extra notification while the driver is asleep.
+#[derive(Default)]
+struct OutboxChanges {
+    ids: parking_lot::Mutex<std::collections::HashSet<String>>,
+    ready: Arc<crate::rt::Notify>,
+}
+
+impl OutboxChanges {
+    fn committed(&self, sessions: impl IntoIterator<Item = String>) {
+        if Arc::strong_count(&self.ready) == 1 {
+            return;
+        }
+        let mut ids = self.ids.lock();
+        let was_empty = ids.is_empty();
+        ids.extend(sessions);
+        if was_empty && !ids.is_empty() {
+            self.ready.notify();
+        }
+    }
+}
+
 /// What waits for the writer, in bytes, and the most it may hold (goal 11, plan 01a1a87b2e56 step 3).
 /// Lockless: atomics, and an event the writer tells as it commits.
 #[derive(Default)]
 pub struct Queue {
+    outbox: OutboxChanges,
     /// Bytes of rows sent and not yet committed (`Row::bytes`).
     bytes: AtomicUsize,
     /// Bytes committed.
@@ -549,17 +653,12 @@ impl Queue {
         b == 0 || b <= most
     }
 
-    /// `bytes` sent: where the bytes sent stand with them ([`Queue::taken_in`]).
+    /// `bytes` sent: where the bytes sent stand with them.
     fn took(&self, bytes: usize) -> u64 {
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         crate::memory::CONVO_QUEUE.add(bytes);
         let n = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.sent.fetch_add(n, Ordering::Relaxed).saturating_add(n)
-    }
-
-    /// Whether the writer has let go of what was sent up to `at` (committed it, or gone with it).
-    fn taken_in(&self, at: u64) -> bool {
-        self.gone.load(Ordering::Acquire) >= at
     }
 
     /// `bytes` counted as waiting for the writer, for a test of what waits on the queue.
@@ -593,6 +692,29 @@ impl Queue {
     }
 }
 
+type DrainTable = parking_lot::Mutex<std::collections::HashMap<String, std::sync::Weak<DrainLane>>>;
+
+struct DrainLane {
+    session: String,
+    table: std::sync::Weak<DrainTable>,
+    gate: crate::turn::Gate,
+}
+
+impl AsRef<crate::turn::Gate> for DrainLane {
+    fn as_ref(&self) -> &crate::turn::Gate { &self.gate }
+}
+
+impl Drop for DrainLane {
+    fn drop(&mut self) {
+        if let Some(table) = self.table.upgrade() {
+            let mut table = table.lock();
+            if table.get(&self.session).is_some_and(|slot| std::ptr::eq(slot.as_ptr(), self)) {
+                table.remove(&self.session);
+            }
+        }
+    }
+}
+
 /// A handle to a machine's store: cheap to clone, usable from any thread.
 #[derive(Clone)]
 pub struct Store {
@@ -600,12 +722,13 @@ pub struct Store {
     inbox_q: InboxQueue,
     queue: Arc<Queue>,
     id: Arc<str>,
+    outbox_drains: Arc<DrainTable>,
     meter: Arc<Meter>,
     watchers: Watchers,
     /// Sessions that ended at or after this (unix ms) keep their records ([`Store::hold_prune`]).
     hold: Arc<AtomicI64>,
     /// The reader thread beside the writer, where the engine has a reader ([`Store::read`]).
-    reads: Option<mpsc::Sender<ReadMsg>>,
+    reads: Option<Arc<ReaderRoute>>,
 }
 
 impl Store {
@@ -622,13 +745,13 @@ impl Store {
             Some(reader) => {
                 let (rtx, rrx) = mpsc::channel::<ReadMsg>();
                 std::thread::Builder::new().name("kiln-convo-read".into()).spawn(move || read_on(reader, &rrx))?;
-                Some(rtx)
+                Some(Arc::new(ReaderRoute { tx: rtx, accepting: parking_lot::Mutex::new(true) }))
             }
             None => None,
         };
         let (iq, w, m, h, q, r) = (Arc::clone(&inbox_q), watchers.clone(), meter.clone(), Arc::clone(&hold), Arc::clone(&queue), reads.clone());
-        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &iq, &w, upkeep, &m, &h, &q, r.as_ref()))?;
-        Ok(Self { tx, inbox_q, queue, id, meter, watchers, hold, reads })
+        std::thread::Builder::new().name("kiln-convo".into()).spawn(move || writer(engine, &rx, &iq, &w, upkeep, &m, &h, &q, r.as_deref()))?;
+        Ok(Self { tx, inbox_q, queue, id, outbox_drains: Arc::default(), meter, watchers, hold, reads })
     }
 
     /// Keeps the records of sessions that ended at or after `ended_ms` (unix ms), however long
@@ -656,6 +779,213 @@ impl Store {
         let (rtx, rrx) = mpsc::channel();
         self.tx.send(Msg::Close(rtx)).map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
         rrx.recv().unwrap_or_else(|_| Err(anyhow::anyhow!("the conversation store stopped before it said it let go of its file")))
+    }
+
+    pub fn enable_inbox_for(&self, owner: &str) -> anyhow::Result<()> {
+        let owner = owner.to_owned();
+        self.durable(move |e| e.enable_inbox_for(&owner))
+    }
+
+    pub fn enable_inbox_replication(&self) -> anyhow::Result<()> {
+        self.durable(|e| e.enable_inbox_replication())
+    }
+
+    /// The originating recorder journals its rows in the same commit as its durable file marks.
+    pub fn record_authored(&self, session: &str, epoch: u64, rows: Vec<Row>) -> anyhow::Result<()> {
+        self.journal_rows(session, Some(epoch), rows, true)
+    }
+
+    pub fn journal_raft_rows(&self, session: &str, epoch: u64, rows: Vec<Row>) -> anyhow::Result<()> {
+        self.journal_rows(session, Some(epoch), rows, false)
+    }
+
+    fn journal_rows(&self, session: &str, epoch: Option<u64>, rows: Vec<Row>, record: bool) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let id = session.to_owned();
+        let bytes = rows
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(u64::try_from(row.bytes()).unwrap_or(u64::MAX)));
+        let queue = Arc::clone(&self.queue);
+        self.durable(move |e| {
+            e.journal_raft_rows(&id, epoch, &rows, record)?;
+            queue.outbox.committed(std::iter::once(id));
+            Ok(())
+        })?;
+        self.queue.written.fetch_add(bytes.max(1), Ordering::Relaxed);
+        self.queue.room.notify();
+        notify(&self.watchers);
+        Ok(())
+    }
+
+    pub fn watch_outbox(&self) -> Arc<crate::rt::Notify> {
+        Arc::clone(&self.queue.outbox.ready)
+    }
+
+    pub fn take_changed_outbox(&self) -> std::collections::HashSet<String> {
+        std::mem::take(&mut *self.queue.outbox.ids.lock())
+    }
+
+    pub fn pending_inbox_sessions(&self) -> anyhow::Result<Vec<String>> {
+        self.run(|e| e.pending_inbox_sessions())
+    }
+
+    fn drain_lane(&self, session: &str) -> Arc<DrainLane> {
+        let mut table = self.outbox_drains.lock();
+        if let Some(lane) = table.get(session).and_then(std::sync::Weak::upgrade) { return lane; }
+        let lane = Arc::new(DrainLane { session: session.to_owned(), table: Arc::downgrade(&self.outbox_drains), gate: crate::turn::Gate::one() });
+        table.insert(session.to_owned(), Arc::downgrade(&lane));
+        lane
+    }
+
+    /// Wait for earlier receipts for this session before occupying a quorum worker.
+    /// The admitted job keeps its turn through cancellation and the final empty-tip barrier.
+    pub(crate) async fn with_outbox_drain<T: Send + 'static>(&self, session: &str, job: impl FnOnce() -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+        let turn = crate::turn::OwnedTurn::take(self.drain_lane(session)).await;
+        crate::rt::blocking_in(crate::rt::SHARE_SESSION, move || { let _turn = turn; job() }).await?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replicate_inbox(&self, session: &str, epoch: u64, submit: impl FnMut(Vec<Row>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let lane = self.drain_lane(session);
+        let _turn = futures::executor::block_on(lane.gate.turn());
+        self.replicate_inbox_held(session, epoch, submit)
+    }
+
+    /// Send the durable local prefix that existed on entry, one original transaction at a time.
+    /// The writer is free during replication and a failed send leaves the original bytes on disk.
+    pub(crate) fn replicate_inbox_held(&self, session: &str, epoch: u64, mut submit: impl FnMut(Vec<Row>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let id = session.to_owned();
+        let Some(tip) = self.run(move |e| e.inbox_outbox_tip(&id, epoch))? else { return Ok(()) };
+        loop {
+            let id = session.to_owned();
+            let Some((rev, rows)) = self.run(move |e| e.next_inbox_tx(&id, epoch, tip))? else { return Ok(()) };
+            submit(rows)?;
+            let id = session.to_owned();
+            self.durable(move |e| e.confirm_inbox_tx(&id, rev))?;
+        }
+    }
+
+    pub(crate) fn has_legacy_name_catalog(&self)->anyhow::Result<bool> { self.read(|r|r.has_legacy_name_catalog()) }
+
+    pub(crate) fn historical_names(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        self.sync()?;
+        self.read(|r| r.historical_names())
+    }
+
+    pub fn founding_rows(&self, session: &str, epoch: u64, owner: &str) -> anyhow::Result<Vec<Row>> {
+        self.sync()?;
+        let (session, owner) = (session.to_owned(), owner.to_owned());
+        self.read(move |r| r.founding_rows(&session, epoch, &owner))
+    }
+
+    pub(crate) fn confirm_local_owner_fence(&self, session: &str, epoch: u64) -> anyhow::Result<()> {
+        let id = session.to_owned();
+        // Reconfirming a fence must not wake its own retry loop if a later, independent
+        // host-file write is still failing.
+        if !self.durable(move |e| e.confirm_local_owner_fence(&id, epoch))? { return Ok(()); }
+        self.queue.written.fetch_add(
+            u64::try_from(session.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(size_of::<u64>() as u64),
+            Ordering::Relaxed,
+        );
+        self.queue.room.notify();
+        notify(&self.watchers);
+        Ok(())
+    }
+
+    pub fn raft_projection_origin(&self, session: &str) -> anyhow::Result<Option<[u8;32]>> {
+        let id = session.to_owned();
+        self.run(move |e| e.raft_projection_origin(&id))
+    }
+
+    /// Includes provisional and interrupted projections. A missing in-memory group cannot
+    /// demote a session previously handled by Raft to unreplicated, local execution.
+    pub(crate) fn has_raft_projection(&self, session: &str) -> anyhow::Result<bool> {
+        let id = session.to_owned();
+        self.run(move |e| e.has_raft_projection(&id))
+    }
+
+    pub fn raft_projection_frontier(&self, session: &str) -> anyhow::Result<Option<(u64, u64)>> {
+        let id = session.to_owned();
+        self.run(move |e| e.raft_projection_frontier(&id))
+    }
+
+    pub fn raft_projection_complete(&self, session: &str) -> anyhow::Result<bool> {
+        let id = session.to_owned();
+        self.run(move |e| e.raft_projection_complete(&id))
+    }
+
+    pub fn begin_raft_projection(&self, session: &str, previous_index: u64) -> anyhow::Result<()> {
+        let id = session.to_owned();
+        self.durable(move |e| e.begin_raft_projection(&id, previous_index))
+    }
+
+    pub fn apply_raft_rows(&self, session: &str, index: u64, term: u64, rows: Vec<Row>) -> anyhow::Result<()> {
+        self.write_raft_rows(session, index, term, rows, ProjectionWrite::Apply, None)
+    }
+
+    pub fn apply_raft_claim_rows(&self, session: &str, index: u64, term: u64, new_epoch: u64, rows: Vec<Row>) -> anyhow::Result<()> {
+        self.write_raft_rows(session, index, term, rows, ProjectionWrite::Apply, Some(new_epoch))
+    }
+
+    pub fn install_raft_rows(&self, session: &str, index: u64, term: u64, rows: Vec<Row>, epoch: u64) -> anyhow::Result<()> {
+        self.write_raft_rows(session, index, term, rows, ProjectionWrite::Install, Some(epoch))
+    }
+
+    /// Replace a wrongly paired store from validated complete WAL history or a verified image.
+    pub fn recover_raft_rows(&self,session:&str,index:u64,term:u64,rows:Vec<Row>,epoch:u64) -> anyhow::Result<()> {
+        self.write_raft_rows(session,index,term,rows,ProjectionWrite::Recover,Some(epoch))
+    }
+
+    /// CP-T3.2. Install the projection and the identity of its founding operation in one
+    /// database transaction. A restored snapshot from another founder can share its term and index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_raft_rows_with_origin(&self, session:&str, index:u64, term:u64, rows:Vec<Row>, epoch:u64, origin:Option<[u8;32]>, recover:bool) -> anyhow::Result<()> {
+        let mode = match origin {
+            Some(origin) => ProjectionWrite::Certified { origin, recover },
+            None if recover => ProjectionWrite::Recover,
+            None => ProjectionWrite::Install,
+        };
+        self.write_raft_rows(session, index, term, rows, mode, Some(epoch))
+    }
+
+    fn write_raft_rows(&self, session: &str, index: u64, term: u64, rows: Vec<Row>, mode: ProjectionWrite, new_epoch: Option<u64>) -> anyhow::Result<()> {
+        let id = session.to_owned();
+        let bytes = rows.iter().fold(0u64, |total, row| total.saturating_add(u64::try_from(row.bytes()).unwrap_or(u64::MAX)));
+        self.durable(move |e| e.write_raft_rows(&id, index, term, &rows, mode, new_epoch))?;
+        self.queue.written.fetch_add(bytes.max(1), Ordering::Relaxed);
+        self.queue.room.notify();
+        notify(&self.watchers);
+        Ok(())
+    }
+
+    pub fn raft_snapshot_rows(&self, session: &str, at: u64) -> anyhow::Result<Vec<Row>> {
+        let id = session.to_owned();
+        self.read(move |r| r.raft_snapshot_rows(&id, at))
+    }
+
+    /// Returns once the reader owns a SQLite view at this point. Later commits may proceed
+    /// while it walks/decodes the cells. A sustained event stream therefore cannot starve capture.
+    pub fn pin_raft_snapshot(&self, session: &str, at: u64) -> anyhow::Result<mpsc::Receiver<anyhow::Result<Vec<Row>>>> {
+        let id = session.to_owned();
+        let (ready, pinned) = mpsc::channel();
+        let (reply, rows) = mpsc::channel();
+        self.send_read(Box::new(move |reader| {
+            let mut signal = Some(ready);
+            let result = reader.pinned_raft_rows(&id, at, &mut || {
+                if let Some(ready) = signal.take() { let _ = ready.send(Ok(())); }
+            });
+            if let Some(ready) = signal {
+                let why = result.as_ref().err().map_or_else(|| "reader did not pin the Raft view".to_string(), |e|format!("{e:#}"));
+                let _ = ready.send(Err(anyhow::anyhow!(why)));
+            }
+            let _ = reply.send(result);
+        }))?;
+        pinned.recv_timeout(READ_WAIT).map_err(|e| anyhow::anyhow!("reading Raft snapshot point: {e}"))??;
+        Ok(rows)
     }
 
     /// Who this store is to its peers.
@@ -698,31 +1028,53 @@ impl Store {
         }
     }
 
-    /// Rows to be committed, then waiting, up to `READ_WAIT` (a writer stuck, its disk say, holds a sender no
-    /// longer), until the writer has taken them in: one put on its way at a time, so what the sender gathers
-    /// meanwhile goes in its next as one, and a burst waits for the writer rather than piling up (consts-audit B3:
-    /// it waited while more waited than the writer committed in 50 ms). False when they couldn't be handed over
-    /// (its writer has stopped: whoever sends them sends them again). Blocking: for a thread of its own.
+    /// Rows to be committed, waiting up to `READ_WAIT` for THIS exact batch's commit receipt
+    /// (never satisfied prematurely by a concurrent producer's larger batch). Returns `true` iff
+    /// SQLite actually committed this batch. Blocking: for a thread of its own.
     pub fn put_wait(&self, rows: Vec<Row>) -> bool {
         if rows.is_empty() {
             return true;
         }
         let bytes = rows.iter().map(Row::bytes).sum();
-        let failed_before = self.queue.failed.load(Ordering::Acquire);
-        let at = self.queue.took(bytes);
-        if self.tx.send(Msg::Rows(rows, bytes)).is_err() {
+        self.queue.took(bytes);
+        let (ack_tx, ack_rx) = mpsc::channel();
+        if self.tx.send(Msg::RowsAck(rows, bytes, ack_tx)).is_err() {
             self.queue.let_go(bytes, false);
             return false;
         }
-        let until = Instant::now() + READ_WAIT;
-        while !self.queue.taken_in(at) && Instant::now() < until {
-            let listener = self.queue.room.listen();
-            if self.queue.taken_in(at) {
-                break;
-            }
-            let _ = listener.wait_deadline(until);
-        }
-        self.queue.taken_in(at) && self.queue.failed.load(Ordering::Acquire) == failed_before
+        ack_rx.recv_timeout(READ_WAIT).unwrap_or(false)
+    }
+
+    /// Number of writer batches that failed to commit to SQLite since this store opened.
+    /// Checked by Raft checkpoints so a lost SQLite batch can never advance `durable`.
+    pub fn failed_commits(&self) -> u64 {
+        self.queue.failed.load(Ordering::Acquire)
+    }
+
+    /// Ascending `(seq, rowid)` keyset page of all events for `session` with `seq <= max_seq`
+    /// past `after`, read on the writer so duplicate `seq` ties at page boundaries are never omitted.
+    pub fn events_snapshot_page(&self, session: &str, max_seq: u64, after: Option<(u64, i64)>, limit: usize) -> anyhow::Result<Vec<(EventRow, i64)>> {
+        let s = session.to_owned();
+        self.run(move |e| e.events_snapshot_page(&s, max_seq, after, limit))
+    }
+
+    /// Return every inbox row for `session` including delete tombstones (`value = None`) so Raft
+    /// replication deletes completed pending entries on followers as well as inserting live rows.
+    pub fn inbox_session_all(&self, session: &str) -> anyhow::Result<Vec<(String, Vec<u8>, Option<Vec<u8>>)>> {
+        let s = session.to_owned();
+        self.run(move |e| e.inbox_session_all(&s))
+    }
+
+    /// Atomically wipe all prior events/records/inbox rows of `session` and apply `rows` in one
+    /// SQLite transaction, returning an explicit error if the commit fails.
+    pub fn replace_session_snapshot(&self, session: &str, rows: Vec<Row>) -> anyhow::Result<()> {
+        let s = session.to_owned();
+        let watchers = self.watchers.clone();
+        self.run(move |e| {
+            e.replace_session_snapshot(&s, &rows)?;
+            notify(&watchers);
+            Ok(())
+        })
     }
 
     /// Waits while anything waits for the writer ([`Queue`]): whoever sent rows waits here after, so a burst waits
@@ -761,17 +1113,27 @@ impl Store {
         self.queue.room.listen()
     }
 
-    /// Run `f` on the engine once what was sent before is committed. Blocking, for `READ_WAIT` at
-    /// most.
-    fn run<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
-        let (rtx, rrx) = mpsc::channel();
-        let asked = Instant::now();
-        self.tx
-            .send(Msg::Run(Box::new(move |e| {
-                let _ = rtx.send(f(e));
-            })))
+    /// Queue one ordered engine operation behind the writer's earlier commits.
+    fn request<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<mpsc::Receiver<anyhow::Result<T>>> {
+        let (reply, done) = mpsc::channel();
+        self.tx.send(Msg::Run(Box::new(move |engine| { let _ = reply.send(f(engine)); })))
             .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
-        match rrx.recv_timeout(READ_WAIT) {
+        Ok(done)
+    }
+
+    /// A durable mutation must report the writer's actual outcome. Timing out while it remains
+    /// queued allows the caller to restart, rewind its native cursor, or replay a stale journal.
+    fn durable<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+        let asked = Instant::now();
+        let result = self.request(f)?.recv().map_err(|_| anyhow::anyhow!("the conversation store stopped before committing"))?;
+        self.meter.waited(asked.elapsed());
+        result
+    }
+
+    /// Run `f` on the engine once what was sent before is committed. Blocking, for `READ_WAIT` at most.
+    fn run<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Engine) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+        let asked = Instant::now();
+        match self.request(f)?.recv_timeout(READ_WAIT) {
             Ok(answer) => {
                 self.meter.waited(asked.elapsed());
                 answer
@@ -866,15 +1228,7 @@ impl Store {
         self.inbox_run_async(move |e| e.inbox_floor(rev)).await
     }
 
-    /// Run `f` on the reader beside the writer, at the last commit ([`Read`]): never behind what was sent before it,
-    /// for what asks for what's committed (an older page; plan 01a1cc09, step 2). A store with no reader
-    /// (or whose reader stopped) runs it on the writer, after what was sent. Blocking, for `READ_WAIT` at most.
-    fn read<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Read) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
-        let (rtx, rrx) = mpsc::channel();
-        let asked = Instant::now();
-        let job: ReadJob = Box::new(move |r| {
-            let _ = rtx.send(f(r));
-        });
+    fn send_read(&self, job: ReadJob) -> anyhow::Result<()> {
         let back = match &self.reads {
             Some(reads) => reads.send(ReadMsg::Run(job)).err().map(|mpsc::SendError(msg)| msg),
             None => Some(ReadMsg::Run(job)),
@@ -884,6 +1238,19 @@ impl Store {
                 .send(Msg::Run(Box::new(move |e| job(&mut OnWriter(e)))))
                 .map_err(|_| anyhow::anyhow!("the conversation store has stopped"))?;
         }
+        Ok(())
+    }
+
+    /// Run `f` on the reader beside the writer, at the last commit ([`Read`]): never behind what was sent before it,
+    /// for what asks for what's committed (an older page; plan 01a1cc09, step 2). A store with no reader
+    /// (or whose reader stopped) runs it on the writer, after what was sent. Blocking, for `READ_WAIT` at most.
+    fn read<T: Send + 'static>(&self, f: impl FnOnce(&mut dyn Read) -> anyhow::Result<T> + Send + 'static) -> anyhow::Result<T> {
+        let (rtx, rrx) = mpsc::channel();
+        let asked = Instant::now();
+        let job: ReadJob = Box::new(move |r| {
+            let _ = rtx.send(f(r));
+        });
+        self.send_read(job)?;
         match rrx.recv_timeout(READ_WAIT) {
             Ok(answer) => {
                 self.meter.waited(asked.elapsed());
@@ -983,6 +1350,29 @@ impl Store {
     pub fn kept(&self, session: &str, last: usize) -> anyhow::Result<Option<Kept>> {
         let s = session.to_owned();
         self.run(move |e| e.kept(&s, last))
+    }
+
+    /// The initial viewer window and the change-feed position at the same writer boundary.
+    pub(crate) fn viewer_snapshot(&self, session: &str, last: usize) -> anyhow::Result<(u64, String, Option<Kept>)> {
+        let (session, store) = (session.to_owned(), self.id().to_owned());
+        self.run(move |engine| {
+            let (epoch, reset) = engine.viewer_generation(&session)?;
+            Ok((engine.top(), format!("{store}.{epoch}.{reset}.{session}"), engine.kept(&session, last)?))
+        })
+    }
+
+    pub(crate) fn viewer_page(&self, session: String, cursor: String, before: u64, limit: usize) -> anyhow::Result<Option<(u64, Vec<EventRow>)>> {
+        let store = self.id().to_owned();
+        self.run(move |engine| {
+            let (epoch, reset) = engine.viewer_generation(&session)?;
+            if cursor != format!("{store}.{epoch}.{reset}.{session}") { return Ok(None); }
+            Ok(Some((engine.top(), engine.events(&session, Some(before), limit)?)))
+        })
+    }
+
+    pub(crate) fn viewer_changes(&self, session: &str, from: u64, max_bytes: usize) -> anyhow::Result<Changes> {
+        let id = session.to_owned();
+        self.run(move |engine| engine.viewer_changes(&id, from, max_bytes))
     }
 
     /// A session's events before event number `before`. Blocking.
@@ -1149,12 +1539,13 @@ impl Store {
 /// everything sent before it. Rows waited up to `COMMIT_MS` (50 ms) for others to share their commit, or for
 /// `COMMIT_ROWS` (2048) of them.
 #[allow(clippy::too_many_arguments)]
-fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &InboxQueue, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue, reads: Option<&mpsc::Sender<ReadMsg>>) {
+fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &InboxQueue, watchers: &Watchers, upkeep: Upkeep, meter: &Meter, hold: &AtomicI64, queue: &Queue, reads: Option<&ReaderRoute>) {
     let keep_closed = upkeep.keep_closed;
     // The hold on letting records go as it last looked: one moved later lets more go, so it looks
     // again.
     let mut held = hold.load(Ordering::Acquire);
     let mut pending: Vec<Row> = Vec::new();
+    let mut pending_acks: Vec<mpsc::Sender<bool>> = Vec::new();
     // The bytes `pending` holds, as the queue counted them.
     let mut pending_bytes = 0usize;
     // Lines kept before lines were compressed may be left: compressed while nothing else waits.
@@ -1166,8 +1557,11 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &Inbox
     let mut compacting: Option<Instant> = None;
     // When it last looked at its file for its telemetry, and counted its sessions.
     let (mut looked, mut counted): (Option<Instant>, Option<Instant>) = (None, None);
-    let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>, pending_bytes: &mut usize| {
+    let commit = |engine: &mut Box<dyn Engine>, pending: &mut Vec<Row>, pending_acks: &mut Vec<mpsc::Sender<bool>>, pending_bytes: &mut usize| {
         if pending.is_empty() {
+            for tx in pending_acks.drain(..) {
+                let _ = tx.send(true);
+            }
             return;
         }
         let rows = rows::coalesce(std::mem::take(pending));
@@ -1191,8 +1585,12 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &Inbox
         }
         #[cfg(test)]
         queue.counted_when_told.store(meter.report("").commits, Ordering::Relaxed);
-        queue.let_go(std::mem::take(pending_bytes), applied.is_ok());
-        if applied.is_ok() {
+        let ok = applied.is_ok();
+        queue.let_go(std::mem::take(pending_bytes), ok);
+        for tx in pending_acks.drain(..) {
+            let _ = tx.send(ok);
+        }
+        if ok {
             notify(watchers);
         }
     };
@@ -1218,7 +1616,10 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &Inbox
         match done {
             Ok(results) => {
                 for (job, result) in taken.into_iter().zip(results) {
-                    let InboxJob { tx, owner, reply, .. } = *job;
+                    let InboxJob { tx, owner, reply, sessions } = *job;
+                    if result.is_ok() && !tx.writes.is_empty() {
+                        queue.outbox.committed(sessions);
+                    }
                     drop((tx, owner));
                     let _ = reply.send(Ok(result));
                 }
@@ -1241,27 +1642,22 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &Inbox
             notify(watchers);
         }
     };
-    let drain_inbox = |engine: &mut Box<dyn Engine>, inbox: &mut Vec<Box<InboxJob>>| {
-        loop {
-            let ops: Vec<InboxOp> = {
-                let mut st = inbox_q.lock();
-                if st.queue.is_empty() {
-                    return;
-                }
-                st.queue.drain(..).collect()
-            };
-            for op in ops {
-                match op {
-                    InboxOp::Commit(job) => inbox.push(job),
-                    InboxOp::Run(f) => {
-                        commit_inbox(engine, inbox);
-                        f(engine.as_mut());
-                        meter.ran();
-                    }
+    let mut intake = std::collections::VecDeque::new();
+    let mut drain_inbox = |engine: &mut Box<dyn Engine>, inbox: &mut Vec<Box<InboxJob>>| {
+        // Capture only the generation already waiting. Arrivals during this transaction wake the
+        // next pass, giving a queued control or ordinary row batch a turn under continuous load.
+        std::mem::swap(&mut intake, &mut inbox_q.lock().queue);
+        for op in intake.drain(..) {
+            match op {
+                InboxOp::Commit(job) => inbox.push(job),
+                InboxOp::Run(f) => {
+                    commit_inbox(engine, inbox);
+                    f(engine.as_mut());
+                    meter.ran();
                 }
             }
-            commit_inbox(engine, inbox);
         }
+        commit_inbox(engine, inbox);
     };
     let mut inbox: Vec<Box<InboxJob>> = Vec::new();
     const DRAIN_MSGS_MAX: usize = 64;
@@ -1294,10 +1690,17 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &Inbox
                             #[cfg(test)]
                             queue.took_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
                         }
+                        Msg::RowsAck(rows, bytes, ack) => {
+                            pending.extend(rows);
+                            pending_bytes += bytes;
+                            pending_acks.push(ack);
+                            #[cfg(test)]
+                            queue.took_on.store(queue.woke.load(Ordering::Relaxed), Ordering::Relaxed);
+                        }
                         Msg::InboxWake => drain_inbox(&mut engine, &mut inbox),
                         Msg::Run(f) => {
                             drain_inbox(&mut engine, &mut inbox);
-                            commit(&mut engine, &mut pending, &mut pending_bytes);
+                            commit(&mut engine, &mut pending, &mut pending_acks, &mut pending_bytes);
                             f(engine.as_mut());
                             meter.ran();
                         }
@@ -1306,13 +1709,13 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &Inbox
                                 inbox_q.lock().stopped = true;
                             }
                             drain_inbox(&mut engine, &mut inbox);
-                            commit(&mut engine, &mut pending, &mut pending_bytes);
+                            commit(&mut engine, &mut pending, &mut pending_acks, &mut pending_bytes);
                             // Its files closed before it says so, its reader's first: whoever moves them next finds them
                             // let go of.
                             if let Some(reads) = reads {
                                 let (done, stopped) = mpsc::channel();
                                 if reads.send(ReadMsg::Stop(done)).is_ok() {
-                                    let _ = stopped.recv_timeout(READ_WAIT);
+                                    let _ = stopped.recv();
                                 }
                             }
                             let released = engine.release();
@@ -1327,7 +1730,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &Inbox
                     next = rx.try_recv().ok();
                 }
                 drain_inbox(&mut engine, &mut inbox);
-                commit(&mut engine, &mut pending, &mut pending_bytes);
+                commit(&mut engine, &mut pending, &mut pending_acks, &mut pending_bytes);
             }
             // Nothing waits (each commit took all there was): the file's upkeep.
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1342,28 +1745,51 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &Inbox
                     }
                 } else if let Some(compact_began) = compacting {
                     let swapping = engine.compact_ready();
+                    let mut detached_ok = true;
                     if swapping
                         && let Some(reads) = reads
                     {
                         let (done, detached) = mpsc::channel();
                         if reads.send(ReadMsg::Detach(done)).is_ok() {
-                            let _ = detached.recv_timeout(READ_WAIT);
+                            detached_ok = detached.recv_timeout(READ_WAIT).is_ok();
                         }
                     }
+                    // Never swap the file out from under a still-attached reader: wait for the next
+                    // idle pass if Detach timed out.
+                    if swapping && !detached_ok {
+                        if let (Some(route), Some(reader)) = (reads, engine.reader()) {
+                            let _ = route.send(ReadMsg::Use(reader));
+                        }
+                        tracing::warn!("conversation store: reader detach timed out before compaction swap; deferring");
+                        continue;
+                    }
+                    let reattach_or_stop = |reads: Option<&ReaderRoute>, reader: Option<Box<dyn Read + Send>>| {
+                        let Some(reads) = reads else { return };
+                        match reader {
+                            Some(r) => {
+                                let _ = reads.send(ReadMsg::Use(r));
+                            }
+                            None => {
+                                // Stop the reader thread cleanly if no replacement reader could be
+                                // opened so subsequent reads fall back to `OnWriter` instead of
+                                // waiting for an unavailable reader.
+                                let (done, stopped) = mpsc::channel();
+                                if reads.send(ReadMsg::Stop(done)).is_ok() {
+                                    let _ = stopped.recv_timeout(READ_WAIT);
+                                }
+                            }
+                        }
+                    };
                     engine = match engine.compact_some(upkeep.compact.unwrap_or(COMPACT_MIN_FREE), COMPACT_STEP) {
                         Ok((e, Compacting::Going)) => {
-                            if swapping
-                                && let (Some(reads), Some(reader)) = (reads, e.reader())
-                            {
-                                let _ = reads.send(ReadMsg::Use(reader));
+                            if swapping {
+                                reattach_or_stop(reads, e.reader());
                             }
                             e
                         }
                         Ok((e, done)) => {
-                            if (swapping || matches!(done, Compacting::Done { .. }))
-                                && let (Some(reads), Some(reader)) = (reads, e.reader())
-                            {
-                                let _ = reads.send(ReadMsg::Use(reader));
+                            if swapping || matches!(done, Compacting::Done { .. }) {
+                                reattach_or_stop(reads, e.reader());
                             }
                             if let Compacting::Done { before, after } = done {
                                 tracing::info!(before, after, "conversation store: its file was made compact");
@@ -1407,7 +1833,7 @@ fn writer(mut engine: Box<dyn Engine>, rx: &mpsc::Receiver<Msg>, inbox_q: &Inbox
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                commit(&mut engine, &mut pending, &mut pending_bytes);
+                commit(&mut engine, &mut pending, &mut pending_acks, &mut pending_bytes);
                 return;
             }
         }
@@ -1554,7 +1980,7 @@ pub fn scratch() -> anyhow::Result<(tempfile::TempDir, Store)> {
 #[cfg(test)]
 pub fn stopped() -> Store {
     let (tx, _) = mpsc::channel();
-    Store { tx, queue: Arc::default(), inbox_q: Arc::default(), id: "stopped".into(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), reads: None }
+    Store { tx, queue: Arc::default(), inbox_q: Arc::default(), id: "stopped".into(), outbox_drains: Arc::default(), meter: Arc::default(), watchers: Arc::default(), hold: Arc::new(AtomicI64::new(i64::MAX)), reads: None }
 }
 
 /// An engine that takes `hold` longer than `inner` to let go of its file ([`Engine::release`]), its
@@ -1652,6 +2078,112 @@ mod tests {
 
     fn said(id: &str, seq: u64, text: &str) -> Update {
         Update::Events { events: vec![Event { id: id.into(), seq, at: 1_000 + seq as i64, parent: None, by: None, body: Body::Assistant { text: text.into(), streaming: false } }] }
+    }
+
+    #[test]
+    fn cp_t3_2_receipt_retry_waits_for_cancelled_call_without_tying_up_other_session_workers() -> anyhow::Result<()> {
+        let (_dir, store) = scratch()?;
+        crate::rt::block_on(async move {
+            let (entered, started) = futures::channel::oneshot::channel();
+            let (release, finish) = std::sync::mpsc::channel();
+            let first = Box::pin(store.with_outbox_drain("busy", move || { let _ = entered.send(()); finish.recv_timeout(INBOX_WAIT)?; Ok(()) }));
+            match futures::future::select(started, first).await {
+                futures::future::Either::Left((started, request)) => { started?; drop(request); }
+                futures::future::Either::Right(_) => anyhow::bail!("the request returned before its quorum wait"),
+            }
+            let places = hyper_rt::blocking::occupancy(crate::rt::SHARE_SESSION).ok_or_else(|| anyhow::anyhow!("no session share"))?.places;
+            let mut requests = Vec::with_capacity(places);
+            for _ in 0..places {
+                let mut request = Box::pin(store.with_outbox_drain("busy", || Ok(())));
+                anyhow::ensure!(futures::poll!(&mut request).is_pending(), "a cancelled issuer released its in-flight receipt");
+                requests.push(request);
+            }
+            if places > 1 {
+                crate::rt::timeout(INBOX_WAIT, store.with_outbox_drain("free", || Ok(()))).await??;
+            }
+            release.send(())?;
+            for request in requests { request.await?; }
+            anyhow::ensure!(store.outbox_drains.lock().is_empty(), "a completed session retained its receipt lane");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn cp_t3_2_concurrent_receipts_cannot_pass_a_blocked_write_with_its_tombstone() -> anyhow::Result<()> {
+        let (_dir, store) = scratch()?;
+        store.enable_inbox_replication()?;
+        let _watch = store.watch_outbox();
+        let row = |value| {
+            Row::Inbox(Box::new(super::super::rows::InboxRow {
+                session: "s".into(),
+                family: "item".into(),
+                key: b"s/m".to_vec(),
+                value,
+            }))
+        };
+        store.journal_raft_rows("s", 0, vec![row(Some(b"original".to_vec()))])?;
+        let (entered, first_pending) = std::sync::mpsc::sync_channel(0);
+        let (release, may_commit) = std::sync::mpsc::sync_channel(0);
+        let (attempt, second_pending) = std::sync::mpsc::sync_channel(0);
+        let submitted = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        std::thread::scope(|threads| -> anyhow::Result<()> {
+            let first_store = store.clone();
+            let first_log = submitted.clone();
+            let first = threads.spawn(move || {
+                first_store.replicate_inbox("s", 0, |rows| {
+                    entered.send(())?;
+                    may_commit.recv_timeout(INBOX_WAIT)?;
+                    first_log.lock().extend(rows);
+                    Ok(())
+                })
+            });
+            first_pending.recv_timeout(INBOX_WAIT)?;
+            // No writer is held by the quorum wait. The next transaction commits locally.
+            store.journal_raft_rows("s", 0, vec![row(None)])?;
+            let second_store = store.clone();
+            let second_log = submitted.clone();
+            let second = threads.spawn(move || {
+                attempt.send(())?;
+                second_store.replicate_inbox("s", 0, |rows| {
+                    second_log.lock().extend(rows);
+                    Ok(())
+                })
+            });
+            second_pending.recv_timeout(INBOX_WAIT)?;
+            release.send(())?;
+            first.join().map_err(|_| anyhow::anyhow!("first receipt thread stopped"))??;
+            second.join().map_err(|_| anyhow::anyhow!("second receipt thread stopped"))??;
+            Ok(())
+        })?;
+        assert_eq!(submitted.lock().as_slice(), [row(Some(b"original".to_vec())), row(None)]);
+        assert!(store.pending_inbox_sessions()?.is_empty());
+        assert_eq!(store.take_changed_outbox(), std::collections::HashSet::from(["s".to_owned()]));
+        assert!(store.take_changed_outbox().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cp_t3_2_late_reader_detach_routes_reads_and_cannot_overtake_reopen() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let t = super::super::turso::Turso::open(&dir.path().join("conversations.db"))?;
+        let replacement = t.reader().ok_or_else(|| anyhow::anyhow!("no reader"))?;
+        let store = Store::start(Box::new(t), Upkeep::default())?;
+        let route = store.reads.as_ref().ok_or_else(|| anyhow::anyhow!("no reader route"))?;
+        let (release, blocked) = mpsc::channel();
+        let (done, detached) = mpsc::channel();
+        route.send(ReadMsg::Run(Box::new(move |_| { let _ = blocked.recv(); }))).map_err(|_| anyhow::anyhow!("reader stopped"))?;
+        route.send(ReadMsg::Detach(done)).map_err(|_| anyhow::anyhow!("reader stopped"))?;
+        // The writer remains available even if its reader is still serving the prior job.
+        assert_eq!(store.read(|_| Ok(17))?,17);
+        assert!(matches!(detached.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        route.send(ReadMsg::Use(replacement)).map_err(|_| anyhow::anyhow!("reader stopped"))?;
+        let (reply, received) = mpsc::channel();
+        route.send(ReadMsg::Run(Box::new(move |_| { let _ = reply.send(()); }))).map_err(|_| anyhow::anyhow!("reader stopped"))?;
+        release.send(())?;
+        detached.recv_timeout(READ_WAIT)?;
+        received.recv_timeout(READ_WAIT)?;
+        store.close()?;
+        Ok(())
     }
 
     /// Plan 01a1cc09, step 2: a store's read of what's committed goes beside its writer: one asked while the writer is

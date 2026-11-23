@@ -13,6 +13,7 @@
 
 pub mod code;
 pub mod rpc;
+pub(crate) mod session_node;
 pub mod skills;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -354,7 +355,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
         Question::Registry { session, terminal } | Question::Call { session, terminal, .. } => (session.as_str(), terminal.as_str()),
         Question::Page { session, .. } | Question::Stream { session, .. } | Question::Act { session, .. } | Question::Told { session, .. } | Question::Answer { session, .. } => (session.as_str(), ""),
         // The hub answers these itself (`Hub::on_read`).
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } | Question::Lessor { .. } => return json!({"error": "not a question for kiln's operations"}),
+        Question::SessionPlacement { .. } | Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } | Question::Lessor { .. } => return json!({"error": "not a question for kiln's operations"}),
     };
     // The person in one of its kiln shells (`kiln spawn --on`, `kiln agents wait`), for a call.
     let caller = if session.is_empty() && !terminal.is_empty() && matches!(ask, Question::Call { .. }) {
@@ -491,7 +492,7 @@ async fn runner_ask_checked(hub: &Arc<Hub>, runner: &str, peer: crate::instances
         Question::Act { .. } | Question::Told { .. } | Question::Answer { .. } => json!({"ok": {}}),
         Question::Directory => json!({ "runners": hub.directory().await }),
         Question::Unread { session, what, code, why } => runner_unread(hub, runner, session, what, *code, why).await,
-        Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } | Question::Lessor { .. } => json!({"error": "not a question for kiln's operations"}),
+        Question::SessionPlacement { .. } | Question::Keep { .. } | Question::Holds { .. } | Question::Holders { .. } | Question::Sizes { .. } | Question::Measured { .. } | Question::Custody { .. } | Question::Lessor { .. } => json!({"error": "not a question for kiln's operations"}),
     };
     let size = answer.to_string().len();
     if size > RUNNER_ANSWER_MAX {

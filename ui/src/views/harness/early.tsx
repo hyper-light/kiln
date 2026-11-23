@@ -132,6 +132,12 @@ export function EarlyLine({ id, start }: { id: string; start: Start }) {
     putBack(start);
     void navigate("/agents");
   };
+  if (start.state === "held")
+    return (
+      <p className="ag-early-line" role="status">
+        {start.why}
+      </p>
+    );
   if (start.state === "failed")
     return (
       <div className="hx-startfail" role="alert">

@@ -94,9 +94,11 @@ function AgentConsole({ id }: { id: string }) {
   useSession(store, (s) => s.ready);
   // Started from Mission control a moment ago (starting.ts): its page shows it starting, with what
   // it was asked, until its machine has it, or why it couldn't (W21-R15).
-  const start = useStart(id);
+  const batch = useStart(id);
+  const slot = batch?.slots?.find((s) => s.id === id);
+  const start = batch && slot ? { ...batch, state: slot.outcome === "refused" ? ("failed" as const) : slot.outcome === "held" ? ("held" as const) : ("started" as const), why: slot.why } : batch;
   // A server that made the agent's id itself: its own page, under that one.
-  const made = start?.started?.[start.ids.indexOf(id)]?.id;
+  const made = start?.slots ? id : start?.started?.[start.ids.indexOf(id)]?.id;
   if (made && made !== id) return <Navigate to={`/agents/${made}`} replace />;
   // One that couldn't: its page says why, there being no conversation to wait for.
   if (start?.state === "failed") return <AgentLoading id={id} start={start} />;

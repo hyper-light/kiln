@@ -61,12 +61,15 @@ enum Ask {
 }
 
 /// The waits, as the registry holds them: what reaches their owner, and their count.
+type Requests = parking_lot::Mutex<std::collections::HashMap<String, (String, String, oneshot::Sender<crate::reach::wire::P2pSendReply>)>>;
+
 pub struct Answers {
     tx: crate::memory::queue::Sender<Ask>,
     /// The messages waited on, as the owner keeps them, and the waits on their way to it: what the bound
     /// counts.
     counted: Arc<AtomicUsize>,
     most: usize,
+    routed: Arc<Requests>,
 }
 
 impl Answers {
@@ -79,7 +82,7 @@ impl Answers {
         // (`crate::rt::spawn_spread_joined`, goal 9's rule); it ends as the registry goes, its queue's senders
         // with it. Its handle isn't needed: dropped, the task goes on.
         drop(crate::rt::spawn_spread_joined(own(rx, Arc::clone(&counted))));
-        Self { tx, counted, most }
+        Self { tx, counted, most, routed: Default::default() }
     }
 
     /// Waits for the answer to message `message` sent to session `id`: none when too many wait already, once
@@ -130,6 +133,20 @@ impl Answers {
         let (tx, rx) = oneshot::channel();
         self.tx.try_send(Ask::WentTo { key: (id.to_owned(), message.to_owned()), tx }).ok()?;
         rx.await.ok().flatten()
+    }
+
+    pub fn request(&self, peer: &str, session: &str) -> Option<(RouteGuard, oneshot::Receiver<crate::reach::wire::P2pSendReply>)> {
+        if !self.count() { return None; }
+        let (tx, rx) = oneshot::channel();
+        let id = crate::util::new_id();
+        self.routed.lock().insert(id.clone(), (peer.into(), session.into(), tx));
+        Some((RouteGuard { id, requests: self.routed.clone(), counted: self.counted.clone() }, rx))
+    }
+
+    pub fn complete(&self, peer: &str, session: &str, id: &str, reply: crate::reach::wire::P2pSendReply) {
+        let mut requests = self.routed.lock();
+        if requests.get(id).is_some_and(|(p, s, _)| p == peer && s == session)
+            && let Some((_, _, tx)) = requests.remove(id) { let _ = tx.send(reply); }
     }
 
     /// One more counted, if the bound has room for it.
@@ -228,6 +245,18 @@ async fn own(rx: crate::memory::queue::Receiver<Ask>, counted: Arc<AtomicUsize>)
                 let _ = tx.send(waiting.values().map(Vec::len).sum());
             }
         }
+    }
+}
+
+pub struct RouteGuard {
+    pub id: String,
+    requests: Arc<Requests>,
+    counted: Arc<AtomicUsize>,
+}
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        self.requests.lock().remove(&self.id);
+        uncount(&self.counted, 1);
     }
 }
 

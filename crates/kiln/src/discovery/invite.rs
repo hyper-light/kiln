@@ -312,6 +312,7 @@ mod tests {
 
     fn request(id: &str, host: &str, address: &str, status: crate::join::Status) -> crate::join::Listed {
         crate::join::Listed {
+            session_node: false,
             id: id.into(),
             name: host.into(),
             hostname: host.into(),

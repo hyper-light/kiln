@@ -478,17 +478,24 @@ pub fn session_up(text: &str) -> Result<SessionUp, Unreadable> {
     }
     let new = |id, refused| Unreadable { id, bare: false, refused };
     match o.get("t") {
+        None if o.contains_key("target") => Err(Unreadable { id: None, bare: true, refused: Refused::malformed("command", "a directed command requires a request envelope") }),
         None => tagged(Value::Object(o), "type", "command").map(SessionUp::Bare).map_err(|refused| Unreadable { id: None, bare: true, refused }),
         Some(Value::String(t)) if t == "cmd" => {
             let Some(id) = command_id(o.get("id")) else {
                 return Err(new(None, Refused::malformed("cmd", format!("a command's id is 1 to {} bytes with no control characters", crate::harness::ops::KEY_MAX))));
             };
-            let target = match o.get("target") {
-                None | Some(Value::Null) => None,
-                Some(Value::String(s)) if !s.trim().is_empty() && s.len() <= crate::harness::ops::KEY_MAX && !s.chars().any(char::is_control) => Some(s.trim().to_owned()),
-                Some(_) => return Err(new(Some(id), Refused::malformed("cmd", "its `target` isn't a valid runner target string"))),
-            };
             let Some(c) = o.get("c").cloned() else { return Err(new(Some(id), Refused::malformed("cmd", "no command (`c`)"))) };
+            let read_target = |v: Option<&Value>| match v {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) if !s.trim().is_empty() && s.len() <= crate::harness::ops::KEY_MAX && !s.chars().any(char::is_control) => Ok(Some(s.trim().to_owned())),
+                Some(_) => Err(new(Some(id.clone()), Refused::malformed("cmd", "its `target` isn't a valid runner target string"))),
+            };
+            let outer = read_target(o.get("target"))?;
+            let inner = read_target(c.get("target"))?;
+            if matches!((&outer, &inner), (Some(a), Some(b)) if a != b) {
+                return Err(new(Some(id), Refused::malformed("cmd", "the envelope and command specify different target nodes")));
+            }
+            let target = outer.or(inner);
             match tagged(c, "type", "command") {
                 Ok(c) => Ok(SessionUp::Under { t: Cmd::Cmd, id, c, target }),
                 Err(refused) => Err(new(Some(id), refused)),

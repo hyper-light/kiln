@@ -236,7 +236,7 @@ impl Inbox {
             return Err(unavailable(session, "mail import does not match the offered destination"));
         }
         let original = match &pending.command {
-            Some(command) => crate::harness::host::message_of(command).is_some_and(|identity| identity.0 == pending.lease.message && (identity.1 == pending.digest || (pending.origin == super::Origin::LegacyRetained && pending.lease.token.is_none() && pending.digest.is_empty()))),
+            Some(command) => crate::harness::host::message_of(command).is_some_and(|identity| identity.0 == pending.lease.message && (super::same_digest(&pending.digest, &identity.1) || (pending.origin == super::Origin::LegacyRetained && pending.lease.token.is_none() && pending.digest.is_empty()))),
             None => pending.origin == super::Origin::LegacyOpaque && pending.current.is_none() && pending.lease.token.is_none() && pending.lease.stage == crate::harness::admission::Stage::ProviderFlight,
         };
         if !original || pending.lease.epoch != manifest.source_epoch || pending.accepted_seq.is_none() {
@@ -290,6 +290,7 @@ impl Inbox {
         self.verify_import(manifest).await?;
         let mut after = None;
         while let Some((cursor, mut pending)) = self.transfer_pending_next(manifest, after).await? {
+            pending.accepted_epoch.get_or_insert(pending.lease.epoch);
             pending.lease.epoch = manifest.destination_epoch;
             let key = message_key(session, &pending.lease.message);
             let value = super::json(session, &pending)?;

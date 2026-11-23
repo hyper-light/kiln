@@ -95,6 +95,44 @@ pub const MIGRATIONS: &[&str] = &[
     // and ended keyset pagination (`closed_at IS NOT NULL ORDER BY closed_at, id`).
     "CREATE INDEX IF NOT EXISTS sessions_closed_updated ON sessions (closed_at, updated_at);
     CREATE INDEX IF NOT EXISTS sessions_closed_id ON sessions (closed_at, id);",
+    // 7: CP-T3.2. Local inbox transactions waiting for quorum. Acknowledgment removes the whole
+    // session transaction; the ordinary feed's revision alone cannot reproduce overwritten rows.
+    "CREATE INDEX inbox_by_session_rev ON inbox(session, rev);
+     CREATE TABLE inbox_outbox(session TEXT NOT NULL, rev INTEGER NOT NULL, ord INTEGER NOT NULL,
+        family TEXT NOT NULL, key BLOB NOT NULL, value BLOB, epoch INTEGER, row_body BLOB,
+        PRIMARY KEY(session, rev, ord));
+     CREATE INDEX inbox_outbox_key ON inbox_outbox(session, family, key);
+     CREATE TABLE convo_raft_state(session TEXT PRIMARY KEY, applied INTEGER NOT NULL, term INTEGER NOT NULL, complete INTEGER NOT NULL, inbox_epoch INTEGER);
+     CREATE TABLE convo_raft_cells(session TEXT NOT NULL, kind TEXT NOT NULL, source BLOB NOT NULL, id BLOB NOT NULL, n INTEGER NOT NULL, body BLOB NOT NULL,
+        PRIMARY KEY(session, kind, source, id));
+     CREATE INDEX convo_raft_order ON convo_raft_cells(session, kind, source, n, id);",
+    // 8: W21-R02. Viewer catch-up seeks the one session on each revision index.
+    "CREATE INDEX events_by_session_rev ON events(session, rev);
+     CREATE INDEX drops_by_session_rev ON drops(session, rev);",
+    // 9: a node upgrading from speculative Tee writes repairs each existing timeline once.
+    "ALTER TABLE convo_raft_state ADD COLUMN verify_events INTEGER NOT NULL DEFAULT 1;",
+    // 10: events can share a sequence after replacement or rewind. Replicas preserve the
+    // original commit order at that sequence so recovery presents the same latest event.
+    "ALTER TABLE convo_raft_cells ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0;
+     UPDATE convo_raft_cells SET ordinal=COALESCE((SELECT e.rev FROM events e WHERE e.session=convo_raft_cells.session AND e.id=CAST(convo_raft_cells.id AS TEXT)),0) WHERE kind='event';
+     DROP INDEX convo_raft_order;
+     CREATE INDEX convo_raft_order ON convo_raft_cells(session,kind,source,n,ordinal,id);",
+    // 11: CP-T3.2. Recovery can fence originals against the committed owner even when an
+    // older speculative mirror omitted or replaced its visible sessions.machine. Recheck all
+    // older working row families once on the next committed ownership change.
+    "ALTER TABLE convo_raft_state ADD COLUMN owner TEXT;
+     UPDATE convo_raft_state SET owner=(SELECT machine FROM sessions WHERE id=convo_raft_state.session),verify_events=1 WHERE applied>0;",
+    // 12: only a database that already possessed its stable ID on upgrade may attest to a
+    // pre-charter holder's historical namespace. A reinstalled empty store cannot prove absence.
+    "CREATE TABLE convo_name_origin(store_id TEXT PRIMARY KEY NOT NULL);
+     INSERT INTO convo_name_origin(store_id) SELECT value FROM meta WHERE key='id' AND value<>'';",
+    // 13: the same position can occur on different provisional founders. Bind the
+    // committed projection and custody to the exact founding WAL operation.
+    "ALTER TABLE convo_raft_state ADD COLUMN genesis BLOB;",
+    // 14: each former executor confirms its own durable admission fence independently of
+    // the replicated head, which now belongs to the newly elected owner.
+    "CREATE TABLE convo_local_owner_fence(session TEXT PRIMARY KEY, epoch INTEGER NOT NULL);",
+
 ];
 
 // Each session's inbox and journal (migration 5): a row as it is now, a deleted one kept empty for the feed.
@@ -105,6 +143,9 @@ pub const INBOX_SCAN: &str = "SELECT key, value, rev FROM inbox WHERE family = ?
 pub const INBOX_PUT: &str = "INSERT INTO inbox (family, key, session, value, rev) VALUES (?1, ?2, ?3, ?4, ?5)
     ON CONFLICT (family, key) DO UPDATE SET session = excluded.session, value = excluded.value, rev = excluded.rev";
 pub const INBOX_DELETE: &str = "UPDATE inbox SET value = NULL, rev = ?3 WHERE family = ?1 AND key = ?2 AND value IS NOT NULL";
+/// Every inbox row of a session including delete tombstones (`value IS NULL`) so Raft replication
+/// removes deleted pending rows on followers instead of leaving delivered messages looking waiting.
+pub const INBOX_SESSION_ALL: &str = "SELECT family, key, value FROM inbox WHERE session = ?1 ORDER BY rev ASC";
 /// The rows of one commit (its number), as they are now: what a page that cut it short didn't read.
 pub const INBOX_AT: &str = "SELECT rev, * FROM inbox WHERE rev = ?1";
 
@@ -194,6 +235,18 @@ pub const EVENTS_BEFORE_BY_SEQ: &str = "SELECT session, id, seq, at, parent, by,
 pub const EVENTS_LAST_BY_SEQ: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev FROM events INDEXED BY events_by_seq WHERE session = ?1 ORDER BY seq DESC LIMIT ?2";
 /// Every event of a session numbered `?2`, each with its durable revision last.
 pub const EVENTS_AT: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev FROM events INDEXED BY events_by_seq WHERE session = ?1 AND seq = ?2";
+/// Ascending keyset cursor for Raft snapshot construction (first page): index-seeks directly on
+/// `events_by_seq(session, seq)` in O(log N) for `seq <= ?2`.
+pub const EVENTS_SNAPSHOT_FIRST: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rowid FROM events INDEXED BY events_by_seq WHERE session = ?1 AND seq <= ?2 ORDER BY seq ASC, rowid ASC LIMIT ?3";
+/// Ascending keyset cursor for Raft snapshot construction (subsequent pages): seeks directly to
+/// `(session, seq >= ?3)` on `events_by_seq` in O(log N) on every page while handling arbitrary
+/// duplicate `seq` ties at page boundaries via `(seq > ?3 OR rowid > ?4)` without scanning from 0.
+pub const EVENTS_SNAPSHOT_AFTER: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rowid FROM events INDEXED BY events_by_seq WHERE session = ?1 AND seq >= ?3 AND seq <= ?2 AND (seq > ?3 OR rowid > ?4) ORDER BY seq ASC, rowid ASC LIMIT ?5";
+/// Atomic session snapshot wipe statements (run inside one transaction before replaying snapshot rows
+/// so deleted inbox keys and deleted record sources are never left behind on an installing follower).
+pub const SNAPSHOT_CLEAR_EVENTS: &str = "DELETE FROM events WHERE session = ?1";
+pub const SNAPSHOT_CLEAR_RECORDS: &str = "DELETE FROM records WHERE session = ?1";
+pub const SNAPSHOT_CLEAR_INBOX: &str = "DELETE FROM inbox WHERE session = ?1";
 
 /// The columns an event row is read from, in this order.
 pub const EVENT_COLUMNS: usize = 12;
@@ -269,6 +322,9 @@ pub const FEED_SESSIONS: &str = "SELECT id, info, meta, state, changes, updated_
 pub const FEED_EVENTS: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev FROM events WHERE rev > ?1 ORDER BY rev LIMIT ?2";
 pub const FEED_RECORDS: &str = "SELECT session, source, n, line_end, line, rev FROM records WHERE rev > ?1 ORDER BY rev LIMIT ?2";
 pub const FEED_DROPS: &str = "SELECT rev, session, what, source, n, at FROM drops WHERE rev > ?1 ORDER BY rev LIMIT ?2";
+pub const VIEW_SESSIONS: &str = "SELECT id, info, meta, state, changes, updated_at, closed_at, epoch, rev, machine FROM sessions WHERE id = ?3 AND rev > ?1 ORDER BY rev LIMIT ?2";
+pub const VIEW_EVENTS: &str = "SELECT session, id, seq, at, parent, by, kind, level, tool, status, text, body, rev FROM events INDEXED BY events_by_session_rev WHERE session = ?3 AND rev > ?1 ORDER BY rev LIMIT ?2";
+pub const VIEW_DROPS: &str = "SELECT rev, session, what, source, n, at FROM drops INDEXED BY drops_by_session_rev WHERE session = ?3 AND rev > ?1 AND what != 'record' ORDER BY rev LIMIT ?2";
 pub const FEED_INBOX: &str = "SELECT session, family, key, value, rev FROM inbox WHERE rev > ?1 ORDER BY rev LIMIT ?2";
 /// The rest of one inbox commit a page of the feed cut short (its rows share its number).
 pub const FEED_INBOX_AT: &str = "SELECT session, family, key, value, rev FROM inbox WHERE rev = ?1";

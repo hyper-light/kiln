@@ -35,6 +35,8 @@ pub struct Route {
 struct Carried {
     #[serde(default)]
     route: Option<Route>,
+    #[serde(default)]
+    relayed: Option<serde::de::IgnoredAny>,
 }
 
 impl Route {
@@ -63,7 +65,12 @@ impl Route {
     /// The route the JSON of a command as a runner was sent it carries: none when it carries none (sent as before
     /// routing), or it can't be read.
     pub fn of(raw: &str) -> Option<Self> {
-        serde_json::from_str::<Carried>(raw).ok()?.route
+        Self::with_proof(raw).map(|(route, _)| route)
+    }
+
+    pub(crate) fn with_proof(raw: &str) -> Option<(Self, bool)> {
+        let carried = serde_json::from_str::<Carried>(raw).ok()?;
+        Some((carried.route?, carried.relayed.is_some()))
     }
 
     /// `raw` with its route replaced by this one (the same message, sent on).

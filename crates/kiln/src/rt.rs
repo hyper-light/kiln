@@ -920,6 +920,10 @@ fn quantum_us_ns(v: &str) -> Result<u64, String> {
 /// The blocking pool's shares.
 pub const SHARE_FS: &str = "fs";
 pub const SHARE_STORE: &str = "store";
+/// CP-T3.2. Session quorum waits can stop until another machine replies. Give each
+/// runtime shard a place to submit one concurrently, independent of the filesystem,
+/// DNS and database work needed to receive and apply those replies.
+pub const SHARE_SESSION: &str = "session";
 
 struct Rt {
     /// Held for the life of the process, never read: dropping it would stop the shards.
@@ -936,12 +940,14 @@ fn start() -> Result<Rt, String> {
     // Each job's wait and run, by share, on /metrics: what the shares' sizes are derived from (goal 3, plan
     // 01a1a59c2a8e step 4; `crate::pool_health`).
     let _ = hyper_rt::blocking::observe(crate::pool_health::blocking_job);
+    let sessions = usize::from(p.shards);
     let pool = hyper_rt::blocking::Config {
-        workers: dns + store + fs,
+        workers: dns + store + fs + sessions,
         shares: vec![
             hyper_rt::blocking::Share { name: hyper_rt::dns::SHARE, limit: dns, waiting: 256 },
             hyper_rt::blocking::Share { name: SHARE_STORE, limit: store, waiting: 16_384 },
             hyper_rt::blocking::Share { name: SHARE_FS, limit: fs, waiting: 8_192 },
+            hyper_rt::blocking::Share { name: SHARE_SESSION, limit: sessions, waiting: p.tasks_per_shard },
         ],
     };
     match hyper_rt::blocking::start(pool) {
@@ -1972,6 +1978,7 @@ where
                 sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_millis(100));
             }
+            Err(e) if share == SHARE_SESSION => return Err(anyhow::anyhow!("session quorum wait unavailable: {e}")),
             Err(e) => {
                 tracing::warn!(error = %e, share, "blocking pool unavailable; running on a thread");
                 let j = Arc::clone(&job);
@@ -2938,6 +2945,31 @@ impl Signals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CP-T3.2. Even a full set of session quorum waiters leaves a worker available for
+    /// the filesystem traffic those quorums depend on.
+    #[test]
+    fn cp_t3_2_session_quorum_waits_leave_workers_for_replication() -> anyhow::Result<()> {
+        rt()?;
+        let share = hyper_rt::blocking::occupancy(SHARE_SESSION).context("session share missing")?;
+        let (started, running) = std::sync::mpsc::channel();
+        let (finished, received) = std::sync::mpsc::channel();
+        let mut releases = Vec::with_capacity(share.places);
+        for _ in 0..share.places {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            releases.push(release);
+            let started = started.clone();
+            hyper_rt::blocking::run(SHARE_SESSION, move || {
+                let _ = started.send(());
+                let _ = wait.recv();
+            })?;
+        }
+        // Dropping releases also releases the workers if a check times out or fails.
+        for _ in &releases { running.recv_timeout(crate::hub::COMMAND_WITHIN)?; }
+        hyper_rt::blocking::run(SHARE_FS, move || { let _ = finished.send(()); })?;
+        received.recv_timeout(crate::hub::COMMAND_WITHIN)?;
+        Ok(())
+    }
 
     /// Goal 9 (plan 01a1a87b2cec step 3): the step quantum is derived from the lab's measurements, not set. The
     /// floor, the two polls a wake finds at p99.9 on the lab's busiest shard and the host's slice, a quantum each,

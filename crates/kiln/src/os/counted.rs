@@ -8,7 +8,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// What a thread allocated: how many blocks (a reallocation is one), and their bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -30,6 +30,30 @@ fn count(bytes: usize) {
     });
 }
 
+// A single isolated test can measure all its worker threads during a bounded operation.
+static MEASURING: AtomicBool = AtomicBool::new(false);
+static ALLOCS: AtomicU64 = AtomicU64::new(0);
+static REALLOCS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) struct ProcessWindow { allocs: u64, reallocs: u64, faults: Option<super::Faults> }
+impl ProcessWindow {
+    pub fn begin() -> Option<Self> {
+        std::env::var_os("KILN_TEST_TRANSFER_TIMING")?;
+        MEASURING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).ok()?;
+        Some(Self { allocs: ALLOCS.load(Ordering::Relaxed), reallocs: REALLOCS.load(Ordering::Relaxed), faults: super::page_faults() })
+    }
+    pub fn report(self, name: &str) {
+        MEASURING.store(false, Ordering::Release);
+        let allocs = ALLOCS.load(Ordering::Relaxed).saturating_sub(self.allocs);
+        let reallocs = REALLOCS.load(Ordering::Relaxed).saturating_sub(self.reallocs);
+        let faults = self.faults.zip(super::page_faults()).map(|(a,b)| (b.minor.saturating_sub(a.minor), b.major.saturating_sub(a.major)));
+        eprintln!("{name}: {allocs} Rust allocations, {reallocs} reallocations, minor/major faults {faults:?}");
+    }
+}
+impl Drop for ProcessWindow {
+    fn drop(&mut self) { MEASURING.store(false, Ordering::Release); }
+}
+
 /// The system's allocator, each allocation counted on the thread that made it.
 struct Counting;
 
@@ -37,18 +61,21 @@ struct Counting;
 // returns what that returned; the count beside it touches only a thread-local cell.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if MEASURING.load(Ordering::Relaxed) { ALLOCS.fetch_add(1, Ordering::Relaxed); }
         count(layout.size());
         // SAFETY: `layout` as the caller gave it, under `GlobalAlloc::alloc`'s contract.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if MEASURING.load(Ordering::Relaxed) { ALLOCS.fetch_add(1, Ordering::Relaxed); }
         count(layout.size());
         // SAFETY: as `alloc`.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if MEASURING.load(Ordering::Relaxed) { REALLOCS.fetch_add(1, Ordering::Relaxed); }
         count(new_size);
         // SAFETY: `ptr` came from this allocator (so from the system's) with `layout`, as the caller promises.
         unsafe { System.realloc(ptr, layout, new_size) }

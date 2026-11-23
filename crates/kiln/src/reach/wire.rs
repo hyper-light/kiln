@@ -160,6 +160,9 @@ pub enum Say {
     ConvoRaft { session: String, from: String, bytes: Vec<u8> },
 }
 
+/// A read-only lookup on the authenticated harness RPC, including through an older relay.
+pub const SESSION_EPOCH_QUERY: &str = r#"{"kiln":"session_epoch"}"#;
+
 /// Outcome of a peer-to-peer forwarded harness message ([`Ask::HarnessSend`] / [`Say::HarnessSaid`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -172,6 +175,11 @@ pub enum P2pSendReply {
     NoSession,
     /// Transport or decode failure on the receiving runner before acceptance.
     Error { why: String },
+    /// An authenticated read of the destination's current committed ownership.
+    Epoch { epoch: u64 },
+    /// The selected node’s response to a fleet-authorized offline session start.
+    Started { status: u16, value: serde_json::Value },
+    Kinds { kinds: Vec<crate::harness::kinds::KindInfo> },
 }
 
 /// The machine a link reached.

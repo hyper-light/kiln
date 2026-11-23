@@ -367,7 +367,7 @@ pub fn disk_space(dir: &Path) -> io::Result<(u64, u64)> {
 
 /// A file's change time (NTFS's, in 100 ns since 1601: set by every write and attribute change,
 /// never by `SetFileTime`) and its index on its volume: what a stat's ctime and inode are on Unix.
-pub fn file_change(path: &Path) -> io::Result<(i64, u64)> {
+pub(super) fn file_info(path: &Path) -> io::Result<(i64, u64, u64)> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
     let file = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(path)?;
@@ -384,7 +384,7 @@ pub fn file_change(path: &Path) -> io::Result<(i64, u64)> {
     if got_basic == 0 || got_info == 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((basic.change, (u64::from(info.index_high) << 32) | u64::from(info.index_low)))
+    Ok((basic.change, u64::from(info.volume), (u64::from(info.index_high) << 32) | u64::from(info.index_low)))
 }
 
 /// This process's DACL from before [`private_memory`] narrowed it (a self-relative security

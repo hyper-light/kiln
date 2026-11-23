@@ -143,6 +143,7 @@ export type JoinRequestStatus = "pending" | "approved" | "denied";
 
 /** A machine asking to join as an agent (`kiln join`), GET /api/join-requests. */
 export interface JoinRequest {
+  session_node?: boolean;
   id: string;
   name: string;
   hostname: string;
