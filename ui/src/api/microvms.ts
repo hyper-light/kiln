@@ -1,7 +1,7 @@
 /** Runners' engines and their microVMs (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, P2.3, P3.2). */
 import type { Res } from "@/lib/data";
 import { ApiError, request } from "./client";
-import type { ContainerFacts, IsolationFacts, LiveAccess, LiveChange, LiveMember, LivePortKey, LiveProtocol, RunnerEngine } from "./wire";
+import type { ContainerFacts, IsolationFacts, LiveAccess, LiveChange, LiveMember, LivePortKey, LiveProtocol, RunnerEngine, RunnerFacts } from "./wire";
 
 const enc = encodeURIComponent;
 
@@ -127,6 +127,17 @@ export function engineOf(facts: { isolation?: IsolationFacts } | null | undefine
   return { engine: i.engine ?? (i.available ? "microvm" : "host"), can: i.available, why: i.why_not };
 }
 export const runnerVmsRes = (name: string): Res<RunnerMicrovms> => ({ key: `microvm/runner/${name}`, fetch: (s) => microvmsApi.runner(name, s), opts: { pollMs: 5000 } });
+
+/**
+ * Whether a machine runs microVMs now, as its facts say (`virt.microvm`), on what, and why not (`isolation`, where
+ * they carry it): each session picks Host or microVM as it starts (the person's decision, 2026-11-23). None from a
+ * machine that hasn't said.
+ */
+export function microvmsOf(facts: Pick<RunnerFacts, "virt" | "isolation"> | null | undefined): { can: boolean; hypervisor: string | null; why: string | null } | null {
+  if (!facts) return null;
+  const can = facts.virt.microvm;
+  return { can, hypervisor: facts.isolation?.hypervisor ?? null, why: can ? null : (facts.isolation?.why_not ?? null) };
+}
 
 /* ------------------------------------------------ a session's sandbox (the agent's Sandbox or Host tab, its rows) */
 

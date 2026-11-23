@@ -2,11 +2,13 @@
  * Which Agentfile an agent's microVM is made from, chosen as it starts (kiln plan
  * 01a1cd8e862e7169a074db3d5fa33f3d, step 31): kiln's for its harness or one of the person's own, kept
  * per harness and per project (the folder it starts in), so the next agent of that harness there
- * starts the same way. None is a process on its machine, as agents start without one. Pure but for
- * the list it reads, so the composer (views/harness/new-agent.tsx) and its tests share one reading;
- * apart from the Agentfiles pages' own code (api/agentfiles.ts), so Mission control loads none of it.
+ * starts the same way. None kept is the host: the composer's Engine row picks Host or microVM per
+ * session (the person's decision, 2026-11-23). Pure but for the list it reads, so the composer
+ * (views/harness/new-agent.tsx) and its tests share one reading; apart from the Agentfiles pages' own
+ * code (api/agentfiles.ts), so Mission control loads none of it.
  */
 import { request } from "@/api/client";
+import { microvmsOf } from "@/api/microvms";
 import type { LeanAgent } from "@/api/types";
 import type { AgentfileBuiltin, AgentfileListing } from "@/api/wire";
 import type { Res } from "@/lib/data";
@@ -82,7 +84,7 @@ export function resumedImage(listing: Listed, kept: Readonly<Record<string, stri
   return (keptThere ?? choices.find((c) => c.whose === "kiln"))?.image;
 }
 
-/** The choices kept, with `image` (none: a process) now harness `kind`'s in `project`. */
+/** The choices kept, with `image` (none: the host) now harness `kind`'s in `project`. */
 export function withChoice(kept: Readonly<Record<string, string>>, kind: string, project: string, image: string | null): Record<string, string> {
   const key = keyOf(kind, project);
   const rest = Object.fromEntries(Object.entries(kept).filter(([k]) => k !== key));
@@ -90,14 +92,12 @@ export function withChoice(kept: Readonly<Record<string, string>>, kind: string,
 }
 
 /**
- * Why an agent can't be held in a microVM on `target` (`local`, `agent:<name>`), as the server
- * refuses one there (`harness::lineage::isolation_on`): a machine starts them once its runner says
- * so; kiln's server starts none itself. Null where it can.
+ * Whether machine `target` (`local`, `agent:<name>`) runs microVMs now, and why not where its runner says
+ * (`facts.virt.microvm`, `facts.isolation.why_not`), as the server holds a start there
+ * (`harness::lineage::isolation_on`): a runner runs them once it says so; kiln's server runs none itself.
  */
-export function whyNoMicrovm(target: string, machines: readonly Pick<LeanAgent, "name" | "facts">[], shown: string): string | null {
+export function microvmsOn(target: string, machines: readonly Pick<LeanAgent, "name" | "facts">[]): { can: boolean; why: string | null } {
   const name = target.startsWith("agent:") ? target.slice("agent:".length) : null;
-  if (!name) return "kiln's server starts no microVMs itself";
-  const said = machines.find((m) => m.name === name)?.facts?.virt.microvm;
-  if (said) return null;
-  return said === false ? `${shown} doesn't start microVMs` : `${shown} hasn't said yet whether it starts microVMs`;
+  const said = name ? microvmsOf(machines.find((m) => m.name === name)?.facts) : null;
+  return { can: said?.can ?? false, why: said?.why ?? null };
 }

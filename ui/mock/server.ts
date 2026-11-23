@@ -2043,9 +2043,16 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (p === "/api/agents" && m === "GET") {
-      // `lean=1`: each with only its facts' `virt` of them, as the server lists them lean (docs/api.md).
+      // `lean=1`: each with only its facts' `virt` of them, as the server lists them lean (docs/api.md), and their
+      // `isolation`, whose `why_not` says why the composer's microVM is off (a proposal until the server lists it lean).
       const lean = url.searchParams.get("lean") === "1";
-      return json(res, 200, lean ? [...agents.values()].map(({ facts, ...runner }) => (facts ? { ...runner, facts: { virt: facts.virt } } : runner)) : [...agents.values()]);
+      return json(
+        res,
+        200,
+        lean
+          ? [...agents.values()].map(({ facts, ...runner }) => (facts ? { ...runner, facts: { virt: facts.virt, ...(facts.isolation ? { isolation: facts.isolation } : {}) } } : runner))
+          : [...agents.values()],
+      );
     }
     if (p === "/api/agents/join" && m === "GET") {
       planAutojoin();

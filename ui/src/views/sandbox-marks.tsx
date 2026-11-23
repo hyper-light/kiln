@@ -35,6 +35,16 @@ export function EngineGlyph({ engine, word, title }: { engine: Engine; word?: bo
   );
 }
 
+/** An engine a machine offers its agents (Host, microVM), as a quiet badge: struck through where it can't, why in its title. */
+export function EngineBadge({ word, off, title }: { word: string; off?: boolean; title?: string }) {
+  return (
+    <span className="sm-badge" data-off={off || undefined} title={title}>
+      {word}
+      {off && <span className="sr-only">: {title}</span>}
+    </span>
+  );
+}
+
 /** How a microVM started, and how long it took. */
 export function StartMark({ kind, ms }: { kind: StartKind; ms: number }) {
   const S = START[kind];

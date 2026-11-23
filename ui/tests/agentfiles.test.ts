@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { AgentfileCheck, AgentfileDiagnostic, AgentfileListing, AgentfileSaved } from "../src/api/wire/index.ts";
-import { builtinImage, choicesFor, chosenFor, keptImage, projectOf, whyNoMicrovm, withChoice } from "../src/views/agentfiles/choose.ts";
+import { builtinImage, choicesFor, chosenFor, keptImage, microvmsOn, projectOf, withChoice } from "../src/views/agentfiles/choose.ts";
 import { copyName, named } from "../src/views/agentfiles/names.ts";
 import { checkWords, keptWords, marks, refused, restoredWords } from "../src/views/agentfiles/lint.ts";
 import { specOf } from "../src/views/harness/spawn-setup.ts";
@@ -71,18 +71,26 @@ test("step31: the spec names its Agentfile as a microVM's image, and one without
   assert.equal("isolation" in specOf({ ...base, agentfile: "" }), false);
 });
 
-test("step31: where its machine would refuse a microVM, the start says why, as the server does", () => {
-  const facts = (microvm: boolean) => ({ virt: { kvm: true, hvf: false, nested: false, microvm } }) as NonNullable<Parameters<typeof whyNoMicrovm>[1][number]["facts"]>;
+test("engine per session: microVM is offered where its machine runs them, else not, with its runner's why", () => {
+  // The person's decision, 2026-11-23: Host or microVM is each session's; a runner says whether it runs microVMs now (`virt.microvm`) and why not (`isolation.why_not`).
+  type Facts = NonNullable<Parameters<typeof microvmsOn>[1][number]["facts"]>;
+  const facts = (microvm: boolean, why_not: string | null = null): Facts => ({
+    virt: { kvm: microvm, hvf: false, nested: false, microvm },
+    isolation: { available: microvm, hypervisor: microvm ? "KVM" : null, why_not },
+  });
   const machines = [
     { name: "vm-box", facts: facts(true) },
-    { name: "plain", facts: facts(false) },
+    { name: "plain", facts: facts(false, "no /dev/kvm on this host") },
+    { name: "terse", facts: { virt: facts(false).virt } },
     { name: "quiet", facts: undefined },
   ];
-  assert.equal(whyNoMicrovm("agent:vm-box", machines, "vm-box"), null);
-  assert.equal(whyNoMicrovm("agent:plain", machines, "plain"), "plain doesn't start microVMs");
-  assert.equal(whyNoMicrovm("agent:quiet", machines, "quiet"), "quiet hasn't said yet whether it starts microVMs");
-  assert.equal(whyNoMicrovm("agent:gone", machines, "gone"), "gone hasn't said yet whether it starts microVMs");
-  assert.equal(whyNoMicrovm("local", machines, "this server"), "kiln's server starts no microVMs itself");
+  assert.deepEqual(microvmsOn("agent:vm-box", machines), { can: true, why: null });
+  assert.deepEqual(microvmsOn("agent:plain", machines), { can: false, why: "no /dev/kvm on this host" });
+  // A lean list without `isolation`, a runner that hasn't said, one not listed, and kiln's server: none, and no why.
+  assert.deepEqual(microvmsOn("agent:terse", machines), { can: false, why: null });
+  assert.deepEqual(microvmsOn("agent:quiet", machines), { can: false, why: null });
+  assert.deepEqual(microvmsOn("agent:gone", machines), { can: false, why: null });
+  assert.deepEqual(microvmsOn("local", machines), { can: false, why: null });
 });
 
 test("step31: a name is an image's, and a copy's is its own, else the first number free", () => {

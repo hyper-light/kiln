@@ -49,3 +49,21 @@
 .sm-warm > i[data-on] {
   background: #a8c9bc;
 }
+/* An engine a machine offers its agents (EngineBadge): quiet beside what it's about, struck through where it can't. */
+.sm-badge {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  padding: 1px 8px;
+  border: 1px solid #2a2d33;
+  border-radius: 999px;
+  color: #a1a4ad;
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: nowrap;
+}
+.sm-badge[data-off] {
+  color: #6d7079;
+  text-decoration: line-through;
+  text-decoration-color: #4a4d55;
+}

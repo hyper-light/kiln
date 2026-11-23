@@ -2,8 +2,8 @@
  * Mission control's composer with nothing selected: it starts an agent, written like a message to
  * it. Above the box, the agent page's own line (permissions · model · effort, and the bolt where
  * the model goes faster); in the box's top slot, the agent, its machine, its folder and how many,
- * each opened in place; under the box, More options (name, workspace, the Agentfile its microVM is
- * made from, the environment it runs with, where its commands run, a shell to run in) and the machine's past sessions, each a
+ * each opened in place; under the box, More options (name, workspace, its engine, Host or microVM, and
+ * the Agentfile its microVM is made from, the environment it runs with, where its commands run, a shell to run in) and the machine's past sessions, each a
  * dropdown that opens in place. Start
  * starts it and opens it; several stay here, and the line under the box says so. There is no
  * dialog: every way in that had one fills this in (new-agent-draft.ts).
@@ -30,7 +30,8 @@ import { useSuspenseResource } from "@/lib/resource";
 import { useRouter } from "@tanstack/react-router";
 import { Link, useNavigate, useSearchParams } from "@/lib/router";
 import { factsOf, moved, scopeMatches } from "./agentenv-scope";
-import { agentfileChoicesRes, choicesFor, chosenFor, projectOf, resumedImage, whyNoMicrovm, withChoice, type AgentfileChoice } from "@/views/agentfiles/choose";
+import { agentfileChoicesRes, choicesFor, chosenFor, microvmsOn, projectOf, resumedImage, withChoice, type AgentfileChoice } from "@/views/agentfiles/choose";
+import { EngineBadge } from "@/views/sandbox-marks";
 import { atOf, doingOf, findAgents } from "./broadcast";
 import { ComposeField } from "./compose-field";
 import { useAttachments } from "./controls";
@@ -127,7 +128,7 @@ function useChoices() {
   const [speedByKind, setSpeedByKind] = useLocalStorage<Record<string, string>>("kiln.agents.speeds", {});
   /** `volume`: a Slates volume of its own over the folder, where Slates workspaces are on and the machine can make one; else its folder (the person's ruling, 2026-11-21: Slates is an option kiln's owner enables). */
   const [workspace, setWorkspace] = useLocalStorage<"folder" | "volume">("kiln.agents.workspace", "folder");
-  /** The Agentfile each harness's microVM is made from, per project (views/agentfiles/choose.ts); none kept: a process on its machine. */
+  /** The Agentfile each harness's microVM is made from, per project (views/agentfiles/choose.ts); none kept: Host, a process on its machine. */
   const [agentfiles, setAgentfiles] = useLocalStorage<Record<string, string>>("kiln.agents.agentfiles", {});
   /** The environments it runs with, top first, kept as the Agentfile is (docs/agents.md, "Environments"); none: its machine's user's. The one kept before stacks starts it. */
   const [agentenvs, setAgentenvs] = useLocalStorage<string[]>("kiln.agents.agentenvs", [readLocal("kiln.agents.agentenv", "")].filter(Boolean));
@@ -282,16 +283,23 @@ function useSetup(c: Choices): Setup {
   return resolve(c, useRes(machinesRes).data);
 }
 
+/** A machine that runs no microVMs, as a title says it: why, where its runner says. */
+const cantTitle = (why: string | null) => why ?? "It can't run microVMs";
+
 /**
- * The Agentfile its microVM is made from, as chosen for its harness in its project (none: a process
- * on its machine), what there is to choose, and why its machine would refuse it, where it would
- * (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step 31).
+ * Where it runs, as chosen for its harness in its project (the person's decision, 2026-11-23): in a
+ * microVM of its own, made from the Agentfile kept (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, step
+ * 31), else on its machine's host; what there is to choose; whether its machine runs microVMs; and,
+ * microVM chosen where it runs none, the line that says so, which Start waits on: nothing falls back
+ * to the host.
  */
 function useAgentfile(c: Choices, s: Setup) {
   const choices = choicesFor(useRes(agentfileChoicesRes).data, s.kind);
   const project = projectOf(s.cwd, c.shell);
   const chosen = chosenFor(c.agentfiles, choices, s.kind, project);
-  return { choices, project, chosen, why: chosen && s.target ? whyNoMicrovm(s.target, s.machines, s.machine) : null };
+  const on = microvmsOn(s.target, s.machines);
+  const refused = chosen && s.target && !on.can ? `${s.machine} can't run microVMs${on.why ? `: ${on.why.replace(/\.$/, "")}` : ""}.` : null;
+  return { choices, project, chosen, on, refused };
 }
 
 /** The environments it runs with, top first, as kept, those still the person's (none: its machine's user's); and all of theirs. */
@@ -350,10 +358,10 @@ function HowLine({ c }: { c: Choices }) {
   );
 }
 
-/** Start. `sending`: several are starting from here: it says so, and a press waits (a second would start more). */
+/** Start. `sending`: several are starting from here: it says so, and a press waits (a second would start more). Off, saying why, where microVM is chosen and its machine runs none. */
 function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (s: Setup, agentfile: AgentfileChoice | null, agentenvs: Agentenv[]) => void }) {
   const s = useSetup(c);
-  const { chosen } = useAgentfile(c, s);
+  const { chosen, refused } = useAgentfile(c, s);
   const env = useAgentenvs(c).chosen;
   const label = c.count > 1 ? `Start ${c.count}` : "Start";
   return (
@@ -361,7 +369,8 @@ function StartButton({ c, sending, run }: { c: Choices; sending: boolean; run: (
       type="button"
       className="cp-send mc-start"
       data-mode="send"
-      disabled={!s.target || s.noHarness}
+      disabled={!s.target || s.noHarness || refused !== null}
+      title={refused ?? undefined}
       {...sendingProps(sending)}
       onClick={() => {
         if (!sending) run(s, chosen, env);
@@ -402,33 +411,66 @@ function Pick({ label, value, onChange, options }: { label: string; value: strin
 }
 
 /**
+ * Where it runs (the person's decision, 2026-11-23): Host, a process on its machine, or microVM, one of
+ * its own made from the Agentfile under this row, kept as that Agentfile is (none kept: Host). microVM
+ * is off where its machine runs none, its title saying why; chosen there, the line under the row says
+ * so and Start waits.
+ */
+function EngineRow({ c, s }: { c: Choices; s: Setup }) {
+  const af = useAgentfile(c, s);
+  // Chosen with nothing kept: the first to choose from, kiln's for the harness.
+  const first = af.choices[0];
+  const keep = (image: string | null) => c.setAgentfiles(withChoice(c.agentfiles, s.kind, af.project, image));
+  return (
+    <>
+      <div className="mc-opt">
+        <span className="mc-opt-key">Engine</span>
+        <div className="mc-opt-val">
+          <div className="mc-seg" role="radiogroup" aria-label="Engine">
+            <button type="button" role="radio" aria-checked={!af.chosen} onClick={() => keep(null)}>
+              Host
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={af.chosen !== null}
+              disabled={!af.on.can || !first}
+              title={!af.on.can ? cantTitle(af.on.why) : first ? undefined : `No Agentfile for ${s.kindName}`}
+              onClick={() => !af.chosen && first && keep(first.image)}
+            >
+              microVM
+            </button>
+          </div>
+        </div>
+      </div>
+      {af.refused && <p className="mc-note mc-opt-note">{af.refused}</p>}
+    </>
+  );
+}
+
+/**
  * The Agentfile its microVM is made from, kept for this harness in this project (kiln plan
- * 01a1cd8e862e7169a074db3d5fa33f3d, step 31): kiln's for the harness, or one of yours; none, a
- * process on its machine. Where its machine would refuse it, it says so under the row.
+ * 01a1cd8e862e7169a074db3d5fa33f3d, step 31): kiln's for the harness, or one of yours. Only while
+ * microVM is chosen.
  */
 function AgentfileRow({ c, s }: { c: Choices; s: Setup }) {
   const af = useAgentfile(c, s);
+  if (!af.chosen) return null;
   return (
-    <>
-      <div className="mc-opt mc-opt-agentfile">
-        <span className="mc-opt-key">Agentfile</span>
-        <div className="mc-opt-val">
-          <Pick
-            label={`The Agentfile ${s.kindName}'s microVM is made from`}
-            value={af.chosen?.image ?? ""}
-            onChange={(v) => c.setAgentfiles(withChoice(c.agentfiles, s.kind, af.project, v || null))}
-            options={[
-              { value: "", label: "None: a process on its machine" },
-              ...af.choices.map((x) => ({ value: x.image, label: x.whose === "kiln" ? `${x.name} (kiln's)` : x.name, group: x.whose === "kiln" ? "kiln's" : "Yours" })),
-            ]}
-          />
-          <Link to="/agents/agentfiles" className="ms-link">
-            Agentfiles
-          </Link>
-        </div>
+    <div className="mc-opt mc-opt-agentfile">
+      <span className="mc-opt-key">Agentfile</span>
+      <div className="mc-opt-val">
+        <Pick
+          label={`The Agentfile ${s.kindName}'s microVM is made from`}
+          value={af.chosen.image}
+          onChange={(v) => c.setAgentfiles(withChoice(c.agentfiles, s.kind, af.project, v))}
+          options={af.choices.map((x) => ({ value: x.image, label: x.whose === "kiln" ? `${x.name} (kiln's)` : x.name, group: x.whose === "kiln" ? "kiln's" : "Yours" }))}
+        />
+        <Link to="/agents/agentfiles" className="ms-link">
+          Agentfiles
+        </Link>
       </div>
-      {af.why && <p className="mc-note mc-opt-panel">{af.why}. An agent from an Agentfile starts only on a machine that starts microVMs.</p>}
-    </>
+    </div>
   );
 }
 
@@ -494,12 +536,15 @@ function Opens({ c, part, text, title }: { c: Choices; part: Exclude<Part, null>
  */
 function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past: boolean; setPast: (o: boolean) => void; onResume: (s: Setup, p: PastSession, image?: string) => void }) {
   const shell = c.shell ? s.shells.find((x) => x.id === c.shell) : undefined;
+  // Beside the machine's name: whether it runs microVMs, struck through where it can't.
+  const vm = microvmsOn(s.target, s.machines);
   return (
     <div className="mc-opts">
-      <div className="mc-opt">
+      <div className="mc-opt mc-opt-machine">
         <span className="mc-opt-key">Machine</span>
         <div className="mc-opt-val">
           <Opens c={c} part="machine" text={s.machine || "None runs agents"} title={s.machineFull} />
+          {s.target && <EngineBadge word="microVM" off={!vm.can} title={vm.can ? "It can run microVMs" : cantTitle(vm.why)} />}
         </div>
       </div>
       {c.open === "machine" && (
@@ -580,6 +625,7 @@ function Options({ c, s, past, setPast, onResume }: { c: Choices; s: Setup; past
           </div>
         </div>
       </div>
+      <EngineRow c={c} s={s} />
       <AgentfileRow c={c} s={s} />
       <AgentenvRow c={c} s={s} />
       <div className="mc-opt">
@@ -689,9 +735,9 @@ function Under({
   onResume: (s: Setup, p: PastSession, image?: string) => void;
 }) {
   const s = useSetup(c);
-  const { chosen } = useAgentfile(c, s);
+  const { chosen, refused } = useAgentfile(c, s);
   const env = useAgentenvs(c).chosen;
-  // What More options holds that isn't as it starts out, said while it's closed.
+  // What More options holds that isn't as it starts out, said while it's closed (Host says nothing).
   const summary = [
     c.name.trim() && `“${c.name.trim()}”`,
     s.volume && "Own volume",
@@ -719,6 +765,8 @@ function Under({
         </button>
       </div>
       {more && <Options c={c} s={s} past={past} setPast={setPast} onResume={onResume} />}
+      {/* Why Start is off, said under the Engine row when open, and here while it's closed. */}
+      {!more && refused && <p className="mc-note">{refused}</p>}
       <MachinesNote />
     </>
   );

@@ -107,26 +107,40 @@ test("step31: a new one is written in place and kept once its name is an image's
   await expect(page).toHaveURL(/\/agents\/agentfiles$/);
 });
 
-test("step31: an agent starts from the Agentfile chosen in More options, refused where its machine starts no microVMs, and the choice is kept", async ({ page }) => {
-  const mine = ((await (await page.request.get("/api/agentfiles")).json()) as { agentfiles: { id: string; name: string }[] }).agentfiles.find((a) => a.name === "claude-rust");
-  expect(mine).toBeTruthy();
-  await page.goto("/agents");
-  await page.getByRole("button", { name: /^More options/ }).click();
-  const pick = page.getByLabel("The Agentfile Claude Code's microVM is made from");
-  await expect(pick).toHaveValue("");
-  await expect(pick.locator("optgroup")).toHaveCount(2);
-  await pick.selectOption({ label: "claude-rust" });
-  // The server's own kiln starts none: said under the row.
-  await expect(page.locator(".mc-opts .mc-note")).toContainText("kiln's server starts no microVMs itself");
+/** In More options, open: machine `machine` (its word in the machine row's panel). */
+async function toMachine(page: Page, machine: RegExp) {
   await page
     .locator(".mc-opt")
     .filter({ has: page.locator(".mc-opt-key", { hasText: /^Machine$/ }) })
     .locator("button.mc-pick")
     .click();
-  await page
-    .getByRole("radiogroup", { name: "Machine" })
-    .getByRole("radio", { name: /metal-mac-mini/ })
-    .click();
+  await page.getByRole("radiogroup", { name: "Machine" }).getByRole("radio", { name: machine }).click();
+}
+
+test("step31: an agent starts in a microVM from the Agentfile chosen in More options, refused where its machine runs none, and the choice is kept", async ({ page }) => {
+  // The engine is each session's (the person's decision, 2026-11-23): Host or microVM, the Agentfile only with microVM.
+  const mine = ((await (await page.request.get("/api/agentfiles")).json()) as { agentfiles: { id: string; name: string }[] }).agentfiles.find((a) => a.name === "claude-rust");
+  expect(mine).toBeTruthy();
+  await page.goto("/agents");
+  await page.getByRole("button", { name: /^More options/ }).click();
+  const engine = page.getByRole("radiogroup", { name: "Engine" });
+  const pick = page.getByLabel("The Agentfile Claude Code's microVM is made from");
+  // Host as it starts out, no Agentfile; kiln's server runs no microVMs, so microVM is off there.
+  await expect(engine.getByRole("radio", { name: "Host" })).toHaveAttribute("aria-checked", "true");
+  await expect(pick).toHaveCount(0);
+  await toMachine(page, /kiln server/);
+  await expect(engine.getByRole("radio", { name: "microVM" })).toBeDisabled();
+  await toMachine(page, /metal-mac-mini/);
+  await engine.getByRole("radio", { name: "microVM" }).click();
+  // Chosen with none kept: kiln's for the harness, first.
+  await expect(pick).toHaveValue("harness-claude");
+  await expect(pick.locator("optgroup")).toHaveCount(2);
+  await pick.selectOption({ label: "claude-rust" });
+  // Kept, on a machine that runs none: said under the row, and Start waits; nothing falls back to the host.
+  await toMachine(page, /kiln server/);
+  await expect(page.locator(".mc-opts .mc-note")).toHaveText("kiln server can't run microVMs.");
+  await expect(page.locator(".mc-start")).toBeDisabled();
+  await toMachine(page, /metal-mac-mini/);
   await expect(page.locator(".mc-opts .mc-note")).toHaveCount(0);
   const start = page.locator(".mc-start");
   await expect(start).toHaveAttribute("aria-label", "Start: Claude Code on metal-mac-mini (mac-mini), in a microVM from claude-rust");
@@ -138,10 +152,11 @@ test("step31: an agent starts from the Agentfile chosen in More options, refused
   await expect
     .poll(async () => ((await (await page.request.get("/api/harness/sessions")).json()) as { id: string; isolation?: { kind: string; image?: string } }[]).find((a) => a.id === id)?.isolation)
     .toEqual({ kind: "microvm", image: `agentfile:${mine?.id}` });
-  // Kept for Claude Code there: the next start begins with it.
+  // Kept for Claude Code there: the next start begins with it, and Host takes it away.
   await page.goto("/agents");
   await page.getByRole("button", { name: /^More options/ }).click();
   await expect(page.getByLabel("The Agentfile Claude Code's microVM is made from")).toHaveValue(`agentfile:${mine?.id}`);
-  await page.getByLabel("The Agentfile Claude Code's microVM is made from").selectOption({ label: "None: a process on its machine" });
+  await page.getByRole("radiogroup", { name: "Engine" }).getByRole("radio", { name: "Host" }).click();
+  await expect(page.getByLabel("The Agentfile Claude Code's microVM is made from")).toHaveCount(0);
   await expect(page.locator(".mc-start")).toHaveAttribute("aria-label", /^Start: Claude Code on [^,]+$/);
 });

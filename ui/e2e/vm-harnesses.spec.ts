@@ -76,11 +76,12 @@ async function toMachine(page: Page, machine: RegExp) {
   await page.getByRole("radiogroup", { name: "Machine" }).getByRole("radio", { name: machine }).click();
 }
 
-/** In More options: the Agentfile its microVM is made from (by its image), then machine `machine`. */
-async function chooseAgentfileAndMachine(page: Page, name: string, image: string, machine: RegExp) {
+/** In More options: machine `machine`, then microVM (the engine is each session's: the person's decision, 2026-11-23), from the Agentfile `image`. */
+async function chooseMicrovm(page: Page, name: string, image: string, machine: RegExp) {
   await page.getByRole("button", { name: /^More options/ }).click();
-  await page.getByLabel(`The Agentfile ${name}'s microVM is made from`).selectOption(image);
   await toMachine(page, machine);
+  await page.getByRole("radiogroup", { name: "Engine" }).getByRole("radio", { name: "microVM" }).click();
+  await page.getByLabel(`The Agentfile ${name}'s microVM is made from`).selectOption(image);
 }
 
 /** Starts it from the composer: its id, from the page it opens. */
@@ -113,11 +114,11 @@ test.describe("against the mock", () => {
     ] as const) {
       await page.goto("/agents");
       await toHarness(page, name);
-      await page.getByRole("button", { name: /^More options/ }).click();
-      // The server's own kiln starts none: said under the row, and nothing starts there.
+      await chooseMicrovm(page, name, `harness-${kind}`, new RegExp(MOCK_VM));
+      // The server's own kiln runs none: said under the row, and nothing starts there.
       await toMachine(page, /kiln server/);
-      await page.getByLabel(`The Agentfile ${name}'s microVM is made from`).selectOption(`harness-${kind}`);
-      await expect(page.locator(".mc-opts .mc-note")).toContainText("kiln's server starts no microVMs itself");
+      await expect(page.locator(".mc-opts .mc-note")).toHaveText("kiln server can't run microVMs.");
+      await expect(page.locator(".mc-start")).toBeDisabled();
       await toMachine(page, new RegExp(MOCK_VM));
       await expect(page.locator(".mc-opts .mc-note")).toHaveCount(0);
       await expect(page.locator(".mc-start")).toHaveAttribute("aria-label", new RegExp(`^Start: ${name} on ${MOCK_VM} .*in a microVM from harness-${kind}$`));
@@ -133,7 +134,7 @@ test.describe("against the mock", () => {
     expect(mine).toBeTruthy();
     await page.goto("/agents");
     await toHarness(page, "Codex");
-    await chooseAgentfileAndMachine(page, "Codex", `agentfile:${mine?.id}`, new RegExp(MOCK_VM));
+    await chooseMicrovm(page, "Codex", `agentfile:${mine?.id}`, new RegExp(MOCK_VM));
     await expect(page.locator(".mc-start")).toHaveAttribute("aria-label", /^Start: Codex on .*in a microVM from claude-rust$/);
     const id = await start(page);
     await expect.poll(() => isolationOf(page, id)).toEqual({ kind: "microvm", image: `agentfile:${mine?.id}` });
@@ -232,7 +233,7 @@ test.describe("against ROOT's server", () => {
         const nonce = `e2e-${Date.now().toString(36)}`;
         await page.goto("/agents");
         await toHarness(page, name);
-        await chooseAgentfileAndMachine(page, name, image, new RegExp(VM_MACHINE ?? ""));
+        await chooseMicrovm(page, name, image, new RegExp(VM_MACHINE ?? ""));
         await page.getByLabel("Its first message").fill(words("VM_E2E_PROMPT", kind, nonce));
         const id = await start(page);
         await expect.poll(() => isolationOf(page, id)).toEqual({ kind: "microvm", image });
@@ -267,7 +268,7 @@ test.describe("against ROOT's server", () => {
         }
         await page.goto("/agents");
         await toHarness(page, name);
-        await chooseAgentfileAndMachine(page, name, image, new RegExp(VM_MACHINE ?? ""));
+        await chooseMicrovm(page, name, image, new RegExp(VM_MACHINE ?? ""));
         await page.getByRole("button", { name: /^A past session on / }).click();
         await page.locator(".ps-list .ps-row").filter({ hasText: nonce }).first().click();
         await expect(page).toHaveURL(/\/agents\/[0-9a-f]{32}$/);
