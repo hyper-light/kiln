@@ -3034,14 +3034,18 @@ mod tests {
         Ok(at)
     }
 
+    /// What a test waits for the door's answer at the most, a hang's bound: never a pace (a loaded machine answers
+    /// when it can).
+    const HANG: Duration = Duration::from_secs(300);
+
     /// `GET path` of the door: the status, the head (lowercased) and the body.
     fn get(at: SocketAddr, path: &str, cookie: Option<&str>) -> anyhow::Result<(u16, String, String)> {
         let mut s = std::net::TcpStream::connect(at)?;
-        s.set_read_timeout(Some(Duration::from_secs(20)))?;
+        s.set_read_timeout(Some(HANG))?;
         let cookie = cookie.map(|c| format!("cookie: {c}\r\n")).unwrap_or_default();
         write!(s, "GET {path} HTTP/1.1\r\nhost: kiln.test\r\n{cookie}connection: close\r\n\r\n")?;
         let mut out = String::new();
-        s.read_to_string(&mut out)?;
+        s.read_to_string(&mut out).with_context(|| format!("reading the answer to GET {path}"))?;
         let (head, body) = out.split_once("\r\n\r\n").unwrap_or((out.as_str(), ""));
         let status = head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         Ok((status, head.to_ascii_lowercase(), body.to_owned()))
@@ -3050,20 +3054,20 @@ mod tests {
     /// `POST path` of the door with `body`: the status and the body.
     fn post(at: SocketAddr, path: &str, body: &str) -> anyhow::Result<(u16, String)> {
         let mut s = std::net::TcpStream::connect(at)?;
-        s.set_read_timeout(Some(Duration::from_secs(20)))?;
+        s.set_read_timeout(Some(HANG))?;
         write!(s, "POST {path} HTTP/1.1\r\nhost: kiln.test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())?;
         let mut out = String::new();
-        s.read_to_string(&mut out)?;
+        s.read_to_string(&mut out).with_context(|| format!("reading the answer to POST {path}"))?;
         let (head, body) = out.split_once("\r\n\r\n").unwrap_or((out.as_str(), ""));
         Ok((head.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0), body.to_owned()))
     }
 
     fn send_http(at: SocketAddr, path: &str, headers: &str, body: &str) -> anyhow::Result<(u16, String, String)> {
         let mut stream = std::net::TcpStream::connect(at)?;
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_read_timeout(Some(HANG))?;
         write!(stream,"POST {path} HTTP/1.1\r\nhost: localhost\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len())?;
         let mut raw = String::new();
-        stream.read_to_string(&mut raw)?;
+        stream.read_to_string(&mut raw).with_context(|| format!("reading the answer to POST {path}"))?;
         let (head, body) = raw.split_once("\r\n\r\n").context("HTTP response")?;
         Ok((head.split_whitespace().nth(1).context("status")?.parse()?, head.to_owned(), body.to_owned()))
     }
@@ -3996,7 +4000,7 @@ mod tests {
 
         // 2. Submit a message to laptop-a targeting laptop-b (with owner cookie + x-kiln-target).
         let mut s = std::net::TcpStream::connect(at_a)?;
-        s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        s.set_read_timeout(Some(HANG))?;
         let payload = r#"{"type":"send","id":"m-quic-1","text":"hello laptop-b","mode":"queue"}"#;
         write!(
             s,
@@ -4232,7 +4236,7 @@ mod tests {
         //    verifying direct QUIC delivery on the FIRST attempt and exact-once inbox deduplication!
         let post_cmd = |at: SocketAddr, session: &str, target: &str, msg_id: &str, text: &str| -> anyhow::Result<(u16, String, String)> {
             let mut s = std::net::TcpStream::connect(at)?;
-            s.set_read_timeout(Some(Duration::from_secs(10)))?;
+            s.set_read_timeout(Some(HANG))?;
             let payload = format!(r#"{{"type":"send","id":"{msg_id}","text":"{text}","mode":"queue"}}"#);
             write!(
                 s,
