@@ -72,16 +72,19 @@ unsafe impl GlobalAlloc for Watch {
     }
 }
 
-/// Where the `size` bytes at `block` first hold the watched secret, if anywhere.
+/// Where the `size` bytes at `block` first hold the watched secret, if anywhere: each byte compared with the marker's,
+/// read from it as it is compared, so the watch puts no copy of the secret on the stack of the thread that frees. A copy
+/// there outlives its frame in that stack's memory, and a later value of that thread's, moved whole into the heap with
+/// the bytes it never wrote (a boxed answer's, its enum's unused bytes), carries it into a block whose free this watch
+/// then finds: the watch's own copy, never the code's under test (E-6 at 1b21394b on Linux, an 808-byte boxed answer).
 ///
 /// # Safety
 ///
 /// `block` is valid for reads of `size` bytes.
 unsafe fn holds(block: *const u8, size: usize) -> Option<usize> {
-    let marker: [u8; SECRET] =
-        std::array::from_fn(|k| MARKER.get(k).map_or(0, |b| b.load(Ordering::Acquire)));
     let last = size.checked_sub(SECRET)?;
-    let (&first, rest) = marker.split_first()?;
+    let (first, rest) = MARKER.split_first()?;
+    let first = first.load(Ordering::Acquire);
     (0..=last).find(|&at| {
         // SAFETY: `at <= size - SECRET`, so `at` and the `SECRET - 1` bytes after it lie in the block, which the
         // caller's contract makes readable.
@@ -90,7 +93,7 @@ unsafe fn holds(block: *const u8, size: usize) -> Option<usize> {
             && rest
                 .iter()
                 .zip(1usize..)
-                .all(|(&want, offset)| read(offset) == want)
+                .all(|(want, offset)| read(offset) == want.load(Ordering::Acquire))
     })
 }
 
@@ -191,22 +194,23 @@ impl Drop for Watching {
 mod tests {
     use super::*;
 
-    /// 32 bytes no other block holds: the test's name's digest in each byte's place, as random as a test needs.
-    fn secret(test: &str) -> [u8; SECRET] {
-        let mut out = [0u8; SECRET];
+    /// 32 bytes no other block holds, made in `out` in place: the test's name's digest in each byte's place, as random
+    /// as a test needs. Never handed back whole by value, which leaves copies on the stack a later move carries into
+    /// the heap ([`holds`]).
+    fn secret(test: &str, out: &mut [u8; SECRET]) {
         for (k, byte) in out.iter_mut().enumerate() {
             let mut hash = std::hash::DefaultHasher::new();
             std::hash::Hash::hash(&(test, k), &mut hash);
             *byte = std::hash::Hasher::finish(&hash).to_le_bytes()[0];
         }
-        out
     }
 
     /// E-6's watch: do free a block holding the secret, one holding other bytes, one wiped first, and the block a grown
     /// Vec leaves behind; expect the first and the last found, and neither the other bytes nor the wiped one.
     #[test]
     fn a_freed_block_is_found_while_it_holds_the_secret_and_not_once_wiped() {
-        let secret = secret("a_freed_block_is_found");
+        let mut secret = [0u8; SECRET];
+        self::secret("a_freed_block_is_found", &mut secret);
         let watching = watch(&secret).unwrap();
         let mut held = vec![7u8; 100];
         held[40..72].copy_from_slice(&secret);
@@ -214,7 +218,9 @@ mod tests {
         assert_eq!(watching.found(), 1, "a freed block holding the secret");
 
         let mut other = vec![7u8; 100];
-        other[40..72].copy_from_slice(&self::secret("another test's"));
+        let mut another = [0u8; SECRET];
+        self::secret("another test's", &mut another);
+        other[40..72].copy_from_slice(&another);
         drop(std::hint::black_box(other));
         assert_eq!(watching.found(), 1, "a freed block holding other bytes");
 

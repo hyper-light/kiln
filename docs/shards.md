@@ -15,7 +15,7 @@ each at one revision, with kiln's recorded changes, and one copy of each project
   recorded changes (`vendor/hex/UPSTREAM.md`, which says what Hex holds at that commit). Hex vendors no Shards: it
   names Shards' crates by git at one revision (its root manifest's `[workspace.dependencies]`), which kiln's root
   manifest points at kiln's own copy (`[patch."https://github.com/hyper-light/shards"]`), so one Shards revision
-  serves Hex and kiln, at one version: Hex asks for exactly the commit kiln vendors (`7158020b61`, Shards' main),
+  serves Hex and kiln, at one version: Hex asks for exactly the commit kiln vendors (`b271669b6`, Shards' main),
   and `crates/kiln/tests/vendored.rs` fails the gate where they differ. kiln's copy holds Hex's `vendor/MANIFEST.toml` and `vendor/patches`,
   so `scripts/vendor.py check` holds Hex's pins of what it does vendor to kiln's. The two move together:
   `scripts/vendor.py shards <commit>` at Hex's new Shards revision, then `scripts/vendor.py hex <commit>`; and

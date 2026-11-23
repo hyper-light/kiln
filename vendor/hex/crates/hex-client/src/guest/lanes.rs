@@ -368,30 +368,29 @@ fn tls(link: shards_api::control::Link) -> Result<(), Refusal> {
 /// end and the lane, one a way, each on one of the lane's halves ([`Socket::split`]), sharing the pair's end, one
 /// reading it and one writing it: no duplicate, which Windows makes inheritable (the review's D-5). Each ends on a
 /// fact: the owner's end of writing or its close, the lane's end in order, or its reset or its connection's end, which
-/// the owner reads as the cut after the bytes before it.
+/// the owner reads as the cut after the bytes before it. A relay's socket closed while the owner sends ends the lane's
+/// reading in order, after every byte the relay wrote, and refuses the owner's writes (Shards' D251 as amended).
 fn bridge(socket: Socket) -> std::io::Result<Bridged> {
     let (owner, ours) = pair()?;
     let (reader, writer) = socket.split();
-    let cut = Cut::default();
+    let (cut, refused) = (Cut::default(), Cut::default());
     let ours = Arc::new(ours);
-    let up = Arc::clone(&ours);
+    let (up, told) = (Arc::clone(&ours), refused.clone());
     std::thread::Builder::new()
         .name("hex-lane-up".to_owned())
-        .spawn(move || upward(writer, &up))?;
+        .spawn(move || upward(writer, &up, &told))?;
     let recorded = cut.clone();
     std::thread::Builder::new()
         .name("hex-lane-down".to_owned())
         .spawn(move || downward(reader, &ours, &recorded))?;
-    Ok(Bridged::new(owner, cut))
+    Ok(Bridged::refusing(owner, cut, refused))
 }
 
 /// What the owner writes, to the lane; the owner's end of writing, or its close, is the lane's FIN: the relay's socket
-/// shut for writing, its reads going on. A write the lane refuses (its reset, its connection's end) ends this way, and
-/// the owner's writes then fail ([`writes_refused`]): on Unix as the pair's other end stops reading; on Windows at
-/// [`Bridged`]'s write once the cut is recorded, what the owner sends meanwhile read here and let go, as Winsock resets
-/// a TCP pair whose receiving is shut while bytes wait or come, which drops what the owner hasn't read (the review's
-/// D-4). An error reading the pair aborts the lane.
-fn upward(mut writer: SocketWriter, mut from: &Local) {
+/// shut for writing, its reads going on. A write the lane refuses (its relay's close, its reset, its connection's end)
+/// ends this way, recorded in `refused`, and the owner's writes then fail ([`writes_refused`]). An error reading the
+/// pair aborts the lane.
+fn upward(mut writer: SocketWriter, mut from: &Local, refused: &Cut) {
     let mut buf = vec![0u8; DATA_BOUND];
     loop {
         #[cfg(target_os = "macos")]
@@ -405,7 +404,8 @@ fn upward(mut writer: SocketWriter, mut from: &Local) {
                 return;
             }
             Ok(n) => {
-                if writer.write_all(buf.get(..n).unwrap_or_default()).is_err() {
+                if let Err(e) = writer.write_all(buf.get(..n).unwrap_or_default()) {
+                    refused.record(&e);
                     writes_refused(from, &mut buf);
                     return;
                 }
@@ -419,17 +419,18 @@ fn upward(mut writer: SocketWriter, mut from: &Local) {
     }
 }
 
-/// The owner's writes once the lane refuses them: on Unix the pair's other end stops reading, so they fail.
-#[cfg(unix)]
-fn writes_refused(from: &Local, _: &mut [u8]) {
-    let _ = from.shutdown(Shutdown::Read);
-}
-
-/// The owner's writes once the lane refuses them, on Windows: read and let go to the owner's end of writing, its
-/// close or its reset, so the pair's other end never closes with bytes unread, which would reset the owner's socket
-/// and drop what it hasn't read. The owner learns of the cut at its next read, or its next write ([`Bridged`]).
-#[cfg(windows)]
+/// The owner's writes once the lane refuses them, what the owner sent before read and let go, so the pair's other end
+/// never closes with bytes unread: Linux tells such a close of a socket pair's end to its peer as a reset
+/// (`unix_release_sock`'s `ECONNRESET`), as Winsock does a loopback TCP pair's (its RST), which the owner would read
+/// after the bytes that came before it in place of the lane's end in order (Shards' D251 as amended). On Unix the
+/// pair's other end stops reading first, so the owner's writes fail (Linux's at once, macOS's once the pair's end
+/// closes) and the bytes left are those that came before; its reading shut, no read here waits, so macOS's sleep
+/// through a half-close (Shards D175) can't hold it. On Windows its receiving stays open, as Winsock resets a TCP pair
+/// whose receiving is shut while bytes wait or come (the review's D-4): what the owner sends is let go to its end of
+/// writing, its close or its reset, and its writes fail at [`Bridged`]'s write.
 fn writes_refused(mut from: &Local, buf: &mut [u8]) {
+    #[cfg(unix)]
+    let _ = from.shutdown(Shutdown::Read);
     loop {
         match from.read(buf) {
             Ok(0) => return,

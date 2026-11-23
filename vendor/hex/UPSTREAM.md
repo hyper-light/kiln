@@ -3,8 +3,8 @@
 The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d, steps 12,
 16 and 17; Hex's `docs/design/`), built on kiln's one Shards and hyper-raft.
 
-- **Upstream:** https://github.com/hyper-light/hex, commit `b4db7e69c895182ae68500c08ded91200d1228b1`
-  (2026-11-19), MIT (`LICENSE`): its branch `cp/t7-p6b3-live`, which takes Shards by git and vendors no copy of its own. Its Shards guests on Shards' console (`shards_api::CONSOLE`, hvc0, since
+- **Upstream:** https://github.com/hyper-light/hex, commit `b1f8fb6194f2079a91753ce599297568b6e53141`
+  (2026-11-22), MIT (`LICENSE`): its main, which takes Shards by git and vendors no copy of its own. Its Shards guests on Shards' console (`shards_api::CONSOLE`, hvc0, since
   Shards deleted the 16550 at `35e2de91e`; Hex's D261, D262), its Shards image class in a process that links Hex
   (`hex_node::images::ImageRuntime::new`, and `ImageRuntime::leasing`, made with its orchestrator's lessors), a member's
   run-time arguments (`ImageMember::args`) and the host folders it sees (`ShardsImage::shares`), a box's host use at
@@ -21,8 +21,9 @@ The runtime and scheduler kiln's harness microVMs run under (kiln plan 01a1cd8e8
   by source, each one's stream asked of the server its orchestrator bound, `ImageRuntime::bind_servers`,
   `hex_api::serve::Servers`; Shards' D286, kiln goal 01a1ec34599974448f6b7663ddb07001); and a running image box's network
   and folders changed in place (`Runtime::change`, `Call::Change` 0x0027, `Refusal::Live`, `BoxInfo::live`; kiln plan
-  01a1dd2e…, P6b.3).
-  It takes Shards' crates by git at `7158020b61`, Shards' main and the commit kiln vendors (vendor/MANIFEST.toml), which
+  01a1dd2e…, P6b.3); and a served share's resync channel handed to Shards' image boot beside its stream
+  (`Servers::stream_resyncing`; Shards' D288), which kiln's copy carried as a change of its own before.
+  It takes Shards' crates by git at `b271669b6`, Shards' main and the commit kiln vendors (vendor/MANIFEST.toml), which
   kiln's root manifest serves from kiln's copy (`[patch."https://github.com/hyper-light/shards"]`); and hyper-raft at
   `e0613f52`, kiln's own; with the changes below its crates build on kiln's (kiln's clippy and the tests
   of what kiln touches: docs/shards.md).
@@ -49,13 +50,12 @@ Each change is recorded in `vendor/patches/hex/`, applied in this order on upstr
 |---|---|---|---|
 | `vendor/patches/hyper-raft/` | Hex's records of hyper-raft's changes made kiln's. Its hyper-raft pin has been kiln's own at each re-vendor since Hex `414aa30d` (at this revision `e0613f52`), so this change's pin parts dropped out as upstream's own; Hex takes Shards by git, which kiln's root `[patch]` points at kiln's copy | kiln holds one copy of each project, with one record of its changes, and Hex must build on it: one Shards revision serves Hex and kiln (the joint plan's step 16) | `0001-hex-builds-on-kiln-s-shards-and-hyper-raft.patch` |
 | `crates/hex-sim/src/lib.rs`, `crates/hex-gpu/src/nvml.rs`, `crates/hex-gpu/src/adl.rs`, `crates/hex-gpu/src/amd.rs` | the files Hex includes by path (hyper-swim's `coordinates.rs`, cuda-rust's loader, all-smi's AMD readers) named at kiln's copies (`vendor/hyper-raft`, `vendor/cuda-rust`, `vendor/all-smi`) | kiln's copy leaves Hex's own copies of them out | `0002-files-hex-includes-by-path-from-kiln-s-copies.patch` |
-| `crates/hex-api/src/serve.rs`, `crates/hex-runtime/src/guest/served.rs` | `Servers::stream_resyncing` (provided: the stream alone by default): a server's share's resync channel beside its stream, which the image class hands Shards' image boot as `ServedShare::resync` (Shards' D288) | kiln goal 90: kiln's `SlatesVolumes` gives Slates' resync end, so a Slates daemon restart never ends an agent microVM's share; offered to Hex with Shards' D288 | `0003-servers-stream-resyncing-a-served-share-s-resync-channel-goes.patch` |
 | `vendor/patches/hyper-raft/` | Record shared datagram addressing, exact detector history and quorum-loss resignation | AD-1 uses one hyper-raft implementation across Kiln and its consumers | `0004-record-shared-datagram-and-liveness-patches.patch` |
 | `vendor/patches/hyper-raft/` | Preserve a session’s campaign hold across replica wakeups | AD-1 lets only eligible voters campaign | `0005-preserve-shared-campaign-hold.patch` |
 | `vendor/patches/hyper-raft/0010-expose-the-observed-peer-incarnation.patch` | Record the shared detector’s peer incarnation query | AD-1 uses the same process identity evidence across Kiln and its consumers | `0006-record-the-shared-observed-peer-incarnation-patch.patch` |
 | `vendor/patches/hyper-raft/0011-send-requested-snapshots-when-compaction-becomes-durable.patch` | Record delivery of requested snapshots after a durable compaction | The shared Raft shell serves waiting peers when a group is idle | `0007-record-the-shared-snapshot-completion-fix.patch` |
 
-The second, third and fourth changes are kiln's layout alone (`Kiln-only:`). The first is offered to Hex as it stands,
+The second change is kiln's layout alone (`Kiln-only:`). The first is offered to Hex as it stands,
 with what it leaves for Hex and kiln to agree on:
 - Hex's own hyper-raft changes beside the one kiln takes (`Endpoint::negotiated`, kiln's fifth): hyper-transport
   taking hyper-quic without its qlog traces, which would turn serde_json's `preserve_order` off for every crate

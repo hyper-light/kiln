@@ -83,18 +83,18 @@ case $target in
     ;;
 esac
 
-# On Windows each carries its own C runtime (+crt-static), as kiln's Windows binary needs only what Windows 10 and later
-# have: built as Shards builds its own, each imports vcruntime140.dll, the Visual C++ runtime, which a clean Windows
-# lacks (jupiter, 2026-11-19); Hex builds its own so for the same reason (its .cargo/config.toml).
-crt=()
+# On Windows each carries its own C runtime, as kiln's Windows binary needs only what Windows 10 and later have:
+# Shards' .cargo/config.toml builds its Windows targets +crt-static (its D36), as Hex's does. One that imports
+# vcruntime140.dll, the Visual C++ runtime, which a clean Windows lacks (jupiter, 2026-11-19), fails the pack.
+static_crt=false
 case $target in
-  *-pc-windows-msvc) crt=("CARGO_TARGET_$(printf %s "$target" | tr a-z- A-Z_)_RUSTFLAGS=-C target-feature=+crt-static") ;;
+  *-pc-windows-msvc) static_crt=true ;;
 esac
 
 cd vendor/shards
-env ${crt[@]+"${crt[@]}"} ${helper_c[@]+"${helper_c[@]}"} cargo build --locked --profile "$profile" -p shards-vm-process \
+env ${helper_c[@]+"${helper_c[@]}"} cargo build --locked --profile "$profile" -p shards-vm-process \
   -p shards-net-process --target "$helpers" --target-dir "$built"
-env ${crt[@]+"${crt[@]}"} ${shards_c[@]+"${shards_c[@]}"} SHARDS_HELPERS=beside cargo build --locked --profile "$profile" -p shards \
+env ${shards_c[@]+"${shards_c[@]}"} SHARDS_HELPERS=beside cargo build --locked --profile "$profile" -p shards \
   --target "$target" --target-dir "$built"
 
 mkdir -p "$out"
@@ -106,7 +106,7 @@ for f in "$helpers/$dir_name/shards-vm$exe" "$helpers/$dir_name/shards-net$exe" 
     continue
   fi
   cp "$built/$f" "$out/$name.part"
-  if [ ${#crt[@]} -gt 0 ] && grep -a -q -i 'vcruntime140' "$out/$name.part"; then
+  if $static_crt && grep -a -q -i 'vcruntime140' "$out/$name.part"; then
     echo "pack: $name imports the Visual C++ runtime (vcruntime140.dll), which a clean Windows lacks" >&2
     rm -f "$out/$name.part"
     exit 1

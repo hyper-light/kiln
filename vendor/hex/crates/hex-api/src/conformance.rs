@@ -96,6 +96,12 @@ pub trait Fixture {
     fn network(&self) -> Option<String> {
         None
     }
+    /// The harness its Shards image VMs run, whose network and folders HEX-IMG-12 and HEX-IMG-13 change live (kiln plan
+    /// P6b.3): by default the one its component is for ([`Fixture::component`], [`Component::harness`]); `None` names
+    /// none, and those cases fail on it.
+    fn harness(&self) -> Option<Member> {
+        self.component().as_ref().and_then(Component::harness)
+    }
 }
 
 /// A component a fixture's node holds for a member its VMs run ([`Fixture::component`]; Shards' D270 slice 4).
@@ -105,6 +111,16 @@ pub struct Component {
     pub at: String,
     /// The component's OSI artifact's manifest digest, `sha256:…`.
     pub digest: String,
+}
+
+impl Component {
+    /// The harness it is for, where its path is one's (`/harness/NAME`).
+    pub fn harness(&self) -> Option<Member> {
+        self.at.strip_prefix("/harness/").map(|name| Member {
+            kind: MemberKind::Harness,
+            name: name.to_owned(),
+        })
+    }
 }
 
 /// One part of the contract.
@@ -1455,20 +1471,13 @@ fn live_refused(
     })
 }
 
-/// The member a live change is for: the harness the fixture's component is for ([`Fixture::component`]), which its VMs
-/// run; or why the case can't be held without one.
+/// The member a live change is for: the harness the fixture names its VMs run ([`Fixture::harness`]); or why the case
+/// can't be held without one.
 fn live_member(fx: &dyn Fixture) -> Result<Member, String> {
-    fx.component()
-        .and_then(|c| {
-            c.at.strip_prefix("/harness/").map(|name| Member {
-                kind: MemberKind::Harness,
-                name: name.to_owned(),
-            })
-        })
-        .ok_or_else(|| {
-            "the fixture names no harness its VMs run (Fixture::component's /harness/NAME): a live change needs one"
-                .to_owned()
-        })
+    fx.harness().ok_or_else(|| {
+        "the fixture names no harness its VMs run (Fixture::harness): a live change needs one"
+            .to_owned()
+    })
 }
 
 /// What box `id`'s run holds as it runs, as inspect says it (none: nothing).
