@@ -48,7 +48,7 @@ use super::rows::{InboxRow, Row};
 use super::rows::RecordRow;
 use super::store::Store;
 use crate::sync::disk::{BLOCK as WAL_BLOCK, CACHE_BYTES as WAL_CACHE_BYTES, CADENCE_BYTES, CADENCE_ENTRIES, DISK as SHARD_DISK_BYTES, GROUPS as SYNC_GROUPS, UNCOMMITTED_BYTES, UNCOMMITTED_ENTRIES};
-use crate::sync::group::{APPEND as APPEND_MAX, BEAT as SYNC_BEAT, Conf, MESSAGE as MESSAGE_MAX, PUMP_MAX as DRIVE_STEPS_MAX, SERVER as SERVER_ID_VAL, TICK as SYNC_TICK, save_atomic};
+use crate::sync::group::{APPEND as APPEND_MAX, Conf, MESSAGE as MESSAGE_MAX, PUMP_MAX as DRIVE_STEPS_MAX, SERVER as SERVER_ID_VAL, save_atomic};
 use crate::sync::wire::{Joiner as WireJoiner, PART as WIRE_PART_MAX};
 
 /// Stable Raft member id for the central server node (`1`, matching `sync::group::SERVER`).
@@ -63,27 +63,29 @@ const ENTRY_DATA_MAX: usize = LARGEST_ENTRY - ENTRY_OVERHEAD - WAL_BLOCK;
 const CHUNK_ENVELOPE_MAX: usize = 85;
 /// Maximum raw JSON bytes per `WireEntry::Part` chunk (exact RFC 4648 base64 3:4 inverse).
 const CHUNK_RAW_MAX: usize = ((ENTRY_DATA_MAX - CHUNK_ENVELOPE_MAX) / 4) * 3;
-/// Poll quantum solely for bounded shutdown and failed-WAL recovery; idle groups do not use it.
-pub(crate) const WAL_RETRY: Duration = SYNC_TICK;
-/// Legacy wire fragment expiry and caller budget, kept stable across protocol versions.
-const WIRE_WINDOW: Duration = WAL_RETRY.saturating_mul((SYNC_BEAT as u32) * 3);
-/// Maximum synchronous wait for a caller receipt. Detector measurements time all elections.
-const OPEN_WAIT: Duration = WIRE_WINDOW.saturating_mul(2);
+/// A test's bound on its own waits, so a regression fails rather than hangs the suite: no
+/// behaviour under test. The manager's own waits are told, never timed.
+#[cfg(test)]
+const TEST_WAIT: Duration = Duration::from_secs(6);
+/// The pause between a test's polls of what it drives: the test's pacing, no behaviour under test.
+#[cfg(test)]
+pub(crate) const TEST_POLL: Duration = Duration::from_millis(100);
 
-/// Back off through consecutive failed WAL opens within the wire repair window.
-fn repair_delay(failures: u32) -> Duration {
-    WAL_RETRY.saturating_mul(2u32.checked_pow(failures).unwrap_or(u32::MAX)).min(WIRE_WINDOW)
-}
+/// RFC 6298 §2.1's retransmission timeout before a path has a round trip measured: "Until a round-trip time (RTT)
+/// measurement has been made for a segment sent between the sender and receiver, the sender SHOULD set RTO <- 1
+/// second". A repair request to a peer whose path the liveness stream hasn't measured yet counts as lost after it.
+const RTO_UNMEASURED: Duration = Duration::from_secs(1);
+
 /// Groups held per `hyper-log` WAL shard (`convo-raft-NNN.log`): `sync::disk::GROUPS^2 = 1024`.
 /// At 1024 groups/shard, `hyper-log`'s persist area is ~100 KiB and 10k concurrent live sessions
 /// span 10 shards cleanly without ever evicting a live session; closed sessions retire and free slots.
 const SHARD_GROUPS: usize = SYNC_GROUPS * SYNC_GROUPS;
 /// Fixed log identifier prefix for `convo-raft-NNN.log` (low 32 bits carry the shard number).
 const LOG_ID_BASE: u128 = u128::from_be_bytes(*b"kiln-convo-r0000");
-/// Target odd Raft voter quorum per live conversation group: once >= 2 learners catch up, the
-/// leader promotes them to reach 3 voters so any 1 node failure automatically elects a successor
-/// from the surviving 2/3 majority without manual handoff (while 2-node fleets stay 1 voter + 1 learner).
-const TARGET_VOTERS: usize = 3;
+/// The fewest voters a fault-tolerant group has: 2f + 1 with f = 1, the smallest ensemble that
+/// survives a failure, as ZooKeeper sizes its ensembles. A session's group promotes to its
+/// policy's [`Policy::voters`]; a fleet's name charter, and a sealed one, name at least this many.
+const MIN_VOTERS: usize = 3;
 /// Wire chunk magic prefix for oversized Raft messages (e.g. multi-MiB `MsgSnapshot`) split across
 /// `<= sync::wire::PART` frames: `4 magic + 8 id + 4 part + 4 parts` = 20-byte header.
 const WIRE_CHUNK_MAGIC: [u8; 4] = *b"KRC1";
@@ -142,6 +144,12 @@ type ApplyReceipt = (CommitTag, bool, u64);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     pub auto_failover: bool,
+    /// The failures f a session's group survives under automatic failover: it promotes 2f + 1
+    /// voters ([`Policy::voters`]), as a ZooKeeper ensemble is sized. Configured (`faults` in
+    /// `session-policy.json`, or `KILN_CONVO_FAULTS`), 1 when not, and committed with the session
+    /// so every replica of it counts the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faults: Option<u32>,
 }
 
 impl Policy {
@@ -149,7 +157,14 @@ impl Policy {
         let auto_failover = std::env::var("KILN_CONVO_FAILOVER")
             .ok()
             .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"));
-        Self { auto_failover }
+        let faults = std::env::var("KILN_CONVO_FAULTS").ok().and_then(|v| v.trim().parse().ok());
+        Self { auto_failover, faults }
+    }
+
+    /// The voters a session's group promotes to under automatic failover: 2f + 1, at least
+    /// [`MIN_VOTERS`].
+    pub fn voters(&self) -> usize {
+        usize::try_from(self.faults.unwrap_or(1)).unwrap_or(usize::MAX).saturating_mul(2).saturating_add(1).max(MIN_VOTERS)
     }
 }
 
@@ -575,6 +590,9 @@ struct ConvoImage {
     founding_index: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_move: Option<MoveIntent>,
+    /// CP-T3.2. The last hand-over given up, so a member that catches up later learns it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    abandoned_move: Option<MoveIntent>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     in_flight_parts: BTreeMap<u64, InFlightPart>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -632,6 +650,9 @@ struct SavedConvo {
     projected: Option<(u64, u64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native_move: Option<MoveIntent>,
+    /// CP-T3.2. The last hand-over given up, so a member that catches up later learns it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    abandoned_move: Option<MoveIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     owner_run: Option<u64>,
     #[serde(default)]
@@ -833,6 +854,9 @@ pub struct GroupStatus {
     pub native_move_digest: Option<String>,
     #[serde(default)]
     pub native_move_ready: bool,
+    /// CP-T3.2. The hand-over its old leader gave up at this epoch: whoever waits on it is told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abandoned_move: Option<AbandonedMove>,
     #[serde(default)]
     pub founded: bool,
     pub session: String,
@@ -848,6 +872,15 @@ pub struct GroupStatus {
     pub epoch: u64,
     pub voters: Vec<u64>,
     pub learners: Vec<u64>,
+}
+
+/// CP-T3.2. A hand-over its old leader gave up: the epoch it was asked at, its target and the
+/// staged package's digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbandonedMove {
+    pub epoch: u64,
+    pub target: String,
+    pub digest: String,
 }
 
 /// Read every inbox family row for `session` from `store` — BOTH live rows (`value: Some(..)`)
@@ -875,6 +908,7 @@ struct SnapshotSpec {
     genesis: Option<Genesis>,
     founding_index: Option<u64>,
     native_move: Option<MoveIntent>,
+    abandoned_move: Option<MoveIntent>,
     in_flight_parts: BTreeMap<u64, InFlightPart>,
     owner_run: Option<u64>,
     owner_term: u64,
@@ -917,7 +951,7 @@ fn build_snapshot_bytes(spec: SnapshotSpec, committed: Receiver<anyhow::Result<V
     if !spec.leader_name.is_empty() {
         rows.push(Row::Machine { session: spec.session.clone(), machine: spec.leader_name.clone() });
     }
-    let img = ConvoImage { configuration:Some(Conf::from(&spec.conf)), genesis: spec.genesis, founding_index: spec.founding_index, native_move: spec.native_move, in_flight_parts: spec.in_flight_parts, owner_run:spec.owner_run, owner_term: spec.owner_term, policy: spec.policy, session: spec.session, leader: spec.leader_name, epoch: spec.epoch, rows };
+    let img = ConvoImage { configuration:Some(Conf::from(&spec.conf)), genesis: spec.genesis, founding_index: spec.founding_index, native_move: spec.native_move, abandoned_move: spec.abandoned_move, in_flight_parts: spec.in_flight_parts, owner_run:spec.owner_run, owner_term: spec.owner_term, policy: spec.policy, session: spec.session, leader: spec.leader_name, epoch: spec.epoch, rows };
     // Large images run through an off-owner counting writer once to reserve their exact
     // wire size. Escaped event bodies and partial-command base64 cannot double the allocation.
     let estimate = img.rows.iter().map(Row::bytes).fold(0usize, usize::saturating_add);
@@ -980,6 +1014,8 @@ struct ConvoMachine {
     founding_barrier: FoundingBarrier,
     projected: Option<(u64, u64)>,
     native_move: Option<MoveIntent>,
+    /// CP-T3.2. The last hand-over given up, so a member that catches up later learns it too.
+    abandoned_move: Option<MoveIntent>,
     owner_run: Option<u64>,
     owner_term: u64,
     recovery_image: Option<SavedImage>,
@@ -1080,6 +1116,7 @@ impl ConvoMachine {
                 founding_index: saved.founding_index,
                 projected: saved.projected,
                 native_move: saved.native_move,
+                abandoned_move: saved.abandoned_move,
                 owner_run:saved.owner_run, owner_term: saved.owner_term,
                 recovery_image: saved.recovery_image,
                 recovery_rows: None,
@@ -1115,6 +1152,7 @@ impl ConvoMachine {
             founding_index: None,
             projected: Some((0, 0)),
             native_move: None,
+            abandoned_move: None,
             owner_run:None, owner_term: 0,
             recovery_image: None,
             recovery_rows: None,
@@ -1189,6 +1227,7 @@ impl ConvoMachine {
         self.genesis = img.genesis;
         self.founding_index = img.founding_index;
         self.native_move = img.native_move;
+        self.abandoned_move = img.abandoned_move;
         self.policy = img.policy;
         self.leader_name = img.leader;
         let owned_rows = img.rows;
@@ -1295,6 +1334,7 @@ impl ConvoMachine {
         self.founded = false;
         self.founding_index = None;
         self.native_move = None;
+        self.abandoned_move = None;
         self.epoch = 0;
         self.policy = None;
         self.applied_bytes = 0;
@@ -1315,6 +1355,7 @@ impl ConvoMachine {
             self.genesis = image.genesis;
             self.founding_index = image.founding_index;
             self.native_move = image.native_move;
+            self.abandoned_move = image.abandoned_move;
             self.policy = image.policy;
             self.in_flight_parts = image.in_flight_parts;
             self.owner_term = image.owner_term;
@@ -1388,6 +1429,7 @@ impl ConvoMachine {
             genesis: self.genesis.clone(),
             founding_index: self.founding_index,
             native_move: self.native_move.clone(),
+            abandoned_move: self.abandoned_move.clone(),
             in_flight_parts: self.in_flight_parts.clone(),
             owner_run:self.owner_run, owner_term: self.owner_term,
             policy: self.policy,
@@ -1415,6 +1457,7 @@ impl ConvoMachine {
             founding_barrier: self.founding_barrier,
             projected: self.projected,
             native_move: self.native_move.clone(),
+            abandoned_move: self.abandoned_move.clone(),
             owner_run:self.owner_run, owner_term: self.owner_term,
             recovery_image: self.recovery_image.clone(),
             chunked_through: self.chunked_through,
@@ -1512,7 +1555,7 @@ impl ConvoMachine {
             if let Some(g) = &mut self.genesis {
                 if !entry.seal_voters.is_empty() {
                     let Some(charter) = entry.genesis_charter else { return Ok(false); };
-                    if entry.seal_voters.len() < TARGET_VOTERS || !entry.seal_voters.windows(2).all(|p| p.first() < p.last())
+                    if entry.seal_voters.len() < MIN_VOTERS || !entry.seal_voters.windows(2).all(|p| p.first() < p.last())
                         || g.charter.is_some_and(|old| old != charter || g.members != entry.seal_voters) { return Ok(false); }
                     if g.charter.is_none() {
                         // The sealed command is self-contained when the directory arrives
@@ -1541,6 +1584,7 @@ impl ConvoMachine {
             if intent.cancel {
                 if intent.ready || self.epoch != intent.epoch || self.native_move.as_ref().is_some_and(|m| m.digest != intent.digest || m.target != intent.target) { return Ok(false); }
                 self.native_move = None;
+                self.abandoned_move = Some(intent);
                 return Ok(true);
             }
             if intent.ready {
@@ -1549,6 +1593,7 @@ impl ConvoMachine {
                 || self.native_move.as_ref().is_some_and(|prior| !prior.ready && (prior.digest != intent.digest || prior.target != intent.target || prior.epoch != intent.epoch)) {
                 return Ok(false);
             }
+            if self.abandoned_move.as_ref().is_some_and(|a| !intent.ready && a.target == intent.target && a.digest == intent.digest) { self.abandoned_move = None; }
             self.native_move = Some(intent);
         } else if takeover && self.native_move.as_ref().is_some_and(|m| m.leadership_only || m.epoch != self.epoch || m.target != entry.leader) {
             self.native_move = None;
@@ -1951,7 +1996,7 @@ enum Input {
         arrived: bool,
     },
     OpenLeader {
-        auto_failover: bool,
+        policy: Policy,
         session: String,
         epoch: u64,
         encoded: Vec<PendingProposal>,
@@ -2021,7 +2066,6 @@ enum Input {
 }
 
 struct OpenWaiter {
-    started: Instant,
     reply: Sender<anyhow::Result<GroupStatus>>,
     admission: Arc<Mutex<AdmissionState>>,
 }
@@ -2038,6 +2082,7 @@ struct SessionGroup {
     process_round: Option<Box<super::custody::Round>>,
     process_watch: Option<Box<super::custody::Watch>>,
     reaffirm_term: Option<u64>,
+    abandon_term: Option<u64>,
     held_owner: Option<u64>,
     lost_owner: Option<u64>,
     deadline: Option<Instant>,
@@ -2050,7 +2095,7 @@ struct SessionGroup {
     sent_proof: Option<(u64,u64,u64,bool)>,
     peer_commit: (u64, u64),
     founding_voter_commits: BTreeMap<u64, (u64, u64)>,
-    applied_waiters: VecDeque<(CommitTag, u64, Instant, usize)>,
+    applied_waiters: VecDeque<(CommitTag, u64, usize)>,
     bookkeeping_term: u64,
     // A sent v2 suffix can still be in WAL flight before machine.chunked_through advances.
     v2_suffix: bool,
@@ -2074,9 +2119,13 @@ struct SessionGroup {
     /// True while a background `"kiln-convo-snap"` thread is building this group's snapshot image.
     snapshot_building: bool,
     snapshot_pinning: bool,
-    /// Exponential backoff state after snapshot build/compact failures so a broken store never spins.
     snapshot_failures: u32,
-    snapshot_backoff_until: Option<Instant>,
+    /// After a failed build or compaction, the applied index and compactable bytes it failed at:
+    /// none is tried again until the log grows by the cadence that makes a compaction due
+    /// (`sync::disk::due`), a caller proposes to it while it's stalled, this node's disk verdict
+    /// changes, or the store is replaced. A failure is retried no more often than a group
+    /// compacts, and nothing is timed.
+    snapshot_held: Option<(u64, u64)>,
     /// Whether this node was the Raft leader on the previous drive pass (drives automatic failover
     /// `Claimed` and returning-leader `LostLeadership` transitions).
     was_leader: bool,
@@ -2471,6 +2520,15 @@ impl SessionGroup {
         own + self.genesis_witnesses.len() > g.members.len() / 2
     }
 
+    /// Whether a snapshot may be built: none failed, or the log grew by a compaction's cadence since.
+    fn snapshot_free(&self) -> bool {
+        self.snapshot_held.is_none_or(|(index, bytes)| self.replica.applied().index.saturating_sub(index) >= CADENCE_ENTRIES / 2
+            || self.replica.compactable_bytes().saturating_sub(bytes) >= CADENCE_BYTES / 2)
+    }
+
+    /// Whether a caller waits on this group's open or commit.
+    fn waits(&self) -> bool { !self.open_waiters.is_empty() || !self.applied_waiters.is_empty() }
+
     fn receipt_frontier(&self) -> u64 {
         let conf = self.replica.configuration();
         if self.replica.machine().founding_barrier == FoundingBarrier::VotingFleet { return 0; }
@@ -2511,8 +2569,13 @@ struct Owner {
     local_exec: bool,
     /// Peers currently reported unreachable so closed-session retirement never wedges on dead nodes.
     unreachable_peers: BTreeSet<u64>,
-    /// Exponential backoff for fenced-replica reopens (`(failures, retry_after)`).
-    reopen_backoff: HashMap<String, (u32, Instant)>,
+    /// Reopen attempts of each fenced group since it last committed cleanly: one fenced again
+    /// before that is held rather than reopened in a loop.
+    reopen_attempts: HashMap<String, u32>,
+    /// Groups whose reopen failed, held until an event that could change that: a repair from a
+    /// peer, a peer trusted again or restarted, a caller asking for the session, this node's
+    /// disk verdict, or a new store (`release_reopens`). Nothing is timed.
+    reopen_held: HashSet<String>,
     recovering: HashMap<String, RecoveryWork>,
     repair_requests: HashMap<String, (u64, u64, Instant)>,
     /// Active off-thread snapshot workers and concurrency ceiling (prevents thread explosion on restart).
@@ -2533,6 +2596,7 @@ struct Owner {
     transfers: HashMap<String, (u64, Option<String>)>,
     flush_waiters: Vec<Sender<bool>>,
     open_answers: Vec<(Sender<anyhow::Result<GroupStatus>>, anyhow::Result<GroupStatus>)>,
+    commit_answers: Vec<(Sender<anyhow::Result<()>>, anyhow::Result<()>)>,
     output_place: Arc<crate::memory::queue::Place>,
     output_waker: Waker,
     waiting_output: BTreeMap<String,usize>,
@@ -2639,7 +2703,8 @@ impl Owner {
             executors: BTreeMap::from([(my_id, local_exec)]),
             local_exec,
             unreachable_peers: BTreeSet::new(),
-            reopen_backoff: HashMap::new(),
+            reopen_attempts: HashMap::new(),
+            reopen_held: HashSet::new(),
             recovering: HashMap::new(),
             repair_requests: HashMap::new(),
             snapshots_in_flight: 0,
@@ -2658,10 +2723,11 @@ impl Owner {
             transfers: HashMap::new(),
             flush_waiters: Vec::new(),
             open_answers: Vec::new(),
+            commit_answers: Vec::new(),
             snapshot_sends: VecDeque::new(),
             snapshot_acks: HashMap::new(),
             wire_generation: HashMap::new(),
-            wire_joiner: WireJoiner::in_dir(dir.join("incoming"), WIRE_WINDOW),
+            wire_joiner: WireJoiner::staged_untimed(dir.join("incoming")),
             next_wire_id: crate::util::new_v7().as_u64_pair().1,
             #[cfg(test)]
             wire_chunks_sent: 0,
@@ -2678,7 +2744,8 @@ impl Owner {
             if let Err(e) = owner.reopen_persisted(&session, slot) {
                 owner.dirty_sessions.insert(session.clone());
                 owner.recovering.insert(session.clone(), RecoveryWork::default());
-                owner.reopen_backoff.insert(session.clone(), (0, Instant::now() + WAL_RETRY));
+                owner.reopen_attempts.insert(session.clone(), 1);
+                owner.reopen_held.insert(session.clone());
                 tracing::error!(%session, shard = slot.shard, gid = slot.gid, error = %format!("{e:#}"), "reopening persisted conversation Raft group failed; slot preserved in sessions.json");
             }
         }
@@ -2758,7 +2825,7 @@ impl Owner {
             session.to_owned(),
             SessionGroup {
                 membership: super::liveness::Membership::new(self.liveness.clone(), slot.gid, None, self.local_exec),
-                indexed_membership:0, local_disk_slow: false, process_round:None, process_watch:None, reaffirm_term: None, held_owner: None, lost_owner: None, deadline: None,
+                indexed_membership:0, local_disk_slow: false, process_round:None, process_watch:None, reaffirm_term: None, abandon_term: None, held_owner: None, lost_owner: None, deadline: None,
                 rejected_witnesses: BTreeSet::new(), genesis_witnesses: BTreeSet::new(), sealing_term: None, founding_epoch: recovered.founding_epoch,
                 publication_term:None, blocked_proof: 0, sent_proof: None, peer_commit: (0, 0), founding_voter_commits: BTreeMap::new(), applied_waiters: VecDeque::new(),
                 bookkeeping_term: 0,
@@ -2776,7 +2843,7 @@ impl Owner {
                 snapshot_building: false,
                 snapshot_pinning: false,
                 snapshot_failures: 0,
-                snapshot_backoff_until: None,
+                snapshot_held: None,
                 was_leader: false,
                 reopened_at_index: Some(compacted),
                 #[cfg(test)]
@@ -2797,19 +2864,17 @@ impl Owner {
     /// `chunk_id` in the new term (preventing collision with term-change orphan chunk purging).
     fn reopen_fenced(&mut self, session: &str) {
         self.dirty_sessions.insert(session.to_owned());
-        if let Some((_, until)) = self.reopen_backoff.get(session)
-            && Instant::now() < *until
-        {
-            return;
-        }
         let Some(&slot) = self.session_slots.get(session) else { return };
         self.unlink_group(session);
+        // Fenced again before it committed cleanly since its last reopen: that reopen failed too.
+        let mut again = false;
         if let Some(mut old) = self.groups.remove(session) {
+            again = self.reopen_attempts.contains_key(session);
             if old.was_leader {
                 let _ = self.failover_tx.try_send(FailoverEvent::LostLeadership { session: session.to_owned(), new_epoch: old.replica.machine().epoch, new_leader: String::new(), term: old.replica.term() });
             }
             for p in &mut old.pending_proposals { p.reset_chunks(); }
-            for (tag, _, _, charge) in old.applied_waiters {
+            for (tag, _, charge) in old.applied_waiters {
                 release_admission(&self.admission, charge);
                 if let Some(tx) = old.commit_waiters.remove(&tag) { let _ = tx.send(Err(anyhow::anyhow!("replication proof interrupted by WAL recovery"))); }
             }
@@ -2826,16 +2891,35 @@ impl Owner {
             self.dirty_sessions.insert(session.to_owned());
             if let Some(shard) = self.shards.get_mut(&slot.shard) { shard.claimed = shard.claimed.saturating_sub(1); }
         }
-        if !self.recovering.contains_key(session) { return; }
-        let attempts = self.reopen_backoff.get(session).map_or(0, |(fails, _)| *fails).saturating_add(1);
-        let delay = repair_delay(attempts);
-        self.reopen_backoff.insert(session.to_owned(), (attempts, Instant::now() + delay));
-        match self.reopen_persisted(session, slot) {
+        if !self.recovering.contains_key(session) || self.reopen_held.contains(session) { return; }
+        let attempts = self.reopen_attempts.get(session).map_or(0, |n| *n).saturating_add(1);
+        self.reopen_attempts.insert(session.to_owned(), attempts);
+        let attempt = if again { Err(anyhow::anyhow!("fenced again before committing cleanly after its last reopen")) } else { self.reopen_persisted(session, slot) };
+        match attempt {
             Ok(()) => { crate::metrics::convo_raft().reopened_replicas.inc(); }
             Err(err) => {
+                self.reopen_held.insert(session.to_owned());
+                self.answer_recovery_waiters(session);
                 if let Err(e)=self.probe_saved_voters(session,slot) {tracing::debug!(%session,%e,"session repair discovery deferred");}
-                tracing::warn!(%session, error = %err, attempts, "retrying fenced conversation from its existing WAL slot");
+                tracing::warn!(%session, error = %err, attempts, "conversation WAL reopen failed; it waits for a repair, a peer's return, a caller, its disk or a new store");
             }
+        }
+    }
+
+    /// An event that could change a failed reopen's outcome: each held group is tried once more.
+    fn release_reopens(&mut self) {
+        for session in std::mem::take(&mut self.reopen_held) { self.reopen_fenced(&session); }
+    }
+
+    /// Whoever waits on a group whose reopen failed is told now. What they asked for stays queued
+    /// for when it reopens, so whether it commits is decided then.
+    fn answer_recovery_waiters(&mut self, session: &str) {
+        let Some(work) = self.recovering.get_mut(session) else { return };
+        for waiter in work.open_waiters.drain(..) {
+            self.open_answers.push((waiter.reply.clone(), Err(anyhow::anyhow!("session {session}'s WAL is being repaired; its ownership isn't confirmed"))));
+        }
+        for (_, tx) in work.commit_waiters.drain() {
+            let _ = tx.send(Err(anyhow::anyhow!("session {session}'s WAL is being repaired; whether this commits is decided once it reopens")));
         }
     }
 
@@ -2883,7 +2967,7 @@ impl Owner {
                 sg.snapshot_building = false;
                 sg.snapshot_pinning = false;
                 sg.snapshot_failures = sg.snapshot_failures.saturating_add(1);
-                sg.snapshot_backoff_until = Some(Instant::now() + repair_delay(sg.snapshot_failures));
+                sg.snapshot_held = Some((sg.replica.applied().index, sg.replica.compactable_bytes()));
             }
         }
     }
@@ -2964,7 +3048,8 @@ impl Owner {
         if let Err(e) = self.save_sessions_index() { self.session_slots.remove(session); return Err(e); }
         self.recovering.entry(session.to_owned()).or_default().wanted_learners.extend(self.peers.keys().copied().filter(|id| !record.members.contains(id)));
         if let Err(e) = self.reopen_persisted(session, slot) {
-            self.reopen_backoff.insert(session.to_owned(), (0, Instant::now() + WAL_RETRY));
+            self.reopen_attempts.insert(session.to_owned(), 1);
+            self.reopen_held.insert(session.to_owned());
             return Err(e);
         }
         self.terminal.remove(session);
@@ -3008,7 +3093,7 @@ impl Owner {
         }
         self.transfers.remove(session);
         self.closed.remove(session);
-        self.reopen_backoff.remove(session);
+        self.reopen_attempts.remove(session); self.reopen_held.remove(session);
         self.dirty_sessions.remove(session);
         self.removed_sessions.push(session.to_owned());
         crate::metrics::convo_raft().retired_groups.inc();
@@ -3062,7 +3147,7 @@ impl Owner {
                 if all_reachable_caught_up {
                     if sg.replica.machine().recovery_image.as_ref().is_some_and(|image| image.index == sg.replica.applied().index) {
                         to_retire.push(session.clone());
-                    } else if sg.snapshot_backoff_until.is_none_or(|until| Instant::now() >= until) {
+                    } else if sg.snapshot_free() {
                         to_archive.push(session.clone());
                     }
                 }
@@ -3123,18 +3208,19 @@ impl Owner {
                 _ => {}
             }
         }
-        let deadline = Instant::now() + OPEN_WAIT;
+        // Driven by events alone: each WAL write's completion wakes its group (`Input::Wake`), and the drain ends once
+        // nothing is out, or once the node's own disk is judged slow: the liveness detector's verdict on the writes the
+        // groups report out (`convo::liveness`, `report_io`), which comes as evidence (`Event::LocalDisk`).
         loop {
             self.drive_all();
             self.publish_shared();
             self.notify_flush_waiters();
             let pending = self.groups.values().any(|sg| sg.writes_out > 0 || (sg.replica.is_leader() && !sg.pending_proposals.is_empty()));
-            if !pending || Instant::now() >= deadline {
+            if !pending || self.liveness.with(|l| l.own_disk_slow()) == Some(true) {
                 break;
             }
-            let wait = deadline.saturating_duration_since(Instant::now()).min(WAL_RETRY);
-            match rx.recv_timeout(wait) {
-                Ok(i @ (Input::Wake(_) | Input::SnapshotPinned { .. })) => { self.handle(i); }
+            match rx.recv() {
+                Ok(i @ (Input::Wake(_) | Input::SnapshotPinned { .. } | Input::NodeEvidence)) => { self.handle(i); }
                 Ok(Input::SnapshotReady { session, generation, at, conf, keep, charge, result }) => {
                     self.scheduled.insert(session.clone());
                     self.on_snapshot_ready(&session, generation, at, conf, keep, charge, result);
@@ -3142,8 +3228,8 @@ impl Owner {
                 Ok(i @ (Input::Propose { .. } | Input::OpenLeader { .. } | Input::Step { .. })) => {
                     let _ = self.handle(i);
                 }
-                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => break,
+                Ok(_) => {}
+                Err(_) => break,
             }
         }
         for (session, sg) in &mut self.groups {
@@ -3157,7 +3243,7 @@ impl Owner {
             for (_, tx) in sg.commit_waiters.drain() {
                 let _ = tx.send(Err(anyhow::anyhow!("conversation Raft shut down before commit for {session}")));
             }
-            release_admission(&self.admission, sg.applied_waiters.drain(..).map(|(_,_,_,bytes)| bytes).sum());
+            release_admission(&self.admission, sg.applied_waiters.drain(..).map(|(_,_,bytes)| bytes).sum());
             release_admission(&self.admission, sg.credits.drain().map(|(_,bytes)| bytes).sum());
             sg.pending_claim = None;
         }
@@ -3279,7 +3365,7 @@ impl Owner {
                         Ok(true) => {
                             sg.compacting = true;
                             sg.snapshot_failures = 0;
-                            sg.snapshot_backoff_until = None;
+                            sg.snapshot_held = None;
                             compacted_ok = true;
                         }
                         Ok(false) => {
@@ -3287,7 +3373,7 @@ impl Owner {
                             // prepared image so a later compact builds fresh instead of reusing stale bytes.
                             sg.replica.machine_mut().prepared_image = None;
                             sg.snapshot_failures = 0;
-                            sg.snapshot_backoff_until = None;
+                            sg.snapshot_held = None;
                         }
                         Err(ReplicaError::Fenced(cause)) => {
                             sg.replica.machine_mut().prepared_image = None;
@@ -3298,7 +3384,7 @@ impl Owner {
                         Err(e) => {
                             sg.replica.machine_mut().prepared_image = None;
                             sg.snapshot_failures = sg.snapshot_failures.saturating_add(1);
-                            sg.snapshot_backoff_until = Some(Instant::now() + repair_delay(sg.snapshot_failures));
+                            sg.snapshot_held = Some((sg.replica.applied().index, sg.replica.compactable_bytes()));
                             tracing::warn!(%session, error = %e, failures = sg.snapshot_failures, "conversation Raft compact deferred with backoff");
                             compact_res = Err(anyhow::anyhow!("compact deferred: {e}"));
                         }
@@ -3306,7 +3392,7 @@ impl Owner {
                 }
                 Err(why) => {
                     sg.snapshot_failures = sg.snapshot_failures.saturating_add(1);
-                    sg.snapshot_backoff_until = Some(Instant::now() + repair_delay(sg.snapshot_failures));
+                    sg.snapshot_held = Some((sg.replica.applied().index, sg.replica.compactable_bytes()));
                     tracing::warn!(%session, %why, failures = sg.snapshot_failures, "off-thread conversation Raft snapshot deferred with backoff");
                     compact_res = Err(anyhow::anyhow!(why));
                 }
@@ -3413,7 +3499,14 @@ impl Owner {
     /// Returns `false` when `Input::Shutdown` requests a clean stop.
     fn handle(&mut self, input: Input) -> bool {
         match &input {
-            Input::OpenLeader { session, .. } | Input::Propose { session, .. } | Input::Step { session, .. } |
+            Input::OpenLeader { session, .. } | Input::Propose { session, .. } => {
+                self.scheduled.insert(session.clone());
+                // A caller asking for the session is an event that could change a failed reopen,
+                // or a failed snapshot that leaves its log stalled.
+                if let Some(sg) = self.groups.get_mut(session) && sg.replica.is_stalled() { sg.snapshot_held = None; }
+                if self.reopen_held.remove(session) { let session = session.clone(); self.reopen_fenced(&session); }
+            }
+            Input::Step { session, .. } |
             Input::ReportSnapshot { session, .. } | Input::Transfer { session, .. } | Input::SnapshotReady { session, .. } => {
                 self.scheduled.insert(session.clone());
             }
@@ -3436,9 +3529,11 @@ impl Owner {
                 self.shared.lock().store = Some(store);
                 let sessions: Vec<_> = self.groups.keys().cloned().collect();
                 for session in sessions {
-                    self.reopen_backoff.remove(&session);
+                    self.reopen_attempts.remove(&session);
                     self.reopen_fenced(&session);
                 }
+                for sg in self.groups.values_mut() { sg.snapshot_held = None; }
+                self.release_reopens();
             }
             Input::RegisterMembers(members) => {
                 let mut names = Vec::with_capacity(members.len());
@@ -3473,6 +3568,7 @@ impl Owner {
                     if new || returned { arrivals.push(id); self.peers.insert(id, name); }
                 }
                 if !arrivals.is_empty() {
+                    self.release_reopens();
                     for (session, sg) in &mut self.groups {
                         if let Some(w)=&mut sg.process_watch && arrivals.contains(&w.leader) {w.answered=None; self.scheduled.insert(session.clone());}
                         if let Some(r)=&mut sg.process_round && arrivals.iter().any(|id|r.asked.contains(id)) {r.retry=Some(self.liveness.now_ns()); self.scheduled.insert(session.clone());}
@@ -3508,12 +3604,15 @@ impl Owner {
                 *self.wire_generation.entry(pid).or_default() += 1;
                 self.v2_peers.remove(&pid);
                 self.snapshot_sends.retain(|send| send.to_id != pid);
+                self.snapshots_lost_to(pid);
                 for id in self.by_peer.get(&pid).into_iter().flatten() {
                     if let Some(sg)=self.groups.get_mut(id) {
                         let _=sg.replica.report_unreachable(pid);
                         self.scheduled.insert(id.clone());
                     }
                 }
+                self.scheduled.extend(self.transfers.iter().filter(|(_, (target, _))| *target == pid).map(|(id, _)| id.clone()));
+                self.scheduled.extend(self.groups.iter().filter(|(_, sg)| sg.waits()).map(|(id, _)| id.clone()));
             }
             Input::ReportSnapshot { session, peer_name, arrived } => {
                 let pid = node_id(&peer_name);
@@ -3527,8 +3626,8 @@ impl Owner {
                     self.reopen_fenced(&session);
                 }
             }
-            Input::OpenLeader { auto_failover, session, epoch, encoded, bytes, reply } => {
-                if let Err(e) = self.ensure_leader_group(&session, epoch, auto_failover, encoded, bytes, reply) {
+            Input::OpenLeader { policy, session, epoch, encoded, bytes, reply } => {
+                if let Err(e) = self.ensure_leader_group(&session, epoch, policy, encoded, bytes, reply) {
                     tracing::warn!(%session, error = %format!("{e:#}"), "open_leader failed");
                 }
             }
@@ -3754,7 +3853,7 @@ impl Owner {
                 let st = self.groups.get(&session).map_or((0, false, 0), |sg| {
                     (
                         sg.snapshot_failures,
-                        sg.snapshot_backoff_until.is_some_and(|u| Instant::now() < u),
+                        !sg.snapshot_free(),
                         sg.replica.machine().in_flight_parts.len(),
                     )
                 });
@@ -3806,7 +3905,7 @@ impl Owner {
         if !(matches!(msg.msg_type, MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgSnapshot)
             || msg.msg_type==MessageType::MsgHeartbeatResponse && msg.context==b"KGP2") { return Ok(()); }
         let requesting = msg.msg_type != MessageType::MsgSnapshot;
-        if requesting && self.repair_requests.get(session).is_some_and(|(peer, term, sent)| *peer == msg.from && *term == msg.term && sent.elapsed() < WIRE_WINDOW) { return Ok(()); }
+        if requesting && self.repair_outstanding(session, msg.from, msg.term) { return Ok(()); }
         let state = self.state_path(slot.gid);
         let saved: SavedConvo = serde_json::from_slice(&std::fs::read(&state)?)?;
         let conf = ConfState::from(&saved.conf);
@@ -3832,7 +3931,7 @@ impl Owner {
             let mut machine = ConvoMachine::open(session.to_owned(), self.names.clone(), self.my_id,None,self.store.clone(),state)?;
             machine.repair_from(&mut log, msg, self.my_id, &journal, true)?;
             drop(log);
-            self.reopen_backoff.remove(session);
+            self.reopen_attempts.remove(session); self.reopen_held.remove(session);
             self.reopen_fenced(session);
         }
         Ok(())
@@ -3842,13 +3941,14 @@ impl Owner {
     /// must match, the winner's image must include its majority certificate, and its WAL
     /// frontier must cover every promise already made by this replica.
     fn reconcile_genesis(&mut self, session: &str, from: &str, msg: &Message) -> anyhow::Result<()> {
+        let outstanding = self.repair_outstanding(session, msg.from, msg.term);
         let sg = self.groups.get_mut(session).context("missing provisional group")?;
         let machine = sg.replica.machine();
         if machine.founding_index.is_none() || machine.genesis.is_none()
             || !msg.context.starts_with(b"KGS1") || msg.term < sg.replica.term() { return Ok(()); }
         match msg.msg_type {
             MessageType::MsgAppend | MessageType::MsgHeartbeat | MessageType::MsgHeartbeatResponse => {
-                if self.repair_requests.get(session).is_some_and(|(peer, term, at)| *peer == msg.from && *term == msg.term && at.elapsed() < WIRE_WINDOW) { return Ok(()); }
+                if outstanding { return Ok(()); }
                 let log = sg.replica.log();
                 let view = log.view()?;
                 let mut request = hyper_raft::proto::message(msg.from, MessageType::MsgAppendResponse);
@@ -3873,7 +3973,7 @@ impl Owner {
                 release_admission(&self.admission, sg.pending_proposals.drain(..).map(|p| p.reserved_bytes).sum());
                 release_admission(&self.admission, sg.credits.drain().map(|(_, charge)| charge).sum());
                 sg.founding_epoch = None;
-                self.reopen_backoff.remove(session);
+                self.reopen_attempts.remove(session); self.reopen_held.remove(session);
                 self.reopen_fenced(session);
             }
             _ => {}
@@ -4045,7 +4145,7 @@ impl Owner {
                 && sg.replica.is_leader() && msg.term == sg.replica.term() && sg.replica.applied().index >= msg.request_snapshot
                 && (conf.learners.contains(&expected_id) || conf.voters.contains(&expected_id))
                 && sg.replica.machine().recovery_image.as_ref().is_none_or(|img| img.index < msg.request_snapshot)
-                && sg.snapshot_backoff_until.is_none_or(|until| Instant::now() >= until) {
+                && sg.snapshot_free() {
                 stalled = true;
             }
             let before_role = (sg.replica.term(), sg.replica.leader(), sg.replica.is_leader());
@@ -4089,14 +4189,14 @@ impl Owner {
         }
     }
 
-    fn ensure_leader_group(&mut self, session: &str, epoch: u64, auto_failover: bool, encoded: Vec<PendingProposal>, bytes: usize, reply: Option<Sender<anyhow::Result<GroupStatus>>>) -> anyhow::Result<()> {
+    fn ensure_leader_group(&mut self, session: &str, epoch: u64, policy: Policy, encoded: Vec<PendingProposal>, bytes: usize, reply: Option<Sender<anyhow::Result<GroupStatus>>>) -> anyhow::Result<()> {
         let waiter = if let Some(reply) = reply {
             if let Err(reason) = reserve_admission(&self.admission, size_of::<OpenWaiter>()) {
                 release_admission(&self.admission, bytes);
                 let _ = reply.send(Err(anyhow::anyhow!(reason)));
                 anyhow::bail!(reason);
             }
-            Some(OpenWaiter { started: Instant::now(), reply, admission: self.admission.clone() })
+            Some(OpenWaiter { reply, admission: self.admission.clone() })
         } else { None };
         let existing = self.groups.contains_key(session);
         let result = (|| -> anyhow::Result<()> {
@@ -4136,7 +4236,7 @@ impl Owner {
                 let conf = ConfState { voters: vec![self.my_id], ..ConfState::default() };
                 let mut connected = self.peers.keys().filter(|id| **id != self.my_id);
                 let eligible = connected.clone().filter(|id| self.executors.get(id) == Some(&true)).count();
-                let barrier = if auto_failover && eligible.saturating_add(1) >= TARGET_VOTERS {
+                let barrier = if policy.auto_failover && eligible.saturating_add(1) >= policy.voters() {
                     FoundingBarrier::VotingFleet
                 } else if connected.next().is_some() { FoundingBarrier::RemoteCopy } else { FoundingBarrier::Local };
                 self.create_group(session, conf, self.me.clone(), Some(barrier))?;
@@ -4201,7 +4301,7 @@ impl Owner {
             session.to_owned(),
             SessionGroup {
                 membership: super::liveness::Membership::new(self.liveness.clone(), slot.gid, None, self.local_exec),
-                indexed_membership:0, local_disk_slow: false, process_round:None, process_watch:None, reaffirm_term: None, held_owner: None, lost_owner: None, deadline: None,
+                indexed_membership:0, local_disk_slow: false, process_round:None, process_watch:None, reaffirm_term: None, abandon_term: None, held_owner: None, lost_owner: None, deadline: None,
                 rejected_witnesses: BTreeSet::new(), genesis_witnesses: BTreeSet::new(), sealing_term: None, founding_epoch: None,
                 publication_term:None, blocked_proof: 0, sent_proof: None, peer_commit: (0, 0), founding_voter_commits: BTreeMap::new(), applied_waiters: VecDeque::new(),
                 bookkeeping_term: 0,
@@ -4219,7 +4319,7 @@ impl Owner {
                 snapshot_building: false,
                 snapshot_pinning: false,
                 snapshot_failures: 0,
-                snapshot_backoff_until: None,
+                snapshot_held: None,
                 was_leader: false,
                 reopened_at_index: None,
                 #[cfg(test)]
@@ -4236,30 +4336,26 @@ impl Owner {
 
     fn next_deadline(&self) -> Option<Instant> {
         if !self.terminal_pending.is_empty() || !self.scheduled.is_empty() { return Some(Instant::now()); }
-        self.deadlines.first().map(|d|d.0).into_iter().chain(self.wire_joiner.expiry())
-            .chain(self.reopen_backoff.iter().filter(|(id,_)|self.recovering.contains_key(*id)).map(|(_,(_,at))|*at))
+        self.deadlines.first().map(|d|d.0).into_iter()
             .chain(self.terminal_retry.values().map(|(_,at)|*at))
-            .chain(self.snapshot_acks.values().map(|(_,_,sent)|*sent + OPEN_WAIT)).min()
+            .chain(self.snapshot_acks.values().map(|(_,_,due)|*due)).min()
     }
 
     fn on_deadline(&mut self) {
-        self.wire_joiner.expire();
         let now = Instant::now();
         while self.deadlines.first().is_some_and(|d| d.0 <= now) {
             let Some((at,id)) = self.deadlines.pop_first() else { break; };
             if let Some(sg) = self.groups.get_mut(&id) && sg.deadline == Some(at) { sg.deadline = None; self.scheduled.insert(id); }
         }
         self.terminal_pending.extend(self.terminal_retry.iter().filter(|(_,(_,at))| now >= *at).map(|(s,_)|s.clone()));
-        self.snapshot_acks.retain(|(session,peer),(_,term,sent)| {
+        self.snapshot_acks.retain(|(session,peer),(_,term,due)| {
             let Some(sg) = self.groups.get_mut(session) else { return false; };
             if sg.replica.term() != *term || !sg.replica.is_leader() { return false; }
-            if sent.elapsed() < OPEN_WAIT { return true; }
+            if now < *due { return true; }
             let _ = sg.replica.report_snapshot(*peer,false);
             self.scheduled.insert(session.clone());
             false
         });
-        let fenced:Vec<_> = self.recovering.keys().filter(|session| self.reopen_backoff.get(*session).is_none_or(|(_,until)| now >= *until)).cloned().collect();
-        for session in fenced { self.reopen_fenced(&session); }
     }
 
     fn next_group_wake(&mut self, session: &str) {
@@ -4267,9 +4363,7 @@ impl Owner {
         let now = Instant::now();
         let clock = self.liveness.now_ns();
         let due = (!sg.snapshot_pinning && sg.replica.fenced().is_none()).then(||sg.replica.deadline()).flatten().and_then(|at| now.checked_add(Duration::from_nanos(at.saturating_sub(clock))))
-            .into_iter().chain(sg.open_waiters.first().map(|w|w.started + OPEN_WAIT))
-            .chain(sg.applied_waiters.front().map(|(_,_,at,_)|*at + OPEN_WAIT))
-            .chain(sg.snapshot_backoff_until.filter(|t|*t > now))
+            .into_iter()
             .chain(sg.process_round.as_ref().filter(|_|!sg.snapshot_pinning && sg.replica.fenced().is_none()).and_then(|r|r.retry).and_then(|t|now.checked_add(Duration::from_nanos(t.saturating_sub(clock)))))
             .chain(sg.changing.and_then(|(_,_,at)|at.checked_add(sg.membership.election()?)).filter(|t|*t > now)).min();
         if due == sg.deadline { return; }
@@ -4310,8 +4404,68 @@ impl Owner {
         }
     }
 
+    /// Every snapshot outstanding to `peer`, failed: it became unreachable, or was suspected, stopped or restarted, so
+    /// no acknowledgement of what was sent it is waited for. Its group sends one again as its core asks.
+    fn snapshots_lost_to(&mut self, peer: u64) {
+        let lost: Vec<String> = self.snapshot_acks.keys().filter(|(_, to)| *to == peer).map(|(session, _)| session.clone()).collect();
+        for session in lost {
+            self.snapshot_acks.remove(&(session.clone(), peer));
+            if let Some(sg) = self.groups.get_mut(&session) {
+                if let Err(ReplicaError::Fenced(_)) = sg.replica.report_snapshot(peer, false) {
+                    self.reopen_fenced(&session);
+                    continue;
+                }
+                self.scheduled.insert(session);
+            }
+        }
+    }
+
+    /// The retransmission timeout of the path to `peer`: RFC 6298's `SRTT + max(G, 4·RTTVAR)` over the round trips the
+    /// node's liveness stream measured to it (`ExchangeRtt::tail_ns`, RFC 9002 §5.3's estimate), plus the node's mean
+    /// flush, as an answer leaves only once what it answers is durable; [`RTO_UNMEASURED`] before any is measured.
+    fn path_rto(&self, peer: u64) -> Duration {
+        self.liveness
+            .with(|l| {
+                let granularity = u64::try_from(l.granularity()?.as_nanos()).unwrap_or(u64::MAX);
+                let tail = l.round_trip(peer)?.tail_ns(granularity)?;
+                Some(Duration::from_nanos(tail).saturating_add(l.flush_mean().unwrap_or(Duration::ZERO)))
+            })
+            .flatten()
+            .unwrap_or(RTO_UNMEASURED)
+    }
+
+    /// A repair request to `peer` in `term`, sent at `sent`, still outstanding: not answered (reopening clears it), its
+    /// term current (the key holds it), its peer not suspected, stopped or restarted since (`node_evidence` clears
+    /// those), and younger than the path's measured retransmission timeout, past which one lost on a live peer is asked
+    /// again on that peer's next message. No timer: it's judged as the next message comes.
+    fn repair_outstanding(&self, session: &str, peer: u64, term: u64) -> bool {
+        self.repair_requests.get(session).is_some_and(|(asked, at, sent)| *asked == peer && *at == term && sent.elapsed() < self.path_rto(peer))
+    }
+
     fn node_evidence(&mut self, event: crate::liveness::Event) {
         use crate::liveness::Event;
+        // A peer suspected, stopped or restarted: what was asked of it, or was on its way from it, is no longer waited
+        // for, so the next message asks again and a partial message of its run goes.
+        if let Event::Change(c) = &event
+            && matches!(c, hyper_liveness::Change::Suspected(_) | hyper_liveness::Change::Stopped { .. } | hyper_liveness::Change::Restarted { .. })
+        {
+            let peer = c.peer();
+            self.repair_requests.retain(|_, (asked, _, _)| *asked != peer);
+            if !matches!(c, hyper_liveness::Change::Suspected(_)) {
+                self.wire_joiner.forget_prefix(&format!("{peer}:"));
+            }
+            self.snapshots_lost_to(peer);
+        }
+        if let Event::Change(c) = &event {
+            let peer = c.peer();
+            self.scheduled.extend(self.transfers.iter().filter(|(_, (target, _))| *target == peer).map(|(id, _)| id.clone()));
+            self.scheduled.extend(self.groups.iter().filter(|(_, sg)| sg.waits()).map(|(id, _)| id.clone()));
+            if matches!(c, hyper_liveness::Change::Trusted { .. } | hyper_liveness::Change::Restarted { .. }) { self.release_reopens(); }
+        }
+        if matches!(event, Event::LocalDisk) {
+            for sg in self.groups.values_mut() { sg.snapshot_held = None; }
+            self.release_reopens();
+        }
         if let Event::Timing(peer) = event {
             for id in self.by_peer.get(&peer).into_iter().flatten() {
                 let Some(sg) = self.groups.get_mut(id) else { continue };
@@ -4391,7 +4545,6 @@ impl Owner {
 
     fn drive_all(&mut self) {
         let now = self.now_ns();
-        let wall_now = Instant::now();
         let mut snap_bundles = Vec::new();
         let mut failed_snapshots: Vec<(String, u64)> = Vec::new();
         let mut finished_transfers = Vec::new();
@@ -4411,12 +4564,9 @@ impl Owner {
             sg.blocked_proof = 0;
             // Pause this group's applies only until the read transaction has pinned its view.
             if sg.snapshot_pinning { continue; }
-            // Skip fenced replicas silently while in exponential reopen backoff so we never spam
-            // error logs on every input/drive pass.
+            // A fenced replica is reopened, or held after a failed reopen (`reopen_fenced`).
             if sg.replica.fenced().is_some() {
-                if self.reopen_backoff.get(session).is_none_or(|(_, until)| wall_now >= *until) {
-                    fenced_sessions.push(session.clone());
-                }
+                fenced_sessions.push(session.clone());
                 continue;
             }
             if sg.replica.machine_mut().record_name_vote().is_err() {
@@ -4459,7 +4609,7 @@ impl Owner {
                 }
                 Err(ReplicaError::Stalled) => {
                     crate::metrics::convo_raft().stalled_events.inc();
-                    if !sg.snapshot_building && sg.snapshot_backoff_until.is_none_or(|u| wall_now >= u) {
+                    if !sg.snapshot_building && sg.snapshot_free() {
                         snapshot_requests.push((session.clone(), 0));
                     }
                 }
@@ -4667,7 +4817,7 @@ impl Owner {
                         Err(ReplicaError::Refused(_) | ReplicaError::Budget(_) | ReplicaError::Marked) => break,
                         Err(ReplicaError::Stalled) => {
                             crate::metrics::convo_raft().stalled_events.inc();
-                            if !sg.snapshot_building && sg.snapshot_backoff_until.is_none_or(|u| wall_now >= u) {
+                            if !sg.snapshot_building && sg.snapshot_free() {
                                 snapshot_requests.push((session.clone(), 0));
                             }
                             break;
@@ -4691,6 +4841,30 @@ impl Owner {
                 if learner_joined {
                     let _ = sg.replica.beat();
                     mutated = true;
+                }
+                // CP-T3.2. The old leader gives up a hand-over once an event shows its target can't
+                // take the lead, by the test that admitted the hand-over (`Input::Transfer`) and the
+                // detector's verdict, and commits that it did, so every member and whoever waits on
+                // it learns. While the target stays eligible, the attempt is made again.
+                let machine = sg.replica.machine();
+                let pending = machine.native_move.clone().filter(|m| !m.leadership_only && !m.cancel && !m.ready && m.epoch == machine.epoch && m.target != self.me);
+                if let Some(m) = pending
+                    && machine.leader_name == self.me && machine.owner_term == term && sg.abandon_term != Some(term) && sg.pending_claim.is_none() && !sg.local_disk_slow
+                {
+                    let target = node_id(&m.target);
+                    let why = if self.peers.get(&target) != Some(&m.target) { Some("it left the fleet") }
+                        else if self.unreachable_peers.contains(&target) { Some("it can't be reached") }
+                        else if self.executors.get(&target) != Some(&true) { Some("it hosts no sessions") }
+                        else if sg.membership.refuses_lead(target) { Some("the detector suspects it, saw it stop, or finds its disk slow") }
+                        else { None };
+                    if let Some(why) = why {
+                        let given_up = MoveIntent { leadership_only: false, cancel: true, ready: false, epoch: m.epoch, target: m.target.clone(), digest: m.digest };
+                        if sg.ownership_command(session, &self.me, false, Some(given_up)).is_ok() {
+                            sg.abandon_term = Some(term);
+                            mutated = true;
+                            tracing::info!(%session, target = %m.target, why, "gave up the session's hand-over");
+                        }
+                    }
                 }
                 // The committed move survives a source restart or a timeout-now that
                 // arrived before the destination could measure its first election.
@@ -4772,7 +4946,7 @@ impl Owner {
             // AND compacting with `keep` will genuinely advance `sg.compacted` (eliminating
             // no-progress snapshot loops on small/fresh sessions).
             if !sg.compacting && !sg.snapshot_building
-                && sg.snapshot_backoff_until.is_none_or(|u| wall_now >= u)
+                && sg.snapshot_free()
                 && sg.replica.machine().in_flight_parts.is_empty()
                 && crate::sync::disk::due(&sg.replica, sg.compacted)
                 && sg.replica.applied().index > sg.compacted
@@ -4810,7 +4984,7 @@ impl Owner {
             let founding_barrier = sg.replica.machine().founding_barrier;
             let voters = sg.replica.configuration().voters.len();
             let formed = match founding_barrier {
-                FoundingBarrier::VotingFleet => voters >= TARGET_VOTERS,
+                FoundingBarrier::VotingFleet => voters >= sg.replica.machine().policy.unwrap_or_default().voters(),
                 FoundingBarrier::RemoteCopy => voters > 1,
                 FoundingBarrier::Local => false,
             };
@@ -4853,21 +5027,22 @@ impl Owner {
             let published = machine.published();
             // Applies arrive in log-index order. A delayed cross-machine receipt retains its
             // original admission credit; a partition cannot build an uncharged waiter list.
-            while let Some(&(tag,index,started,charge)) = sg.applied_waiters.front() {
+            let blocked = unconfirmable(sg, self.my_id, &self.peers, &self.executors, &self.unreachable_peers);
+            while let Some(&(tag,index,charge)) = sg.applied_waiters.front() {
                 let current = sg.replica.is_leader() && tag.term == sg.replica.term();
                 let success = published && current && index <= replicated;
-                if !success && current && sg.commit_waiters.contains_key(&tag) && started.elapsed() < OPEN_WAIT { break; }
+                if !success && current && sg.commit_waiters.contains_key(&tag) && blocked.is_none() { break; }
                 sg.applied_waiters.pop_front();
                 release_admission(&self.admission, charge);
                 if let Some(tx) = sg.commit_waiters.remove(&tag) {
-                    let _ = tx.send(if success { Ok(()) } else { Err(anyhow::anyhow!("no durable replication confirmation for {session}")) });
+                    self.commit_answers.push((tx, if success { Ok(()) } else { Err(anyhow::anyhow!("no durable replication confirmation for {session}{}", blocked.map(|why| format!(": {why}")).unwrap_or_default())) }));
                 }
             }
             if !sg.open_waiters.is_empty() {
                 let ready = !sg.local_disk_slow && published && replicated >= sg.replica.applied().index && sg.replica.is_leader() && sg.replica.machine().owner_term == sg.replica.term() && sg.replica.machine().founded && sg.replica.machine().leader_name == self.me && sg.pending_claim.is_none() && sg.pending_proposals.is_empty() && sg.writes_out == 0;
-                let timed_out = sg.open_waiters.first().is_some_and(|w| w.started.elapsed() >= OPEN_WAIT);
                 let conflict = sg.conflicting_names();
-                if ready || conflict || timed_out {
+                let taken = sg.replica.machine().founded && sg.replica.machine().leader_name != self.me;
+                if ready || conflict || taken || blocked.is_some() {
                     let st = group_status(session, &self.me, self.my_id, sg, &self.peers);
                     for waiter in sg.open_waiters.drain(..) {
                         let historical = !published && machine.genesis.as_ref().is_some_and(|g| g.charter.is_none()) && machine.names.read().active.as_ref().is_some_and(|c| c.reserved.contains(session));
@@ -4875,7 +5050,9 @@ impl Owner {
                             Err(anyhow::anyhow!("conflicting starts for session {session} have incompatible durable name votes; inspect its session status or use another id"))
                         } else if historical {
                             Err(anyhow::anyhow!("reserved session {session} has no completed proof; reconnect the original registrar and selected node, or restore their original WAL checkpoints"))
-                        } else { Err(anyhow::anyhow!("timed out waiting for committed session ownership (leader {}, term {}, applied {}, epoch {}, founded {}, queued {}, writes {})", st.leader_id, st.term, st.applied, st.epoch, sg.replica.machine().founded, sg.pending_proposals.len(), sg.writes_out)) };
+                        } else if taken {
+                            Err(anyhow::anyhow!("{} took ownership of session {session} first", sg.replica.machine().leader_name))
+                        } else { Err(anyhow::anyhow!("session ownership can't be confirmed: {} (leader {}, term {}, applied {}, epoch {}, founded {})", blocked.unwrap_or_default(), st.leader_id, st.term, st.applied, st.epoch, sg.replica.machine().founded)) };
                         self.open_answers.push((waiter.reply.clone(), answer));
                     }
                 }
@@ -4897,7 +5074,7 @@ impl Owner {
             self.wire_chunks_sent = self.wire_chunks_sent.saturating_add(chunks_sent);
         }
         for s in cleared_backoff {
-            self.reopen_backoff.remove(&s);
+            self.reopen_attempts.remove(&s);
         }
         for s in finished_transfers {
             self.transfers.remove(&s);
@@ -4942,7 +5119,10 @@ impl Owner {
             if send.part < send.total {
                 self.snapshot_sends.push_back(send);
             } else {
-                self.snapshot_acks.insert((send.session, send.to_id), (send.index, send.term, Instant::now()));
+                // Overdue past the path's measured retransmission timeout for each part and its acknowledgement: what
+                // a snapshot lost on a live peer, with no event saying so, is judged by. Every other end is an event.
+                let due = Instant::now() + self.path_rto(send.to_id).saturating_mul(send.total.saturating_add(1));
+                self.snapshot_acks.insert((send.session, send.to_id), (send.index, send.term, due));
             }
         }
         if (!self.snapshot_sends.is_empty() || !self.waiting_output.is_empty()) && !self.out_tx.is_closed() {
@@ -4976,7 +5156,7 @@ impl Owner {
                 self.recovering.contains_key(&session).then(|| {
                     let last = sh.statuses.get(&session);
                     GroupStatus { execution_held: false, name_conflict: false, conflicting_start_request: None, recovering: true, founded: last.is_some_and(|s| s.founded), session: session.clone(), node: self.me.clone(), node_id: self.my_id,
-                        native_move_ready: false, native_move_digest: None, is_leader: false, owner: None, leader_id: 0, leader_name: None,
+                        native_move_ready: false, native_move_digest: None, abandoned_move: None, is_leader: false, owner: None, leader_id: 0, leader_name: None,
                         term: last.map_or(0, |s| s.term), epoch: last.map_or(0, |s| s.epoch), applied: last.map_or(0, |s| s.applied),
                         voters: Vec::new(), learners: Vec::new() }
                 })
@@ -4985,7 +5165,7 @@ impl Owner {
                 let new_lead = st.is_leader;
                 let old = sh.statuses.get(&session);
                 if st.founded && !old.is_some_and(|s|s.founded) && let Some(holds)=sh.start_holds.upgrade(){holds.founded(&session);}
-                if old.is_none_or(|old| old.recovering != st.recovering || old.founded != st.founded || old.name_conflict != st.name_conflict || old.execution_held != st.execution_held || old.native_move_digest != st.native_move_digest || old.native_move_ready != st.native_move_ready || old.owner != st.owner || old.is_leader != st.is_leader || old.term != st.term || old.epoch != st.epoch || old.leader_id != st.leader_id) {
+                if old.is_none_or(|old| old.recovering != st.recovering || old.founded != st.founded || old.name_conflict != st.name_conflict || old.execution_held != st.execution_held || old.native_move_digest != st.native_move_digest || old.native_move_ready != st.native_move_ready || old.abandoned_move != st.abandoned_move || old.owner != st.owner || old.is_leader != st.is_leader || old.term != st.term || old.epoch != st.epoch || old.leader_id != st.leader_id) {
                     custody_changed = true;
                     sh.note_custody(&session);
                 }
@@ -5015,6 +5195,7 @@ impl Owner {
     fn notify_flush_waiters(&mut self) {
         // Open must return after the public status can authorize the caller's next operation.
         for (tx, answer) in self.open_answers.drain(..) { let _ = tx.send(answer); }
+        for (tx, answer) in self.commit_answers.drain(..) { let _ = tx.send(answer); }
         if self.flush_waiters.is_empty() {
             return;
         }
@@ -5310,7 +5491,7 @@ impl Manager {
         let mut ids: Vec<_> = voters.iter().map(|n| node_id(n)).collect();
         ids.sort_unstable();
         ids.dedup();
-        anyhow::ensure!(ids.len() == voters.len() && ids.len() >= TARGET_VOTERS && voters.iter().all(|n| !n.is_empty()), "fleet charter has no distinct fault-tolerant electorate");
+        anyhow::ensure!(ids.len() == voters.len() && ids.len() >= MIN_VOTERS && voters.iter().all(|n| !n.is_empty()), "fleet charter has no distinct fault-tolerant electorate");
         self.change_names(NameChange::Install(Arc::new(NameCharter { digest, voters: ids, reserved: reserved.into() }))).map(drop)
     }
 
@@ -5443,10 +5624,8 @@ impl Manager {
             } else { initial_rows.extend(fresh_inbox_rows); }
         }
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.enqueue(session, epoch, initial_rows, true, None, |encoded, bytes| Input::OpenLeader { auto_failover: self.policy.auto_failover, session: session.to_owned(), epoch, encoded, bytes, reply: Some(reply_tx) })?;
-        reply_rx
-            .recv_timeout(OPEN_WAIT + WIRE_WINDOW)
-            .map_err(|_| anyhow::anyhow!("timed out waiting for WAL leader election for {session}"))?
+        self.enqueue(session, epoch, initial_rows, true, None, |encoded, bytes| Input::OpenLeader { policy: self.policy, session: session.to_owned(), epoch, encoded, bytes, reply: Some(reply_tx) })?;
+        reply_rx.recv().map_err(|_| anyhow::anyhow!("the conversation Raft owner stopped before opening {session}"))?
     }
 
     /// Propose new conversation rows for `session` on its leader (split up front to WAL entry
@@ -5479,9 +5658,7 @@ impl Manager {
     pub fn propose_sync(&self, session: &str, epoch: u64, rows: Vec<Row>) -> anyhow::Result<()> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.enqueue(session, epoch, rows, false, None, |encoded, bytes| Input::Propose { session: session.to_owned(), epoch, encoded, bytes, reply: Some(reply_tx) })?;
-        reply_rx
-            .recv_timeout(OPEN_WAIT)
-            .map_err(|_| anyhow::anyhow!("timed out waiting for Raft quorum commit for {session}"))?
+        reply_rx.recv().map_err(|_| anyhow::anyhow!("the conversation Raft owner stopped before committing for {session}"))?
     }
 
     /// Commit the staged destination's exact bytes before it can be elected to activate them.
@@ -5506,7 +5683,7 @@ impl Manager {
     fn commit_move_intent(&self, session: &str, epoch: u64, intent: MoveIntent) -> anyhow::Result<()> {
         let (tx, rx) = mpsc::channel();
         self.enqueue(session, epoch, Vec::new(), false, Some(intent), |encoded, bytes| Input::Propose { session: session.to_owned(), epoch, encoded, bytes, reply: Some(tx) })?;
-        rx.recv_timeout(OPEN_WAIT).context("native move has not committed")?
+        rx.recv().context("native move has not committed")?
     }
 
     /// Initiate Raft leadership transfer for `session` to `target_node` (e.g. when a session moves
@@ -5525,7 +5702,7 @@ impl Manager {
         if self.tx.send(Input::Transfer { epoch, digest, session: session.to_owned(), target_node: target_node.to_owned(), reply: reply_tx }).is_err() {
             return false;
         }
-        reply_rx.recv_timeout(OPEN_WAIT).unwrap_or(false)
+        reply_rx.recv().unwrap_or(false)
     }
 
     pub async fn begin_move(self: &Arc<Self>, session: &str, target: &str, epoch: u64, digest: &str) -> anyhow::Result<()> {
@@ -5535,19 +5712,23 @@ impl Manager {
 
     /// Observe the destination's activation without taking a blocking place it may itself
     /// need to commit that activation (including an in-place resume on this machine).
+    /// CP-T3.2. Told, never timed: it ends on the destination's activation, another owner's
+    /// claim, or the old leader's committed word that it gave the hand-over up.
     pub async fn wait_moved(&self, session: &str, target: &str, old_epoch: u64, digest: &str) -> anyhow::Result<()> {
         let next = old_epoch.checked_add(1).context("session epoch overflow")?;
         let changed = self.changed();
-        crate::rt::timeout(OPEN_WAIT, async {
+        async {
             loop {
                 let notice = changed.listen();
                 let status = self.status(session).context("session Raft group disappeared during transfer")?;
                 let arrived = status.epoch == next && status.owner.as_deref() == Some(target) && status.leader_id == node_id(target) && status.native_move_digest.as_deref() == Some(digest);
                 if arrived && status.native_move_ready { return Ok(()); }
                 anyhow::ensure!(arrived || status.epoch <= old_epoch || status.owner.is_none(), "another Raft owner claimed session {session} during transfer");
+                let given_up = status.epoch == old_epoch && status.abandoned_move.as_ref().is_some_and(|a| a.epoch == old_epoch && a.target == target && a.digest == digest);
+                anyhow::ensure!(!given_up, "its old leader gave the hand-over up");
                 notice.await;
             }
-        }).await.with_context(|| format!("session {session} has not confirmed ownership on {target}"))?
+        }.await.with_context(|| format!("session {session} has not confirmed ownership on {target}"))
     }
 
     /// Deliver an incoming Raft message for `session` from transport-authenticated `from_node`.
@@ -5624,7 +5805,7 @@ impl Manager {
         self.tx
             .send(Input::ForceCompact { session: session.to_owned(), keep, reply: tx })
             .map_err(|_| anyhow::anyhow!("manager stopped"))?;
-        rx.recv_timeout(OPEN_WAIT).map_err(|_| anyhow::anyhow!("force_compact timed out"))?
+        rx.recv().map_err(|_| anyhow::anyhow!("force_compact: manager stopped"))?
     }
 
     #[cfg(test)]
@@ -5633,7 +5814,7 @@ impl Manager {
         self.tx
             .send(Input::InjectRawProposal { session: session.to_owned(), raw, reply: tx })
             .map_err(|_| anyhow::anyhow!("manager stopped"))?;
-        rx.recv_timeout(OPEN_WAIT).map_err(|_| anyhow::anyhow!("inject_raw_proposal timed out"))?
+        rx.recv().map_err(|_| anyhow::anyhow!("inject_raw_proposal: manager stopped"))?
     }
 
     #[cfg(test)]
@@ -5642,7 +5823,7 @@ impl Manager {
         self.tx
             .send(Input::FailNextPersist { session: session.to_owned(), reply: tx })
             .map_err(|_| anyhow::anyhow!("manager stopped"))?;
-        rx.recv_timeout(OPEN_WAIT).map_err(|_| anyhow::anyhow!("fail_next_persist timed out"))?
+        rx.recv().map_err(|_| anyhow::anyhow!("fail_next_persist: manager stopped"))?
     }
 
     #[cfg(test)]
@@ -5651,15 +5832,52 @@ impl Manager {
         self.tx
             .send(Input::SnapshotState { session: session.to_owned(), reply: tx })
             .map_err(|_| anyhow::anyhow!("manager stopped"))?;
-        rx.recv_timeout(OPEN_WAIT).map_err(|_| anyhow::anyhow!("snapshot_state timed out"))
+        rx.recv().map_err(|_| anyhow::anyhow!("snapshot_state: manager stopped"))
     }
+}
+
+/// Why an open or commit at this group can no longer be confirmed by the members it needs, by
+/// the detector's verdicts and the fleet's reports so far; `None` while it still can be. Each
+/// verdict that changes it drives the group again (`Owner::node_evidence`), so no waiter is
+/// timed.
+fn unconfirmable(sg: &SessionGroup, me: u64, peers: &BTreeMap<u64, String>, executors: &BTreeMap<u64, bool>, unreachable: &BTreeSet<u64>) -> Option<&'static str> {
+    if sg.local_disk_slow { return Some("this node's WAL is judged slow"); }
+    let able = |p: &u64| *p != me && !unreachable.contains(p) && !sg.membership.lost(*p);
+    let conf = sg.replica.configuration();
+    let machine = sg.replica.machine();
+    if conf.voters.len() > 1 && conf.voters.iter().filter(|v| **v == me || able(v)).count() <= conf.voters.len() / 2 {
+        return Some("too few of its voters remain for a quorum");
+    }
+    let copies = || conf.voters.iter().chain(&conf.learners).chain(&sg.wanted_learners).any(able);
+    match machine.founding_barrier {
+        // As `reconcile_learners` promotes: reachable executors, and in a chartered founding the
+        // charter's executors even when unreachable, so long as a majority can answer. Judged
+        // once the founding entry has applied, which carries the session's policy and charter.
+        FoundingBarrier::VotingFleet if machine.founded => {
+            let target = machine.policy.unwrap_or_default().voters();
+            let live = peers.keys().chain(&conf.voters).chain(&conf.learners).filter(|p| able(p) && executors.get(*p) == Some(&true)).collect::<BTreeSet<_>>();
+            let charter = machine.genesis.as_ref().filter(|g| g.charter.is_some() && machine.founding_index.is_some())
+                .map_or(0, |g| g.members.iter().filter(|m| **m != me && !live.contains(m) && executors.get(*m) == Some(&true)).count());
+            if live.len().saturating_add(charter).saturating_add(1) < target || live.len().saturating_add(1) <= target / 2 {
+                return Some("too few executors remain to form its voters");
+            }
+        }
+        FoundingBarrier::RemoteCopy if !copies() => return Some("no member remains to hold its copy"),
+        FoundingBarrier::Local if conf.voters.len() <= 1 && !(conf.learners.is_empty() && sg.wanted_learners.is_empty()) && !copies() => return Some("no member remains to hold its copy"),
+        _ => {}
+    }
+    if !machine.published() && let Some(g) = machine.genesis.as_ref().filter(|_| machine.founding_index.is_some()) {
+        let witnesses = g.members.iter().filter(|m| **m == me || sg.genesis_witnesses.contains(*m) || (able(m) && !sg.rejected_witnesses.contains(*m))).count();
+        if witnesses <= g.members.len() / 2 { return Some("too few of its name's voters remain to witness it"); }
+    }
+    None
 }
 
 fn settle_committed_tags(session: &str, sg: &mut SessionGroup, committed_tags: &mut Vec<ApplyReceipt>, failovers: &mut Vec<FailoverEvent>, admission: &Mutex<AdmissionState>) {
     for (tag, accepted, index) in committed_tags.drain(..) {
         let charge = sg.credits.remove(&tag).unwrap_or(0);
         if accepted && sg.commit_waiters.contains_key(&tag) {
-            sg.applied_waiters.push_back((tag, index, Instant::now(), charge));
+            sg.applied_waiters.push_back((tag, index, charge));
         } else {
             release_admission(admission, charge);
             if let Some(tx) = sg.commit_waiters.remove(&tag) {
@@ -5732,41 +5950,27 @@ fn reconcile_learners(sg: &mut SessionGroup, unreachable_peers: &BTreeSet<u64>, 
         return (false, joined);
     }
     // Phase 2 (opt-in): promote caught-up reachable learners to voters to establish a fault-tolerant
-    // odd quorum (`TARGET_VOTERS = 3`) so leader failure automatically triggers Raft failover.
-    if auto_failover && conf.voters_outgoing.is_empty() && conf.voters.len() < TARGET_VOTERS {
-        let needed = TARGET_VOTERS - conf.voters.len();
-        // A two-node fleet may wait here for its third voter for its whole lifetime.
-        // Allocate the wire change only when there are enough voters to propose it.
-        let mut candidates = [0_u64; TARGET_VOTERS];
-        let mut count = 0;
-        let ready = conf.learners.iter().copied()
-            .filter(|m| executors.get(m) == Some(&true) && !unreachable_peers.contains(m) && sg.replica.caught_up(*m));
-        for (slot, voter) in candidates.iter_mut().take(needed).zip(ready) {
-            *slot = voter;
-            count += 1;
-        }
+    // odd quorum, the session policy's 2f + 1 (`Policy::voters`), so leader failure automatically
+    // triggers Raft failover.
+    let target = sg.replica.machine().policy.unwrap_or_default().voters();
+    if auto_failover && conf.voters_outgoing.is_empty() && conf.voters.len() < target {
+        let needed = target - conf.voters.len();
+        // A fleet smaller than the target may wait here for its last voters for its whole
+        // lifetime. Allocate the wire change only when there are enough voters to propose it.
+        let ready = |m: &u64| executors.get(m) == Some(&true) && !unreachable_peers.contains(m) && sg.replica.caught_up(*m);
+        let learners = || conf.learners.iter().copied().filter(|m| ready(m)).take(needed);
         let machine = sg.replica.machine();
-        if count < needed && machine.founding_index.is_some()
-            && let Some(charter) = machine.genesis.as_ref().filter(|g| g.charter.is_some())
-        {
-            // The caller has already checked the charter quorum's durable founding witnesses.
-            // Raft must also be able to commit under the incoming session voter configuration.
-            let current = conf.voters.iter().filter(|v| **v == sg.replica.leader() || (!unreachable_peers.contains(v) && sg.replica.caught_up(**v))).count();
-            if current + count > TARGET_VOTERS / 2 {
-                for &voter in &charter.members {
-                    if !conf.voters.contains(&voter) && !candidates.contains(&voter)
-                        && executors.get(&voter) == Some(&true) && (unreachable_peers.contains(&voter) || v2_peers.contains(&voter))
-                        && let Some(slot) = candidates.get_mut(count) {
-                        *slot = voter;
-                        count += 1;
-                        if count == needed { break; }
-                    }
-                }
-            }
-        }
-        if count == needed {
-            let [first, ..] = candidates;
-            let changes = candidates.iter().take(needed).map(|&node_id| ConfChangeSingle { change_type: ConfChangeType::AddNode, node_id }).collect();
+        // The caller has already checked the charter quorum's durable founding witnesses.
+        // Raft must also be able to commit under the incoming session voter configuration.
+        let current = conf.voters.iter().filter(|v| **v == sg.replica.leader() || (!unreachable_peers.contains(v) && sg.replica.caught_up(**v))).count();
+        let charter = || machine.genesis.as_ref()
+            .filter(|g| g.charter.is_some() && machine.founding_index.is_some() && current + learners().count() > target / 2)
+            .into_iter().flat_map(|g| g.members.iter().copied())
+            .filter(|v| !conf.voters.contains(v) && !learners().any(|c| c == *v)
+                && executors.get(v) == Some(&true) && (unreachable_peers.contains(v) || v2_peers.contains(v)));
+        let candidates = || learners().chain(charter()).take(needed);
+        if candidates().count() == needed && let Some(first) = candidates().next() {
+            let changes = candidates().map(|node_id| ConfChangeSingle { change_type: ConfChangeType::AddNode, node_id }).collect();
             let change = ConfChangeV2 { transition: ConfChangeTransition::Auto, changes, context: Vec::new() };
             if sg.replica.change(Vec::new(), &change).is_ok() {
                 sg.changing = Some((first, true, Instant::now()));
@@ -5912,6 +6116,8 @@ fn group_status(session: &str, me: &str, my_id: u64, sg: &SessionGroup, peers: &
         recovering,
         native_move_digest: native.map(|m| m.digest.clone()),
         native_move_ready: native.is_some_and(|m| m.ready),
+        abandoned_move: machine.abandoned_move.as_ref().filter(|m| m.epoch == machine.epoch)
+            .map(|m| AbandonedMove { epoch: m.epoch, target: m.target.clone(), digest: m.digest.clone() }),
         founded: machine.published(),
         session: session.to_owned(),
         node: me.to_owned(),
@@ -6076,9 +6282,18 @@ mod tests {
         fn while_pumping<T: Send>(&self, call: impl FnOnce() -> anyhow::Result<T> + Send) -> anyhow::Result<T> {
             thread::scope(|scope| {
                 let job = scope.spawn(call);
-                let until = Instant::now() + OPEN_WAIT + WIRE_WINDOW;
-                while !job.is_finished() && Instant::now() < until { self.settle()?; }
-                job.join().map_err(|_| anyhow::anyhow!("fleet operation stopped"))?
+                let until = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
+                let mut pumped = Ok(());
+                while !job.is_finished() && Instant::now() < until && pumped.is_ok() { pumped = self.settle(); }
+                // A caller waits on its owner's answer, never a timer. One still waiting here is a
+                // failure: stopping the owners drops what it waits on, so it wakes and the test fails
+                // rather than hangs.
+                let stuck = !job.is_finished();
+                if stuck { for (mgr, _, _, _) in self.nodes.values() { mgr.shutdown(); } }
+                let answer = job.join().map_err(|_| anyhow::anyhow!("fleet operation stopped"))?;
+                pumped?;
+                anyhow::ensure!(!stuck, "fleet operation was not answered while the fleet was pumped: {:?}", answer.as_ref().err());
+                answer
             })
         }
 
@@ -6120,7 +6335,7 @@ mod tests {
                     if offline.contains(&name.as_str()) {
                         continue;
                     }
-                    anyhow::ensure!(mgr.flush(OPEN_WAIT), "node {name} WAL flush stalled");
+                    anyhow::ensure!(mgr.flush(TEST_WAIT), "node {name} WAL flush stalled");
                 }
                 let mut moved = false;
                 for (from, (mgr, _, _, _)) in &self.nodes {
@@ -6168,7 +6383,7 @@ mod tests {
             for m in online() {
                 let (ask,answer)=mpsc::channel();
                 m.tx.send(Input::NextTimer(ask)).map_err(|_|anyhow::anyhow!("Raft timer owner stopped"))?;
-                if let Some(t)=answer.recv_timeout(OPEN_WAIT)? {next=Some(next.map_or(t,|old:u64|old.min(t)));}
+                if let Some(t)=answer.recv_timeout(TEST_WAIT)? {next=Some(next.map_or(t,|old:u64|old.min(t)));}
             }
             for m in online() {
                 if let Some(at)=next {m.live.set_test_clock(at.max(m.live.now_ns()));}
@@ -6329,7 +6544,7 @@ mod tests {
 
         fn elect_survivor(&self, offline: &[&str], session: &str) -> anyhow::Result<()> {
             self.detector_partition(offline, false)?;
-            let until = Instant::now() + OPEN_WAIT + WIRE_WINDOW;
+            let until = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
             loop {
                 self.settle_except(offline)?;
                 if self
@@ -6447,14 +6662,20 @@ mod tests {
         let session = "explicit-across-rosters";
         let minority = fleet.mgr("d")?.clone();
         let pending = thread::spawn(move || minority.open_leader(session, 1, vec![user_event(session, 1, "CDE")]));
-        let until = Instant::now() + OPEN_WAIT;
+        let until = Instant::now() + TEST_WAIT;
         while fleet.store("c")?.kept(session, 1)?.is_none_or(|k| k.events.is_empty()) && Instant::now() < until { fleet.settle_except(&["a","b"])?; }
         anyhow::ensure!(!pending.is_finished() && fleet.mgr("d")?.status(session).is_some_and(|st| !st.founded), "a disjoint directory majority acknowledged the id");
         let majority = fleet.mgr("a")?.clone();
         let winner = thread::spawn(move || majority.open_leader(session, 1, vec![user_event(session, 1, "AB")]));
-        let until = Instant::now() + OPEN_WAIT;
+        let until = Instant::now() + TEST_WAIT;
         while !winner.is_finished() && Instant::now() < until { fleet.settle_except(&["c","d","e"])?; }
         winner.join().map_err(|_| anyhow::anyhow!("charter owner stopped"))??;
+        // The provisional founder is told once it hears the winner: no timer answers it. Its
+        // groups beat once the detector has measured their links.
+        fleet.detector_partition(&[], false)?;
+        let until = Instant::now() + TEST_WAIT;
+        while !pending.is_finished() && Instant::now() < until { fleet.settle()?; }
+        anyhow::ensure!(pending.is_finished(), "the provisional founder must be told once it hears the winner");
         anyhow::ensure!(pending.join().map_err(|_| anyhow::anyhow!("provisional founder stopped"))?.is_err());
         Ok(())
     }
@@ -6493,7 +6714,7 @@ mod tests {
         let session = "cutoff-before-registrar-contact";
         let original = fleet.mgr("a")?.clone();
         let opening = thread::spawn(move || original.open_leader(session, 1, vec![user_event(session, 1, "original prompt")]));
-        let until = Instant::now() + OPEN_WAIT;
+        let until = Instant::now() + TEST_WAIT;
         while fleet.store("c")?.kept(session, 1)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < until {
             fleet.settle_except(&["registrar"])?;
         }
@@ -6523,9 +6744,9 @@ mod tests {
         let selected = fleet.mgr("original")?.clone();
         let session = "opening-at-cutoff";
         let opening = thread::spawn(move || selected.open_leader(session, 1, vec![user_event(session, 1, "selected")]));
-        let deadline = Instant::now() + OPEN_WAIT;
+        let deadline = Instant::now() + TEST_WAIT;
         while fleet.store("original")?.kept(session, 1)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < deadline {
-            anyhow::ensure!(fleet.mgr("original")?.flush(OPEN_WAIT));
+            anyhow::ensure!(fleet.mgr("original")?.flush(TEST_WAIT));
         }
         let original_status = fleet.mgr("original")?.status(session).context("opening local slot")?;
         let registrar = fleet.mgr("registrar")?;
@@ -6533,7 +6754,7 @@ mod tests {
         beat.from = node_id("original");
         beat.term = original_status.term;
         registrar.step("original", session, &beat.encode_to_vec())?;
-        anyhow::ensure!(registrar.flush(OPEN_WAIT));
+        anyhow::ensure!(registrar.flush(TEST_WAIT));
         anyhow::ensure!(registrar.historical_name_inventory()?.iter().any(|s| s == session));
         let reserved: BTreeSet<_> = registrar.freeze_name_registrar()?.into_iter().collect();
         let digest = [2;32];
@@ -6560,17 +6781,17 @@ mod tests {
         };
         let first = run("a")?;
         let other = run("b")?;
-        let until = Instant::now() + OPEN_WAIT;
+        let until = Instant::now() + TEST_WAIT;
         // Let both selected candidates commit their independent index/term locally.
         for node in ["a","b"] {
-            while fleet.store(node)?.kept(session, 8)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < until { anyhow::ensure!(fleet.mgr(node)?.flush(OPEN_WAIT)); }
+            while fleet.store(node)?.kept(session, 8)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < until { anyhow::ensure!(fleet.mgr(node)?.flush(TEST_WAIT)); }
             anyhow::ensure!(fleet.mgr(node)?.status(session).is_some_and(|st| !st.founded));
         }
         while !first.is_finished() && Instant::now() < until { fleet.settle_except(&["b"])?; }
         first.join().map_err(|_| anyhow::anyhow!("first founder stopped"))??;
         fleet.settle()?;
         anyhow::ensure!(other.join().map_err(|_| anyhow::anyhow!("other founder stopped"))?.is_err());
-        let until = Instant::now() + OPEN_WAIT;
+        let until = Instant::now() + TEST_WAIT;
         while !fleet.mgr("b")?.status(session).is_some_and(|s| s.owner.as_deref() == Some("a")) && Instant::now() < until { fleet.settle()?; }
         let loser = fleet.mgr("b")?.status(session);
         anyhow::ensure!(loser.as_ref().is_some_and(|s| s.founded && s.owner.as_deref() == Some("a")), "rejected founder failed to reconcile: {loser:?}, winner {:?}", fleet.mgr("a")?.status(session));
@@ -6591,9 +6812,9 @@ mod tests {
             let (m, name) = (manager.clone(), name.clone());
             opens.push(thread::spawn(move || m.open_leader(session, 1, vec![user_event(session, 1, &name)])));
         }
-        let deadline = Instant::now() + OPEN_WAIT;
+        let deadline = Instant::now() + TEST_WAIT;
         for (manager, store, _, _) in fleet.nodes.values() {
-            while store.kept(session, 1)?.is_none_or(|k| k.events.is_empty()) && Instant::now() < deadline { anyhow::ensure!(manager.flush(OPEN_WAIT)); }
+            while store.kept(session, 1)?.is_none_or(|k| k.events.is_empty()) && Instant::now() < deadline { anyhow::ensure!(manager.flush(TEST_WAIT)); }
         }
         while opens.iter().any(|op| !op.is_finished()) && Instant::now() < deadline { fleet.settle()?; }
         for opening in opens {
@@ -6657,18 +6878,18 @@ mod tests {
         let source = fleet.mgr("a")?.clone();
         let session = "sess-bootstrap-receipt";
         let opening = thread::spawn(move || source.open_leader(session, 1, vec![user_event(session, 1, "open")]));
-        let deadline = Instant::now() + OPEN_WAIT;
+        let deadline = Instant::now() + TEST_WAIT;
         while fleet.store("a")?.kept(session, 10)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < deadline {
-            anyhow::ensure!(fleet.mgr("a")?.flush(OPEN_WAIT));
+            anyhow::ensure!(fleet.mgr("a")?.flush(TEST_WAIT));
         }
         anyhow::ensure!(fleet.mgr("a")?.status(session).is_some_and(|st| !st.founded) && !opening.is_finished(), "local apply alone exposed or acknowledged founding");
         while !opening.is_finished() && Instant::now() < deadline { fleet.settle()?; }
         opening.join().map_err(|_| anyhow::anyhow!("founder stopped"))??;
         let source = fleet.mgr("a")?.clone();
         let sending = thread::spawn(move || source.propose_sync(session, 1, vec![user_event(session, 2, "first")]));
-        let deadline = Instant::now() + OPEN_WAIT;
+        let deadline = Instant::now() + TEST_WAIT;
         while fleet.store("a")?.kept(session, 10)?.is_none_or(|s| s.events.len() < 2) && Instant::now() < deadline {
-            anyhow::ensure!(fleet.mgr("a")?.flush(OPEN_WAIT));
+            anyhow::ensure!(fleet.mgr("a")?.flush(TEST_WAIT));
         }
         anyhow::ensure!(!sending.is_finished(), "local apply alone acknowledged the first message");
         while !sending.is_finished() && Instant::now() < deadline { fleet.settle()?; }
@@ -6680,7 +6901,7 @@ mod tests {
     #[test]
     fn cp_t32_two_charter_voters_can_open_a_session_without_the_third_or_the_registrar() -> anyhow::Result<()> {
         let voters = ["a", "b", "c"];
-        let fleet = Fleet::new_with_policy(&voters, Policy { auto_failover: true })?;
+        let fleet = Fleet::new_with_policy(&voters, Policy { auto_failover: true, ..Policy::default() })?;
         for (mgr, _, _, _) in fleet.nodes.values() {
             mgr.set_name_registrar("bootstrap")?;
             mgr.install_name_charter([7; 32], voters.iter().map(|v| (*v).to_owned()).collect(), BTreeSet::new())?;
@@ -6690,7 +6911,7 @@ mod tests {
         let selected = fleet.mgr("c")?;
         let status = thread::scope(|scope| -> anyhow::Result<GroupStatus> {
             let opening = scope.spawn(|| selected.open_leader(session, 0, vec![user_event(session, 1, "offline opening")]));
-            let deadline = Instant::now() + OPEN_WAIT + WIRE_WINDOW;
+            let deadline = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
             while !opening.is_finished() && Instant::now() < deadline { fleet.settle_except(&["b"])?; }
             opening.join().map_err(|_| anyhow::anyhow!("founder stopped"))?
         })?;
@@ -6703,13 +6924,13 @@ mod tests {
 
     #[test]
     fn cp_t32_third_executor_enrolled_after_founding_joins_the_session_quorum() -> anyhow::Result<()> {
-        let mut fleet = Fleet::new_with_policy(&["a","b"], Policy { auto_failover: true })?;
+        let mut fleet = Fleet::new_with_policy(&["a","b"], Policy { auto_failover: true, ..Policy::default() })?;
         let session = "late-voter";
         fleet.open("b", session, 1, vec![user_event(session, 1, "on b")])?;
         let before = fleet.mgr("b")?.status(session).context("missing founding group")?;
         anyhow::ensure!(before.voters.len() == 1 && before.owner.as_deref() == Some("b"));
         fleet.add_node("c")?;
-        let until = Instant::now() + OPEN_WAIT;
+        let until = Instant::now() + TEST_WAIT;
         while fleet.mgr("b")?.status(session).is_none_or(|s| s.voters.len() != 3) && Instant::now() < until { fleet.settle()?; }
         fleet.settle()?;
         for name in ["a","b","c"] {
@@ -6722,7 +6943,7 @@ mod tests {
 
     #[test]
     fn cp_t32_storage_only_members_replicate_without_becoming_executor_voters() -> anyhow::Result<()> {
-        let fleet = Fleet::new_with_policy(&["owner", "replica", "worker"], Policy { auto_failover: true })?;
+        let fleet = Fleet::new_with_policy(&["owner", "replica", "worker"], Policy { auto_failover: true, ..Policy::default() })?;
         for (mgr, _, _, _) in fleet.nodes.values() { mgr.set_peer_executor("replica", false); }
         fleet.open("owner", "sess-storage-vote", 1, vec![user_event("sess-storage-vote", 1, "replicated")])?;
         fleet.settle()?;
@@ -6752,7 +6973,7 @@ mod tests {
     #[test]
     fn cp_t32_a_disk_handoff_and_one_bad_path_cannot_transfer_the_providers_epoch() -> anyhow::Result<()> {
         use hyper_timing::Trust;
-        let fleet=Fleet::new_with_policy(&["a","b","c"],Policy{auto_failover:true})?;
+        let fleet=Fleet::new_with_policy(&["a","b","c"],Policy{auto_failover:true, ..Policy::default()})?;
         let session="bad-path-during-disk-handoff";
         let (a,b,c)=(fleet.mgr("a")?,fleet.mgr("b")?,fleet.mgr("c")?);
         let opened=fleet.open("b",session,1,vec![user_event(session,1,"original")])?;
@@ -6763,12 +6984,12 @@ mod tests {
             && c.live.with(|l|matches!(l.trust(b.my_id),Some(Trust::Trusted{..})))==Some(true))?;
         b.live.report_io(0,None,Some(b.live.now_ns()));
         fleet.detect_links(&[],false,&broken,|| b.live.with(|l|l.own_disk_slow())==Some(true) && c.live.with(|l|l.disk_slow(b.my_id))==Some(Some(true)))?;
-        let until=Instant::now()+OPEN_WAIT;
+        let until=Instant::now()+TEST_WAIT;
         loop {
             fleet.settle()?;
             let (tx,rx)=mpsc::channel();
             a.tx.send(Input::ProcessRefusal(session.into(),c.my_id,tx)).map_err(|_|anyhow::anyhow!("A stopped"))?;
-            if rx.recv_timeout(OPEN_WAIT)? {break;}
+            if rx.recv_timeout(TEST_WAIT)? {break;}
             anyhow::ensure!(Instant::now()<until,"C did not attest its continuing trust of B: A {:?}, B {:?}, C {:?}",a.status(session),b.status(session),c.status(session));
         }
         let incumbent=b.status(session).context("missing incumbent")?;
@@ -6785,7 +7006,7 @@ mod tests {
 
     #[test]
     fn cp_t32_a_disk_handoff_releases_no_provider_or_receipt_and_restores_its_epoch() -> anyhow::Result<()> {
-        let fleet = Fleet::new_with_policy(&["a","b","c"],Policy { auto_failover:true })?;
+        let fleet = Fleet::new_with_policy(&["a","b","c"],Policy { auto_failover: true, ..Policy::default() })?;
         let session = "disk-handoff";
         let owner = fleet.mgr("a")?;
         let opened = fleet.open("a", session, 1, vec![user_event(session,1,"prior receipt")])?;
@@ -6835,11 +7056,73 @@ mod tests {
             anyhow::ensure!(b.confirm_native_activation(session, 2, "b".repeat(64)).is_err(), "wrong native digest cannot open custody");
             b.confirm_native_activation(session, 2, digest)
         });
-        let until = Instant::now() + OPEN_WAIT;
+        let until = Instant::now() + TEST_WAIT;
         while !acknowledge.is_finished() && Instant::now() < until { fleet.settle()?; }
         acknowledge.join().map_err(|_| anyhow::anyhow!("destination receipt task stopped"))??;
         fleet.settle()?;
         waiting.join().map_err(|_| anyhow::anyhow!("source move waiter stopped"))??;
+        Ok(())
+    }
+
+    /// CP-T3.2. The old leader gives a hand-over up once its target can't be reached and commits
+    /// that it did: the source's wait ends on that word, told rather than timed, and every member
+    /// of the session learns it.
+    #[test]
+    fn cp_t32_the_old_leader_commits_giving_a_hand_over_up_and_its_waiter_is_told() -> anyhow::Result<()> {
+        let fleet = Fleet::new(&["a", "b", "c"])?;
+        let session = "sess-given-up";
+        fleet.open("a", session, 1, vec![user_event(session, 1, "ready")])?;
+        fleet.settle()?;
+        // Measured links: the leader beats, so its followers learn each commit.
+        fleet.detector_partition(&[], false)?;
+        let digest = "a".repeat(64);
+        let intent = MoveIntent { leadership_only: false, cancel: false, ready: false, epoch: 1, target: "b".into(), digest: digest.clone() };
+        fleet.mgr("a")?.peer_unreachable("b");
+        fleet.while_pumping(|| fleet.mgr("a")?.commit_move_intent(session, 1, intent))?;
+        let source = fleet.mgr("a")?.clone();
+        let expected = digest.clone();
+        let waiting = thread::spawn(move || crate::rt::block_on(async move { source.wait_moved(session, "b", 1, &expected).await }));
+        let until = Instant::now() + TEST_WAIT;
+        while !waiting.is_finished() && Instant::now() < until { fleet.settle()?; }
+        anyhow::ensure!(waiting.is_finished(), "the source's wait must end on its committed word");
+        let told = waiting.join().map_err(|_| anyhow::anyhow!("source move waiter stopped"))?;
+        anyhow::ensure!(told.as_ref().is_err_and(|e| format!("{e:#}").contains("gave the hand-over up")), "the wait must say the hand-over was given up: {told:?}");
+        let member = fleet.mgr("c")?.status(session).context("member status")?;
+        anyhow::ensure!(member.abandoned_move == Some(AbandonedMove { epoch: 1, target: "b".into(), digest }), "every member learns it: {member:?}");
+        Ok(())
+    }
+
+    /// An open waits on what decides it, never a timer: once the one member that could hold its
+    /// copy is unreachable, it's answered at once that no member remains to hold it.
+    #[test]
+    fn cp_t32_an_open_is_answered_once_no_member_remains_to_hold_its_copy() -> anyhow::Result<()> {
+        let fleet = Fleet::new(&["a", "b"])?;
+        let session = "sess-no-copy";
+        let opener = fleet.mgr("a")?.clone();
+        let opening = thread::spawn(move || opener.open_leader(session, 1, vec![user_event(session, 1, "first")]));
+        fleet.mgr("a")?.peer_unreachable("b");
+        let until = Instant::now() + TEST_WAIT;
+        while !opening.is_finished() && Instant::now() < until {
+            fleet.mgr("a")?.drive_due();
+            thread::sleep(TEST_POLL);
+        }
+        anyhow::ensure!(opening.is_finished(), "the open must be answered on the event");
+        let answer = opening.join().map_err(|_| anyhow::anyhow!("opener stopped"))?;
+        anyhow::ensure!(answer.as_ref().is_err_and(|e| format!("{e:#}").contains("no member remains to hold its copy")), "{answer:?}");
+        Ok(())
+    }
+
+    /// CP-T3.2. A session's group promotes to 2f + 1 voters of its configured f, at least 3, as a
+    /// ZooKeeper ensemble is sized; a policy written before `faults` existed reads as f = 1, and an
+    /// unset f writes nothing new.
+    #[test]
+    fn cp_t32_voters_are_two_f_plus_one_of_the_configured_faults() -> anyhow::Result<()> {
+        anyhow::ensure!(Policy::default().voters() == 3);
+        anyhow::ensure!(Policy { auto_failover: true, faults: Some(2) }.voters() == 5);
+        anyhow::ensure!(Policy { auto_failover: true, faults: Some(0) }.voters() == MIN_VOTERS);
+        let older: Policy = serde_json::from_str(r#"{"auto_failover":true}"#)?;
+        anyhow::ensure!(older.faults.is_none() && older.voters() == 3);
+        anyhow::ensure!(serde_json::to_string(&Policy { auto_failover: true, faults: None })? == r#"{"auto_failover":true}"#);
         Ok(())
     }
 
@@ -6879,7 +7162,7 @@ mod tests {
             let st = mgr.open_leader("sess-wal", 3, vec![user_event("sess-wal", 1, "persisted-1")])?;
             anyhow::ensure!(st.is_leader && st.applied >= 2, "initial entry must commit to WAL: {st:?}");
             mgr.propose("sess-wal", 3, vec![user_event("sess-wal", 2, "persisted-2")])?;
-            anyhow::ensure!(mgr.flush(OPEN_WAIT), "WAL flush timed out");
+            anyhow::ensure!(mgr.flush(TEST_WAIT), "WAL flush timed out");
             let st2 = mgr.status("sess-wal").ok_or_else(|| anyhow::anyhow!("missing status before restart"))?;
             anyhow::ensure!(st2.applied > st.applied, "second entry must advance applied in WAL: {st2:?}");
             anyhow::ensure!(wal_path.exists() && std::fs::metadata(&wal_path)?.len() > 0, "convo-raft-000.log must exist on disk");
@@ -6893,7 +7176,7 @@ mod tests {
         // committed row directly into Store without any test-only `mem_rows` path!).
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let mgr_after = Manager::open("laptop-b", wal_dir.path(), Some(store_2.clone()))?;
-        anyhow::ensure!(mgr_after.flush(OPEN_WAIT), "WAL reopen flush timed out");
+        anyhow::ensure!(mgr_after.flush(TEST_WAIT), "WAL reopen flush timed out");
         store_2.sync()?;
         let st_after = mgr_after.status("sess-wal").ok_or_else(|| anyhow::anyhow!("sess-wal missing after WAL restart"))?;
         anyhow::ensure!(st_after.is_leader && st_after.applied >= committed_before, "recovered leader must preserve WAL index (before={committed_before}): {st_after:?}");
@@ -7064,7 +7347,7 @@ mod tests {
                 let st = mgr.open_leader(&s, 1, vec![user_event(&s, 1, &format!("work-{i}"))])?;
                 anyhow::ensure!(st.is_leader && st.applied >= 2, "{s} must commit to WAL: {st:?}");
             }
-            anyhow::ensure!(mgr.flush(OPEN_WAIT));
+            anyhow::ensure!(mgr.flush(TEST_WAIT));
             let shards = mgr.shared.lock().shard_count;
             anyhow::ensure!(shards >= 3, "5 live sessions across 2-group shards must span >= 3 WAL shards, got {shards}");
             anyhow::ensure!(mgr.all_status().len() == 5, "zero live sessions may be evicted");
@@ -7072,7 +7355,7 @@ mod tests {
         }
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let reopened = Manager::open_with_shard_groups("laptop-b", wal_dir.path(), Some(store_2.clone()), 2)?;
-        anyhow::ensure!(reopened.flush(OPEN_WAIT));
+        anyhow::ensure!(reopened.flush(TEST_WAIT));
         store_2.sync()?;
         anyhow::ensure!(reopened.all_status().len() == 5, "all 5 sessions across 3 WAL shards must recover after restart");
         for i in 1..=5u64 {
@@ -7100,7 +7383,7 @@ mod tests {
         }
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let reopened = Manager::open("laptop-b", wal_dir.path(), Some(store_2.clone()))?;
-        anyhow::ensure!(reopened.flush(OPEN_WAIT));
+        anyhow::ensure!(reopened.flush(TEST_WAIT));
         store_2.sync()?;
         let kept = store_2.kept("sess-drain", 20)?.ok_or_else(|| anyhow::anyhow!("missing sess-drain after restart"))?;
         anyhow::ensure!(kept.events.len() == 10, "all 10 queued rows must flush durably on shutdown and replay into Store, got {}", kept.events.len());
@@ -7122,7 +7405,7 @@ mod tests {
         let applied_1 = {
             let mgr = Manager::open("laptop-b", &dir_old, Some(store_1))?;
             let st = mgr.open_leader("sess-bg", 1, vec![user_event("sess-bg", 1, "from-old")])?;
-            anyhow::ensure!(mgr.flush(OPEN_WAIT));
+            anyhow::ensure!(mgr.flush(TEST_WAIT));
             let a = st.applied;
             mgr.shutdown();
             a
@@ -7132,10 +7415,10 @@ mod tests {
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let applied_2 = {
             let mgr = Manager::open("laptop-b", &dir_new, Some(store_2))?;
-            anyhow::ensure!(mgr.flush(OPEN_WAIT));
+            anyhow::ensure!(mgr.flush(TEST_WAIT));
             let epoch = mgr.status("sess-bg").context("missing recovered custody")?.epoch;
             mgr.propose("sess-bg", epoch, vec![user_event("sess-bg", 2, "from-new")])?;
-            anyhow::ensure!(mgr.flush(OPEN_WAIT));
+            anyhow::ensure!(mgr.flush(TEST_WAIT));
             let st = mgr.status("sess-bg").ok_or_else(|| anyhow::anyhow!("missing sess-bg in new build"))?;
             anyhow::ensure!(st.applied > applied_1, "incoming build must append onto existing log");
             let a = st.applied;
@@ -7146,7 +7429,7 @@ mod tests {
         move_wal_dir(&dir_new, &dir_old)?;
         let (_sdir3, store_3) = crate::convo::store::scratch()?;
         let mgr_back = Manager::open("laptop-b", &dir_old, Some(store_3.clone()))?;
-        anyhow::ensure!(mgr_back.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr_back.flush(TEST_WAIT));
         store_3.sync()?;
         let st_back = mgr_back.status("sess-bg").ok_or_else(|| anyhow::anyhow!("missing sess-bg after rollback"))?;
         anyhow::ensure!(st_back.is_leader && st_back.applied >= applied_2, "rollback must preserve full log without reset: {st_back:?}");
@@ -7159,8 +7442,8 @@ mod tests {
     /// 1. A transient `Fatal` during `persist` (e.g. store sync failure) fences the replica;
     ///    `reopen_fenced` automatically reopens it from durable state, increments `reopened_replicas()`,
     ///    and the session genuinely RESUMES proposing and replicating new rows to followers!
-    /// 2. A permanent corrupt entry increments `corrupt_entries()` and enters exponential reopen
-    ///    backoff instead of spinning in a tight loop.
+    /// 2. A permanent corrupt entry increments `corrupt_entries()` and is held after its reopen
+    ///    fails, until an event could change that, instead of spinning in a tight loop.
     #[test]
     fn fenced_replica_reopens_from_durable_state_and_resumes() -> anyhow::Result<()> {
         let fleet = Fleet::new(&["laptop-a", "laptop-b"])?;
@@ -7200,16 +7483,16 @@ mod tests {
             kept.events
         );
 
-        // 2. Permanent corrupt entry increments `corrupt_entries()` and hits reopen backoff cleanly.
+        // 2. Permanent corrupt entry increments `corrupt_entries()` and is held cleanly.
         let corrupt_before = corrupt_entries();
         let reopened_mid = reopened_replicas();
         fleet.mgr("laptop-b")?.inject_raw_proposal("sess-fence", b"{not-valid-convo-entry".to_vec())?;
         fleet.mgr("laptop-b")?.drive_due();
-        anyhow::ensure!(!fleet.mgr("laptop-b")?.flush(OPEN_WAIT), "a permanently corrupt committed command cannot report a clean flush");
+        anyhow::ensure!(!fleet.mgr("laptop-b")?.flush(TEST_WAIT), "a permanently corrupt committed command cannot report a clean flush");
         anyhow::ensure!(corrupt_entries() > corrupt_before, "undecodable entry must increment corrupt_entries metric");
-        // Exponential backoff prevents tight-loop reopens on a permanently corrupt entry.
+        // A reopen fenced again before committing cleanly is held: no tight-loop reopens on a permanently corrupt entry.
         let reopened_after = reopened_replicas();
-        anyhow::ensure!(reopened_after <= reopened_mid + 2, "reopen backoff must throttle permanent corrupt-entry loop: before={reopened_mid} after={reopened_after}");
+        anyhow::ensure!(reopened_after <= reopened_mid + 2, "a held reopen must stop the permanent corrupt-entry loop: before={reopened_mid} after={reopened_after}");
         Ok(())
     }
 
@@ -7243,7 +7526,7 @@ mod tests {
                 chunk_b64: base64::engine::general_purpose::STANDARD.encode(b"half-json").into(),
             })?;
             mgr.inject_raw_proposal("sess-crash-chunk", orphan_part)?;
-            anyhow::ensure!(mgr.flush(OPEN_WAIT));
+            anyhow::ensure!(mgr.flush(TEST_WAIT));
             let (_, _, in_flight) = mgr.snapshot_state("sess-crash-chunk")?;
             anyhow::ensure!(in_flight == 1, "partial chunk must be recorded before crash, got {in_flight}");
             mgr.shutdown();
@@ -7252,12 +7535,12 @@ mod tests {
         // deterministically purges the stranded part 0/2 and unblocks compaction!
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let mgr_after = Manager::open("laptop-b", wal_dir.path(), Some(store_2.clone()))?;
-        anyhow::ensure!(mgr_after.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr_after.flush(TEST_WAIT));
         store_2.sync()?;
         let (_, _, in_flight_after) = mgr_after.snapshot_state("sess-crash-chunk")?;
         anyhow::ensure!(in_flight_after == 0, "new term must purge stranded mid-chunk entry, got {in_flight_after}");
         mgr_after.force_compact("sess-crash-chunk", 0)?;
-        anyhow::ensure!(mgr_after.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr_after.flush(TEST_WAIT));
         Ok(())
     }
 
@@ -7292,8 +7575,8 @@ mod tests {
         Ok(())
     }
 
-    /// Verifies that a failing snapshot build enters exponential backoff instead of spawning
-    /// snapshot worker threads on every drive pass.
+    /// Verifies that a failing snapshot build is held, until the group applies past it or an event
+    /// clears it, instead of spawning snapshot worker threads on every drive pass.
     #[test]
     fn failed_snapshot_build_backs_off_without_spinning() -> anyhow::Result<()> {
         let wal_dir = tempfile::tempdir()?;
@@ -7301,14 +7584,14 @@ mod tests {
         let mgr = Manager::open("laptop-b", wal_dir.path(), Some(store.clone()))?;
         // Inject a projection newer than the pinned Raft point to exercise the read failure.
         mgr.open_leader("sess-snap-fail", 1, vec![user_event("sess-snap-fail", 1, "missing-from-store")])?;
-        anyhow::ensure!(mgr.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr.flush(TEST_WAIT));
 
         let st = mgr.status("sess-snap-fail").context("missing session")?;
         store.apply_raft_rows("sess-snap-fail", st.applied + 1, st.term, vec![user_event("sess-snap-fail", 2, "ahead")])?;
         let err = mgr.force_compact("sess-snap-fail", 0);
         anyhow::ensure!(err.is_err(), "inconsistent store must fail snapshot build: {err:?}");
         let (failures, backed_off, _) = mgr.snapshot_state("sess-snap-fail")?;
-        anyhow::ensure!(failures == 1 && backed_off, "failed snapshot must increment failure count ({failures}) and arm backoff ({backed_off})");
+        anyhow::ensure!(failures == 1 && backed_off, "failed snapshot must increment failure count ({failures}) and be held ({backed_off})");
         Ok(())
     }
 
@@ -7380,7 +7663,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-spoof", &spoofed.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr.flush(TEST_WAIT));
         anyhow::ensure!(mgr.status("sess-spoof").is_none(), "spoofed msg.from must never create a Raft group");
 
         store.put(vec![Row::Session {
@@ -7402,7 +7685,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-mine", &hijack.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr.flush(TEST_WAIT));
         anyhow::ensure!(mgr.status("sess-mine").is_none(), "peer must not initiate group for session already owned locally");
 
         let fleet = Fleet::new(&["laptop-a", "laptop-b"])?;
@@ -7439,7 +7722,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-bypass", &hb.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr.flush(TEST_WAIT));
 
         // Step 2: laptop-evil sends a committed entry claiming `target: "agent:laptop-victim"`.
         let evil_entry = ConvoEntry {
@@ -7479,7 +7762,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-bypass", &app.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr.flush(TEST_WAIT));
         store.sync()?;
         anyhow::ensure!(store.kept("sess-bypass", 10)?.is_none(), "spoofed target row after heartbeat must be dropped");
         Ok(())
@@ -7660,7 +7943,7 @@ mod tests {
             let mgr = Manager::open("laptop-b", wal_dir.path(), Some(store_1))?;
             mgr.open_leader("sess-ok", 1, vec![user_event("sess-ok", 1, "ok")])?;
             mgr.open_leader("sess-corrupt-state", 1, vec![user_event("sess-corrupt-state", 1, "bad")])?;
-            anyhow::ensure!(mgr.flush(OPEN_WAIT));
+            anyhow::ensure!(mgr.flush(TEST_WAIT));
             mgr.shutdown();
         }
         // Corrupt ONLY `sess-corrupt-state`'s state file temporarily so its reopen fails once.
@@ -7672,7 +7955,7 @@ mod tests {
             let mgr = Manager::open("laptop-b", wal_dir.path(), Some(store_2))?;
             // Creating a third session triggers `save_sessions_index()`.
             mgr.open_leader("sess-third", 1, vec![user_event("sess-third", 1, "third")])?;
-            anyhow::ensure!(!mgr.flush(OPEN_WAIT), "the damaged session must be reported while the third session remains healthy");
+            anyhow::ensure!(!mgr.flush(TEST_WAIT), "the damaged session must be reported while the third session remains healthy");
             mgr.shutdown();
         }
         // Verify `sess-corrupt-state` was NOT erased from `sessions.json`, and recovers once repaired!
@@ -7681,7 +7964,7 @@ mod tests {
         std::fs::write(&state_path, backup)?;
         let (_sdir3, store_3) = crate::convo::store::scratch()?;
         let mgr_recovered = Manager::open("laptop-b", wal_dir.path(), Some(store_3))?;
-        anyhow::ensure!(mgr_recovered.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr_recovered.flush(TEST_WAIT));
         anyhow::ensure!(mgr_recovered.status("sess-corrupt-state").is_some(), "preserved WAL group must recover cleanly once state file is intact");
         Ok(())
     }
@@ -7758,7 +8041,7 @@ mod tests {
         use crate::harness::inbox::{Inbox, Limits};
         use crate::convo::inbox::InboxRecords;
 
-        let fleet = Fleet::new_with_policy(&["node-a", "node-b", "node-c"], Policy { auto_failover: true })?;
+        let fleet = Fleet::new_with_policy(&["node-a", "node-b", "node-c"], Policy { auto_failover: true, ..Policy::default() })?;
         let inbox_a = Arc::new(Inbox::new(Arc::new(InboxRecords::new(crate::convo::inbox::Source::Store(fleet.store("node-a")?.clone()), crate::harness::inbox::FAMILIES, None)), Limits::default()));
         let inbox_b = Arc::new(Inbox::new(Arc::new(InboxRecords::new(crate::convo::inbox::Source::Store(fleet.store("node-b")?.clone()), crate::harness::inbox::FAMILIES, None)), Limits::default()));
         let inbox_c = Arc::new(Inbox::new(Arc::new(InboxRecords::new(crate::convo::inbox::Source::Store(fleet.store("node-c")?.clone()), crate::harness::inbox::FAMILIES, None)), Limits::default()));
@@ -7841,7 +8124,7 @@ mod tests {
 
         // 5. Bring B back online: B must step down, emit `LostLeadership`, fence its old inbox, and
         //    be UNABLE to propose or accept under its old ownership epoch (epoch 1)!
-        let deadline = Instant::now() + OPEN_WAIT;
+        let deadline = Instant::now() + TEST_WAIT;
         while fleet.mgr("node-b")?.status(sess).is_none_or(|s| s.owner.as_deref() != Some(winner_name.as_str()) || s.epoch != new_epoch) && Instant::now() < deadline {
             fleet.settle()?;
         }
@@ -7868,7 +8151,7 @@ mod tests {
     /// even before reconnecting to the new leader (so its harness cannot keep accepting work!).
     #[test]
     fn isolated_leader_steps_down_via_check_quorum_and_emits_lost_leadership() -> anyhow::Result<()> {
-        let fleet = Fleet::new_with_policy(&["node-a", "node-b", "node-c"], Policy { auto_failover: true })?;
+        let fleet = Fleet::new_with_policy(&["node-a", "node-b", "node-c"], Policy { auto_failover: true, ..Policy::default() })?;
         let sess = "sess-quorum-fence";
         let open_row = Row::Session {
             session: sess.into(),
@@ -7886,14 +8169,14 @@ mod tests {
         anyhow::ensure!(fleet.mgr("node-b")?.status(sess).is_some_and(|s| s.is_leader && s.voters.len() == 3));
 
         // Partition B from A and C: tick ONLY B (no responses from A or C!).
-        // `check_quorum` must step B down within `WIRE_WINDOW` and emit `LostLeadership`!
+        // `check_quorum` must step B down within `(TEST_WAIT / 2)` and emit `LostLeadership`!
         let rx_b = fleet.mgr("node-b")?.failover_events();
         // The first quorum check still counts answers from before the partition.
         fleet.detector_partition(&["node-b"],true)?;
         let quorum_ticks = raft_settings(node_id("node-b"), 1)?.core.election_tick;
         for _ in 0..quorum_ticks.saturating_mul(2) {
             fleet.mgr("node-b")?.drive_due();
-            anyhow::ensure!(fleet.mgr("node-b")?.flush(OPEN_WAIT));
+            anyhow::ensure!(fleet.mgr("node-b")?.flush(TEST_WAIT));
             let out = fleet.mgr("node-b")?.outgoing();
             while out.try_recv().is_ok() {}
         }
@@ -7914,7 +8197,7 @@ mod tests {
     /// partitioned leader steps down before achieving quorum commit!
     #[test]
     fn propose_sync_waits_for_quorum_commit_and_fails_on_step_down() -> anyhow::Result<()> {
-        let fleet = Fleet::new_with_policy(&["node-a", "node-b", "node-c"], Policy { auto_failover: true })?;
+        let fleet = Fleet::new_with_policy(&["node-a", "node-b", "node-c"], Policy { auto_failover: true, ..Policy::default() })?;
         let sess = "sess-quorum-sync";
         let open_row = Row::Session {
             session: sess.into(),
@@ -7955,7 +8238,7 @@ mod tests {
         let quorum_ticks = raft_settings(node_id("node-b"), 1)?.core.election_tick;
         for _ in 0..quorum_ticks.saturating_mul(2) {
             fleet.mgr("node-b")?.drive_due();
-            anyhow::ensure!(fleet.mgr("node-b")?.flush(OPEN_WAIT));
+            anyhow::ensure!(fleet.mgr("node-b")?.flush(TEST_WAIT));
             let out = fleet.mgr("node-b")?.outgoing();
             while out.try_recv().is_ok() {}
             if h_fail.is_finished() {
@@ -7972,7 +8255,7 @@ mod tests {
     /// actually commits across quorum!
     #[test]
     fn failover_does_not_emit_claimed_until_ownership_claim_commits() -> anyhow::Result<()> {
-        let fleet = Fleet::new_with_policy(&["node-a", "node-b", "node-c"], Policy { auto_failover: true })?;
+        let fleet = Fleet::new_with_policy(&["node-a", "node-b", "node-c"], Policy { auto_failover: true, ..Policy::default() })?;
         let sess = "sess-commit-before-claim";
         let open_row = Row::Session {
             session: sess.into(),
@@ -7993,11 +8276,11 @@ mod tests {
         // the newly elected leader CANNOT commit its ownership claim yet!
         fleet.detector_partition(&["node-b"],false)?;
         let mut winner: Option<String> = None;
-        let deadline=Instant::now()+OPEN_WAIT+WIRE_WINDOW;
+        let deadline=Instant::now()+TEST_WAIT+(TEST_WAIT / 2);
         while Instant::now()<deadline {
             fleet.advance(&["node-b"])?;
             for n in ["node-a", "node-c"] {
-                anyhow::ensure!(fleet.mgr(n)?.flush(OPEN_WAIT));
+                anyhow::ensure!(fleet.mgr(n)?.flush(TEST_WAIT));
             }
             for from in ["node-a", "node-c"] {
                 let rx = fleet.mgr(from)?.outgoing();
@@ -8017,7 +8300,7 @@ mod tests {
                 }
             }
             for n in ["node-a", "node-c"] {
-                anyhow::ensure!(fleet.mgr(n)?.flush(OPEN_WAIT));
+                anyhow::ensure!(fleet.mgr(n)?.flush(TEST_WAIT));
                 if fleet.mgr(n)?.status(sess).is_some_and(|s| s.is_leader) {
                     winner = Some(n.to_owned());
                     break;
@@ -8136,15 +8419,15 @@ mod tests {
         mgr.mark_peer_v2("voter");
         anyhow::ensure!(mgr.status(session).is_some_and(|s| s.recovering && s.owner.is_none()));
 
-        let deadline = Instant::now() + OPEN_WAIT + WIRE_WINDOW;
+        let deadline = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
         while fleet.mgr("replica")?.status(session).is_none_or(|s| s.recovering) && Instant::now() < deadline {
             for (from,(mgr,_,_,_)) in &fleet.nodes {
                 mgr.drive_due();
-                let _ = mgr.flush(WAL_RETRY);
+                let _ = mgr.flush(TEST_POLL);
                 let rx = mgr.outgoing();
                 while let Ok(msg) = rx.try_recv() { fleet.mgr(&msg.to_name)?.step_owned(from, &msg.session, msg.bytes)?; }
             }
-            thread::sleep(WAL_RETRY);
+            thread::sleep(TEST_POLL);
         }
         fleet.settle()?;
         anyhow::ensure!(fleet.store("replica")?.kept(session, 8)?.is_some_and(|s| s.events.iter().any(|e| e.text == "survives")));
@@ -8183,9 +8466,9 @@ mod tests {
         let opening = thread::spawn(move || founder.open_leader(sess, 1, vec![open_row]));
 
         // Pump until the legacy replica confirms the founding entry.
-        let deadline = Instant::now() + OPEN_WAIT;
+        let deadline = Instant::now() + TEST_WAIT;
         while !opening.is_finished() && Instant::now() < deadline {
-            anyhow::ensure!(mgr_b.flush(OPEN_WAIT) && mgr_leg.flush(OPEN_WAIT));
+            anyhow::ensure!(mgr_b.flush(TEST_WAIT) && mgr_leg.flush(TEST_WAIT));
             let rx_b = mgr_b.outgoing();
             while let Ok(m) = rx_b.try_recv() {
                 anyhow::ensure!(m.bytes.get(..4) != Some(WIRE_CHUNK_MAGIC.as_slice()), "must never send KRC1 frame to legacy peer");
@@ -8217,15 +8500,15 @@ mod tests {
             store_b.put(vec![ev.clone()]);
             mgr_b.propose(sess, 1, vec![ev])?;
         }
-        anyhow::ensure!(mgr_b.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr_b.flush(TEST_WAIT));
         mgr_b.force_compact(sess, 0)?;
-        anyhow::ensure!(mgr_b.flush(OPEN_WAIT));
+        anyhow::ensure!(mgr_b.flush(TEST_WAIT));
 
         // Register a second late legacy peer without `mark_peer_v2` and confirm zero KRC1 frames!
         mgr_b.register_peers(["laptop-legacy", "laptop-legacy-late"]);
         for _ in 0..8 {
             mgr_b.drive_due();
-            anyhow::ensure!(mgr_b.flush(OPEN_WAIT));
+            anyhow::ensure!(mgr_b.flush(TEST_WAIT));
             let rx_b = mgr_b.outgoing();
             while let Ok(m) = rx_b.try_recv() {
                 anyhow::ensure!(

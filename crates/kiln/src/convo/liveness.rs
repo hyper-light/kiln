@@ -327,6 +327,21 @@ impl Membership {
         }) == Some(true)
     }
 
+    /// CP-T3.2. The detector's verdict that `member` can't take the lead: it's gone ([`lost`](Self::lost))
+    /// or its disk is slow. A link with no verdict yet is none of these: its first verdict comes as
+    /// an event.
+    pub fn refuses_lead(&self, member: u64) -> bool {
+        let p = self.physical(member);
+        self.lost(member) || self.shared.with(|l| l.disk_slow(p) == Some(true)) == Some(true)
+    }
+
+    /// The detector's verdict that `member` is gone: it stopped or it's suspected. A link with no
+    /// verdict yet is neither.
+    pub fn lost(&self, member: u64) -> bool {
+        let p = self.physical(member);
+        self.shared.with(|l| l.stopped(p) || l.trust(p) == Some(Trust::Suspected)) == Some(true)
+    }
+
     /// AD-1 P1.2. A log with a slow local device can hand its lead to an up-to-date
     /// voter whose disk has room. The execution owner is an independent committed field.
     pub fn yield_stalled_log<L: LogStore, M: StateMachine, B: Budget>(

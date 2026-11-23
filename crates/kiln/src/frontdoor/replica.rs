@@ -4280,7 +4280,7 @@ mod tests {
             while !first.is_finished() || !second.is_finished() {
                 raft_a.drive_due();
                 raft_b.drive_due();
-                std::thread::sleep(crate::convo::raft::WAL_RETRY);
+                std::thread::sleep(crate::convo::raft::TEST_POLL);
             }
             first.join().map_err(|_| anyhow::anyhow!("node A founder stopped"))??;
             second.join().map_err(|_| anyhow::anyhow!("node B founder stopped"))??;
