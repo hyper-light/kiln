@@ -2731,10 +2731,11 @@ impl Owner {
         let depth = group_store.depth();
         let mut machine = ConvoMachine::open(session.to_owned(), self.names.clone(), self.my_id,None,self.store.clone(),state_file)?;
         let journal = machine.state_file.with_extension("peer-repair");
-        if journal.try_exists()? {
+        let repair = if journal.try_exists()? {
             let repair = Message::decode(&std::fs::read(&journal)?).map_err(|e| anyhow::anyhow!("invalid session repair journal: {e:?}"))?;
             machine.repair_from(&mut group_store, &repair, self.my_id, &journal, false)?;
-        }
+            Some(repair)
+        } else { None };
         machine.recover_projection(&group_store)?;
         self.repair_requests.remove(session);
         let (base, last) = group_store.bounds().map_err(|e| anyhow::anyhow!("conversation WAL bounds: {e:?}"))?;
@@ -2745,8 +2746,14 @@ impl Owner {
                 v2_suffix
             }).map_err(|e| anyhow::anyhow!("reading unapplied WAL suffix: {e:?}"))?;
         }
-        let replica = Replica::open(&raft_settings(self.my_id, depth)?, group_store, machine, Bytes::new(u64::try_from(crate::memory::room::share()).unwrap_or(u64::MAX)))
+        let mut replica = Replica::open(&raft_settings(self.my_id, depth)?, group_store, machine, Bytes::new(u64::try_from(crate::memory::room::share()).unwrap_or(u64::MAX)))
             .map_err(|e| anyhow::anyhow!("reopening Raft group for {session}: {e:?}"))?;
+        if let Some(mut snapshot) = repair {
+            // The journal restored the WAL. The reopened follower still needs the
+            // authenticated leader frame to recognize it and acknowledge that WAL.
+            snapshot.context.clear();
+            replica.step(snapshot).context("acknowledging restored session snapshot")?;
+        }
         ws.claimed = ws.claimed.saturating_add(1);
         let compacted = replica.log().bounds().map_or(0, |(base, _)| base.index);
         let recovered = self.recovering.remove(session).unwrap_or_default();
@@ -6576,6 +6583,14 @@ mod tests {
         anyhow::ensure!(loser.as_ref().is_some_and(|s| s.founded && s.owner.as_deref() == Some("a")), "rejected founder failed to reconcile: {loser:?}, winner {:?}", fleet.mgr("a")?.status(session));
         anyhow::ensure!(fleet.store("b")?.kept(session, 8)?.is_some_and(|s| s.events.len() == 1 && s.events.iter().all(|e| e.text == "a")));
         anyhow::ensure!(fleet.store("c")?.kept(session, 8)?.is_some_and(|s| s.events.iter().all(|e| e.text == "a")));
+        let winner = fleet.mgr("a")?.clone();
+        let sending = thread::spawn(move || winner.propose_sync(session, 1, vec![user_event(session, 2, "after repair")]));
+        let until = Instant::now() + OPEN_WAIT;
+        while !sending.is_finished() && Instant::now() < until { fleet.settle()?; }
+        sending.join().map_err(|_| anyhow::anyhow!("winner stopped during follow-up"))??;
+        fleet.settle()?;
+        anyhow::ensure!(fleet.store("b")?.kept(session, 8)?.is_some_and(|s|
+            s.events.iter().map(|e| e.text.as_str()).eq(["a", "after repair"])), "repaired follower did not apply the winner's next entry");
         Ok(())
     }
 

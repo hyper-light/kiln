@@ -1,0 +1,177 @@
+Subject: Send requested snapshots when compaction becomes durable
+Why: An idle session leader must serve a waiting peer as soon as its snapshot is ready and resume replication once the peer confirms installation.
+
+diff --git a/crates/hyper-durable/src/replica.rs b/crates/hyper-durable/src/replica.rs
+index 6737877fc2c9d4afb8576b03396d0a704491e966..0f48ba61a403fce5fc71db5f9888a095996b6d6d 100644
+--- a/crates/hyper-durable/src/replica.rs
++++ b/crates/hyper-durable/src/replica.rs
+@@ -1778,6 +1778,29 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
+                 if let Some(stall) = self.stall.as_mut() {
+                     stall.freed = true;
+                 }
++                // CP-T3.2. A peer may have requested an image before one existed.
++                // A durable compaction can satisfy that request even on a quiet group.
++                if self.is_leader() {
++                    let offered = self
++                        .node
++                        .store()
++                        .snapshot
++                        .as_ref()
++                        .map_or(0, hyper_raft::proto::snapshot_index);
++                    self.waiting.clear();
++                    self.waiting
++                        .extend(self.node.raft.tracker().iter().filter_map(|(peer, p)| {
++                            (p.pending_request_snapshot != 0
++                                && p.pending_request_snapshot <= offered
++                                && p.state != ProgressState::Snapshot)
++                                .then_some(peer)
++                        }));
++                    let sent = self
++                        .waiting
++                        .iter()
++                        .try_for_each(|&peer| self.node.send_append(peer));
++                    self.must(sent)?;
++                }
+             }
+             return self.tell_durable_commit();
+         };
+diff --git a/crates/hyper-durable/tests/shell.rs b/crates/hyper-durable/tests/shell.rs
+index ab0abd82e2a7b5a56fa167ad88fdf2303582a953..12c4cd6d3929b76a1c4943add949bc18259248b6 100644
+--- a/crates/hyper-durable/tests/shell.rs
++++ b/crates/hyper-durable/tests/shell.rs
+@@ -1698,6 +1698,110 @@ fn refused(r: &mut Sim, append: &Message) -> Message {
+         .expect("a snapshot for the learner")
+ }
+ 
++/// CP-T3.2. Without ticks, a waiting peer gets its image on durable compaction alone.
++#[test]
++fn durable_compaction_serves_only_outstanding_snapshot_requests_it_covers()
++-> Result<(), ReplicaError> {
++    let mut leader = sole(1, Unbounded, |_| {});
++    for peer in [2, 3, 4] {
++        leader.change(Vec::new(), &change(ConfChangeType::AddLearnerNode, peer))?;
++        pump(&mut leader);
++    }
++    let at = leader.applied().index;
++    for (peer, requested) in [(2, at), (3, at.saturating_add(2))] {
++        leader.step(Message {
++            msg_type: MessageType::MsgAppendResponse,
++            from: peer,
++            to: 1,
++            term: leader.term(),
++            index: at,
++            reject: true,
++            request_snapshot: requested,
++            ..Message::default()
++        })?;
++    }
++    let snapshots = |out: Output<_>| {
++        out.messages
++            .into_iter()
++            .filter(|m| m.msg_type == MessageType::MsgSnapshot)
++            .map(|m| {
++                (
++                    m.to,
++                    m.snapshot.as_deref().map(hyper_raft::proto::snapshot_index),
++                )
++            })
++            .collect::<Vec<_>>()
++    };
++    assert!(snapshots(pump(&mut leader)).is_empty());
++    assert!(leader.compact(0, now(), waker())?);
++    assert_eq!(snapshots(pump(&mut leader)), [(2, Some(at))]);
++    // Peer 2's first snapshot is still in flight, and peer 3's request is
++    // still ahead of this next image. Peer 4 has never requested one.
++    leader.propose(Vec::new(), b"again".to_vec())?;
++    pump(&mut leader);
++    assert!(leader.compact(0, now(), waker())?);
++    assert!(snapshots(pump(&mut leader)).is_empty());
++    // The transport reports no success. The follower confirms the first
++    // image after "again" is compacted, then confirms the newer image.
++    for index in [at, leader.applied().index] {
++        leader.step(Message {
++            msg_type: MessageType::MsgAppendResponse,
++            from: 2,
++            to: 1,
++            term: leader.term(),
++            index,
++            ..Message::default()
++        })?;
++        let sent = snapshots(pump(&mut leader));
++        if index == at {
++            assert_eq!(sent, [(2, Some(leader.applied().index))]);
++        } else {
++            assert!(sent.is_empty(), "a confirmed image was reissued: {sent:?}");
++        }
++    }
++    // A peer can request repair at an index it previously matched. Only an
++    // acknowledgment through the image can release the next ordinary append.
++    let matched = leader.applied().index;
++    leader.step(Message {
++        msg_type: MessageType::MsgAppendResponse,
++        from: 2,
++        to: 1,
++        term: leader.term(),
++        index: matched,
++        reject: true,
++        request_snapshot: matched,
++        ..Message::default()
++    })?;
++    assert_eq!(snapshots(pump(&mut leader)), [(2, Some(matched))]);
++    leader.step(Message {
++        msg_type: MessageType::MsgAppendResponse,
++        from: 2,
++        to: 1,
++        term: leader.term(),
++        index: matched.saturating_sub(1),
++        ..Message::default()
++    })?;
++    leader.propose(Vec::new(), b"next".to_vec())?;
++    let appends_next = |out: Output<_>| {
++        out.messages.iter().any(|m| {
++            m.to == 2
++                && m.msg_type == MessageType::MsgAppend
++                && m.entries.iter().any(|e| e.data == b"next")
++        })
++    };
++    assert!(!appends_next(pump(&mut leader)));
++    leader.step(Message {
++        msg_type: MessageType::MsgAppendResponse,
++        from: 2,
++        to: 1,
++        term: leader.term(),
++        index: matched,
++        ..Message::default()
++    })?;
++    assert!(appends_next(pump(&mut leader)));
++    Ok(())
++}
++
+ /// A machine that keeps its owner's checkpoints images the latest, behind what it applied
+ /// (focal's): the snapshot a member behind the log's start is sent carries the configuration the
+ /// group held at the image's point, never one applied since (Ongaro and Ousterhout 2014, §7). A
+diff --git a/crates/hyper-raft/src/raft.rs b/crates/hyper-raft/src/raft.rs
+index 4baa0af2c48605001223dff83915b9254b5ee830..0d9209576adfa131d9d3d8233115a1b29aefe5e8 100644
+--- a/crates/hyper-raft/src/raft.rs
++++ b/crates/hyper-raft/src/raft.rs
+@@ -3821,13 +3821,18 @@ impl<S: Storage> Raft<S> {
+         progress.recent_active = true;
+         progress.update_committed(message.commit);
+         let paused = progress.is_paused();
+-        if !progress.maybe_update(message.index) {
++        let installed =
++            progress.state == ProgressState::Snapshot && message.index >= progress.pending_snapshot;
++        if !progress.maybe_update(message.index) && !installed {
+             return Ok(());
+         }
+         match progress.state {
+             ProgressState::Probe => progress.become_replicate(),
+             ProgressState::Snapshot => {
+-                if progress.is_snapshot_caught_up() {
++                if installed {
++                    // The receiver confirmed installation, even if the transport
++                    // never reports success. The next send follows the image.
++                    progress.pending_request_snapshot = 0;
+                     progress.become_probe();
+                 }
+             }
