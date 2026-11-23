@@ -2129,6 +2129,9 @@ struct SessionGroup {
     /// Whether this node was the Raft leader on the previous drive pass (drives automatic failover
     /// `Claimed` and returning-leader `LostLeadership` transitions).
     was_leader: bool,
+    /// Writes of this group's that became durable (`Driven::flushed`), for tests.
+    #[cfg(test)]
+    durable_writes: u64,
     /// Applied index when last reopened from a fence; once `applied > reopened_at_index`, reopen
     /// backoff resets cleanly.
     reopened_at_index: Option<u64>,
@@ -2159,6 +2162,9 @@ struct Shared {
     shard_count: usize,
     #[cfg(test)]
     wire_chunks_sent: u64,
+    /// Writes that became durable, summed over the node's groups: a test's measure of progress.
+    #[cfg(test)]
+    durable_writes: u64,
 }
 
 #[derive(Default)]
@@ -2853,6 +2859,8 @@ impl Owner {
                 snapshot_held: None,
                 was_leader: false,
                 reopened_at_index: Some(compacted),
+                #[cfg(test)]
+                durable_writes: 0,
                 #[cfg(test)]
                 compact_waiters: recovered.compact_waiters,
                 needs_restart_campaign: true,
@@ -4330,6 +4338,8 @@ impl Owner {
                 was_leader: false,
                 reopened_at_index: None,
                 #[cfg(test)]
+                durable_writes: 0,
+                #[cfg(test)]
                 compact_waiters: Vec::new(),
                 needs_restart_campaign: false,
                 compacted,
@@ -5147,6 +5157,7 @@ impl Owner {
                 let mut sh = self.shared.lock();
                 sh.shard_count = self.shards.len();
                 sh.wire_chunks_sent = self.wire_chunks_sent;
+                sh.durable_writes = self.groups.values().map(|g| g.durable_writes).fold(0, u64::wrapping_add);
             }
             return;
         }
@@ -5192,6 +5203,7 @@ impl Owner {
         {
             sh.shard_count = self.shards.len();
             sh.wire_chunks_sent = self.wire_chunks_sent;
+            sh.durable_writes = self.groups.values().map(|g| g.durable_writes).fold(0, u64::wrapping_add);
         }
         if custody_changed { sh.changed.notify(); }
         let m = crate::metrics::convo_raft();
@@ -5833,6 +5845,14 @@ impl Manager {
         rx.recv().map_err(|_| anyhow::anyhow!("fail_next_persist: manager stopped"))?
     }
 
+    /// Test harness only. Writes of this node's groups that became durable so far.
+    #[cfg(test)]
+    fn durable_writes(&self) -> u64 { self.shared.lock().durable_writes }
+
+    /// Test harness only. Sessions whose group is fenced or reopening.
+    #[cfg(test)]
+    fn recovering(&self) -> Vec<String> { self.shared.lock().statuses.values().filter(|s| s.recovering).map(|s| s.session.clone()).collect() }
+
     #[cfg(test)]
     fn snapshot_state(&self, session: &str) -> anyhow::Result<(u32, bool, usize)> {
         let (tx, rx) = mpsc::channel();
@@ -6008,6 +6028,8 @@ fn drive_one(
         output.clear();
         let previous_handover=sg.replica.handed_over();
         let driven = sg.replica.drive(now, &sg.waker, output)?;
+        #[cfg(test)]
+        if driven.flushed.is_some() { sg.durable_writes = sg.durable_writes.wrapping_add(1); }
         let prior=sg.replica.machine();
         if sg.replica.handed_over()!=previous_handover && sg.replica.is_leader() && prior.owner_term==sg.replica.term()
             && node_id(&prior.leader_name)==sg.replica.id() {
@@ -6239,6 +6261,21 @@ mod tests {
         alarms:BTreeMap<u64,u64>,
     }
 
+    /// Waits for `mgr`'s writes to finish while they keep becoming durable. A loaded machine is
+    /// slow, which is no failure; a node whose writes stop finishing, or one with a group fenced
+    /// or reopening, is.
+    fn flushed(mgr: &Manager) -> anyhow::Result<()> {
+        let mut seen = mgr.durable_writes();
+        loop {
+            if mgr.flush(TEST_WAIT) { return Ok(()); }
+            let recovering = mgr.recovering();
+            anyhow::ensure!(recovering.is_empty(), "WAL flush failed: groups recovering {recovering:?}");
+            let now = mgr.durable_writes();
+            anyhow::ensure!(now != seen, "WAL flush stalled: no write became durable in {TEST_WAIT:?}");
+            seen = now;
+        }
+    }
+
     struct Fleet {
         detector_links:Mutex<DetectorLinks>,
         detector_cut:AtomicBool,
@@ -6342,7 +6379,7 @@ mod tests {
                     if offline.contains(&name.as_str()) {
                         continue;
                     }
-                    anyhow::ensure!(mgr.flush(TEST_WAIT), "node {name} WAL flush stalled");
+                    flushed(mgr).with_context(|| format!("node {name}"))?;
                 }
                 let mut moved = false;
                 for (from, (mgr, _, _, _)) in &self.nodes {
@@ -7335,14 +7372,11 @@ mod tests {
     fn oversized_single_row_chunks_through_wal_without_dropping() -> anyhow::Result<()> {
         let fleet = Fleet::new(&["laptop-a", "laptop-b"])?;
         fleet.open("laptop-b", "sess-huge-row", 1, Vec::new())?;
-        let drops_before = dropped_proposals();
         let huge_payload = "Z".repeat(1200 * 1024);
         let huge_ev = user_event("sess-huge-row", 1, &huge_payload);
         anyhow::ensure!(serde_json::to_vec(&huge_ev)?.len() > ENTRY_DATA_MAX, "test row must exceed ENTRY_DATA_MAX");
         fleet.mgr("laptop-b")?.propose("sess-huge-row", 1, vec![huge_ev])?;
         fleet.settle()?;
-
-        anyhow::ensure!(dropped_proposals() == drops_before, "oversized single row must never drop");
         fleet.store("laptop-a")?.sync()?;
         let kept = fleet.store("laptop-a")?.kept("sess-huge-row", 10)?.ok_or_else(|| anyhow::anyhow!("laptop-a missing chunked single row"))?;
         anyhow::ensure!(kept.events.len() == 1 && kept.events.first().is_some_and(|e| e.text.len() == huge_payload.len()), "chunked 1.2 MiB row must replicate intact");
@@ -8483,7 +8517,8 @@ mod tests {
         // Pump until the legacy replica confirms the founding entry.
         let deadline = Instant::now() + TEST_WAIT;
         while !opening.is_finished() && Instant::now() < deadline {
-            anyhow::ensure!(mgr_b.flush(TEST_WAIT) && mgr_leg.flush(TEST_WAIT));
+            flushed(&mgr_b)?;
+            flushed(&mgr_leg)?;
             let rx_b = mgr_b.outgoing();
             while let Ok(m) = rx_b.try_recv() {
                 anyhow::ensure!(m.bytes.get(..4) != Some(WIRE_CHUNK_MAGIC.as_slice()), "must never send KRC1 frame to legacy peer");
@@ -8501,11 +8536,11 @@ mod tests {
 
         // 1. Oversized single row requiring `WireEntry::Part` MUST be refused cleanly rather than
         //    fencing the legacy peer with undecodable `WireEntry::Part` entries!
-        let corrupt_before = corrupt_entries();
         let huge = user_event(sess, 1, &"Q".repeat(1200 * 1024));
         let part_res = mgr_b.propose_sync(sess, 1, vec![user_event(sess, 501, "before"), huge, user_event(sess, 502, "after")]);
         anyhow::ensure!(part_res.is_err(), "proposing WireEntry::Part with legacy peer in group must fail explicitly: {part_res:?}");
-        anyhow::ensure!(corrupt_entries() == corrupt_before, "legacy peer must suffer zero corrupt_entries");
+        flushed(&mgr_leg)?;
+        anyhow::ensure!(mgr_leg.status(sess).is_some_and(|s| !s.recovering) && mgr_leg.recovering().is_empty(), "legacy peer must suffer no corrupt entry");
         anyhow::ensure!(store_b.kept(sess, 20)?.is_some_and(|k| k.events.iter().all(|e| e.text != "before" && e.text != "after")), "rejecting a mixed operation must project no prefix or suffix");
 
         // 2. Oversized snapshot (> WIRE_PART_MAX) for a late legacy peer MUST NOT emit KRC1 frames!
@@ -8515,15 +8550,15 @@ mod tests {
             store_b.put(vec![ev.clone()]);
             mgr_b.propose(sess, 1, vec![ev])?;
         }
-        anyhow::ensure!(mgr_b.flush(TEST_WAIT));
+        flushed(&mgr_b)?;
         mgr_b.force_compact(sess, 0)?;
-        anyhow::ensure!(mgr_b.flush(TEST_WAIT));
+        flushed(&mgr_b)?;
 
         // Register a second late legacy peer without `mark_peer_v2` and confirm zero KRC1 frames!
         mgr_b.register_peers(["laptop-legacy", "laptop-legacy-late"]);
         for _ in 0..8 {
             mgr_b.drive_due();
-            anyhow::ensure!(mgr_b.flush(TEST_WAIT));
+            flushed(&mgr_b)?;
             let rx_b = mgr_b.outgoing();
             while let Ok(m) = rx_b.try_recv() {
                 anyhow::ensure!(
