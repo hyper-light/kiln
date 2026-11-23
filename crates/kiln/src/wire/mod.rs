@@ -331,6 +331,7 @@ classes! {
         ServerMsg::SkillFile { .. } => Class::Answer,
         ServerMsg::HarnessMailTransfer { .. } => REFUSED,
         ServerMsg::HarnessHistoryFor { .. } => Class::Ask,
+        // Retired: no server sends it (the person's decision of 2026-11-23).
         ServerMsg::RunnerEngine { .. } => Class::State,
         ServerMsg::AdoptPolicy { .. } => Class::State,
         ServerMsg::Replay { .. } => Class::Ask,

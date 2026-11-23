@@ -688,10 +688,10 @@ run out, and two lines can't take the same one by accident as they could a bit.
   person, listing with its own past sessions those kept in that person's microVM volumes there, each
   saying it ran in one (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5); a runner that didn't name it
   is asked `HarnessHistory` and lists its own alone.
-  `runner.engine`: the runner takes its engine as its owner set it on the server
-  (`ServerMsg::RunnerEngine`; kiln plan 01a1dd2e…, P2.3), keeps it for its restarts and writes it into
-  its facts, so its own admission holds it; a runner that didn't name it is held to it by the server
-  alone.
+  `runner.engine`: retired (the person's decision of 2026-11-23: each agent session chooses its
+  engine, and a runner has none). A runner from before named it to take its engine as its owner set
+  it (`ServerMsg::RunnerEngine`; kiln plan 01a1dd2e…, P2.3); no runner names it now, and a server
+  sends nothing for it. The name means that alone, for good.
   `reach.adopt-policy`: the runner takes the room its hand-overs' spools leave on its volume as the
   server says it (`ServerMsg::AdoptPolicy`; CP-T3.2), each time it names this, and takes sessions
   over from other machines under it; a runner that didn't name it hears it only with a transfer's
@@ -831,7 +831,7 @@ code: each bit once, each appended variant at its index, in this order.
 | `ServerMsg` | 78 | `SkillFile` | | this line: a piece of an installed package's file a runner asked for, to a runner that named `skills` |
 | `ServerMsg` | 79 | `HarnessMailTransfer` | | this line: durable journal transfer phase, to a runner that named `mail-transfer` |
 | `ServerMsg` | 80 | `HarnessHistoryFor` | | main (kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5): a machine's past sessions for a person, JSON, to a runner that named `harness.history-volumes` |
-| `ServerMsg` | 81 | `RunnerEngine` | | main (kiln plan 01a1dd2e…, P2.3): a runner's engine as its owner set it, JSON, to a runner that named `runner.engine` |
+| `ServerMsg` | 81 | `RunnerEngine` | | main (kiln plan 01a1dd2e…, P2.3), retired (the person's decision of 2026-11-23: each session chooses its engine): its place kept, as `AdoptPolicy` follows it; no server sends it, and a runner ignores it unread |
 | `ServerMsg` | 82 | `AdoptPolicy` | | main (CP-T3.2): the room a hand-over's spool leaves on a runner's volume, JSON, to a runner that named `reach.adopt-policy` |
 | `ServerMsg` | 83 | `Replay` | | main, withdrawn (kiln plan 01a1dd2e…, P7.1b: replays were never part of experiments): its place kept, as `Prebuild` follows it; no server sends it, and a runner refuses it as a kind it doesn't know, its `req` answered why |
 | `ServerMsg` | 84 | `Prebuild` | | main (kiln plan 01a1dd2e…, P4.5): an Agentfile to build ahead of its sessions, JSON, to a runner that named `agentfiles.prebuild`; `{"end": <id>}`, a deleted Agentfile's builds to end, to one that named `agentfiles.prebuild.end` |
@@ -1103,7 +1103,7 @@ Four edges are left, and the lab steers clear of each:
 | `SkillFile` | answer | A piece of an installed package's file the runner asked for (`AgentMsg::Skills` `want`), by its SHA-256, at its offset; the last says so. | New: to runners that named `skills`, in pieces of 512 KiB. |
 | `HarnessMailTransfer` | command, refused while away | Apply the authoritative durable transfer phase for one exact manifest. | Persisted destination readiness precedes source permission to send; Committed precedes activation. |
 | `HarnessHistoryFor` | ask | `HarnessHistory` for a person (`aisessions::Asked`, JSON: `{kind, limit, person}`, the person whoever asked the server): the machine's past sessions with those kept in that person's microVM volumes there, each saying it ran in one (`isolation`). Answered by `HarnessHistory`. | New: to runners that named `harness.history-volumes`; a runner that didn't is asked `HarnessHistory`, and lists its own alone. |
-| `RunnerEngine` | state | What the runner's owner set on the server for its engine (`harness::engine::Asked`, JSON: `{engine, version}`, `engine` `host`, `microvm` or null for what it can do, `version` how many times it was set): kept in its state folder for its restarts and written into its facts (`isolation.engine`, `virt.microvm` only on `microvm`), which it says again at once; a `HarnessOpen` whose spec was decided under another `version` (`engine_version`) is refused. A barrier against session commands. The newest wins. | New: to runners that named `runner.engine`, as they name it and whenever it changes. |
+| `RunnerEngine` | state | Retired (the person's decision of 2026-11-23: each agent session chooses its engine, and a runner has none): sent by no server; a runner passes it on unread and ignores it. It carried what a runner's owner set for how it ran new sessions, on a server from before. | As its class says. |
 | `AdoptPolicy` | state | The room a hand-over's spool leaves on this runner's volume (`harness::moving::stream::Told`, JSON: `{disk_floor}`, the operator's `[ci.scheduler.admission] disk_free` in bytes, or null for none set): its reach node takes sessions over from other machines under it (docs/reach.md §8), and forgets it as its server drops. Until it knows it, it refuses every hand-over. The newest wins. | New: to runners that named `reach.adopt-policy`, as they name it (each time they connect). |
 | `Replay` | ask | Withdrawn (P7.1b): sent by no server; a runner refuses it as a kind it doesn't know, answering its `req` why. | As its class says. |
 | `Prebuild` | command, parked | Build an Agentfile ahead of its sessions (`agentfiles::prebuild::Ask`, JSON: `{agentfile, version, harness, text, secrets?}`): its text at a version, beside kiln's harness directory for one of kiln's harnesses, given the secrets it names (P4.7), into the store the runner's microVMs boot from, as a session of that harness builds it there, so the session that starts after it builds nothing. Answered by `Prebuilt` as it goes. | New: to the newest process of a runner that named `agentfiles.prebuild`, at each save of the Agentfile (or of an agent definition naming it), and again for those not done or failed each time one of its processes names the feature. |

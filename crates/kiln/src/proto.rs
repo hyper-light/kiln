@@ -817,11 +817,6 @@ pub mod feature {
     /// kiln plan 01a1d2c16eb074f19cf7ae7f1025c0be step 5). A runner that didn't name it is asked
     /// as before, for its own alone.
     pub const HISTORY_VOLUMES: &str = "harness.history-volumes";
-    /// This runner takes its engine as its owner set it on the server ([`super::ServerMsg::RunnerEngine`];
-    /// kiln plan 01a1dd2e…, P2.3), keeps it for its restarts and writes it into its facts, so its own
-    /// admission holds it as an owner probes it. A runner that didn't name it is held to it by the
-    /// server alone.
-    pub const RUNNER_ENGINE: &str = "runner.engine";
     /// This runner takes the room its hand-overs' spools leave as the server says it
     /// ([`super::ServerMsg::AdoptPolicy`]; CP-T3.2), each time it names this: a session moved to it
     /// from another machine is taken over under it. A runner that didn't name it hears it only with
@@ -910,7 +905,7 @@ pub mod feature {
     /// AD-1. This node has a running, authenticated, kernel-stamped failure detector.
     pub const CONVO_LIVENESS: &str = "convo-liveness";
     pub const CONVO_MOVE: &str = "convo-raft-move";
-    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, RUNNER_ENGINE, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD, MAIL_ROUTE, RESET, P2P_MAIL, CONVO_RAFT, CONVO_RAFT_V2, ROUTE_RECEIPT, CONVO_MOVE, CONVO_EXECUTOR, CONVO_NAME_CHARTER, CONVO_LIVENESS, SESSION_STARTS, AUTHORITY_MAIL];
+    pub const ALL: &[&str] = &[PLACE, LINK_FEATURES, OFFERS, TOLD, SIZES, SESSIONS, PLACE_HEALTH, PLACE_SYNC, FAST, KEEP, PLACE_BUDGET, PLACE_HANDOFF, PLACE_TOKENS, SKILLS, STATE_PAGES, MAIL_FLOW, MAIL_TRANSFER, NATIVE_RESUME, PLACE_KEEPER, HISTORY_VOLUMES, ADOPT_POLICY, PREBUILD, LEASES, VOLUMES, PREBUILD_END, SLATES_MOVE, AGENTENV, VOLUME_EXEC, RUNNER_ROLE, WORKSPACE_HOLD, MAIL_ROUTE, RESET, P2P_MAIL, CONVO_RAFT, CONVO_RAFT_V2, ROUTE_RECEIPT, CONVO_MOVE, CONVO_EXECUTOR, CONVO_NAME_CHARTER, CONVO_LIVENESS, SESSION_STARTS, AUTHORITY_MAIL];
 
     /// [`ALL`], as a message carries them.
     pub fn for_session_host(executable: bool, detector: bool) -> Vec<String> {
@@ -1314,10 +1309,11 @@ pub enum ServerMsg {
     /// runners that named [`feature::HISTORY_VOLUMES`]. Appended last, after `HarnessMailTransfer`:
     /// postcard encodes variants by index.
     HarnessHistoryFor { req: u64, json: String },
-    /// What a runner's owner set on the server for its engine, how it runs new agent sessions
-    /// (JSON [`crate::harness::engine::Asked`]; kiln plan 01a1dd2e…, P2.3): none, and what it can do
-    /// decides. Only to runners that named [`feature::RUNNER_ENGINE`], as they name it and whenever it
-    /// changes. Appended last, after `HarnessHistoryFor`: postcard encodes variants by index.
+    /// Retired (the person's decision of 2026-11-23: each agent session chooses its engine, and a runner
+    /// has none). It carried what a runner's owner set on a server from before for how it ran new
+    /// sessions, to runners that named `runner.engine` (kiln plan 01a1dd2e…, P2.3). Its place is kept,
+    /// as postcard encodes variants by index and `AdoptPolicy` follows it: no server sends it, and a
+    /// runner ignores it unread (`crate::wire::payload`).
     RunnerEngine { json: String },
     /// The room a hand-over's spool leaves on this runner's volume (JSON
     /// [`crate::harness::moving::stream::Told`]: the operator's floor, or none set; CP-T3.2). A

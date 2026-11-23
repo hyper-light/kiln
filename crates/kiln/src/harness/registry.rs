@@ -4626,16 +4626,13 @@ impl Registry {
         self.open_as(hub, target, spec, count, &[]).await
     }
 
-    /// The boundary a start of `spec` on `target` runs in, as [`Registry::open_as`] decides it: as it asks; else its
-    /// parent's, since an isolated agent's agents are isolated too, however they're started (kiln plan
-    /// 01a1cd8e862e7169a074db3d5fa33f3d step 32); else, for a new conversation on a `microvm` runner, a microVM of its own
-    /// (kiln plan 01a1dd2e…, P2.3; one taken up, `resume`, a found session taken over or branched or a conversation
-    /// continued, stays where its harness keeps it). None: on its machine's host. What a start's workspace is judged by
-    /// before it's opened (`api`'s `harness_open`: a volume served to its microVM needs no host mount, docs/agentic.md W8).
-    pub fn isolation_for(&self, hub: &Hub, target: &str, spec: &Spec) -> Option<super::session::Isolation> {
-        spec.isolation.clone().or_else(|| spec.parent.as_deref().and_then(|p| self.info(p)).and_then(|i| i.isolation)).or_else(|| {
-            (spec.resume.is_none() && crate::harness::lineage::engine_at(hub, target) == Ok(crate::harness::engine::Engine::Microvm)).then(|| super::session::Isolation { person: spec.opener.clone(), ..super::session::Isolation::microvm() })
-        })
+    /// The boundary a start of `spec` runs in, as [`Registry::open_as`] decides it: as it asks (the person's decision of
+    /// 2026-11-23: the engine is each session's choice, never its runner's); else its parent's, since an isolated agent's
+    /// agents are isolated too, however they're started (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32). None: on
+    /// its machine's host, the default. What a start's workspace is judged by before it's opened (`api`'s
+    /// `harness_open`: a volume served to its microVM needs no host mount, docs/agentic.md W8).
+    pub fn isolation_for(&self, spec: &Spec) -> Option<super::session::Isolation> {
+        spec.isolation.clone().or_else(|| spec.parent.as_deref().and_then(|p| self.info(p)).and_then(|i| i.isolation))
     }
 
     /// [`Registry::open`], the sessions under `ids` in order (made by the client that asks, so its
@@ -4649,23 +4646,12 @@ impl Registry {
         // The most egress its microVM may be granted live: the org's policy, never what was asked (kiln plan 01a1dd2e…,
         // P6b.4).
         spec.egress_ceiling.clone_from(&hub.cfg.agents.egress_ceiling);
-        // Its boundary ([`Registry::isolation_for`]): an isolated agent's agents are isolated too, and a new
-        // conversation that asks for no microVM takes its runner's engine. One is held so only where its machine starts
-        // microVMs: one that can't would run it as a process, unasked (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
-        spec.isolation = self.isolation_for(hub, target, &spec);
-        // A new conversation that isn't isolated takes its runner's container where its engine is `container` (docs/agentic.md
-        // W9); one taken up stays where its harness keeps it.
-        if spec.isolation.is_none() && spec.container.is_none() && spec.resume.is_none() {
-            spec.container = crate::harness::lineage::container_at(hub, target).map_err(anyhow::Error::msg)?;
-        }
-        // The engine setting its boundary is decided under (kiln plan 01a1dd2e…, P2.3), before anything
-        // it waits for: its runner refuses it where it's been set again since. One `agents.start`
-        // decided keeps the one it was decided under.
-        if spec.engine_version.is_none() {
-            spec.engine_version = crate::harness::engine::version_at(hub, target);
-        }
+        // Its boundary ([`Registry::isolation_for`]): as it asks, an isolated agent's agents isolated too, else its
+        // machine's host. One is held so only where its machine can run microVMs: one that can't is refused, typed, never
+        // run as a process unasked (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d step 32).
+        spec.isolation = self.isolation_for(&spec);
         if spec.isolation.is_some() {
-            crate::harness::lineage::isolation_on(hub, target).map_err(|why| anyhow::anyhow!("an agent can't run isolated there: {why}"))?;
+            crate::harness::lineage::isolation_on(hub, target)?;
         }
         let loc = Location::of_target(target);
         // Internal starters such as definitions or plan children reach this same entry

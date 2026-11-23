@@ -693,47 +693,6 @@ pub fn list_ops() -> Vec<Op> {
             },
         },
         Op {
-            name: "runners.engine",
-            summary: "How a runner runs new agent sessions, its engine: `host` (each a process on the machine, no microVM) or `microvm` (each in a Shards microVM of its own, through Hex); where that comes from (its owner set it, or nothing set: `host`, the microVM engine being an option its owner enables) and why; whether it can hold microVMs now and why not; its isolation facts; and how many of its sessions run on its engine and how many on the other, which finish there (`draining`), each of those listed (`draining_sessions`: id, name, harness, state, engine), with the switch they drain for while any does (`switch`: `from`, `to`, `at`).",
-            read_only: true,
-            destructive: false,
-            input: Input::of::<input::RunnersEngine>(),
-            route: |v| Ok((Method::GET, path(&["api", "runners", &runner_of(v)?, "engine"]))),
-            run: |cx, v| Box::pin(async move { crate::harness::engine::read(&cx.hub, &runner_of(&v)?).await }),
-        },
-        Op {
-            name: "runners.engine.set",
-            summary: "Set how a runner runs new agent sessions: `host` or `microvm`, or null for the default (`host`: the microVM engine is an option its owner enables here, never a default). `microvm` is refused, saying why, where the runner can't hold microVMs now. Nothing running stops: its sessions on the other engine finish there, and new sessions take the new one.",
-            read_only: false,
-            destructive: false,
-            input: Input::of::<input::RunnersEngineSet>(),
-            route: |v| Ok((Method::PUT, path(&["api", "runners", &runner_of(v)?, "engine"]))),
-            run: |cx, v| {
-                Box::pin(async move {
-                    let body = json!({"engine": v.get("engine").cloned().unwrap_or(Value::Null)});
-                    crate::harness::engine::set(&cx.hub, &runner_of(&v)?, &body, &cx.caller.name).await
-                })
-            },
-        },
-        Op {
-            name: "runners.engine.end_draining",
-            summary: "End now the agent sessions a runner's engine switch drains (those still on the engine it had: runners.engine's `draining_sessions`), each after the agents it started, rather than waiting for each to finish there. Answers runners.engine's view after it, with those it ended (`ended`). Destructive: an agent's call waits for its person's click.",
-            read_only: false,
-            destructive: true,
-            input: Input::of::<input::RunnersEngineEndDraining>(),
-            route: |v| Ok((Method::POST, path(&["api", "runners", &runner_of(v)?, "engine", "end"]))),
-            run: |cx, v| Box::pin(async move { crate::harness::engine::end_draining(&cx.hub, &runner_of(&v)?, &cx.caller.name).await }),
-        },
-        Op {
-            name: "runners.engine.cancel",
-            summary: "Cancel a runner's engine switch while what it drains still runs: its engine set back to what its owner had set before the switch (runners.engine's `switch.from`), so those sessions are on its engine again. Refused where it wasn't switched, or nothing drains (the switch is done: runners.engine.set it instead). Answers runners.engine's view after it.",
-            read_only: false,
-            destructive: false,
-            input: Input::of::<input::RunnersEngineCancel>(),
-            route: |v| Ok((Method::POST, path(&["api", "runners", &runner_of(v)?, "engine", "cancel"]))),
-            run: |cx, v| Box::pin(async move { crate::harness::engine::cancel(&cx.hub, &runner_of(&v)?, &cx.caller.name).await }),
-        },
-        Op {
             name: "updates.list",
             summary: "The kiln of every runner you may read against the newest: its build, whether it's up to date, what it does next, the ways it can be upgraded now (or why not), its policy; and their latest upgrades with their state, error and log.",
             read_only: true,
@@ -812,43 +771,6 @@ pub mod input {
         pub action: RunnersRepairAction,
         /// For retry-upgrade: how; by default the way kiln can.
         pub way: Option<RunnersRepairWay>,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct RunnersEngine {
-        /// The runner (machine) by name, as Runners lists it.
-        pub runner: String,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(rename_all = "lowercase")]
-    pub enum RunnerEngine {
-        Host,
-        Microvm,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct RunnersEngineSet {
-        /// The runner (machine) by name, as Runners lists it.
-        pub runner: String,
-        /// `host` or `microvm`; null for what the runner can do.
-        pub engine: Option<RunnerEngine>,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct RunnersEngineEndDraining {
-        /// The runner (machine) by name, as Runners lists it.
-        pub runner: String,
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct RunnersEngineCancel {
-        /// The runner (machine) by name, as Runners lists it.
-        pub runner: String,
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

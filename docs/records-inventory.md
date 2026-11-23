@@ -428,7 +428,6 @@ dropped by a later migration, is listed too, and says so.
 | `replaces.json` | `crates/kiln/src/updates.rs`, `crates/kiln/src/upgrade.rs` |  |
 | `result.json` | `crates/kiln-lab/src/browser/run.rs` |  |
 | `run.json` | `crates/kiln-lab/src/browser/run.rs`, `crates/kiln-lab/src/main.rs` |  |
-| `runner-engine.json` | `crates/kiln/src/harness/engine.rs` |  |
 | `runs.json` | `crates/kiln/src/runner/warm.rs` |  |
 | `s1-agent-s1.json` | `crates/kiln/src/harness/moving.rs` | yes |
 | `same-chat.json` | `crates/kiln/src/harness/host.rs` | yes |

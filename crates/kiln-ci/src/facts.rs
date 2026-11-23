@@ -45,7 +45,7 @@ pub struct RunnerFacts {
     pub kiln: Option<KilnFacts>,
     /// Whether its agents can have workspaces of their own (Slates volumes), and why not.
     pub workspaces: Option<Workspaces>,
-    /// Whether it holds isolated agents in microVMs of their own, on what, and why not (kiln plan
+    /// Whether it can run microVMs now, on what, and why not (kiln plan
     /// 01a1cd8e862e7169a074db3d5fa33f3d step 17): [`Virt::microvm`] is its `available`. Absent from a
     /// runner from before it.
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -260,20 +260,21 @@ pub struct WorkFacts {
 #[cfg_attr(feature = "ts", ts(rename = "IsolationFacts"))]
 #[serde(default)]
 pub struct Isolation {
-    /// Agents here can be held isolated: its kiln carries the microVMs' runtime, and the machine has
-    /// a hypervisor it can use.
+    /// It can run microVMs now: its kiln carries their runtime, and the machine has a hypervisor it
+    /// can use. A session that asks for a microVM is placed and admitted only where this holds
+    /// ([`Virt::microvm`] says the same).
     pub available: bool,
     /// The hypervisor its microVMs run on (`KVM`, `Hypervisor.framework`, `WHP`), where known.
     pub hypervisor: Option<String>,
-    /// Why agents here can't be held isolated.
+    /// Why it can't run microVMs now.
     pub why_not: Option<String>,
-    /// How the runner runs new agent sessions now, its engine (kiln plan 01a1dd2e…, P2.3): what its
-    /// owner set on the server, else `microvm` where agents here can be held isolated (`available`;
-    /// the person's decision 3), else `host`. `virt.microvm` holds only on a `microvm` one. Absent
-    /// from a runner and a server from before engines.
+    /// Retired (the person's decision of 2026-11-23: each session chooses its engine, and a runner
+    /// has none): how a runner from before ran new agent sessions, as its owner set it (`host`,
+    /// `microvm` or `container`). kiln neither sets nor reads it. A runner from before still says
+    /// it, so any word is taken, and the server drops it from the facts it keeps.
     #[cfg_attr(feature = "ts", ts(optional))]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub engine: Option<Engine>,
+    pub engine: Option<String>,
     /// Whether its Hex node lists the class its image VMs run as (Hex's `shards-image`; kiln plan
     /// 01a1dd2e…, P2.2 and P2.4), as its runner read it from its node: a session that needs a
     /// microVM is placed only where it's listed. Absent from a runner holding no microVMs through
@@ -296,9 +297,9 @@ pub enum NodeImageClass {
     Unlisted { why: String },
 }
 
-/// How a runner runs new agent sessions (kiln plan 01a1dd2e…, P2.3): as processes on its host, each in a
-/// Shards microVM of its own, through Hex, or each in a container of its own on its workspace's Slates volume
-/// (docs/agentic.md W9).
+/// How an agent session runs (the person's decision of 2026-11-23: each session's choice, never its
+/// runner's): as a process of its machine's host, the default, or in a Shards microVM of its own,
+/// through Hex, where it asks for one. An agent definition says its sessions'.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(rename = "RunnerEngine"))]
@@ -552,10 +553,10 @@ pub struct Virt {
     /// Hypervisor.framework is usable (macOS).
     pub hvf: bool,
     pub nested: bool,
-    /// It starts microVMs itself: a hypervisor it can use and the runtime that boots them, which kiln
-    /// carries from kiln plan 01a1cd8e862e7169a074db3d5fa33f3d's step 16 (Shards, through Hex). Said by
-    /// the runner; one that doesn't say so starts none (step 32: where microVM agents and the work
-    /// they start are placed).
+    /// It can run microVMs now: a hypervisor it can use and the runtime that boots them, which kiln
+    /// carries from kiln plan 01a1cd8e862e7169a074db3d5fa33f3d's step 16 (Shards, through Hex); its
+    /// [`Isolation::available`]. Said by the runner; one that doesn't say so runs none (step 32: where
+    /// a session that asks for a microVM, and the work it starts, are placed).
     pub microvm: bool,
 }
 

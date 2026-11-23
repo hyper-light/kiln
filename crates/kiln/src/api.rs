@@ -1126,15 +1126,6 @@ async fn authorized(hub: Arc<Hub>, caller: crate::authz::Caller, req: Request, m
         }
         // The warm pools kiln names on a runner (`crate::sandbox::pools`; kiln plan 01a1dd2e…, P3.2).
         (&Method::GET, ["api", "runners", name, "pools"]) => boxed(|| crate::sandbox::pools::get(&hub, &caller, name)).await.map_err(|(c, m)| err(c, m)),
-        // How a runner runs new agent sessions, its engine (`crate::harness::engine`; kiln plan 01a1dd2e…, P2.3).
-        (&Method::GET, ["api", "runners", name, "engine"]) => boxed(|| crate::harness::engine::get(&hub, name)).await.map_err(|(c, m)| err(c, m)),
-        (&Method::PUT, ["api", "runners", name, "engine"]) => {
-            let name = (*name).to_owned();
-            boxed(|| crate::harness::engine::put(&hub, &name, req, &caller.name)).await.map_err(|(c, m)| err(c, m))
-        }
-        // While a switch of it drains (decision 8): "End them now", and the switch cancelled.
-        (&Method::POST, ["api", "runners", name, "engine", "end"]) => boxed(|| own_op(&hub, &caller, "runners.engine.end_draining", json!({ "runner": name }))).await,
-        (&Method::POST, ["api", "runners", name, "engine", "cancel"]) => boxed(|| own_op(&hub, &caller, "runners.engine.cancel", json!({ "runner": name }))).await,
         (&Method::POST, ["api", "runners", name, "front-door", "cert", "renew"]) => front_door(boxed(|| crate::frontdoor::control::renew(&hub, name)).await),
         (&Method::GET, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::get(&hub)).await),
         (&Method::PUT, ["api", "tailscale"]) => front_door(boxed(|| crate::frontdoor::tailnet::put(&hub, req)).await),
@@ -7279,8 +7270,6 @@ pub(crate) fn as_asked(spec: &mut crate::harness::session::Spec, caller: Option<
     // `agentenv`, docs/agents.md "Environments"), never what's asked: a spec that carried one would put what it
     // likes in its harness's environment unread.
     spec.agentenv = None;
-    // The engine setting its boundary is decided under is kiln's (kiln plan 01a1dd2e…, P2.3).
-    spec.engine_version = None;
     // How much its launcher lets it do unasked is kiln's to record, from the mode asked (`Registry::open_as`), never
     // what's asked: an agent never raises its own permission (the person's rule, 2026-11-18; docs/agentic.md W6).
     spec.launched = None;
@@ -7393,7 +7382,7 @@ async fn harness_open_body(hub:&Arc<Hub>,caller:Option<crate::authz::Caller>,key
         None => {}
         Some("folder") => body.spec.workspace = Some(crate::workspace::Workspace { kind: "folder".into(), ..Default::default() }),
         Some("volume") => {
-            let used = crate::harness::lineage::WorkspaceUse::of(hub.harness.isolation_for(hub, &body.target, &body.spec).is_some());
+            let used = crate::harness::lineage::WorkspaceUse::of(hub.harness.isolation_for(&body.spec).is_some());
             crate::harness::lineage::workspaces_on(hub, &body.target, used).await.map_err(|no| err(StatusCode::CONFLICT, format!("an agent can't have a workspace of its own there: {no}")))?;
             body.spec.workspace = Some(crate::workspace::Workspace { kind: "volume".into(), ..Default::default() });
         }
@@ -7456,7 +7445,7 @@ async fn harness_open_body(hub:&Arc<Hub>,caller:Option<crate::authz::Caller>,key
                 }
                 return Ok(srv::json(batch.status(),&batch.0));
             }
-            let conflict=e.is::<crate::harness::registry::IdTaken>() || e.is::<crate::harness::lineage::NoWorkspace>();
+            let conflict=e.is::<crate::harness::registry::IdTaken>() || e.is::<crate::harness::lineage::NoWorkspace>() || e.is::<crate::harness::lineage::NoMicrovm>();
             let code=if conflict{StatusCode::CONFLICT}else if e.is::<crate::harness::registry::StartUnconfirmed>(){StatusCode::SERVICE_UNAVAILABLE}else{StatusCode::BAD_REQUEST};
             return Err(err(code,format!("{e:#}")));
         }

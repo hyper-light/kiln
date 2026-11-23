@@ -793,8 +793,6 @@ pub struct Hub {
     /// How many agent sessions each machine runs at once, as set here, and what each said it
     /// holds (`crate::harness::limit`).
     pub agent_limits: crate::harness::limit::AgentLimits,
-    /// Each runner's engine as its owner set it here (`crate::harness::engine`).
-    pub engines: crate::harness::engine::Engines,
     /// Which environment each agent session runs with, and the runner process each was given it in
     /// (`crate::agentenvs`).
     pub agentenvs: crate::agentenvs::Held,
@@ -1024,7 +1022,6 @@ impl Hub {
             front_doors: crate::frontdoor::control::FrontDoors::default(),
             live,
             agent_limits: crate::harness::limit::AgentLimits::default(),
-            engines: crate::harness::engine::Engines::default(),
             agentenvs: crate::agentenvs::Held::default(),
             headrooms: crate::headroom::control::Headrooms::default(),
             peered: crate::peers::Peers::default(),
@@ -2420,7 +2417,6 @@ impl Hub {
         if let Ok(Some(mgr)) = self.harness.session_consensus() { mgr.forget_member(agent); }
         self.front_doors.forget(&self.store, agent).await;
         self.agent_limits.forget(&self.store, agent).await;
-        self.engines.forget(&self.store, agent).await;
         self.headrooms.forget(&self.store, agent).await;
         self.places.forget(agent);
         self.tailnet.wake.notify();
@@ -2439,7 +2435,7 @@ impl Hub {
     pub async fn move_runner(&self, from: &str, to: &str, label: &str, hostname: &str) -> anyhow::Result<String> {
         anyhow::ensure!(from != to, "{from} is known by that name already");
         anyhow::ensure!(!self.is_connected(from), "{from} has a runner process connected: it moves to its machine id once none is");
-        let prefixes = vec![crate::frontdoor::control::KEY_PREFIX, crate::harness::limit::KEY_PREFIX, crate::harness::engine::KEY_PREFIX, crate::updates::POLICY_PREFIX];
+        let prefixes = vec![crate::frontdoor::control::KEY_PREFIX, crate::harness::limit::KEY_PREFIX, crate::updates::POLICY_PREFIX];
         self.store.move_runner(from.to_owned(), to.to_owned(), label.to_owned(), hostname.to_owned(), prefixes).await?;
         // What the store kept: `to`'s own label when it had one.
         let label = self.store.agent_label(to.to_owned()).await.ok().flatten().unwrap_or_else(|| label.to_owned());
@@ -2462,7 +2458,6 @@ impl Hub {
         metrics::agent_samples().update(|m| m.remove(from));
         self.front_doors.moved(from, to);
         self.agent_limits.moved(from, to);
-        self.engines.moved(from, to);
         self.places.moved(from, to);
         self.sync.moved(from, to);
         let moved = self.harness.move_machine(self, from, to).await;
@@ -3816,8 +3811,6 @@ impl Hub {
                         }
                     }
                 }
-                // One that takes its engine is told what its owner set (`crate::harness::engine`).
-                crate::harness::engine::on_features(self, &agent, peer, &names).await;
                 // An agent pod's runner is given the session it was made for (docs/agentic.md W10).
                 crate::api::boxed(|| crate::k8s::agent::on_features(self, &agent)).await;
                 // One that takes a certificate in the runner's role, on a link made with one from before it, is reissued
@@ -4372,9 +4365,10 @@ impl Hub {
                     // The machine it is, kept with its name for the joins to come
                     // (`crate::join::free_name`); a job's pod is its node's, and goes.
                     let machine = f.machine_id.clone();
-                    // Its engine, as its owner set it here, over what it says (kiln plan 01a1dd2e…,
-                    // P2.3): what placement and the runners API read, whatever its kiln.
-                    crate::harness::engine::overlay(&mut f, self.engines.asked(agent));
+                    // What it can run now, whatever its kiln: a runner from before sessions chose their engine (the
+                    // person's decision of 2026-11-23) writes the engine its owner set into these, which placement and
+                    // the runners API read as what it can do (`crate::harness::engine::as_capable`).
+                    crate::harness::engine::as_capable(&mut f);
                     let known = self.change_agent(agent, |a| {
                         a.facts = Some(f.clone());
                         !a.ephemeral

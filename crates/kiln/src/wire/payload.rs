@@ -1153,9 +1153,6 @@ pub enum FromServer {
     /// `HarnessHistoryFor`: this machine's past sessions, asked for a person (kiln plan
     /// 01a1d2c16eb074f19cf7ae7f1025c0be step 5).
     HarnessHistoryFor { req: u64, asked: crate::aisessions::Asked },
-    /// `RunnerEngine`: what the runner's owner set on the server for its engine (kiln plan 01a1dd2e…,
-    /// P2.3).
-    RunnerEngine(crate::harness::engine::Asked),
     /// `AdoptPolicy`: the room a hand-over's spool leaves on this runner's volume (CP-T3.2).
     AdoptPolicy(crate::harness::moving::stream::Told),
     /// `Volumes`: the agent volumes its microVMs' store keeps of the names asked, or one cleared (kiln plan 01a1dd2e…,
@@ -1229,7 +1226,6 @@ impl Carries for ServerMsg {
             ServerMsg::Headroom { json } => FromServer::Headroom(payload(W, "Headroom", &json)?),
             ServerMsg::Custody { json } => FromServer::Custody(payload(W, "Custody", &json)?),
             ServerMsg::HarnessHistoryFor { req, json } => FromServer::HarnessHistoryFor { req, asked: payload(W, "HarnessHistoryFor", &json).map_err(|e| e.waits(Waits::Asking(req)))? },
-            ServerMsg::RunnerEngine { json } => FromServer::RunnerEngine(payload(W, "RunnerEngine", &json)?),
             ServerMsg::AdoptPolicy { json } => FromServer::AdoptPolicy(payload(W, "AdoptPolicy", &json)?),
             // P7.1b's replay, withdrawn (replays were never part of experiments): a kind this build doesn't
             // know, its asker answered why.
@@ -1296,6 +1292,9 @@ impl Carries for ServerMsg {
             | ServerMsg::HarnessMailTransfer { .. }
             | ServerMsg::Later { .. }
             | ServerMsg::Back { .. }
+            // Retired: a runner's engine as a server from before sessions chose their own set it (the person's decision
+            // of 2026-11-23). No server sends it, and a runner ignores it unread.
+            | ServerMsg::RunnerEngine { .. }
             // A build asked ahead of its sessions is read by `crate::agentfiles::prebuild` (P4.5).
             | ServerMsg::Prebuild { .. }
             // A certificate reissued in the runner's role is a PEM, checked by `crate::pki::take_runner_role` (W10).
@@ -1434,7 +1433,6 @@ mod tests {
             case("Identity", |json| ServerMsg::Identity { json }, &crate::proto::IdentityGiven { kind: "runner".into(), uri: "kiln://runner/m1".into(), ..Default::default() }, None),
             case("Observe", |json| ServerMsg::Observe { json, bytes: Vec::new() }, &crate::observe::wire::Msg::Release, Some(r#"{"kind":"teleport"}"#)),
             case("Headroom", |json| ServerMsg::Headroom { json }, &crate::headroom::Push::default(), None),
-            case("RunnerEngine", |json| ServerMsg::RunnerEngine { json }, &crate::harness::engine::Asked { engine: Some(crate::harness::engine::Engine::Host), version: 1 }, None),
             case("AdoptPolicy", |json| ServerMsg::AdoptPolicy { json }, &crate::harness::moving::stream::Told { disk_floor: Some(20 << 30) }, None),
         ];
         cases.push(Case { of: "StreamOpen", make: |json| ServerMsg::StreamOpen { stream: "st1".into(), session: "s1".into(), json }, good: r#"{"url":"https://example.com"}"#.into(), unknown: None, any: false });
@@ -1455,9 +1453,9 @@ mod tests {
         // On main as the plan was made, 22 of AgentMsg's and 16 of ServerMsg's, T3's HarnessSend
         // since; W24's WorkState; a machine's agent limit, AgentLimit; W27's identities and
         // observe's group, Identity and Observe, each way; and headroom's, HeadroomStatus and
-        // Headroom; a runner's engine, RunnerEngine (kiln plan 01a1dd2e…, P2.3); the room a hand-over's
-        // spool leaves, AdoptPolicy (CP-T3.2).
-        anyhow::ensure!(runner.len() + ANSWERS.len() == 27 && server.len() == 23, "{} and {} variants", runner.len() + ANSWERS.len(), server.len());
+        // Headroom; the room a hand-over's spool leaves, AdoptPolicy (CP-T3.2). A runner's engine, RunnerEngine (kiln plan
+        // 01a1dd2e…, P2.3), carried none once retired (the person's decision of 2026-11-23): a runner reads it no more.
+        anyhow::ensure!(runner.len() + ANSWERS.len() == 27 && server.len() == 22, "{} and {} variants", runner.len() + ANSWERS.len(), server.len());
         fn check<M: Carries>(cases: Vec<Case<M>>) -> anyhow::Result<()> {
             for c in cases {
                 anyhow::ensure!(read((c.make)(c.good.clone())).map_err(|e| anyhow::anyhow!("{}: {e}", c.of))?, "{} came through as it was", c.of);
@@ -1493,6 +1491,16 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// The person's decision of 2026-11-23: a runner has no engine, so `ServerMsg::RunnerEngine` is retired. Kept in its
+    /// place (postcard numbers variants by index), it's passed on unread whatever a server from before put in it, and
+    /// never refused, so a runner answers it nothing and ignores it.
+    #[test]
+    fn a_retired_runner_engine_is_passed_on_unread() {
+        for json in [r#"{"engine":"microvm","version":3}"#, r#"{"engine":"container"}"#, "not json"] {
+            assert!(matches!(payload_of(ServerMsg::RunnerEngine { json: json.into() }), Ok(Carried::Nothing(ServerMsg::RunnerEngine { .. }))), "{json}");
+        }
     }
 
     /// What it says of what it couldn't read never quotes what came: a secret's value, say.

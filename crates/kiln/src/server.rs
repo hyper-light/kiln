@@ -157,8 +157,6 @@ pub async fn run(cfg: Config, shutdown: Shutdown) -> anyhow::Result<()> {
     // it connects, and the server's own agents held to theirs from the start.
     hub.agent_limits.load(&hub.store).await?;
     crate::harness::limit::hold_local(&hub);
-    // Each runner's engine as its owner set it: sent to each runner as it names the feature.
-    hub.engines.load(&hub.store).await?;
     // Which environment each agent session runs with: what its runner is given again as it announces one
     // without it (`crate::agentenvs::resolve::opened`).
     hub.agentenvs.load(&hub.store).await?;

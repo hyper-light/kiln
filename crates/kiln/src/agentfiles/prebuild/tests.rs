@@ -1,4 +1,4 @@
-//! P4.5 (kiln plan 01a1dd2e6a0b76bbba478c532781feed): a save asks each of its person's microvm runners to build its
+//! P4.5 (kiln plan 01a1dd2e6a0b76bbba478c532781feed): a save asks each of its person's runners that can run microVMs to build its
 //! Agentfile, their words move each build forward only, the page reads where each is, and a runner's build is the one a
 //! session there makes, so the session that starts after it builds nothing.
 
@@ -26,8 +26,7 @@ async fn op(hub: &Arc<Hub>, caller: &Caller, name: &str, input: Value) -> anyhow
     .map_err(|(code, why)| anyhow::anyhow!("{name}: {code} {why}"))
 }
 
-/// A runner of a test's hub whose facts say it holds microVMs (its engine `microvm`, nothing set) or can't (`host`),
-/// connected or away.
+/// A runner of a test's hub whose facts say it can run microVMs or can't, connected or away.
 fn runner(name: &str, microvm: bool, connected: bool) -> crate::hub::AgentLive {
     use kiln_ci::facts::{Isolation, RunnerFacts};
     let isolation = if microvm {
@@ -51,7 +50,7 @@ fn runner(name: &str, microvm: bool, connected: bool) -> crate::hub::AgentLive {
         isolation: Some(isolation),
         ..RunnerFacts::default()
     };
-    crate::harness::engine::overlay(&mut facts, crate::harness::engine::Asked::default());
+    facts.virt.microvm = microvm;
     crate::hub::AgentLive {
         facts: Some(Box::new(facts)),
         connected,
@@ -154,7 +153,7 @@ fn p4_5_a_builds_state_moves_forward_only() {
     assert_eq!(State::of("cancelled"), None);
 }
 
-/// Saved, an Agentfile is queued on each of its person's microvm runners (one away too, none whose engine is host), for
+/// Saved, an Agentfile is queued on each of its person's runners that can run microVMs (one away too, none that can't), for
 /// each harness its sessions run; its runners' words move each forward only, and a word on a version saved over since
 /// moves nothing; the page reads each runner's state, its image, and Shards' words where it failed; deleted, its builds
 /// go with it.
@@ -323,7 +322,7 @@ fn p4_5_a_save_queues_its_build_on_each_microvm_runner_and_their_words_move_it()
     })
 }
 
-/// A save that writes no build (its person has no runner that builds Agentfiles: one whose engine is host) tells its
+/// A save that writes no build (its person has no runner that builds Agentfiles: one that can't run microVMs) tells its
 /// version alone: its builds didn't move.
 #[test]
 fn p4_5_a_save_that_writes_no_build_tells_none() -> anyhow::Result<()> {
@@ -508,7 +507,7 @@ fn build_on(answer: &Value, runner: &str) -> Value {
 /// A runner's builds of an Agentfile asked again (`agentfiles.rebuild`) by whoever reaches it as they read its builds
 /// (another person's is as none): one that failed, or one done, is queued again at its version now, and its runner's words
 /// move it forward as they move a save's; one on a runner away waits, queued, until it's back. Refused, nothing written,
-/// where the runner can't build it (none of that name, its engine host, its kiln saying it builds nothing ahead), where no
+/// where the runner can't build it (none of that name, one that can't run microVMs, its kiln saying it builds nothing ahead), where no
 /// session of it runs the harness named, or where its build there is underway.
 #[test]
 fn p4_5_a_runners_build_is_asked_again_and_refused_where_it_cant_be() -> anyhow::Result<()> {

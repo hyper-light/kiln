@@ -1,11 +1,11 @@
 //! Agentfiles built ahead of their sessions (kiln plan 01a1dd2e6a0b76bbba478c532781feed P4.5): saving one of a person's
-//! Agentfiles, or an agent definition that names one, asks each of their `microvm` runners to build it for that
-//! runner's platform, exactly as a session there builds it as it starts. So the session that starts after the build is
-//! done builds nothing: its machine's store holds its image's content already (`crate::sandbox::image::Pinned::built`,
-//! said in its start's record as `built_us`).
+//! Agentfiles, or an agent definition that names one, asks each of their runners that can run microVMs to build it for
+//! that runner's platform, exactly as a session there builds it as it starts. So the session that starts after the
+//! build is done builds nothing: its machine's store holds its image's content already
+//! (`crate::sandbox::image::Pinned::built`, said in its start's record as `built_us`).
 //!
-//! - **On which runners.** Its person's: each runner whose engine is `microvm` as the server has its facts
-//!   (`crate::harness::engine::of`) and that its owner may start agents on (`runners.terminal` there,
+//! - **On which runners.** Its person's: each runner that can run microVMs now, as the server has its facts
+//!   (`crate::harness::engine::capable`), and that its owner may start agents on (`runners.terminal` there,
 //!   `crate::harness::lineage::may_run_on`), connected or not; outposts and one-job runners aside.
 //! - **What is built.** Its text at its version now, once for each of kiln's harnesses a session of it runs: those it
 //!   declares (`HARNESS <harness>`) and those of its person's agent definitions that name it, each beside kiln's harness
@@ -35,7 +35,6 @@ use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
 
 use crate::exec::Uplink;
-use crate::harness::engine::Engine;
 use crate::hub::Hub;
 use crate::instances::PeerId;
 use crate::proto::{AgentMsg, ServerMsg, feature};
@@ -155,10 +154,8 @@ pub enum Refusal {
         "no runner {0} builds Agentfiles ahead of their sessions: kiln knows none of that name, and outposts and one-job runners build none"
     )]
     NoRunner(String),
-    /// Its engine isn't `microvm`, as the server has its facts.
-    #[error(
-        "{0} builds no Agentfile: its sessions run on the machine, from no image (its engine isn't microvm)"
-    )]
+    /// It can't run microVMs now, as the server has its facts: no session there boots an image.
+    #[error("{0} builds no Agentfile: it can't run microVMs, which its sessions' images boot in")]
     NotMicrovm(String),
     /// The Agentfile's person may not start agents there (`runners.terminal`), or can't sign in any more: kiln's words.
     #[error("{0}")]
@@ -234,13 +231,13 @@ async fn current(hub: &Hub, id: &str) -> anyhow::Result<Option<super::Agentfile>
     }
 }
 
-/// Whether `caller`'s Agentfiles are built on runner `a`: its engine is `microvm`, as the server has its facts, and
+/// Whether `caller`'s Agentfiles are built on runner `a`: it can run microVMs now, as the server has its facts, and
 /// `caller` may start agents there; outposts and one-job runners build none. Else why not.
 fn builds_for(caller: &crate::authz::Caller, a: &crate::hub::AgentLive) -> Result<(), Refusal> {
     if a.outpost || a.ephemeral {
         return Err(Refusal::NoRunner(a.shown().to_owned()));
     }
-    if a.facts.as_deref().and_then(crate::harness::engine::of) != Some(Engine::Microvm) {
+    if !a.facts.as_deref().is_some_and(|f| crate::harness::engine::capable(f).usable) {
         return Err(Refusal::NotMicrovm(a.shown().to_owned()));
     }
     crate::harness::lineage::may_run_on(

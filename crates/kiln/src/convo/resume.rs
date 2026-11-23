@@ -169,7 +169,6 @@ fn build_package(store: &Store, id: &str, from: &str, cwd: Option<&str>, shown: 
         egress_ceiling: restrictions.egress_ceiling,
         volumes: restrictions.volumes,
         opener: restrictions.opener,
-        engine_version: restrictions.engine_version,
         kind: kind.id.to_owned(),
         name: non_empty(&info.name),
         model: non_empty(&state.model),

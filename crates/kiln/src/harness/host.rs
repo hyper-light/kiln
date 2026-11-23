@@ -1588,11 +1588,6 @@ impl Host {
     /// A forwarded placement that acquired its claim before launching must not charge it
     /// a second time when the provider is published.
     pub(crate) fn open_admitted(&self, id: Option<String>, spec: Spec, claim_held: bool) -> anyhow::Result<(Arc<Session>, bool)> {
-        // Its boundary decided under this runner's engine setting as it holds it, or not started: one
-        // placed just before a switch never starts on the engine it had (kiln plan 01a1dd2e…, P2.3).
-        if let Some(why) = crate::harness::engine::stale(spec.engine_version, crate::harness::engine::here()) {
-            anyhow::bail!("{why}");
-        }
         // Held in a microVM of its own or not at all (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d
         // steps 17 and 32): a machine whose kiln carries no microVM runtime refuses an isolated
         // agent, never running it as a process.
@@ -4899,34 +4894,6 @@ mod tests {
             let why = host.open(None, spec).err().map(|e| format!("{e:#}")).unwrap_or_default();
             anyhow::ensure!(why.contains("kiln's balancer"), "no claim: {why}");
             anyhow::ensure!(host.inventory().sessions.is_empty(), "nothing started");
-            Ok(())
-        })
-    }
-
-    /// Kiln plan 01a1dd2e…, P2.3: a microVM's start placed for this runner just before its owner switched
-    /// it to host (decided under setting 0, the runner holding setting 1 by the time it opens) is refused
-    /// here, the engine it has now named, and nothing starts in a microVM, though this runner holds them;
-    /// one decided under the setting it holds passes that check. Taking `engine::stale` out of
-    /// `Host::open` starts it.
-    #[test]
-    fn p2_3_a_microvm_start_placed_before_a_switch_to_host_never_starts_in_a_microvm() -> anyhow::Result<()> {
-        use crate::harness::engine::{self, Asked, Engine};
-        crate::rt::block_on(async move {
-            let dir = tempfile::tempdir()?;
-            let (sink, _updates) = async_channel::unbounded::<(String, super::super::core::Update)>();
-            let host = Host::new(sink, None, Limits::default());
-            let (images, _) = crate::sandbox::image::tests::holding(dir.path(), claude_image()?)?;
-            host.hold_isolated_in(crate::sandbox::Microvms::new(Arc::new(kiln_seams::sandbox::SimSandbox::new()), images));
-            let placed = Spec { isolation: Some(super::super::session::Isolation::microvm()), claim: Some(balancers_claim()), engine_version: Some(0), ..no_harness(dir.path()) };
-            // The switch lands on the runner (`ServerMsg::RunnerEngine`) while the start is on its way.
-            engine::hold(Asked { engine: Some(Engine::Host), version: 1 });
-            let why = host.open(None, placed.clone()).err().map(|e| format!("{e:#}")).unwrap_or_default();
-            let started = host.inventory().sessions.len();
-            let decided_now = host.open(None, Spec { engine_version: Some(1), ..placed }).err().map(|e| format!("{e:#}")).unwrap_or_default();
-            engine::hold(Asked::default());
-            anyhow::ensure!(why.contains("set again (to host, setting 1)") && why.contains("placed under setting 0"), "refused, the engine named: {why}");
-            anyhow::ensure!(started == 0, "nothing placed before the switch started here");
-            anyhow::ensure!(!decided_now.contains("set again"), "one decided under the setting it holds passes: {decided_now}");
             Ok(())
         })
     }

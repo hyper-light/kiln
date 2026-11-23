@@ -382,10 +382,8 @@ const SERVER_SESSION_COMMANDS: &[&str] = &["HarnessOpen", "HarnessCmd", "Harness
 /// Its variants that what a session loop takes is judged by, ordered both ways against it: the handshake and what it
 /// says the server takes (a session's custody, its relays, its unread words), what the server kept of its sessions, a
 /// session's identity at an epoch and the work kiln handed it, how many sessions the machine runs at once; and the
-/// server's word of when to dial it again (its admission's turn, its drain's notice: docs/resilience.md R5); and
-/// the runner's engine as its owner set it, so a start decided under one setting comes after it and one decided
-/// under the next after that (kiln plan 01a1dd2e…, P2.3).
-const SERVER_BARRIERS: &[&str] = &["Welcome", "Refused", "Caps", "Kept", "Identity", "Custody", "AgentLimit", "Later", "Back", "RunnerEngine"];
+/// server's word of when to dial it again (its admission's turn, its drain's notice: docs/resilience.md R5).
+const SERVER_BARRIERS: &[&str] = &["Welcome", "Refused", "Caps", "Kept", "Identity", "Custody", "AgentLimit", "Later", "Back"];
 
 /// Its variants of a protocol of their own the link carries.
 const SERVER_CARRIED: &[&str] = &["Sync", "Observe", "Cluster", "Convo", "Reach", "ReachRefused", "PortData", "PortAck", "PortClose"];

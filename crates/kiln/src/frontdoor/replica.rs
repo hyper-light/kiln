@@ -980,11 +980,6 @@ impl LocalNode {
                 previous.insert(id.clone(), info);
             }
         }
-        let engine = crate::harness::engine::here();
-        if authority.is_none() && engine.engine.is_some_and(|e| e != crate::harness::engine::Engine::Host) {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, "the selected execution engine requires fleet placement".into()));
-        }
-        if authority.is_none() {spec.engine_version = Some(engine.version);}
         spec.launched = Some(spec.launched_level());
 
         let mut created_here = Vec::with_capacity(count);

@@ -1,7 +1,7 @@
 //! The installed Devin's and Antigravity's catalogs for the existing start dialog, before a person starts a session:
-//! asked of the harness installed on this machine only where its runner's sessions run on its host
-//! ([`sessions_on_host`]). On a runner whose sessions run in microVMs nothing of a harness runs on the host (kiln goal
-//! 3cd82843), and the catalog stays unknown until a session, in its microVM, tells it (`session`'s `note_models`).
+//! asked of the harness installed on this machine only where it holds no microVMs, so its sessions surely run on its
+//! host (`warm_models`). On a runner that holds them nothing of a harness is asked on the host (kiln goal 3cd82843),
+//! and the catalog stays unknown until a session tells it (`session`'s `note_models`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,18 +37,13 @@ impl Warmup {
     }
 }
 
-/// Whether a runner whose owner set its engine to `engine` (none: none set), its kiln carrying Shards or not
-/// (`carried`), surely runs its sessions on its host (`harness::engine`): its owner set `host`, or none was set and it
-/// can hold no microVMs. One that may run them in microVMs asks no harness on its host for anything.
-fn sessions_on_host(engine: Option<crate::harness::engine::Engine>) -> bool {
-    // None set: kiln carries Shards, so its sessions may run in microVMs.
-    matches!(engine, Some(crate::harness::engine::Engine::Host))
-}
-
+/// The catalogs of the harnesses installed on this machine's host, asked only where it holds no microVMs: there its
+/// sessions surely run on its host. One that holds them may run a session in one (the person's decision of 2026-11-23:
+/// each session chooses), and asks no harness on its host for anything (kiln goal 3cd82843): its catalog is unknown
+/// until a session tells it. Asked again at each listing of kinds (`kinds::offered`).
 #[cfg(not(test))]
 pub(super) fn warm_models() {
-    // Asked again at each listing of kinds (`kinds::offered`): a runner set to `host` later warms it then.
-    if !sessions_on_host(crate::harness::engine::here().engine) {
+    if crate::sandbox::microvm().is_some() {
         return;
     }
     warm_devin();
@@ -343,16 +338,6 @@ mod tests {
         assert_eq!(got, want);
         // Not signed in, it lists none.
         assert!(super::agy_catalog("Fetching available models...\nError: Please sign in to view available models. Launch the CLI without arguments to sign in.\n").is_empty());
-    }
-
-    /// kiln goal 3cd82843: on a runner whose sessions run in microVMs, no harness on its host is asked for its
-    /// catalog; only one set to `host`, or one that can hold no microVMs, asks its installed Devin.
-    #[test]
-    fn s35_a_microvm_runner_asks_no_harness_on_its_host_for_its_catalog() {
-        use crate::harness::engine::Engine;
-        assert!(!super::sessions_on_host(Some(Engine::Microvm)));
-        assert!(!super::sessions_on_host(None), "none set, its kiln carrying Shards: its sessions may run in microVMs");
-        assert!(super::sessions_on_host(Some(Engine::Host)));
     }
 
     use super::*;

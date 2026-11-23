@@ -246,7 +246,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentfiles.builds",
-            summary: "Where one of your Agentfiles' builds ahead of its sessions are (kiln plan 01a1dd2e… P4.5): saving it, or an agent definition that names it, builds it on each of your runners whose engine is microvm, for each of kiln's harnesses its sessions run (those it declares, and your agent definitions' that name it), as a session there builds it, so one started after its build is done builds nothing. Each: its `runner`, `harness`, the `version` it builds, its `state` (`queued`, `building`, `done` or `failed`), its `image` pinned by its digest once done, `why` it failed (Shards' words, or kiln's), and when it last changed (`at`, Unix ms).",
+            summary: "Where one of your Agentfiles' builds ahead of its sessions are (kiln plan 01a1dd2e… P4.5): saving it, or an agent definition that names it, builds it on each of your runners that can run microVMs, for each of kiln's harnesses its sessions run (those it declares, and your agent definitions' that name it), as a session there builds it, so one started after its build is done builds nothing. Each: its `runner`, `harness`, the `version` it builds, its `state` (`queued`, `building`, `done` or `failed`), its `image` pinned by its digest once done, `why` it failed (Shards' words, or kiln's), and when it last changed (`at`, Unix ms).",
             read_only: true,
             destructive: false,
             input: Input::of::<input::AgentfilesBuilds>(),
@@ -255,7 +255,7 @@ pub fn list_ops() -> Vec<Op> {
         },
         Op {
             name: "agentfiles.rebuild",
-            summary: "Build one of your Agentfiles again on one of your runners (kiln plan 01a1dd2e… P4.5): its builds there ahead of its sessions (each harness its sessions run, or `harness` alone), asked again as a save asks them, at its version now: `queued` (`failed` where its secrets can't be read) and sent to the runner, or asked as it comes back where it's away. One that failed is built again; one done is found in the runner's store at once. Answers its builds, as agentfiles.builds reads them. Refused, nothing asked: 404 where no runner of that name builds Agentfiles (outposts and one-job runners build none) or none of its sessions runs `harness`; 409 where the runner's engine isn't microvm, its kiln builds nothing ahead (upgrade it), or a build there is `queued` or `building` already, until its runner ends it; 403 where its person may not start agents there.",
+            summary: "Build one of your Agentfiles again on one of your runners (kiln plan 01a1dd2e… P4.5): its builds there ahead of its sessions (each harness its sessions run, or `harness` alone), asked again as a save asks them, at its version now: `queued` (`failed` where its secrets can't be read) and sent to the runner, or asked as it comes back where it's away. One that failed is built again; one done is found in the runner's store at once. Answers its builds, as agentfiles.builds reads them. Refused, nothing asked: 404 where no runner of that name builds Agentfiles (outposts and one-job runners build none) or none of its sessions runs `harness`; 409 where the runner can't run microVMs, its kiln builds nothing ahead (upgrade it), or a build there is `queued` or `building` already, until its runner ends it; 403 where its person may not start agents there.",
             read_only: false,
             destructive: false,
             input: Input::of::<input::AgentfilesRebuild>(),

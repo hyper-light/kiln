@@ -256,7 +256,8 @@ pub fn facts(kvm: bool) -> Facts {
 /// The isolation facts of a machine holding isolated agents in `held`, or in none. Held with the carried Shards
 /// ([`hold`]), they're what Shards' own check of this host says now (`shards_api::host_check`, Shards' D262: the check
 /// its VM process makes before it boots, made without booting one, by one launch of the carried `shards`), so a runner
-/// whose hypervisor can't run microVMs says so in Shards' words, and its engine is `host` (kiln plan 01a1dd2e…, P2.3).
+/// whose hypervisor can't run microVMs says so in Shards' words, and no session there runs in one (kiln plan
+/// 01a1dd2e…, P2.3).
 /// A stand-in's ([`Microvms::new`], [`held_in`] alone) carries no `shards` to ask. Held through Hex, they say whether its
 /// node lists the class its image VMs run as, as that node says at each probe ([`image_class`], P2.4). Blocking.
 pub fn facts_of(kvm: bool, held: Option<&Microvms>) -> Facts {
@@ -483,20 +484,20 @@ mod tests {
     /// Kiln plan 01a1dd2e…, P2.3 AC2: a machine holding microVMs with the carried Shards says what Shards' own check of
     /// its host says (`shards_api::host_check`): available where it runs them, its backend the hypervisor; else not,
     /// in Shards' words (`/dev/kvm` named where it's missing or this user can't open it, an Intel Mac's platform
-    /// named), and its engine is `host` with that why; not available either where Shards couldn't say, with its words.
+    /// named), and kiln reads it as a runner that can't run microVMs, with that why; not available either where Shards
+    /// couldn't say, with its words.
     #[test]
     fn p2_3_a_runner_says_what_shards_check_of_its_host_says() {
-        use crate::harness::engine::{Asked, capable, held};
-        use kiln_ci::facts::{Engine, RunnerFacts};
+        use crate::harness::engine::capable;
+        use kiln_ci::facts::RunnerFacts;
         use shards_api::{Backend, CheckRefusal, HostCheck, Unusable};
         let usable = super::checked(None, Ok(HostCheck::Usable(Backend::HypervisorFramework)));
         assert_eq!((usable.available, usable.hypervisor.as_deref(), usable.why_not.as_deref()), (true, Some("Hypervisor.framework"), None));
         for (why, says) in [(Unusable::KvmDenied, "cannot open /dev/kvm: permission denied"), (Unusable::KvmMissing, "/dev/kvm does not exist")] {
             let f = super::checked(None, Ok(HostCheck::Unusable { backend: Some(Backend::Kvm), why }));
             assert!(!f.available && f.hypervisor.is_none() && f.why_not.as_deref().is_some_and(|w| w.contains(says)), "{f:?}");
-            let runner = RunnerFacts { isolation: Some(f.clone()), ..RunnerFacts::default() };
-            let h = held(Asked::default(), &capable(&runner), &crate::harness::engine::containers(&runner));
-            assert_eq!((h.engine, h.why.as_deref()), (Engine::Host, f.why_not.as_deref()));
+            let can = capable(&RunnerFacts { isolation: Some(f.clone()), ..RunnerFacts::default() });
+            assert_eq!((can.usable, can.why.as_deref()), (false, f.why_not.as_deref()));
         }
         let intel = super::checked(None, Ok(HostCheck::Unusable { backend: None, why: Unusable::Unsupported { os: "macos".into(), arch: "x86_64".into() } }));
         assert!(!intel.available && intel.why_not.as_deref().is_some_and(|w| w.contains("macos/x86_64")), "{intel:?}");
