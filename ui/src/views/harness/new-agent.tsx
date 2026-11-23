@@ -427,7 +427,7 @@ function EngineRow({ c, s }: { c: Choices; s: Setup }) {
         <span className="mc-opt-key">Engine</span>
         <div className="mc-opt-val">
           <div className="mc-seg" role="radiogroup" aria-label="Engine">
-            <button type="button" role="radio" aria-checked={!af.chosen} onClick={() => keep(null)}>
+            <button type="button" role="radio" aria-checked={!af.chosen} onClick={() => af.chosen && keep(null)}>
               Host
             </button>
             <button

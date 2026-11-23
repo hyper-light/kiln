@@ -33,7 +33,8 @@ const cantWhy = (why: string | null) => why ?? "It can't run microVMs";
 export function AgentsCell({ facts }: { facts: RunnerFacts | null | undefined }) {
   const m = microvmsOf(facts);
   if (!m) return <span className="cell-dim">—</span>;
-  if (m.can) return <span className="rv-agents">host · microVM</span>;
+  // Its one break after the dot (a phone's cell wraps there rather than squeeze the runner's name).
+  if (m.can) return <span className="rv-agents">{"host\u00a0· microVM"}</span>;
   const why = cantWhy(m.why);
   return (
     <span className="rv-agents" title={why}>
