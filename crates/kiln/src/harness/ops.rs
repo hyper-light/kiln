@@ -1634,13 +1634,27 @@ pub mod input {
         Volume,
     }
 
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, JsonSchema)]
     #[serde(rename_all = "snake_case")]
     pub enum AgentsStartIsolation {
         None,
         Microvm,
         /// A pod of its own on kiln's Kubernetes engine (docs/agentic.md W10), its workspace held by the runner `on` names.
         Pod,
+    }
+
+    /// `none`, `microvm` or `pod`; `container` refused, typed: there is no container engine (the person's decision of
+    /// 2026-11-23, `crate::harness::engine::NoContainer`).
+    impl<'de> Deserialize<'de> for AgentsStartIsolation {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            match String::deserialize(d)?.as_str() {
+                "none" => Ok(AgentsStartIsolation::None),
+                "microvm" => Ok(AgentsStartIsolation::Microvm),
+                "pod" => Ok(AgentsStartIsolation::Pod),
+                crate::harness::engine::CONTAINER => Err(serde::de::Error::custom(crate::harness::engine::NoContainer)),
+                other => Err(serde::de::Error::unknown_variant(other, &["none", "microvm", "pod"])),
+            }
+        }
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

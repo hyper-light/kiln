@@ -1228,6 +1228,7 @@ pub fn isolation_for(asked: Option<&str>, image: Option<String>, parent: Option<
             (None, None) => None,
         },
         Some(Isolation::MICROVM) => Some(inherited.unwrap_or_else(Isolation::microvm)),
+        Some(crate::harness::engine::CONTAINER) => return Err(crate::harness::engine::NoContainer.to_string()),
         Some(other) => return Err(format!("`isolation` is \"none\" (a process on its machine) or \"microvm\" (a microVM of its own), not {other:?}")),
     };
     Ok(match image {
@@ -2387,7 +2388,8 @@ mod tests {
         assert_eq!(isolation_for(None, None, Some(&vm))?, Some(imaged.clone()));
         assert_eq!(isolation_for(Some(" microvm "), None, Some(&vm))?, Some(imaged));
         assert!(isolation_for(Some("none"), None, Some(&vm)).is_err(), "a process under an isolated agent is refused");
-        assert!(isolation_for(Some("container"), None, None).is_err(), "an isolation kiln doesn't know is refused");
+        assert!(isolation_for(Some("pod-of-my-own"), None, None).is_err(), "an isolation kiln doesn't know is refused");
+        assert_eq!(isolation_for(Some("container"), None, None), Err("there is no container engine".to_owned()), "a container, typed (the person's decision of 2026-11-23)");
         Ok(())
     }
 

@@ -212,6 +212,28 @@ fn p7_1_a_host_variant_of_a_definition_with_volumes_is_refused() -> anyhow::Resu
     })
 }
 
+/// The person's decision of 2026-11-23 ("there is no container engine yet"): a definition made or changed to run in a
+/// container, an experiment's variant that names one and a variant added later that does are refused, typed (400, there is
+/// no container engine), as they're read, and so is an agent started with `isolation` `container`.
+#[test]
+fn there_is_no_container_engine_for_a_definition_a_variant_or_a_start() -> anyhow::Result<()> {
+    crate::rt::block_on(async {
+        let hub = crate::hub::tests::scratch_hub_with(|_| {}).await?;
+        let ada = person("ada", "developer")?;
+        let call = |name: &'static str, input: Value| op(&hub, &ada, name, input);
+        let why = "there is no container engine";
+        refused(call("agentdefs.create", json!({"name": "boxed", "harness": "claude", "engine": "container"})).await, 400, why)?;
+        let def = s(&call("agentdefs.create", json!({"name": "boxed", "harness": "claude"})).await.map_err(failed)?, "/id");
+        refused(call("agentdefs.update", json!({"id": def, "engine": "container"})).await, 400, why)?;
+        refused(call("agentdefs.experiments.create", json!({"id": def, "name": "x", "variants": [vm(50, 2, 4), {"weight": 50, "engine": "container"}]})).await, 400, why)?;
+        let made = call("agentdefs.experiments.create", json!({"id": def, "name": "y", "variants": [vm(50, 2, 4), vm(50, 4, 8)]})).await.map_err(failed)?;
+        let e = s(&made, "/experiment/id");
+        refused(call("agentdefs.experiments.variants.add", json!({"id": def, "experiment": e, "engine": "container"})).await, 400, why)?;
+        refused(op(&hub, &Caller::owner(), "agents.start", json!({"kind": "claude", "isolation": "container"})).await, 400, why)?;
+        anyhow::Ok(())
+    })
+}
+
 /// P7.1's authz ("another person's experiment is invisible"): Bo lists none of Ada's, and reads, changes, deletes or
 /// starts none on her definition (each as no such definition); his own list is his alone. An admin reaches everyone's,
 /// as agent definitions are. Taking `super::reach`'s definition check out lets Bo change hers.

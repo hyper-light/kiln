@@ -7358,6 +7358,11 @@ async fn harness_open_body(hub:&Arc<Hub>,caller:Option<crate::authz::Caller>,key
     let request = key.as_deref().map(|key| start_digest(&caller.as_ref().map(crate::harness::ops::key_scope).unwrap_or_else(|| "admin".into()), key, false, &body))
         .transpose().map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     let mut body: HarnessOpen = serde_json::from_value(body).map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    // A container asked for, as an isolation's kind or a container of its own, is refused, typed: there is no container
+    // engine (the person's decision of 2026-11-23; `crate::harness::engine::NoContainer`).
+    if body.spec.container.is_some() || body.spec.isolation.as_ref().is_some_and(|i| i.kind.trim() == crate::harness::engine::CONTAINER) {
+        return Err(err(StatusCode::BAD_REQUEST, crate::harness::engine::NoContainer.to_string()));
+    }
     as_asked(&mut body.spec, caller.as_ref());
     body.spec.start_request=request;
     body.spec.start_key=key.map(|k|caller.as_ref().map_or_else(||k.clone(),|c|crate::harness::ops::start_key(c,&k)));
@@ -9345,6 +9350,22 @@ mod tests {
             // What the lean list left out of them, for the rows a page shows.
             assert_eq!(read("/api/harness/sessions?summaries=a,b,nobody,a").await?, json!({"a": "Done: the gate is green", "b": "And said so"}));
             assert_eq!(read("/api/harness/sessions?summaries=").await?, json!({}));
+            Ok(())
+        })
+    }
+
+    /// The person's decision of 2026-11-23 ("there is no container engine yet"): a start through the console's route
+    /// (`POST /api/harness/sessions`) that asks for a container, as its isolation's kind or a container of its own, is
+    /// refused, typed (400, there is no container engine), before anything is placed; nothing starts.
+    #[test]
+    fn a_start_that_asks_for_a_container_is_refused_typed() -> anyhow::Result<()> {
+        crate::rt::block_on(async {
+            let hub = crate::hub::tests::scratch_hub().await?;
+            for spec in [serde_json::json!({"kind": "claude", "isolation": {"kind": "container"}}), serde_json::json!({"kind": "claude", "container": {"image": "ghcr.io/org/agents:1"}})] {
+                let refused = harness_open_body(&hub, None, None, serde_json::json!({"target": "local", "spec": spec})).await.err().map(|ApiError(code, why)| (code, why));
+                anyhow::ensure!(refused == Some((StatusCode::BAD_REQUEST, "there is no container engine".to_owned())), "{spec}: {refused:?}");
+            }
+            anyhow::ensure!(hub.harness.list().is_empty(), "nothing started");
             Ok(())
         })
     }

@@ -392,13 +392,26 @@ pub mod input {
     use crate::agentdefs::volumes::Volume;
 
     /// Where an agent's sessions run.
-    #[derive(Debug, Deserialize, JsonSchema)]
+    #[derive(Debug, JsonSchema)]
     #[serde(rename_all = "lowercase")]
     pub enum Engine {
         /// Its harness a process of its machine's.
         Host,
         /// A microVM of its own, made from its Agentfile.
         Microvm,
+    }
+
+    /// `host` or `microvm`; `container` refused, typed: there is no container engine (the person's decision of
+    /// 2026-11-23, `crate::harness::engine::NoContainer`). A definition's and an experiment's variant's alike.
+    impl<'de> Deserialize<'de> for Engine {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            match String::deserialize(d)?.as_str() {
+                "host" => Ok(Engine::Host),
+                "microvm" => Ok(Engine::Microvm),
+                crate::harness::engine::CONTAINER => Err(serde::de::Error::custom(crate::harness::engine::NoContainer)),
+                other => Err(serde::de::Error::unknown_variant(other, &["host", "microvm"])),
+            }
+        }
     }
 
     #[derive(Debug, Deserialize, JsonSchema)]

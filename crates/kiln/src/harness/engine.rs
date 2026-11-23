@@ -47,6 +47,25 @@ pub fn as_capable(facts: &mut RunnerFacts) {
     }
 }
 
+/// What a request names to ask for a container: an engine's word (an agent definition's, an experiment's variant's) or a
+/// session's isolation's kind.
+pub const CONTAINER: &str = "container";
+
+/// Why a request that asks for a container is refused (the person's decision of 2026-11-23: "there is no container
+/// engine yet"): a session runs on its machine's host or in a microVM, and nothing else. Typed, so each edge where a
+/// request can still name one says it alike: an agent definition's or an experiment's variant's `engine`, `agents.start`'s
+/// `isolation`, and a start's `spec.isolation.kind` or `spec.container` (`POST /api/harness/sessions`, 400).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoContainer;
+
+impl std::fmt::Display for NoContainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("there is no container engine")
+    }
+}
+
+impl std::error::Error for NoContainer {}
+
 /// Whether a runner's Hex node lists the class image VMs run as (Hex's `shards-image`, P2.2), as its
 /// facts say (`isolation.image_class`, which its runner reads from its node: `crate::sandbox::facts_of`).
 /// A runner that can run microVMs but whose node lists none is refused a session that asks for one, in Hex's words.
