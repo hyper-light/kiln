@@ -25,7 +25,7 @@ import type { Workspace } from "./Workspace";
 /**
  * A session as lists show it.
  */
-export type AgentInfo = { recovery?: unknown, 
+export type AgentInfo = { 
 /**
  * Omitted detail fields in the owner's bounded control projection.
  */

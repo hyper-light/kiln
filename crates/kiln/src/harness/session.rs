@@ -726,7 +726,7 @@ pub struct Info {
     #[cfg_attr(test, ts(skip))]
     pub start_request: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(test, ts(optional, type = "unknown"))]
+    #[cfg_attr(test, ts(skip))]
     pub recovery: Option<Box<RecoverySettings>>,
     /// Omitted detail fields in the owner's bounded control projection.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
