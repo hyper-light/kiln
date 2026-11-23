@@ -426,8 +426,6 @@ fn lab(runner: Option<&str>) -> anyhow::Result<()> {
                 Ok(list.iter().any(|x| x.get("name").and_then(Value::as_str) == Some(key.as_str()) && x.get("connected").and_then(Value::as_bool) == Some(true)))
             })
             .map_err(|e| anyhow::anyhow!("{e:#}\nthe runner's log:\n{}", std::fs::read_to_string(dir.path().join("runner.log")).unwrap_or_default()))?;
-            // Its sessions on its host, where the stand-in is.
-            common::agents::on_host(port, &admin, name, &dir.path().join("runner-state"), Duration::from_secs(90))?;
             (format!("agent:{key}"), Some(r))
         }
     };

@@ -591,7 +591,7 @@ impl Lab {
         for i in 0..lab.nodes.len() {
             let n = lab.node(i)?;
             let log = lab.fleet.root.path().join(format!("{}.log", n.name));
-            common::agents::connected_as_is(lab.fleet.http, &lab.fleet.admin, n.name, &log, WITHIN).map_err(|e| anyhow::anyhow!("{e:#}\n{}", lab.remote_logs()))?;
+            common::agents::connected(lab.fleet.http, &lab.fleet.admin, n.name, &log, WITHIN).map_err(|e| anyhow::anyhow!("{e:#}\n{}", lab.remote_logs()))?;
             lab.until_joined(i)?;
             lab.on_host(i)?;
         }
@@ -703,22 +703,12 @@ impl Lab {
         }
     }
 
-    /// Runner `i` set as kiln's e2e fixture sets its runner (`vm_e2e::up_own`, `slates_e2e`'s fixture): its agents on
-    /// its host (engine `host`), and its headroom off, so a machine others keep busy doesn't hold its agents' turns.
+    /// Runner `i` set as kiln's e2e fixture sets its runner (`vm_e2e::up_own`, `slates_e2e`'s fixture): its headroom off,
+    /// so a machine others keep busy doesn't hold its agents' turns. Its agents ask for no microVM, so each runs on its
+    /// host.
     fn on_host(&self, i: usize) -> anyhow::Result<()> {
         let n = self.node(i)?;
-        common::agents::headroom_off(self.fleet.http, &self.fleet.admin, n.name, WITHIN)?;
-        let path = format!("/api/runners/{}/engine", n.machine);
-        let began = Instant::now();
-        loop {
-            let (code, body) = common::http(self.fleet.http, "PUT", &path, &self.fleet.admin, Some(&json!({"engine": "host"})))?;
-            let now = self.get(&path).unwrap_or(Value::Null);
-            if code == 200 && now.pointer("/isolation/engine").and_then(Value::as_str) == Some("host") {
-                return Ok(());
-            }
-            anyhow::ensure!(began.elapsed() < WITHIN, "{}'s engine never became host: {code} {body}; {now}", n.name);
-            std::thread::sleep(LOOK);
-        }
+        common::agents::headroom_off(self.fleet.http, &self.fleet.admin, n.name, WITHIN)
     }
 
     /// The first runner's node counts three members.

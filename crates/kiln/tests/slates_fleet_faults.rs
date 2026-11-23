@@ -220,30 +220,10 @@ impl Lab {
         Ok(lab)
     }
 
-    /// Every runner's engine set to its host, and waited for until kiln's facts of it say so (as `vm_e2e::set_engine`
-    /// does): the flows' agent works as a process on its runner in the runner's own workspace volume, which a move takes
-    /// (W7); an isolated agent's microVM is its machine's, and kiln refuses to move it.
+    /// Every runner ready for the flows' agent, which asks for no microVM, so it works as a process on its runner in the
+    /// runner's own workspace volume, which a move takes (W7); an isolated agent's microVM is its machine's, and kiln
+    /// refuses to move it.
     fn on_hosts(&self) -> anyhow::Result<()> {
-        for n in &self.nodes {
-            let began = Instant::now();
-            loop {
-                let (code, body) = self.fleet.request("PUT", &format!("/api/runners/{}/engine", n.machine), Some(&json!({"engine": "host"})))?;
-                if code == 200 {
-                    break;
-                }
-                anyhow::ensure!(began.elapsed() < WITHIN, "{}'s engine set to host: {code} {}", n.name, String::from_utf8_lossy(&body));
-                std::thread::sleep(LOOK);
-            }
-            loop {
-                let engine = self.fleet.call("GET", &format!("/api/runners/{}/engine", n.machine), None)?;
-                if engine.pointer("/isolation/engine").and_then(Value::as_str) == Some("host") {
-                    break;
-                }
-                anyhow::ensure!(began.elapsed() < WITHIN, "{} never held engine host: {engine}", n.name);
-                std::thread::sleep(LOOK);
-            }
-        }
-        eprintln!("PROVEN: every runner's engine is its host");
         // Each runner's headroom judgement off (as `vm_e2e`'s runners have it): on a loaded host kiln's balancer counts the
         // lab's runner under strain and queues its agent for room that never comes (adacachy, 2026-11-20: a move-cut
         // flow's start stayed queued past 900 s).

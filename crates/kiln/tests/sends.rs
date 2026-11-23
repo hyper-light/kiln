@@ -101,8 +101,6 @@ fn a_message_sent_twice_under_one_key_through_a_runner_reaches_its_agent_once() 
         let (_, runners) = api("GET", "/api/agents", None)?;
         Ok(runners.as_array().into_iter().flatten().any(|r| r.get("name") == Some(&json!(common::machine("t3-runner"))) && r.get("connected") == Some(&json!(true))))
     })?;
-    // Its sessions on its host, where the stand-in is.
-    common::agents::on_host(server.port, &server.admin, "t3-runner", &state, Duration::from_secs(90))?;
     // An agent on it, its harness running there.
     let cwd = dir.path().join("agent");
     std::fs::create_dir_all(&cwd)?;

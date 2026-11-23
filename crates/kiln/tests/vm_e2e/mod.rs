@@ -790,11 +790,9 @@ pub fn isolation_required() -> bool {
 /// own words where it gives them (`facts.isolation.why_not`, kiln plan step 17's `RunnerFacts`).
 pub fn skip_reason(machine: &str, says: Option<bool>, why_not: Option<&str>) -> String {
     match (says, why_not) {
-        (Some(true), _) => format!("{machine} starts microVMs"),
-        (Some(false), Some(why)) => format!("SKIP: {machine} holds no isolated agents: {why}"),
-        (Some(false), None) => format!(
-            "SKIP: {machine} starts no microVMs (facts.virt.microvm is false) and says no why, its engine microvm"
-        ),
+        (Some(true), _) => format!("{machine} can run microVMs"),
+        (Some(false), Some(why)) => format!("SKIP: {machine} can't run microVMs: {why}"),
+        (Some(false), None) => format!("SKIP: {machine} can't run microVMs (facts.virt.microvm is false) and says no why"),
         (None, _) => format!("SKIP: {machine} hasn't said whether it starts microVMs (no facts yet)"),
     }
 }
@@ -1258,47 +1256,11 @@ fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The gate: whether the fixture's runner starts microVMs, its owner having set its engine to
-/// `microvm`, as a person enables them: a runner holds `host` until its owner does (the person's
-/// ruling, 2026-11-21). Ok(false) after saying why it skips, in kiln's words where it refuses
-/// `microvm` to a runner that can't hold microVMs; an error where `VM_E2E=1` requires it.
+/// The gate: whether the fixture's runner can run microVMs now, as its facts say ([`microvms_of`]: `facts.virt.microvm`,
+/// what it can do, since each session chooses its engine: the person's decision of 2026-11-23). Ok(false) after saying
+/// why it skips, in the runner's own words (`facts.isolation.why_not`); an error where `VM_E2E=1` requires it.
 pub fn isolation_ready(f: &Fixture) -> anyhow::Result<bool> {
-    let facts = || {
-        setup_on(f, &format!("{}'s facts on microVMs", f.machine), || {
-            let (code, body) = common::http(f.port, "GET", "/api/reach/runners", &f.admin, None)?;
-            if code != 200 {
-                return Ok(server_said(code, &body));
-            }
-            let reach: Value = serde_json::from_str(&body)?;
-            let entry = reach.get("runners").and_then(Value::as_array).and_then(|rs| rs.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(f.machine.as_str())));
-            Ok(microvms_said(entry))
-        })
-    };
-    // Its facts first: kiln refuses `microvm` to a runner that hasn't said yet whether it can hold
-    // microVMs.
-    let (mut says, mut why_not) = facts()?;
-    if !says {
-        let path = format!("/api/runners/{}/engine", f.machine);
-        let refused = setup_on(f, &format!("{}'s engine set to microvm", f.machine), || {
-            let (code, body) = common::http(f.port, "PUT", &path, &f.admin, Some(&json!({"engine": "microvm"})))?;
-            Ok(match code {
-                200 => Setup::Ready(None),
-                // kiln's word that this runner can't hold microVMs now, and why.
-                409 => Setup::Ready(Some(serde_json::from_str::<Value>(&body).ok().and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned)).unwrap_or(body))),
-                _ => server_said(code, &body),
-            })
-        })?;
-        match refused {
-            Some(why) => (says, why_not) = (false, Some(why)),
-            None => {
-                setup_on(f, &format!("{} holding engine microvm", f.machine), || {
-                    let v = engine_of(f, &f.machine)?;
-                    Ok(if v.pointer("/isolation/engine").and_then(Value::as_str) == Some("microvm") { Setup::Ready(()) } else { Setup::Wait })
-                })?;
-                (says, why_not) = facts()?;
-            }
-        }
-    }
+    let (says, why_not) = microvms_of(f, &f.machine)?;
     if says {
         return Ok(true);
     }
@@ -1306,6 +1268,20 @@ pub fn isolation_ready(f: &Fixture) -> anyhow::Result<bool> {
     anyhow::ensure!(!isolation_required(), "{why} (VM_E2E=1 requires microVMs here)");
     eprintln!("{why}");
     Ok(false)
+}
+
+/// What runner `machine`'s facts say of microVMs once they've come (`GET /api/reach/runners`, [`microvms_said`]):
+/// whether it can run them now (`facts.virt.microvm`), and why not (`facts.isolation.why_not`).
+pub fn microvms_of(f: &Fixture, machine: &str) -> anyhow::Result<(bool, Option<String>)> {
+    setup_on(f, &format!("{machine}'s facts on microVMs"), || {
+        let (code, body) = common::http(f.port, "GET", "/api/reach/runners", &f.admin, None)?;
+        if code != 200 {
+            return Ok(server_said(code, &body));
+        }
+        let reach: Value = serde_json::from_str(&body)?;
+        let entry = reach.get("runners").and_then(Value::as_array).and_then(|rs| rs.iter().find(|r| r.get("name").and_then(Value::as_str) == Some(machine)));
+        Ok(microvms_said(entry))
+    })
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2682,15 +2658,9 @@ pub fn in_microvm(f: &Fixture, kind: &str, image: &str, project: &str, mcp: bool
 #[cfg(unix)]
 pub fn host_fixture(dir: &Path) -> anyhow::Result<Fixture> {
     let stub = stub_host_env(dir)?;
-    let f = up(dir, "box", &stub.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
-    // Its sessions as processes on this host: a runner of a kiln carrying Shards runs them in microVMs
-    // unless its engine is set to host (kiln plan 01a1dd2e…, P2.3), as here. ROOT's runner
-    // (`VM_E2E_SERVER`) is left as ROOT set it.
-    if f._server.is_some() {
-        let machine = f.machine.clone();
-        set_engine(&f, &machine, "host")?;
-    }
-    Ok(f)
+    // Its sessions ask for no microVM, so each runs as a process on this host (the person's decision of 2026-11-23:
+    // each session chooses its engine, a runner has none).
+    up(dir, "box", &stub.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())
 }
 
 /// A runner's environment with the stand-in under each harness's name and no real harness, under `dir`:
@@ -2748,23 +2718,14 @@ pub fn stub_python() -> anyhow::Result<PathBuf> {
     anyhow::bail!("the stand-in harness is a Python script, and no Python 3 answers here (py -3, python, python3)")
 }
 
-/// Runner `machine`'s engine as kiln says it (`GET /api/runners/:name/engine`; kiln plan 01a1dd2e…, P2.3).
-pub fn engine_of(f: &Fixture, machine: &str) -> anyhow::Result<Value> {
-    f.get(&format!("/api/runners/{machine}/engine"))
-}
-
-/// Sets runner `machine`'s engine (`host`, `microvm`) and waits until the facts kiln has of it say so:
-/// its view then.
-pub fn set_engine(f: &Fixture, machine: &str, engine: &str) -> anyhow::Result<Value> {
-    let path = format!("/api/runners/{machine}/engine");
-    setup_on(f, &format!("{machine}'s engine set to {engine}"), || {
-        let (code, body) = common::http(f.port, "PUT", &path, &f.admin, Some(&json!({"engine": engine})))?;
-        Ok(if code == 200 { Setup::Ready(()) } else { server_said(code, &body) })
-    })?;
-    setup_on(f, &format!("{machine} holding engine {engine}"), || {
-        let v = engine_of(f, machine)?;
-        Ok(if v.pointer("/isolation/engine").and_then(Value::as_str) == Some(engine) { Setup::Ready(v) } else { Setup::Wait })
-    })
+/// [`another_runner`], unable to run microVMs whatever its host: a file stands where its kiln writes the Shards it carries
+/// out (`<state>/shards`, `kiln::shards::write_out`), so it holds none and its facts say it can't, and why
+/// (`isolation.why_not`), as a runner on a host whose hypervisor Shards can't use says.
+pub fn runner_without_microvms(f: &Fixture, name: &str, env: &[(&str, &str)]) -> anyhow::Result<Runner> {
+    let state = own_state(&f.dir, name);
+    std::fs::create_dir_all(&state)?;
+    std::fs::write(state.join("shards"), "not a folder: this runner writes no Shards out, so it runs no microVMs")?;
+    another_runner(f, name, env)
 }
 
 /// A second runner `name` of the fixture's own server, connected: held while it's kept.

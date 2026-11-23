@@ -66,8 +66,6 @@ fn a_sessions_updates_survive_a_cut_link() -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "the runner never connected: {body}\n{}\n{}", runner_log(), s.log());
         std::thread::sleep(Duration::from_millis(300));
     }
-    // Its sessions on its host, where the stand-in is.
-    agents::on_host(s.port, &s.admin, "wire-runner", &dir.path().join("wire-runner-state"), Duration::from_secs(120))?;
 
     // A session there, streaming through the cuts. It's opened just after the runner connects
     // again: opening isn't on the channel yet (plan step 3), so a cut as it goes would lose it.

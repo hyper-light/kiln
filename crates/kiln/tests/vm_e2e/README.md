@@ -56,11 +56,10 @@ cargo test -p kiln --test vm_harnesses stub::     # Linux, macOS (python3)
 cargo test -p kiln --test vm_harnesses host::     # Linux, macOS (python3): Claude Code and Codex through kiln
 ```
 
-Each microVM test first sets its runner's engine to `microvm`, as its owner enables it (a runner
-holds `host` until its owner does: the person's ruling, 2026-11-21). `step34::` skips, in kiln's
-words, where kiln refuses that to a runner that can't hold microVMs (its `PUT
-/api/runners/:name/engine` answer), or in the runner's own (`facts.isolation.why_not`) where it says
-it starts none all the same (`facts.virt.microvm`). From kiln's own
+Each microVM test asks for a microVM in its session's own start: the engine is each session's choice,
+never its runner's (the person's decision of 2026-11-23). It first reads whether its runner can run
+microVMs now (`facts.virt.microvm`), and where it can't, `step34::` skips in the runner's own words
+(`facts.isolation.why_not`); `VM_E2E=1` makes that a failure. From kiln's own
 image for a harness (`harness-<kind>`: the vendor's CLI) it then skips until ROOT gives a real task,
 every one of the five `VM_E2E_*` words below (`untasked`): the stand-in's words never go to a model.
 

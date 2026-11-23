@@ -34,9 +34,7 @@ fn a_runner_from_before_the_channel_connects_and_runs_agents() -> anyhow::Result
     let dir = tempfile::tempdir()?;
     let s = common::start_env(dir.path(), &Options { agent: false, ci: "", extra: "" }, false, &[])?;
     let (_runner, log) = agents::runner(dir.path(), s.port, "old", Some("old"), Talk { lines: LINES, every_ms: 10 })?;
-    // Its engine left as it is: a runner that says nothing past `Build`'s 32 bits names no features, so it is never
-    // sent one (`agents::on_host` would wait for it to keep one).
-    agents::connected_as_is(s.port, &s.admin, "old", &log, Duration::from_secs(120))?;
+    agents::connected(s.port, &s.admin, "old", &log, Duration::from_secs(120))?;
     let work = dir.path().join("work");
     std::fs::create_dir_all(&work)?;
     let (controls, messages) = (work.join(".fake-claude-controls"), work.join(".fake-claude-messages"));

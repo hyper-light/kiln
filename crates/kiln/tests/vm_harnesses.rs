@@ -1510,12 +1510,11 @@ mod host {
 }
 
 // =================================================================================================
-// A runner's engine on a runner that holds microVMs (kiln plan 01a1dd2e…, P2.3 and P2.4): a kiln
-// carrying Shards. Skipped, in the runner's own words, where it holds none; ROOT runs them (a runner
-// that holds none is `runner_engine.rs`'s). Its sessions are the stand-in's: in a microVM from the
-// stand-in's Agentfile, on the host behind each harness's name. No vendor's CLI runs, and no prompt
-// goes to one. On every host OS kiln runs microVMs on: HVF, KVM and WHP (vm_e2e::stub_host_env's
-// Windows form puts the stand-in on the host there).
+// Each session's engine (the person's decision of 2026-11-23: each session chooses it, a runner has none), on runners
+// that can run microVMs: a kiln carrying Shards. Skipped, in the runner's own words, where it can't; ROOT runs them.
+// Their sessions are the stand-in's: in a microVM from the stand-in's Agentfile, on the host behind each harness's name.
+// No vendor's CLI runs, and no prompt goes to one. On every host OS kiln runs microVMs on: HVF, KVM and WHP
+// (vm_e2e::stub_host_env's Windows form puts the stand-in on the host there).
 // =================================================================================================
 mod engine {
     use serde_json::{Value, json};
@@ -1557,62 +1556,64 @@ mod engine {
         Ok(())
     }
 
-    /// P2.3's first and second tests, and AC3: a runner whose owner set it to `microvm` (an option
-    /// its owner enables: `host` until then, the person's ruling of 2026-11-21) reports `microvm`
-    /// from the server; its owner switches it to `host`: the session in a microVM there goes on (`draining`
-    /// 1), answering its next turn in its microVM, the next that asks nothing starts on its host with no
-    /// microVM, and one that needs a microVM is refused, the engine named. Its setting taken away, it's `host` again, the default.
-    /// The microVM session answers a turn there before the switch too, so a harness that never ran in its
-    /// microVM fails here, in kiln's words on it, before anything is switched.
+    /// Host session `id`'s opening turn answered on its runner's host: its harness said where it ran, the host's own
+    /// kernel and no guest's, and kiln says it runs on its host, with no microVM.
+    fn answered_on_its_host(f: &vm_e2e::Fixture, pace: &mut vm_e2e::Pace, id: &str, what: &str) -> anyhow::Result<()> {
+        let (info, events) = pace.until(f, id, vm_e2e::Asked::Opening, what, |_, e| vm_e2e::said_marker(&vm_e2e::said(e), vm_e2e::STUB_DONE))?;
+        let said = vm_e2e::where_said(&vm_e2e::said(&events));
+        anyhow::ensure!(said.is_some() && vm_e2e::check_in_guest(said.as_ref(), std::env::consts::OS, vm_e2e::host_boot_id().as_deref()).is_err(), "{what}: it said it ran in a guest, or said nothing of where: {said:?}");
+        anyhow::ensure!(info.pointer("/runs/in") == Some(&json!("host")) && info.get("isolation").is_none_or(Value::is_null), "{what}: kiln says it runs {}", info.get("runs").unwrap_or(&Value::Null));
+        Ok(())
+    }
+
+    /// The person's decision of 2026-11-23, on one runner that can run microVMs: a session that asks for a microVM
+    /// answers its turn in its microVM; the next, asking for none, answers its turn on the runner's host with no
+    /// microVM; and the first answers again in its microVM beside it. Nothing of the runner is set between them. The
+    /// microVM session answers first, so a harness that never ran in its microVM fails here, in kiln's words on it.
     #[test]
-    fn p2_3_a_runner_its_owner_set_to_microvm_holds_it_and_a_switch_to_host_starts_the_next_on_its_host() -> anyhow::Result<()> {
+    fn a_session_runs_in_a_microvm_where_it_asks_for_one_and_on_its_host_where_it_asks_for_none() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let stub = vm_e2e::stub_host_env(dir.path())?;
         let f = vm_e2e::up_own(dir.path(), "vm", &stub.iter().map(|(k, v)| (*k, v.as_str())).collect::<Vec<_>>())?;
         if !vm_e2e::isolation_ready(&f)? {
             return Ok(());
         }
-        let v = vm_e2e::engine_of(&f, &f.machine)?;
-        anyhow::ensure!(v.get("engine") == Some(&json!("microvm")) && v.get("from") == Some(&json!("server")) && v.pointer("/virt/microvm") == Some(&json!(true)), "a runner its owner set to microvm runs microvm: {v}");
         let project = vm_e2e::project(dir.path())?;
         let kept = vm_e2e::keep_stub(&f, "claude")?;
         let image = format!("agentfile:{}", kept.id);
         let vm = vm_e2e::open(&f, &json!({"kind": "claude", "cwd": project, "prompt": "do the task", "isolation": {"kind": "microvm", "image": image}}))?;
         let mut pace = vm_e2e::Pace::default();
         answered_in_its_microvm(&f, &mut pace, &vm, None, "the microVM one's first turn")?;
-
-        let v = vm_e2e::set_engine(&f, &f.machine, "host")?;
-        anyhow::ensure!(v.get("engine") == Some(&json!("host")) && v.get("from") == Some(&json!("server")) && v.get("draining") == Some(&json!(1)), "switched, the microVM one draining: {v}");
-        let next = vm_e2e::open(&f, &json!({"kind": "claude", "cwd": project}))?;
-        anyhow::ensure!(runs_in(&f, &next)? == "host" && vm_e2e::info(&f, &next)?.get("isolation").is_none_or(Value::is_null), "the next on its host: {}", vm_e2e::info(&f, &next)?);
-        let body = json!({"target": format!("agent:{}", f.machine), "spec": {"kind": "claude", "cwd": project, "isolation": {"kind": "microvm", "image": image}}});
-        let (code, said) = crate::common::http_within(f.port, "POST", "/api/harness/sessions", &f.admin, Some(&body), std::time::Duration::from_secs(75))?;
-        anyhow::ensure!(code >= 400 && said.contains("its engine is host"), "a microVM refused on it: {code} {said}");
-        answered_in_its_microvm(&f, &mut pace, &vm, Some("after-the-switch"), "the microVM one goes on, draining")?;
-        for id in [&next, &vm] {
+        let host = vm_e2e::open(&f, &json!({"kind": "claude", "cwd": project, "prompt": "do the task"}))?;
+        answered_on_its_host(&f, &mut pace, &host, "the one that asks for no microVM")?;
+        anyhow::ensure!(runs_in(&f, &host)? == "host", "the one that asks for no microVM, on its host: {}", vm_e2e::info(&f, &host)?);
+        answered_in_its_microvm(&f, &mut pace, &vm, Some("beside-the-host-one"), "the microVM one, beside the one on the host")?;
+        for id in [&host, &vm] {
             let _ = crate::common::http(f.port, "DELETE", &format!("/api/harness/agents/{id}"), &f.admin, None);
         }
-        let (code, _) = crate::common::http(f.port, "PUT", &format!("/api/runners/{}/engine", f.machine), &f.admin, Some(&json!({"engine": null})))?;
-        let v = vm_e2e::engine_of(&f, &f.machine)?;
-        anyhow::ensure!(code == 200 && v.get("engine") == Some(&json!("host")) && v.get("from") == Some(&json!("default")), "its setting taken away, host by default: {code} {v}");
         Ok(())
     }
 
-    /// P2.4's first test: with two runners, one set to `host` and one `microvm`, every agent that needs
-    /// a microVM, placed by need, lands on the `microvm` one.
+    /// The person's decision of 2026-11-23, with two runners, one that can run microVMs and one that can't (a file
+    /// stands where its kiln writes Shards out: `vm_e2e::runner_without_microvms`), each saying so in its facts: every
+    /// agent that asks for a microVM, placed by what it needs, lands on the one that can; one asked of the one that
+    /// can't is refused there, typed (409), in its words.
     #[test]
-    fn p2_4_every_microvm_session_lands_on_the_microvm_runner() -> anyhow::Result<()> {
+    fn every_microvm_session_lands_on_the_runner_that_can_run_microvms() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let f = vm_e2e::up_own(dir.path(), "vm", &[])?;
         if !vm_e2e::isolation_ready(&f)? {
             return Ok(());
         }
-        let _plain = vm_e2e::another_runner(&f, "plain", &[])?;
+        let _plain = vm_e2e::runner_without_microvms(&f, "plain", &[])?;
         let plain = crate::common::machine("plain");
-        vm_e2e::set_engine(&f, &plain, "host")?;
+        let (can, why) = vm_e2e::microvms_of(&f, &plain)?;
+        let why = why.unwrap_or_default();
+        anyhow::ensure!(!can && !why.is_empty(), "the runner without microVMs says it can't, and why: {can} {why:?}");
         let project = vm_e2e::project(dir.path())?;
         let kept = vm_e2e::keep_stub(&f, "claude")?;
-        let ask = json!({"kind": "claude", "cwd": project, "image": format!("agentfile:{}", kept.id), "count": 3});
+        let image = format!("agentfile:{}", kept.id);
+        let ask = json!({"kind": "claude", "cwd": project, "image": image, "count": 3});
         let (code, body) = crate::common::http_within(f.port, "POST", "/api/harness/agents", &f.admin, Some(&ask), std::time::Duration::from_secs(600))?;
         anyhow::ensure!(code == 200, "{code} {body}\n{}", f.runner_log());
         let started: Value = serde_json::from_str(&body)?;
@@ -1621,9 +1622,12 @@ mod engine {
         for a in &agents {
             let id = a.get("id").and_then(Value::as_str).unwrap_or_default();
             let info = vm_e2e::info(&f, id)?;
-            anyhow::ensure!(info.get("target") == Some(&json!(format!("agent:{}", f.machine))), "on the microvm runner: {info}");
+            anyhow::ensure!(info.get("target") == Some(&json!(format!("agent:{}", f.machine))), "on the runner that can run microVMs: {info}");
             let _ = crate::common::http(f.port, "DELETE", &format!("/api/harness/agents/{id}"), &f.admin, None);
         }
+        let on_plain = json!({"kind": "claude", "cwd": project, "image": image, "on": plain});
+        let (code, said) = crate::common::http_within(f.port, "POST", "/api/harness/agents", &f.admin, Some(&on_plain), std::time::Duration::from_secs(120))?;
+        anyhow::ensure!(code == 409 && said.contains("can't run microVMs: ") && said.contains(&why), "one asked of the runner that can't: {code} {said}");
         Ok(())
     }
 }

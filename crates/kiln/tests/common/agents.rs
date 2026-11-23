@@ -131,47 +131,10 @@ pub fn path_without_harnesses(_dir: &Path) -> anyhow::Result<String> {
     Ok(std::env::join_paths(kept)?.to_string_lossy().into_owned())
 }
 
-/// Waits until the server lists runner `name` connected ([`connected_as_is`]), then sets its engine to `host`
-/// ([`on_host`]): the stand-in harness these helpers put on its PATH is its host's. Its state folder is
-/// `<name>-state` beside its log, `<name>.log`, as [`runner_env`] starts it.
+/// Waits until the server lists runner `name` connected, known by its machine id ([`super::machine`]). A session that
+/// asks for no microVM runs on its host, where the stand-in harness these helpers put on its PATH is (the person's
+/// decision of 2026-11-23: each session chooses its engine, a runner has none).
 pub fn connected(port: u16, admin: &str, name: &str, log: &Path, within: Duration) -> anyhow::Result<()> {
-    connected_as_is(port, admin, name, log, within)?;
-    on_host(port, admin, name, &log.with_file_name(format!("{name}-state")), within)
-}
-
-/// Sets runner `name`'s engine to `host` (docs/isolation.md, "A runner's engine"), and waits until the runner
-/// keeps that setting in its state folder `state`, so each start placed from then on is a process of its host's. A
-/// runner whose machine holds microVMs (its kiln carries Shards, and Shards' check of the host passes, as on a KVM
-/// host) otherwise runs a session that asks nothing in a microVM of its own (the person's decision 3), where the
-/// stand-in harness isn't. Already set, it's left as it is: each setting is a version of its own, and the runner
-/// refuses a start placed under another.
-pub fn on_host(port: u16, admin: &str, name: &str, state: &Path, within: Duration) -> anyhow::Result<()> {
-    let path = format!("/api/runners/{}/engine", super::machine(name));
-    let (st, body) = super::http(port, "GET", &path, admin, None)?;
-    anyhow::ensure!(st == 200, "{name}'s engine: {st} {body}");
-    let mut view: Value = serde_json::from_str(&body).unwrap_or_default();
-    if view.get("asked") != Some(&json!("host")) {
-        let (st, body) = super::http(port, "PUT", &path, admin, Some(&json!({ "engine": "host" })))?;
-        anyhow::ensure!(st == 200, "{name}'s engine set to host: {st} {body}");
-        view = serde_json::from_str(&body).unwrap_or_default();
-    }
-    let version = view.get("version").cloned().unwrap_or_default();
-    let kept = state.join("runner-engine.json");
-    let deadline = Instant::now() + within;
-    loop {
-        let text = std::fs::read_to_string(&kept).unwrap_or_default();
-        let held: Value = serde_json::from_str(&text).unwrap_or_default();
-        if held.get("engine") == Some(&json!("host")) && held.get("version") == Some(&version) {
-            return Ok(());
-        }
-        anyhow::ensure!(Instant::now() < deadline, "{name} never kept its engine host, setting {version} ({}: {text:?})", kept.display());
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Waits until the server lists runner `name` connected, known by its machine id ([`super::machine`]), its engine
-/// left as it is.
-pub fn connected_as_is(port: u16, admin: &str, name: &str, log: &Path, within: Duration) -> anyhow::Result<()> {
     let key = super::machine(name);
     let deadline = Instant::now() + within;
     loop {
