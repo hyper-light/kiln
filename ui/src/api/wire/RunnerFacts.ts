@@ -71,7 +71,7 @@ kiln: KilnFacts | null,
  */
 workspaces: Workspaces | null,
 /**
- * Whether it holds isolated agents in microVMs of their own, on what, and why not (kiln plan
+ * Whether it can run microVMs now, on what, and why not (kiln plan
  * 01a1cd8e862e7169a074db3d5fa33f3d step 17): [`Virt::microvm`] is its `available`. Absent from a
  * runner from before it.
  */
