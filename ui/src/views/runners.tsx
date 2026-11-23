@@ -50,8 +50,8 @@ import { limitLine, parseLimit, settable, standing, withEvent } from "./agent-li
 import { refusedLately, refusedLine } from "./refused";
 import { useClock } from "./harness/dom";
 import { ImagesPanel, PoolsPanel, poolsRes, imagesRes } from "./runners-pools";
-import { EngineBlock, EngineCell, MicrovmsSection, RunnerNow } from "./runners-microvms";
-import { runnerEngineRes, runnerVmsRes } from "@/api/microvms";
+import { AgentsCell, AgentsLine, MicrovmsSection, RunnerNow } from "./runners-microvms";
+import { runnerVmsRes } from "@/api/microvms";
 import { keptAt, noPoolsLine, poolAgent, poolHits, poolSize, poolUntil } from "./warm-pools";
 import { useAuth } from "@/lib/auth";
 
@@ -134,7 +134,7 @@ function RunnersBody() {
   // All of it asked for at once, the open runner's microVMs and the CI panels below too: each read
   // would otherwise wait for the one before it, and the page move as each came. Whole: each runner's
   // row and its detail show its facts (its executors, its hardware).
-  warm(agentsWholeRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes, poolsRes, imagesRes, ...(selected ? [runnerVmsRes(selected), runnerEngineRes(selected)] : []));
+  warm(agentsWholeRes, historyRes, joinRequestsRes, discoveryRes, updatesRes, frontDoorsRes, poolsRes, imagesRes, ...(selected ? [runnerVmsRes(selected)] : []));
   const agents = useAgentsWholeLive();
   const history = useMetricsHistory().data;
   const joinRequests = useRes(joinRequestsRes).data;
@@ -144,7 +144,7 @@ function RunnersBody() {
   const [chosen, setChosen] = React.useState<Chosen>({});
 
   const openAgent = (name: string | null) => {
-    if (name) warm(runnerVmsRes(name), runnerEngineRes(name));
+    if (name) warm(runnerVmsRes(name));
     const n = new URLSearchParams(params);
     if (name) n.set("agent", name);
     else n.delete("agent");
@@ -331,7 +331,7 @@ function RunnersBody() {
                         </span>
                       </td>
                       <td>
-                        <EngineCell facts={a.facts} />
+                        <AgentsCell facts={a.facts} />
                       </td>
                       {/* What it can run legs in, as it last probed (W21-R08). */}
                       <td className="cell-mono hidden whitespace-nowrap lg:table-cell">{a.facts ? Object.keys(a.facts.executors).join(", ") || "—" : "—"}</td>
@@ -435,8 +435,8 @@ function RunnersHead() {
         <th className="w-6" aria-label="State" />
         <th>Runner</th>
         <th className="hidden md:table-cell">Labels</th>
-        {/* Two things that both say "host": where agents' sessions run, and how CI's jobs run. */}
-        <th title="Where agents' sessions run here: in Shards microVMs, or on the host">Agents in</th>
+        {/* Two things that both say "host": what agents' sessions can run in, and how CI's jobs run. */}
+        <th title="What agents can run in here">Agents</th>
         <th className="hidden lg:table-cell" title="How CI jobs run here: kiln's executors (host, docker, shards, k8s)">
           CI in
         </th>
@@ -564,7 +564,7 @@ function AgentDetails({
   onTerminal: () => void;
 }) {
   const [forgetting, setForgetting] = React.useState(false);
-  // Those who manage runners switch an engine and release pools; others see them, disabled, with why.
+  // Those who manage runners release pools; others see them, disabled, with why.
   const can = useAuth((s) => (s.kind === "authed" ? s.me?.can : undefined));
   const manage = !can || can["runners.manage"] === "server";
   const samples = useAgentHistory(agent.name);
@@ -616,9 +616,7 @@ function AgentDetails({
         )}
       </div>
       <RunnerName agent={agent} onRename={onRename} />
-      <Loadable label={`${shown}'s engine`} fallback={<Hold height={64} />}>
-        <EngineBlock name={agent.name} manage={manage} />
-      </Loadable>
+      <AgentsLine facts={agent.facts} />
       {staleWhy(agent) && <p className="mt-3 text-[12.5px] text-[#c8cad0]">{staleWhy(agent)}</p>}
       {forgetting && (
         <Confirm
@@ -669,7 +667,7 @@ function AgentDetails({
       </div>
 
       <Loadable label={`${shown}'s microVMs`} fallback={<Hold height={160} />}>
-        <MicrovmsSection name={agent.name} manage={manage} />
+        <MicrovmsSection name={agent.name} manage={manage} can={agent.facts?.virt.microvm ?? false} />
       </Loadable>
 
       {agent.facts?.virt.microvm && (
@@ -890,7 +888,7 @@ function RunnerFactsList({ facts }: { facts: RunnerFacts }) {
     { label: "Processor", value: `${facts.cpu.model ?? "—"} · ${facts.cpu.cores} cores, ${facts.cpu.threads} threads` },
     ...(facts.gpus.length > 0 ? [{ label: "GPU", value: facts.gpus.map((g) => [g.model, g.memory > 0 && formatBytes(g.memory)].filter(Boolean).join(" · ")).join(", ") }] : []),
     { label: "Virtualization", value: [facts.virt.kvm && "KVM", facts.virt.nested && "nested", facts.virt.hvf && "Hypervisor.framework"].filter(Boolean).join(", ") || "none" },
-    // How CI jobs run here (an agent's session runs in the engine above, "Agents in").
+    // How CI jobs run here (what agents can run in is above, "Agents").
     { label: "CI in", value: executors.join(", ") },
     {
       label: "Tools",

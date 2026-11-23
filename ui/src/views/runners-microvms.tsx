@@ -1,25 +1,23 @@
 /**
- * A runner's engine and its microVMs on the Runners page (kiln plan 01a1cd8e862e7169a074db3d5fa33f3d,
- * P2.3, P3.2): the table's "Agents in" cell, from its facts; in a runner's details, its engine as the
- * server says it (`GET|PUT /api/runners/:name/engine`: switched by those who manage runners, what runs
- * on the other engine finishing there), and then the microVMs it runs, each with its controls, its
- * warm pools and the images built there.
+ * What a runner's agents can run in and its microVMs, on the Runners page (kiln plan
+ * 01a1cd8e862e7169a074db3d5fa33f3d, P3.2): the table's Agents cell and a line in a runner's details,
+ * from its facts (each session picks Host or microVM as it starts: the person's decision, 2026-11-23),
+ * then the microVMs it runs, each with its controls, its warm pools and the images built there.
  */
 import * as React from "react";
 import { Ban, ChartLine, Hammer, Pause, Play, RotateCcw, Square, Trash2, X, Check } from "lucide-react";
-import { engineApi, engineOf, runnerEngineRes, runnerVmsRes, sandboxApi, type Engine, type MicroVm, type RunnerImage, type WarmPool } from "@/api/microvms";
-import type { HostSample } from "@/api/wire";
+import { microvmsOf, runnerVmsRes, sandboxApi, type MicroVm, type RunnerImage, type WarmPool } from "@/api/microvms";
+import type { HostSample, RunnerFacts } from "@/api/wire";
 import { Button } from "@/components/ui/button";
-import { Confirm, Meter, Sparkline } from "@/components/ui/misc";
+import { Meter, Sparkline } from "@/components/ui/misc";
 import { StatusDot } from "@/components/ui/status";
-import { Segmented } from "@/components/ui/tabs";
 import { toast } from "@/components/ui/toast";
 import { useRes } from "@/lib/data";
 import { formatBytes } from "@/lib/format";
 import { errorMessage } from "@/lib/hooks";
 import { Link } from "@/lib/router";
 import { LimitMeter } from "./harness/limits";
-import { ENGINE_ICON, ENGINE_PLACE, ENGINE_WORD, START, StartMark, WarmDots } from "./sandbox-marks";
+import { EngineBadge, START, StartMark, WarmDots } from "./sandbox-marks";
 import "./runners-microvms.css";
 
 const VM_STATUS: Record<MicroVm["state"], string> = { running: "running", idle: "succeeded", paused: "queued", failed: "failed", draining: "timed_out" };
@@ -28,25 +26,35 @@ const ago = (s: number) => (s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}
 const G = 2 ** 30;
 const gib = (n: number) => Math.round((n / G) * 100) / 100;
 
-/** The table's cell, from its facts: its engine as an icon and a word; one that can't run microVMs carries ⊘, its reason in the tooltip; a runner from before engines, none. */
-export function EngineCell({ facts }: { facts: Parameters<typeof engineOf>[0] }) {
-  const e = engineOf(facts);
-  if (!e)
-    return (
-      <span className="cell-dim" title="Its runner says nothing of microVMs: its kiln is from before them">
-        —
-      </span>
-    );
-  const Icon = ENGINE_ICON[e.engine];
+/** Why a runner runs no microVMs, as its facts say, else that it can't. */
+const cantWhy = (why: string | null) => why ?? "It can't run microVMs";
+
+/** The table's Agents cell, from its facts: "host · microVM" where it runs microVMs, else "host" and ⊘, why in its title; a runner without facts, none. */
+export function AgentsCell({ facts }: { facts: RunnerFacts | null | undefined }) {
+  const m = microvmsOf(facts);
+  if (!m) return <span className="cell-dim">—</span>;
+  if (m.can) return <span className="rv-agents">host · microVM</span>;
+  const why = cantWhy(m.why);
   return (
-    <span
-      className="rv-engine"
-      title={e.why ?? (e.engine === "microvm" ? `In microVMs (${facts?.isolation?.hypervisor ?? "its hypervisor"})` : e.engine === "container" ? "In containers on their workspaces" : "On the host")}
-    >
-      <Icon size={13} aria-hidden="true" />
-      <span className="rv-engine-word">{e.engine}</span>
-      {!e.can && <Ban size={12} className="rv-ban" role="img" aria-label={e.why ?? "Can't run microVMs"} />}
+    <span className="rv-agents" title={why}>
+      host
+      <Ban size={12} className="rv-ban" role="img" aria-label={why} />
     </span>
+  );
+}
+
+/** In a runner's details, what its agents can run in: Host, and microVM, struck through with why where it can't. */
+export function AgentsLine({ facts }: { facts: RunnerFacts | null | undefined }) {
+  const m = microvmsOf(facts);
+  if (!m) return null;
+  const why = cantWhy(m.why);
+  return (
+    <div className="rv-agents-line" role="group" aria-label="Agents">
+      <span className="label">Agents</span>
+      <EngineBadge word="Host" />
+      <EngineBadge word="microVM" off={!m.can} title={m.can ? (m.hypervisor ?? undefined) : why} />
+      {!m.can && <span className="rv-agents-why">{why}</span>}
+    </div>
   );
 }
 
@@ -79,193 +87,13 @@ export function RunnerNow({ name, sample }: { name: string; sample: HostSample |
   );
 }
 
-/**
- * A runner's engine, in its details, as the server says it: the switch (those who manage runners;
- * microvm only where it can hold them), its checks (its facts' microVM, its isolation, whether it can
- * hold microVMs now), where its engine comes from, and its sessions still on the other engine, which
- * finish there: listed in place, ended now (destructive, confirmed inline), or kept by taking the switch
- * back (`runners.engine.end_draining`, `runners.engine.cancel`).
- */
-export function EngineBlock({ name, manage }: { name: string; manage: boolean }) {
-  const res = useRes(runnerEngineRes(name));
-  const e = res.data;
-  const [asking, setAsking] = React.useState<Engine | null>(null);
-  const [sending, setSending] = React.useState(false);
-  const [drains, setDrains] = React.useState(false);
-  const [ending, setEnding] = React.useState(false);
-  if (!e.engine) return null;
-  const drained = (call: Promise<typeof e>, said: (v: typeof e) => string, failed: string) => {
-    setSending(true);
-    call
-      .then((next) => {
-        res.setData(() => next);
-        setEnding(false);
-        toast({ title: said(next), tone: "info" });
-      })
-      .catch((err: unknown) => toast.error(failed, errorMessage(err)))
-      .finally(() => setSending(false));
-  };
-  const endNow = () => drained(engineApi.endDraining(name), (v) => `Ended ${(v as typeof v & { ended?: string[] }).ended?.length ?? 0}`, "Couldn't end them");
-  const undo = () => drained(engineApi.cancel(name), (v) => `Back on ${v.engine ? ENGINE_PLACE[v.engine] : "what it can do"}`, "Couldn't take the switch back");
-  const can = e.microvm?.usable ?? false;
-  const boxes = e.container?.usable ?? false;
-  const send = (engine: Engine | null) => {
-    setSending(true);
-    engineApi
-      .set(name, engine)
-      .then((next) => {
-        res.setData(() => next);
-        setAsking(null);
-        toast({ title: engine ? `Its new sessions run in ${ENGINE_PLACE[engine]}` : "Its engine is what it can do", tone: "info" });
-      })
-      .catch((err: unknown) => toast.error("Couldn't set its engine", errorMessage(err)))
-      .finally(() => setSending(false));
-  };
-  const checks: [string, string, string][] = [
-    ["microVM", e.virt?.microvm ? "succeeded" : "skipped", e.virt?.microvm ? "virt.microvm: yes" : "virt.microvm: no (its engine is host)"],
-    [
-      "Isolation",
-      e.isolation?.available ? "succeeded" : "failed",
-      e.isolation?.available ? `isolation.available: yes · ${e.isolation.hypervisor ?? ""}` : `isolation.why_not: ${e.isolation?.why_not ?? "not said"}`,
-    ],
-    ["Can hold", can ? "succeeded" : "failed", can ? "It can hold agents in microVMs now" : (e.microvm?.why ?? "It can't hold agents in microVMs")],
-  ];
-  return (
-    <section className="rv-block" aria-label="Engine">
-      <div className="rv-head">
-        <span className="label" title="Where agents' sessions run here (CI's jobs run on its executors: the facts' CI in)">
-          Agents in
-        </span>
-        <Segmented
-          size="xs"
-          label={`Engine of ${name}`}
-          value={e.engine}
-          pending={sending ? (asking ?? null) : null}
-          onChange={(v) => v !== e.engine && setAsking(v)}
-          options={(["microvm", "host", "container"] as Engine[]).map((x) => {
-            const Icon = ENGINE_ICON[x];
-            const unable = (x === "microvm" && !can) || (x === "container" && !boxes);
-            const why = x === "microvm" ? e.microvm?.why : x === "container" ? (e.container?.why ?? "Its runner doesn't say whether its agents can run in containers") : null;
-            return {
-              value: x,
-              disabled: !manage || unable,
-              title: !manage ? "Only those who manage runners set its engine" : unable ? (why ?? undefined) : undefined,
-              label: (
-                <>
-                  <Icon size={13} aria-hidden="true" />
-                  {ENGINE_WORD[x]}
-                </>
-              ),
-            };
-          })}
-        />
-        <span className="rv-checks">
-          {checks.map(([word, status, tip]) => (
-            <span key={word} title={tip}>
-              <StatusDot status={status} title={tip} />
-              {word}
-            </span>
-          ))}
-        </span>
-        <span className="rv-default" title={e.from === "server" ? "Its owner set it on the server" : "Nothing set: host. microvm is its owner's to set"}>
-          {e.from === "server" ? "set" : "default"}
-          {e.draining > 0 && (
-            <button
-              type="button"
-              className="rv-override rv-drain-toggle"
-              aria-expanded={drains}
-              onClick={() => setDrains((o) => !o)}
-              title={`${e.draining} of its sessions run on the other engine, and finish there`}
-            >
-              {e.draining} draining
-            </button>
-          )}
-          {e.asked && manage && (
-            <button type="button" className="ms-link" disabled={sending} onClick={() => send(null)} title="Take what was set away: what it can do decides">
-              use default
-            </button>
-          )}
-        </span>
-      </div>
-      {e.why && <p className="rv-why">{e.why}</p>}
-      {drains && e.draining_sessions.length > 0 && (
-        <div className="rv-drains">
-          <ul aria-label="Draining">
-            {e.draining_sessions.map((d) => {
-              const Icon = ENGINE_ICON[d.engine];
-              return (
-                <li key={d.id}>
-                  <StatusDot status={d.state === "working" ? "running" : "queued"} title={d.state} />
-                  <Link to={`/agents/${encodeURIComponent(d.id)}`}>{d.name}</Link>
-                  <span className="rv-drain-kind">{d.kind}</span>
-                  <Icon size={12} aria-label={d.engine} />
-                </li>
-              );
-            })}
-          </ul>
-          {manage && (
-            <span className="rv-drain-acts">
-              <Button size="xs" variant="ghost" disabled={sending} onClick={() => setEnding(true)} title="End each now, rather than letting it finish where it runs">
-                <Square size={12} aria-hidden="true" />
-                End now
-              </Button>
-              {e.switch && (
-                <Button size="xs" variant="ghost" disabled={sending} onClick={undo} title="Put back the engine it had: these run on it again">
-                  <RotateCcw size={12} aria-hidden="true" />
-                  Undo switch
-                </Button>
-              )}
-            </span>
-          )}
-        </div>
-      )}
-      {ending && (
-        <Confirm
-          label={`End ${e.draining_sessions.length} now`}
-          actions={
-            <>
-              <Button size="xs" pending={sending} onClick={endNow}>
-                End them
-              </Button>
-              <Button size="xs" variant="ghost" onClick={() => setEnding(false)}>
-                Keep
-              </Button>
-            </>
-          }
-        >
-          <p>Each ends for good; its changes stay on disk.</p>
-        </Confirm>
-      )}
-      {asking && (
-        <Confirm
-          label={`Run its new sessions in ${ENGINE_PLACE[asking]}`}
-          actions={
-            <>
-              <Button size="xs" pending={sending} onClick={() => send(asking)}>
-                {e.sessions > 0 ? "Switch, they finish" : "Switch"}
-              </Button>
-              <Button size="xs" variant="ghost" onClick={() => setAsking(null)}>
-                Cancel
-              </Button>
-            </>
-          }
-        >
-          <p>{e.sessions > 0 ? `Its ${e.sessions} running finish on ${e.engine}.` : `New sessions on ${asking}.`}</p>
-        </Confirm>
-      )}
-    </section>
-  );
-}
-
-/** What a runner's microVMs hold: its room, then each microVM, its warm pools and the images built there. */
-export function MicrovmsSection({ name, manage }: { name: string; manage: boolean }) {
-  const e = useRes(runnerEngineRes(name)).data;
+/** What a runner's microVMs hold: its room, then each microVM, its warm pools and the images built there. `can`: it runs microVMs now, as its facts say. */
+export function MicrovmsSection({ name, manage, can }: { name: string; manage: boolean; can: boolean }) {
   const res = useRes(runnerVmsRes(name));
   const r = res.data;
   // One microVM's telemetry open at a time (kiln's principle 1).
   const [chart, setChart] = React.useState<string | null>(null);
   const [building, setBuilding] = React.useState(false);
-  const can = e.microvm?.usable ?? false;
   if (!can && r.vms.length === 0 && r.images.length === 0) return null;
   const warm = r.pools.reduce((a, p) => a + p.warm, 0);
   const bound = r.pools.reduce((a, p) => a + p.bound, 0);
