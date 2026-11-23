@@ -14,9 +14,9 @@ import "./definition.css";
  * and its variant as its swatch; pressed, the Engine tab, where they are (in a microVM: a session on bare
  * metal has no Engine tab, so its crumb only says). A session started from no definition shows nothing here.
  */
-export function DefCrumb({ agentId, target, onOpen }: { agentId: string; target: string; onOpen: () => void }) {
+export function DefCrumb({ agentId, isolation, onOpen }: { agentId: string; isolation?: string; onOpen: () => void }) {
   const defs = useRes(agentdefsRes).data;
-  const engine = useEngineOf(agentId, target);
+  const engine = useEngineOf(agentId, isolation);
   const d = defs.find((x) => x.sessions.some((s) => s.id === agentId));
   if (!d) return null;
   const mine = d.sessions.find((s) => s.id === agentId)!;

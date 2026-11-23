@@ -155,8 +155,9 @@ export function Inspector({
   // At work now: its turn runs, or subagents it sent off still work (as Mission control has it); the goal under way shimmers.
   const working = useSession(store, (s) => workingNow(s.info, s.state, kiln));
   const meta = useSession(store, (s) => s.meta);
-  // Where it runs: every session has the Engine tab (its sandboxes in a microVM only, inside it).
+  // Where it runs: every session has the Engine tab (its sandboxes in a microVM only, inside it, as its start chose).
   const target = useSession(store, (s) => s.info?.target);
+  const isolation = useSession(store, (s) => s.info?.isolation?.kind);
   // What one who changed its files did alone: its session answers, or its events show it edit by edit.
   const answers = meta?.features.includes("own_edits") ?? false;
   const own = React.useMemo<OwnSource>(
@@ -226,7 +227,7 @@ export function Inspector({
           )}
           {tab === "engine" && agentId && (
             <Loadable label="Loading its engine" fallback={<Hold label="Loading its engine" />}>
-              <EngineTab agentId={agentId} target={target ?? ""} />
+              <EngineTab agentId={agentId} target={target ?? ""} isolation={isolation} />
             </Loadable>
           )}
         </div>

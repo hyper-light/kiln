@@ -50,7 +50,7 @@ export function MicroVmRows({ a, list }: { a: AgentInfo; list: readonly AgentInf
 }
 
 function MicroVmRowsRead({ a, list }: { a: AgentInfo; list: readonly AgentInfo[] }) {
-  const engine = useEngineOf(a.id, a.target);
+  const engine = useEngineOf(a.id, a.isolation?.kind);
   const d = sessionDefOf(useRes(agentdefsRes).data, a);
   if (engine !== "microvm") return null;
   return (

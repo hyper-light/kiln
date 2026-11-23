@@ -253,7 +253,7 @@ export function AgentHeader({
         )}
         {info && (
           <React.Suspense fallback={null}>
-            <DefCrumb agentId={info.id} target={info.target} onOpen={() => onDefinition?.()} />
+            <DefCrumb agentId={info.id} isolation={info.isolation?.kind} onOpen={() => onDefinition?.()} />
           </React.Suspense>
         )}
       </p>

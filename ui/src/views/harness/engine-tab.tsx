@@ -33,9 +33,9 @@ import { EngineVm, useSandboxed, WORD } from "./engine-rows";
 import { Fold } from "./fold";
 import { useAgentList } from "./use-agents";
 
-export function EngineTab({ agentId, target }: { agentId: string; target: string }) {
+export function EngineTab({ agentId, target, isolation }: { agentId: string; target: string; isolation?: string }) {
   // Its sandboxes only in a microVM: one on bare metal has none.
-  const engine = useEngineOf(agentId, target);
+  const engine = useEngineOf(agentId, isolation);
   return (
     <div className="in-secs at">
       {engine === "microvm" && (

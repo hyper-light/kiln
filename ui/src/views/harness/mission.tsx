@@ -469,7 +469,7 @@ const Row = React.memo(function Row({
       <span className="ms-meta">
         {/* Where it runs: its engine, its runner, how it started; then when it was last at work, and its harness. */}
         <span className="ms-where">
-          <SandboxLine id={a.id} target={a.target} />
+          <SandboxLine id={a.id} target={a.target} isolation={a.isolation?.kind} />
         </span>
         <span className="ms-meta-2">
           {activityAt(a) > 0 && <Ago className="ms-time" ts={Math.floor(activityAt(a) / 1000)} />}

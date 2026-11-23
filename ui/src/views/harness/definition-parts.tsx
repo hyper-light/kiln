@@ -8,9 +8,9 @@ import * as React from "react";
 import { ChevronRight } from "lucide-react";
 import { variantIn, type AgentDef } from "@/api/agentdefs";
 import { sandboxesRes, type SandboxBrief } from "@/api/microvms";
-import { agentsRes, labelOf, useRes } from "@/lib/data";
+import { labelOf, useRes } from "@/lib/data";
 import { EngineGlyph, StartMark } from "@/views/sandbox-marks";
-import { leanEngine } from "./engine-of";
+import { startedIn } from "./engine-of";
 import { variantName, variantTone } from "./variants";
 import "./mission.css";
 import "./definition.css";
@@ -36,23 +36,22 @@ export function sessionVariant(d: AgentDef | undefined, id: string, names?: Read
   return at ? { tone: variantTone(at.i, at.e.variants.length), name: variantName(at.e.variants, at.i, names) } : null;
 }
 
-/** A session's sandbox in short: its engine, its runner, how it started. */
-export function SandboxLine({ id, target }: { id: string; target: string }) {
+/** A session's sandbox in short: its engine, its runner, how it started. `isolation`: its isolation's kind, none for a process. */
+export function SandboxLine({ id, target, isolation }: { id: string; target: string; isolation?: string }) {
   return (
     <React.Suspense fallback={<span>{labelOf(target.replace(/^agent:/, ""))}</span>}>
-      <SandboxLineRead id={id} target={target} />
+      <SandboxLineRead id={id} target={target} isolation={isolation} />
     </React.Suspense>
   );
 }
-function SandboxLineRead({ id, target }: { id: string; target: string }) {
+function SandboxLineRead({ id, target, isolation }: { id: string; target: string; isolation?: string }) {
   const b: SandboxBrief | undefined = useRes(sandboxesRes).data[id];
   const machine = target.replace(/^agent:/, "");
-  // A session the sandboxes don't list yet (just started): where it runs, from its machine's facts.
-  const engine = leanEngine(useRes(agentsRes).data.find((r) => r.name === machine)?.facts);
+  // A session the sandboxes don't list yet (just started): where it runs, as its start chose.
   if (!b)
     return (
       <span className="df-sandbox">
-        {engine && <EngineGlyph engine={engine} />}
+        <EngineGlyph engine={startedIn(isolation)} />
         <span className="df-runner">{labelOf(machine)}</span>
       </span>
     );

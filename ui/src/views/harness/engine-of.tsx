@@ -3,26 +3,17 @@
  * has sandboxes, settings and experiments to show: its Mission row's groups after its subagents, and the
  * Sandboxes section of agent chat's Engine tab (which every session has).
  */
-import * as React from "react";
 import { sandboxesRes, type Engine } from "@/api/microvms";
-import { agentsRes, useRes } from "@/lib/data";
+import { useRes } from "@/lib/data";
 
 /**
- * A runner's engine as its lean facts say it (the runners' list carries `virt` alone): kiln writes
- * `virt.microvm` only on a runner whose engine is `microvm` (harness/engine.rs `overlay`), so it's `host`
- * otherwise; none from a runner before facts.
+ * Where a session runs as its start chose (the person's decision, 2026-11-23: Host or microVM is each
+ * session's, never its runner's), from its isolation's kind (`AgentInfo.isolation.kind`): in a microVM of
+ * its own where it's isolated in one, else on its machine's host.
  */
-export const leanEngine = (facts: { virt?: { microvm: boolean } } | undefined): Engine | null => (facts?.virt ? (facts.virt.microvm ? "microvm" : "host") : null);
+export const startedIn = (isolation: string | undefined): Engine => (isolation === "microvm" ? "microvm" : "host");
 
-/** Its sandbox's engine, else (none listed yet: just started) its runner's. */
-export function useEngineOf(id: string, target: string): Engine | null {
-  const brief = useRes(sandboxesRes).data[id];
-  const machine = target.replace(/^agent:/, "");
-  const facts = useRes(agentsRes).data.find((r) => r.name === machine)?.facts;
-  return brief?.engine ?? leanEngine(facts);
-}
-
-/** What only a session in a microVM shows. */
-export function OnMicroVm({ id, target, children }: { id: string; target: string; children: React.ReactNode }) {
-  return useEngineOf(id, target) === "microvm" ? children : null;
+/** Its sandbox's engine, else (none listed yet: just started) what its start chose. */
+export function useEngineOf(id: string, isolation: string | undefined): Engine {
+  return useRes(sandboxesRes).data[id]?.engine ?? startedIn(isolation);
 }
