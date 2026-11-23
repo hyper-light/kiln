@@ -1,7 +1,7 @@
 //! The installed Devin's and Antigravity's catalogs for the existing start dialog, before a person starts a session:
-//! asked of the harness installed on this machine only where it holds no microVMs, so its sessions surely run on its
-//! host (`warm_models`). On a runner that holds them nothing of a harness is asked on the host (kiln goal 3cd82843),
-//! and the catalog stays unknown until a session tells it (`session`'s `note_models`).
+//! asked of the harness installed on this machine's host, on every runner (`warm_models`): a session that asks for no
+//! microVM runs there, the default everywhere (the person's decision of 2026-11-23). A session in a microVM tells its
+//! own as it runs (`session`'s `note_models`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,15 +37,12 @@ impl Warmup {
     }
 }
 
-/// The catalogs of the harnesses installed on this machine's host, asked only where it holds no microVMs: there its
-/// sessions surely run on its host. One that holds them may run a session in one (the person's decision of 2026-11-23:
-/// each session chooses), and asks no harness on its host for anything (kiln goal 3cd82843): its catalog is unknown
-/// until a session tells it. Asked again at each listing of kinds (`kinds::offered`).
+/// The catalogs of the harnesses installed on this machine's host, on every runner, whether or not it holds microVMs: a
+/// session that asks for no microVM runs on its machine's host, the default everywhere (the person's decision of
+/// 2026-11-23: each session chooses its engine), so host sessions happen on every runner. A session in a microVM says
+/// its own catalog as it runs. Asked at each listing of kinds (`kinds::offered`).
 #[cfg(not(test))]
 pub(super) fn warm_models() {
-    if crate::sandbox::microvm().is_some() {
-        return;
-    }
     warm_devin();
     warm_agy();
 }

@@ -145,7 +145,7 @@ What a session does to its harness maps onto the member:
 | stop | SIGTERM to its group, SIGKILL after its grace | `Run::signal(Terminate)`, TERM to its member alone over its run's agent-control endpoint (Hex's `Runtime::signal_member`, Shards' D238); its kill (the microVM's stop) after its grace |
 | kill | SIGKILL | the microVM's stop |
 | its CLI's own answers (its models, its version, an MCP server added or removed) | its CLI run on the host (`Effect::Run`) | never run on the host: its version is its image's pin where it boots kiln's image for its harness, anything else refused in words (`session::in_microvm_alone`; kiln goal 3cd82843, r734) |
-| its kind's catalog for the start dialog (Devin's models) | asked of the Devin installed on the host, where the runner holds no microVMs (`acp::catalog::warm_models`) | not asked on a runner that holds microVMs: unknown until a session tells it |
+| its kind's catalog for the start dialog (Devin's models) | asked of the Devin installed on the host, on every runner (`acp::catalog::warm_models`) | its own, as its session tells it |
 
 ## Refused, rather than done another way
 
