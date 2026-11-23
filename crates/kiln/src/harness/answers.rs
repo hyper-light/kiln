@@ -17,6 +17,12 @@
 //! The owner also keeps where a message routed to a runner went ([`Routed`]; docs/sends.md, "Routed to its
 //! session"), with its wait and only while it's waited on: a forward of it from that runner reads it there,
 //! asked as a message too, and it goes as its wait does.
+//!
+//! And it keeps the requests a message sent straight to a runner waits on ([`Answers::request`]): that runner's
+//! receipt comes back as a frame of its own on the hub's loop, which finds the request by its id. A request goes to
+//! the owner before its message does, and the receipt comes back after that message went, so the owner has the
+//! request before the receipt; a receipt is taken only from the runner the request went to, for its session; a request
+//! given up goes with its guard ([`RouteGuard`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,21 +61,28 @@ enum Ask {
     Route { key: Key, routed: Option<Routed> },
     /// Where the message waited on went, as kept: told to the end given.
     WentTo { key: Key, tx: oneshot::Sender<Option<Routed>> },
+    /// A message sent straight to `peer`'s session `session` waits for that runner's receipt, by its id: the end it
+    /// goes to.
+    Request { id: String, peer: String, session: String, tx: oneshot::Sender<crate::reach::wire::P2pSendReply> },
+    /// A runner's receipt for request `id`: taken only from the runner it went to, for its session.
+    Receipt { id: String, peer: String, session: String, reply: crate::reach::wire::P2pSendReply },
+    /// Request `id` was given up.
+    Unrequest { id: String },
     /// How many wait now, the owner's count (a test's).
     #[cfg(test)]
     Held(oneshot::Sender<usize>),
+    /// How many requests wait for receipts now (a test's).
+    #[cfg(test)]
+    RequestsHeld(oneshot::Sender<usize>),
 }
 
 /// The waits, as the registry holds them: what reaches their owner, and their count.
-type Requests = parking_lot::Mutex<std::collections::HashMap<String, (String, String, oneshot::Sender<crate::reach::wire::P2pSendReply>)>>;
-
 pub struct Answers {
     tx: crate::memory::queue::Sender<Ask>,
     /// The messages waited on, as the owner keeps them, and the waits on their way to it: what the bound
     /// counts.
     counted: Arc<AtomicUsize>,
     most: usize,
-    routed: Arc<Requests>,
 }
 
 impl Answers {
@@ -82,7 +95,7 @@ impl Answers {
         // (`crate::rt::spawn_spread_joined`, goal 9's rule); it ends as the registry goes, its queue's senders
         // with it. Its handle isn't needed: dropped, the task goes on.
         drop(crate::rt::spawn_spread_joined(own(rx, Arc::clone(&counted))));
-        Self { tx, counted, most, routed: Default::default() }
+        Self { tx, counted, most }
     }
 
     /// Waits for the answer to message `message` sent to session `id`: none when too many wait already, once
@@ -135,18 +148,24 @@ impl Answers {
         rx.await.ok().flatten()
     }
 
+    /// A message about to go straight to `peer`'s session `session` waits for that runner's receipt: its id (to send
+    /// with it), held until the guard goes, and the end the receipt comes to. Asked before the message goes, so its
+    /// owner has it before the receipt can come. None when too many wait already, or the owner is gone.
     pub fn request(&self, peer: &str, session: &str) -> Option<(RouteGuard, oneshot::Receiver<crate::reach::wire::P2pSendReply>)> {
         if !self.count() { return None; }
         let (tx, rx) = oneshot::channel();
         let id = crate::util::new_id();
-        self.routed.lock().insert(id.clone(), (peer.into(), session.into(), tx));
-        Some((RouteGuard { id, requests: self.routed.clone(), counted: self.counted.clone() }, rx))
+        if self.tx.try_send(Ask::Request { id: id.clone(), peer: peer.into(), session: session.into(), tx }).is_err() {
+            uncount(&self.counted, 1);
+            return None;
+        }
+        Some((RouteGuard { id, asks: self.tx.clone(), counted: self.counted.clone() }, rx))
     }
 
+    /// Runner `peer`'s receipt `reply` for request `id`, about its session `session`: it reaches the request if it's
+    /// still waited on and went to that runner's session.
     pub fn complete(&self, peer: &str, session: &str, id: &str, reply: crate::reach::wire::P2pSendReply) {
-        let mut requests = self.routed.lock();
-        if requests.get(id).is_some_and(|(p, s, _)| p == peer && s == session)
-            && let Some((_, _, tx)) = requests.remove(id) { let _ = tx.send(reply); }
+        let _ = self.tx.try_send(Ask::Receipt { id: id.into(), peer: peer.into(), session: session.into(), reply });
     }
 
     /// One more counted, if the bound has room for it.
@@ -170,6 +189,14 @@ impl Answers {
         self.tx.try_send(Ask::Held(tx)).ok()?;
         rx.await.ok()
     }
+
+    /// How many requests wait for receipts now, once the owner has taken what was sent it before.
+    #[cfg(test)]
+    pub async fn requests_held(&self) -> Option<usize> {
+        let (tx, rx) = oneshot::channel();
+        self.tx.try_send(Ask::RequestsHeld(tx)).ok()?;
+        rx.await.ok()
+    }
 }
 
 /// `n` fewer counted: never below none.
@@ -185,6 +212,8 @@ async fn own(rx: crate::memory::queue::Receiver<Ask>, counted: Arc<AtomicUsize>)
     let mut waiting: HashMap<Key, Vec<oneshot::Sender<Said>>> = HashMap::new();
     // Where those routed to a runner went, while they're waited on.
     let mut routed: HashMap<Key, Routed> = HashMap::new();
+    // Messages sent straight to a runner, waiting for its receipt: by request id, the runner and session they went to.
+    let mut requests: HashMap<String, (String, String, oneshot::Sender<crate::reach::wire::P2pSendReply>)> = HashMap::new();
     while let Ok(ask) = rx.recv().await {
         match ask {
             Ask::Wait { key, tx } => {
@@ -240,22 +269,40 @@ async fn own(rx: crate::memory::queue::Receiver<Ask>, counted: Arc<AtomicUsize>)
             Ask::WentTo { key, tx } => {
                 let _ = tx.send(routed.get(&key).cloned());
             }
+            Ask::Request { id, peer, session, tx } => {
+                requests.insert(id, (peer, session, tx));
+            }
+            Ask::Receipt { id, peer, session, reply } => {
+                if requests.get(&id).is_some_and(|(p, s, _)| *p == peer && *s == session)
+                    && let Some((_, _, tx)) = requests.remove(&id)
+                {
+                    let _ = tx.send(reply);
+                }
+            }
+            Ask::Unrequest { id } => {
+                requests.remove(&id);
+            }
             #[cfg(test)]
             Ask::Held(tx) => {
                 let _ = tx.send(waiting.values().map(Vec::len).sum());
+            }
+            #[cfg(test)]
+            Ask::RequestsHeld(tx) => {
+                let _ = tx.send(requests.len());
             }
         }
     }
 }
 
+/// A request waiting for a runner's receipt ([`Answers::request`]): given up as it goes.
 pub struct RouteGuard {
     pub id: String,
-    requests: Arc<Requests>,
+    asks: crate::memory::queue::Sender<Ask>,
     counted: Arc<AtomicUsize>,
 }
 impl Drop for RouteGuard {
     fn drop(&mut self) {
-        self.requests.lock().remove(&self.id);
+        let _ = self.asks.try_send(Ask::Unrequest { id: std::mem::take(&mut self.id) });
         uncount(&self.counted, 1);
     }
 }
@@ -306,6 +353,79 @@ mod tests {
                 s.await.map_err(|_| anyhow::anyhow!("a sender ended"))?.map_err(|e| anyhow::anyhow!(e))?;
             }
             anyhow::ensure!(answers.held().await == Some(0), "waits left: {:?}", answers.held().await);
+            anyhow::ensure!(answers.counted.load(Ordering::Acquire) == 0, "{} still counted", answers.counted.load(Ordering::Acquire));
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2's routed receipts with no lock (goal 5, plan 01a1a59c2aae): a receipt reaches its own request once; one
+    /// from another runner, or for another session, isn't taken (the request still gets its own); a second is no one's.
+    /// A request given up takes no receipt after, is told nothing, and frees its count.
+    #[test]
+    fn cp_t3_2_a_routed_receipt_reaches_its_own_request_once() -> anyhow::Result<()> {
+        use crate::reach::wire::P2pSendReply;
+        crate::rt::block_on(async {
+            let answers = Answers::new(10);
+            let (guard, rx) = answers.request("runner-a", "s1").ok_or_else(|| anyhow::anyhow!("not requested"))?;
+            let id = guard.id.clone();
+            answers.complete("runner-b", "s1", &id, P2pSendReply::Error { why: "another runner's".into() });
+            answers.complete("runner-a", "s2", &id, P2pSendReply::Error { why: "another session's".into() });
+            answers.complete("runner-a", "s1", &id, P2pSendReply::Error { why: "its own".into() });
+            answers.complete("runner-a", "s1", &id, P2pSendReply::Error { why: "a second".into() });
+            match rx.await {
+                Ok(P2pSendReply::Error { why }) if why == "its own" => {}
+                other => anyhow::bail!("the request was told {other:?}"),
+            }
+            drop(guard);
+            let (gone, gone_rx) = answers.request("runner-a", "s1").ok_or_else(|| anyhow::anyhow!("not requested"))?;
+            let gone_id = gone.id.clone();
+            drop(gone);
+            answers.complete("runner-a", "s1", &gone_id, P2pSendReply::NoSession);
+            anyhow::ensure!(gone_rx.await.is_err(), "a request given up was told its receipt");
+            anyhow::ensure!(answers.requests_held().await == Some(0), "requests left: {:?}", answers.requests_held().await);
+            anyhow::ensure!(answers.counted.load(Ordering::Acquire) == 0, "{} still counted", answers.counted.load(Ordering::Acquire));
+            Ok(())
+        })
+    }
+
+    /// CP-T3.2's routed receipts with no lock (goal 5, plan 01a1a59c2aae): requests made from every shard at once, their
+    /// receipts arriving from other shards in no order of theirs, each reach their own request once, and nothing is
+    /// held or counted after.
+    #[test]
+    fn cp_t3_2_routed_receipts_from_every_shard_reach_their_requests_once() -> anyhow::Result<()> {
+        use crate::reach::wire::P2pSendReply;
+        crate::rt::block_on(async {
+            let answers = Arc::new(Answers::new(10_000));
+            let (senders, per) = (8usize, 200usize);
+            let mut sending = Vec::new();
+            for s in 0..senders {
+                let answers = Arc::clone(&answers);
+                sending.push(crate::rt::spawn_spread_joined(async move {
+                    let mut waits = Vec::new();
+                    for n in 0..per {
+                        let Some((guard, rx)) = answers.request(&format!("r{s}"), &format!("s{n}")) else { return Err(format!("request {s}/{n} not made")) };
+                        waits.push((n, guard, rx));
+                    }
+                    let receipts: Vec<(usize, String)> = waits.iter().map(|(n, guard, _)| (*n, guard.id.clone())).collect();
+                    let a = Arc::clone(&answers);
+                    crate::rt::spawn_spread(async move {
+                        for (n, id) in receipts.into_iter().rev() {
+                            a.complete(&format!("r{s}"), &format!("s{n}"), &id, P2pSendReply::Error { why: format!("{s}/{n}") });
+                        }
+                    });
+                    for (n, guard, rx) in waits {
+                        match rx.await {
+                            Ok(P2pSendReply::Error { why }) if why == format!("{s}/{n}") => drop(guard),
+                            other => return Err(format!("request {s}/{n} was told {other:?}")),
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            for s in sending {
+                s.await.map_err(|_| anyhow::anyhow!("a sender ended"))?.map_err(|e| anyhow::anyhow!(e))?;
+            }
+            anyhow::ensure!(answers.requests_held().await == Some(0), "requests left: {:?}", answers.requests_held().await);
             anyhow::ensure!(answers.counted.load(Ordering::Acquire) == 0, "{} still counted", answers.counted.load(Ordering::Acquire));
             Ok(())
         })

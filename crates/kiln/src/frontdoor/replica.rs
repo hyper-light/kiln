@@ -2757,7 +2757,10 @@ async fn pipe_session_ws(door: Arc<Door>, session: String, credentials: HeaderMa
     // One browser command may be in progress. Reading upstream and writing the browser remain
     // independently pollable while that command awaits its destination or its control receipt.
     let (ack_tx, ack_rx) = async_channel::bounded(1);
-    let barrier = parking_lot::Mutex::new(None::<(String, bool, futures::channel::oneshot::Sender<()>)>);
+    // The command in progress goes from the side that sends it to the side that matches its control receipt over a
+    // lock-free queue (goal 5, plan 01a1a59c2aae): posted before the command goes upstream, so it's there before its
+    // receipt can come back.
+    let (asked_tx, asked_rx) = crate::memory::queue::unbounded::<(String, bool, futures::channel::oneshot::Sender<()>)>(&crate::memory::owners::CHANNELS);
     let to_peer = async {
         use crate::wire::ui::{Cmd, SessionUp};
         while let Some(Ok(mut msg)) = b_rx.next().await {
@@ -2784,7 +2787,7 @@ async fn pipe_session_ws(door: Arc<Door>, session: String, credentials: HeaderMa
                     msg = crate::http::ws::text(line);
                 }
                 let (tx, rx) = futures::channel::oneshot::channel();
-                *barrier.lock() = Some((id, bare, tx));
+                if asked_tx.try_send((id, bare, tx)).is_err() { break; }
                 receipt = Some(rx);
             }
             if u_tx.send(msg).await.is_err() { break; }
@@ -2792,6 +2795,8 @@ async fn pipe_session_ws(door: Arc<Door>, session: String, credentials: HeaderMa
         }
     };
     let to_browser = async {
+        // The command in progress, as the sending side posted it.
+        let mut asked: Option<(String, bool, futures::channel::oneshot::Sender<()>)> = None;
         loop {
             let (mut msg, upstream) = futures::select! {
                 frame = ack_rx.recv().fuse() => match frame { Ok(frame) => (crate::http::ws::text(frame), false), Err(_) => break },
@@ -2800,11 +2805,11 @@ async fn pipe_session_ws(door: Arc<Door>, session: String, credentials: HeaderMa
             if upstream && let crate::http::ws::Message::Text(text) = &msg {
                 #[derive(serde::Deserialize)]
                 struct Receipt<'a> { t: &'a str, id: &'a str, why: Option<String> }
-                let mut pending = barrier.lock();
-                if let Some((asked, _, _)) = pending.as_ref()
+                while let Ok(posted) = asked_rx.try_recv() { asked = Some(posted); }
+                if let Some((id, _, _)) = asked.as_ref()
                     && let Ok(frame) = serde_json::from_str::<Receipt<'_>>(text.as_str())
-                    && matches!(frame.t, "ack" | "nack") && asked == frame.id
-                    && let Some((_, bare, tx)) = pending.take()
+                    && matches!(frame.t, "ack" | "nack") && id == frame.id
+                    && let Some((_, bare, tx)) = asked.take()
                 {
                     let _ = tx.send(());
                     if bare {

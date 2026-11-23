@@ -914,7 +914,7 @@ fn thread_main(spec: Spec, rx: crate::memory::queue::Receiver<Out>, hand: Box<dy
         // A fresh runtime per incarnation: whatever a failed loop left behind goes with it.
         let outcome = match LocalRuntime::new(&config) {
             Ok(mut local) => local
-                .block_on(run_loop(Arc::clone(&spec), rx.clone(), std::rc::Rc::clone(&owner), (Arc::clone(&last_dial), Arc::clone(&leaf)), std::mem::take(&mut carry)))
+                .block_on(run_loop(Arc::clone(&spec), rx.clone(), std::rc::Rc::clone(&owner), Arc::clone(&last_dial), Arc::clone(&leaf), std::mem::take(&mut carry)))
                 .map_err(|e| format!("{e}")),
             Err(e) => Err(format!("cannot start the net runtime: {e}")),
         };
@@ -1260,7 +1260,8 @@ async fn run_loop(
     spec: Arc<Spec>,
     rx: crate::memory::queue::Receiver<Out>,
     owner: Owner,
-    (last_dial, leaf): (Arc<Mutex<Option<SocketAddr>>>, Arc<Mutex<Leaf>>),
+    last_dial: Arc<Mutex<Option<SocketAddr>>>,
+    leaf: Arc<Mutex<Leaf>>,
     carry: Carry,
 ) -> anyhow::Result<Exit> {
     let presented = leaf.lock().unwrap_or_else(PoisonError::into_inner).clone();

@@ -716,7 +716,7 @@ pub struct Hub {
     /// again as its uptime goes on (goal 9, plan 01a1a87b2cec step 5).
     pub started_ms: i64,
     pub generation: u64,
-    pub(crate) token_cache: Arc<parking_lot::Mutex<crate::authz::gate::TokenCache>>,
+    pub(crate) token_cache: Arc<crate::authz::gate::TokenCache>,
     /// Runners connected just before this server started ([`crate::store::Store::runners_before`]).
     pub runners_before: AtomicU64,
     /// How long a runner is given to come back, learned from how long runners took to ([`crate::comeback`]).
