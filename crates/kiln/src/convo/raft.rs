@@ -6259,6 +6259,9 @@ mod tests {
         rng:kiln_sim::Rng,
         flushing:BTreeMap<u64,u64>,
         alarms:BTreeMap<u64,u64>,
+        /// The cut the links were last driven across (offline, isolate, broken), which `advance` keeps
+        /// driving them across as Raft time passes.
+        partition:Option<(Vec<String>,bool,Vec<(u64,u64)>)>,
     }
 
     /// Waits for `mgr`'s writes to finish while they keep becoming durable. A loaded machine is
@@ -6304,7 +6307,7 @@ mod tests {
                 }
                 nodes.insert(name.clone(), (mgr, store, store_dir, wal_dir));
             }
-            Ok(Self { detector_links:Mutex::new(DetectorLinks{wire:kiln_sim::Queue::new(),rng:kiln_sim::Rng::new(19),flushing:BTreeMap::new(),alarms:BTreeMap::new()}), detector_cut:AtomicBool::new(false), offline:Mutex::default(), snapshot_bytes: AtomicU64::new(0), policy, nodes })
+            Ok(Self { detector_links:Mutex::new(DetectorLinks{wire:kiln_sim::Queue::new(),rng:kiln_sim::Rng::new(19),flushing:BTreeMap::new(),alarms:BTreeMap::new(),partition:None}), detector_cut:AtomicBool::new(false), offline:Mutex::default(), snapshot_bytes: AtomicU64::new(0), policy, nodes })
         }
 
         fn add_node(&mut self, name: &str) -> anyhow::Result<()> {
@@ -6429,6 +6432,7 @@ mod tests {
                 m.tx.send(Input::NextTimer(ask)).map_err(|_|anyhow::anyhow!("Raft timer owner stopped"))?;
                 if let Some(t)=answer.recv_timeout(TEST_WAIT)? {next=Some(next.map_or(t,|old:u64|old.min(t)));}
             }
+            if let Some(at)=next {self.links_to(at)?;}
             for m in online() {
                 if let Some(at)=next {m.live.set_test_clock(at.max(m.live.now_ns()));}
                 m.drive_due();
@@ -6447,23 +6451,48 @@ mod tests {
         }
 
         fn detect_links(&self, offline: &[&str], isolate: bool, broken: &[(u64,u64)], observed: impl Fn() -> bool) -> anyhow::Result<()> {
-            use crate::sim::session_liveness::Beats;
             if !offline.is_empty() {
                 self.detector_cut.store(true, Ordering::SeqCst);
             }
+            self.drive_links(offline, isolate, broken, None, observed)
+        }
+
+        /// The time `advance` moves the clock through passes on the detectors' links too, across their
+        /// last cut. Skipped in silence, it had every node suspect each peer whose freshness point fell
+        /// inside the skip: a fleet-wide silence no test injected.
+        fn links_to(&self, at: u64) -> anyhow::Result<()> {
+            let Some((offline, isolate, broken)) = self.detector_links.lock().partition.clone() else { return Ok(()) };
+            let offline: Vec<&str> = offline.iter().map(String::as_str).collect();
+            self.drive_links(&offline, isolate, &broken, Some(at), || true)
+        }
+
+        /// Drives the links until the cut is seen and `observed` holds, or, given `until`, through every
+        /// wake up to that time.
+        fn drive_links(&self, offline: &[&str], isolate: bool, broken: &[(u64,u64)], until: Option<u64>, observed: impl Fn() -> bool) -> anyhow::Result<()> {
+            use crate::sim::session_liveness::Beats;
             let links: Vec<_> = self.nodes.iter().map(|(name, (mgr, _, _, _))| (name, mgr)).collect();
             let mut now = links.iter().map(|(_, m)| m.live.now_ns()).max().unwrap_or(1);
             // Keep in-flight proof writes, UDP packets and absolute alarms between
             // fault transitions. Dropping those here would itself simulate another cut.
             let mut network=self.detector_links.lock();
-            let DetectorLinks{wire,rng,flushing,alarms}=&mut *network;
-            let mut warm = false;
+            if until.is_none() {
+                network.partition = Some((offline.iter().map(|n| (*n).to_owned()).collect(), isolate, broken.to_vec()));
+            }
+            let DetectorLinks{wire,rng,flushing,alarms,..}=&mut *network;
+            // Driven to a time, the links already carry their cut.
+            let mut warm = until.is_some();
             for (_,m) in &links {alarms.insert(m.my_id,now);}
             let due_limit = now + u64::try_from(Duration::from_secs(60).as_nanos())?;
-            while now < due_limit {
+            loop {
                 let alarm = alarms.values().min().copied();
                 let arrival = wire.next_at().map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-                let next = alarm.into_iter().chain(arrival).min().context("no detector wake")?;
+                let next = alarm.into_iter().chain(arrival).min();
+                match until {
+                    Some(at) if next.is_none_or(|t| t > at) => return Ok(()),
+                    Some(_) => {}
+                    None => anyhow::ensure!(now < due_limit, "virtual detectors did not observe the partition"),
+                }
+                let next = next.context("no detector wake")?;
                 now = now.max(next) + if Some(next) == alarm { rng.below(20_000) } else { 0 };
                 let mut arrived = BTreeMap::<u64, Vec<(u64, u64, Vec<u8>)>>::new();
                 while let Some((stamp, (from, to, data))) = wire.pop_due(Duration::from_nanos(now)) {
@@ -6560,7 +6589,7 @@ mod tests {
                             }) == Some(true)
                         })
                     });
-                } else {
+                } else if until.is_none() {
                     let complete = links
                         .iter()
                         .filter(|(n, _)| isolate == offline.contains(&n.as_str()))
@@ -6583,7 +6612,6 @@ mod tests {
                     }
                 }
             }
-            anyhow::bail!("virtual detectors did not observe the partition")
         }
 
         fn elect_survivor(&self, offline: &[&str], session: &str) -> anyhow::Result<()> {
