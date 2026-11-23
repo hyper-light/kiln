@@ -145,7 +145,7 @@ What a session does to its harness maps onto the member:
 | stop | SIGTERM to its group, SIGKILL after its grace | `Run::signal(Terminate)`, TERM to its member alone over its run's agent-control endpoint (Hex's `Runtime::signal_member`, Shards' D238); its kill (the microVM's stop) after its grace |
 | kill | SIGKILL | the microVM's stop |
 | its CLI's own answers (its models, its version, an MCP server added or removed) | its CLI run on the host (`Effect::Run`) | never run on the host: its version is its image's pin where it boots kiln's image for its harness, anything else refused in words (`session::in_microvm_alone`; kiln goal 3cd82843, r734) |
-| its kind's catalog for the start dialog (Devin's models) | asked of the Devin installed on the host (`acp::catalog::warm_models`) | not asked on a runner whose sessions may run in microVMs: unknown until a session, in its microVM, tells it (`acp::catalog::sessions_on_host`) |
+| its kind's catalog for the start dialog (Devin's models) | asked of the Devin installed on the host, where the runner holds no microVMs (`acp::catalog::warm_models`) | not asked on a runner that holds microVMs: unknown until a session tells it |
 
 ## Refused, rather than done another way
 
@@ -172,53 +172,34 @@ What a session does to its harness maps onto the member:
 - **What its boundary doesn't hold** is refused by the boundary, typed (`Refusal::Unsupported`), and the
   session's start fails in its words.
 
-## A runner's engine
+## Each session's engine
 
-kiln plan 01a1dd2e…, P2.3 and P2.4 (`harness::engine`). A runner's **engine** is how it runs new agent
-sessions: `host`, each a process of its machine's with no microVM, or `microvm`, each in a Shards microVM of
-its own through Hex (`sandbox::hexvm`).
+The person's decision of 2026-11-23 (`harness::engine`): the engine is each session's choice, never its runner's. A
+session that asks for a microVM runs in a Shards microVM of its own, through Hex (`sandbox::hexvm`): its spec's
+`isolation` (`{kind: "microvm", image}`, the image an Agentfile), or `agents.start`'s `isolation` `microvm` or `image`.
+One that asks for none runs as a process of its machine's host. That is the default. An agent definition says its
+sessions' engine (`engine` `host`, else a microVM), and so does each variant of its experiments.
 
-- **Which one.** What its owner set on the server (`PUT /api/runners/:name/engine`, `runners.engine.set` over
-  MCP and code mode; `runners.manage` on that runner), else `host`: the microVM engine is an option its owner
-  enables, never a default (the person's ruling, 2026-11-21, over decision 3's `microvm` wherever it could hold
-  them), saying why where it can't hold microVMs. Whether it can is read in one place, `engine::capable`, from
-  its isolation facts below, which carry Shards' own check of its host (`shards_api::host_check`).
-  `microvm` set where it can't any more is held as `host`, saying why.
-- **Refused.** `microvm` on a runner that can't hold microVMs, saying why (409).
-- **Held where it's decided.** The server keeps what's set (`kv` `runner_engine/<runner>`) and writes the engine
-  into the facts it has of the runner (`isolation.engine`; `virt.microvm` only on `microvm`), which placement
-  and the runners API read. It sends it to the runner (`ServerMsg::RunnerEngine`, feature `runner.engine`),
-  which keeps it for its restarts and writes it into its own facts, so its admission refuses a microVM ask
-  while it runs sessions on its host, whoever owns the placement.
-- **Each new session's boundary.** A start that asks nothing takes the engine of the runner it's placed on
-  (a conversation taken up, `resume`, stays where its harness keeps it). One
-  that asks `microvm`, names an Agentfile or has an isolated parent needs a `microvm` runner; one that asks
-  `none` needs a `host` runner. Each is refused where nothing fits, the engine named. The server itself
-  (`local`) runs sessions on its host. A `microvm` runner's Hex node must also list Hex's `shards-image`
-  class (P2.2), as its runner said of it (`isolation.image_class`, below; `engine::node_images`): one whose
-  node lists none is refused, named, in Hex's words, and one whose runner doesn't say (from before the
-  class) is placed by its engine alone.
-- **A switch** takes nothing away: the sessions of the engine it had finish there (`draining` in its view, each
-  of them in `draining_sessions`, with the switch they drain for, `switch`: what was set before, what it was set
-  to, and when), and new sessions take the new one. While they drain (ROOT's decision 8 of the design):
-  `runners.engine.end_draining` ("End them now", `POST /api/runners/:name/engine/end`; destructive, so an
-  agent's call waits for its person's click) ends each, after the agents it started; `runners.engine.cancel`
-  (`POST /api/runners/:name/engine/cancel`) sets the engine back to what was set before the switch, so they're
-  on its engine again, refused where it wasn't switched or nothing drains. Both need `runners.manage` on that
-  runner. The switch is kept with the setting (`engine::Kept`), on the server alone: the runner is sent the
-  setting. Each setting has a version (the one before's plus one, kept with it), and a
-  start carries the version its boundary was decided under, taken before it waits to be placed
-  (`Spec::engine_version`). The runner refuses one decided under another (`engine::stale`), naming its engine
-  now, so a session placed just before a switch never starts on the engine the runner had. The push is ordered
-  against starts on the runner's link (a barrier).
-- **Its real-VM test** (`vm_harnesses` `engine::p2_3_…`) has the microVM session answer a turn in its microVM
-  before the switch and another after it, as it drains, each waited for on its harness's liveness (step 35's
-  waits), so a harness that never ran there fails at once in kiln's word on it. It couldn't pass on the Hex
-  kiln vendored before (1969a423e, on Shards 9975d1f55): its image class gave a start share to the run's root alone,
-  so a harness never started in its project (Shards D277: `Setup (entering its working directory): errno 2`), its
-  run ended failed, and kiln said exit -1; the switch ended nothing, the session having ended before it. The Hex
-  kiln vendors now (84c870b0f, on Shards v0.8.0, aa819b058) gives a share its members (`hex_api::Mount`), and kiln maps
-  `Share::members` in `sandbox::hexvm` (P1.4); its run on that Hex is owed.
+- **What a runner can do.** It can run microVMs now where its facts say so: its kiln carries Shards, and Shards' own
+  check of its host passes (`isolation.available`, read in one place, `engine::capable`; `virt.microvm` says the
+  same). Where it can't, `isolation.why_not` says why, in Shards' words.
+- **Placed and admitted by that.** A session that asks for a microVM is placed only on a runner that can run them,
+  and that runner's own admission holds it to the same fact (the need `microvm`, `virt.microvm`). A runner that
+  can't refuses it, typed (409, `lineage::NoMicrovm`): "<runner> can't run microVMs: <why>". It never runs on the
+  host instead. Where a runner says what its Hex node lists (`isolation.image_class`, `engine::node_images`), the
+  node must list Hex's `shards-image` class (P2.2): one that lists none is refused, in Hex's words.
+- **A session on its host runs on any runner**, whatever the runner can do. The server itself (`local`) runs
+  sessions on its host alone.
+- **As before**, an isolated agent's agents are isolated too, and a conversation taken up (`resume`) stays where its
+  harness keeps it.
+- **Runners from before.** A runner from before this wrote the engine its owner set into its facts
+  (`isolation.engine`, and `virt.microvm` false where that was `host`). The server reads its facts as what it can do
+  (`engine::as_capable`) and drops `isolation.engine`. It sends no engine to any runner (`ServerMsg::RunnerEngine` is
+  retired), and keeps none: the old `runner_engine/<runner>` rows are left unread.
+- **Its real-VM tests** (`vm_harnesses`' `engine::` tests): on one runner that can run microVMs, a session that asks
+  for one answers in its microVM and one that asks for none runs on the host; with two runners, one that can and one
+  that can't (a file stands where its kiln writes Shards out), every session that asks for a microVM lands on the
+  one that can.
 
 ## Live overrides
 

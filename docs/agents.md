@@ -1564,10 +1564,12 @@ refused, never run as a process; where the machine picked would refuse it, the c
 under the row. Once such a start goes through, its harness runs as its image's HARNESS member, its
 stdio the member's streams, and its session drives it through the same adapter as on the host: it
 starts, is steered, interrupted, resumed and stopped as a process is (docs/isolation.md, step 17).
-A runner starts it, in a Shards microVM through Hex, where its kiln carries Shards and its engine is
-`microvm` (docs/isolation.md, "A runner's engine"). kiln's releases don't carry Shards yet
-(docs/shards.md), so on any other runner such a start is refused, saying so (its facts'
-`isolation.why_not`).
+A runner starts it, in a Shards microVM through Hex, where its kiln carries Shards and Shards' check
+of its host passes. The engine is each session's choice, never its runner's (the person's decision of
+2026-11-23; docs/isolation.md, "Each session's engine"): a start that asks for no microVM runs on its
+machine's host, on any runner. kiln's releases don't carry Shards yet (docs/shards.md), so on any
+other runner a microVM's start is refused, saying so (409: `<runner> can't run microVMs: <why>`, the
+why its facts' `isolation.why_not`).
 
 **Placed and charged by kiln's balancer** (step 32). An isolated agent is placed as runs are
 (docs/lb.md), or not at all: its placement asks its microVM's own vCPUs and memory, never what its
@@ -1605,12 +1607,13 @@ given to it, no network but the ports and hosts its grants name, nothing coming 
 - **What it starts is isolated too.** An agent an isolated agent starts runs in a microVM of its
   own as well. Asked for as a process on its machine (`isolation: "none"`), it's refused: "an
   isolated agent's agents are isolated too: it can't start one as a process on its machine".
-- **Where it runs.** Only on a runner that says it starts microVMs (its facts' `virt.microvm`, the
-  need `microvm`). Anywhere else it's refused, never run as a process.
+- **Where it runs.** Only on a runner that can run microVMs now (its facts' `virt.microvm`, the need
+  `microvm`). Anywhere else it's refused, never run as a process. An agent that asks for no microVM
+  runs on its machine's host, on any runner: that is the default.
 - **Not everywhere yet.** kiln holds Shards and Hex at one Shards revision and starts each harness
   through Hex, but its releases don't carry Shards' programs yet (docs/shards.md). Only a runner
-  whose kiln carries them, with its engine `microvm`, starts isolated agents; everywhere else every
-  isolated start is refused, saying so.
+  whose kiln carries them, on a host Shards can run microVMs on, starts isolated agents; everywhere
+  else every isolated start is refused, saying so.
 
 ### What kiln's Agentfiles give it
 
