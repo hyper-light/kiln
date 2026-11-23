@@ -3629,7 +3629,8 @@ async fn agents_whole(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> anyhow::
 }
 
 /// `GET /api/agents?lean=1` (W21-R02): the runners `caller` may read, each with only what a page that lists the
-/// runners and starts agents on them reads of its facts: whether it starts microVMs (`facts.virt`). Its facts are
+/// runners and starts agents on them reads of its facts: whether it starts microVMs (`facts.virt`), and why not
+/// (`facts.isolation.why_not`). Its facts are
 /// seven tenths of the list (22.8 KB of the 32.8 KB of eleven runners: `kiln-lab bar`, 2026-11-14), and the rest of
 /// them only a page that shows a runner's hardware reads (the Runners page). Mission control asks so as it opens.
 /// Made of [`agents_read`]'s own answer, off the shard: the whole list is read and written again.
@@ -3644,14 +3645,19 @@ async fn agents_lean_read(hub: &Arc<Hub>, caller: &crate::authz::Caller) -> Resp
     }
 }
 
-/// The runners' list `whole` (`GET /api/agents`'s JSON), each runner's facts only their `virt` (none: no facts).
+/// The runners' list `whole` (`GET /api/agents`'s JSON), each runner's facts only their `virt`, and where it can't
+/// run microVMs, why (`isolation.why_not`), which Mission control's composer says beside its engine (none: no facts).
 fn lean_agents(whole: &[u8]) -> anyhow::Result<bytes::Bytes> {
     let mut runners: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(whole)?;
     for runner in &mut runners {
-        let virt = runner.remove("facts").and_then(|mut facts| facts.get_mut("virt").map(serde_json::Value::take));
-        if let Some(virt) = virt {
-            runner.insert("facts".to_owned(), json!({ "virt": virt }));
+        let Some(mut facts) = runner.remove("facts") else { continue };
+        let Some(virt) = facts.get_mut("virt").map(serde_json::Value::take) else { continue };
+        let mut lean = serde_json::Map::new();
+        lean.insert("virt".to_owned(), virt);
+        if let Some(why) = facts.pointer_mut("/isolation/why_not").map(serde_json::Value::take).filter(|w| !w.is_null()) {
+            lean.insert("isolation".to_owned(), json!({ "why_not": why }));
         }
+        runner.insert("facts".to_owned(), serde_json::Value::Object(lean));
     }
     crate::reads::encode(&runners)
 }
@@ -9190,6 +9196,27 @@ fn back(connected: u64, before: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    /// The lean runners' list (`?lean=1`) keeps each runner's `virt` and, where it can't run microVMs, why: what
+    /// Mission control's composer says beside the engine; none of its other facts.
+    #[test]
+    fn the_lean_runners_list_keeps_virt_and_why_a_runner_cant_run_microvms() -> anyhow::Result<()> {
+        let whole = serde_json::to_vec(&json!([
+            {"name": "a", "facts": {"virt": {"microvm": false}, "isolation": {"available": false, "why_not": "no /dev/kvm on this host"}, "cpus": 8}},
+            {"name": "b", "facts": {"virt": {"microvm": true}, "isolation": {"available": true, "why_not": null}, "cpus": 32}},
+            {"name": "c"},
+        ]))?;
+        let lean: serde_json::Value = serde_json::from_slice(&lean_agents(&whole)?)?;
+        assert_eq!(
+            lean,
+            json!([
+                {"name": "a", "facts": {"virt": {"microvm": false}, "isolation": {"why_not": "no /dev/kvm on this host"}}},
+                {"name": "b", "facts": {"virt": {"microvm": true}}},
+                {"name": "c"},
+            ])
+        );
+        Ok(())
+    }
+
     /// W8 piece 4: a runner without a host mount (a Windows host without WinFsp) is said to give a volume served to a
     /// microVM beside giving none mounted on its host, each with its own why; one that keeps no workspaces gives neither.
     #[test]
