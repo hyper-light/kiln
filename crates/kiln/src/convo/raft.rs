@@ -6268,14 +6268,20 @@ mod tests {
     /// slow, which is no failure; a node whose writes stop finishing, or one with a group fenced
     /// or reopening, is.
     fn flushed(mgr: &Manager) -> anyhow::Result<()> {
+        // A hang's bound, never a pace: a loaded machine makes a write durable when it can (84e73a54d).
+        const HANG: Duration = Duration::from_secs(300);
         let mut seen = mgr.durable_writes();
+        let mut since = std::time::Instant::now();
         loop {
             if mgr.flush(TEST_WAIT) { return Ok(()); }
             let recovering = mgr.recovering();
             anyhow::ensure!(recovering.is_empty(), "WAL flush failed: groups recovering {recovering:?}");
             let now = mgr.durable_writes();
-            anyhow::ensure!(now != seen, "WAL flush stalled: no write became durable in {TEST_WAIT:?}");
-            seen = now;
+            if now != seen {
+                seen = now;
+                since = std::time::Instant::now();
+            }
+            anyhow::ensure!(since.elapsed() < HANG, "WAL flush hung: no write became durable in {HANG:?}");
         }
     }
 
