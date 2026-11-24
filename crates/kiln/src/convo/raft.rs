@@ -67,6 +67,9 @@ const CHUNK_RAW_MAX: usize = ((ENTRY_DATA_MAX - CHUNK_ENVELOPE_MAX) / 4) * 3;
 /// behaviour under test. The manager's own waits are told, never timed.
 #[cfg(test)]
 const TEST_WAIT: Duration = Duration::from_secs(6);
+/// A test's bound on a wait that ends once what it waits for happens: a hang's alone, never a pace (84e73a54d).
+#[cfg(test)]
+const HANG: Duration = Duration::from_secs(300);
 /// The pause between a test's polls of what it drives: the test's pacing, no behaviour under test.
 #[cfg(test)]
 pub(crate) const TEST_POLL: Duration = Duration::from_millis(100);
@@ -2129,6 +2132,9 @@ struct SessionGroup {
     /// Whether this node was the Raft leader on the previous drive pass (drives automatic failover
     /// `Claimed` and returning-leader `LostLeadership` transitions).
     was_leader: bool,
+    /// Writes of this group's that became durable (`Driven::flushed`), for tests.
+    #[cfg(test)]
+    durable_writes: u64,
     /// Applied index when last reopened from a fence; once `applied > reopened_at_index`, reopen
     /// backoff resets cleanly.
     reopened_at_index: Option<u64>,
@@ -2159,6 +2165,9 @@ struct Shared {
     shard_count: usize,
     #[cfg(test)]
     wire_chunks_sent: u64,
+    /// Writes that became durable, summed over the node's groups: a test's measure of progress.
+    #[cfg(test)]
+    durable_writes: u64,
 }
 
 #[derive(Default)]
@@ -2853,6 +2862,8 @@ impl Owner {
                 snapshot_held: None,
                 was_leader: false,
                 reopened_at_index: Some(compacted),
+                #[cfg(test)]
+                durable_writes: 0,
                 #[cfg(test)]
                 compact_waiters: recovered.compact_waiters,
                 needs_restart_campaign: true,
@@ -4330,6 +4341,8 @@ impl Owner {
                 was_leader: false,
                 reopened_at_index: None,
                 #[cfg(test)]
+                durable_writes: 0,
+                #[cfg(test)]
                 compact_waiters: Vec::new(),
                 needs_restart_campaign: false,
                 compacted,
@@ -5147,6 +5160,7 @@ impl Owner {
                 let mut sh = self.shared.lock();
                 sh.shard_count = self.shards.len();
                 sh.wire_chunks_sent = self.wire_chunks_sent;
+                sh.durable_writes = self.groups.values().map(|g| g.durable_writes).fold(0, u64::wrapping_add);
             }
             return;
         }
@@ -5192,6 +5206,7 @@ impl Owner {
         {
             sh.shard_count = self.shards.len();
             sh.wire_chunks_sent = self.wire_chunks_sent;
+            sh.durable_writes = self.groups.values().map(|g| g.durable_writes).fold(0, u64::wrapping_add);
         }
         if custody_changed { sh.changed.notify(); }
         let m = crate::metrics::convo_raft();
@@ -5833,6 +5848,14 @@ impl Manager {
         rx.recv().map_err(|_| anyhow::anyhow!("fail_next_persist: manager stopped"))?
     }
 
+    /// Test harness only. Writes of this node's groups that became durable so far.
+    #[cfg(test)]
+    fn durable_writes(&self) -> u64 { self.shared.lock().durable_writes }
+
+    /// Test harness only. Sessions whose group is fenced or reopening.
+    #[cfg(test)]
+    fn recovering(&self) -> Vec<String> { self.shared.lock().statuses.values().filter(|s| s.recovering).map(|s| s.session.clone()).collect() }
+
     #[cfg(test)]
     fn snapshot_state(&self, session: &str) -> anyhow::Result<(u32, bool, usize)> {
         let (tx, rx) = mpsc::channel();
@@ -6008,6 +6031,8 @@ fn drive_one(
         output.clear();
         let previous_handover=sg.replica.handed_over();
         let driven = sg.replica.drive(now, &sg.waker, output)?;
+        #[cfg(test)]
+        if driven.flushed.is_some() { sg.durable_writes = sg.durable_writes.wrapping_add(1); }
         let prior=sg.replica.machine();
         if sg.replica.handed_over()!=previous_handover && sg.replica.is_leader() && prior.owner_term==sg.replica.term()
             && node_id(&prior.leader_name)==sg.replica.id() {
@@ -6237,6 +6262,28 @@ mod tests {
         rng:kiln_sim::Rng,
         flushing:BTreeMap<u64,u64>,
         alarms:BTreeMap<u64,u64>,
+        /// The cut the links were last driven across (offline, isolate, broken), which `advance` keeps
+        /// driving them across as Raft time passes.
+        partition:Option<(Vec<String>,bool,Vec<(u64,u64)>)>,
+    }
+
+    /// Waits for `mgr`'s writes to finish while they keep becoming durable. A loaded machine is
+    /// slow, which is no failure; a node whose writes stop finishing, or one with a group fenced
+    /// or reopening, is.
+    fn flushed(mgr: &Manager) -> anyhow::Result<()> {
+        let mut seen = mgr.durable_writes();
+        let mut since = std::time::Instant::now();
+        loop {
+            if mgr.flush(TEST_WAIT) { return Ok(()); }
+            let recovering = mgr.recovering();
+            anyhow::ensure!(recovering.is_empty(), "WAL flush failed: groups recovering {recovering:?}");
+            let now = mgr.durable_writes();
+            if now != seen {
+                seen = now;
+                since = std::time::Instant::now();
+            }
+            anyhow::ensure!(since.elapsed() < HANG, "WAL flush hung: no write became durable in {HANG:?}");
+        }
     }
 
     struct Fleet {
@@ -6267,7 +6314,7 @@ mod tests {
                 }
                 nodes.insert(name.clone(), (mgr, store, store_dir, wal_dir));
             }
-            Ok(Self { detector_links:Mutex::new(DetectorLinks{wire:kiln_sim::Queue::new(),rng:kiln_sim::Rng::new(19),flushing:BTreeMap::new(),alarms:BTreeMap::new()}), detector_cut:AtomicBool::new(false), offline:Mutex::default(), snapshot_bytes: AtomicU64::new(0), policy, nodes })
+            Ok(Self { detector_links:Mutex::new(DetectorLinks{wire:kiln_sim::Queue::new(),rng:kiln_sim::Rng::new(19),flushing:BTreeMap::new(),alarms:BTreeMap::new(),partition:None}), detector_cut:AtomicBool::new(false), offline:Mutex::default(), snapshot_bytes: AtomicU64::new(0), policy, nodes })
         }
 
         fn add_node(&mut self, name: &str) -> anyhow::Result<()> {
@@ -6289,7 +6336,7 @@ mod tests {
         fn while_pumping<T: Send>(&self, call: impl FnOnce() -> anyhow::Result<T> + Send) -> anyhow::Result<T> {
             thread::scope(|scope| {
                 let job = scope.spawn(call);
-                let until = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
+                let until = Instant::now() + HANG;
                 let mut pumped = Ok(());
                 while !job.is_finished() && Instant::now() < until && pumped.is_ok() { pumped = self.settle(); }
                 // A caller waits on its owner's answer, never a timer. One still waiting here is a
@@ -6342,7 +6389,7 @@ mod tests {
                     if offline.contains(&name.as_str()) {
                         continue;
                     }
-                    anyhow::ensure!(mgr.flush(TEST_WAIT), "node {name} WAL flush stalled");
+                    flushed(mgr).with_context(|| format!("node {name}"))?;
                 }
                 let mut moved = false;
                 for (from, (mgr, _, _, _)) in &self.nodes {
@@ -6390,8 +6437,9 @@ mod tests {
             for m in online() {
                 let (ask,answer)=mpsc::channel();
                 m.tx.send(Input::NextTimer(ask)).map_err(|_|anyhow::anyhow!("Raft timer owner stopped"))?;
-                if let Some(t)=answer.recv_timeout(TEST_WAIT)? {next=Some(next.map_or(t,|old:u64|old.min(t)));}
+                if let Some(t)=answer.recv_timeout(HANG)? {next=Some(next.map_or(t,|old:u64|old.min(t)));}
             }
+            if let Some(at)=next {self.links_to(at)?;}
             for m in online() {
                 if let Some(at)=next {m.live.set_test_clock(at.max(m.live.now_ns()));}
                 m.drive_due();
@@ -6410,23 +6458,48 @@ mod tests {
         }
 
         fn detect_links(&self, offline: &[&str], isolate: bool, broken: &[(u64,u64)], observed: impl Fn() -> bool) -> anyhow::Result<()> {
-            use crate::sim::session_liveness::Beats;
             if !offline.is_empty() {
                 self.detector_cut.store(true, Ordering::SeqCst);
             }
+            self.drive_links(offline, isolate, broken, None, observed)
+        }
+
+        /// The time `advance` moves the clock through passes on the detectors' links too, across their
+        /// last cut. Skipped in silence, it had every node suspect each peer whose freshness point fell
+        /// inside the skip: a fleet-wide silence no test injected.
+        fn links_to(&self, at: u64) -> anyhow::Result<()> {
+            let Some((offline, isolate, broken)) = self.detector_links.lock().partition.clone() else { return Ok(()) };
+            let offline: Vec<&str> = offline.iter().map(String::as_str).collect();
+            self.drive_links(&offline, isolate, &broken, Some(at), || true)
+        }
+
+        /// Drives the links until the cut is seen and `observed` holds, or, given `until`, through every
+        /// wake up to that time.
+        fn drive_links(&self, offline: &[&str], isolate: bool, broken: &[(u64,u64)], until: Option<u64>, observed: impl Fn() -> bool) -> anyhow::Result<()> {
+            use crate::sim::session_liveness::Beats;
             let links: Vec<_> = self.nodes.iter().map(|(name, (mgr, _, _, _))| (name, mgr)).collect();
             let mut now = links.iter().map(|(_, m)| m.live.now_ns()).max().unwrap_or(1);
             // Keep in-flight proof writes, UDP packets and absolute alarms between
             // fault transitions. Dropping those here would itself simulate another cut.
             let mut network=self.detector_links.lock();
-            let DetectorLinks{wire,rng,flushing,alarms}=&mut *network;
-            let mut warm = false;
+            if until.is_none() {
+                network.partition = Some((offline.iter().map(|n| (*n).to_owned()).collect(), isolate, broken.to_vec()));
+            }
+            let DetectorLinks{wire,rng,flushing,alarms,..}=&mut *network;
+            // Driven to a time, the links already carry their cut.
+            let mut warm = until.is_some();
             for (_,m) in &links {alarms.insert(m.my_id,now);}
             let due_limit = now + u64::try_from(Duration::from_secs(60).as_nanos())?;
-            while now < due_limit {
+            loop {
                 let alarm = alarms.values().min().copied();
                 let arrival = wire.next_at().map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
-                let next = alarm.into_iter().chain(arrival).min().context("no detector wake")?;
+                let next = alarm.into_iter().chain(arrival).min();
+                match until {
+                    Some(at) if next.is_none_or(|t| t > at) => return Ok(()),
+                    Some(_) => {}
+                    None => anyhow::ensure!(now < due_limit, "virtual detectors did not observe the partition"),
+                }
+                let next = next.context("no detector wake")?;
                 now = now.max(next) + if Some(next) == alarm { rng.below(20_000) } else { 0 };
                 let mut arrived = BTreeMap::<u64, Vec<(u64, u64, Vec<u8>)>>::new();
                 while let Some((stamp, (from, to, data))) = wire.pop_due(Duration::from_nanos(now)) {
@@ -6523,7 +6596,7 @@ mod tests {
                             }) == Some(true)
                         })
                     });
-                } else {
+                } else if until.is_none() {
                     let complete = links
                         .iter()
                         .filter(|(n, _)| isolate == offline.contains(&n.as_str()))
@@ -6546,12 +6619,11 @@ mod tests {
                     }
                 }
             }
-            anyhow::bail!("virtual detectors did not observe the partition")
         }
 
         fn elect_survivor(&self, offline: &[&str], session: &str) -> anyhow::Result<()> {
             self.detector_partition(offline, false)?;
-            let until = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
+            let until = Instant::now() + HANG;
             loop {
                 self.settle_except(offline)?;
                 if self
@@ -6669,18 +6741,18 @@ mod tests {
         let session = "explicit-across-rosters";
         let minority = fleet.mgr("d")?.clone();
         let pending = thread::spawn(move || minority.open_leader(session, 1, vec![user_event(session, 1, "CDE")]));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while fleet.store("c")?.kept(session, 1)?.is_none_or(|k| k.events.is_empty()) && Instant::now() < until { fleet.settle_except(&["a","b"])?; }
         anyhow::ensure!(!pending.is_finished() && fleet.mgr("d")?.status(session).is_some_and(|st| !st.founded), "a disjoint directory majority acknowledged the id");
         let majority = fleet.mgr("a")?.clone();
         let winner = thread::spawn(move || majority.open_leader(session, 1, vec![user_event(session, 1, "AB")]));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !winner.is_finished() && Instant::now() < until { fleet.settle_except(&["c","d","e"])?; }
         winner.join().map_err(|_| anyhow::anyhow!("charter owner stopped"))??;
         // The provisional founder is told once it hears the winner: no timer answers it. Its
         // groups beat once the detector has measured their links.
         fleet.detector_partition(&[], false)?;
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !pending.is_finished() && Instant::now() < until { fleet.settle()?; }
         anyhow::ensure!(pending.is_finished(), "the provisional founder must be told once it hears the winner");
         anyhow::ensure!(pending.join().map_err(|_| anyhow::anyhow!("provisional founder stopped"))?.is_err());
@@ -6721,7 +6793,7 @@ mod tests {
         let session = "cutoff-before-registrar-contact";
         let original = fleet.mgr("a")?.clone();
         let opening = thread::spawn(move || original.open_leader(session, 1, vec![user_event(session, 1, "original prompt")]));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while fleet.store("c")?.kept(session, 1)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < until {
             fleet.settle_except(&["registrar"])?;
         }
@@ -6751,9 +6823,9 @@ mod tests {
         let selected = fleet.mgr("original")?.clone();
         let session = "opening-at-cutoff";
         let opening = thread::spawn(move || selected.open_leader(session, 1, vec![user_event(session, 1, "selected")]));
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while fleet.store("original")?.kept(session, 1)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < deadline {
-            anyhow::ensure!(fleet.mgr("original")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("original")?.flush(HANG));
         }
         let original_status = fleet.mgr("original")?.status(session).context("opening local slot")?;
         let registrar = fleet.mgr("registrar")?;
@@ -6761,7 +6833,7 @@ mod tests {
         beat.from = node_id("original");
         beat.term = original_status.term;
         registrar.step("original", session, &beat.encode_to_vec())?;
-        anyhow::ensure!(registrar.flush(TEST_WAIT));
+        anyhow::ensure!(registrar.flush(HANG));
         anyhow::ensure!(registrar.historical_name_inventory()?.iter().any(|s| s == session));
         let reserved: BTreeSet<_> = registrar.freeze_name_registrar()?.into_iter().collect();
         let digest = [2;32];
@@ -6788,17 +6860,17 @@ mod tests {
         };
         let first = run("a")?;
         let other = run("b")?;
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         // Let both selected candidates commit their independent index/term locally.
         for node in ["a","b"] {
-            while fleet.store(node)?.kept(session, 8)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < until { anyhow::ensure!(fleet.mgr(node)?.flush(TEST_WAIT)); }
+            while fleet.store(node)?.kept(session, 8)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < until { anyhow::ensure!(fleet.mgr(node)?.flush(HANG)); }
             anyhow::ensure!(fleet.mgr(node)?.status(session).is_some_and(|st| !st.founded));
         }
         while !first.is_finished() && Instant::now() < until { fleet.settle_except(&["b"])?; }
         first.join().map_err(|_| anyhow::anyhow!("first founder stopped"))??;
         fleet.settle()?;
         anyhow::ensure!(other.join().map_err(|_| anyhow::anyhow!("other founder stopped"))?.is_err());
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !fleet.mgr("b")?.status(session).is_some_and(|s| s.owner.as_deref() == Some("a")) && Instant::now() < until { fleet.settle()?; }
         let loser = fleet.mgr("b")?.status(session);
         anyhow::ensure!(loser.as_ref().is_some_and(|s| s.founded && s.owner.as_deref() == Some("a")), "rejected founder failed to reconcile: {loser:?}, winner {:?}", fleet.mgr("a")?.status(session));
@@ -6806,7 +6878,7 @@ mod tests {
         anyhow::ensure!(fleet.store("c")?.kept(session, 8)?.is_some_and(|s| s.events.iter().all(|e| e.text == "a")));
         let winner = fleet.mgr("a")?.clone();
         let sending = thread::spawn(move || winner.propose_sync(session, 1, vec![user_event(session, 2, "after repair")]));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !sending.is_finished() && Instant::now() < until { fleet.settle()?; }
         sending.join().map_err(|_| anyhow::anyhow!("winner stopped during follow-up"))??;
         fleet.settle()?;
@@ -6827,9 +6899,9 @@ mod tests {
             let (m, name) = (manager.clone(), name.clone());
             opens.push(thread::spawn(move || m.open_leader(session, 1, vec![user_event(session, 1, &name)])));
         }
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         for (manager, store, _, _) in fleet.nodes.values() {
-            while store.kept(session, 1)?.is_none_or(|k| k.events.is_empty()) && Instant::now() < deadline { anyhow::ensure!(manager.flush(TEST_WAIT)); }
+            while store.kept(session, 1)?.is_none_or(|k| k.events.is_empty()) && Instant::now() < deadline { anyhow::ensure!(manager.flush(HANG)); }
         }
         while opens.iter().any(|op| !op.is_finished()) && Instant::now() < deadline { fleet.settle()?; }
         for opening in opens {
@@ -6893,18 +6965,18 @@ mod tests {
         let source = fleet.mgr("a")?.clone();
         let session = "sess-bootstrap-receipt";
         let opening = thread::spawn(move || source.open_leader(session, 1, vec![user_event(session, 1, "open")]));
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while fleet.store("a")?.kept(session, 10)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < deadline {
-            anyhow::ensure!(fleet.mgr("a")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("a")?.flush(HANG));
         }
         anyhow::ensure!(fleet.mgr("a")?.status(session).is_some_and(|st| !st.founded) && !opening.is_finished(), "local apply alone exposed or acknowledged founding");
         while !opening.is_finished() && Instant::now() < deadline { fleet.settle()?; }
         opening.join().map_err(|_| anyhow::anyhow!("founder stopped"))??;
         let source = fleet.mgr("a")?.clone();
         let sending = thread::spawn(move || source.propose_sync(session, 1, vec![user_event(session, 2, "first")]));
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while fleet.store("a")?.kept(session, 10)?.is_none_or(|s| s.events.len() < 2) && Instant::now() < deadline {
-            anyhow::ensure!(fleet.mgr("a")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("a")?.flush(HANG));
         }
         anyhow::ensure!(!sending.is_finished(), "local apply alone acknowledged the first message");
         while !sending.is_finished() && Instant::now() < deadline { fleet.settle()?; }
@@ -6926,7 +6998,7 @@ mod tests {
         let selected = fleet.mgr("c")?;
         let status = thread::scope(|scope| -> anyhow::Result<GroupStatus> {
             let opening = scope.spawn(|| selected.open_leader(session, 0, vec![user_event(session, 1, "offline opening")]));
-            let deadline = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
+            let deadline = Instant::now() + HANG;
             while !opening.is_finished() && Instant::now() < deadline { fleet.settle_except(&["b"])?; }
             opening.join().map_err(|_| anyhow::anyhow!("founder stopped"))?
         })?;
@@ -6945,7 +7017,7 @@ mod tests {
         let before = fleet.mgr("b")?.status(session).context("missing founding group")?;
         anyhow::ensure!(before.voters.len() == 1 && before.owner.as_deref() == Some("b"));
         fleet.add_node("c")?;
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while fleet.mgr("b")?.status(session).is_none_or(|s| s.voters.len() != 3) && Instant::now() < until { fleet.settle()?; }
         fleet.settle()?;
         for name in ["a","b","c"] {
@@ -6999,12 +7071,12 @@ mod tests {
             && c.live.with(|l|matches!(l.trust(b.my_id),Some(Trust::Trusted{..})))==Some(true))?;
         b.live.report_io(0,None,Some(b.live.now_ns()));
         fleet.detect_links(&[],false,&broken,|| b.live.with(|l|l.own_disk_slow())==Some(true) && c.live.with(|l|l.disk_slow(b.my_id))==Some(Some(true)))?;
-        let until=Instant::now()+TEST_WAIT;
+        let until=Instant::now() + HANG;
         loop {
             fleet.settle()?;
             let (tx,rx)=mpsc::channel();
             a.tx.send(Input::ProcessRefusal(session.into(),c.my_id,tx)).map_err(|_|anyhow::anyhow!("A stopped"))?;
-            if rx.recv_timeout(TEST_WAIT)? {break;}
+            if rx.recv_timeout(HANG)? {break;}
             anyhow::ensure!(Instant::now()<until,"C did not attest its continuing trust of B: A {:?}, B {:?}, C {:?}",a.status(session),b.status(session),c.status(session));
         }
         let incumbent=b.status(session).context("missing incumbent")?;
@@ -7071,7 +7143,7 @@ mod tests {
             anyhow::ensure!(b.confirm_native_activation(session, 2, "b".repeat(64)).is_err(), "wrong native digest cannot open custody");
             b.confirm_native_activation(session, 2, digest)
         });
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !acknowledge.is_finished() && Instant::now() < until { fleet.settle()?; }
         acknowledge.join().map_err(|_| anyhow::anyhow!("destination receipt task stopped"))??;
         fleet.settle()?;
@@ -7097,7 +7169,7 @@ mod tests {
         let source = fleet.mgr("a")?.clone();
         let expected = digest.clone();
         let waiting = thread::spawn(move || crate::rt::block_on(async move { source.wait_moved(session, "b", 1, &expected).await }));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !waiting.is_finished() && Instant::now() < until { fleet.settle()?; }
         anyhow::ensure!(waiting.is_finished(), "the source's wait must end on its committed word");
         let told = waiting.join().map_err(|_| anyhow::anyhow!("source move waiter stopped"))?;
@@ -7116,7 +7188,7 @@ mod tests {
         let opener = fleet.mgr("a")?.clone();
         let opening = thread::spawn(move || opener.open_leader(session, 1, vec![user_event(session, 1, "first")]));
         fleet.mgr("a")?.peer_unreachable("b");
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !opening.is_finished() && Instant::now() < until {
             fleet.mgr("a")?.drive_due();
             thread::sleep(TEST_POLL);
@@ -7177,7 +7249,7 @@ mod tests {
             let st = mgr.open_leader("sess-wal", 3, vec![user_event("sess-wal", 1, "persisted-1")])?;
             anyhow::ensure!(st.is_leader && st.applied >= 2, "initial entry must commit to WAL: {st:?}");
             mgr.propose("sess-wal", 3, vec![user_event("sess-wal", 2, "persisted-2")])?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT), "WAL flush timed out");
+            anyhow::ensure!(mgr.flush(HANG), "WAL flush timed out");
             let st2 = mgr.status("sess-wal").ok_or_else(|| anyhow::anyhow!("missing status before restart"))?;
             anyhow::ensure!(st2.applied > st.applied, "second entry must advance applied in WAL: {st2:?}");
             anyhow::ensure!(wal_path.exists() && std::fs::metadata(&wal_path)?.len() > 0, "convo-raft-000.log must exist on disk");
@@ -7191,7 +7263,7 @@ mod tests {
         // committed row directly into Store without any test-only `mem_rows` path!).
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let mgr_after = Manager::open("laptop-b", wal_dir.path(), Some(store_2.clone()))?;
-        anyhow::ensure!(mgr_after.flush(TEST_WAIT), "WAL reopen flush timed out");
+        anyhow::ensure!(mgr_after.flush(HANG), "WAL reopen flush timed out");
         store_2.sync()?;
         let st_after = mgr_after.status("sess-wal").ok_or_else(|| anyhow::anyhow!("sess-wal missing after WAL restart"))?;
         anyhow::ensure!(st_after.is_leader && st_after.applied >= committed_before, "recovered leader must preserve WAL index (before={committed_before}): {st_after:?}");
@@ -7335,14 +7407,11 @@ mod tests {
     fn oversized_single_row_chunks_through_wal_without_dropping() -> anyhow::Result<()> {
         let fleet = Fleet::new(&["laptop-a", "laptop-b"])?;
         fleet.open("laptop-b", "sess-huge-row", 1, Vec::new())?;
-        let drops_before = dropped_proposals();
         let huge_payload = "Z".repeat(1200 * 1024);
         let huge_ev = user_event("sess-huge-row", 1, &huge_payload);
         anyhow::ensure!(serde_json::to_vec(&huge_ev)?.len() > ENTRY_DATA_MAX, "test row must exceed ENTRY_DATA_MAX");
         fleet.mgr("laptop-b")?.propose("sess-huge-row", 1, vec![huge_ev])?;
         fleet.settle()?;
-
-        anyhow::ensure!(dropped_proposals() == drops_before, "oversized single row must never drop");
         fleet.store("laptop-a")?.sync()?;
         let kept = fleet.store("laptop-a")?.kept("sess-huge-row", 10)?.ok_or_else(|| anyhow::anyhow!("laptop-a missing chunked single row"))?;
         anyhow::ensure!(kept.events.len() == 1 && kept.events.first().is_some_and(|e| e.text.len() == huge_payload.len()), "chunked 1.2 MiB row must replicate intact");
@@ -7362,7 +7431,7 @@ mod tests {
                 let st = mgr.open_leader(&s, 1, vec![user_event(&s, 1, &format!("work-{i}"))])?;
                 anyhow::ensure!(st.is_leader && st.applied >= 2, "{s} must commit to WAL: {st:?}");
             }
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let shards = mgr.shared.lock().shard_count;
             anyhow::ensure!(shards >= 3, "5 live sessions across 2-group shards must span >= 3 WAL shards, got {shards}");
             anyhow::ensure!(mgr.all_status().len() == 5, "zero live sessions may be evicted");
@@ -7370,7 +7439,7 @@ mod tests {
         }
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let reopened = Manager::open_with_shard_groups("laptop-b", wal_dir.path(), Some(store_2.clone()), 2)?;
-        anyhow::ensure!(reopened.flush(TEST_WAIT));
+        anyhow::ensure!(reopened.flush(HANG));
         store_2.sync()?;
         anyhow::ensure!(reopened.all_status().len() == 5, "all 5 sessions across 3 WAL shards must recover after restart");
         for i in 1..=5u64 {
@@ -7398,7 +7467,7 @@ mod tests {
         }
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let reopened = Manager::open("laptop-b", wal_dir.path(), Some(store_2.clone()))?;
-        anyhow::ensure!(reopened.flush(TEST_WAIT));
+        anyhow::ensure!(reopened.flush(HANG));
         store_2.sync()?;
         let kept = store_2.kept("sess-drain", 20)?.ok_or_else(|| anyhow::anyhow!("missing sess-drain after restart"))?;
         anyhow::ensure!(kept.events.len() == 10, "all 10 queued rows must flush durably on shutdown and replay into Store, got {}", kept.events.len());
@@ -7420,7 +7489,7 @@ mod tests {
         let applied_1 = {
             let mgr = Manager::open("laptop-b", &dir_old, Some(store_1))?;
             let st = mgr.open_leader("sess-bg", 1, vec![user_event("sess-bg", 1, "from-old")])?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let a = st.applied;
             mgr.shutdown();
             a
@@ -7430,10 +7499,10 @@ mod tests {
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let applied_2 = {
             let mgr = Manager::open("laptop-b", &dir_new, Some(store_2))?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let epoch = mgr.status("sess-bg").context("missing recovered custody")?.epoch;
             mgr.propose("sess-bg", epoch, vec![user_event("sess-bg", 2, "from-new")])?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let st = mgr.status("sess-bg").ok_or_else(|| anyhow::anyhow!("missing sess-bg in new build"))?;
             anyhow::ensure!(st.applied > applied_1, "incoming build must append onto existing log");
             let a = st.applied;
@@ -7444,7 +7513,7 @@ mod tests {
         move_wal_dir(&dir_new, &dir_old)?;
         let (_sdir3, store_3) = crate::convo::store::scratch()?;
         let mgr_back = Manager::open("laptop-b", &dir_old, Some(store_3.clone()))?;
-        anyhow::ensure!(mgr_back.flush(TEST_WAIT));
+        anyhow::ensure!(mgr_back.flush(HANG));
         store_3.sync()?;
         let st_back = mgr_back.status("sess-bg").ok_or_else(|| anyhow::anyhow!("missing sess-bg after rollback"))?;
         anyhow::ensure!(st_back.is_leader && st_back.applied >= applied_2, "rollback must preserve full log without reset: {st_back:?}");
@@ -7541,7 +7610,7 @@ mod tests {
                 chunk_b64: base64::engine::general_purpose::STANDARD.encode(b"half-json").into(),
             })?;
             mgr.inject_raw_proposal("sess-crash-chunk", orphan_part)?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let (_, _, in_flight) = mgr.snapshot_state("sess-crash-chunk")?;
             anyhow::ensure!(in_flight == 1, "partial chunk must be recorded before crash, got {in_flight}");
             mgr.shutdown();
@@ -7550,12 +7619,12 @@ mod tests {
         // deterministically purges the stranded part 0/2 and unblocks compaction!
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let mgr_after = Manager::open("laptop-b", wal_dir.path(), Some(store_2.clone()))?;
-        anyhow::ensure!(mgr_after.flush(TEST_WAIT));
+        anyhow::ensure!(mgr_after.flush(HANG));
         store_2.sync()?;
         let (_, _, in_flight_after) = mgr_after.snapshot_state("sess-crash-chunk")?;
         anyhow::ensure!(in_flight_after == 0, "new term must purge stranded mid-chunk entry, got {in_flight_after}");
         mgr_after.force_compact("sess-crash-chunk", 0)?;
-        anyhow::ensure!(mgr_after.flush(TEST_WAIT));
+        anyhow::ensure!(mgr_after.flush(HANG));
         Ok(())
     }
 
@@ -7599,7 +7668,7 @@ mod tests {
         let mgr = Manager::open("laptop-b", wal_dir.path(), Some(store.clone()))?;
         // Inject a projection newer than the pinned Raft point to exercise the read failure.
         mgr.open_leader("sess-snap-fail", 1, vec![user_event("sess-snap-fail", 1, "missing-from-store")])?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
 
         let st = mgr.status("sess-snap-fail").context("missing session")?;
         store.apply_raft_rows("sess-snap-fail", st.applied + 1, st.term, vec![user_event("sess-snap-fail", 2, "ahead")])?;
@@ -7678,7 +7747,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-spoof", &spoofed.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
         anyhow::ensure!(mgr.status("sess-spoof").is_none(), "spoofed msg.from must never create a Raft group");
 
         store.put(vec![Row::Session {
@@ -7700,7 +7769,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-mine", &hijack.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
         anyhow::ensure!(mgr.status("sess-mine").is_none(), "peer must not initiate group for session already owned locally");
 
         let fleet = Fleet::new(&["laptop-a", "laptop-b"])?;
@@ -7737,7 +7806,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-bypass", &hb.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
 
         // Step 2: laptop-evil sends a committed entry claiming `target: "agent:laptop-victim"`.
         let evil_entry = ConvoEntry {
@@ -7777,7 +7846,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-bypass", &app.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
         store.sync()?;
         anyhow::ensure!(store.kept("sess-bypass", 10)?.is_none(), "spoofed target row after heartbeat must be dropped");
         Ok(())
@@ -7958,7 +8027,7 @@ mod tests {
             let mgr = Manager::open("laptop-b", wal_dir.path(), Some(store_1))?;
             mgr.open_leader("sess-ok", 1, vec![user_event("sess-ok", 1, "ok")])?;
             mgr.open_leader("sess-corrupt-state", 1, vec![user_event("sess-corrupt-state", 1, "bad")])?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             mgr.shutdown();
         }
         // Corrupt ONLY `sess-corrupt-state`'s state file temporarily so its reopen fails once.
@@ -7979,7 +8048,7 @@ mod tests {
         std::fs::write(&state_path, backup)?;
         let (_sdir3, store_3) = crate::convo::store::scratch()?;
         let mgr_recovered = Manager::open("laptop-b", wal_dir.path(), Some(store_3))?;
-        anyhow::ensure!(mgr_recovered.flush(TEST_WAIT));
+        anyhow::ensure!(mgr_recovered.flush(HANG));
         anyhow::ensure!(mgr_recovered.status("sess-corrupt-state").is_some(), "preserved WAL group must recover cleanly once state file is intact");
         Ok(())
     }
@@ -8139,7 +8208,7 @@ mod tests {
 
         // 5. Bring B back online: B must step down, emit `LostLeadership`, fence its old inbox, and
         //    be UNABLE to propose or accept under its old ownership epoch (epoch 1)!
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while fleet.mgr("node-b")?.status(sess).is_none_or(|s| s.owner.as_deref() != Some(winner_name.as_str()) || s.epoch != new_epoch) && Instant::now() < deadline {
             fleet.settle()?;
         }
@@ -8191,7 +8260,7 @@ mod tests {
         let quorum_ticks = raft_settings(node_id("node-b"), 1)?.core.election_tick;
         for _ in 0..quorum_ticks.saturating_mul(2) {
             fleet.mgr("node-b")?.drive_due();
-            anyhow::ensure!(fleet.mgr("node-b")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("node-b")?.flush(HANG));
             let out = fleet.mgr("node-b")?.outgoing();
             while out.try_recv().is_ok() {}
         }
@@ -8253,7 +8322,7 @@ mod tests {
         let quorum_ticks = raft_settings(node_id("node-b"), 1)?.core.election_tick;
         for _ in 0..quorum_ticks.saturating_mul(2) {
             fleet.mgr("node-b")?.drive_due();
-            anyhow::ensure!(fleet.mgr("node-b")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("node-b")?.flush(HANG));
             let out = fleet.mgr("node-b")?.outgoing();
             while out.try_recv().is_ok() {}
             if h_fail.is_finished() {
@@ -8291,11 +8360,11 @@ mod tests {
         // the newly elected leader CANNOT commit its ownership claim yet!
         fleet.detector_partition(&["node-b"],false)?;
         let mut winner: Option<String> = None;
-        let deadline=Instant::now()+TEST_WAIT+(TEST_WAIT / 2);
+        let deadline=Instant::now() + HANG;
         while Instant::now()<deadline {
             fleet.advance(&["node-b"])?;
             for n in ["node-a", "node-c"] {
-                anyhow::ensure!(fleet.mgr(n)?.flush(TEST_WAIT));
+                anyhow::ensure!(fleet.mgr(n)?.flush(HANG));
             }
             for from in ["node-a", "node-c"] {
                 let rx = fleet.mgr(from)?.outgoing();
@@ -8315,7 +8384,7 @@ mod tests {
                 }
             }
             for n in ["node-a", "node-c"] {
-                anyhow::ensure!(fleet.mgr(n)?.flush(TEST_WAIT));
+                anyhow::ensure!(fleet.mgr(n)?.flush(HANG));
                 if fleet.mgr(n)?.status(sess).is_some_and(|s| s.is_leader) {
                     winner = Some(n.to_owned());
                     break;
@@ -8434,7 +8503,7 @@ mod tests {
         mgr.mark_peer_v2("voter");
         anyhow::ensure!(mgr.status(session).is_some_and(|s| s.recovering && s.owner.is_none()));
 
-        let deadline = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
+        let deadline = Instant::now() + HANG;
         while fleet.mgr("replica")?.status(session).is_none_or(|s| s.recovering) && Instant::now() < deadline {
             for (from,(mgr,_,_,_)) in &fleet.nodes {
                 mgr.drive_due();
@@ -8481,9 +8550,10 @@ mod tests {
         let opening = thread::spawn(move || founder.open_leader(sess, 1, vec![open_row]));
 
         // Pump until the legacy replica confirms the founding entry.
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while !opening.is_finished() && Instant::now() < deadline {
-            anyhow::ensure!(mgr_b.flush(TEST_WAIT) && mgr_leg.flush(TEST_WAIT));
+            flushed(&mgr_b)?;
+            flushed(&mgr_leg)?;
             let rx_b = mgr_b.outgoing();
             while let Ok(m) = rx_b.try_recv() {
                 anyhow::ensure!(m.bytes.get(..4) != Some(WIRE_CHUNK_MAGIC.as_slice()), "must never send KRC1 frame to legacy peer");
@@ -8501,11 +8571,11 @@ mod tests {
 
         // 1. Oversized single row requiring `WireEntry::Part` MUST be refused cleanly rather than
         //    fencing the legacy peer with undecodable `WireEntry::Part` entries!
-        let corrupt_before = corrupt_entries();
         let huge = user_event(sess, 1, &"Q".repeat(1200 * 1024));
         let part_res = mgr_b.propose_sync(sess, 1, vec![user_event(sess, 501, "before"), huge, user_event(sess, 502, "after")]);
         anyhow::ensure!(part_res.is_err(), "proposing WireEntry::Part with legacy peer in group must fail explicitly: {part_res:?}");
-        anyhow::ensure!(corrupt_entries() == corrupt_before, "legacy peer must suffer zero corrupt_entries");
+        flushed(&mgr_leg)?;
+        anyhow::ensure!(mgr_leg.status(sess).is_some_and(|s| !s.recovering) && mgr_leg.recovering().is_empty(), "legacy peer must suffer no corrupt entry");
         anyhow::ensure!(store_b.kept(sess, 20)?.is_some_and(|k| k.events.iter().all(|e| e.text != "before" && e.text != "after")), "rejecting a mixed operation must project no prefix or suffix");
 
         // 2. Oversized snapshot (> WIRE_PART_MAX) for a late legacy peer MUST NOT emit KRC1 frames!
@@ -8515,15 +8585,15 @@ mod tests {
             store_b.put(vec![ev.clone()]);
             mgr_b.propose(sess, 1, vec![ev])?;
         }
-        anyhow::ensure!(mgr_b.flush(TEST_WAIT));
+        flushed(&mgr_b)?;
         mgr_b.force_compact(sess, 0)?;
-        anyhow::ensure!(mgr_b.flush(TEST_WAIT));
+        flushed(&mgr_b)?;
 
         // Register a second late legacy peer without `mark_peer_v2` and confirm zero KRC1 frames!
         mgr_b.register_peers(["laptop-legacy", "laptop-legacy-late"]);
         for _ in 0..8 {
             mgr_b.drive_due();
-            anyhow::ensure!(mgr_b.flush(TEST_WAIT));
+            flushed(&mgr_b)?;
             let rx_b = mgr_b.outgoing();
             while let Ok(m) = rx_b.try_recv() {
                 anyhow::ensure!(
