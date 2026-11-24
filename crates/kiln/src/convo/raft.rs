@@ -67,6 +67,9 @@ const CHUNK_RAW_MAX: usize = ((ENTRY_DATA_MAX - CHUNK_ENVELOPE_MAX) / 4) * 3;
 /// behaviour under test. The manager's own waits are told, never timed.
 #[cfg(test)]
 const TEST_WAIT: Duration = Duration::from_secs(6);
+/// A test's bound on a wait that ends once what it waits for happens: a hang's alone, never a pace (84e73a54d).
+#[cfg(test)]
+const HANG: Duration = Duration::from_secs(300);
 /// The pause between a test's polls of what it drives: the test's pacing, no behaviour under test.
 #[cfg(test)]
 pub(crate) const TEST_POLL: Duration = Duration::from_millis(100);
@@ -6268,8 +6271,6 @@ mod tests {
     /// slow, which is no failure; a node whose writes stop finishing, or one with a group fenced
     /// or reopening, is.
     fn flushed(mgr: &Manager) -> anyhow::Result<()> {
-        // A hang's bound, never a pace: a loaded machine makes a write durable when it can (84e73a54d).
-        const HANG: Duration = Duration::from_secs(300);
         let mut seen = mgr.durable_writes();
         let mut since = std::time::Instant::now();
         loop {
@@ -6335,7 +6336,7 @@ mod tests {
         fn while_pumping<T: Send>(&self, call: impl FnOnce() -> anyhow::Result<T> + Send) -> anyhow::Result<T> {
             thread::scope(|scope| {
                 let job = scope.spawn(call);
-                let until = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
+                let until = Instant::now() + HANG;
                 let mut pumped = Ok(());
                 while !job.is_finished() && Instant::now() < until && pumped.is_ok() { pumped = self.settle(); }
                 // A caller waits on its owner's answer, never a timer. One still waiting here is a
@@ -6436,7 +6437,7 @@ mod tests {
             for m in online() {
                 let (ask,answer)=mpsc::channel();
                 m.tx.send(Input::NextTimer(ask)).map_err(|_|anyhow::anyhow!("Raft timer owner stopped"))?;
-                if let Some(t)=answer.recv_timeout(TEST_WAIT)? {next=Some(next.map_or(t,|old:u64|old.min(t)));}
+                if let Some(t)=answer.recv_timeout(HANG)? {next=Some(next.map_or(t,|old:u64|old.min(t)));}
             }
             if let Some(at)=next {self.links_to(at)?;}
             for m in online() {
@@ -6622,7 +6623,7 @@ mod tests {
 
         fn elect_survivor(&self, offline: &[&str], session: &str) -> anyhow::Result<()> {
             self.detector_partition(offline, false)?;
-            let until = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
+            let until = Instant::now() + HANG;
             loop {
                 self.settle_except(offline)?;
                 if self
@@ -6740,18 +6741,18 @@ mod tests {
         let session = "explicit-across-rosters";
         let minority = fleet.mgr("d")?.clone();
         let pending = thread::spawn(move || minority.open_leader(session, 1, vec![user_event(session, 1, "CDE")]));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while fleet.store("c")?.kept(session, 1)?.is_none_or(|k| k.events.is_empty()) && Instant::now() < until { fleet.settle_except(&["a","b"])?; }
         anyhow::ensure!(!pending.is_finished() && fleet.mgr("d")?.status(session).is_some_and(|st| !st.founded), "a disjoint directory majority acknowledged the id");
         let majority = fleet.mgr("a")?.clone();
         let winner = thread::spawn(move || majority.open_leader(session, 1, vec![user_event(session, 1, "AB")]));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !winner.is_finished() && Instant::now() < until { fleet.settle_except(&["c","d","e"])?; }
         winner.join().map_err(|_| anyhow::anyhow!("charter owner stopped"))??;
         // The provisional founder is told once it hears the winner: no timer answers it. Its
         // groups beat once the detector has measured their links.
         fleet.detector_partition(&[], false)?;
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !pending.is_finished() && Instant::now() < until { fleet.settle()?; }
         anyhow::ensure!(pending.is_finished(), "the provisional founder must be told once it hears the winner");
         anyhow::ensure!(pending.join().map_err(|_| anyhow::anyhow!("provisional founder stopped"))?.is_err());
@@ -6792,7 +6793,7 @@ mod tests {
         let session = "cutoff-before-registrar-contact";
         let original = fleet.mgr("a")?.clone();
         let opening = thread::spawn(move || original.open_leader(session, 1, vec![user_event(session, 1, "original prompt")]));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while fleet.store("c")?.kept(session, 1)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < until {
             fleet.settle_except(&["registrar"])?;
         }
@@ -6822,9 +6823,9 @@ mod tests {
         let selected = fleet.mgr("original")?.clone();
         let session = "opening-at-cutoff";
         let opening = thread::spawn(move || selected.open_leader(session, 1, vec![user_event(session, 1, "selected")]));
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while fleet.store("original")?.kept(session, 1)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < deadline {
-            anyhow::ensure!(fleet.mgr("original")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("original")?.flush(HANG));
         }
         let original_status = fleet.mgr("original")?.status(session).context("opening local slot")?;
         let registrar = fleet.mgr("registrar")?;
@@ -6832,7 +6833,7 @@ mod tests {
         beat.from = node_id("original");
         beat.term = original_status.term;
         registrar.step("original", session, &beat.encode_to_vec())?;
-        anyhow::ensure!(registrar.flush(TEST_WAIT));
+        anyhow::ensure!(registrar.flush(HANG));
         anyhow::ensure!(registrar.historical_name_inventory()?.iter().any(|s| s == session));
         let reserved: BTreeSet<_> = registrar.freeze_name_registrar()?.into_iter().collect();
         let digest = [2;32];
@@ -6859,17 +6860,17 @@ mod tests {
         };
         let first = run("a")?;
         let other = run("b")?;
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         // Let both selected candidates commit their independent index/term locally.
         for node in ["a","b"] {
-            while fleet.store(node)?.kept(session, 8)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < until { anyhow::ensure!(fleet.mgr(node)?.flush(TEST_WAIT)); }
+            while fleet.store(node)?.kept(session, 8)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < until { anyhow::ensure!(fleet.mgr(node)?.flush(HANG)); }
             anyhow::ensure!(fleet.mgr(node)?.status(session).is_some_and(|st| !st.founded));
         }
         while !first.is_finished() && Instant::now() < until { fleet.settle_except(&["b"])?; }
         first.join().map_err(|_| anyhow::anyhow!("first founder stopped"))??;
         fleet.settle()?;
         anyhow::ensure!(other.join().map_err(|_| anyhow::anyhow!("other founder stopped"))?.is_err());
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !fleet.mgr("b")?.status(session).is_some_and(|s| s.owner.as_deref() == Some("a")) && Instant::now() < until { fleet.settle()?; }
         let loser = fleet.mgr("b")?.status(session);
         anyhow::ensure!(loser.as_ref().is_some_and(|s| s.founded && s.owner.as_deref() == Some("a")), "rejected founder failed to reconcile: {loser:?}, winner {:?}", fleet.mgr("a")?.status(session));
@@ -6877,7 +6878,7 @@ mod tests {
         anyhow::ensure!(fleet.store("c")?.kept(session, 8)?.is_some_and(|s| s.events.iter().all(|e| e.text == "a")));
         let winner = fleet.mgr("a")?.clone();
         let sending = thread::spawn(move || winner.propose_sync(session, 1, vec![user_event(session, 2, "after repair")]));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !sending.is_finished() && Instant::now() < until { fleet.settle()?; }
         sending.join().map_err(|_| anyhow::anyhow!("winner stopped during follow-up"))??;
         fleet.settle()?;
@@ -6898,9 +6899,9 @@ mod tests {
             let (m, name) = (manager.clone(), name.clone());
             opens.push(thread::spawn(move || m.open_leader(session, 1, vec![user_event(session, 1, &name)])));
         }
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         for (manager, store, _, _) in fleet.nodes.values() {
-            while store.kept(session, 1)?.is_none_or(|k| k.events.is_empty()) && Instant::now() < deadline { anyhow::ensure!(manager.flush(TEST_WAIT)); }
+            while store.kept(session, 1)?.is_none_or(|k| k.events.is_empty()) && Instant::now() < deadline { anyhow::ensure!(manager.flush(HANG)); }
         }
         while opens.iter().any(|op| !op.is_finished()) && Instant::now() < deadline { fleet.settle()?; }
         for opening in opens {
@@ -6964,18 +6965,18 @@ mod tests {
         let source = fleet.mgr("a")?.clone();
         let session = "sess-bootstrap-receipt";
         let opening = thread::spawn(move || source.open_leader(session, 1, vec![user_event(session, 1, "open")]));
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while fleet.store("a")?.kept(session, 10)?.is_none_or(|s| s.events.is_empty()) && Instant::now() < deadline {
-            anyhow::ensure!(fleet.mgr("a")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("a")?.flush(HANG));
         }
         anyhow::ensure!(fleet.mgr("a")?.status(session).is_some_and(|st| !st.founded) && !opening.is_finished(), "local apply alone exposed or acknowledged founding");
         while !opening.is_finished() && Instant::now() < deadline { fleet.settle()?; }
         opening.join().map_err(|_| anyhow::anyhow!("founder stopped"))??;
         let source = fleet.mgr("a")?.clone();
         let sending = thread::spawn(move || source.propose_sync(session, 1, vec![user_event(session, 2, "first")]));
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while fleet.store("a")?.kept(session, 10)?.is_none_or(|s| s.events.len() < 2) && Instant::now() < deadline {
-            anyhow::ensure!(fleet.mgr("a")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("a")?.flush(HANG));
         }
         anyhow::ensure!(!sending.is_finished(), "local apply alone acknowledged the first message");
         while !sending.is_finished() && Instant::now() < deadline { fleet.settle()?; }
@@ -6997,7 +6998,7 @@ mod tests {
         let selected = fleet.mgr("c")?;
         let status = thread::scope(|scope| -> anyhow::Result<GroupStatus> {
             let opening = scope.spawn(|| selected.open_leader(session, 0, vec![user_event(session, 1, "offline opening")]));
-            let deadline = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
+            let deadline = Instant::now() + HANG;
             while !opening.is_finished() && Instant::now() < deadline { fleet.settle_except(&["b"])?; }
             opening.join().map_err(|_| anyhow::anyhow!("founder stopped"))?
         })?;
@@ -7016,7 +7017,7 @@ mod tests {
         let before = fleet.mgr("b")?.status(session).context("missing founding group")?;
         anyhow::ensure!(before.voters.len() == 1 && before.owner.as_deref() == Some("b"));
         fleet.add_node("c")?;
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while fleet.mgr("b")?.status(session).is_none_or(|s| s.voters.len() != 3) && Instant::now() < until { fleet.settle()?; }
         fleet.settle()?;
         for name in ["a","b","c"] {
@@ -7070,12 +7071,12 @@ mod tests {
             && c.live.with(|l|matches!(l.trust(b.my_id),Some(Trust::Trusted{..})))==Some(true))?;
         b.live.report_io(0,None,Some(b.live.now_ns()));
         fleet.detect_links(&[],false,&broken,|| b.live.with(|l|l.own_disk_slow())==Some(true) && c.live.with(|l|l.disk_slow(b.my_id))==Some(Some(true)))?;
-        let until=Instant::now()+TEST_WAIT;
+        let until=Instant::now() + HANG;
         loop {
             fleet.settle()?;
             let (tx,rx)=mpsc::channel();
             a.tx.send(Input::ProcessRefusal(session.into(),c.my_id,tx)).map_err(|_|anyhow::anyhow!("A stopped"))?;
-            if rx.recv_timeout(TEST_WAIT)? {break;}
+            if rx.recv_timeout(HANG)? {break;}
             anyhow::ensure!(Instant::now()<until,"C did not attest its continuing trust of B: A {:?}, B {:?}, C {:?}",a.status(session),b.status(session),c.status(session));
         }
         let incumbent=b.status(session).context("missing incumbent")?;
@@ -7142,7 +7143,7 @@ mod tests {
             anyhow::ensure!(b.confirm_native_activation(session, 2, "b".repeat(64)).is_err(), "wrong native digest cannot open custody");
             b.confirm_native_activation(session, 2, digest)
         });
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !acknowledge.is_finished() && Instant::now() < until { fleet.settle()?; }
         acknowledge.join().map_err(|_| anyhow::anyhow!("destination receipt task stopped"))??;
         fleet.settle()?;
@@ -7168,7 +7169,7 @@ mod tests {
         let source = fleet.mgr("a")?.clone();
         let expected = digest.clone();
         let waiting = thread::spawn(move || crate::rt::block_on(async move { source.wait_moved(session, "b", 1, &expected).await }));
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !waiting.is_finished() && Instant::now() < until { fleet.settle()?; }
         anyhow::ensure!(waiting.is_finished(), "the source's wait must end on its committed word");
         let told = waiting.join().map_err(|_| anyhow::anyhow!("source move waiter stopped"))?;
@@ -7187,7 +7188,7 @@ mod tests {
         let opener = fleet.mgr("a")?.clone();
         let opening = thread::spawn(move || opener.open_leader(session, 1, vec![user_event(session, 1, "first")]));
         fleet.mgr("a")?.peer_unreachable("b");
-        let until = Instant::now() + TEST_WAIT;
+        let until = Instant::now() + HANG;
         while !opening.is_finished() && Instant::now() < until {
             fleet.mgr("a")?.drive_due();
             thread::sleep(TEST_POLL);
@@ -7248,7 +7249,7 @@ mod tests {
             let st = mgr.open_leader("sess-wal", 3, vec![user_event("sess-wal", 1, "persisted-1")])?;
             anyhow::ensure!(st.is_leader && st.applied >= 2, "initial entry must commit to WAL: {st:?}");
             mgr.propose("sess-wal", 3, vec![user_event("sess-wal", 2, "persisted-2")])?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT), "WAL flush timed out");
+            anyhow::ensure!(mgr.flush(HANG), "WAL flush timed out");
             let st2 = mgr.status("sess-wal").ok_or_else(|| anyhow::anyhow!("missing status before restart"))?;
             anyhow::ensure!(st2.applied > st.applied, "second entry must advance applied in WAL: {st2:?}");
             anyhow::ensure!(wal_path.exists() && std::fs::metadata(&wal_path)?.len() > 0, "convo-raft-000.log must exist on disk");
@@ -7262,7 +7263,7 @@ mod tests {
         // committed row directly into Store without any test-only `mem_rows` path!).
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let mgr_after = Manager::open("laptop-b", wal_dir.path(), Some(store_2.clone()))?;
-        anyhow::ensure!(mgr_after.flush(TEST_WAIT), "WAL reopen flush timed out");
+        anyhow::ensure!(mgr_after.flush(HANG), "WAL reopen flush timed out");
         store_2.sync()?;
         let st_after = mgr_after.status("sess-wal").ok_or_else(|| anyhow::anyhow!("sess-wal missing after WAL restart"))?;
         anyhow::ensure!(st_after.is_leader && st_after.applied >= committed_before, "recovered leader must preserve WAL index (before={committed_before}): {st_after:?}");
@@ -7430,7 +7431,7 @@ mod tests {
                 let st = mgr.open_leader(&s, 1, vec![user_event(&s, 1, &format!("work-{i}"))])?;
                 anyhow::ensure!(st.is_leader && st.applied >= 2, "{s} must commit to WAL: {st:?}");
             }
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let shards = mgr.shared.lock().shard_count;
             anyhow::ensure!(shards >= 3, "5 live sessions across 2-group shards must span >= 3 WAL shards, got {shards}");
             anyhow::ensure!(mgr.all_status().len() == 5, "zero live sessions may be evicted");
@@ -7438,7 +7439,7 @@ mod tests {
         }
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let reopened = Manager::open_with_shard_groups("laptop-b", wal_dir.path(), Some(store_2.clone()), 2)?;
-        anyhow::ensure!(reopened.flush(TEST_WAIT));
+        anyhow::ensure!(reopened.flush(HANG));
         store_2.sync()?;
         anyhow::ensure!(reopened.all_status().len() == 5, "all 5 sessions across 3 WAL shards must recover after restart");
         for i in 1..=5u64 {
@@ -7466,7 +7467,7 @@ mod tests {
         }
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let reopened = Manager::open("laptop-b", wal_dir.path(), Some(store_2.clone()))?;
-        anyhow::ensure!(reopened.flush(TEST_WAIT));
+        anyhow::ensure!(reopened.flush(HANG));
         store_2.sync()?;
         let kept = store_2.kept("sess-drain", 20)?.ok_or_else(|| anyhow::anyhow!("missing sess-drain after restart"))?;
         anyhow::ensure!(kept.events.len() == 10, "all 10 queued rows must flush durably on shutdown and replay into Store, got {}", kept.events.len());
@@ -7488,7 +7489,7 @@ mod tests {
         let applied_1 = {
             let mgr = Manager::open("laptop-b", &dir_old, Some(store_1))?;
             let st = mgr.open_leader("sess-bg", 1, vec![user_event("sess-bg", 1, "from-old")])?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let a = st.applied;
             mgr.shutdown();
             a
@@ -7498,10 +7499,10 @@ mod tests {
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let applied_2 = {
             let mgr = Manager::open("laptop-b", &dir_new, Some(store_2))?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let epoch = mgr.status("sess-bg").context("missing recovered custody")?.epoch;
             mgr.propose("sess-bg", epoch, vec![user_event("sess-bg", 2, "from-new")])?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let st = mgr.status("sess-bg").ok_or_else(|| anyhow::anyhow!("missing sess-bg in new build"))?;
             anyhow::ensure!(st.applied > applied_1, "incoming build must append onto existing log");
             let a = st.applied;
@@ -7512,7 +7513,7 @@ mod tests {
         move_wal_dir(&dir_new, &dir_old)?;
         let (_sdir3, store_3) = crate::convo::store::scratch()?;
         let mgr_back = Manager::open("laptop-b", &dir_old, Some(store_3.clone()))?;
-        anyhow::ensure!(mgr_back.flush(TEST_WAIT));
+        anyhow::ensure!(mgr_back.flush(HANG));
         store_3.sync()?;
         let st_back = mgr_back.status("sess-bg").ok_or_else(|| anyhow::anyhow!("missing sess-bg after rollback"))?;
         anyhow::ensure!(st_back.is_leader && st_back.applied >= applied_2, "rollback must preserve full log without reset: {st_back:?}");
@@ -7609,7 +7610,7 @@ mod tests {
                 chunk_b64: base64::engine::general_purpose::STANDARD.encode(b"half-json").into(),
             })?;
             mgr.inject_raw_proposal("sess-crash-chunk", orphan_part)?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             let (_, _, in_flight) = mgr.snapshot_state("sess-crash-chunk")?;
             anyhow::ensure!(in_flight == 1, "partial chunk must be recorded before crash, got {in_flight}");
             mgr.shutdown();
@@ -7618,12 +7619,12 @@ mod tests {
         // deterministically purges the stranded part 0/2 and unblocks compaction!
         let (_sdir2, store_2) = crate::convo::store::scratch()?;
         let mgr_after = Manager::open("laptop-b", wal_dir.path(), Some(store_2.clone()))?;
-        anyhow::ensure!(mgr_after.flush(TEST_WAIT));
+        anyhow::ensure!(mgr_after.flush(HANG));
         store_2.sync()?;
         let (_, _, in_flight_after) = mgr_after.snapshot_state("sess-crash-chunk")?;
         anyhow::ensure!(in_flight_after == 0, "new term must purge stranded mid-chunk entry, got {in_flight_after}");
         mgr_after.force_compact("sess-crash-chunk", 0)?;
-        anyhow::ensure!(mgr_after.flush(TEST_WAIT));
+        anyhow::ensure!(mgr_after.flush(HANG));
         Ok(())
     }
 
@@ -7667,7 +7668,7 @@ mod tests {
         let mgr = Manager::open("laptop-b", wal_dir.path(), Some(store.clone()))?;
         // Inject a projection newer than the pinned Raft point to exercise the read failure.
         mgr.open_leader("sess-snap-fail", 1, vec![user_event("sess-snap-fail", 1, "missing-from-store")])?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
 
         let st = mgr.status("sess-snap-fail").context("missing session")?;
         store.apply_raft_rows("sess-snap-fail", st.applied + 1, st.term, vec![user_event("sess-snap-fail", 2, "ahead")])?;
@@ -7746,7 +7747,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-spoof", &spoofed.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
         anyhow::ensure!(mgr.status("sess-spoof").is_none(), "spoofed msg.from must never create a Raft group");
 
         store.put(vec![Row::Session {
@@ -7768,7 +7769,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-mine", &hijack.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
         anyhow::ensure!(mgr.status("sess-mine").is_none(), "peer must not initiate group for session already owned locally");
 
         let fleet = Fleet::new(&["laptop-a", "laptop-b"])?;
@@ -7805,7 +7806,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-bypass", &hb.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
 
         // Step 2: laptop-evil sends a committed entry claiming `target: "agent:laptop-victim"`.
         let evil_entry = ConvoEntry {
@@ -7845,7 +7846,7 @@ mod tests {
             ..Message::default()
         };
         mgr.step("laptop-evil", "sess-bypass", &app.encode_to_vec())?;
-        anyhow::ensure!(mgr.flush(TEST_WAIT));
+        anyhow::ensure!(mgr.flush(HANG));
         store.sync()?;
         anyhow::ensure!(store.kept("sess-bypass", 10)?.is_none(), "spoofed target row after heartbeat must be dropped");
         Ok(())
@@ -8026,7 +8027,7 @@ mod tests {
             let mgr = Manager::open("laptop-b", wal_dir.path(), Some(store_1))?;
             mgr.open_leader("sess-ok", 1, vec![user_event("sess-ok", 1, "ok")])?;
             mgr.open_leader("sess-corrupt-state", 1, vec![user_event("sess-corrupt-state", 1, "bad")])?;
-            anyhow::ensure!(mgr.flush(TEST_WAIT));
+            anyhow::ensure!(mgr.flush(HANG));
             mgr.shutdown();
         }
         // Corrupt ONLY `sess-corrupt-state`'s state file temporarily so its reopen fails once.
@@ -8047,7 +8048,7 @@ mod tests {
         std::fs::write(&state_path, backup)?;
         let (_sdir3, store_3) = crate::convo::store::scratch()?;
         let mgr_recovered = Manager::open("laptop-b", wal_dir.path(), Some(store_3))?;
-        anyhow::ensure!(mgr_recovered.flush(TEST_WAIT));
+        anyhow::ensure!(mgr_recovered.flush(HANG));
         anyhow::ensure!(mgr_recovered.status("sess-corrupt-state").is_some(), "preserved WAL group must recover cleanly once state file is intact");
         Ok(())
     }
@@ -8207,7 +8208,7 @@ mod tests {
 
         // 5. Bring B back online: B must step down, emit `LostLeadership`, fence its old inbox, and
         //    be UNABLE to propose or accept under its old ownership epoch (epoch 1)!
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while fleet.mgr("node-b")?.status(sess).is_none_or(|s| s.owner.as_deref() != Some(winner_name.as_str()) || s.epoch != new_epoch) && Instant::now() < deadline {
             fleet.settle()?;
         }
@@ -8259,7 +8260,7 @@ mod tests {
         let quorum_ticks = raft_settings(node_id("node-b"), 1)?.core.election_tick;
         for _ in 0..quorum_ticks.saturating_mul(2) {
             fleet.mgr("node-b")?.drive_due();
-            anyhow::ensure!(fleet.mgr("node-b")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("node-b")?.flush(HANG));
             let out = fleet.mgr("node-b")?.outgoing();
             while out.try_recv().is_ok() {}
         }
@@ -8321,7 +8322,7 @@ mod tests {
         let quorum_ticks = raft_settings(node_id("node-b"), 1)?.core.election_tick;
         for _ in 0..quorum_ticks.saturating_mul(2) {
             fleet.mgr("node-b")?.drive_due();
-            anyhow::ensure!(fleet.mgr("node-b")?.flush(TEST_WAIT));
+            anyhow::ensure!(fleet.mgr("node-b")?.flush(HANG));
             let out = fleet.mgr("node-b")?.outgoing();
             while out.try_recv().is_ok() {}
             if h_fail.is_finished() {
@@ -8359,11 +8360,11 @@ mod tests {
         // the newly elected leader CANNOT commit its ownership claim yet!
         fleet.detector_partition(&["node-b"],false)?;
         let mut winner: Option<String> = None;
-        let deadline=Instant::now()+TEST_WAIT+(TEST_WAIT / 2);
+        let deadline=Instant::now() + HANG;
         while Instant::now()<deadline {
             fleet.advance(&["node-b"])?;
             for n in ["node-a", "node-c"] {
-                anyhow::ensure!(fleet.mgr(n)?.flush(TEST_WAIT));
+                anyhow::ensure!(fleet.mgr(n)?.flush(HANG));
             }
             for from in ["node-a", "node-c"] {
                 let rx = fleet.mgr(from)?.outgoing();
@@ -8383,7 +8384,7 @@ mod tests {
                 }
             }
             for n in ["node-a", "node-c"] {
-                anyhow::ensure!(fleet.mgr(n)?.flush(TEST_WAIT));
+                anyhow::ensure!(fleet.mgr(n)?.flush(HANG));
                 if fleet.mgr(n)?.status(sess).is_some_and(|s| s.is_leader) {
                     winner = Some(n.to_owned());
                     break;
@@ -8502,7 +8503,7 @@ mod tests {
         mgr.mark_peer_v2("voter");
         anyhow::ensure!(mgr.status(session).is_some_and(|s| s.recovering && s.owner.is_none()));
 
-        let deadline = Instant::now() + TEST_WAIT + (TEST_WAIT / 2);
+        let deadline = Instant::now() + HANG;
         while fleet.mgr("replica")?.status(session).is_none_or(|s| s.recovering) && Instant::now() < deadline {
             for (from,(mgr,_,_,_)) in &fleet.nodes {
                 mgr.drive_due();
@@ -8549,7 +8550,7 @@ mod tests {
         let opening = thread::spawn(move || founder.open_leader(sess, 1, vec![open_row]));
 
         // Pump until the legacy replica confirms the founding entry.
-        let deadline = Instant::now() + TEST_WAIT;
+        let deadline = Instant::now() + HANG;
         while !opening.is_finished() && Instant::now() < deadline {
             flushed(&mgr_b)?;
             flushed(&mgr_leg)?;
