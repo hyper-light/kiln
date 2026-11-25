@@ -118,7 +118,7 @@ pub struct InstallArgs {
     /// Port on this machine for kiln's local UI and API (default: 7070; Docker also uses port+1 for QUIC).
     #[arg(long, default_value_t = 7070)]
     pub port: u16,
-    /// Local node HTTP server address for an installed agent (default: `0.0.0.0:<port>`; pass `off` to disable).
+    /// Local node HTTP server address for an installed agent (default: `0.0.0.0:7073`; pass `off` to disable).
     #[arg(long, env = "KILN_NODE_HTTP_ADDR")]
     pub http_addr: Option<String>,
 }
@@ -592,12 +592,12 @@ async fn agent_setup(a: &InstallArgs) -> anyhow::Result<Vec<String>> {
     Ok(args)
 }
 
-/// Resolved local HTTP server bind address for an installed runner node (enabled by default on `0.0.0.0:<port>`).
+/// Resolved local HTTP server bind address for an installed runner node (enabled by default on `0.0.0.0:7073`).
 fn agent_http_addr(a: &InstallArgs) -> Option<String> {
     match a.http_addr.as_deref().map(str::trim) {
         Some(v) if v.eq_ignore_ascii_case("off") || v.is_empty() => None,
         Some(v) => Some(v.to_owned()),
-        None => Some(format!("0.0.0.0:{}", a.port)),
+        None => Some(crate::config::NODE_HTTP_ADDR.to_owned()),
     }
 }
 

@@ -387,10 +387,10 @@ struct AgentArgs {
     no_observe: bool,
     #[arg(long, env = "KILN_SHELL")]
     shell: Option<String>,
-    /// Local HTTP server address for this runner node (default: 0.0.0.0:7070; pass `off` to disable).
+    /// Local HTTP server address for this runner node (default: 0.0.0.0:7073; pass `off` to disable).
     /// Runs a unified fleet entrypoint backed by cluster Raft, per-session conversation Raft, and
     /// direct `hyper-quic` peer-to-peer message forwarding.
-    #[arg(long, env = "KILN_NODE_HTTP_ADDR", default_value = "0.0.0.0:7070")]
+    #[arg(long, env = "KILN_NODE_HTTP_ADDR", default_value = kiln::config::NODE_HTTP_ADDR)]
     http_addr: String,
     /// Fault injection, a test build's (docs/ci.md W22-AC04): `drop=2s,delay=300ms,oom=1s,disk=8,corrupt`.
     #[cfg(feature = "chaos")]
@@ -820,7 +820,7 @@ async fn real_main(cli: Cli) -> anyhow::Result<()> {
                 declared: kiln::runner::probe::Declared::from_file(&config_path),
                 // A runner process reaches no credential store: its microVMs hold no credentials (plan step 33).
                 leasing: None,
-                // Part 1: every non-ephemeral runner also serves its own local HTTP entrypoint (`0.0.0.0:7070`) by default.
+                // Part 1: every non-ephemeral runner also serves its own local HTTP entrypoint (`0.0.0.0:7073`) by default.
                 node_http: (!a.ephemeral && !a.http_addr.eq_ignore_ascii_case("off") && !a.http_addr.trim().is_empty()).then_some(a.http_addr),
             };
             let result = boxed(|| run_agent(opts, shutdown)).await;

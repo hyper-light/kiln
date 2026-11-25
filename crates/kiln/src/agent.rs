@@ -82,7 +82,7 @@ pub struct Opts {
     /// server's own runner. None elsewhere, where its runs' asks go to the server's broker over this runner's link to it
     /// (`secrets::lessor::Remote`, its reach node's), or, with no link, are refused (`sandbox::hexvm::NO_BROKER`).
     pub leasing: Option<crate::sandbox::Leasing>,
-    /// Local HTTP server address for this runner node (default `Some("0.0.0.0:7070")`; `None` for
+    /// Local HTTP server address for this runner node (default `Some("0.0.0.0:7073")`; `None` for
     /// ephemeral pods, outposts, in-process `local-agent`, or `--http-addr off`).
     pub node_http: Option<String>,
 }
@@ -3185,7 +3185,7 @@ pub(crate) async fn run_node(o: Opts, shutdown: Shutdown, embedded: Option<Arc<c
         });
         ln
     });
-    // Start this runner node's own local HTTP server (`0.0.0.0:7070` by default) unless disabled or
+    // Start this runner node's own local HTTP server (`0.0.0.0:7073` by default) unless disabled or
     // taking over during blue/green upgrade. Gracefully yields on `AddrInUse` if co-located with `kiln server`.
     let bind_node = |node: &crate::frontdoor::replica::LocalNode| -> anyhow::Result<Option<crate::frontdoor::proxy::Listening>> {
         let Some(addr) = &o.node_http else { return Ok(None); };

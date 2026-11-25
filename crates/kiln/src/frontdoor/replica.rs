@@ -2869,7 +2869,7 @@ impl srv::Handler for Door {
     }
 }
 
-/// Start a runner node's own local HTTP server (`0.0.0.0:7070` by default) serving kiln's unified
+/// Start a runner node's own local HTTP server (`0.0.0.0:7073` by default) serving kiln's unified
 /// UI/API entrypoint backed by its cluster Raft learner, per-session conversation Raft store, and
 /// direct `hyper-quic` peer-to-peer message forwarding.
 ///

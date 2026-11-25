@@ -87,6 +87,7 @@ pub fn candidates(cfg: &Config, url: Option<&str>, token: Option<&str>) -> Vec<T
         urls.extend(cred("KILN_URL"));
         urls.push(local_url(cfg));
         urls.push("http://localhost:7070".to_owned());
+        urls.push("http://localhost:7073".to_owned());
     }
     urls.dedup();
     let mut tokens: Vec<(String, String)> = Vec::new();
