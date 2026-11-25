@@ -440,7 +440,10 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
     let mut agents = Vec::new();
     if m.is_some() || shape == Shape::Marketplace {
         for d in named_dirs(m.as_ref(), "agents", &root, "agents") {
-            for (rest, f) in tree.within(&d) {
+            // W20-R01: a manifest's `agents` names files (`./agents/lead.md`) as often as a folder.
+            let one: Vec<(&str, &File)> = tree.files.get(d.as_str()).map(|f| (base(&d), *f)).into_iter().collect();
+            let listed: Vec<(&str, &File)> = if one.is_empty() { tree.within(&d).collect() } else { one };
+            for (rest, f) in listed {
                 if rest.contains('/') || !rest.ends_with(".md") {
                     continue;
                 }
@@ -463,6 +466,14 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
             hooks.extend(events.keys().cloned());
         }
         out.push(File { path: format!("hooks/{rest}"), bytes: f.bytes.clone(), exec: f.exec });
+    }
+    // W20-R01: the plugin's own `bin/` runs on the machine too: its scripts' interpreters are needs.
+    if m.is_some() || shape == Shape::Marketplace {
+        for (_, f) in tree.within(&at("bin")) {
+            if let Some(t) = interpreter(&f.bytes) {
+                needs.insert(t);
+            }
+        }
     }
     let mut mcp = Vec::new();
     if let Some(f) = tree.files.get(at(".mcp.json").as_str()) {
@@ -595,6 +606,24 @@ mod tests {
         // The marketplace's root, with two plugins and no name: a choice.
         assert!(matches!(read(&files, None, "plugins"), Ok(Read::Choose(c)) if c.len() == 2));
         assert_eq!(read(&files, Some("nope"), "plugins"), Err(Refusal::NoPlugin("nope".into())));
+        Ok(())
+    }
+
+    #[test]
+    fn w20_r01_a_manifest_names_agent_files_and_bin_scripts_are_needs() -> anyhow::Result<()> {
+        let files = vec![
+            f(".claude-plugin/marketplace.json", r#"{"name":"astack","plugins":[{"name":"astack","source":"./harness/claude-code"}]}"#),
+            f("harness/claude-code/.claude-plugin/plugin.json", r#"{"name":"astack","skills":"./skills/","agents":["./agents/lead.md","./agents/worker.md"]}"#),
+            f("harness/claude-code/skills/ab-test/SKILL.md", &skill("ab-test", "Compare.")),
+            f("harness/claude-code/agents/lead.md", "---\nname: lead\ndescription: Leads.\n---\n"),
+            f("harness/claude-code/agents/worker.md", "---\nname: worker\ndescription: Works.\n---\n"),
+            f("harness/claude-code/agents/unlisted.md", "---\nname: unlisted\n---\n"),
+            f("harness/claude-code/bin/astack-status", "#!/usr/bin/env python3\nprint(1)\n"),
+            f("harness/claude-code/bin/astack-stamp-hook", "#!/bin/sh\ntrue\n"),
+        ];
+        let p = package(read(&files, None, "astack"))?;
+        assert_eq!(p.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["lead", "worker"]);
+        assert_eq!(p.needs, ["python3"]);
         Ok(())
     }
 
