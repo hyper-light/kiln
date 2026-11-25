@@ -1028,7 +1028,7 @@ pub async fn offer_instead_of_server(config_path: &Path, cfg: &crate::config::Co
         no_install: false,
         boot: crate::install::Boot::Auto,
         wait: 3,
-        http_addr: "0.0.0.0:7070".to_owned(),
+        http_addr: crate::config::NODE_HTTP_ADDR.to_owned(),
     };
     cli(args, shutdown).await?;
     Ok(true)
@@ -1066,8 +1066,8 @@ pub struct JoinArgs {
     /// Seconds to look for servers on the network.
     #[arg(long, default_value_t = 3)]
     pub wait: u64,
-    /// Local HTTP server address for this runner node (default: 0.0.0.0:7070; pass `off` to disable).
-    #[arg(long, env = "KILN_NODE_HTTP_ADDR", default_value = "0.0.0.0:7070")]
+    /// Local HTTP server address for this runner node (default: 0.0.0.0:7073; pass `off` to disable).
+    #[arg(long, env = "KILN_NODE_HTTP_ADDR", default_value = crate::config::NODE_HTTP_ADDR)]
     pub http_addr: String,
 }
 

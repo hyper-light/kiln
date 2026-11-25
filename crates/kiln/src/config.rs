@@ -87,6 +87,10 @@ pub struct Workspaces {
     pub enabled: bool,
 }
 
+/// Where a runner's node HTTP listens unless told otherwise: its own port, never the server's 7070 (a runner and a server on one
+/// machine both bound 7070 and the loser never served, 2026-11-25).
+pub const NODE_HTTP_ADDR: &str = "0.0.0.0:7073";
+
 /// Why a start that asks for a Slates volume is refused while `[workspaces]` is off ([`Workspaces`]).
 pub const WORKSPACES_OFF: &str = "Slates workspaces are off on this kiln: they're an option its owner enables (`[workspaces] enabled = true` in the server's config)";
 
@@ -1139,6 +1143,15 @@ impl Default for Updates {
 #[cfg(test)]
 mod reach_tests {
     use super::*;
+
+    /// A runner's node HTTP and the server's HTTP, both defaults, are on different ports (a runner and a server on one
+    /// machine took the same one, and the one that lost never served).
+    #[test]
+    fn a_runners_node_http_default_is_not_the_servers_port() {
+        let port = |a: &str| a.rsplit_once(':').map(|(_, p)| p.to_owned());
+        assert_ne!(port(NODE_HTTP_ADDR), port(&Config::default().server.http_addr));
+        assert_ne!(port(NODE_HTTP_ADDR), port(&Config::default().server.quic_addr));
+    }
 
     /// docs/needs.md §6: `[runner] budget` is read as written, naming only what it limits; one that
     /// can't be read is refused naming its word; and an unknown `[runner]` key refuses the config in
