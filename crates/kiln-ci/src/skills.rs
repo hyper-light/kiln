@@ -469,10 +469,13 @@ pub fn read(files: &[File], want: Option<&str>, fallback: &str) -> Result<Read, 
     }
     // W20-R01: the plugin's own `bin/` runs on the machine too: its scripts' interpreters are needs.
     if m.is_some() || shape == Shape::Marketplace {
-        for (_, f) in tree.within(&at("bin")) {
-            if let Some(t) = interpreter(&f.bytes) {
-                needs.insert(t);
+        for (rest, f) in tree.within(&at("bin")) {
+            if rest.split('/').any(|s| s == ".git" || s == "node_modules") {
+                continue;
             }
+            needs.extend(interpreter(&f.bytes));
+            // Claude Code puts a plugin's `bin/` on PATH; the skills and hooks call it by name.
+            out.push(File { path: format!("bin/{rest}"), bytes: f.bytes.clone(), exec: f.exec || f.bytes.starts_with(b"#!") });
         }
     }
     let mut mcp = Vec::new();
@@ -540,7 +543,7 @@ impl Default for Picks {
 impl Picks {
     /// Whether a file of the package (by its installed path) is among what's picked.
     pub fn takes(&self, path: &str) -> bool {
-        (self.skills && path.starts_with("skills/")) || (self.agents && path.starts_with("agents/")) || (self.hooks && path.starts_with("hooks/")) || (self.mcp && path == ".mcp.json")
+        (self.skills && path.starts_with("skills/")) || (self.agents && path.starts_with("agents/")) || (self.hooks && path.starts_with("hooks/")) || ((self.skills || self.hooks) && path.starts_with("bin/")) || (self.mcp && path == ".mcp.json")
     }
 }
 
@@ -624,6 +627,12 @@ mod tests {
         let p = package(read(&files, None, "astack"))?;
         assert_eq!(p.agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["lead", "worker"]);
         assert_eq!(p.needs, ["python3"]);
+        let bin: Vec<(&str, bool)> = p.files.iter().filter(|f| f.path.starts_with("bin/")).map(|f| (f.path.as_str(), f.exec)).collect();
+        assert_eq!(bin, [("bin/astack-stamp-hook", true), ("bin/astack-status", true)], "the plugin's bin/ installs, runnable");
+        let skills_only = installed(&p, Picks { skills: true, agents: false, hooks: false, mcp: false, setup: true });
+        assert!(skills_only.iter().any(|f| f.path == "bin/astack-status"));
+        let agents_only = installed(&p, Picks { skills: false, agents: true, hooks: false, mcp: false, setup: true });
+        assert!(!agents_only.iter().any(|f| f.path.starts_with("bin/")));
         Ok(())
     }
 
